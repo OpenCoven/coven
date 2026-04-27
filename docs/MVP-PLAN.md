@@ -1402,47 +1402,29 @@ git add src __tests__
  git commit -m "feat: show coven sessions in comux"
 ```
 
-### Task 10: OpenClaw launch-through-Coven spike
+### Task 10: OpenClaw launch-through-Coven spike — parked
 
-**Files:**
-- `extensions/coven/index.ts`
-- `extensions/coven/src/config.ts`
-- `extensions/coven/src/client.ts`
-- `extensions/coven/src/runtime.ts`
-- `extensions/coven/src/runtime.test.ts`
+**Status:** deferred / not approved for the active path.
 
-- [x] **Step 1: Add Coven availability check**
+The implementation spike proved the bridge is technically viable, but it should not be treated as required for the Coven MVP yet. We are proceeding as if the OpenClaw PR is not approved and will revisit after Coven has more independent direct usage.
 
-OpenClaw now has an opt-in `coven` ACP runtime backend that checks the local Coven daemon through the Unix-socket `/health` API before using Coven for a task.
+**Spike artifacts:**
+- OpenClaw branch: `feat/coven-bridge-mvp`
+- OpenClaw PR: `openclaw/openclaw#72878` — closed/parked, not merged
+- Core idea: an opt-in `coven` ACP runtime backend that checks Coven daemon health, launches with `POST /sessions`, maps output/exit events into ACP runtime events, and falls back to `acpx`.
 
-- [x] **Step 2: Add opt-in launch route**
+**Why parked:**
+- Coven can continue maturing through direct CLI/daemon usage and the comux bridge.
+- First-class OpenClaw ACP routing is useful, but not necessary to validate Coven's local harness substrate.
+- Deferring avoids making the OpenClaw codebase carry a young integration before Coven's daemon/API surface has enough real-world mileage.
 
-The route is opt-in through the bundled `coven` plugin plus `acp.backend = "coven"`. If the plugin is disabled or the backend is not selected, OpenClaw keeps the existing direct ACP runtime path.
-
-- [x] **Step 3: Launch coding tasks through Coven when enabled**
-
-The `coven` ACP runtime launches a task with `POST /sessions`, sending `projectRoot`, `cwd`, `harness`, `title`, and `prompt`; it records the returned Coven session id on the ACP runtime handle.
-
-- [x] **Step 4: Preserve fallback**
-
-If Coven is unavailable at session initialization, or if a launch fails after detection, the runtime falls back to the configured direct ACP backend (`acpx` by default) and preserves direct launch behavior.
-
-- [x] **Step 5: Verify**
-
-```bash
-node scripts/run-vitest.mjs run --config test/vitest/vitest.extensions.config.ts extensions/coven/src/runtime.test.ts
-/Users/buns/Documents/GitHub/openclaw/openclaw/node_modules/.bin/tsc -p tsconfig.extensions.json --noEmit --pretty false
-```
-
-- [x] **Step 6: Commit**
-
-OpenClaw branch `feat/coven-bridge-mvp` was committed and pushed as `ce3eac99c3 feat: route acp sessions through coven`.
-
-```bash
-git add extensions/coven
- git commit -m "feat: route acp sessions through coven"
-git push -u origin feat/coven-bridge-mvp
-```
+- [x] **Spike: add Coven availability check**
+- [x] **Spike: add opt-in launch route**
+- [x] **Spike: launch coding tasks through Coven when enabled**
+- [x] **Spike: preserve fallback**
+- [x] **Spike: verify with focused tests and extension typecheck**
+- [x] **Spike: commit/push branch**
+- [ ] **Revisit after Coven direct/comux usage matures**
 
 ## 17. Progress tracking
 
@@ -1498,12 +1480,12 @@ Use a simple milestone board until the repo exists. Once created, mirror this in
 - [x] comux attaches or opens Coven session view
 - [x] comux preserves project boundary
 
-### Milestone 7: OpenClaw bridge
+### Milestone 7: OpenClaw bridge — deferred
 
-- [x] OpenClaw detects Coven
-- [x] OpenClaw launches one coding task via Coven
-- [x] OpenClaw receives status/events
-- [x] direct launch fallback preserved
+- [x] Technical spike completed on an OpenClaw branch
+- [x] PR opened for transparent review, then closed/parked before merge
+- [ ] Revisit first-class OpenClaw routing after Coven direct CLI/daemon and comux usage mature
+- [ ] Do not block the Coven MVP on OpenClaw approval
 
 ### Milestone 8: Future harness proof
 
