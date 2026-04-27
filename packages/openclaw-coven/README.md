@@ -2,7 +2,7 @@
 
 OpenClaw ACP runtime bridge for local Coven daemon sessions.
 
-This package installs an **opt-in** OpenClaw plugin with backend id `coven`. It lets OpenClaw route ACP coding sessions through a local Coven daemon while keeping OpenClaw's direct ACPX backend as a separately configurable fallback.
+This package installs an **opt-in** OpenClaw plugin with plugin id `opencoven-coven` and ACP backend id `coven`. It lets OpenClaw route ACP coding sessions through a local Coven daemon while keeping OpenClaw's direct ACPX backend as a separately configurable fallback.
 
 ## Requirements
 
@@ -37,7 +37,7 @@ Minimal opt-in config:
   },
   plugins: {
     entries: {
-      coven: {
+      "opencoven-coven": {
         enabled: true,
         config: {
           covenHome: "~/.coven",
@@ -68,7 +68,7 @@ OpenClaw remains responsible for chat/session routing, ACP bindings, task state,
 ## Safety boundaries
 
 - Disabled by default.
-- Requires explicit `acp.backend = "coven"` selection.
+- Requires explicit `plugins.entries["opencoven-coven"].enabled = true` and `acp.backend = "coven"` selection.
 - Does not auto-start Coven.
 - Does not expose OpenClaw tools to Coven-managed harnesses.
 - Restricts socket configuration to `<covenHome>/coven.sock`.

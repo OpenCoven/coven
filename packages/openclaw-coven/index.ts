@@ -6,8 +6,10 @@ import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { createCovenPluginConfigSchema, resolveCovenPluginConfig } from "./src/config.js";
 import { CovenAcpRuntime, COVEN_BACKEND_ID } from "./src/runtime.js";
 
+const COVEN_PLUGIN_ID = "opencoven-coven";
+
 export default definePluginEntry({
-  id: COVEN_BACKEND_ID,
+  id: COVEN_PLUGIN_ID,
   name: "Coven ACP Runtime",
   description:
     "Opt-in ACP runtime backend that launches coding tasks through a local Coven daemon.",

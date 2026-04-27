@@ -1,5 +1,5 @@
 {
-  "id": "coven",
+  "id": "opencoven-coven",
   "enabledByDefault": false,
   "name": "Coven ACP Runtime",
   "description": "Opt-in ACP runtime backend that launches coding tasks through a local Coven daemon.",
