@@ -1276,7 +1276,7 @@ Before building a long-lived server, write a PID/status file under `~/.coven/dae
 }
 ```
 
-- [ ] **Step 3: Add local API only after direct CLI proves stable**
+- [x] **Step 3: Add local API only after direct CLI proves stable**
 
 Use Unix socket or localhost port. Required MVP endpoints:
 
@@ -1296,7 +1296,7 @@ coven daemon status
 
 Expected: status shows running daemon and socket/port.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/coven-cli
@@ -1482,8 +1482,8 @@ Use a simple milestone board until the repo exists. Once created, mirror this in
 ### Milestone 5: Daemon/API
 
 - [x] daemon start/status/stop
-- [ ] local API health
-- [ ] sessions API
+- [x] local API health
+- [x] sessions API
 - [ ] events API
 
 ### Milestone 6: comux bridge
@@ -1550,4 +1550,5 @@ Current repo status after initial implementation passes:
 - `coven run` creates session metadata, supports `--detach`, and can run attached PTY harness sessions.
 - `coven sessions`, `coven doctor`, and `coven --help` have been smoke-tested locally.
 - Daemon control surface now supports `coven daemon start/status/stop` using a local `daemon.json` status file and socket path metadata.
-- Next implementation slice: replace the status-file-only daemon with a real local server/API for `/health`, sessions, input, kill, and events.
+- Local API routing now covers `/health`, `/sessions`, `/sessions/:id`, input/kill acceptance stubs, and empty events responses, with a Unix-socket health smoke test.
+- Next implementation slice: make `coven daemon start` launch a long-lived background server and back input/kill/events with real PTY/session plumbing.
