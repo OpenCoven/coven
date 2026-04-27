@@ -22,7 +22,18 @@ pub struct ApiResponse {
     pub body: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionLaunch {
+    pub id: String,
+    pub project_root: String,
+    pub cwd: String,
+    pub harness: String,
+    pub prompt: String,
+    pub title: String,
+}
+
 pub trait SessionRuntime {
+    fn launch_session(&self, launch: &SessionLaunch) -> Result<()>;
     fn send_input(&self, session_id: &str, payload: &Value) -> Result<()>;
     fn kill_session(&self, session_id: &str) -> Result<()>;
 }
@@ -30,6 +41,10 @@ pub trait SessionRuntime {
 pub struct NoopSessionRuntime;
 
 impl SessionRuntime for NoopSessionRuntime {
+    fn launch_session(&self, _launch: &SessionLaunch) -> Result<()> {
+        Ok(())
+    }
+
     fn send_input(&self, _session_id: &str, _payload: &Value) -> Result<()> {
         Ok(())
     }
@@ -79,6 +94,7 @@ pub fn handle_request_with_runtime(
             let sessions = store::list_sessions(&conn)?;
             json_response(200, &sessions)
         }
+        ("POST", "/sessions") => launch_session(coven_home, body, runtime),
         ("POST", path) if path.starts_with("/sessions/") && path.ends_with("/input") => {
             let session_id = session_action_id(path, "/input");
             record_input(coven_home, session_id, body, runtime)
@@ -108,6 +124,66 @@ pub fn handle_request_with_runtime(
 
 fn store_path(coven_home: &Path) -> std::path::PathBuf {
     coven_home.join("coven.sqlite3")
+}
+
+fn launch_session(
+    coven_home: &Path,
+    body: Option<&str>,
+    runtime: &dyn SessionRuntime,
+) -> Result<ApiResponse> {
+    let payload = parse_body(body)?;
+    let launch = session_launch_from_payload(payload)?;
+    runtime.launch_session(&launch)?;
+    let conn = store::open_store(&store_path(coven_home))?;
+    let now = current_timestamp();
+    let record = store::SessionRecord {
+        id: launch.id.clone(),
+        project_root: launch.project_root.clone(),
+        harness: launch.harness.clone(),
+        title: launch.title.clone(),
+        status: "running".to_string(),
+        exit_code: None,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    store::insert_session(&conn, &record)?;
+    json_response(201, &record)
+}
+
+fn session_launch_from_payload(payload: Value) -> Result<SessionLaunch> {
+    let project_root = required_string(&payload, "projectRoot")?;
+    let cwd = payload
+        .get("cwd")
+        .and_then(Value::as_str)
+        .unwrap_or(&project_root)
+        .to_string();
+    let harness = required_string(&payload, "harness")?;
+    let prompt = required_string(&payload, "prompt")?;
+    let title = payload
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or(&prompt)
+        .to_string();
+
+    Ok(SessionLaunch {
+        id: Uuid::new_v4().to_string(),
+        project_root,
+        cwd,
+        harness,
+        prompt,
+        title,
+    })
+}
+
+fn required_string(payload: &Value, field: &str) -> Result<String> {
+    payload
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .with_context(|| format!("request body requires string field `{field}`"))
 }
 
 fn record_input(
@@ -282,6 +358,52 @@ mod tests {
     }
 
     #[test]
+    fn launch_request_invokes_runtime_and_persists_running_session() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let runtime = RecordingRuntime::default();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(
+                r#"{"projectRoot":"/repo","cwd":"/repo/app","harness":"codex","prompt":"hello coven","title":"Demo"}"#,
+            ),
+            &runtime,
+        )?;
+        let list = handle_request("GET", "/sessions", temp_dir.path(), None)?;
+
+        assert_eq!(response.status, 201);
+        assert!(response.body.contains(r#""status":"running""#));
+        assert_eq!(runtime.launches.borrow().len(), 1);
+        assert_eq!(runtime.launches.borrow()[0].harness, "codex");
+        assert_eq!(runtime.launches.borrow()[0].prompt, "hello coven");
+        assert!(list.body.contains(r#""title":"Demo""#));
+        Ok(())
+    }
+
+    #[test]
+    fn launch_request_rejects_missing_required_fields() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let runtime = RecordingRuntime::default();
+
+        let error = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(r#"{"harness":"codex"}"#),
+            &runtime,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("projectRoot"));
+        assert!(runtime.launches.borrow().is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn input_request_records_session_event() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
         insert_test_session(temp_dir.path(), "session-1")?;
@@ -383,11 +505,17 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingRuntime {
+        launches: std::cell::RefCell<Vec<SessionLaunch>>,
         inputs: std::cell::RefCell<Vec<String>>,
         kills: std::cell::RefCell<Vec<String>>,
     }
 
     impl SessionRuntime for RecordingRuntime {
+        fn launch_session(&self, launch: &SessionLaunch) -> Result<()> {
+            self.launches.borrow_mut().push(launch.clone());
+            Ok(())
+        }
+
         fn send_input(&self, session_id: &str, payload: &Value) -> Result<()> {
             let data = payload
                 .get("data")

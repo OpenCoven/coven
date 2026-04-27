@@ -4,7 +4,7 @@ use std::thread;
 
 use anyhow::{anyhow, Context, Result};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use portable_pty::{native_pty_system, CommandBuilder, PtySize, PtySystem};
+use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, PtySize, PtySystem};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessCommand {
@@ -17,6 +17,11 @@ pub struct HarnessCommand {
 pub struct PtyRunResult {
     pub status: &'static str,
     pub exit_code: Option<i32>,
+}
+
+pub struct DetachedPtySession {
+    pub input: Box<dyn Write + Send>,
+    pub killer: Box<dyn ChildKiller + Send + Sync>,
 }
 
 impl HarnessCommand {
@@ -59,6 +64,35 @@ pub fn build_harness_command(harness_id: &str, prompt: &str, cwd: &Path) -> Resu
 pub fn run_attached(command: &HarnessCommand) -> Result<PtyRunResult> {
     let pty_system = native_pty_system();
     run_attached_with_pty_system(command, pty_system.as_ref())
+}
+
+pub fn spawn_detached(command: &HarnessCommand) -> Result<DetachedPtySession> {
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(terminal_size())
+        .context("failed to open PTY")?;
+    let mut child = pair
+        .slave
+        .spawn_command(command.to_command_builder())
+        .with_context(|| format!("failed to spawn harness `{}`", command.program()))?;
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .context("failed to clone PTY reader")?;
+    let input = pair
+        .master
+        .take_writer()
+        .context("failed to open PTY writer")?;
+    let killer = child.clone_killer();
+
+    thread::spawn(move || {
+        let _ = io::copy(&mut reader, &mut io::sink());
+        let _ = child.wait();
+    });
+
+    Ok(DetachedPtySession { input, killer })
 }
 
 fn run_attached_with_pty_system(
@@ -163,6 +197,22 @@ mod tests {
         assert_eq!(command.program(), "codex");
         assert_eq!(command.args(), &["hello; rm -rf /"]);
         assert_eq!(command.cwd(), cwd);
+    }
+
+    #[test]
+    fn spawn_detached_starts_pty_and_returns_input_and_kill_handles() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let command = HarnessCommand {
+            program: "cat".to_string(),
+            args: vec![],
+            cwd: temp_dir.path().to_path_buf(),
+        };
+
+        let mut session = spawn_detached(&command)?;
+        session.input.write_all(b"hello detached pty\n")?;
+        session.input.flush()?;
+        session.killer.kill()?;
+        Ok(())
     }
 
     #[test]

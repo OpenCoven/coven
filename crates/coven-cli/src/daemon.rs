@@ -1,10 +1,11 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
 #[cfg(unix)]
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read};
 #[cfg(unix)]
 use std::os::unix::net::UnixListener;
 
@@ -12,7 +13,10 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::api::SessionRuntime;
+use crate::{
+    api::{SessionLaunch, SessionRuntime},
+    pty_runner,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -60,6 +64,16 @@ impl LiveSessionRuntime {
 }
 
 impl SessionRuntime for LiveSessionRuntime {
+    fn launch_session(&self, launch: &SessionLaunch) -> Result<()> {
+        let command = pty_runner::build_harness_command(
+            &launch.harness,
+            &launch.prompt,
+            Path::new(&launch.cwd),
+        )?;
+        let detached = pty_runner::spawn_detached(&command)?;
+        self.register(launch.id.clone(), detached.input, Box::new(detached.killer))
+    }
+
     fn send_input(&self, session_id: &str, payload: &Value) -> Result<()> {
         let data = payload
             .get("data")
@@ -92,6 +106,12 @@ impl SessionRuntime for LiveSessionRuntime {
             .remove(session_id)
             .with_context(|| format!("session `{session_id}` is not live in this daemon"))?;
         session.killer.kill()
+    }
+}
+
+impl RuntimeKiller for Box<dyn portable_pty::ChildKiller + Send + Sync> {
+    fn kill(&mut self) -> Result<()> {
+        self.as_mut().kill().context("failed to kill live session")
     }
 }
 
