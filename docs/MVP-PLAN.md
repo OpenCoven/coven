@@ -1405,38 +1405,43 @@ git add src __tests__
 ### Task 10: OpenClaw launch-through-Coven spike
 
 **Files:**
-- Exact files depend on OpenClaw repo structure at implementation time.
-- Target area: coding harness/session launch path.
+- `extensions/coven/index.ts`
+- `extensions/coven/src/config.ts`
+- `extensions/coven/src/client.ts`
+- `extensions/coven/src/runtime.ts`
+- `extensions/coven/src/runtime.test.ts`
 
-- [ ] **Step 1: Add Coven availability check**
+- [x] **Step 1: Add Coven availability check**
 
-OpenClaw should detect local `coven` availability and daemon health.
+OpenClaw now has an opt-in `coven` ACP runtime backend that checks the local Coven daemon through the Unix-socket `/health` API before using Coven for a task.
 
-- [ ] **Step 2: Add opt-in launch route**
+- [x] **Step 2: Add opt-in launch route**
 
-Introduce an opt-in config flag such as:
+The route is opt-in through the bundled `coven` plugin plus `acp.backend = "coven"`. If the plugin is disabled or the backend is not selected, OpenClaw keeps the existing direct ACP runtime path.
 
-```json
-{
-  "coding": {
-    "useCoven": true
-  }
-}
-```
+- [x] **Step 3: Launch coding tasks through Coven when enabled**
 
-- [ ] **Step 3: Launch coding tasks through Coven when enabled**
+The `coven` ACP runtime launches a task with `POST /sessions`, sending `projectRoot`, `cwd`, `harness`, `title`, and `prompt`; it records the returned Coven session id on the ACP runtime handle.
 
-OpenClaw sends project root, harness id, title, and prompt to Coven, then records the Coven session id.
+- [x] **Step 4: Preserve fallback**
 
-- [ ] **Step 4: Preserve fallback**
+If Coven is unavailable at session initialization, or if a launch fails after detection, the runtime falls back to the configured direct ACP backend (`acpx` by default) and preserves direct launch behavior.
 
-If Coven is unavailable, OpenClaw keeps direct launch behavior and reports the fallback clearly.
-
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Verify**
 
 ```bash
-git add .
- git commit -m "feat: route coding sessions through coven"
+node scripts/run-vitest.mjs run --config test/vitest/vitest.extensions.config.ts extensions/coven/src/runtime.test.ts
+/Users/buns/Documents/GitHub/openclaw/openclaw/node_modules/.bin/tsc -p tsconfig.extensions.json --noEmit --pretty false
+```
+
+- [x] **Step 6: Commit**
+
+OpenClaw branch `feat/coven-bridge-mvp` was committed and pushed as `ce3eac99c3 feat: route acp sessions through coven`.
+
+```bash
+git add extensions/coven
+ git commit -m "feat: route acp sessions through coven"
+git push -u origin feat/coven-bridge-mvp
 ```
 
 ## 17. Progress tracking
@@ -1495,10 +1500,10 @@ Use a simple milestone board until the repo exists. Once created, mirror this in
 
 ### Milestone 7: OpenClaw bridge
 
-- [ ] OpenClaw detects Coven
-- [ ] OpenClaw launches one coding task via Coven
-- [ ] OpenClaw receives status/events
-- [ ] direct launch fallback preserved
+- [x] OpenClaw detects Coven
+- [x] OpenClaw launches one coding task via Coven
+- [x] OpenClaw receives status/events
+- [x] direct launch fallback preserved
 
 ### Milestone 8: Future harness proof
 
