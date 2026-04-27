@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 #[cfg(unix)]
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixListener;
 
@@ -165,19 +165,12 @@ pub fn serve_next_connection(
         .context("failed to accept API connection")?;
     let mut reader = BufReader::new(stream);
     let request_line = read_http_request_line(&mut reader)?;
-    let mut header = String::new();
-    loop {
-        header.clear();
-        let bytes = reader
-            .read_line(&mut header)
-            .context("failed to read API request header")?;
-        if bytes == 0 || header == "\r\n" || header == "\n" {
-            break;
-        }
-    }
+    let content_length = read_http_headers(&mut reader)?;
+    let body = read_http_body(&mut reader, content_length)?;
     let mut stream = reader.into_inner();
     let (method, path) = parse_request_line(&request_line)?;
-    let response = crate::api::handle_request(method, path, coven_home, status)?;
+    let response =
+        crate::api::handle_request_with_body(method, path, coven_home, status, body.as_deref())?;
     let reason = match response.status {
         200 => "OK",
         202 => "Accepted",
@@ -208,6 +201,44 @@ fn read_http_request_line<R: BufRead>(reader: &mut R) -> Result<String> {
         anyhow::bail!("empty API request");
     }
     Ok(line)
+}
+
+#[cfg(unix)]
+fn read_http_headers<R: BufRead>(reader: &mut R) -> Result<usize> {
+    let mut content_length = 0;
+    let mut header = String::new();
+    loop {
+        header.clear();
+        let bytes = reader
+            .read_line(&mut header)
+            .context("failed to read API request header")?;
+        if bytes == 0 || header == "\r\n" || header == "\n" {
+            break;
+        }
+        if let Some((name, value)) = header.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = value
+                    .trim()
+                    .parse()
+                    .context("invalid Content-Length header")?;
+            }
+        }
+    }
+    Ok(content_length)
+}
+
+#[cfg(unix)]
+fn read_http_body<R: Read>(reader: &mut R, content_length: usize) -> Result<Option<String>> {
+    if content_length == 0 {
+        return Ok(None);
+    }
+    let mut bytes = vec![0; content_length];
+    reader
+        .read_exact(&mut bytes)
+        .context("failed to read API request body")?;
+    String::from_utf8(bytes)
+        .map(Some)
+        .context("API request body was not valid UTF-8")
 }
 
 #[cfg(unix)]
@@ -286,6 +317,54 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains(r#""ok":true"#));
         assert!(response.contains(r#""pid":12345"#));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forwards_http_request_body_to_api() -> Result<()> {
+        use std::io::{Read, Write};
+        use std::net::Shutdown;
+        use std::os::unix::net::UnixStream;
+        use std::thread;
+
+        let temp_dir = tempfile::tempdir()?;
+        let conn = crate::store::open_store(&temp_dir.path().join("coven.sqlite3"))?;
+        crate::store::insert_session(
+            &conn,
+            &crate::store::SessionRecord {
+                id: "session-1".to_string(),
+                project_root: "/repo".to_string(),
+                harness: "codex".to_string(),
+                title: "hello from coven".to_string(),
+                status: "running".to_string(),
+                exit_code: None,
+                created_at: "2026-04-27T10:00:00Z".to_string(),
+                updated_at: "2026-04-27T10:00:00Z".to_string(),
+            },
+        )?;
+        let listener = bind_api_socket(temp_dir.path())?;
+        let home = temp_dir.path().to_path_buf();
+        let server = thread::spawn(move || serve_next_connection(&listener, &home, None));
+
+        let body = r#"{"data":"hello over socket"}"#;
+        let request = format!(
+            "POST /sessions/session-1/input HTTP/1.1\r\nHost: coven\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let mut stream = UnixStream::connect(daemon_socket_path(temp_dir.path()))?;
+        stream.write_all(request.as_bytes())?;
+        stream.shutdown(Shutdown::Write)?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+
+        server.join().expect("server thread panicked")?;
+        let events = crate::store::list_events(&conn, "session-1")?;
+        assert!(response.starts_with("HTTP/1.1 202 Accepted"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "input");
+        assert!(events[0].payload_json.contains("hello over socket"));
         Ok(())
     }
 }

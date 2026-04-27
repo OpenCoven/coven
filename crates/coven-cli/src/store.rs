@@ -16,6 +16,15 @@ pub struct SessionRecord {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventRecord {
+    pub id: String,
+    pub session_id: String,
+    pub kind: String,
+    pub payload_json: String,
+    pub created_at: String,
+}
+
 pub fn open_store(path: &Path) -> Result<Connection> {
     if let Some(parent) = path
         .parent()
@@ -131,6 +140,12 @@ pub fn update_session_status(
     Ok(())
 }
 
+pub fn get_session(conn: &Connection, session_id: &str) -> Result<Option<SessionRecord>> {
+    Ok(list_sessions(conn)?
+        .into_iter()
+        .find(|session| session.id == session_id))
+}
+
 pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionRecord>> {
     let mut statement = conn
         .prepare(
@@ -166,6 +181,60 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionRecord>> {
         .context("failed to read sessions")?;
 
     Ok(sessions)
+}
+
+pub fn insert_event(conn: &Connection, record: &EventRecord) -> Result<()> {
+    conn.execute(
+        "INSERT INTO events (
+            id,
+            session_id,
+            kind,
+            payload_json,
+            created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            &record.id,
+            &record.session_id,
+            &record.kind,
+            &record.payload_json,
+            &record.created_at,
+        ],
+    )
+    .with_context(|| format!("failed to insert event {}", record.id))?;
+
+    Ok(())
+}
+
+pub fn list_events(conn: &Connection, session_id: &str) -> Result<Vec<EventRecord>> {
+    let mut statement = conn
+        .prepare(
+            "SELECT
+                id,
+                session_id,
+                kind,
+                payload_json,
+                created_at
+            FROM events
+            WHERE session_id = ?1
+            ORDER BY created_at ASC, id ASC",
+        )
+        .context("failed to prepare event list query")?;
+
+    let events = statement
+        .query_map(params![session_id], |row| {
+            Ok(EventRecord {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                kind: row.get(2)?,
+                payload_json: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })
+        .context("failed to query events")?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to read events")?;
+
+    Ok(events)
 }
 
 #[cfg(test)]
@@ -275,6 +344,30 @@ mod tests {
         assert_eq!(sessions[0].status, "completed");
         assert_eq!(sessions[0].exit_code, Some(0));
         assert_eq!(sessions[0].updated_at, "2026-04-27T06:01:00Z");
+        Ok(())
+    }
+
+    #[test]
+    fn inserts_and_lists_events_for_session() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+        insert_session(&conn, &session_record("session-1", "2026-04-27T06:00:00Z"))?;
+        insert_event(
+            &conn,
+            &EventRecord {
+                id: "event-1".to_string(),
+                session_id: "session-1".to_string(),
+                kind: "input".to_string(),
+                payload_json: r#"{"data":"hello"}"#.to_string(),
+                created_at: "2026-04-27T06:01:00Z".to_string(),
+            },
+        )?;
+
+        let events = list_events(&conn, "session-1")?;
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "input");
+        assert_eq!(events[0].payload_json, r#"{"data":"hello"}"#);
         Ok(())
     }
 
