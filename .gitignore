@@ -4,3 +4,15 @@
 *.log
 /.comux-hooks
 /.comux
+# Local runtime state and credentials
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite3
+*.db
+*.sock
+*.pem
+*.key
+*.p12
+*.pfx
