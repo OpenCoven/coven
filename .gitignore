@@ -2,3 +2,5 @@
 /.coven/
 .DS_Store
 *.log
+/.comux-hooks
+/.comux
