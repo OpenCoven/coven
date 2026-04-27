@@ -28,9 +28,6 @@ const DEFAULT_HARNESSES: Record<string, string> = {
   "codex-cli": "codex",
   claude: "claude",
   "claude-cli": "claude",
-  gemini: "gemini",
-  "google-gemini-cli": "gemini",
-  opencode: "opencode",
 };
 const HEALTH_CHECK_TIMEOUT_MS = 5_000;
 const MAX_COVEN_PROMPT_BYTES = 500_000;

@@ -1,6 +1,6 @@
 {
   "name": "@opencoven/coven",
-  "version": "2026.4.27",
+  "version": "2026.4.27-patch.1",
   "description": "OpenClaw ACP runtime bridge for local Coven daemon sessions.",
   "type": "module",
   "license": "MIT",

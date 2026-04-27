@@ -241,6 +241,21 @@ describe("CovenAcpRuntime", () => {
     expect(client.health).not.toHaveBeenCalled();
   });
 
+  it("keeps future harness ids out of the default OpenClaw mapping", async () => {
+    const client = fakeClient();
+    const runtime = new CovenAcpRuntime({ config, client });
+
+    await expect(
+      runtime.ensureSession({
+        sessionKey: "agent:gemini:test",
+        agent: "gemini",
+        mode: "oneshot",
+        cwd: workspaceDir,
+      }),
+    ).rejects.toThrow(/Unknown or unauthorized ACP agent/);
+    expect(client.health).not.toHaveBeenCalled();
+  });
+
   it("allows explicit configured agent-to-harness mappings", async () => {
     const client = fakeClient();
     const runtime = new CovenAcpRuntime({

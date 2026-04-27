@@ -63,6 +63,7 @@ The plugin:
 - validates plugin configuration and the local socket trust anchor;
 - launches sessions through `POST /sessions`;
 - polls Coven events and maps them into ACP runtime events;
+- maps only Codex and Claude Code agent ids by default for v0;
 - uses fallback ACP backends only when explicitly configured.
 
 OpenClaw remains responsible for chat/session routing, ACP bindings, task state, permissions UX, and user-facing delivery. Coven remains responsible for local harness supervision.

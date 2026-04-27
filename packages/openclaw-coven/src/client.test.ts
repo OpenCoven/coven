@@ -82,6 +82,68 @@ describe("createCovenClient", () => {
     );
   });
 
+  it("normalizes snake_case session records returned by the Rust daemon", async () => {
+    await withServer(
+      (_req, res) => {
+        res.setHeader("Content-Type", "application/json");
+        res.end(
+          JSON.stringify({
+            id: "session-1",
+            project_root: tmpDir,
+            harness: "codex",
+            title: "Smoke",
+            status: "completed",
+            exit_code: 0,
+            created_at: "2026-04-27T10:00:00Z",
+            updated_at: "2026-04-27T10:00:01Z",
+          }),
+        );
+      },
+      async (socketPath) => {
+        await expect(createCovenClient(socketPath).getSession("session-1")).resolves.toEqual({
+          id: "session-1",
+          projectRoot: tmpDir,
+          harness: "codex",
+          title: "Smoke",
+          status: "completed",
+          exitCode: 0,
+          createdAt: "2026-04-27T10:00:00Z",
+          updatedAt: "2026-04-27T10:00:01Z",
+        });
+      },
+    );
+  });
+
+  it("normalizes snake_case event records returned by the Rust daemon", async () => {
+    await withServer(
+      (_req, res) => {
+        res.setHeader("Content-Type", "application/json");
+        res.end(
+          JSON.stringify([
+            {
+              id: "event-1",
+              session_id: "session-1",
+              kind: "output",
+              payload_json: JSON.stringify({ data: "hello" }),
+              created_at: "2026-04-27T10:00:00Z",
+            },
+          ]),
+        );
+      },
+      async (socketPath) => {
+        await expect(createCovenClient(socketPath).listEvents("session-1")).resolves.toEqual([
+          {
+            id: "event-1",
+            sessionId: "session-1",
+            kind: "output",
+            payloadJson: JSON.stringify({ data: "hello" }),
+            createdAt: "2026-04-27T10:00:00Z",
+          },
+        ]);
+      },
+    );
+  });
+
   it("rejects oversized event cursors before building the events URL", () => {
     expect(() =>
       createCovenClient("/tmp/coven.sock").listEvents("session-1", {

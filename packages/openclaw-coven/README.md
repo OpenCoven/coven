@@ -14,7 +14,7 @@ OpenClaw core does not include OpenCoven or Coven. This package is the integrati
 
 ## Install
 
-After this package is published to ClawHub:
+Install the external plugin from ClawHub:
 
 ```bash
 openclaw plugins install clawhub:@opencoven/coven
@@ -43,8 +43,6 @@ Minimal opt-in config:
         enabled: true,
         config: {
           covenHome: "~/.coven",
-          allowFallback: true,
-          fallbackBackend: "acpx",
         },
       },
     },
@@ -53,6 +51,8 @@ Minimal opt-in config:
 ```
 
 `allowFallback` defaults to `false`. Enable it only when you intentionally want failed/unavailable Coven launches to fall back to another ACP backend such as `acpx`.
+
+By default, the plugin only maps OpenClaw ACP agent ids for the current Coven v0 scope: Codex and Claude Code. Future harness ids must be explicitly configured in `harnesses` after the Rust daemon supports and validates them.
 
 ## Architecture
 

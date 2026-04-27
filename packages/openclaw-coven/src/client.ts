@@ -71,6 +71,8 @@ type HttpResponse = {
   body: string;
 };
 
+type JsonRecord = Record<string, unknown>;
+
 type SocketFingerprint = {
   dev: number;
   ino: number;
@@ -364,6 +366,68 @@ async function requestJson<T>(options: RequestOptions): Promise<T> {
   }
 }
 
+function requireRecord(value: unknown, label: string): JsonRecord {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(`${label} response must be an object`);
+  }
+  return value as JsonRecord;
+}
+
+function requireStringField(record: JsonRecord, camelKey: string, snakeKey: string): string {
+  const value = record[camelKey] ?? record[snakeKey];
+  if (typeof value !== "string") {
+    throw new Error(`Coven response field ${camelKey} is invalid`);
+  }
+  return value;
+}
+
+function requireNullableNumberField(
+  record: JsonRecord,
+  camelKey: string,
+  snakeKey: string,
+): number | null {
+  const value = record[camelKey] ?? record[snakeKey];
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error(`Coven response field ${camelKey} is invalid`);
+  }
+  return value;
+}
+
+function normalizeSessionRecord(value: unknown): CovenSessionRecord {
+  const record = requireRecord(value, "Coven session");
+  return {
+    id: requireStringField(record, "id", "id"),
+    projectRoot: requireStringField(record, "projectRoot", "project_root"),
+    harness: requireStringField(record, "harness", "harness"),
+    title: requireStringField(record, "title", "title"),
+    status: requireStringField(record, "status", "status"),
+    exitCode: requireNullableNumberField(record, "exitCode", "exit_code"),
+    createdAt: requireStringField(record, "createdAt", "created_at"),
+    updatedAt: requireStringField(record, "updatedAt", "updated_at"),
+  };
+}
+
+function normalizeEventRecord(value: unknown): CovenEventRecord {
+  const record = requireRecord(value, "Coven event");
+  return {
+    id: requireStringField(record, "id", "id"),
+    sessionId: requireStringField(record, "sessionId", "session_id"),
+    kind: requireStringField(record, "kind", "kind"),
+    payloadJson: requireStringField(record, "payloadJson", "payload_json"),
+    createdAt: requireStringField(record, "createdAt", "created_at"),
+  };
+}
+
+function normalizeEventRecords(value: unknown): CovenEventRecord[] {
+  if (!Array.isArray(value)) {
+    throw new Error("Coven events response must be an array");
+  }
+  return value.map(normalizeEventRecord);
+}
+
 export function createCovenClient(
   socketPath: string,
   clientOptions: { socketRoot?: string } = {},
@@ -379,23 +443,23 @@ export function createCovenClient(
       });
     },
     launchSession(input, signal) {
-      return requestJson<CovenSessionRecord>({
+      return requestJson<unknown>({
         socketPath,
         socketRoot: clientOptions.socketRoot,
         method: "POST",
         path: "/sessions",
         body: input,
         signal,
-      });
+      }).then(normalizeSessionRecord);
     },
     getSession(sessionId, signal) {
-      return requestJson<CovenSessionRecord>({
+      return requestJson<unknown>({
         socketPath,
         socketRoot: clientOptions.socketRoot,
         method: "GET",
         path: `/sessions/${encodeURIComponent(sessionId)}`,
         signal,
-      });
+      }).then(normalizeSessionRecord);
     },
     listEvents(sessionId, options, signal) {
       const params = new URLSearchParams({
@@ -405,13 +469,13 @@ export function createCovenClient(
       if (afterEventId) {
         params.set("afterEventId", requireSafeQueryId(afterEventId, "Coven event id"));
       }
-      return requestJson<CovenEventRecord[]>({
+      return requestJson<unknown>({
         socketPath,
         socketRoot: clientOptions.socketRoot,
         method: "GET",
         path: `/events?${params.toString()}`,
         signal,
-      });
+      }).then(normalizeEventRecords);
     },
     async sendInput(sessionId, data, signal) {
       await requestJson<unknown>({
@@ -437,4 +501,6 @@ export function createCovenClient(
 
 export const __testing = {
   validateSocketPathForUse,
+  normalizeEventRecord,
+  normalizeSessionRecord,
 };
