@@ -22,6 +22,23 @@ pub struct ApiResponse {
     pub body: String,
 }
 
+pub trait SessionRuntime {
+    fn send_input(&self, session_id: &str, payload: &Value) -> Result<()>;
+    fn kill_session(&self, session_id: &str) -> Result<()>;
+}
+
+pub struct NoopSessionRuntime;
+
+impl SessionRuntime for NoopSessionRuntime {
+    fn send_input(&self, _session_id: &str, _payload: &Value) -> Result<()> {
+        Ok(())
+    }
+
+    fn kill_session(&self, _session_id: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
 pub fn health_response(daemon: Option<DaemonStatus>) -> HealthResponse {
     HealthResponse { ok: true, daemon }
 }
@@ -43,6 +60,17 @@ pub fn handle_request_with_body(
     daemon: Option<DaemonStatus>,
     body: Option<&str>,
 ) -> Result<ApiResponse> {
+    handle_request_with_runtime(method, path, coven_home, daemon, body, &NoopSessionRuntime)
+}
+
+pub fn handle_request_with_runtime(
+    method: &str,
+    path: &str,
+    coven_home: &Path,
+    daemon: Option<DaemonStatus>,
+    body: Option<&str>,
+    runtime: &dyn SessionRuntime,
+) -> Result<ApiResponse> {
     let (route, query) = split_path_query(path);
     match (method, route) {
         ("GET", "/health") => json_response(200, &health_response(daemon)),
@@ -53,11 +81,11 @@ pub fn handle_request_with_body(
         }
         ("POST", path) if path.starts_with("/sessions/") && path.ends_with("/input") => {
             let session_id = session_action_id(path, "/input");
-            record_input(coven_home, session_id, body)
+            record_input(coven_home, session_id, body, runtime)
         }
         ("POST", path) if path.starts_with("/sessions/") && path.ends_with("/kill") => {
             let session_id = session_action_id(path, "/kill");
-            kill_session(coven_home, session_id)
+            kill_session(coven_home, session_id, runtime)
         }
         ("GET", path) if path.starts_with("/sessions/") => {
             let session_id = path.trim_start_matches("/sessions/");
@@ -82,23 +110,34 @@ fn store_path(coven_home: &Path) -> std::path::PathBuf {
     coven_home.join("coven.sqlite3")
 }
 
-fn record_input(coven_home: &Path, session_id: &str, body: Option<&str>) -> Result<ApiResponse> {
+fn record_input(
+    coven_home: &Path,
+    session_id: &str,
+    body: Option<&str>,
+    runtime: &dyn SessionRuntime,
+) -> Result<ApiResponse> {
     let conn = store::open_store(&store_path(coven_home))?;
     if store::get_session(&conn, session_id)?.is_none() {
         return json_response(404, &json!({ "error": "session not found" }));
     }
 
     let payload = parse_body(body)?;
+    runtime.send_input(session_id, &payload)?;
     insert_event(&conn, session_id, "input", payload)?;
     json_response(202, &json!({ "ok": true, "accepted": true }))
 }
 
-fn kill_session(coven_home: &Path, session_id: &str) -> Result<ApiResponse> {
+fn kill_session(
+    coven_home: &Path,
+    session_id: &str,
+    runtime: &dyn SessionRuntime,
+) -> Result<ApiResponse> {
     let conn = store::open_store(&store_path(coven_home))?;
     if store::get_session(&conn, session_id)?.is_none() {
         return json_response(404, &json!({ "error": "session not found" }));
     }
 
+    runtime.kill_session(session_id)?;
     let now = current_timestamp();
     store::update_session_status(&conn, session_id, "killed", None, &now)?;
     insert_event(&conn, session_id, "kill", json!({ "status": "killed" }))?;
@@ -265,6 +304,29 @@ mod tests {
     }
 
     #[test]
+    fn input_request_invokes_live_runtime_hook() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "session-1")?;
+        let runtime = RecordingRuntime::default();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions/session-1/input",
+            temp_dir.path(),
+            None,
+            Some(r#"{"data":"hello coven"}"#),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 202);
+        assert_eq!(
+            runtime.inputs.borrow().as_slice(),
+            &["session-1:hello coven"]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn kill_request_marks_session_killed_and_records_event() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
         insert_test_session(temp_dir.path(), "session-1")?;
@@ -276,6 +338,26 @@ mod tests {
         assert_eq!(response.status, 202);
         assert!(detail.body.contains(r#""status":"killed""#));
         assert!(events.body.contains(r#""kind":"kill""#));
+        Ok(())
+    }
+
+    #[test]
+    fn kill_request_invokes_live_runtime_hook() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "session-1")?;
+        let runtime = RecordingRuntime::default();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions/session-1/kill",
+            temp_dir.path(),
+            None,
+            None,
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 202);
+        assert_eq!(runtime.kills.borrow().as_slice(), &["session-1"]);
         Ok(())
     }
 
@@ -297,6 +379,30 @@ mod tests {
         assert!(input.body.contains("session not found"));
         assert!(kill.body.contains("session not found"));
         Ok(())
+    }
+
+    #[derive(Default)]
+    struct RecordingRuntime {
+        inputs: std::cell::RefCell<Vec<String>>,
+        kills: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl SessionRuntime for RecordingRuntime {
+        fn send_input(&self, session_id: &str, payload: &Value) -> Result<()> {
+            let data = payload
+                .get("data")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            self.inputs
+                .borrow_mut()
+                .push(format!("{session_id}:{data}"));
+            Ok(())
+        }
+
+        fn kill_session(&self, session_id: &str) -> Result<()> {
+            self.kills.borrow_mut().push(session_id.to_string());
+            Ok(())
+        }
     }
 
     fn insert_test_session(coven_home: &std::path::Path, id: &str) -> anyhow::Result<()> {
