@@ -1402,21 +1402,23 @@ git add src __tests__
  git commit -m "feat: show coven sessions in comux"
 ```
 
-### Task 10: OpenClaw launch-through-Coven spike — parked
+### Task 10: OpenClaw launch-through-Coven external plugin
 
-**Status:** deferred / not approved for the active path.
+**Status:** externalized / published outside OpenClaw core.
 
-The implementation spike proved the bridge is technically viable, but it should not be treated as required for the Coven MVP yet. We are proceeding as if the OpenClaw PR is not approved and will revisit after Coven has more independent direct usage.
+The implementation spike proved the bridge is technically viable, but first-class routing should live outside OpenClaw core while Coven matures. The bundled OpenClaw PR remains closed/parked; the active integration path is the external ClawHub package `@openclaw/coven`, sourced from `OpenCoven/coven`.
 
-**Spike artifacts:**
+**Artifacts:**
 - OpenClaw branch: `feat/coven-bridge-mvp`
 - OpenClaw PR: `openclaw/openclaw#72878` — closed/parked, not merged
-- Core idea: an opt-in `coven` ACP runtime backend that checks Coven daemon health, launches with `POST /sessions`, maps output/exit events into ACP runtime events, and falls back to `acpx`.
+- External plugin package: `packages/openclaw-coven` in `OpenCoven/coven`
+- ClawHub package: `@openclaw/coven` latest `2026.4.27`
+- Core idea: an opt-in `coven` ACP runtime backend that checks Coven daemon health, launches with `POST /sessions`, maps output/exit events into ACP runtime events, and can fall back to `acpx` only when explicitly configured.
 
-**Why parked:**
-- Coven can continue maturing through direct CLI/daemon usage and the comux bridge.
+**Why externalized:**
+- Coven can continue maturing through direct CLI/daemon usage, comux, and an opt-in ClawHub plugin.
 - First-class OpenClaw ACP routing is useful, but not necessary to validate Coven's local harness substrate.
-- Deferring avoids making the OpenClaw codebase carry a young integration before Coven's daemon/API surface has enough real-world mileage.
+- Keeping the bridge source in `OpenCoven/coven` avoids making OpenClaw core carry a young integration before Coven's daemon/API surface has enough real-world mileage.
 
 - [x] **Spike: add Coven availability check**
 - [x] **Spike: add opt-in launch route**
@@ -1424,7 +1426,8 @@ The implementation spike proved the bridge is technically viable, but it should 
 - [x] **Spike: preserve fallback**
 - [x] **Spike: verify with focused tests and extension typecheck**
 - [x] **Spike: commit/push branch**
-- [ ] **Revisit after Coven direct/comux usage matures**
+- [x] **Externalize bridge as ClawHub package**
+- [ ] **Revisit bundled/core integration after Coven direct/comux/plugin usage matures**
 
 ## 17. Progress tracking
 
@@ -1480,12 +1483,14 @@ Use a simple milestone board until the repo exists. Once created, mirror this in
 - [x] comux attaches or opens Coven session view
 - [x] comux preserves project boundary
 
-### Milestone 7: OpenClaw bridge — deferred
+### Milestone 7: OpenClaw bridge — external plugin
 
 - [x] Technical spike completed on an OpenClaw branch
 - [x] PR opened for transparent review, then closed/parked before merge
-- [ ] Revisit first-class OpenClaw routing after Coven direct CLI/daemon and comux usage mature
-- [ ] Do not block the Coven MVP on OpenClaw approval
+- [x] External plugin package added under `packages/openclaw-coven`
+- [x] ClawHub package `@openclaw/coven@2026.4.27` published from `OpenCoven/coven`
+- [ ] Revisit bundled/core OpenClaw routing after Coven direct CLI/daemon, comux, and plugin usage mature
+- [x] Do not block the Coven MVP on OpenClaw approval
 
 ### Milestone 8: Future harness proof
 
@@ -1548,7 +1553,7 @@ Current repo status after initial implementation passes:
 - Detached daemon-launched PTYs now capture output chunks as `output` events and process exits as `exit` events, updating running session status to `completed`/`failed` without overwriting killed sessions.
 - `coven attach <session-id>` now replays captured output events, follows running sessions until exit, prints final exit status, and forwards terminal line input to live daemon sessions through the Unix-socket input API. Event timestamps now use nanosecond precision so captured output/exit ordering remains stable when events land in the same second.
 - Comux bridge now exposes scoped `coven.sessions.list` and `coven.sessions.open`; opening a Coven session creates a Comux shell pane titled `coven:<session title>`, runs `coven attach <session-id>`, persists `shellType: coven` metadata, and refuses sessions outside the current project root.
-- OpenClaw bridge is parked/deferred; active path is direct Coven CLI/daemon plus comux usage.
+- OpenClaw bridge is externalized: bundled OpenClaw PR remains parked, and `@openclaw/coven@2026.4.27` is published on ClawHub from `packages/openclaw-coven` in this repo. The active path is direct Coven CLI/daemon plus comux usage, with optional OpenClaw routing through the external plugin.
 - Future-harness proof slice documented Hermes CLI observations in `docs/FUTURE-HARNESSES.md` and refactored the adapter seam so future CLIs can declare fixed prefix args before the prompt without adding unsupported harness ids prematurely.
 - npm wrapper package scaffold exists at `packages/cli`; local verification confirms `node packages/cli/bin/coven.js doctor` invokes the `coven` binary, and `npm pack --dry-run` includes only package metadata, README, and bin shim.
 - Comux now has Coven session protocol types and a project-scoped fake-client bridge helper; tests prove sessions outside the current project root are filtered out. Committed in `BunsDev/comux` as `1fe3a21 feat: add coven session bridge types`.
