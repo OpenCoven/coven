@@ -1310,7 +1310,7 @@ git add crates/coven-cli
 - Create: `packages/cli/bin/coven.js`
 - Create: `packages/cli/README.md`
 
-- [ ] **Step 1: Create npm package metadata**
+- [x] **Step 1: Create npm package metadata**
 
 Create `packages/cli/package.json`:
 
@@ -1331,7 +1331,7 @@ Create `packages/cli/package.json`:
 }
 ```
 
-- [ ] **Step 2: Create shim**
+- [x] **Step 2: Create shim**
 
 Create `packages/cli/bin/coven.js`:
 
@@ -1347,7 +1347,7 @@ const result = spawnSync(binary, process.argv.slice(2), { stdio: 'inherit' });
 process.exit(result.status ?? 1);
 ```
 
-- [ ] **Step 3: Verify binary command name**
+- [x] **Step 3: Verify binary command name**
 
 ```bash
 node packages/cli/bin/coven.js doctor
@@ -1355,7 +1355,7 @@ node packages/cli/bin/coven.js doctor
 
 Expected: command invokes `coven`; docs never tell users to type `opencoven`.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add packages/cli
@@ -1552,3 +1552,4 @@ Current repo status after initial implementation passes:
 - Daemon control surface now supports `coven daemon start/status/stop` using a local `daemon.json` status file and socket path metadata.
 - Local API routing now covers `/health`, `/sessions`, `/sessions/:id`, input/kill acceptance stubs, and empty events responses, with a Unix-socket health smoke test.
 - Next implementation slice: make `coven daemon start` launch a long-lived background server and back input/kill/events with real PTY/session plumbing.
+- npm wrapper package scaffold exists at `packages/cli`; local verification confirms `node packages/cli/bin/coven.js doctor` invokes the `coven` binary, and `npm pack --dry-run` includes only package metadata, README, and bin shim.

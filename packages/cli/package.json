@@ -1,0 +1,15 @@
+{
+  "name": "@opencoven/cli",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Coven CLI wrapper for the native harness substrate binary.",
+  "type": "module",
+  "bin": {
+    "coven": "bin/coven.js"
+  },
+  "files": [
+    "bin",
+    "README.md"
+  ],
+  "license": "MIT"
+}
