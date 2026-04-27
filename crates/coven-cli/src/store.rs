@@ -11,6 +11,7 @@ pub struct SessionRecord {
     pub harness: String,
     pub title: String,
     pub status: String,
+    pub exit_code: Option<i32>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -35,6 +36,7 @@ pub fn open_store(path: &Path) -> Result<Connection> {
             harness TEXT NOT NULL,
             title TEXT NOT NULL,
             status TEXT NOT NULL,
+            exit_code INTEGER,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -56,8 +58,29 @@ pub fn open_store(path: &Path) -> Result<Connection> {
         ",
     )
     .context("failed to initialize Coven store schema")?;
+    ensure_exit_code_column(&conn)?;
 
     Ok(conn)
+}
+
+fn ensure_exit_code_column(conn: &Connection) -> Result<()> {
+    let mut statement = conn
+        .prepare("PRAGMA table_info(sessions)")
+        .context("failed to inspect sessions schema")?;
+    let has_exit_code = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .context("failed to query sessions schema")?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to read sessions schema")?
+        .into_iter()
+        .any(|column| column == "exit_code");
+
+    if !has_exit_code {
+        conn.execute("ALTER TABLE sessions ADD COLUMN exit_code INTEGER", [])
+            .context("failed to add sessions.exit_code column")?;
+    }
+
+    Ok(())
 }
 
 pub fn insert_session(conn: &Connection, record: &SessionRecord) -> Result<()> {
@@ -68,20 +91,42 @@ pub fn insert_session(conn: &Connection, record: &SessionRecord) -> Result<()> {
             harness,
             title,
             status,
+            exit_code,
             created_at,
             updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             &record.id,
             &record.project_root,
             &record.harness,
             &record.title,
             &record.status,
+            record.exit_code,
             &record.created_at,
             &record.updated_at,
         ],
     )
     .with_context(|| format!("failed to insert session {}", record.id))?;
+
+    Ok(())
+}
+
+pub fn update_session_status(
+    conn: &Connection,
+    session_id: &str,
+    status: &str,
+    exit_code: Option<i32>,
+    updated_at: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions
+         SET status = ?2,
+             exit_code = ?3,
+             updated_at = ?4
+         WHERE id = ?1",
+        params![session_id, status, exit_code, updated_at],
+    )
+    .with_context(|| format!("failed to update session {session_id}"))?;
 
     Ok(())
 }
@@ -95,6 +140,7 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionRecord>> {
                 harness,
                 title,
                 status,
+                exit_code,
                 created_at,
                 updated_at
             FROM sessions
@@ -110,8 +156,9 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionRecord>> {
                 harness: row.get(2)?,
                 title: row.get(3)?,
                 status: row.get(4)?,
-                created_at: row.get(5)?,
-                updated_at: row.get(6)?,
+                exit_code: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
             })
         })
         .context("failed to query sessions")?
@@ -175,6 +222,62 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn adds_exit_code_column_to_existing_store() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let path = temp_dir.path().join("coven.db");
+        {
+            let conn = Connection::open(&path)?;
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    project_root TEXT NOT NULL,
+                    harness TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );",
+            )?;
+        }
+
+        let conn = open_store(&path)?;
+        let session = session_record("session-1", "2026-04-27T06:00:00Z");
+        insert_session(&conn, &session)?;
+        update_session_status(
+            &conn,
+            "session-1",
+            "completed",
+            Some(0),
+            "2026-04-27T06:01:00Z",
+        )?;
+
+        assert_eq!(list_sessions(&conn)?[0].exit_code, Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn updates_session_status_and_exit_code() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+        let session = session_record("session-1", "2026-04-27T06:00:00Z");
+        insert_session(&conn, &session)?;
+
+        update_session_status(
+            &conn,
+            "session-1",
+            "completed",
+            Some(0),
+            "2026-04-27T06:01:00Z",
+        )?;
+
+        let sessions = list_sessions(&conn)?;
+        assert_eq!(sessions[0].status, "completed");
+        assert_eq!(sessions[0].exit_code, Some(0));
+        assert_eq!(sessions[0].updated_at, "2026-04-27T06:01:00Z");
+        Ok(())
+    }
+
     fn session_record(id: &str, created_at: &str) -> SessionRecord {
         SessionRecord {
             id: id.to_string(),
@@ -182,6 +285,7 @@ mod tests {
             harness: "codex".to_string(),
             title: format!("Session {id}"),
             status: "active".to_string(),
+            exit_code: None,
             created_at: created_at.to_string(),
             updated_at: created_at.to_string(),
         }

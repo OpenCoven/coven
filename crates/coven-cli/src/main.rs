@@ -8,11 +8,14 @@ use uuid::Uuid;
 
 mod harness;
 mod project;
+mod pty_runner;
 mod store;
 
 const DEFAULT_COVEN_HOME_DIR: &str = ".coven";
 const STORE_FILE_NAME: &str = "coven.sqlite3";
 const DEFAULT_SESSION_STATUS: &str = "created";
+const RUNNING_SESSION_STATUS: &str = "running";
+const FAILED_SESSION_STATUS: &str = "failed";
 const DEFAULT_TITLE_CHARS: usize = 48;
 
 #[derive(Parser, Debug)]
@@ -34,6 +37,8 @@ enum Command {
         cwd: Option<PathBuf>,
         #[arg(long)]
         title: Option<String>,
+        #[arg(long)]
+        detach: bool,
     },
     Sessions,
 }
@@ -47,7 +52,8 @@ fn main() -> Result<()> {
             prompt,
             cwd,
             title,
-        } => run_session(&harness, &prompt, cwd.as_deref(), title.as_deref()),
+            detach,
+        } => run_session(&harness, &prompt, cwd.as_deref(), title.as_deref(), detach),
         Command::Sessions => list_sessions(),
     }
 }
@@ -73,6 +79,7 @@ fn run_session(
     prompt_args: &[String],
     cwd: Option<&Path>,
     title: Option<&str>,
+    detach: bool,
 ) -> Result<()> {
     let prompt = joined_prompt(prompt_args)?;
     let selected_harness = selected_available_harness(harness_id)?;
@@ -93,6 +100,7 @@ fn run_session(
         harness: selected_harness.id.to_string(),
         title: session_title(title, &prompt),
         status: DEFAULT_SESSION_STATUS.to_string(),
+        exit_code: None,
         created_at: now.clone(),
         updated_at: now,
     };
@@ -105,7 +113,43 @@ fn run_session(
         record.harness,
         cwd.display()
     );
-    Ok(())
+
+    if detach {
+        println!("detached session {}; harness was not spawned", record.id);
+        return Ok(());
+    }
+
+    store::update_session_status(
+        &conn,
+        &record.id,
+        RUNNING_SESSION_STATUS,
+        None,
+        &current_timestamp(),
+    )?;
+
+    let command = pty_runner::build_harness_command(selected_harness.id, &prompt, &cwd)?;
+    match pty_runner::run_attached(&command) {
+        Ok(result) => {
+            store::update_session_status(
+                &conn,
+                &record.id,
+                result.status,
+                result.exit_code,
+                &current_timestamp(),
+            )?;
+            Ok(())
+        }
+        Err(error) => {
+            store::update_session_status(
+                &conn,
+                &record.id,
+                FAILED_SESSION_STATUS,
+                None,
+                &current_timestamp(),
+            )?;
+            Err(error)
+        }
+    }
 }
 
 fn list_sessions() -> Result<()> {
@@ -155,6 +199,10 @@ fn joined_prompt(prompt_args: &[String]) -> Result<String> {
         anyhow::bail!("prompt must not be empty");
     }
     Ok(prompt.to_string())
+}
+
+fn current_timestamp() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
 fn session_title(title: Option<&str>, prompt: &str) -> String {
@@ -254,6 +302,22 @@ mod tests {
     }
 
     #[test]
+    fn cli_run_defaults_to_attached_and_accepts_detach() {
+        let attached = Cli::parse_from(["coven", "run", "codex", "hello"]);
+        let detached = Cli::parse_from(["coven", "run", "codex", "hello", "--detach"]);
+
+        match attached.command {
+            Command::Run { detach, .. } => assert!(!detach),
+            other => panic!("expected run command, got {other:?}"),
+        }
+
+        match detached.command {
+            Command::Run { detach, .. } => assert!(detach),
+            other => panic!("expected run command, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn format_session_line_prints_id_status_harness_and_title() {
         let session = store::SessionRecord {
             id: "session-id".to_string(),
@@ -261,6 +325,7 @@ mod tests {
             harness: "codex".to_string(),
             title: "A useful session".to_string(),
             status: "created".to_string(),
+            exit_code: None,
             created_at: "2026-04-27T06:00:00Z".to_string(),
             updated_at: "2026-04-27T06:00:00Z".to_string(),
         };
