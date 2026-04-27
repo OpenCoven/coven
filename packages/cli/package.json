@@ -1,7 +1,7 @@
 {
   "name": "@opencoven/cli",
   "version": "0.0.0",
-  "private": true,
+  "private": false,
   "description": "Coven CLI wrapper for the native harness substrate binary.",
   "type": "module",
   "bin": {

@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build Coven as a private, standalone, Rust-first harness substrate that runs Codex and Claude Code as project-scoped, attachable PTY sessions, then exposes enough API surface for comux and external clients such as the `@opencoven/coven` OpenClaw plugin to manage those sessions through Coven.
+**Goal:** Build Coven as a public, standalone, Rust-first harness substrate that runs Codex and Claude Code as project-scoped, attachable PTY sessions, then exposes enough API surface for comux and external clients such as the `@opencoven/coven` OpenClaw plugin to manage those sessions through Coven.
 
 **Architecture:** Coven starts as a local Rust CLI/daemon with strict project-root boundaries, a small built-in adapter layer for Codex and Claude Code, local SQLite/event-log persistence, and a local API for clients. TypeScript enters as a convenience layer for npm distribution, SDKs, and external adapters; comux becomes the first visual cockpit client, while OpenClaw integration stays outside OpenClaw core as a ClawHub plugin.
 
@@ -43,7 +43,7 @@ OpenCoven should not force users into one basket. Coven gives the OpenCoven ecos
 ## 3. Naming and package rules
 
 - **Product:** Coven
-- **Private repo target:** `OpenCoven/coven`
+- **Public repo target:** `OpenCoven/coven`
 - **CLI command:** `coven`
 - **npm org/namespace:** `@OpenCoven` / lowercase npm package names such as `@opencoven/cli`
 - **Do not use as terminal command:** `@opencoven`, `opencoven`, or a scoped package name
@@ -67,7 +67,7 @@ coven attach <session-id>
 
 ### In scope for MVP
 
-- Private repo and private package/release flow.
+- Public repo and public package/release flow.
 - Rust CLI command named `coven`.
 - Local daemon process.
 - Interactive PTY sessions.
@@ -78,7 +78,7 @@ coven attach <session-id>
 - Local event log and session metadata.
 - Minimal local API for comux and external plugin integration.
 - Npm-first distribution wrapper with native binary.
-- Clear docs for early private testers.
+- Clear public docs for early adopters.
 
 ### Out of scope for MVP
 
@@ -96,7 +96,7 @@ coven attach <session-id>
 
 ### Scope rule
 
-If a feature does not help a private tester run Codex or Claude Code in a visible, project-scoped, attachable session, it is not MVP.
+If a feature does not help an early adopter run Codex or Claude Code in a visible, project-scoped, attachable session, it is not MVP.
 
 ## 5. MVP success criteria
 
@@ -398,8 +398,8 @@ Rules:
 
 ### MVP distribution
 
-- Private GitHub repo.
-- Private npm package `@opencoven/cli` if feasible.
+- Public GitHub repo.
+- Public npm package `@opencoven/cli` when the wrapper is ready.
 - Package exposes binary command `coven`.
 - Rust binary is built in CI and bundled/downloaded by npm wrapper.
 
@@ -448,7 +448,7 @@ gantt
   title Coven MVP Roadmap
   dateFormat  YYYY-MM-DD
   section Foundation
-  Private repo + Rust skeleton           :a1, 2026-04-27, 1d
+  Public repo + Rust skeleton            :a1, 2026-04-27, 1d
   CLI command + daemon lifecycle         :a2, after a1, 1d
   Project boundary guard                 :a3, after a2, 1d
   section Harness MVP
@@ -462,17 +462,17 @@ gantt
   comux client spike                     :d1, after c2, 1d
   external OpenClaw plugin spike         :d2, after d1, 1d
   section Polish
-  npm wrapper + private install docs     :e1, after d2, 1d
+  npm wrapper + public install docs      :e1, after d2, 1d
   MVP smoke suite + demo script          :e2, after e1, 1d
 ```
 
 ### Phase 0: Product framing and repo setup
 
-Goal: create the private home for Coven and lock the initial design.
+Goal: keep the public home for Coven clear and lock the initial design.
 
 Exit criteria:
 
-- Private repo exists.
+- Public repo exists.
 - README states Coven's product thesis.
 - Plan/spec files are committed.
 - Project board or tracking checklist exists.
@@ -521,7 +521,7 @@ Exit criteria:
 - Session metadata survives daemon restart.
 - Event logs can be tailed.
 - Local API supports projects/harnesses/sessions/events.
-- API has an auth/local-origin story appropriate for private MVP.
+- API has an auth/local-origin story appropriate for a public local-first MVP.
 
 ### Phase 5: comux bridge
 
@@ -559,7 +559,7 @@ Exit criteria:
 
 ## 16. Implementation plan
 
-### Task 1: Create private Coven repo skeleton
+### Task 1: Create Coven repo skeleton
 
 **Files:**
 - Create: `README.md`
@@ -571,7 +571,7 @@ Exit criteria:
 - Create: `crates/coven-cli/src/main.rs`
 - Create: `.gitignore`
 
-- [x] **Step 1: Initialize private repo**
+- [x] **Step 1: Initialize repo**
 
 Run:
 
@@ -581,7 +581,7 @@ cd ~/Documents/GitHub/OpenCoven/coven
 git init -b main
 ```
 
-Expected: empty private local repo on `main`.
+Expected: empty local repo on `main`.
 
 - [x] **Step 2: Create Rust workspace**
 
@@ -1336,7 +1336,7 @@ Create `packages/cli/package.json`:
 {
   "name": "@opencoven/cli",
   "version": "0.0.0",
-  "private": true,
+  "private": false,
   "description": "Coven CLI wrapper for the native harness substrate binary.",
   "bin": {
     "coven": "bin/coven.js"
@@ -1467,7 +1467,7 @@ Use a simple milestone board until the repo exists. Once created, mirror this in
 - [x] Product thesis approved.
 - [x] MVP scope approved.
 - [x] Architecture approved.
-- [x] Private repo created.
+- [x] Public repo created.
 
 ### Milestone 1: CLI skeleton
 
@@ -1535,7 +1535,7 @@ Use a simple milestone board until the repo exists. Once created, mirror this in
 | --- | --- | --- |
 | Codex and Claude CLIs have different prompt semantics | Adapter bugs | Confirm CLI invocation behavior before final PTY implementation; keep adapters separate. |
 | PTY attach/detach is harder than expected | MVP delay | Start with foreground interactive PTY, then daemonized attach as phase 2. |
-| npm native binary packaging eats time | MVP delay | Keep private install docs with `cargo install --path` fallback before polishing npm. |
+| npm native binary packaging eats time | MVP delay | Keep public install docs with `cargo install --path` fallback before polishing npm. |
 | OpenClaw integration scope balloons | MVP delay | Keep OpenClaw integration externalized as the opt-in `@opencoven/coven` plugin; do not add Coven code to OpenClaw core. |
 | Socket API changes break the external plugin | OpenClaw integration regression | Version `/health`, use structured API errors, and test the plugin against representative daemon responses. |
 | comux tries to become Coven | Architecture drift | comux remains cockpit client; Coven owns harness runtime. |
@@ -1555,13 +1555,13 @@ Every implementation slice should use this gate:
 
 ## 20. Definition of MVP done
 
-Coven MVP is done when a private tester can install/run Coven, launch Codex and Claude Code in project-scoped interactive sessions, list and attach to sessions, recover basic metadata after restart, and see those sessions from comux or through the external `@opencoven/coven` OpenClaw plugin.
+Coven MVP is done when an early adopter can install/run Coven from the public repo, launch Codex and Claude Code in project-scoped interactive sessions, list and attach to sessions, recover basic metadata after restart, and see those sessions from comux or through the external `@opencoven/coven` OpenClaw plugin.
 
-MVP is not public-ready until at least one non-Val private tester successfully runs both harnesses and reports that the install/run/attach flow is understandable.
+MVP is public-facing now; the next readiness bar is at least one non-Val early adopter successfully running both harnesses and reporting that the install/run/attach flow is understandable.
 
 ## 21. Immediate next action
 
-Create the private repo `OpenCoven/coven`, add this plan as `docs/MVP-PLAN.md`, and implement Task 1 with no extra scope.
+Keep the public repo `OpenCoven/coven` as the canonical home, keep this plan in `docs/MVP-PLAN.md`, and continue implementation with no extra scope.
 
 
 ## 21. Progress update — 2026-04-27

@@ -18,9 +18,9 @@ The MVP proves the core runtime loop:
 - Commands for running, listing, attaching to, and killing sessions
 - A minimal local API for first-party clients
 - An external OpenClaw plugin package that consumes that API without entering OpenClaw core
-- Private distribution and documentation for early testers
+- Public distribution and documentation for early adopters
 
-Out of scope for MVP: public launch, marketplace plugins, cloud sync, multi-user collaboration, a full comux rewrite, bundled OpenClaw core integration, or replacing OpenClaw.
+Out of scope for MVP: marketplace plugins, cloud sync, multi-user collaboration, a full comux rewrite, bundled OpenClaw core integration, or replacing OpenClaw.
 
 ## Built-in v0 harness direction
 
@@ -57,9 +57,9 @@ The package `@opencoven/coven` is a compatibility adapter:
 
 This makes the socket API the contract. Protocol versioning, compatibility tests, and release notes belong in the Coven repo and plugin package, not in OpenClaw core.
 
-## Private-first status
+## Public-first status
 
-Coven starts private while the safety model, daemon behavior, adapter contracts, and user experience mature. Public packaging and launch should wait until private testers can reliably run Codex and Claude Code in visible, attachable, project-scoped sessions.
+Coven is public now while the safety model, daemon behavior, adapter contracts, and user experience continue to mature. Public packaging should stay conservative, and readiness should be judged by whether early adopters can reliably run Codex and Claude Code in visible, attachable, project-scoped sessions.
 
 ## Canonical community handles
 
