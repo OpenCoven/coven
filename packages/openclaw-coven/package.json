@@ -1,5 +1,5 @@
 {
-  "name": "@openclaw/coven",
+  "name": "@opencoven/coven",
   "version": "2026.4.27",
   "description": "OpenClaw ACP runtime bridge for local Coven daemon sessions.",
   "type": "module",

@@ -1,4 +1,4 @@
-# @openclaw/coven
+# @opencoven/coven
 
 OpenClaw ACP runtime bridge for local Coven daemon sessions.
 
@@ -15,7 +15,7 @@ This package installs an **opt-in** OpenClaw plugin with backend id `coven`. It 
 After this package is published to ClawHub:
 
 ```bash
-openclaw plugins install clawhub:@openclaw/coven
+openclaw plugins install clawhub:@opencoven/coven
 ```
 
 During development, install from a local checkout:

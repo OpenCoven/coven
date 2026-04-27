@@ -63,7 +63,7 @@ Coven also carries an external OpenClaw plugin package at `packages/openclaw-cov
 Once published to ClawHub, install it with:
 
 ```sh
-openclaw plugins install clawhub:@openclaw/coven
+openclaw plugins install clawhub:@opencoven/coven
 ```
 
 The plugin is opt-in: enable `plugins.entries.coven.enabled` and set `acp.backend = "coven"` only when you want OpenClaw ACP sessions to route through a local Coven daemon.

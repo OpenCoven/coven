@@ -1406,13 +1406,13 @@ git add src __tests__
 
 **Status:** externalized / published outside OpenClaw core.
 
-The implementation spike proved the bridge is technically viable, but first-class routing should live outside OpenClaw core while Coven matures. The bundled OpenClaw PR remains closed/parked; the active integration path is the external ClawHub package `@openclaw/coven`, sourced from `OpenCoven/coven`.
+The implementation spike proved the bridge is technically viable, but first-class routing should live outside OpenClaw core while Coven matures. The bundled OpenClaw PR remains closed/parked; the active integration path is the external ClawHub package `@opencoven/coven`, sourced from `OpenCoven/coven`.
 
 **Artifacts:**
 - OpenClaw branch: `feat/coven-bridge-mvp`
 - OpenClaw PR: `openclaw/openclaw#72878` — closed/parked, not merged
 - External plugin package: `packages/openclaw-coven` in `OpenCoven/coven`
-- ClawHub package: `@openclaw/coven` latest `2026.4.27`
+- ClawHub package: `@opencoven/coven` latest `2026.4.27`
 - Core idea: an opt-in `coven` ACP runtime backend that checks Coven daemon health, launches with `POST /sessions`, maps output/exit events into ACP runtime events, and can fall back to `acpx` only when explicitly configured.
 
 **Why externalized:**
@@ -1488,7 +1488,7 @@ Use a simple milestone board until the repo exists. Once created, mirror this in
 - [x] Technical spike completed on an OpenClaw branch
 - [x] PR opened for transparent review, then closed/parked before merge
 - [x] External plugin package added under `packages/openclaw-coven`
-- [x] ClawHub package `@openclaw/coven@2026.4.27` published from `OpenCoven/coven`
+- [x] ClawHub package `@opencoven/coven@2026.4.27` published from `OpenCoven/coven`
 - [ ] Revisit bundled/core OpenClaw routing after Coven direct CLI/daemon, comux, and plugin usage mature
 - [x] Do not block the Coven MVP on OpenClaw approval
 
@@ -1553,7 +1553,7 @@ Current repo status after initial implementation passes:
 - Detached daemon-launched PTYs now capture output chunks as `output` events and process exits as `exit` events, updating running session status to `completed`/`failed` without overwriting killed sessions.
 - `coven attach <session-id>` now replays captured output events, follows running sessions until exit, prints final exit status, and forwards terminal line input to live daemon sessions through the Unix-socket input API. Event timestamps now use nanosecond precision so captured output/exit ordering remains stable when events land in the same second.
 - Comux bridge now exposes scoped `coven.sessions.list` and `coven.sessions.open`; opening a Coven session creates a Comux shell pane titled `coven:<session title>`, runs `coven attach <session-id>`, persists `shellType: coven` metadata, and refuses sessions outside the current project root.
-- OpenClaw bridge is externalized: bundled OpenClaw PR remains parked, and `@openclaw/coven@2026.4.27` is published on ClawHub from `packages/openclaw-coven` in this repo. The active path is direct Coven CLI/daemon plus comux usage, with optional OpenClaw routing through the external plugin.
+- OpenClaw bridge is externalized: bundled OpenClaw PR remains parked, and `@opencoven/coven@2026.4.27` is published on ClawHub from `packages/openclaw-coven` in this repo. The active path is direct Coven CLI/daemon plus comux usage, with optional OpenClaw routing through the external plugin.
 - Future-harness proof slice documented Hermes CLI observations in `docs/FUTURE-HARNESSES.md` and refactored the adapter seam so future CLIs can declare fixed prefix args before the prompt without adding unsupported harness ids prematurely.
 - npm wrapper package scaffold exists at `packages/cli`; local verification confirms `node packages/cli/bin/coven.js doctor` invokes the `coven` binary, and `npm pack --dry-run` includes only package metadata, README, and bin shim.
 - Comux now has Coven session protocol types and a project-scoped fake-client bridge helper; tests prove sessions outside the current project root are filtered out. Committed in `BunsDev/comux` as `1fe3a21 feat: add coven session bridge types`.
