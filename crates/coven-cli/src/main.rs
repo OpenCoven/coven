@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 
+mod harness;
 mod project;
 
 #[derive(Parser, Debug)]
@@ -19,7 +20,18 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Doctor => {
-            println!("coven doctor: ok");
+            println!("coven doctor");
+            for harness in harness::built_in_harnesses() {
+                let status = if harness.available {
+                    "available"
+                } else {
+                    "missing"
+                };
+                println!("- {} ({}): {status}", harness.label, harness.executable);
+                if !harness.available {
+                    println!("  {}", harness.install_hint);
+                }
+            }
         }
     }
     Ok(())
