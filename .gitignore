@@ -1,0 +1,4 @@
+/target/
+/.coven/
+.DS_Store
+*.log
