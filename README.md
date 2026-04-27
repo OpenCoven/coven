@@ -2,7 +2,7 @@
 
 Coven is a Rust-first, standalone CLI/daemon harness substrate for project-scoped interactive agent sessions.
 
-The goal is simple: run trusted coding harnesses like Codex and Claude Code inside explicit project boundaries, keep the work visible and attachable, and give clients like comux and OpenClaw a stable local runtime to coordinate with.
+The goal is simple: run trusted coding harnesses like Codex and Claude Code inside explicit project boundaries, keep the work visible and attachable, and give clients like comux and the external OpenClaw plugin a stable local runtime to coordinate with.
 
 > One project. Any harness. Visible work.
 
@@ -18,7 +18,7 @@ The current implementation includes:
 - detached PTY sessions backed by daemon runtime handles
 - `coven sessions`
 - `coven attach <session-id>`
-- local daemon HTTP API over a Unix socket for comux/OpenClaw integration
+- local daemon HTTP API over a Unix socket for comux and external plugin integrations
 - SQLite-backed metadata and event logs under `COVEN_HOME` / `.coven`
 
 ## Safety model
@@ -46,7 +46,7 @@ coven attach <session-id>
 
 ## Local API
 
-The daemon exposes a local HTTP API over a Unix socket for clients such as comux and OpenClaw:
+The daemon exposes a local HTTP API over a Unix socket for clients such as comux and the external OpenClaw plugin:
 
 - `GET /health`
 - `GET /sessions`
@@ -60,13 +60,17 @@ The daemon exposes a local HTTP API over a Unix socket for clients such as comux
 ## OpenClaw plugin
 
 Coven also carries an external OpenClaw plugin package at `packages/openclaw-coven`.
-Once published to ClawHub, install it with:
+OpenClaw core does not include OpenCoven or Coven; the integration path is the opt-in ClawHub package `@opencoven/coven`.
+
+Install it with:
 
 ```sh
 openclaw plugins install clawhub:@opencoven/coven
 ```
 
-The plugin is opt-in: enable `plugins.entries.coven.enabled` and set `acp.backend = "coven"` only when you want OpenClaw ACP sessions to route through a local Coven daemon.
+The plugin is opt-in: enable `plugins.entries["opencoven-coven"].enabled` and set `acp.backend = "coven"` only when you want OpenClaw ACP sessions to route through a local Coven daemon.
+
+The plugin is a socket client. It does not become part of Coven's trust root, and the Rust daemon still validates project roots, cwd, harness ids, input, and kill requests.
 
 ## Community
 
@@ -82,8 +86,10 @@ Coven v0 focuses on:
 - interactive PTY sessions scoped to explicit project roots
 - built-in Codex and Claude Code adapters
 - session list, attach, kill, metadata, and event logs
-- a minimal local API for comux and OpenClaw integration
+- a minimal local API for comux and external plugin integration
 - npm wrapper package shape under `@opencoven/cli` once publishing is ready
+
+For the current authority boundaries and release split, see [docs/OPERATIONAL-MODEL.md](docs/OPERATIONAL-MODEL.md).
 
 ## Security
 

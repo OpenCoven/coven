@@ -3,6 +3,8 @@
 Coven is an early local-first harness substrate for project-scoped coding-agent sessions.
 Please treat the repository as pre-1.0 software and avoid running untrusted harnesses or prompts in sensitive repositories.
 
+OpenClaw integration is externalized through the `@opencoven/coven` plugin. OpenClaw core is not part of Coven's trust root; the plugin should be treated as a local socket client, and the Rust daemon must continue validating launch paths, harness ids, input, and kill requests before acting.
+
 ## Reporting vulnerabilities
 
 Please report suspected vulnerabilities privately through GitHub Security Advisories for this repository.

@@ -2,6 +2,8 @@
 
 Coven v0 intentionally supports only the Codex and Claude Code adapters. This note records what the current adapter seam must preserve before adding additional harnesses such as Hermes.
 
+OpenClaw is not a Coven harness target in v0. OpenClaw integration is externalized through the `@opencoven/coven` plugin, which acts as a socket client for the Rust daemon.
+
 ## Current adapter contract
 
 A Coven harness adapter resolves to:

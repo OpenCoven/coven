@@ -4,6 +4,8 @@ OpenClaw ACP runtime bridge for local Coven daemon sessions.
 
 This package installs an **opt-in** OpenClaw plugin with plugin id `opencoven-coven` and ACP backend id `coven`. It lets OpenClaw route ACP coding sessions through a local Coven daemon while keeping OpenClaw's direct ACPX backend as a separately configurable fallback.
 
+OpenClaw core does not include OpenCoven or Coven. This package is the integration boundary: OpenClaw ACP runtime calls enter the plugin, and the plugin talks to the local Coven daemon over the configured Unix socket.
+
 ## Requirements
 
 - OpenClaw `>=2026.4.26`
@@ -65,6 +67,8 @@ The plugin:
 
 OpenClaw remains responsible for chat/session routing, ACP bindings, task state, and user-facing delivery. Coven owns project-scoped harness supervision, session metadata, attachability, and event history.
 
+The plugin is a client, not a trust root. The Rust daemon must still validate project roots, cwd, harness ids, session ids, input, and kill requests before acting.
+
 ## Safety boundaries
 
 - Disabled by default.
@@ -76,4 +80,6 @@ OpenClaw remains responsible for chat/session routing, ACP bindings, task state,
 
 ## Development notes
 
-The source lives in the Coven repo so the bridge can mature with the Coven daemon/API. The bundled OpenClaw plugin can remain a release convenience, but this external package is the clean distribution boundary.
+The source lives in the Coven repo so the bridge can mature with the Coven daemon/API. Do not add Coven or OpenCoven code back into OpenClaw core as part of normal plugin work.
+
+Because the plugin is externalized, the Coven socket API is a compatibility contract. Plugin changes should be tested against representative daemon responses, and daemon changes that affect `/health`, `/sessions`, `/events`, input, or kill behavior should update this package in the same repo.

@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build Coven as a private, standalone, Rust-first harness substrate that runs Codex and Claude Code as project-scoped, attachable PTY sessions, then exposes enough API surface for comux and OpenClaw to manage those sessions through Coven.
+**Goal:** Build Coven as a private, standalone, Rust-first harness substrate that runs Codex and Claude Code as project-scoped, attachable PTY sessions, then exposes enough API surface for comux and external clients such as the `@opencoven/coven` OpenClaw plugin to manage those sessions through Coven.
 
-**Architecture:** Coven starts as a local Rust CLI/daemon with strict project-root boundaries, a small built-in adapter layer for Codex and Claude Code, local SQLite/event-log persistence, and a local API for clients. TypeScript enters as a convenience layer for npm distribution, SDKs, and later plugin/adapters; comux becomes the first visual cockpit client.
+**Architecture:** Coven starts as a local Rust CLI/daemon with strict project-root boundaries, a small built-in adapter layer for Codex and Claude Code, local SQLite/event-log persistence, and a local API for clients. TypeScript enters as a convenience layer for npm distribution, SDKs, and external adapters; comux becomes the first visual cockpit client, while OpenClaw integration stays outside OpenClaw core as a ClawHub plugin.
 
-**Tech Stack:** Rust, Tokio, portable-pty or equivalent PTY library, SQLite, JSON-RPC or HTTP+SSE local API, npm wrapper package `@opencoven/cli` exposing binary command `coven`, later TypeScript SDK packages under `@opencoven/*`.
+**Tech Stack:** Rust, `portable-pty`, SQLite via `rusqlite`, local HTTP-over-Unix-socket daemon API, npm wrapper package `@opencoven/cli` exposing binary command `coven`, and TypeScript packages for external adapters such as `@opencoven/coven`.
 
 ---
 
@@ -14,7 +14,7 @@
 
 Coven is not another agent harness. Coven is the harness substrate.
 
-It lets a user bring whatever coding harness they already trust — Codex, Claude Code, Hermes, Aider, Gemini, OpenClaw, or custom tools — and run it inside a project-scoped, observable, attachable, persistent workspace.
+It lets a user bring whatever coding harness they already trust — Codex, Claude Code, Hermes, Aider, Gemini, OpenCode, or custom tools — and run it inside a project-scoped, observable, attachable, persistent workspace.
 
 **North-star promise:**
 
@@ -38,7 +38,7 @@ OpenCoven should not force users into one basket. Coven gives the OpenCoven ecos
 - Project-scoped autonomy boundaries.
 - Persistent session/event history.
 - Attachability and visibility.
-- A path for comux, OpenMeow, and OpenClaw to coordinate work without hard-coding one agent provider.
+- A path for comux, OpenMeow, and external adapters such as `@opencoven/coven` to coordinate work without hard-coding one agent provider.
 
 ## 3. Naming and package rules
 
@@ -76,7 +76,7 @@ coven attach <session-id>
 - Strict explicit project-root boundary.
 - Session list / attach / kill.
 - Local event log and session metadata.
-- Minimal local API for comux/OpenClaw integration.
+- Minimal local API for comux and external plugin integration.
 - Npm-first distribution wrapper with native binary.
 - Clear docs for early private testers.
 
@@ -86,6 +86,7 @@ coven attach <session-id>
 - Marketplace/plugin ecosystem.
 - Full TypeScript plugin runtime.
 - Cloud sync as a hard requirement.
+- Bundled OpenClaw core integration.
 - Full OpenClaw replacement.
 - Full comux UI rewrite.
 - Mobile/native clients.
@@ -115,7 +116,7 @@ coven run claude "polish this UI"
 6. Session metadata and event logs survive daemon restart.
 7. Coven refuses to run a session outside the explicitly selected project root.
 8. comux can query sessions through the local API and show them as external/Coven-managed panes.
-9. OpenClaw can invoke Coven for at least one local project task instead of launching the harness directly.
+9. The external OpenClaw plugin can invoke Coven for at least one local project task without requiring Coven code in the OpenClaw repo.
 10. The npm wrapper exposes the command as `coven`.
 
 ## 6. Product metrics
@@ -145,7 +146,7 @@ coven run claude "polish this UI"
 - Number of sessions launched per project per day.
 - Session duration distribution.
 - Number of sessions viewed through comux.
-- Number of sessions launched via OpenClaw once integrated.
+- Number of sessions launched through the external OpenClaw plugin once enabled.
 - Manual user rating per session: useful / not useful / blocked.
 
 ## 7. System architecture
@@ -166,9 +167,10 @@ flowchart TD
   Pty2 --> Events
   Daemon --> Store[(SQLite metadata + event store)]
   Events --> Store
-  Daemon --> API[Local API: JSON-RPC or HTTP+SSE]
+  Daemon --> API[Local HTTP API over Unix socket]
   API --> Comux[comux cockpit]
-  API --> OpenClaw[OpenClaw Gateway / orchestrator]
+  API --> OpenClawPlugin[external @opencoven/coven plugin]
+  OpenClawPlugin --> OpenClaw[OpenClaw ACP runtime]
   API --> OpenMeow[OpenMeow intake/status]
 ```
 
@@ -248,9 +250,19 @@ erDiagram
 
 ## 10. Local API v0
 
-The local API should be boring and stable. Prefer JSON-RPC over stdio or HTTP, or HTTP+SSE if comux integration is easier.
+The local API should be boring and stable. It is now the contract between Rust and external clients, including comux and the `@opencoven/coven` OpenClaw plugin. Prefer the smallest local HTTP-over-Unix-socket surface that can be versioned, tested, and kept backward compatible.
 
-Required calls:
+Implemented route surface:
+
+- `GET /health`
+- `GET /sessions`
+- `POST /sessions`
+- `GET /sessions/:id`
+- `GET /events?sessionId=...`
+- `POST /sessions/:id/input`
+- `POST /sessions/:id/kill`
+
+Logical contract:
 
 ```ts
 type HarnessId = 'codex' | 'claude' | string;
@@ -290,7 +302,7 @@ type RunRequest = {
 };
 ```
 
-Required operations:
+Future logical operations, if a higher-level SDK is added:
 
 - `projects.open`
 - `harnesses.list`
@@ -353,7 +365,6 @@ Future adapter support should cover:
 - `aider`
 - `gemini`
 - `opencode`
-- `openclaw`
 - `custom` command adapter
 
 ## 12. Security and trust boundaries
@@ -379,6 +390,8 @@ Rules:
 - Prompt text must not be interpolated into shell commands.
 - Harness launch should use argv APIs, not `sh -c`, unless unavoidable and reviewed.
 - Event logs must not intentionally store tokens, private URLs, or environment dumps.
+- Socket clients are not trusted just because they are first-party or installed from ClawHub.
+- OpenClaw core is not part of the Coven trust root; the external plugin is only a socket client.
 - External actions such as push/publish/merge are harness behavior, not Coven behavior; later policies can observe/block/require approvals.
 
 ## 13. Distribution strategy
@@ -401,13 +414,15 @@ Rules:
 ```mermaid
 flowchart TD
   OpenMeow[OpenMeow intake] --> OpenClaw[OpenClaw routing / memory / permissions]
-  OpenClaw --> Coven[Coven harness substrate]
+  OpenClaw --> Plugin[external @opencoven/coven plugin]
+  Plugin --> Coven[Coven harness substrate]
   Comux[comux cockpit] --> Coven
   Coven --> Codex[Codex]
   Coven --> Claude[Claude Code]
   Coven -. later .-> Hermes[Hermes]
   Coven --> Events[Session events]
-  Events --> OpenClaw
+  Events --> Plugin
+  Plugin --> OpenClaw
   Events --> Comux
   Comux --> User[User watches / attaches / intervenes]
 ```
@@ -418,7 +433,9 @@ comux should not become the harness substrate. comux should become the cockpit U
 
 ### OpenClaw role
 
-OpenClaw should use Coven as the local harness manager when launching coding work. OpenClaw remains valuable for permissions, memory, routing, scheduling, user interaction, and Gateway persistence.
+OpenClaw should use Coven only through the external `@opencoven/coven` plugin. The OpenClaw repo no longer includes OpenCoven or Coven code, and Coven should not assume OpenClaw internals. OpenClaw remains valuable for permissions, memory, routing, scheduling, user interaction, and Gateway persistence; the plugin translates OpenClaw ACP runtime calls into Coven socket API calls.
+
+The plugin is not part of Coven's trust root. Rust must revalidate all project roots, cwd values, harness ids, input, and kill requests.
 
 ### OpenMeow role
 
@@ -443,7 +460,7 @@ gantt
   Local API + event streaming            :c2, after c1, 1d
   section Integration
   comux client spike                     :d1, after c2, 1d
-  OpenClaw launch-through-Coven spike    :d2, after d1, 1d
+  external OpenClaw plugin spike         :d2, after d1, 1d
   section Polish
   npm wrapper + private install docs     :e1, after d2, 1d
   MVP smoke suite + demo script          :e2, after e1, 1d
@@ -517,16 +534,17 @@ Exit criteria:
 - comux marks sessions as Coven-managed vs native comux panes.
 - No full comux rewrite required.
 
-### Phase 6: OpenClaw management-through-Coven
+### Phase 6: External OpenClaw plugin
 
-Goal: stop managing coding harnesses directly where Coven is available.
+Goal: provide an opt-in OpenClaw ACP backend through a ClawHub package, without adding Coven code to OpenClaw core.
 
 Exit criteria:
 
-- OpenClaw can launch a coding task through Coven.
-- OpenClaw receives session ID and status/events.
-- OpenClaw can ask Coven to attach/stop/list sessions.
-- Existing direct harness path remains as fallback during transition.
+- The `@opencoven/coven` plugin can launch a coding task through Coven.
+- The plugin receives session ID and status/events.
+- The plugin can stop/list sessions through the Coven socket API where the host runtime needs it.
+- Existing direct ACP path remains as fallback only when explicitly configured.
+- No bundled OpenClaw core integration is required for MVP.
 
 ### Phase 7: Hermes/future harness adapters
 
@@ -1414,7 +1432,7 @@ git add src __tests__
 
 **Status:** externalized / published outside OpenClaw core.
 
-The implementation spike proved the bridge is technically viable, but first-class routing should live outside OpenClaw core while Coven matures. The bundled OpenClaw PR remains closed/parked; the active integration path is the external ClawHub package `@opencoven/coven`, sourced from `OpenCoven/coven`.
+The implementation spike proved the bridge is technically viable, but the OpenClaw repo no longer includes OpenCoven or Coven. The active integration path is the external ClawHub package `@opencoven/coven`, sourced from `OpenCoven/coven`.
 
 **Artifacts:**
 - OpenClaw branch: `feat/coven-bridge-mvp`
@@ -1425,8 +1443,9 @@ The implementation spike proved the bridge is technically viable, but first-clas
 
 **Why externalized:**
 - Coven can continue maturing through direct CLI/daemon usage, comux, and an opt-in ClawHub plugin.
-- First-class OpenClaw ACP routing is useful, but not necessary to validate Coven's local harness substrate.
-- Keeping the bridge source in `OpenCoven/coven` avoids making OpenClaw core carry a young integration before Coven's daemon/API surface has enough real-world mileage.
+- The plugin creates a clean compatibility boundary: OpenClaw ACP runtime calls in, Coven socket API calls out.
+- Keeping the bridge source in `OpenCoven/coven` avoids making OpenClaw core carry Coven-specific runtime code.
+- Externalization makes the local socket API a real product contract, so compatibility tests and API versioning move earlier.
 
 - [x] **Spike: add Coven availability check**
 - [x] **Spike: add opt-in launch route**
@@ -1435,7 +1454,9 @@ The implementation spike proved the bridge is technically viable, but first-clas
 - [x] **Spike: verify with focused tests and extension typecheck**
 - [x] **Spike: commit/push branch**
 - [x] **Externalize bridge as ClawHub package**
-- [ ] **Revisit bundled/core integration after Coven direct/comux/plugin usage matures**
+- [x] **Confirm OpenClaw core does not carry Coven/OpenCoven code**
+- [ ] **Add explicit Coven API versioning for external clients**
+- [ ] **Add plugin compatibility tests against versioned daemon responses**
 
 ## 17. Progress tracking
 
@@ -1498,7 +1519,8 @@ Use a simple milestone board until the repo exists. Once created, mirror this in
 - [x] PR opened for transparent review, then closed/parked before merge
 - [x] External plugin package added under `packages/openclaw-coven`
 - [x] ClawHub package `@opencoven/coven@2026.4.27` published from `OpenCoven/coven`
-- [ ] Revisit bundled/core OpenClaw routing after Coven direct CLI/daemon, comux, and plugin usage mature
+- [x] OpenClaw core remains free of OpenCoven/Coven code
+- [ ] Add API version compatibility tests for the external plugin
 - [x] Do not block the Coven MVP on OpenClaw approval
 
 ### Milestone 8: Future harness proof
@@ -1514,7 +1536,8 @@ Use a simple milestone board until the repo exists. Once created, mirror this in
 | Codex and Claude CLIs have different prompt semantics | Adapter bugs | Confirm CLI invocation behavior before final PTY implementation; keep adapters separate. |
 | PTY attach/detach is harder than expected | MVP delay | Start with foreground interactive PTY, then daemonized attach as phase 2. |
 | npm native binary packaging eats time | MVP delay | Keep private install docs with `cargo install --path` fallback before polishing npm. |
-| OpenClaw integration scope balloons | MVP delay | Make OpenClaw launch-through-Coven opt-in and only one task path first. |
+| OpenClaw integration scope balloons | MVP delay | Keep OpenClaw integration externalized as the opt-in `@opencoven/coven` plugin; do not add Coven code to OpenClaw core. |
+| Socket API changes break the external plugin | OpenClaw integration regression | Version `/health`, use structured API errors, and test the plugin against representative daemon responses. |
 | comux tries to become Coven | Architecture drift | comux remains cockpit client; Coven owns harness runtime. |
 | Harnesses perform external actions | Trust risk | Coven v0 scopes cwd/project; later policy layer observes/blocks sensitive actions. |
 | Hermes behavior unknown | Bad abstraction | Treat Hermes as phase-2 validation target, not a v0 blocker. |
@@ -1532,7 +1555,7 @@ Every implementation slice should use this gate:
 
 ## 20. Definition of MVP done
 
-Coven MVP is done when a private tester can install/run Coven, launch Codex and Claude Code in project-scoped interactive sessions, list and attach to sessions, recover basic metadata after restart, and see those sessions from comux or OpenClaw through a minimal integration path.
+Coven MVP is done when a private tester can install/run Coven, launch Codex and Claude Code in project-scoped interactive sessions, list and attach to sessions, recover basic metadata after restart, and see those sessions from comux or through the external `@opencoven/coven` OpenClaw plugin.
 
 MVP is not public-ready until at least one non-Val private tester successfully runs both harnesses and reports that the install/run/attach flow is understandable.
 
@@ -1562,7 +1585,7 @@ Current repo status after initial implementation passes:
 - Detached daemon-launched PTYs now capture output chunks as `output` events and process exits as `exit` events, updating running session status to `completed`/`failed` without overwriting killed sessions.
 - `coven attach <session-id>` now replays captured output events, follows running sessions until exit, prints final exit status, and forwards terminal line input to live daemon sessions through the Unix-socket input API. Event timestamps now use nanosecond precision so captured output/exit ordering remains stable when events land in the same second.
 - Comux bridge now exposes scoped `coven.sessions.list` and `coven.sessions.open`; opening a Coven session creates a Comux shell pane titled `coven:<session title>`, runs `coven attach <session-id>`, persists `shellType: coven` metadata, and refuses sessions outside the current project root.
-- OpenClaw bridge is externalized: bundled OpenClaw PR remains parked, and `@opencoven/coven@2026.4.27` is published on ClawHub from `packages/openclaw-coven` in this repo. The active path is direct Coven CLI/daemon plus comux usage, with optional OpenClaw routing through the external plugin.
+- OpenClaw bridge is externalized: OpenClaw core does not carry OpenCoven/Coven code, the old OpenClaw PR remains parked, and `@opencoven/coven@2026.4.27` is published on ClawHub from `packages/openclaw-coven` in this repo. The active path is direct Coven CLI/daemon plus comux usage, with optional OpenClaw routing through the external plugin.
 - Future-harness proof slice documented Hermes CLI observations in `docs/FUTURE-HARNESSES.md` and refactored the adapter seam so future CLIs can declare fixed prefix args before the prompt without adding unsupported harness ids prematurely.
 - npm wrapper package scaffold exists at `packages/cli`; local verification confirms `node packages/cli/bin/coven.js doctor` invokes the `coven` binary, and `npm pack --dry-run` includes only package metadata, README, and bin shim.
 - Comux now has Coven session protocol types and a project-scoped fake-client bridge helper; tests prove sessions outside the current project root are filtered out. Committed in `BunsDev/comux` as `1fe3a21 feat: add coven session bridge types`.
