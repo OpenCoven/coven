@@ -1,6 +1,8 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+use anyhow::{anyhow, Result};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessSummary {
     pub id: &'static str,
@@ -10,23 +12,67 @@ pub struct HarnessSummary {
     pub install_hint: &'static str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessCommandSpec {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub executable: &'static str,
+    pub prompt_prefix_args: &'static [&'static str],
+    pub install_hint: &'static str,
+}
+
+impl HarnessCommandSpec {
+    pub fn prompt_args(&self, prompt: &str) -> Vec<String> {
+        self.prompt_prefix_args
+            .iter()
+            .map(|arg| (*arg).to_string())
+            .chain(std::iter::once(prompt.to_string()))
+            .collect()
+    }
+}
+
 pub fn built_in_harnesses() -> Vec<HarnessSummary> {
+    built_in_harness_specs()
+        .into_iter()
+        .map(|spec| HarnessSummary {
+            id: spec.id,
+            label: spec.label,
+            executable: spec.executable,
+            available: executable_exists(spec.executable),
+            install_hint: spec.install_hint,
+        })
+        .collect()
+}
+
+pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
     vec![
-        HarnessSummary {
+        HarnessCommandSpec {
             id: "codex",
             label: "Codex",
             executable: "codex",
-            available: executable_exists("codex"),
+            prompt_prefix_args: &[],
             install_hint: "Install or authenticate the Codex CLI, then retry `coven doctor`.",
         },
-        HarnessSummary {
+        HarnessCommandSpec {
             id: "claude",
             label: "Claude Code",
             executable: "claude",
-            available: executable_exists("claude"),
+            prompt_prefix_args: &[],
             install_hint: "Install or authenticate Claude Code, then retry `coven doctor`.",
         },
     ]
+}
+
+pub fn command_parts_for_harness(
+    harness_id: &str,
+    prompt: &str,
+) -> Result<(&'static str, Vec<String>)> {
+    let spec = built_in_harness_specs()
+        .into_iter()
+        .find(|spec| spec.id == harness_id)
+        .ok_or_else(|| anyhow!("unsupported harness `{harness_id}`"))?;
+
+    Ok((spec.executable, spec.prompt_args(prompt)))
 }
 
 fn executable_exists(executable: &str) -> bool {
@@ -166,6 +212,43 @@ mod tests {
         assert_eq!(harnesses[1].id, "claude");
         assert_eq!(harnesses[1].label, "Claude Code");
         assert_eq!(harnesses[1].executable, "claude");
+    }
+
+    #[test]
+    fn command_parts_for_known_harnesses_append_prompt() -> anyhow::Result<()> {
+        assert_eq!(
+            command_parts_for_harness("codex", "fix tests")?,
+            ("codex", vec!["fix tests".to_string()])
+        );
+        assert_eq!(
+            command_parts_for_harness("claude", "polish ui")?,
+            ("claude", vec!["polish ui".to_string()])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn command_spec_supports_prefix_args_for_future_harnesses() {
+        let spec = HarnessCommandSpec {
+            id: "future",
+            label: "Future Harness",
+            executable: "future",
+            prompt_prefix_args: &["chat", "-q"],
+            install_hint: "Install the future harness.",
+        };
+
+        assert_eq!(
+            spec.prompt_args("hello"),
+            vec!["chat".to_string(), "-q".to_string(), "hello".to_string()]
+        );
+    }
+
+    #[test]
+    fn command_parts_reject_unknown_harnesses() {
+        assert!(command_parts_for_harness("hermes", "hello")
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported harness"));
     }
 
     #[cfg(unix)]

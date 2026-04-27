@@ -2,7 +2,7 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, PtySize, PtySystem};
 
@@ -53,15 +53,11 @@ impl HarnessCommand {
 }
 
 pub fn build_harness_command(harness_id: &str, prompt: &str, cwd: &Path) -> Result<HarnessCommand> {
-    let program = match harness_id {
-        "codex" => "codex",
-        "claude" => "claude",
-        _ => return Err(anyhow!("unsupported harness `{harness_id}`")),
-    };
+    let (program, args) = crate::harness::command_parts_for_harness(harness_id, prompt)?;
 
     Ok(HarnessCommand {
         program: program.to_string(),
-        args: vec![prompt.to_string()],
+        args,
         cwd: cwd.to_path_buf(),
     })
 }

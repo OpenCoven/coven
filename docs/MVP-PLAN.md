@@ -1489,8 +1489,8 @@ Use a simple milestone board until the repo exists. Once created, mirror this in
 
 ### Milestone 8: Future harness proof
 
-- [ ] Hermes CLI contract researched and documented
-- [ ] adapter contract updated if needed
+- [x] Hermes CLI contract researched and documented in `docs/FUTURE-HARNESSES.md`
+- [x] adapter contract updated with explicit harness command specs and prefix-arg support
 - [ ] generic command adapter considered after real usage
 
 ## 18. MVP risks and mitigations
@@ -1548,6 +1548,7 @@ Current repo status after initial implementation passes:
 - Detached daemon-launched PTYs now capture output chunks as `output` events and process exits as `exit` events, updating running session status to `completed`/`failed` without overwriting killed sessions.
 - `coven attach <session-id>` now replays captured output events, follows running sessions until exit, prints final exit status, and forwards terminal line input to live daemon sessions through the Unix-socket input API. Event timestamps now use nanosecond precision so captured output/exit ordering remains stable when events land in the same second.
 - Comux bridge now exposes scoped `coven.sessions.list` and `coven.sessions.open`; opening a Coven session creates a Comux shell pane titled `coven:<session title>`, runs `coven attach <session-id>`, persists `shellType: coven` metadata, and refuses sessions outside the current project root.
-- Next implementation slice: OpenClaw bridge detection/launch/status-events path, with direct launch fallback preserved.
+- OpenClaw bridge is parked/deferred; active path is direct Coven CLI/daemon plus comux usage.
+- Future-harness proof slice documented Hermes CLI observations in `docs/FUTURE-HARNESSES.md` and refactored the adapter seam so future CLIs can declare fixed prefix args before the prompt without adding unsupported harness ids prematurely.
 - npm wrapper package scaffold exists at `packages/cli`; local verification confirms `node packages/cli/bin/coven.js doctor` invokes the `coven` binary, and `npm pack --dry-run` includes only package metadata, README, and bin shim.
 - Comux now has Coven session protocol types and a project-scoped fake-client bridge helper; tests prove sessions outside the current project root are filtered out. Committed in `BunsDev/comux` as `1fe3a21 feat: add coven session bridge types`.
