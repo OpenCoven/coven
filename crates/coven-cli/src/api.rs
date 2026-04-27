@@ -305,7 +305,7 @@ fn session_action_id<'a>(path: &'a str, suffix: &str) -> &'a str {
 }
 
 pub(crate) fn current_timestamp() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+    Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
 
 fn json_response<T: Serialize>(status: u16, body: &T) -> Result<ApiResponse> {

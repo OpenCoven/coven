@@ -1,5 +1,9 @@
+use std::collections::HashSet;
 use std::ffi::OsString;
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{SecondsFormat, Utc};
@@ -47,6 +51,9 @@ enum Command {
         detach: bool,
     },
     Sessions,
+    Attach {
+        session_id: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -71,6 +78,7 @@ fn main() -> Result<()> {
             detach,
         } => run_session(&harness, &prompt, cwd.as_deref(), title.as_deref(), detach),
         Command::Sessions => list_sessions(),
+        Command::Attach { session_id } => attach_session(&session_id),
     }
 }
 
@@ -154,7 +162,7 @@ fn run_session(
     let cwd = project::resolve_inside_root(&project_root, cwd).context("failed to resolve cwd")?;
     let store_path = coven_store_path()?;
     let conn = store::open_store(&store_path)?;
-    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
     let record = store::SessionRecord {
         id: Uuid::new_v4().to_string(),
         project_root: project_root.to_string_lossy().into_owned(),
@@ -229,6 +237,138 @@ fn list_sessions() -> Result<()> {
     Ok(())
 }
 
+fn attach_session(session_id: &str) -> Result<()> {
+    let home = coven_home_dir()?;
+    let store_path = home.join(STORE_FILE_NAME);
+    let conn = store::open_store(&store_path)?;
+    let Some(session) = store::get_session(&conn, session_id)? else {
+        anyhow::bail!("session `{session_id}` not found");
+    };
+
+    eprintln!(
+        "attached to session {} status={} harness={} title={} ",
+        session.id, session.status, session.harness, session.title
+    );
+
+    maybe_spawn_input_forwarder(home.clone(), session_id.to_string());
+
+    let mut seen = HashSet::new();
+    loop {
+        let events = store::list_events(&conn, session_id)?;
+        for event in printable_new_events(&events, &mut seen) {
+            print!("{event}");
+            io::stdout()
+                .flush()
+                .context("failed to flush session output")?;
+        }
+
+        let status = store::get_session(&conn, session_id)?
+            .map(|session| session.status)
+            .unwrap_or_else(|| "missing".to_string());
+        if status != RUNNING_SESSION_STATUS {
+            break;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+
+    Ok(())
+}
+
+fn printable_new_events(events: &[store::EventRecord], seen: &mut HashSet<String>) -> Vec<String> {
+    events
+        .iter()
+        .filter(|event| seen.insert(event.id.clone()))
+        .filter_map(printable_event_text)
+        .collect()
+}
+
+fn printable_event_text(event: &store::EventRecord) -> Option<String> {
+    match event.kind.as_str() {
+        "output" => serde_json::from_str::<serde_json::Value>(&event.payload_json)
+            .ok()?
+            .get("data")?
+            .as_str()
+            .map(ToOwned::to_owned),
+        "exit" => {
+            let payload = serde_json::from_str::<serde_json::Value>(&event.payload_json).ok()?;
+            let status = payload.get("status")?.as_str()?;
+            let exit_code = payload
+                .get("exitCode")
+                .and_then(serde_json::Value::as_i64)
+                .map(|code| format!(" exitCode={code}"))
+                .unwrap_or_default();
+            Some(format!("\n[coven session {status}{exit_code}]\n"))
+        }
+        _ => None,
+    }
+}
+
+fn maybe_spawn_input_forwarder(coven_home: PathBuf, session_id: String) {
+    if !io::stdin().is_terminal() {
+        return;
+    }
+
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        for line in stdin.lock().lines() {
+            let Ok(mut line) = line else {
+                break;
+            };
+            line.push('\n');
+            let _ = send_session_input(&coven_home, &session_id, &line);
+        }
+    });
+}
+
+#[cfg(unix)]
+fn send_session_input(coven_home: &Path, session_id: &str, data: &str) -> Result<()> {
+    use std::os::unix::net::UnixStream;
+
+    let socket = daemon::daemon_socket_path(coven_home);
+    let body = serde_json::json!({ "data": data }).to_string();
+    let request = format!(
+        "POST /sessions/{session_id}/input HTTP/1.1\r\nHost: coven\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let mut stream = UnixStream::connect(&socket).with_context(|| {
+        format!(
+            "failed to connect to Coven daemon socket {}",
+            socket.display()
+        )
+    })?;
+    stream
+        .write_all(request.as_bytes())
+        .context("failed to write Coven input request")?;
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .context("failed to finish Coven input request")?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .context("failed to read Coven input response")?;
+    ensure_successful_http_response(&response)
+}
+
+#[cfg(not(unix))]
+fn send_session_input(_coven_home: &Path, _session_id: &str, _data: &str) -> Result<()> {
+    anyhow::bail!("Coven attach input forwarding is only implemented on Unix-like systems for now")
+}
+
+fn ensure_successful_http_response(response: &str) -> Result<()> {
+    let status = response
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|status| status.parse::<u16>().ok())
+        .context("invalid Coven daemon response")?;
+    if (200..300).contains(&status) {
+        Ok(())
+    } else {
+        anyhow::bail!("Coven daemon rejected input with HTTP {status}")
+    }
+}
+
 fn selected_available_harness(harness_id: &str) -> Result<harness::HarnessSummary> {
     let harnesses = harness::built_in_harnesses();
     let known_harnesses = harnesses
@@ -263,7 +403,7 @@ fn joined_prompt(prompt_args: &[String]) -> Result<String> {
 }
 
 fn current_timestamp() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+    Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
 
 fn session_title(title: Option<&str>, prompt: &str) -> String {
@@ -391,6 +531,51 @@ mod tests {
             Command::Run { detach, .. } => assert!(detach),
             other => panic!("expected run command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cli_accepts_attach_command() {
+        let cli = Cli::parse_from(["coven", "attach", "session-1"]);
+
+        match cli.command {
+            Command::Attach { session_id } => assert_eq!(session_id, "session-1"),
+            other => panic!("expected attach command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn printable_event_text_extracts_output_payload() {
+        let event = store::EventRecord {
+            id: "event-1".to_string(),
+            session_id: "session-1".to_string(),
+            kind: "output".to_string(),
+            payload_json: r#"{"data":"hello\n"}"#.to_string(),
+            created_at: "2026-04-27T10:00:00Z".to_string(),
+        };
+
+        assert_eq!(printable_event_text(&event).as_deref(), Some("hello\n"));
+    }
+
+    #[test]
+    fn printable_event_text_formats_exit_payload() {
+        let event = store::EventRecord {
+            id: "event-1".to_string(),
+            session_id: "session-1".to_string(),
+            kind: "exit".to_string(),
+            payload_json: r#"{"status":"completed","exitCode":0}"#.to_string(),
+            created_at: "2026-04-27T10:00:00Z".to_string(),
+        };
+
+        assert_eq!(
+            printable_event_text(&event).as_deref(),
+            Some("\n[coven session completed exitCode=0]\n")
+        );
+    }
+
+    #[test]
+    fn successful_http_response_accepts_2xx_only() {
+        assert!(ensure_successful_http_response("HTTP/1.1 202 Accepted\r\n\r\n{}").is_ok());
+        assert!(ensure_successful_http_response("HTTP/1.1 409 Conflict\r\n\r\n{}").is_err());
     }
 
     #[test]

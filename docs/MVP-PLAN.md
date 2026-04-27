@@ -1559,6 +1559,7 @@ Current repo status after initial implementation passes:
 - API `POST /sessions` now launches detached PTY sessions through the daemon runtime, registers their input/kill handles, and persists running session metadata.
 - Daemon restart recovery now marks persisted `running` sessions as `orphaned` on boot, and input/kill return `409 session not live` for orphaned or missing live handles.
 - Detached daemon-launched PTYs now capture output chunks as `output` events and process exits as `exit` events, updating running session status to `completed`/`failed` without overwriting killed sessions.
-- Next implementation slice: wire attach/tail UX on top of captured events so users and clients can follow session output live.
+- `coven attach <session-id>` now replays captured output events, follows running sessions until exit, prints final exit status, and forwards terminal line input to live daemon sessions through the Unix-socket input API. Event timestamps now use nanosecond precision so captured output/exit ordering remains stable when events land in the same second.
+- Next implementation slice: wire comux to open Coven-managed session views using the events/input/kill APIs.
 - npm wrapper package scaffold exists at `packages/cli`; local verification confirms `node packages/cli/bin/coven.js doctor` invokes the `coven` binary, and `npm pack --dry-run` includes only package metadata, README, and bin shim.
 - Comux now has Coven session protocol types and a project-scoped fake-client bridge helper; tests prove sessions outside the current project root are filtered out. Committed in `BunsDev/comux` as `1fe3a21 feat: add coven session bridge types`.
