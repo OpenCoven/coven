@@ -54,6 +54,8 @@ enum DaemonCommand {
     Start,
     Status,
     Stop,
+    #[command(hide = true)]
+    Serve,
 }
 
 fn main() -> Result<()> {
@@ -92,14 +94,9 @@ fn run_daemon_command(command: DaemonCommand) -> Result<()> {
     let home = coven_home_dir()?;
     match command {
         DaemonCommand::Start => {
-            let status = daemon::DaemonStatus {
-                pid: std::process::id(),
-                started_at: current_timestamp(),
-                socket: daemon::daemon_socket_path(&home)
-                    .to_string_lossy()
-                    .into_owned(),
-            };
-            daemon::write_status(&home, &status)?;
+            let current_exe =
+                std::env::current_exe().context("failed to resolve current executable")?;
+            let status = daemon::start_background_server(&home, &current_exe, current_timestamp())?;
             println!(
                 "coven daemon status=running pid={} socket={}",
                 status.pid, status.socket
@@ -116,10 +113,22 @@ fn run_daemon_command(command: DaemonCommand) -> Result<()> {
             None => println!("coven daemon status=stopped"),
         },
         DaemonCommand::Stop => {
-            if daemon::clear_status(&home)? {
+            if daemon::stop_background_server(&home)? {
                 println!("coven daemon status=stopped");
             } else {
                 println!("coven daemon was not running");
+            }
+        }
+        DaemonCommand::Serve => {
+            #[cfg(unix)]
+            {
+                daemon::serve_forever(&home, current_timestamp())?;
+            }
+            #[cfg(not(unix))]
+            {
+                anyhow::bail!(
+                    "coven daemon server is only implemented on Unix-like systems for now"
+                );
             }
         }
     }
@@ -358,8 +367,8 @@ mod tests {
     }
 
     #[test]
-    fn cli_accepts_daemon_start_status_and_stop_commands() {
-        for subcommand in ["start", "status", "stop"] {
+    fn cli_accepts_daemon_start_status_stop_and_hidden_serve_commands() {
+        for subcommand in ["start", "status", "stop", "serve"] {
             let cli = Cli::parse_from(["coven", "daemon", subcommand]);
             match cli.command {
                 Command::Daemon { .. } => {}

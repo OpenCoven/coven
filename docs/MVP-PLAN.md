@@ -1551,6 +1551,7 @@ Current repo status after initial implementation passes:
 - `coven sessions`, `coven doctor`, and `coven --help` have been smoke-tested locally.
 - Daemon control surface now supports `coven daemon start/status/stop` using a local `daemon.json` status file and socket path metadata.
 - Local API routing now covers `/health`, `/sessions`, `/sessions/:id`, input/kill acceptance stubs, and empty events responses, with a Unix-socket health smoke test.
-- Next implementation slice: make `coven daemon start` launch a long-lived background server and back input/kill/events with real PTY/session plumbing.
+- `coven daemon start` now launches a long-lived background Unix-socket server via hidden `daemon serve`; smoke verified `/health` over the socket and `daemon stop` cleanup.
+- Next implementation slice: back input/kill/events with real PTY/session plumbing instead of acceptance/empty stubs.
 - npm wrapper package scaffold exists at `packages/cli`; local verification confirms `node packages/cli/bin/coven.js doctor` invokes the `coven` binary, and `npm pack --dry-run` includes only package metadata, README, and bin shim.
 - Comux now has Coven session protocol types and a project-scoped fake-client bridge helper; tests prove sessions outside the current project root are filtered out. Committed in `BunsDev/comux` as `1fe3a21 feat: add coven session bridge types`.

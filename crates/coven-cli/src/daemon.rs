@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 #[cfg(unix)]
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixListener;
 
@@ -16,12 +17,54 @@ pub struct DaemonStatus {
     pub socket: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonSpawnSpec {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    pub coven_home: PathBuf,
+}
+
 pub fn daemon_status_path(coven_home: &Path) -> PathBuf {
     coven_home.join("daemon.json")
 }
 
 pub fn daemon_socket_path(coven_home: &Path) -> PathBuf {
     coven_home.join("coven.sock")
+}
+
+pub fn background_server_spec(current_exe: &Path, coven_home: &Path) -> DaemonSpawnSpec {
+    DaemonSpawnSpec {
+        program: current_exe.to_path_buf(),
+        args: vec!["daemon".to_string(), "serve".to_string()],
+        coven_home: coven_home.to_path_buf(),
+    }
+}
+
+pub fn start_background_server(
+    coven_home: &Path,
+    current_exe: &Path,
+    started_at: String,
+) -> Result<DaemonStatus> {
+    let spec = background_server_spec(current_exe, coven_home);
+    std::fs::create_dir_all(coven_home)
+        .with_context(|| format!("failed to create Coven home {}", coven_home.display()))?;
+    let child = Command::new(&spec.program)
+        .args(&spec.args)
+        .env("COVEN_HOME", &spec.coven_home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("failed to start Coven daemon {}", spec.program.display()))?;
+    let status = DaemonStatus {
+        pid: child.id(),
+        started_at,
+        socket: daemon_socket_path(coven_home)
+            .to_string_lossy()
+            .into_owned(),
+    };
+    write_status(coven_home, &status)?;
+    Ok(status)
 }
 
 pub fn write_status(coven_home: &Path, status: &DaemonStatus) -> Result<()> {
@@ -56,6 +99,32 @@ pub fn clear_status(coven_home: &Path) -> Result<bool> {
     Ok(true)
 }
 
+pub fn stop_background_server(coven_home: &Path) -> Result<bool> {
+    let status = read_status(coven_home)?;
+    let Some(status) = status else {
+        return Ok(false);
+    };
+
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(status.pid.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    clear_status(coven_home)?;
+    let socket = daemon_socket_path(coven_home);
+    if socket.exists() {
+        std::fs::remove_file(&socket)
+            .with_context(|| format!("failed to remove daemon socket {}", socket.display()))?;
+    }
+    Ok(true)
+}
+
 #[cfg(unix)]
 pub fn bind_api_socket(coven_home: &Path) -> Result<UnixListener> {
     std::fs::create_dir_all(coven_home)
@@ -70,19 +139,44 @@ pub fn bind_api_socket(coven_home: &Path) -> Result<UnixListener> {
 }
 
 #[cfg(unix)]
+pub fn serve_forever(coven_home: &Path, started_at: String) -> Result<()> {
+    let status = DaemonStatus {
+        pid: std::process::id(),
+        started_at,
+        socket: daemon_socket_path(coven_home)
+            .to_string_lossy()
+            .into_owned(),
+    };
+    write_status(coven_home, &status)?;
+    let listener = bind_api_socket(coven_home)?;
+    loop {
+        serve_next_connection(&listener, coven_home, Some(status.clone()))?;
+    }
+}
+
+#[cfg(unix)]
 pub fn serve_next_connection(
-    listener: UnixListener,
+    listener: &UnixListener,
     coven_home: &Path,
     status: Option<DaemonStatus>,
 ) -> Result<()> {
-    let (mut stream, _) = listener
+    let (stream, _) = listener
         .accept()
         .context("failed to accept API connection")?;
-    let mut request = String::new();
-    stream
-        .read_to_string(&mut request)
-        .context("failed to read API request")?;
-    let (method, path) = parse_request_line(&request)?;
+    let mut reader = BufReader::new(stream);
+    let request_line = read_http_request_line(&mut reader)?;
+    let mut header = String::new();
+    loop {
+        header.clear();
+        let bytes = reader
+            .read_line(&mut header)
+            .context("failed to read API request header")?;
+        if bytes == 0 || header == "\r\n" || header == "\n" {
+            break;
+        }
+    }
+    let mut stream = reader.into_inner();
+    let (method, path) = parse_request_line(&request_line)?;
     let response = crate::api::handle_request(method, path, coven_home, status)?;
     let reason = match response.status {
         200 => "OK",
@@ -105,8 +199,19 @@ pub fn serve_next_connection(
 }
 
 #[cfg(unix)]
-fn parse_request_line(request: &str) -> Result<(&str, &str)> {
-    let line = request.lines().next().context("empty API request")?;
+fn read_http_request_line<R: BufRead>(reader: &mut R) -> Result<String> {
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .context("failed to read API request line")?;
+    if line.is_empty() {
+        anyhow::bail!("empty API request");
+    }
+    Ok(line)
+}
+
+#[cfg(unix)]
+fn parse_request_line(line: &str) -> Result<(&str, &str)> {
     let mut parts = line.split_whitespace();
     let method = parts.next().context("missing HTTP method")?;
     let path = parts.next().context("missing HTTP path")?;
@@ -139,6 +244,18 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn builds_background_server_spawn_spec() {
+        let spec = background_server_spec(
+            Path::new("/usr/local/bin/coven"),
+            Path::new("/tmp/coven-home"),
+        );
+
+        assert_eq!(spec.program, PathBuf::from("/usr/local/bin/coven"));
+        assert_eq!(spec.args, vec!["daemon".to_string(), "serve".to_string()]);
+        assert_eq!(spec.coven_home, PathBuf::from("/tmp/coven-home"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn serves_health_over_unix_socket() -> Result<()> {
@@ -157,7 +274,7 @@ mod tests {
         };
         let listener = bind_api_socket(temp_dir.path())?;
         let home = temp_dir.path().to_path_buf();
-        let server = thread::spawn(move || serve_next_connection(listener, &home, Some(status)));
+        let server = thread::spawn(move || serve_next_connection(&listener, &home, Some(status)));
 
         let mut stream = UnixStream::connect(daemon_socket_path(temp_dir.path()))?;
         stream.write_all(b"GET /health HTTP/1.1\r\nHost: coven\r\n\r\n")?;
