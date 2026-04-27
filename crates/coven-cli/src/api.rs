@@ -193,12 +193,20 @@ fn record_input(
     runtime: &dyn SessionRuntime,
 ) -> Result<ApiResponse> {
     let conn = store::open_store(&store_path(coven_home))?;
-    if store::get_session(&conn, session_id)?.is_none() {
+    let Some(session) = store::get_session(&conn, session_id)? else {
         return json_response(404, &json!({ "error": "session not found" }));
+    };
+    if session.status == "orphaned" {
+        return session_not_live_response(session_id);
     }
 
     let payload = parse_body(body)?;
-    runtime.send_input(session_id, &payload)?;
+    if let Err(error) = runtime.send_input(session_id, &payload) {
+        if error.to_string().contains("not live") {
+            return session_not_live_response(session_id);
+        }
+        return Err(error);
+    }
     insert_event(&conn, session_id, "input", payload)?;
     json_response(202, &json!({ "ok": true, "accepted": true }))
 }
@@ -209,15 +217,33 @@ fn kill_session(
     runtime: &dyn SessionRuntime,
 ) -> Result<ApiResponse> {
     let conn = store::open_store(&store_path(coven_home))?;
-    if store::get_session(&conn, session_id)?.is_none() {
+    let Some(session) = store::get_session(&conn, session_id)? else {
         return json_response(404, &json!({ "error": "session not found" }));
+    };
+    if session.status == "orphaned" {
+        return session_not_live_response(session_id);
     }
 
-    runtime.kill_session(session_id)?;
+    if let Err(error) = runtime.kill_session(session_id) {
+        if error.to_string().contains("not live") {
+            return session_not_live_response(session_id);
+        }
+        return Err(error);
+    }
     let now = current_timestamp();
     store::update_session_status(&conn, session_id, "killed", None, &now)?;
     insert_event(&conn, session_id, "kill", json!({ "status": "killed" }))?;
     json_response(202, &json!({ "ok": true, "accepted": true }))
+}
+
+fn session_not_live_response(session_id: &str) -> Result<ApiResponse> {
+    json_response(
+        409,
+        &json!({
+            "error": "session not live",
+            "sessionId": session_id,
+        }),
+    )
 }
 
 fn list_session_events(coven_home: &Path, session_id: &str) -> Result<ApiResponse> {
@@ -484,6 +510,57 @@ mod tests {
     }
 
     #[test]
+    fn input_and_kill_reject_orphaned_sessions_as_not_live() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session_with_status(temp_dir.path(), "session-1", "orphaned")?;
+
+        let input = handle_request_with_body(
+            "POST",
+            "/sessions/session-1/input",
+            temp_dir.path(),
+            None,
+            Some(r#"{"data":"hello"}"#),
+        )?;
+        let kill = handle_request("POST", "/sessions/session-1/kill", temp_dir.path(), None)?;
+
+        assert_eq!(input.status, 409);
+        assert_eq!(kill.status, 409);
+        assert!(input.body.contains("session not live"));
+        assert!(kill.body.contains("session not live"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_not_live_errors_become_conflict_responses() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "session-1")?;
+        let runtime = NotLiveRuntime;
+
+        let input = handle_request_with_runtime(
+            "POST",
+            "/sessions/session-1/input",
+            temp_dir.path(),
+            None,
+            Some(r#"{"data":"hello"}"#),
+            &runtime,
+        )?;
+        let kill = handle_request_with_runtime(
+            "POST",
+            "/sessions/session-1/kill",
+            temp_dir.path(),
+            None,
+            None,
+            &runtime,
+        )?;
+
+        assert_eq!(input.status, 409);
+        assert_eq!(kill.status, 409);
+        assert!(input.body.contains("session not live"));
+        assert!(kill.body.contains("session not live"));
+        Ok(())
+    }
+
+    #[test]
     fn input_and_kill_reject_unknown_sessions() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
 
@@ -533,14 +610,38 @@ mod tests {
         }
     }
 
+    struct NotLiveRuntime;
+
+    impl SessionRuntime for NotLiveRuntime {
+        fn launch_session(&self, _launch: &SessionLaunch) -> Result<()> {
+            Ok(())
+        }
+
+        fn send_input(&self, session_id: &str, _payload: &Value) -> Result<()> {
+            anyhow::bail!("session `{session_id}` is not live in this daemon")
+        }
+
+        fn kill_session(&self, session_id: &str) -> Result<()> {
+            anyhow::bail!("session `{session_id}` is not live in this daemon")
+        }
+    }
+
     fn insert_test_session(coven_home: &std::path::Path, id: &str) -> anyhow::Result<()> {
+        insert_test_session_with_status(coven_home, id, "running")
+    }
+
+    fn insert_test_session_with_status(
+        coven_home: &std::path::Path,
+        id: &str,
+        status: &str,
+    ) -> anyhow::Result<()> {
         let conn = crate::store::open_store(&coven_home.join("coven.sqlite3"))?;
         let session = crate::store::SessionRecord {
             id: id.to_string(),
             project_root: "/repo".to_string(),
             harness: "codex".to_string(),
             title: "hello from coven".to_string(),
-            status: "running".to_string(),
+            status: status.to_string(),
             exit_code: None,
             created_at: "2026-04-27T10:00:00Z".to_string(),
             updated_at: "2026-04-27T10:00:00Z".to_string(),

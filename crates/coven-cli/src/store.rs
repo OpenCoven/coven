@@ -140,6 +140,19 @@ pub fn update_session_status(
     Ok(())
 }
 
+pub fn mark_running_sessions_orphaned(conn: &Connection, updated_at: &str) -> Result<usize> {
+    let updated = conn
+        .execute(
+            "UPDATE sessions
+             SET status = 'orphaned',
+                 updated_at = ?1
+             WHERE status = 'running'",
+            params![updated_at],
+        )
+        .context("failed to mark running sessions orphaned")?;
+    Ok(updated)
+}
+
 pub fn get_session(conn: &Connection, session_id: &str) -> Result<Option<SessionRecord>> {
     Ok(list_sessions(conn)?
         .into_iter()
@@ -344,6 +357,35 @@ mod tests {
         assert_eq!(sessions[0].status, "completed");
         assert_eq!(sessions[0].exit_code, Some(0));
         assert_eq!(sessions[0].updated_at, "2026-04-27T06:01:00Z");
+        Ok(())
+    }
+
+    #[test]
+    fn marks_only_running_sessions_orphaned() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+        let mut running = session_record("running", "2026-04-27T06:00:00Z");
+        running.status = "running".to_string();
+        let mut killed = session_record("killed", "2026-04-27T06:00:00Z");
+        killed.status = "killed".to_string();
+        insert_session(&conn, &running)?;
+        insert_session(&conn, &killed)?;
+
+        let updated = mark_running_sessions_orphaned(&conn, "2026-04-27T07:00:00Z")?;
+        let sessions = list_sessions(&conn)?;
+
+        assert_eq!(updated, 1);
+        let running = sessions
+            .iter()
+            .find(|session| session.id == "running")
+            .unwrap();
+        let killed = sessions
+            .iter()
+            .find(|session| session.id == "killed")
+            .unwrap();
+        assert_eq!(running.status, "orphaned");
+        assert_eq!(running.updated_at, "2026-04-27T07:00:00Z");
+        assert_eq!(killed.status, "killed");
         Ok(())
     }
 

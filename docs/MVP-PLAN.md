@@ -1556,6 +1556,7 @@ Current repo status after initial implementation passes:
 - API input/kill now call a tested `SessionRuntime` hook before persisting events/status, creating the seam for daemon-owned live PTY handles without changing the HTTP contract.
 - Daemon now has an in-memory live-session runtime registry with writer/kill handles, and the Unix-socket server routes API input/kill through that registry.
 - API `POST /sessions` now launches detached PTY sessions through the daemon runtime, registers their input/kill handles, and persists running session metadata.
-- Next implementation slice: add restart recovery for persisted running sessions whose live daemon handles are gone.
+- Daemon restart recovery now marks persisted `running` sessions as `orphaned` on boot, and input/kill return `409 session not live` for orphaned or missing live handles.
+- Next implementation slice: expose session output/log capture so launched PTYs are observable, not just controllable.
 - npm wrapper package scaffold exists at `packages/cli`; local verification confirms `node packages/cli/bin/coven.js doctor` invokes the `coven` binary, and `npm pack --dry-run` includes only package metadata, README, and bin shim.
 - Comux now has Coven session protocol types and a project-scoped fake-client bridge helper; tests prove sessions outside the current project root are filtered out. Committed in `BunsDev/comux` as `1fe3a21 feat: add coven session bridge types`.

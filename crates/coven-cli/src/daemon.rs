@@ -158,6 +158,11 @@ pub fn start_background_server(
     Ok(status)
 }
 
+pub fn recover_orphaned_sessions(coven_home: &Path, updated_at: &str) -> Result<usize> {
+    let conn = crate::store::open_store(&coven_home.join("coven.sqlite3"))?;
+    crate::store::mark_running_sessions_orphaned(&conn, updated_at)
+}
+
 pub fn write_status(coven_home: &Path, status: &DaemonStatus) -> Result<()> {
     std::fs::create_dir_all(coven_home)
         .with_context(|| format!("failed to create Coven home {}", coven_home.display()))?;
@@ -233,12 +238,13 @@ pub fn bind_api_socket(coven_home: &Path) -> Result<UnixListener> {
 pub fn serve_forever(coven_home: &Path, started_at: String) -> Result<()> {
     let status = DaemonStatus {
         pid: std::process::id(),
-        started_at,
+        started_at: started_at.clone(),
         socket: daemon_socket_path(coven_home)
             .to_string_lossy()
             .into_owned(),
     };
     write_status(coven_home, &status)?;
+    recover_orphaned_sessions(coven_home, &started_at)?;
     let listener = bind_api_socket(coven_home)?;
     let runtime = LiveSessionRuntime::default();
     loop {
@@ -273,6 +279,7 @@ pub fn serve_next_connection(
     let reason = match response.status {
         200 => "OK",
         202 => "Accepted",
+        409 => "Conflict",
         404 => "Not Found",
         _ => "OK",
     };
@@ -429,6 +436,28 @@ mod tests {
     }
 
     #[test]
+    fn recovers_persisted_running_sessions_as_orphaned() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = crate::store::open_store(&temp_dir.path().join("coven.sqlite3"))?;
+        let mut running = session_record("running");
+        running.status = "running".to_string();
+        let mut killed = session_record("killed");
+        killed.status = "killed".to_string();
+        crate::store::insert_session(&conn, &running)?;
+        crate::store::insert_session(&conn, &killed)?;
+        drop(conn);
+
+        let updated = recover_orphaned_sessions(temp_dir.path(), "2026-04-27T08:00:00Z")?;
+        let conn = crate::store::open_store(&temp_dir.path().join("coven.sqlite3"))?;
+        let sessions = crate::store::list_sessions(&conn)?;
+
+        assert_eq!(updated, 1);
+        assert_eq!(session_status(&sessions, "running"), "orphaned");
+        assert_eq!(session_status(&sessions, "killed"), "killed");
+        Ok(())
+    }
+
+    #[test]
     fn writes_reads_and_clears_daemon_status() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let status = DaemonStatus {
@@ -549,5 +578,26 @@ mod tests {
         assert_eq!(events[0].kind, "input");
         assert!(events[0].payload_json.contains("hello over socket"));
         Ok(())
+    }
+
+    fn session_record(id: &str) -> crate::store::SessionRecord {
+        crate::store::SessionRecord {
+            id: id.to_string(),
+            project_root: "/repo".to_string(),
+            harness: "codex".to_string(),
+            title: format!("Session {id}"),
+            status: "running".to_string(),
+            exit_code: None,
+            created_at: "2026-04-27T07:00:00Z".to_string(),
+            updated_at: "2026-04-27T07:00:00Z".to_string(),
+        }
+    }
+
+    fn session_status(sessions: &[crate::store::SessionRecord], id: &str) -> String {
+        sessions
+            .iter()
+            .find(|session| session.id == id)
+            .map(|session| session.status.clone())
+            .unwrap_or_default()
     }
 }
