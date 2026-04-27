@@ -553,7 +553,7 @@ Exit criteria:
 - Create: `crates/coven-cli/src/main.rs`
 - Create: `.gitignore`
 
-- [ ] **Step 1: Initialize private repo**
+- [x] **Step 1: Initialize private repo**
 
 Run:
 
@@ -565,7 +565,7 @@ git init -b main
 
 Expected: empty private local repo on `main`.
 
-- [ ] **Step 2: Create Rust workspace**
+- [x] **Step 2: Create Rust workspace**
 
 Create `Cargo.toml`:
 
@@ -630,7 +630,7 @@ fn main() -> anyhow::Result<()> {
 }
 ```
 
-- [ ] **Step 3: Verify CLI skeleton**
+- [x] **Step 3: Verify CLI skeleton**
 
 Run:
 
@@ -644,7 +644,7 @@ Expected output contains:
 coven doctor: ok
 ```
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add .
@@ -658,7 +658,7 @@ git commit -m "chore: scaffold coven rust workspace"
 - Modify: `crates/coven-cli/src/main.rs`
 - Test: `crates/coven-cli/src/project.rs`
 
-- [ ] **Step 1: Add path canonicalization helper and tests**
+- [x] **Step 1: Add path canonicalization helper and tests**
 
 Create `crates/coven-cli/src/project.rs`:
 
@@ -721,7 +721,7 @@ Update `crates/coven-cli/Cargo.toml`:
 tempfile = "3"
 ```
 
-- [ ] **Step 2: Run tests**
+- [x] **Step 2: Run tests**
 
 ```bash
 cargo test -p coven-cli project
@@ -729,7 +729,7 @@ cargo test -p coven-cli project
 
 Expected: all project boundary tests pass.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add crates/coven-cli
@@ -742,7 +742,7 @@ git add crates/coven-cli
 - Create: `crates/coven-cli/src/harness.rs`
 - Modify: `crates/coven-cli/src/main.rs`
 
-- [ ] **Step 1: Create harness model**
+- [x] **Step 1: Create harness model**
 
 Create `crates/coven-cli/src/harness.rs`:
 
@@ -787,7 +787,7 @@ pub fn built_in_harnesses() -> Vec<HarnessSummary> {
 }
 ```
 
-- [ ] **Step 2: Wire `coven doctor`**
+- [x] **Step 2: Wire `coven doctor`**
 
 Modify `crates/coven-cli/src/main.rs` to include:
 
@@ -828,7 +828,7 @@ fn main() -> anyhow::Result<()> {
 }
 ```
 
-- [ ] **Step 3: Verify doctor output**
+- [x] **Step 3: Verify doctor output**
 
 ```bash
 cargo run -p coven-cli -- doctor
@@ -836,7 +836,7 @@ cargo run -p coven-cli -- doctor
 
 Expected output lists Codex and Claude Code with `available` or `missing`.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add crates/coven-cli
@@ -849,7 +849,7 @@ git add crates/coven-cli
 - Create: `crates/coven-cli/src/store.rs`
 - Modify: `crates/coven-cli/Cargo.toml`
 
-- [ ] **Step 1: Add SQLite dependencies**
+- [x] **Step 1: Add SQLite dependencies**
 
 Update `crates/coven-cli/Cargo.toml`:
 
@@ -864,7 +864,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ```
 
-- [ ] **Step 2: Implement schema and session insert/list**
+- [x] **Step 2: Implement schema and session insert/list**
 
 Create `crates/coven-cli/src/store.rs`:
 
@@ -935,7 +935,7 @@ pub fn list_sessions(conn: &Connection) -> anyhow::Result<Vec<SessionRecord>> {
 }
 ```
 
-- [ ] **Step 3: Add store tests**
+- [x] **Step 3: Add store tests**
 
 Append to `store.rs`:
 
@@ -966,7 +966,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 ```bash
 cargo test -p coven-cli store
@@ -974,7 +974,7 @@ cargo test -p coven-cli store
 
 Expected: store tests pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/coven-cli
@@ -988,7 +988,7 @@ git add crates/coven-cli
 - Modify: `crates/coven-cli/src/harness.rs`
 - Modify: `crates/coven-cli/src/store.rs`
 
-- [ ] **Step 1: Add CLI shape**
+- [x] **Step 1: Add CLI shape**
 
 Modify command enum in `main.rs`:
 
@@ -1008,7 +1008,7 @@ enum Command {
 }
 ```
 
-- [ ] **Step 2: Add store path helper**
+- [x] **Step 2: Add store path helper**
 
 Add to `main.rs`:
 
@@ -1021,7 +1021,7 @@ fn coven_home() -> anyhow::Result<std::path::PathBuf> {
 }
 ```
 
-- [ ] **Step 3: Implement run metadata creation before PTY**
+- [x] **Step 3: Implement run metadata creation before PTY**
 
 In `main.rs`, implement `Command::Run` as a metadata-only first pass:
 
@@ -1057,7 +1057,7 @@ Command::Run { harness, prompt, cwd, title } => {
 }
 ```
 
-- [ ] **Step 4: Implement sessions listing**
+- [x] **Step 4: Implement sessions listing**
 
 In `Command::Sessions`:
 
@@ -1071,7 +1071,7 @@ Command::Sessions => {
 }
 ```
 
-- [ ] **Step 5: Verify metadata run**
+- [x] **Step 5: Verify metadata run**
 
 Run from a git repo where Codex or Claude is installed:
 
@@ -1082,7 +1082,7 @@ cargo run -p coven-cli -- sessions
 
 Expected: a session is created and listed.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/coven-cli
@@ -1097,7 +1097,7 @@ git add crates/coven-cli
 - Modify: `crates/coven-cli/src/harness.rs`
 - Modify: `crates/coven-cli/src/main.rs`
 
-- [ ] **Step 1: Add PTY dependency**
+- [x] **Step 1: Add PTY dependency**
 
 Update dependencies:
 
@@ -1105,7 +1105,7 @@ Update dependencies:
 portable-pty = "0.8"
 ```
 
-- [ ] **Step 2: Build harness command without shell interpolation**
+- [x] **Step 2: Build harness command without shell interpolation**
 
 Add to `harness.rs`:
 
@@ -1138,7 +1138,7 @@ pub fn build_harness_command(id: &str, cwd: PathBuf, prompt: String) -> anyhow::
 
 Implementation note: during real implementation, confirm Codex and Claude exact prompt argument behavior locally before finalizing. If either requires a subcommand or prompt file, adjust `args` while preserving argv-based launch.
 
-- [ ] **Step 3: Implement PTY spawn**
+- [x] **Step 3: Implement PTY spawn**
 
 Create `pty_runner.rs`:
 
@@ -1202,7 +1202,7 @@ pub fn run_interactive(command: HarnessCommand) -> anyhow::Result<i32> {
 }
 ```
 
-- [ ] **Step 4: Wire run command to PTY runner**
+- [x] **Step 4: Wire run command to PTY runner**
 
 In `main.rs`, add:
 
@@ -1218,7 +1218,7 @@ let exit_code = pty_runner::run_interactive(command)?;
 println!("session {} exited with {}", id, exit_code);
 ```
 
-- [ ] **Step 5: Manual smoke test**
+- [x] **Step 5: Manual smoke test**
 
 Run:
 
@@ -1229,7 +1229,7 @@ cargo run -p coven-cli -- run claude "print the current directory and stop"
 
 Expected: each harness opens interactively in the current project root and exits cleanly.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/coven-cli
@@ -1243,7 +1243,7 @@ git add crates/coven-cli
 - Create: `crates/coven-cli/src/daemon.rs`
 - Modify: `crates/coven-cli/src/main.rs`
 
-- [ ] **Step 1: Add daemon commands**
+- [x] **Step 1: Add daemon commands**
 
 Add CLI commands:
 
@@ -1264,7 +1264,7 @@ enum DaemonCommand {
 }
 ```
 
-- [ ] **Step 2: Implement minimal daemon status file**
+- [x] **Step 2: Implement minimal daemon status file**
 
 Before building a long-lived server, write a PID/status file under `~/.coven/daemon.json`.
 
@@ -1287,7 +1287,7 @@ Use Unix socket or localhost port. Required MVP endpoints:
 - `POST /sessions/:id/kill`
 - `GET /events?sessionId=<id>`
 
-- [ ] **Step 4: Verify daemon health**
+- [x] **Step 4: Verify daemon health**
 
 ```bash
 coven daemon start
@@ -1445,43 +1445,43 @@ Use a simple milestone board until the repo exists. Once created, mirror this in
 
 ### Milestone 0: Plan locked
 
-- [ ] Product thesis approved.
-- [ ] MVP scope approved.
-- [ ] Architecture approved.
-- [ ] Private repo created.
+- [x] Product thesis approved.
+- [x] MVP scope approved.
+- [x] Architecture approved.
+- [x] Private repo created.
 
 ### Milestone 1: CLI skeleton
 
-- [ ] `coven --help`
-- [ ] `coven doctor`
-- [ ] Codex detection
-- [ ] Claude detection
+- [x] `coven --help`
+- [x] `coven doctor`
+- [x] Codex detection
+- [x] Claude detection
 
 ### Milestone 2: Project safety
 
-- [ ] Explicit project root
-- [ ] cwd boundary guard
-- [ ] symlink escape tests
-- [ ] missing harness hints
+- [x] Explicit project root
+- [x] cwd boundary guard
+- [x] symlink escape tests
+- [x] missing harness hints
 
 ### Milestone 3: Interactive sessions
 
-- [ ] `coven run codex`
-- [ ] `coven run claude`
-- [ ] PTY output visible
-- [ ] PTY input forwarded
-- [ ] exit status recorded
+- [x] `coven run codex`
+- [x] `coven run claude`
+- [x] PTY output visible
+- [x] PTY input forwarded
+- [x] exit status recorded
 
 ### Milestone 4: Persistence
 
-- [ ] SQLite schema
-- [ ] sessions list
-- [ ] event log
+- [x] SQLite schema
+- [x] sessions list
+- [x] event log
 - [ ] restart recovery
 
 ### Milestone 5: Daemon/API
 
-- [ ] daemon start/status/stop
+- [x] daemon start/status/stop
 - [ ] local API health
 - [ ] sessions API
 - [ ] events API
@@ -1538,3 +1538,16 @@ MVP is not public-ready until at least one non-Val private tester successfully r
 
 Create the private repo `OpenCoven/coven`, add this plan as `docs/MVP-PLAN.md`, and implement Task 1 with no extra scope.
 
+
+## 21. Progress update — 2026-04-27
+
+Current repo status after initial implementation passes:
+
+- Rust workspace scaffold is complete and committed.
+- Project-root boundary guard is implemented with symlink escape coverage.
+- Built-in harness detection supports Codex and Claude Code.
+- Local SQLite store supports session metadata, session listing, status updates, and an events table.
+- `coven run` creates session metadata, supports `--detach`, and can run attached PTY harness sessions.
+- `coven sessions`, `coven doctor`, and `coven --help` have been smoke-tested locally.
+- Daemon control surface now supports `coven daemon start/status/stop` using a local `daemon.json` status file and socket path metadata.
+- Next implementation slice: replace the status-file-only daemon with a real local server/API for `/health`, sessions, input, kill, and events.

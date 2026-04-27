@@ -6,6 +6,8 @@ use chrono::{SecondsFormat, Utc};
 use clap::{Parser, Subcommand};
 use uuid::Uuid;
 
+mod api;
+mod daemon;
 mod harness;
 mod project;
 mod pty_runner;
@@ -29,6 +31,10 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     Doctor,
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommand,
+    },
     Run {
         harness: String,
         #[arg(required = true, num_args = 1..)]
@@ -43,10 +49,18 @@ enum Command {
     Sessions,
 }
 
+#[derive(Subcommand, Debug)]
+enum DaemonCommand {
+    Start,
+    Status,
+    Stop,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Doctor => run_doctor(),
+        Command::Daemon { command } => run_daemon_command(command),
         Command::Run {
             harness,
             prompt,
@@ -69,6 +83,44 @@ fn run_doctor() -> Result<()> {
         println!("- {} ({}): {status}", harness.label, harness.executable);
         if !harness.available {
             println!("  {}", harness.install_hint);
+        }
+    }
+    Ok(())
+}
+
+fn run_daemon_command(command: DaemonCommand) -> Result<()> {
+    let home = coven_home_dir()?;
+    match command {
+        DaemonCommand::Start => {
+            let status = daemon::DaemonStatus {
+                pid: std::process::id(),
+                started_at: current_timestamp(),
+                socket: daemon::daemon_socket_path(&home)
+                    .to_string_lossy()
+                    .into_owned(),
+            };
+            daemon::write_status(&home, &status)?;
+            println!(
+                "coven daemon status=running pid={} socket={}",
+                status.pid, status.socket
+            );
+        }
+        DaemonCommand::Status => match daemon::read_status(&home)? {
+            Some(status) => {
+                let health = api::health_response(Some(status.clone()));
+                println!(
+                    "coven daemon status=running ok={} pid={} socket={}",
+                    health.ok, status.pid, status.socket
+                );
+            }
+            None => println!("coven daemon status=stopped"),
+        },
+        DaemonCommand::Stop => {
+            if daemon::clear_status(&home)? {
+                println!("coven daemon status=stopped");
+            } else {
+                println!("coven daemon was not running");
+            }
         }
     }
     Ok(())
@@ -218,10 +270,14 @@ fn first_chars(value: &str, limit: usize) -> String {
 }
 
 fn coven_store_path() -> Result<PathBuf> {
-    let home = coven_home_from_env(std::env::var_os("COVEN_HOME"), std::env::var_os("HOME"))?;
+    let home = coven_home_dir()?;
     std::fs::create_dir_all(&home)
         .with_context(|| format!("failed to create Coven home directory {}", home.display()))?;
     Ok(home.join(STORE_FILE_NAME))
+}
+
+fn coven_home_dir() -> Result<PathBuf> {
+    coven_home_from_env(std::env::var_os("COVEN_HOME"), std::env::var_os("HOME"))
 }
 
 fn coven_home_from_env(coven_home: Option<OsString>, home: Option<OsString>) -> Result<PathBuf> {
@@ -299,6 +355,17 @@ mod tests {
 
         assert_eq!(path, PathBuf::from("/tmp/user-home").join(".coven"));
         Ok(())
+    }
+
+    #[test]
+    fn cli_accepts_daemon_start_status_and_stop_commands() {
+        for subcommand in ["start", "status", "stop"] {
+            let cli = Cli::parse_from(["coven", "daemon", subcommand]);
+            match cli.command {
+                Command::Daemon { .. } => {}
+                other => panic!("expected daemon command, got {other:?}"),
+            }
+        }
     }
 
     #[test]
