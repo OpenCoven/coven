@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 
 #[cfg(unix)]
 use std::io::{BufRead, BufReader, Read, Write};
@@ -8,6 +10,9 @@ use std::os::unix::net::UnixListener;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::api::SessionRuntime;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -22,6 +27,72 @@ pub struct DaemonSpawnSpec {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub coven_home: PathBuf,
+}
+
+pub trait RuntimeKiller: Send {
+    fn kill(&mut self) -> Result<()>;
+}
+
+#[derive(Default)]
+pub struct LiveSessionRuntime {
+    sessions: Mutex<HashMap<String, LiveSessionHandle>>,
+}
+
+struct LiveSessionHandle {
+    input: Box<dyn Write + Send>,
+    killer: Box<dyn RuntimeKiller>,
+}
+
+impl LiveSessionRuntime {
+    #[allow(dead_code)]
+    pub fn register(
+        &self,
+        session_id: String,
+        input: Box<dyn Write + Send>,
+        killer: Box<dyn RuntimeKiller>,
+    ) -> Result<()> {
+        self.sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("live session registry lock poisoned"))?
+            .insert(session_id, LiveSessionHandle { input, killer });
+        Ok(())
+    }
+}
+
+impl SessionRuntime for LiveSessionRuntime {
+    fn send_input(&self, session_id: &str, payload: &Value) -> Result<()> {
+        let data = payload
+            .get("data")
+            .and_then(Value::as_str)
+            .context("input payload requires string field `data`")?;
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("live session registry lock poisoned"))?;
+        let session = sessions
+            .get_mut(session_id)
+            .with_context(|| format!("session `{session_id}` is not live in this daemon"))?;
+        session
+            .input
+            .write_all(data.as_bytes())
+            .context("failed to write input to live session")?;
+        session
+            .input
+            .flush()
+            .context("failed to flush live session input")?;
+        Ok(())
+    }
+
+    fn kill_session(&self, session_id: &str) -> Result<()> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("live session registry lock poisoned"))?;
+        let mut session = sessions
+            .remove(session_id)
+            .with_context(|| format!("session `{session_id}` is not live in this daemon"))?;
+        session.killer.kill()
+    }
 }
 
 pub fn daemon_status_path(coven_home: &Path) -> PathBuf {
@@ -149,8 +220,9 @@ pub fn serve_forever(coven_home: &Path, started_at: String) -> Result<()> {
     };
     write_status(coven_home, &status)?;
     let listener = bind_api_socket(coven_home)?;
+    let runtime = LiveSessionRuntime::default();
     loop {
-        serve_next_connection(&listener, coven_home, Some(status.clone()))?;
+        serve_next_connection(&listener, coven_home, Some(status.clone()), &runtime)?;
     }
 }
 
@@ -159,6 +231,7 @@ pub fn serve_next_connection(
     listener: &UnixListener,
     coven_home: &Path,
     status: Option<DaemonStatus>,
+    runtime: &dyn SessionRuntime,
 ) -> Result<()> {
     let (stream, _) = listener
         .accept()
@@ -169,8 +242,14 @@ pub fn serve_next_connection(
     let body = read_http_body(&mut reader, content_length)?;
     let mut stream = reader.into_inner();
     let (method, path) = parse_request_line(&request_line)?;
-    let response =
-        crate::api::handle_request_with_body(method, path, coven_home, status, body.as_deref())?;
+    let response = crate::api::handle_request_with_runtime(
+        method,
+        path,
+        coven_home,
+        status,
+        body.as_deref(),
+        runtime,
+    )?;
     let reason = match response.status {
         200 => "OK",
         202 => "Accepted",
@@ -254,6 +333,82 @@ mod tests {
     use super::*;
 
     #[test]
+    fn live_runtime_writes_input_to_registered_session() -> Result<()> {
+        let runtime = LiveSessionRuntime::default();
+        let output = SharedBuffer::default();
+        runtime.register(
+            "session-1".to_string(),
+            Box::new(output.clone()),
+            Box::new(RecordingKiller::default()),
+        )?;
+
+        SessionRuntime::send_input(
+            &runtime,
+            "session-1",
+            &serde_json::json!({ "data": "hello live pty" }),
+        )?;
+
+        assert_eq!(output.text(), "hello live pty");
+        Ok(())
+    }
+
+    #[test]
+    fn live_runtime_kills_and_removes_registered_session() -> Result<()> {
+        let runtime = LiveSessionRuntime::default();
+        let killed = std::sync::Arc::new(std::sync::Mutex::new(false));
+        runtime.register(
+            "session-1".to_string(),
+            Box::new(SharedBuffer::default()),
+            Box::new(RecordingKiller {
+                killed: killed.clone(),
+            }),
+        )?;
+
+        SessionRuntime::kill_session(&runtime, "session-1")?;
+
+        assert!(*killed.lock().unwrap());
+        assert!(SessionRuntime::kill_session(&runtime, "session-1")
+            .unwrap_err()
+            .to_string()
+            .contains("not live"));
+        Ok(())
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedBuffer {
+        data: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl SharedBuffer {
+        fn text(&self) -> String {
+            String::from_utf8(self.data.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl Write for SharedBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.data.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingKiller {
+        killed: std::sync::Arc<std::sync::Mutex<bool>>,
+    }
+
+    impl RuntimeKiller for RecordingKiller {
+        fn kill(&mut self) -> Result<()> {
+            *self.killed.lock().unwrap() = true;
+            Ok(())
+        }
+    }
+
+    #[test]
     fn writes_reads_and_clears_daemon_status() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let status = DaemonStatus {
@@ -305,7 +460,9 @@ mod tests {
         };
         let listener = bind_api_socket(temp_dir.path())?;
         let home = temp_dir.path().to_path_buf();
-        let server = thread::spawn(move || serve_next_connection(&listener, &home, Some(status)));
+        let runtime = LiveSessionRuntime::default();
+        let server =
+            thread::spawn(move || serve_next_connection(&listener, &home, Some(status), &runtime));
 
         let mut stream = UnixStream::connect(daemon_socket_path(temp_dir.path()))?;
         stream.write_all(b"GET /health HTTP/1.1\r\nHost: coven\r\n\r\n")?;
@@ -345,7 +502,13 @@ mod tests {
         )?;
         let listener = bind_api_socket(temp_dir.path())?;
         let home = temp_dir.path().to_path_buf();
-        let server = thread::spawn(move || serve_next_connection(&listener, &home, None));
+        let runtime = LiveSessionRuntime::default();
+        runtime.register(
+            "session-1".to_string(),
+            Box::new(SharedBuffer::default()),
+            Box::new(RecordingKiller::default()),
+        )?;
+        let server = thread::spawn(move || serve_next_connection(&listener, &home, None, &runtime));
 
         let body = r#"{"data":"hello over socket"}"#;
         let request = format!(

@@ -1554,6 +1554,7 @@ Current repo status after initial implementation passes:
 - `coven daemon start` now launches a long-lived background Unix-socket server via hidden `daemon serve`; smoke verified `/health` over the socket and `daemon stop` cleanup.
 - Input/kill/events are now store-backed: input and kill validate session existence, append session events, and kill updates session status; daemon forwards HTTP request bodies to the API.
 - API input/kill now call a tested `SessionRuntime` hook before persisting events/status, creating the seam for daemon-owned live PTY handles without changing the HTTP contract.
-- Next implementation slice: implement the daemon runtime registry that owns PTY writers/children and backs those `SessionRuntime` hooks, then add restart recovery.
+- Daemon now has an in-memory live-session runtime registry with writer/kill handles, and the Unix-socket server routes API input/kill through that registry.
+- Next implementation slice: register daemon-launched PTY sessions into the live registry, then add restart recovery.
 - npm wrapper package scaffold exists at `packages/cli`; local verification confirms `node packages/cli/bin/coven.js doctor` invokes the `coven` binary, and `npm pack --dry-run` includes only package metadata, README, and bin shim.
 - Comux now has Coven session protocol types and a project-scoped fake-client bridge helper; tests prove sessions outside the current project root are filtered out. Committed in `BunsDev/comux` as `1fe3a21 feat: add coven session bridge types`.
