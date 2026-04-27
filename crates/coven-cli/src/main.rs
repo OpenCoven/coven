@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand};
 
+mod project;
+
 #[derive(Parser, Debug)]
 #[command(name = "coven")]
 #[command(about = "Project-scoped harness substrate for agent sessions")]
