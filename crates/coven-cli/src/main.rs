@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 
 mod harness;
 mod project;
+mod store;
 
 #[derive(Parser, Debug)]
 #[command(name = "coven")]
