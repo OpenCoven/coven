@@ -1395,6 +1395,14 @@ Prefer showing Coven sessions as external managed panes rather than replacing na
 
 Test that comux refuses to display sessions outside the current project root.
 
+- [x] **Step 3.5: Add project-scoped Coven launch from comux bridge**
+
+Comux can now send `coven.sessions.launch` through its daemon protocol. The bridge validates harness/prompt input, resolves `cwd` inside the active comux project root, calls Coven `POST /sessions`, and rejects any returned session whose project root is outside the comux project scope.
+
+- [x] **Step 3.6: Enforce Coven API launch boundaries**
+
+Coven now canonicalizes `projectRoot` and resolves `cwd` with the same `resolve_inside_root` guard used by the direct CLI before daemon/API launches reach the runtime.
+
 - [x] **Step 4: Commit**
 
 ```bash
@@ -1480,8 +1488,9 @@ Use a simple milestone board until the repo exists. Once created, mirror this in
 ### Milestone 6: comux bridge
 
 - [x] comux lists Coven sessions
+- [x] comux launches Coven sessions through the local API
 - [x] comux attaches or opens Coven session view
-- [x] comux preserves project boundary
+- [x] comux preserves project boundary for list/open/launch
 
 ### Milestone 7: OpenClaw bridge — external plugin
 
@@ -1557,3 +1566,5 @@ Current repo status after initial implementation passes:
 - Future-harness proof slice documented Hermes CLI observations in `docs/FUTURE-HARNESSES.md` and refactored the adapter seam so future CLIs can declare fixed prefix args before the prompt without adding unsupported harness ids prematurely.
 - npm wrapper package scaffold exists at `packages/cli`; local verification confirms `node packages/cli/bin/coven.js doctor` invokes the `coven` binary, and `npm pack --dry-run` includes only package metadata, README, and bin shim.
 - Comux now has Coven session protocol types and a project-scoped fake-client bridge helper; tests prove sessions outside the current project root are filtered out. Committed in `BunsDev/comux` as `1fe3a21 feat: add coven session bridge types`.
+- Comux follow-up branch `coven-comux-launch` adds `coven.sessions.launch`, a bridge helper that validates launch input and scopes `cwd` to the active comux project before calling Coven `POST /sessions`; focused tests cover in-scope launch and out-of-scope rejection.
+- Coven follow-up branch `coven-api-launch-boundary` closes the matching daemon/API safety gap: `POST /sessions` now canonicalizes `projectRoot`, resolves `cwd` through `resolve_inside_root`, and rejects out-of-root launches before runtime invocation.
