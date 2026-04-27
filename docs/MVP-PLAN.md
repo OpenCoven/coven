@@ -1371,7 +1371,7 @@ git add packages/cli
   - `src/daemon/bridge.ts`
   - relevant tests under `__tests__/daemon/`
 
-- [ ] **Step 1: Add Coven client interface in comux**
+- [x] **Step 1: Add Coven client interface in comux**
 
 Define a minimal client type:
 
@@ -1387,15 +1387,15 @@ export type CovenSessionSummary = {
 };
 ```
 
-- [ ] **Step 2: Add `coven.sessions.list` or map into existing pane status**
+- [x] **Step 2: Add `coven.sessions.list` or map into existing pane status**
 
 Prefer showing Coven sessions as external managed panes rather than replacing native comux panes.
 
-- [ ] **Step 3: Add tests with fake Coven API**
+- [x] **Step 3: Add tests with fake Coven API**
 
 Test that comux refuses to display sessions outside the current project root.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add src __tests__
@@ -1488,9 +1488,9 @@ Use a simple milestone board until the repo exists. Once created, mirror this in
 
 ### Milestone 6: comux bridge
 
-- [ ] comux lists Coven sessions
+- [x] comux lists Coven sessions
 - [ ] comux attaches or opens Coven session view
-- [ ] comux preserves project boundary
+- [x] comux preserves project boundary
 
 ### Milestone 7: OpenClaw bridge
 
@@ -1553,3 +1553,4 @@ Current repo status after initial implementation passes:
 - Local API routing now covers `/health`, `/sessions`, `/sessions/:id`, input/kill acceptance stubs, and empty events responses, with a Unix-socket health smoke test.
 - Next implementation slice: make `coven daemon start` launch a long-lived background server and back input/kill/events with real PTY/session plumbing.
 - npm wrapper package scaffold exists at `packages/cli`; local verification confirms `node packages/cli/bin/coven.js doctor` invokes the `coven` binary, and `npm pack --dry-run` includes only package metadata, README, and bin shim.
+- Comux now has Coven session protocol types and a project-scoped fake-client bridge helper; tests prove sessions outside the current project root are filtered out. Committed in `BunsDev/comux` as `1fe3a21 feat: add coven session bridge types`.
