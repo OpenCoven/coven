@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::{daemon::DaemonStatus, store};
+use crate::{daemon::DaemonStatus, project, store};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -155,11 +155,10 @@ fn launch_session(
 
 fn session_launch_from_payload(payload: Value) -> Result<SessionLaunch> {
     let project_root = required_string(&payload, "projectRoot")?;
-    let cwd = payload
-        .get("cwd")
-        .and_then(Value::as_str)
-        .unwrap_or(&project_root)
-        .to_string();
+    let cwd = payload.get("cwd").and_then(Value::as_str);
+    let canonical_project_root = project::canonical_project_root(Path::new(&project_root))
+        .context("failed to resolve projectRoot")?;
+    let canonical_cwd = project::resolve_inside_root(&canonical_project_root, cwd.map(Path::new))?;
     let harness = required_string(&payload, "harness")?;
     let prompt = required_string(&payload, "prompt")?;
     let title = payload
@@ -171,8 +170,8 @@ fn session_launch_from_payload(payload: Value) -> Result<SessionLaunch> {
 
     Ok(SessionLaunch {
         id: Uuid::new_v4().to_string(),
-        project_root,
-        cwd,
+        project_root: canonical_project_root.to_string_lossy().into_owned(),
+        cwd: canonical_cwd.to_string_lossy().into_owned(),
         harness,
         prompt,
         title,
@@ -389,16 +388,25 @@ mod tests {
     #[test]
     fn launch_request_invokes_runtime_and_persists_running_session() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
+        let project_root = temp_dir.path().join("repo");
+        let cwd = project_root.join("app");
+        std::fs::create_dir_all(&cwd)?;
         let runtime = RecordingRuntime::default();
+        let body = json!({
+            "projectRoot": project_root,
+            "cwd": cwd,
+            "harness": "codex",
+            "prompt": "hello coven",
+            "title": "Demo"
+        })
+        .to_string();
 
         let response = handle_request_with_runtime(
             "POST",
             "/sessions",
             temp_dir.path(),
             None,
-            Some(
-                r#"{"projectRoot":"/repo","cwd":"/repo/app","harness":"codex","prompt":"hello coven","title":"Demo"}"#,
-            ),
+            Some(&body),
             &runtime,
         )?;
         let list = handle_request("GET", "/sessions", temp_dir.path(), None)?;
@@ -408,6 +416,14 @@ mod tests {
         assert_eq!(runtime.launches.borrow().len(), 1);
         assert_eq!(runtime.launches.borrow()[0].harness, "codex");
         assert_eq!(runtime.launches.borrow()[0].prompt, "hello coven");
+        assert_eq!(
+            runtime.launches.borrow()[0].project_root,
+            project_root.canonicalize()?.to_string_lossy()
+        );
+        assert_eq!(
+            runtime.launches.borrow()[0].cwd,
+            cwd.canonicalize()?.to_string_lossy()
+        );
         assert!(list.body.contains(r#""title":"Demo""#));
         Ok(())
     }
@@ -415,14 +431,22 @@ mod tests {
     #[test]
     fn launch_request_persists_failed_status_when_runtime_launch_fails() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
         let runtime = FailingLaunchRuntime;
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello"
+        })
+        .to_string();
 
         let error = handle_request_with_runtime(
             "POST",
             "/sessions",
             temp_dir.path(),
             None,
-            Some(r#"{"projectRoot":"/repo","harness":"codex","prompt":"hello"}"#),
+            Some(&body),
             &runtime,
         )
         .unwrap_err();
@@ -430,6 +454,40 @@ mod tests {
 
         assert!(error.to_string().contains("launch failed"));
         assert!(sessions.body.contains(r#""status":"failed""#));
+        Ok(())
+    }
+
+    #[test]
+    fn launch_request_rejects_cwd_outside_project_root() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let project_root = temp_dir.path().join("repo");
+        let outside = temp_dir.path().join("outside");
+        std::fs::create_dir_all(&project_root)?;
+        std::fs::create_dir_all(&outside)?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({
+            "projectRoot": project_root,
+            "cwd": outside,
+            "harness": "codex",
+            "prompt": "hello"
+        })
+        .to_string();
+
+        let error = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("outside the Coven project root"),
+            "unexpected error: {error:?}"
+        );
+        assert!(runtime.launches.borrow().is_empty());
         Ok(())
     }
 
