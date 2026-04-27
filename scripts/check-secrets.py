@@ -15,6 +15,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 EXCLUDED_PARTS = {".git", "target", "node_modules", ".coven", ".comux", ".comux-hooks"}
+EXCLUDED_PATHS = {"scripts/check-secrets.py"}
 SECRET_RULES: list[tuple[str, re.Pattern[str]]] = [
     ("private_key", re.compile(r"-----BEGIN (?:RSA |DSA |EC |OPENSSH |PGP )?PRIVATE KEY-----")),
     ("aws_access_key", re.compile(r"AKIA[0-9A-Z]{16}")),
@@ -75,6 +76,8 @@ def tracked_file_hits() -> list[tuple[str, int, str]]:
     files = sh("git", "ls-files").splitlines()
     hits: list[tuple[str, int, str]] = []
     for rel in files:
+        if rel in EXCLUDED_PATHS:
+            continue
         path = ROOT / rel
         if any(part in EXCLUDED_PARTS for part in path.relative_to(ROOT).parts):
             continue
@@ -91,6 +94,8 @@ def history_blob_hits() -> list[tuple[str, str, int, str]]:
         parts = row.split(" ", 1)
         sha = parts[0]
         rel = parts[1] if len(parts) > 1 else "<unknown>"
+        if rel in EXCLUDED_PATHS:
+            continue
         if sha in seen:
             continue
         seen.add(sha)
