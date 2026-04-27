@@ -133,7 +133,6 @@ fn launch_session(
 ) -> Result<ApiResponse> {
     let payload = parse_body(body)?;
     let launch = session_launch_from_payload(payload)?;
-    runtime.launch_session(&launch)?;
     let conn = store::open_store(&store_path(coven_home))?;
     let now = current_timestamp();
     let record = store::SessionRecord {
@@ -147,6 +146,10 @@ fn launch_session(
         updated_at: now,
     };
     store::insert_session(&conn, &record)?;
+    if let Err(error) = runtime.launch_session(&launch) {
+        store::update_session_status(&conn, &record.id, "failed", None, &current_timestamp())?;
+        return Err(error);
+    }
     json_response(201, &record)
 }
 
@@ -196,7 +199,7 @@ fn record_input(
     let Some(session) = store::get_session(&conn, session_id)? else {
         return json_response(404, &json!({ "error": "session not found" }));
     };
-    if session.status == "orphaned" {
+    if session.status != "running" {
         return session_not_live_response(session_id);
     }
 
@@ -220,7 +223,7 @@ fn kill_session(
     let Some(session) = store::get_session(&conn, session_id)? else {
         return json_response(404, &json!({ "error": "session not found" }));
     };
-    if session.status == "orphaned" {
+    if session.status != "running" {
         return session_not_live_response(session_id);
     }
 
@@ -301,7 +304,7 @@ fn session_action_id<'a>(path: &'a str, suffix: &str) -> &'a str {
         .unwrap_or_default()
 }
 
-fn current_timestamp() -> String {
+pub(crate) fn current_timestamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
@@ -410,6 +413,27 @@ mod tests {
     }
 
     #[test]
+    fn launch_request_persists_failed_status_when_runtime_launch_fails() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let runtime = FailingLaunchRuntime;
+
+        let error = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(r#"{"projectRoot":"/repo","harness":"codex","prompt":"hello"}"#),
+            &runtime,
+        )
+        .unwrap_err();
+        let sessions = handle_request("GET", "/sessions", temp_dir.path(), None)?;
+
+        assert!(error.to_string().contains("launch failed"));
+        assert!(sessions.body.contains(r#""status":"failed""#));
+        Ok(())
+    }
+
+    #[test]
     fn launch_request_rejects_missing_required_fields() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let runtime = RecordingRuntime::default();
@@ -510,6 +534,27 @@ mod tests {
     }
 
     #[test]
+    fn input_and_kill_reject_completed_sessions_as_not_live() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session_with_status(temp_dir.path(), "session-1", "completed")?;
+
+        let input = handle_request_with_body(
+            "POST",
+            "/sessions/session-1/input",
+            temp_dir.path(),
+            None,
+            Some(r#"{"data":"hello"}"#),
+        )?;
+        let kill = handle_request("POST", "/sessions/session-1/kill", temp_dir.path(), None)?;
+
+        assert_eq!(input.status, 409);
+        assert_eq!(kill.status, 409);
+        assert!(input.body.contains("session not live"));
+        assert!(kill.body.contains("session not live"));
+        Ok(())
+    }
+
+    #[test]
     fn input_and_kill_reject_orphaned_sessions_as_not_live() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
         insert_test_session_with_status(temp_dir.path(), "session-1", "orphaned")?;
@@ -606,6 +651,22 @@ mod tests {
 
         fn kill_session(&self, session_id: &str) -> Result<()> {
             self.kills.borrow_mut().push(session_id.to_string());
+            Ok(())
+        }
+    }
+
+    struct FailingLaunchRuntime;
+
+    impl SessionRuntime for FailingLaunchRuntime {
+        fn launch_session(&self, _launch: &SessionLaunch) -> Result<()> {
+            anyhow::bail!("launch failed")
+        }
+
+        fn send_input(&self, _session_id: &str, _payload: &Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> Result<()> {
             Ok(())
         }
     }

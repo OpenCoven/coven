@@ -11,7 +11,7 @@ use std::os::unix::net::UnixListener;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::{
     api::{SessionLaunch, SessionRuntime},
@@ -39,6 +39,7 @@ pub trait RuntimeKiller: Send {
 
 #[derive(Default)]
 pub struct LiveSessionRuntime {
+    coven_home: Option<PathBuf>,
     sessions: Mutex<HashMap<String, LiveSessionHandle>>,
 }
 
@@ -48,6 +49,13 @@ struct LiveSessionHandle {
 }
 
 impl LiveSessionRuntime {
+    pub fn with_coven_home(coven_home: PathBuf) -> Self {
+        Self {
+            coven_home: Some(coven_home),
+            sessions: Mutex::default(),
+        }
+    }
+
     #[allow(dead_code)]
     pub fn register(
         &self,
@@ -70,7 +78,11 @@ impl SessionRuntime for LiveSessionRuntime {
             &launch.prompt,
             Path::new(&launch.cwd),
         )?;
-        let detached = pty_runner::spawn_detached(&command)?;
+        let observer = self
+            .coven_home
+            .as_ref()
+            .map(|coven_home| output_observer(coven_home.to_path_buf(), launch.id.clone()));
+        let detached = pty_runner::spawn_detached_with_observer(&command, observer)?;
         self.register(launch.id.clone(), detached.input, Box::new(detached.killer))
     }
 
@@ -113,6 +125,85 @@ impl RuntimeKiller for Box<dyn portable_pty::ChildKiller + Send + Sync> {
     fn kill(&mut self) -> Result<()> {
         self.as_mut().kill().context("failed to kill live session")
     }
+}
+
+fn output_observer(coven_home: PathBuf, session_id: String) -> pty_runner::DetachedPtyObserver {
+    let output_home = coven_home.clone();
+    let output_session_id = session_id.clone();
+    let exit_home = coven_home;
+    let exit_session_id = session_id;
+
+    pty_runner::DetachedPtyObserver {
+        on_output: Box::new(move |chunk| {
+            if chunk.is_empty() {
+                return;
+            }
+            let text = String::from_utf8_lossy(&chunk).into_owned();
+            let _ = record_session_event(
+                &output_home,
+                &output_session_id,
+                "output",
+                json!({ "data": text }),
+            );
+        }),
+        on_exit: Box::new(move |result| {
+            let _ = record_session_exit(&exit_home, &exit_session_id, result);
+        }),
+    }
+}
+
+fn record_session_exit(
+    coven_home: &Path,
+    session_id: &str,
+    result: pty_runner::PtyRunResult,
+) -> Result<()> {
+    let conn = crate::store::open_store(&coven_home.join("coven.sqlite3"))?;
+    if crate::store::get_session(&conn, session_id)?
+        .map(|session| session.status == "running")
+        .unwrap_or(false)
+    {
+        crate::store::update_session_status(
+            &conn,
+            session_id,
+            result.status,
+            result.exit_code,
+            &crate::api::current_timestamp(),
+        )?;
+    }
+    crate::store::insert_event(
+        &conn,
+        &crate::store::EventRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            kind: "exit".to_string(),
+            payload_json: serde_json::to_string(&json!({
+                "status": result.status,
+                "exitCode": result.exit_code,
+            }))
+            .context("failed to serialize exit event payload")?,
+            created_at: crate::api::current_timestamp(),
+        },
+    )
+}
+
+fn record_session_event(
+    coven_home: &Path,
+    session_id: &str,
+    kind: &str,
+    payload: Value,
+) -> Result<()> {
+    let conn = crate::store::open_store(&coven_home.join("coven.sqlite3"))?;
+    crate::store::insert_event(
+        &conn,
+        &crate::store::EventRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            kind: kind.to_string(),
+            payload_json: serde_json::to_string(&payload)
+                .context("failed to serialize session event payload")?,
+            created_at: crate::api::current_timestamp(),
+        },
+    )
 }
 
 pub fn daemon_status_path(coven_home: &Path) -> PathBuf {
@@ -246,7 +337,7 @@ pub fn serve_forever(coven_home: &Path, started_at: String) -> Result<()> {
     write_status(coven_home, &status)?;
     recover_orphaned_sessions(coven_home, &started_at)?;
     let listener = bind_api_socket(coven_home)?;
-    let runtime = LiveSessionRuntime::default();
+    let runtime = LiveSessionRuntime::with_coven_home(coven_home.to_path_buf());
     loop {
         serve_next_connection(&listener, coven_home, Some(status.clone()), &runtime)?;
     }
@@ -577,6 +668,66 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "input");
         assert!(events[0].payload_json.contains("hello over socket"));
+        Ok(())
+    }
+
+    #[test]
+    fn records_output_and_exit_events_for_live_session() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = crate::store::open_store(&temp_dir.path().join("coven.sqlite3"))?;
+        let mut session = session_record("session-1");
+        session.status = "running".to_string();
+        crate::store::insert_session(&conn, &session)?;
+        drop(conn);
+
+        record_session_event(
+            temp_dir.path(),
+            "session-1",
+            "output",
+            json!({ "data": "hello from pty" }),
+        )?;
+        record_session_exit(
+            temp_dir.path(),
+            "session-1",
+            pty_runner::PtyRunResult {
+                status: "completed",
+                exit_code: Some(0),
+            },
+        )?;
+
+        let conn = crate::store::open_store(&temp_dir.path().join("coven.sqlite3"))?;
+        let sessions = crate::store::list_sessions(&conn)?;
+        let events = crate::store::list_events(&conn, "session-1")?;
+        assert_eq!(session_status(&sessions, "session-1"), "completed");
+        assert_eq!(events.len(), 2);
+        let output = events.iter().find(|event| event.kind == "output").unwrap();
+        let exit = events.iter().find(|event| event.kind == "exit").unwrap();
+        assert!(output.payload_json.contains("hello from pty"));
+        assert!(exit.payload_json.contains("completed"));
+        Ok(())
+    }
+
+    #[test]
+    fn exit_event_does_not_overwrite_killed_session_status() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = crate::store::open_store(&temp_dir.path().join("coven.sqlite3"))?;
+        let mut session = session_record("session-1");
+        session.status = "killed".to_string();
+        crate::store::insert_session(&conn, &session)?;
+        drop(conn);
+
+        record_session_exit(
+            temp_dir.path(),
+            "session-1",
+            pty_runner::PtyRunResult {
+                status: "failed",
+                exit_code: Some(1),
+            },
+        )?;
+
+        let conn = crate::store::open_store(&temp_dir.path().join("coven.sqlite3"))?;
+        let sessions = crate::store::list_sessions(&conn)?;
+        assert_eq!(session_status(&sessions, "session-1"), "killed");
         Ok(())
     }
 

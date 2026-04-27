@@ -1477,7 +1477,8 @@ Use a simple milestone board until the repo exists. Once created, mirror this in
 - [x] SQLite schema
 - [x] sessions list
 - [x] event log
-- [ ] restart recovery
+- [x] restart recovery
+- [x] PTY output/exit log capture
 
 ### Milestone 5: Daemon/API
 
@@ -1557,6 +1558,7 @@ Current repo status after initial implementation passes:
 - Daemon now has an in-memory live-session runtime registry with writer/kill handles, and the Unix-socket server routes API input/kill through that registry.
 - API `POST /sessions` now launches detached PTY sessions through the daemon runtime, registers their input/kill handles, and persists running session metadata.
 - Daemon restart recovery now marks persisted `running` sessions as `orphaned` on boot, and input/kill return `409 session not live` for orphaned or missing live handles.
-- Next implementation slice: expose session output/log capture so launched PTYs are observable, not just controllable.
+- Detached daemon-launched PTYs now capture output chunks as `output` events and process exits as `exit` events, updating running session status to `completed`/`failed` without overwriting killed sessions.
+- Next implementation slice: wire attach/tail UX on top of captured events so users and clients can follow session output live.
 - npm wrapper package scaffold exists at `packages/cli`; local verification confirms `node packages/cli/bin/coven.js doctor` invokes the `coven` binary, and `npm pack --dry-run` includes only package metadata, README, and bin shim.
 - Comux now has Coven session protocol types and a project-scoped fake-client bridge helper; tests prove sessions outside the current project root are filtered out. Committed in `BunsDev/comux` as `1fe3a21 feat: add coven session bridge types`.
