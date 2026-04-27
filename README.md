@@ -56,6 +56,18 @@ The daemon exposes a local HTTP API over a Unix socket for clients such as comux
 - `POST /sessions/:id/input`
 - `POST /sessions/:id/kill`
 
+
+## OpenClaw plugin
+
+Coven also carries an external OpenClaw plugin package at `packages/openclaw-coven`.
+Once published to ClawHub, install it with:
+
+```sh
+openclaw plugins install clawhub:@openclaw/coven
+```
+
+The plugin is opt-in: enable `plugins.entries.coven.enabled` and set `acp.backend = "coven"` only when you want OpenClaw ACP sessions to route through a local Coven daemon.
+
 ## Community
 
 - Discord: `discord.gg/opencoven`

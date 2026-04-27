@@ -1,0 +1,52 @@
+{
+  "name": "@openclaw/coven",
+  "version": "2026.4.27",
+  "description": "OpenClaw ACP runtime bridge for local Coven daemon sessions.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/OpenCoven/coven.git",
+    "directory": "packages/openclaw-coven"
+  },
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "coven",
+    "acp",
+    "agent-runtime"
+  ],
+  "files": [
+    "README.md",
+    "tsconfig.json",
+    "index.ts",
+    "openclaw.plugin.json",
+    "src/**/*.ts",
+    "!src/**/*.test.ts"
+  ],
+  "peerDependencies": {
+    "openclaw": ">=2026.4.26"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "install": {
+      "minHostVersion": ">=2026.4.26"
+    },
+    "compat": {
+      "pluginApi": ">=2026.4.25"
+    },
+    "build": {
+      "openclawVersion": "2026.4.26"
+    },
+    "release": {
+      "publishToClawHub": true
+    }
+  }
+}

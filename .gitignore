@@ -16,3 +16,6 @@
 *.key
 *.p12
 *.pfx
+node_modules/
+packages/*/node_modules/
+*.tgz
