@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" role="img" aria-label="OpenCoven — Orchestrate Intelligence">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#6E4BFF"/><stop offset="1" stop-color="#A78BFF"/></linearGradient>
+    <radialGradient id="glow" cx="50%" cy="50%" r="45%"><stop stop-color="#8A63FF" stop-opacity="0.32"/><stop offset="1" stop-color="#8A63FF" stop-opacity="0"/></radialGradient>
+  </defs>
+  <rect width="1200" height="630" fill="#000"/>
+  <circle cx="600" cy="315" r="290" fill="url(#glow)"/>
+  <g transform="translate(485 70) scale(.225)" color="url(#g)">
+<path fill="currentColor" d="M512 82c121 90 213 219 280 389 21 53 52 101 94 144-82-14-152-48-210-102-35-33-65-72-90-117-19 68-44 129-74 182-30-53-55-114-74-182-25 45-55 84-90 117-58 54-128 88-210 102 42-43 73-91 94-144C299 301 391 172 512 82Z"/>
+  <path fill="#000000" d="M512 220c66 74 114 168 145 282-42-26-82-66-119-119-10 57-18 98-26 123-8-25-16-66-26-123-37 53-77 93-119 119 31-114 79-208 145-282Z"/>
+  <path fill="currentColor" d="M146 259l117 47-20 48-89-35c-17 58-10 111 21 158l-44 27c-48-74-43-158 15-245Zm732 0c58 87 63 171 15 245l-44-27c31-47 38-100 21-158l-89 35-20-48 117-47Z"/>
+  <path fill="currentColor" d="M512 314l76 177h-42v143h-68V491h-42l76-177Z"/>
+  <path fill="currentColor" d="M410 468c-34 47-44 103-30 166 13 56 46 101 99 136-24-58-27-112-10-162 13-39 34-74 63-105-46 10-84-2-122-35Zm204 0c34 47 44 103 30 166-13 56-46 101-99 136 24-58 27-112 10-162-13-39-34-74-63-105 46 10 84-2 122-35Z"/>
+  <path fill="currentColor" d="M397 760h230v48H397zM452 808h120l-34 73h-52l-34-73Zm60 52l46 108h-92l46-108Z"/>
+  </g>
+  <text x="600" y="360" text-anchor="middle" fill="#fff" font-family="Satoshi, Inter, system-ui, sans-serif" font-size="82" font-weight="700">OpenCoven</text>
+  <text x="600" y="430" text-anchor="middle" fill="#A78BFF" font-family="Satoshi, Inter, system-ui, sans-serif" font-size="42" font-weight="600">Orchestrate Intelligence</text>
+  <text x="600" y="488" text-anchor="middle" fill="rgba(255,255,255,.72)" font-family="Inter, system-ui, sans-serif" font-size="28">Multi-agent systems. Unified control. Real execution.</text>
+</svg>

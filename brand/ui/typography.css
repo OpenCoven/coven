@@ -1,0 +1,16 @@
+/* OpenCoven typography tokens. Do not bundle commercial fonts without license. */
+:root {
+  --oc-font-ui: Inter, "SF Pro Text", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --oc-font-display: Satoshi, "Neue Montreal", Geist, Inter, "SF Pro Display", -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  --oc-font-mono: "SF Mono", SFMono-Regular, ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+
+  --oc-tracking-heading: -0.02em;
+  --oc-tracking-hero: -0.055em;
+  --oc-tracking-label: 0.14em;
+  --oc-line-body: 1.6;
+  --oc-line-heading: 1.05;
+}
+
+body { font-family: var(--oc-font-ui); }
+h1, h2, h3, .oc-display { font-family: var(--oc-font-display); letter-spacing: var(--oc-tracking-heading); }
+code, pre, kbd, samp, .oc-mono { font-family: var(--oc-font-mono); }

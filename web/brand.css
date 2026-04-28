@@ -1,0 +1,86 @@
+/* OpenCoven brand color tokens. Canonical values mirror DESIGN.md. */
+:root {
+  color-scheme: dark;
+
+  /* Anchors */
+  --oc-black: #000000;
+  --oc-white: #ffffff;
+
+  /* Purple spectrum */
+  --oc-purple-1: #6E4BFF;
+  --oc-purple-2: #8A63FF;
+  --oc-purple-3: #A78BFF;
+  --oc-purple-glow: #7C5CFF;
+
+  /* Controlled accents */
+  --oc-accent-blue: #0A84FF;
+  --oc-danger: #FF3B30;
+  --oc-success: #30D158;
+
+  /* Surfaces */
+  --oc-surface-0: var(--oc-black);
+  --oc-surface-1: #050507;
+  --oc-surface-2: #080812;
+  --oc-border-subtle: rgba(255, 255, 255, 0.08);
+  --oc-border-strong: rgba(255, 255, 255, 0.14);
+  --oc-text: rgba(255, 255, 255, 0.94);
+  --oc-text-muted: rgba(255, 255, 255, 0.64);
+  --oc-text-faint: rgba(255, 255, 255, 0.42);
+
+  /* Signature treatments: use sparingly. */
+  --oc-gradient-signature: linear-gradient(135deg, var(--oc-purple-1), var(--oc-purple-3));
+  --oc-radial-glow: radial-gradient(circle, rgba(138, 99, 255, 0.28) 0%, rgba(138, 99, 255, 0) 68%);
+  --oc-focus-ring: 0 0 0 2px rgba(124, 92, 255, 0.52), 0 0 32px rgba(124, 92, 255, 0.28);
+  --oc-hover-glow: 0 0 36px rgba(124, 92, 255, 0.26);
+}
+
+/* OpenCoven typography tokens. Do not bundle commercial fonts without license. */
+:root {
+  --oc-font-ui: Inter, "SF Pro Text", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --oc-font-display: Satoshi, "Neue Montreal", Geist, Inter, "SF Pro Display", -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  --oc-font-mono: "SF Mono", SFMono-Regular, ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+
+  --oc-tracking-heading: -0.02em;
+  --oc-tracking-hero: -0.055em;
+  --oc-tracking-label: 0.14em;
+  --oc-line-body: 1.6;
+  --oc-line-heading: 1.05;
+}
+
+body { font-family: var(--oc-font-ui); }
+h1, h2, h3, .oc-display { font-family: var(--oc-font-display); letter-spacing: var(--oc-tracking-heading); }
+code, pre, kbd, samp, .oc-mono { font-family: var(--oc-font-mono); }
+
+/* Landing-page adherence overrides. Keep this file loaded after inline page styles. */
+:root {
+  --bg: var(--oc-black);
+  --panel: rgba(255, 255, 255, 0.035);
+  --panel-strong: rgba(255, 255, 255, 0.06);
+  --line: var(--oc-border-strong);
+  --line-soft: var(--oc-border-subtle);
+  --text: var(--oc-text);
+  --muted: var(--oc-text-muted);
+  --faint: var(--oc-text-faint);
+  --violet: var(--oc-purple-2);
+  --violet-2: var(--oc-purple-3);
+  --violet-3: var(--oc-purple-1);
+  --ink: var(--oc-surface-2);
+}
+
+body { background: var(--oc-black); }
+header, .eyebrow, .button-secondary, .feature-card, .link-card, .terminal-panel, .stat-card, .install-card { backdrop-filter: none !important; }
+header { background: rgba(0, 0, 0, 0.82); border-bottom-color: var(--oc-border-subtle); }
+h1 { letter-spacing: var(--oc-tracking-hero); }
+.section-kicker, .eyebrow, .manager-pill, .console-status { letter-spacing: var(--oc-tracking-label); }
+.brand-mark, .footer-mark, .console-logo { border-color: rgba(167, 139, 255, 0.22); background: var(--oc-black); }
+.logo { color: var(--oc-purple-3); }
+.button { transform: none !important; transition: background .2s ease, border-color .2s ease, box-shadow .2s ease, color .2s ease; }
+.button:hover, .button:active { transform: none !important; }
+.button-primary { background: var(--oc-purple-2); color: var(--oc-white); border: 1px solid rgba(167,139,255,.42); box-shadow: 0 0 0 1px rgba(167,139,255,.12), 0 0 34px rgba(124,92,255,.18); }
+.button-primary:hover { background: var(--oc-purple-1); color: var(--oc-white); box-shadow: var(--oc-hover-glow); }
+.button-secondary { border-color: var(--oc-border-subtle); background: rgba(255,255,255,.035); color: var(--oc-text); }
+.button-secondary:hover, .link-card:hover { border-color: rgba(167,139,255,.28); background: rgba(255,255,255,.05); box-shadow: var(--oc-hover-glow); }
+.hero-console, .terminal-panel, .install-card { background: var(--oc-surface-2); border-color: var(--oc-border-subtle); }
+.hero-console::before { box-shadow: 0 0 80px rgba(124, 92, 255, 0.14); border-color: rgba(124, 92, 255, 0.12); }
+a:focus-visible, button:focus-visible { outline: none; box-shadow: var(--oc-focus-ring); }
+.feature-icon, .manager-pill, .console-status, .live, .code-copy button { background: rgba(138,99,255,.1); border-color: rgba(167,139,255,.18); color: rgba(239,232,255,.92); }

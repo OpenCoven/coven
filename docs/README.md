@@ -8,7 +8,8 @@ This directory holds the product and architecture notes for Coven, the OpenCoven
 - [Operational model](OPERATIONAL-MODEL.md) — authority boundaries between Rust, comux, OpenClaw, and npm wrappers.
 - [MVP plan](MVP-PLAN.md) — implementation plan and success criteria.
 - [Future harnesses](FUTURE-HARNESSES.md) — adapter direction after Codex and Claude Code.
-- [Brand assets](BRAND.md) — logo pack and package-local asset copies.
+- [Brand assets](BRAND.md) — canonical logo, token, typography, and social asset pack.
+- [Brand adherence checklist](BRANDING-ADHERENCE.md) — implementation progress, exceptions, and risks.
 
 ## Documentation stance
 
