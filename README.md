@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/opencoven/opencoven-256.png" alt="Coven logo" width="128" height="128">
+</p>
+
 # Coven
 
 Coven is a Rust-first, standalone CLI/daemon harness substrate for project-scoped interactive agent sessions.
@@ -76,6 +80,10 @@ The plugin is a socket client. It does not become part of Coven's trust root, an
 
 - Discord: `discord.gg/opencoven`
 - X / Twitter: `@OpenCvn`
+
+## Brand assets
+
+The canonical Coven logo pack lives under [`assets/opencoven`](assets/opencoven). Package-local README logos are copied into each publishable package so package previews do not depend on files outside the package tarball.
 
 ## MVP direction
 

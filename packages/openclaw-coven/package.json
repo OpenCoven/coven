@@ -17,6 +17,7 @@
     "agent-runtime"
   ],
   "files": [
+    "assets",
     "README.md",
     "tsconfig.json",
     "index.ts",
