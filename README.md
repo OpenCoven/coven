@@ -1,104 +1,138 @@
 <p align="center">
-  <img src="assets/opencoven/opencoven-256.png" alt="Coven logo" width="128" height="128">
+  <img src="assets/opencoven/opencoven-256.png" alt="OpenCoven logo" width="128" height="128">
 </p>
 
-# Coven
+<h1 align="center">OpenCoven / Coven</h1>
 
-Coven is a Rust-first, standalone CLI/daemon harness substrate for project-scoped interactive agent sessions.
+<h3 align="center">Project-scoped harness sessions for the OpenCoven ecosystem</h3>
 
-The goal is simple: run trusted coding harnesses like Codex and Claude Code inside explicit project boundaries, keep the work visible and attachable, and give clients like comux and the external OpenClaw plugin a stable local runtime to coordinate with.
+<p align="center">
+  Run Codex, Claude Code, and future harnesses inside explicit local project boundaries.<br/>
+  Launch, observe, attach, and coordinate agent work through one neutral runtime substrate.
+</p>
 
-> One project. Any harness. Visible work.
+<p align="center">
+  <a href="https://github.com/OpenCoven/coven/issues"><strong>Issues</strong></a>
+  ·
+  <a href="https://discord.gg/opencoven"><strong>Discord</strong></a>
+  ·
+  <a href="https://x.com/OpenCvn"><strong>@OpenCvn</strong></a>
+</p>
 
-## Status
+---
 
-Coven is an early MVP. It is public for transparency and review, but it is not published as a stable package yet.
+## Install
 
-The current implementation includes:
+Coven is an early MVP. The public package shape is here, but stable installation is not the primary promise yet.
 
-- `coven doctor` harness detection
-- `coven daemon start/status/stop`
-- project-scoped `coven run <harness> <prompt>` sessions
-- detached PTY sessions backed by daemon runtime handles
-- `coven sessions`
-- `coven attach <session-id>`
-- local daemon HTTP API over a Unix socket for comux and external plugin integrations
-- SQLite-backed metadata and event logs under `COVEN_HOME` / `.coven`
-
-## Safety model
-
-Coven is local-first and intentionally explicit:
-
-- Sessions are scoped to an explicit project root.
-- Runtime state is ignored by git (`.coven/`, SQLite files, sockets, logs, env files, and private keys).
-- The repository includes a CI secret guard that scans current files and git history without printing matched values.
-- Coven does not require repository-stored credentials; harness auth should stay in the harness/provider's normal local auth flow.
-
-Do not run untrusted prompts or harnesses in sensitive repositories unless you understand the harness' own permissions and tool behavior.
-
-## Usage examples
+From a checkout today:
 
 ```sh
+git clone https://github.com/OpenCoven/coven.git
+cd coven
+cargo build --workspace
+```
+
+The user-facing command is always `coven`. Once the npm wrapper is ready, the package path is:
+
+```sh
+npm exec @opencoven/cli -- doctor
+pnpm dlx @opencoven/cli doctor
+```
+
+## Quick Start
+
+```sh
+cd /path/to/your/project
 coven doctor
 coven daemon start
-coven daemon status
-coven run codex "fix tests"
+coven run codex "fix the failing tests"
 coven run claude "polish this UI"
 coven sessions
 coven attach <session-id>
 ```
 
+`coven doctor` checks whether supported local harness CLIs are available. `coven run` creates a project-scoped session record, validates the working directory, and launches the selected harness through Coven-managed PTY execution.
+
+## What it does
+
+Coven is the local harness substrate for OpenCoven. It does not replace your coding agent, your UI, or OpenClaw. It gives them a shared room where project work can happen visibly and safely.
+
+- **Project-root boundaries** — every launch is tied to an explicit repository/project root.
+- **Harness-neutral runtime** — v0 focuses on Codex and Claude Code, with a clean adapter path for future harnesses.
+- **Attachable PTY sessions** — live work can be listed and reattached from the CLI.
+- **Local daemon API** — comux, OpenMeow, and the external OpenClaw plugin can coordinate through the same socket contract.
+- **SQLite-backed history** — session metadata and event logs survive daemon restarts.
+- **Rust authority layer** — launch, cwd, input, kill, and path-sensitive requests are revalidated in Rust.
+- **External OpenClaw bridge** — `@opencoven/coven` is an opt-in plugin; OpenClaw core does not include Coven code.
+- **OpenCoven package shape** — CLI wrapper packages live under the `@opencoven/*` namespace while the command stays `coven`.
+
+## Commands
+
+| Command | Action |
+|---|---|
+| `coven doctor` | Detect supported harness CLIs and print install hints |
+| `coven daemon start` | Start the local Coven daemon |
+| `coven daemon status` | Show daemon health, pid, and socket path |
+| `coven daemon stop` | Stop the local daemon |
+| `coven run <harness> <prompt>` | Launch a project-scoped harness session |
+| `coven run <harness> <prompt> --cwd <path>` | Launch from a cwd inside the project root |
+| `coven run <harness> <prompt> --title <title>` | Set a readable session title |
+| `coven sessions` | List known sessions |
+| `coven attach <session-id>` | Replay/follow session output and forward input |
+
 ## Local API
 
-The daemon exposes a local HTTP API over a Unix socket for clients such as comux and the external OpenClaw plugin:
+The daemon exposes a small HTTP API over a Unix socket for first-party and external clients:
 
-- `GET /health`
-- `GET /sessions`
-- `POST /sessions`
-- `GET /sessions/:id`
-- `GET /events?sessionId=...`
-- `POST /sessions/:id/input`
-- `POST /sessions/:id/kill`
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Check daemon health and metadata |
+| `GET /sessions` | List sessions |
+| `POST /sessions` | Launch a session |
+| `GET /sessions/:id` | Fetch one session |
+| `GET /events?sessionId=...` | Read session events |
+| `POST /sessions/:id/input` | Forward input to a live session |
+| `POST /sessions/:id/kill` | Kill a live session |
 
+Treat the socket API as the product contract. Clients may validate for UX, but the Rust daemon remains the authority boundary.
 
-## OpenClaw plugin
+## Requirements
 
-Coven also carries an external OpenClaw plugin package at `packages/openclaw-coven`.
-OpenClaw core does not include OpenCoven or Coven; the integration path is the opt-in ClawHub package `@opencoven/coven`.
+- Rust stable toolchain
+- Git
+- macOS or another Unix-like system for daemon socket / PTY behavior today
+- At least one supported harness CLI:
+  - [Codex](https://github.com/openai/codex)
+  - [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
+- Node.js 18+ only for npm wrapper/plugin package development
 
-Install it with:
+## OpenCoven integrations
 
-```sh
-openclaw plugins install clawhub:@opencoven/coven
-```
+- **comux** is the visual cockpit for agent panes and can consume Coven-managed sessions through the local API.
+- **OpenClaw** integrates only through the external `@opencoven/coven` plugin package.
+- **OpenMeow** can consume Coven session status, intake, or notifications as the desktop companion surface matures.
 
-The plugin is opt-in: enable `plugins.entries["opencoven-coven"].enabled` and set `acp.backend = "coven"` only when you want OpenClaw ACP sessions to route through a local Coven daemon.
+Coven is the room where harnesses run. The clients decide how to present and route that work.
 
-The plugin is a socket client. It does not become part of Coven's trust root, and the Rust daemon still validates project roots, cwd, harness ids, input, and kill requests.
+## Documentation
+
+- [Product spec](docs/PRODUCT-SPEC.md)
+- [Operational model](docs/OPERATIONAL-MODEL.md)
+- [MVP plan](docs/MVP-PLAN.md)
+- [Future harnesses](docs/FUTURE-HARNESSES.md)
+- [Brand assets](docs/BRAND.md)
+- [Security policy](SECURITY.md)
+
+## Contributing
+
+See **[CONTRIBUTING.md](./CONTRIBUTING.md)** for the recommended local development loop, release checks, and OpenCoven documentation rules.
 
 ## Community
 
 - Discord: `discord.gg/opencoven`
 - X / Twitter: `@OpenCvn`
 
-## Brand assets
+## License
 
-The canonical Coven logo pack lives under [`assets/opencoven`](assets/opencoven). Package-local README logos are copied into each publishable package so package previews do not depend on files outside the package tarball.
-
-## MVP direction
-
-Coven v0 focuses on:
-
-- a Rust CLI command named `coven`
-- a local daemon for supervised harness sessions
-- interactive PTY sessions scoped to explicit project roots
-- built-in Codex and Claude Code adapters
-- session list, attach, kill, metadata, and event logs
-- a minimal local API for comux and external plugin integration
-- npm wrapper package shape under `@opencoven/cli` once publishing is ready
-
-For the current authority boundaries and release split, see [docs/OPERATIONAL-MODEL.md](docs/OPERATIONAL-MODEL.md).
-
-## Security
-
-See [SECURITY.md](SECURITY.md).
+MIT
