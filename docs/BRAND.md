@@ -26,9 +26,9 @@ The existing raster icon pack remains available in [`assets/opencoven`](../asset
 
 ## Package copies
 
-The npm package READMEs use package-local copies of `opencoven-128.png`:
+The npm package READMEs use package-local copies of `opencoven.svg` so package previews do not depend on files outside the package tarball:
 
-- [`packages/cli/assets/opencoven-128.png`](../packages/cli/assets/opencoven-128.png)
-- [`packages/openclaw-coven/assets/opencoven-128.png`](../packages/openclaw-coven/assets/opencoven-128.png)
+- [`packages/cli/assets/opencoven.svg`](../packages/cli/assets/opencoven.svg)
+- [`packages/openclaw-coven/assets/opencoven.svg`](../packages/openclaw-coven/assets/opencoven.svg)
 
 Keep those copies in sync with [`assets/opencoven/opencoven-128.png`](../assets/opencoven/opencoven-128.png) until package READMEs move to SVG rendering.

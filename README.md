@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/opencoven/opencoven-256.png" alt="OpenCoven logo" width="128" height="128">
+  <img src="assets/opencoven/opencoven.svg" alt="OpenCoven logo" width="128" height="128">
 </p>
 
 <h1 align="center">OpenCoven / Coven</h1>
