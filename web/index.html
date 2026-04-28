@@ -1,0 +1,892 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OpenCoven — Local harness control for agentic work</title>
+    <meta
+      name="description"
+      content="OpenCoven is a local, Rust-first harness substrate for running Codex and Claude Code as project-scoped, attachable sessions."
+    />
+    <meta property="og:title" content="OpenCoven" />
+    <meta
+      property="og:description"
+      content="One project. Any harness. Visible work."
+    />
+    <meta property="og:type" content="website" />
+    <meta name="theme-color" content="#050508" />
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #050508;
+        --panel: rgba(255, 255, 255, 0.035);
+        --panel-strong: rgba(255, 255, 255, 0.06);
+        --line: rgba(255, 255, 255, 0.1);
+        --line-soft: rgba(255, 255, 255, 0.075);
+        --text: rgba(255, 255, 255, 0.94);
+        --muted: rgba(255, 255, 255, 0.62);
+        --faint: rgba(255, 255, 255, 0.42);
+        --violet: #8b5cf6;
+        --violet-2: #b892ff;
+        --violet-3: #5b3cff;
+        --ink: #080812;
+        --radius-xl: 2rem;
+        --radius-2xl: 3.5rem;
+        --shadow: 0 32px 120px rgba(0, 0, 0, 0.45);
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "Segoe UI", sans-serif;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html {
+        scroll-behavior: smooth;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        overflow-x: hidden;
+        background: var(--bg);
+        color: var(--text);
+      }
+
+      a {
+        color: inherit;
+        text-decoration: none;
+      }
+
+      .background {
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        z-index: 0;
+        overflow: hidden;
+      }
+
+      .glow-top,
+      .glow-side,
+      .glow-bottom {
+        position: absolute;
+        border-radius: 999px;
+        filter: blur(80px);
+      }
+
+      .glow-top {
+        left: 50%;
+        top: -18rem;
+        width: 44rem;
+        height: 44rem;
+        transform: translateX(-50%);
+        background: rgba(139, 92, 246, 0.22);
+      }
+
+      .glow-side {
+        right: -20rem;
+        bottom: 12rem;
+        width: 48rem;
+        height: 48rem;
+        background: rgba(91, 60, 255, 0.18);
+      }
+
+      .glow-bottom {
+        left: -22rem;
+        bottom: -26rem;
+        width: 52rem;
+        height: 52rem;
+        background: rgba(184, 146, 255, 0.12);
+      }
+
+      .grid-bg {
+        position: absolute;
+        inset: 0;
+        opacity: 0.16;
+        background-image:
+          linear-gradient(to right, rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+          linear-gradient(to bottom, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
+        background-size: 72px 72px;
+        mask-image: radial-gradient(circle at 50% 18%, black, transparent 76%);
+      }
+
+      .noise {
+        position: absolute;
+        inset: 0;
+        opacity: 0.08;
+        background-image: radial-gradient(rgba(255,255,255,.65) 0.6px, transparent 0.6px);
+        background-size: 3px 3px;
+      }
+
+      .page {
+        position: relative;
+        z-index: 1;
+      }
+
+      .container {
+        width: min(100% - 3rem, 1180px);
+        margin-inline: auto;
+      }
+
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding-block: 1.5rem;
+      }
+
+      .brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.8rem;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+      }
+
+      .brand-mark,
+      .footer-mark {
+        display: grid;
+        place-items: center;
+        border: 1px solid rgba(184, 146, 255, 0.16);
+        background: rgba(255,255,255,.035);
+        box-shadow: 0 0 42px rgba(139, 92, 246, 0.18);
+      }
+
+      .brand-mark {
+        width: 2.6rem;
+        height: 2.6rem;
+        border-radius: 1rem;
+      }
+
+      .footer-mark {
+        width: 2.1rem;
+        height: 2.1rem;
+        border-radius: 0.8rem;
+      }
+
+      nav {
+        display: flex;
+        gap: 2rem;
+        color: rgba(255,255,255,.55);
+        font-size: 0.9rem;
+      }
+
+      nav a {
+        transition: color .2s ease;
+      }
+
+      nav a:hover {
+        color: white;
+      }
+
+      .hero {
+        display: grid;
+        grid-template-columns: 1.04fr 0.96fr;
+        align-items: center;
+        gap: 3.5rem;
+        min-height: calc(100vh - 90px);
+        padding-block: 3rem 7rem;
+      }
+
+      .eyebrow {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.45rem 0.72rem;
+        border: 1px solid rgba(184, 146, 255, 0.18);
+        border-radius: 999px;
+        background: rgba(184, 146, 255, 0.045);
+        color: rgba(230, 216, 255, 0.86);
+        font-size: 0.72rem;
+        font-weight: 700;
+        letter-spacing: 0.22em;
+        text-transform: uppercase;
+      }
+
+      h1,
+      h2,
+      h3,
+      p {
+        margin: 0;
+      }
+
+      h1 {
+        max-width: 850px;
+        margin-top: 1.5rem;
+        font-size: clamp(4rem, 9vw, 8.6rem);
+        line-height: 0.86;
+        letter-spacing: -0.085em;
+        font-weight: 760;
+      }
+
+      .lead {
+        max-width: 690px;
+        margin-top: 1.8rem;
+        color: var(--muted);
+        font-size: clamp(1.08rem, 2vw, 1.32rem);
+        line-height: 1.65;
+      }
+
+      .hero-actions,
+      .cta-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.8rem;
+        margin-top: 2.2rem;
+      }
+
+      .button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0.55rem;
+        min-height: 3.1rem;
+        padding-inline: 1.2rem;
+        border-radius: 1.05rem;
+        font-size: 0.9rem;
+        font-weight: 760;
+        transition:
+          transform 0.2s ease,
+          background 0.2s ease,
+          border-color 0.2s ease;
+      }
+
+      .button:hover {
+        transform: translateY(-1px);
+      }
+
+      .button-primary {
+        background: white;
+        color: black;
+      }
+
+      .button-primary:hover {
+        background: #efe7ff;
+      }
+
+      .button-secondary {
+        border: 1px solid rgba(255,255,255,.12);
+        background: rgba(255,255,255,.04);
+        color: rgba(255,255,255,.84);
+      }
+
+      .button-secondary:hover {
+        border-color: rgba(255,255,255,.2);
+        background: rgba(255,255,255,.075);
+      }
+
+      .sigil-wrap {
+        position: relative;
+        width: min(100%, 560px);
+        aspect-ratio: 1;
+        margin-inline: auto;
+      }
+
+      .sigil-glow {
+        position: absolute;
+        inset: 0;
+        border-radius: var(--radius-2xl);
+        background: rgba(139, 92, 246, 0.2);
+        filter: blur(60px);
+      }
+
+      .sigil-card {
+        position: relative;
+        display: grid;
+        place-items: center;
+        height: 100%;
+        padding: clamp(2rem, 6vw, 4rem);
+        border: 1px solid rgba(224, 210, 255, 0.13);
+        border-radius: var(--radius-2xl);
+        background:
+          radial-gradient(circle at 50% 28%, rgba(184, 146, 255, 0.18), transparent 48%),
+          linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.015));
+        box-shadow: var(--shadow);
+        overflow: hidden;
+      }
+
+      .sigil-card::after {
+        content: "";
+        position: absolute;
+        inset: 1.2rem;
+        border: 1px solid rgba(255,255,255,.06);
+        border-radius: calc(var(--radius-2xl) - 1rem);
+      }
+
+      .sigil {
+        position: relative;
+        z-index: 1;
+        width: min(100%, 23rem);
+        animation: pulse 4.2s ease-in-out infinite;
+      }
+
+      @keyframes pulse {
+        0%, 100% { transform: scale(1); filter: drop-shadow(0 0 22px rgba(139,92,246,.35)); }
+        50% { transform: scale(1.025); filter: drop-shadow(0 0 42px rgba(184,146,255,.55)); }
+      }
+
+      section {
+        padding-block: 5.5rem;
+      }
+
+      .section-kicker {
+        color: rgba(184, 146, 255, 0.78);
+        font-size: 0.78rem;
+        font-weight: 800;
+        letter-spacing: 0.22em;
+        text-transform: uppercase;
+      }
+
+      h2 {
+        margin-top: 1rem;
+        max-width: 760px;
+        font-size: clamp(2.6rem, 5vw, 5rem);
+        line-height: 0.95;
+        letter-spacing: -0.07em;
+        font-weight: 760;
+      }
+
+      .section-copy {
+        margin-top: 1.2rem;
+        max-width: 650px;
+        color: var(--muted);
+        line-height: 1.75;
+      }
+
+      .feature-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 1rem;
+        margin-top: 3rem;
+      }
+
+      .feature-card,
+      .link-card,
+      .terminal-panel,
+      .stat-card,
+      .install-card {
+        border: 1px solid var(--line-soft);
+        background: var(--panel);
+        box-shadow: 0 24px 80px rgba(0,0,0,.24);
+        backdrop-filter: blur(18px);
+      }
+
+      .feature-card {
+        min-height: 235px;
+        padding: 1.7rem;
+        border-radius: 1.7rem;
+      }
+
+      .feature-icon {
+        width: 2.65rem;
+        height: 2.65rem;
+        display: grid;
+        place-items: center;
+        border-radius: 1rem;
+        color: var(--violet-2);
+        background: rgba(184, 146, 255, 0.08);
+        border: 1px solid rgba(184,146,255,.12);
+      }
+
+      .feature-card h3 {
+        margin-top: 1.35rem;
+        font-size: 1.12rem;
+        letter-spacing: -0.02em;
+      }
+
+      .feature-card p {
+        margin-top: 0.75rem;
+        color: rgba(255,255,255,.55);
+        line-height: 1.7;
+        font-size: 0.95rem;
+      }
+
+      .split {
+        display: grid;
+        grid-template-columns: 0.94fr 1.06fr;
+        align-items: center;
+        gap: 3rem;
+      }
+
+      .check-list {
+        margin-top: 2rem;
+        display: grid;
+        gap: 0.85rem;
+        color: rgba(255,255,255,.72);
+        font-size: 0.95rem;
+      }
+
+      .check {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+      }
+
+      .dot {
+        width: 0.4rem;
+        height: 0.4rem;
+        border-radius: 999px;
+        background: var(--violet-2);
+        box-shadow: 0 0 20px rgba(184,146,255,.65);
+      }
+
+      .terminal-panel {
+        border-radius: var(--radius-xl);
+        padding: 1rem;
+        background: rgba(8, 8, 18, 0.9);
+      }
+
+      .terminal-top {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0.95rem 1rem;
+        border: 1px solid rgba(255,255,255,.08);
+        border-radius: 1.25rem;
+        background: rgba(255,255,255,.03);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-size: 0.82rem;
+        color: rgba(255,255,255,.7);
+      }
+
+      .live {
+        padding: 0.35rem 0.65rem;
+        border-radius: 999px;
+        background: rgba(139, 92, 246, 0.17);
+        color: rgba(230,216,255,.9);
+        font-family: inherit;
+        font-size: 0.72rem;
+      }
+
+      .terminal-lines {
+        display: grid;
+        gap: 0.75rem;
+        margin-top: 0.9rem;
+      }
+
+      .terminal-block {
+        padding: 1rem;
+        border: 1px solid rgba(255,255,255,.08);
+        border-radius: 1.2rem;
+        background: rgba(255,255,255,.027);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-size: 0.78rem;
+        line-height: 1.7;
+      }
+
+      .prompt {
+        color: rgba(255,255,255,.48);
+      }
+
+      .output {
+        color: rgba(216, 201, 255, .88);
+      }
+
+      .session-grid {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 0.75rem;
+        margin-top: 0.9rem;
+      }
+
+      .stat-card {
+        padding: 1rem;
+        border-radius: 1.2rem;
+      }
+
+      .stat-label {
+        color: rgba(255,255,255,.38);
+        font-size: 0.75rem;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      }
+
+      .stat-value {
+        margin-top: 0.35rem;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-size: 1.5rem;
+      }
+
+      .install-card {
+        padding: clamp(1.5rem, 6vw, 3rem);
+        border-radius: 2.4rem;
+        background:
+          radial-gradient(circle at 50% 0%, rgba(139,92,246,.2), transparent 50%),
+          rgba(255,255,255,.035);
+        text-align: center;
+      }
+
+      .install-card h2 {
+        margin-inline: auto;
+      }
+
+      .code-copy {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1rem;
+        max-width: 760px;
+        margin: 2.2rem auto 0;
+        padding: 1rem 1.1rem;
+        border: 1px solid rgba(255,255,255,.1);
+        border-radius: 1.25rem;
+        background: rgba(0,0,0,.28);
+        color: rgba(255,255,255,.72);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-size: 0.92rem;
+        text-align: left;
+        overflow-x: auto;
+      }
+
+      .code-copy button {
+        border: 0;
+        border-radius: 0.8rem;
+        padding: 0.6rem 0.8rem;
+        background: rgba(184,146,255,.12);
+        color: rgba(230,216,255,.9);
+        cursor: pointer;
+        font-weight: 700;
+      }
+
+      .mini-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 0.85rem;
+        max-width: 760px;
+        margin: 1rem auto 0;
+        text-align: left;
+      }
+
+      .mini {
+        padding: 1rem;
+        border: 1px solid rgba(255,255,255,.085);
+        border-radius: 1.1rem;
+        background: rgba(255,255,255,.025);
+        font-size: 0.78rem;
+        color: rgba(255,255,255,.55);
+      }
+
+      .mini strong {
+        display: block;
+        margin-bottom: 0.35rem;
+        color: rgba(255,255,255,.82);
+      }
+
+      .link-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 1rem;
+        margin-top: 3rem;
+      }
+
+      .link-card {
+        padding: 1.4rem;
+        border-radius: 1.35rem;
+        transition:
+          transform 0.2s ease,
+          background 0.2s ease,
+          border-color 0.2s ease;
+      }
+
+      .link-card:hover {
+        transform: translateY(-2px);
+        border-color: rgba(184,146,255,.2);
+        background: rgba(255,255,255,.06);
+      }
+
+      .link-card h3 {
+        margin-top: 0.9rem;
+        font-size: 1rem;
+      }
+
+      .link-card p {
+        margin-top: 0.55rem;
+        color: rgba(255,255,255,.55);
+        font-size: 0.9rem;
+        line-height: 1.6;
+      }
+
+      footer {
+        border-top: 1px solid rgba(255,255,255,.08);
+        padding-block: 2rem;
+        color: rgba(255,255,255,.5);
+        font-size: 0.82rem;
+      }
+
+      .footer-inner {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1rem;
+      }
+
+      .footer-brand {
+        display: flex;
+        align-items: center;
+        gap: 0.7rem;
+      }
+
+      svg.icon {
+        width: 1.25rem;
+        height: 1.25rem;
+      }
+
+      @media (max-width: 900px) {
+        nav {
+          display: none;
+        }
+
+        .hero,
+        .split,
+        .feature-grid,
+        .link-grid,
+        .mini-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .hero {
+          padding-top: 2rem;
+        }
+
+        .feature-card {
+          min-height: auto;
+        }
+
+        .footer-inner {
+          align-items: flex-start;
+          flex-direction: column;
+        }
+      }
+
+      @media (max-width: 560px) {
+        .container {
+          width: min(100% - 2rem, 1180px);
+        }
+
+        h1 {
+          font-size: 4rem;
+        }
+
+        .hero-actions,
+        .cta-actions {
+          flex-direction: column;
+        }
+
+        .button {
+          width: 100%;
+        }
+
+        .session-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .code-copy {
+          align-items: stretch;
+          flex-direction: column;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="background" aria-hidden="true">
+      <div class="glow-top"></div>
+      <div class="glow-side"></div>
+      <div class="glow-bottom"></div>
+      <div class="grid-bg"></div>
+      <div class="noise"></div>
+    </div>
+
+    <div class="page">
+      <header class="container">
+        <a class="brand" href="#top" aria-label="OpenCoven home">
+          <span class="brand-mark"><svg width="28" height="28" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><defs><linearGradient id="mark-a" x1="512" y1="90" x2="512" y2="940" gradientUnits="userSpaceOnUse"><stop stop-color="#B892FF"/><stop offset=".58" stop-color="#8B5CF6"/><stop offset="1" stop-color="#5B3CFF"/></linearGradient></defs><g fill="url(#mark-a)"><path d="M250 300C180 330 150 400 180 460C210 520 280 540 340 510C300 500 260 460 260 410C260 360 300 330 350 330L250 300Z"/><path d="M774 300C844 330 874 400 844 460C814 520 744 540 684 510C724 500 764 460 764 410C764 360 724 330 674 330L774 300Z"/><path d="M512 140C420 240 360 360 320 520C290 640 240 720 180 780L360 940C340 820 360 700 400 600C440 500 470 420 512 360C554 420 584 500 624 600C664 700 684 820 664 940L844 780C784 720 734 640 704 520C664 360 604 240 512 140Z"/><path d="M512 260C460 340 420 440 400 560C440 600 584 600 624 560C604 440 564 340 512 260Z" fill="#050508"/><path d="M512 360C480 420 460 480 464 560C466 600 480 640 512 680C544 640 558 600 560 560C564 480 544 420 512 360Z"/><path d="M512 492L548 608H526V722H498V608H476L512 492Z" fill="#050508"/><path d="M438 536C392 603 395 690 470 746C438 670 458 605 498 554C476 562 456 572 438 536Z"/><path d="M586 536C632 603 629 690 554 746C586 670 566 605 526 554C548 562 568 572 586 536Z"/><rect x="438" y="746" width="148" height="22" rx="2"/><path d="M464 768H560L535 820H489L464 768Z"/><path d="M512 800L542 920H482L512 800Z"/></g></svg></span>
+          <span>OpenCoven</span>
+        </a>
+        <nav aria-label="Primary navigation">
+          <a href="#runtime">Runtime</a>
+          <a href="#features">Features</a>
+          <a href="#install">Install</a>
+          <a href="#community">Community</a>
+        </nav>
+      </header>
+
+      <main id="top">
+        <section class="container hero">
+          <div>
+            <div class="eyebrow">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8L12 3z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8L19 15z"/></svg>
+              Rust-first harness substrate
+            </div>
+            <h1>One project. Any harness. Visible work.</h1>
+            <p class="lead">
+              Coven is a local runtime for running Codex and Claude Code as
+              project-scoped, attachable sessions. It gives developer tools a
+              shared substrate for launching, watching, and controlling agentic work.
+            </p>
+            <div class="hero-actions">
+              <a class="button button-primary" href="#install">
+                Start with Coven
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14"/><path d="M13 5l7 7-7 7"/></svg>
+              </a>
+              <a class="button button-secondary" href="https://github.com/OpenCoven/coven">
+                View GitHub
+              </a>
+            </div>
+          </div>
+
+          <div class="sigil-wrap" aria-hidden="true">
+            <div class="sigil-glow"></div>
+            <div class="sigil-card">
+              <svg class="sigil" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="mark-b" x1="512" y1="90" x2="512" y2="940" gradientUnits="userSpaceOnUse"><stop stop-color="#B892FF"/><stop offset=".58" stop-color="#8B5CF6"/><stop offset="1" stop-color="#5B3CFF"/></linearGradient></defs><g fill="url(#mark-b)"><path d="M250 300C180 330 150 400 180 460C210 520 280 540 340 510C300 500 260 460 260 410C260 360 300 330 350 330L250 300Z"/><path d="M774 300C844 330 874 400 844 460C814 520 744 540 684 510C724 500 764 460 764 410C764 360 724 330 674 330L774 300Z"/><path d="M512 140C420 240 360 360 320 520C290 640 240 720 180 780L360 940C340 820 360 700 400 600C440 500 470 420 512 360C554 420 584 500 624 600C664 700 684 820 664 940L844 780C784 720 734 640 704 520C664 360 604 240 512 140Z"/><path d="M512 260C460 340 420 440 400 560C440 600 584 600 624 560C604 440 564 340 512 260Z" fill="#050508"/><path d="M512 360C480 420 460 480 464 560C466 600 480 640 512 680C544 640 558 600 560 560C564 480 544 420 512 360Z"/><path d="M512 492L548 608H526V722H498V608H476L512 492Z" fill="#050508"/><path d="M438 536C392 603 395 690 470 746C438 670 458 605 498 554C476 562 456 572 438 536Z"/><path d="M586 536C632 603 629 690 554 746C586 670 566 605 526 554C548 562 568 572 586 536Z"/><rect x="438" y="746" width="148" height="22" rx="2"/><path d="M464 768H560L535 820H489L464 768Z"/><path d="M512 800L542 920H482L512 800Z"/></g></svg>
+            </div>
+          </div>
+        </section>
+
+        <section id="features" class="container">
+          <div class="section-kicker">Developer-native control</div>
+          <h2>Not another chat box. A harness layer.</h2>
+          <p class="section-copy">
+            Coven stays close to the metal: local process supervision, attachable PTYs,
+            session metadata, and a small API that other tools can trust without absorbing the runtime.
+          </p>
+          <div class="feature-grid">
+            <article class="feature-card">
+              <div class="feature-icon"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 17l6-6-6-6"/><path d="M12 19h8"/></svg></div>
+              <h3>Local harness runtime</h3>
+              <p>Run Codex and Claude Code inside explicit project boundaries with foreground, detached, and attachable session flows.</p>
+            </article>
+            <article class="feature-card">
+              <div class="feature-icon"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg></div>
+              <h3>Visible execution</h3>
+              <p>List, attach, inspect, and recover session state without digging through invisible agent internals or terminal archaeology.</p>
+            </article>
+            <article class="feature-card">
+              <div class="feature-icon"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3v12"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg></div>
+              <h3>Client substrate</h3>
+              <p>Give comux, OpenClaw plugins, and future OpenCoven surfaces one stable local API for session orchestration.</p>
+            </article>
+          </div>
+        </section>
+
+        <section id="runtime" class="container">
+          <div class="split">
+            <div>
+              <div class="section-kicker">Local-first runtime</div>
+              <h2>A daemon you own.</h2>
+              <p class="section-copy">
+                Coven runs on your machine, in your repo, with local SQLite-backed metadata.
+                The boundary is the project root; the job is keeping autonomous work visible and controllable.
+              </p>
+              <div class="check-list">
+                <div class="check"><span class="dot"></span> Strict project-root session boundaries</div>
+                <div class="check"><span class="dot"></span> Local daemon API over Unix socket</div>
+                <div class="check"><span class="dot"></span> SQLite metadata and event history</div>
+                <div class="check"><span class="dot"></span> External OpenClaw plugin via ClawHub</div>
+              </div>
+            </div>
+            <div class="terminal-panel">
+              <div class="terminal-top">
+                <span>coven://project/open</span>
+                <span class="live">live</span>
+              </div>
+              <div class="terminal-lines">
+                <div class="terminal-block">
+                  <div class="prompt">$ coven daemon start</div>
+                  <div class="output">&gt; listening on local socket</div>
+                  <div class="output">&gt; project root verified</div>
+                </div>
+                <div class="terminal-block">
+                  <div class="prompt">$ coven run codex "fix failing tests"</div>
+                  <div class="output">&gt; session codex-73k2 created</div>
+                  <div class="output">&gt; attach with coven attach codex-73k2</div>
+                </div>
+              </div>
+              <div class="session-grid">
+                <div class="stat-card"><div class="stat-label">sessions.running</div><div class="stat-value">02</div></div>
+                <div class="stat-card"><div class="stat-label">harnesses.ready</div><div class="stat-value">codex</div></div>
+                <div class="stat-card"><div class="stat-label">events.tailed</div><div class="stat-value">1.2k</div></div>
+                <div class="stat-card"><div class="stat-label">scope</div><div class="stat-value">repo</div></div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="install" class="container">
+          <div class="install-card">
+            <div class="section-kicker">Public early access</div>
+            <h2>Bring any familiar into the circle.</h2>
+            <p class="section-copy" style="margin-inline:auto;">
+              Coven is early, public, and developer-facing. Clone the repo, start the daemon,
+              and run Codex or Claude Code where the work is visible.
+            </p>
+            <div class="code-copy" role="group" aria-label="Install command">
+              <code>git clone https://github.com/OpenCoven/coven.git</code>
+              <button type="button" data-copy="git clone https://github.com/OpenCoven/coven.git">Copy</button>
+            </div>
+            <div class="mini-grid">
+              <div class="mini"><strong>1. Build</strong><code>cargo build --workspace --locked</code></div>
+              <div class="mini"><strong>2. Start</strong><code>coven daemon start</code></div>
+              <div class="mini"><strong>3. Run</strong><code>coven run codex "fix tests"</code></div>
+            </div>
+            <div class="cta-actions" style="justify-content:center;">
+              <a class="button button-primary" href="https://github.com/OpenCoven/coven#readme">Read the docs</a>
+              <a class="button button-secondary" href="https://github.com/OpenCoven/coven/issues">File an issue</a>
+            </div>
+          </div>
+        </section>
+
+        <section id="community" class="container">
+          <div class="section-kicker">OpenCoven ecosystem</div>
+          <h2>Shape the substrate with us.</h2>
+          <p class="section-copy">
+            The v0 path starts with Codex, Claude Code, comux, and the external OpenClaw plugin.
+            Future harnesses and clients plug into the same local contract.
+          </p>
+          <div class="link-grid">
+            <a class="link-card" href="https://github.com/OpenCoven/coven">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 22v-4a4.8 4.8 0 0 0-1-3.5c3 0 6-2 6-5.5.08-1.25-.27-2.48-1-3.5.28-1.15.28-2.35 0-3.5 0 0-1 0-3 1.5-2.64-.5-5.36-.5-8 0C6 2 5 2 5 2c-.3 1.15-.3 2.35 0 3.5A5.4 5.4 0 0 0 4 9c0 3.5 3 5.5 6 5.5-.39.49-.68 1.3-.8 2.1-1.8.8-3.2.3-4.2-1.1 0 0-.8-1.5-2-1.6 0 0-1.3 0-.1.8 0 0 .9.4 1.5 2 0 0 .8 2.5 4.7 1.7V22"/></svg>
+              <h3>GitHub</h3>
+              <p>Source, roadmap, issues, and release work.</p>
+            </a>
+            <a class="link-card" href="https://github.com/OpenCoven/coven/blob/main/docs/MVP-PLAN.md">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M4 4.5A2.5 2.5 0 0 1 6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5z"/></svg>
+              <h3>MVP plan</h3>
+              <p>Current scope, API direction, and done criteria.</p>
+            </a>
+            <a class="link-card" href="https://discord.gg/opencoven">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"/></svg>
+              <h3>Discord</h3>
+              <p>Join the OpenCoven community: discord.gg/opencoven.</p>
+            </a>
+          </div>
+        </section>
+      </main>
+
+      <footer>
+        <div class="container footer-inner">
+          <div class="footer-brand">
+            <span class="footer-mark"><svg width="20" height="20" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><defs><linearGradient id="mark-c" x1="512" y1="90" x2="512" y2="940" gradientUnits="userSpaceOnUse"><stop stop-color="#B892FF"/><stop offset=".58" stop-color="#8B5CF6"/><stop offset="1" stop-color="#5B3CFF"/></linearGradient></defs><path fill="url(#mark-c)" d="M512 140C420 240 360 360 320 520C290 640 240 720 180 780L360 940C340 820 360 700 400 600C440 500 470 420 512 360C554 420 584 500 624 600C664 700 684 820 664 940L844 780C784 720 734 640 704 520C664 360 604 240 512 140Z"/></svg></span>
+            <span>© 2026 OpenCoven. MIT licensed.</span>
+          </div>
+          <a href="https://x.com/OpenCvn">@OpenCvn</a>
+        </div>
+      </footer>
+    </div>
+
+    <script>
+      for (const button of document.querySelectorAll("[data-copy]")) {
+        button.addEventListener("click", async () => {
+          const text = button.getAttribute("data-copy");
+          try {
+            await navigator.clipboard.writeText(text);
+            const old = button.textContent;
+            button.textContent = "Copied";
+            setTimeout(() => (button.textContent = old), 1400);
+          } catch {
+            button.textContent = "Copy failed";
+          }
+        });
+      }
+    </script>
+  </body>
+</html>
