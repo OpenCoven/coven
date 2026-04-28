@@ -70,9 +70,7 @@
       .glow-top,
       .glow-side,
       .glow-bottom {
-        position: absolute;
-        border-radius: 999px;
-        filter: blur(80px);
+        display: none;
       }
 
       .glow-top {
@@ -103,20 +101,15 @@
       .grid-bg {
         position: absolute;
         inset: 0;
-        opacity: 0.16;
-        background-image:
-          linear-gradient(to right, rgba(255, 255, 255, 0.035) 1px, transparent 1px),
-          linear-gradient(to bottom, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
+        opacity: 0.14;
+        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='72' height='72' viewBox='0 0 72 72'%3E%3Cpath d='M72 0H0v72' fill='none' stroke='rgba(255,255,255,0.16)' stroke-width='1'/%3E%3C/svg%3E");
         background-size: 72px 72px;
-        mask-image: radial-gradient(circle at 50% 18%, black, transparent 76%);
       }
 
       .noise {
         position: absolute;
         inset: 0;
-        opacity: 0.08;
-        background-image: radial-gradient(rgba(255,255,255,.65) 0.6px, transparent 0.6px);
-        background-size: 3px 3px;
+        opacity: 0;
       }
 
       .page {
@@ -134,6 +127,11 @@
         align-items: center;
         justify-content: space-between;
         padding-block: 1.5rem;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+        backdrop-filter: blur(12px);
+        position: sticky;
+        top: 0;
+        z-index: 100;
       }
 
       .brand {
@@ -148,15 +146,38 @@
       .footer-mark {
         display: grid;
         place-items: center;
-        border: 1px solid rgba(184, 146, 255, 0.16);
-        background: rgba(255,255,255,.035);
-        box-shadow: 0 0 42px rgba(139, 92, 246, 0.18);
+        border: 1px solid rgba(184, 146, 255, 0.2);
+        background: #0b0b12;
+        box-shadow: 0 0 0 1px rgba(139, 92, 246, 0.08), 0 20px 60px rgba(0, 0, 0, 0.35);
+      }
+
+      .svg-sprite {
+        position: absolute;
+        width: 0;
+        height: 0;
+        overflow: hidden;
+      }
+
+      .logo {
+        display: block;
+        color: var(--violet);
+        filter: drop-shadow(0 0 24px rgba(139, 92, 246, 0.32));
+      }
+
+      .logo-small {
+        width: 2.25rem;
+        height: 2.25rem;
+      }
+
+      .logo-footer {
+        width: 1.25rem;
+        height: 1.25rem;
       }
 
       .brand-mark {
-        width: 2.6rem;
-        height: 2.6rem;
-        border-radius: 1rem;
+        width: 3.15rem;
+        height: 3.15rem;
+        border-radius: 1.05rem;
       }
 
       .footer-mark {
@@ -182,26 +203,37 @@
 
       .hero {
         display: grid;
-        grid-template-columns: 1.04fr 0.96fr;
+        grid-template-columns: minmax(0, 1fr) minmax(420px, 500px);
         align-items: center;
         gap: 3.5rem;
         min-height: calc(100vh - 90px);
-        padding-block: 3rem 7rem;
+        padding-block: 4rem 8rem;
+      }
+
+      .hero > * {
+        min-width: 0;
       }
 
       .eyebrow {
         display: inline-flex;
         align-items: center;
         gap: 0.5rem;
-        padding: 0.45rem 0.72rem;
-        border: 1px solid rgba(184, 146, 255, 0.18);
+        padding: 0.55rem 1rem;
+        border: 1px solid rgba(184, 146, 255, 0.24);
         border-radius: 999px;
-        background: rgba(184, 146, 255, 0.045);
-        color: rgba(230, 216, 255, 0.86);
+        background: rgba(184, 146, 255, 0.065);
+        backdrop-filter: blur(12px);
+        color: rgba(230, 216, 255, 0.92);
         font-size: 0.72rem;
         font-weight: 700;
         letter-spacing: 0.22em;
         text-transform: uppercase;
+        transition: all 0.3s ease;
+      }
+
+      .eyebrow:hover {
+        background: rgba(184, 146, 255, 0.09);
+        border-color: rgba(184, 146, 255, 0.36);
       }
 
       h1,
@@ -214,26 +246,39 @@
       h1 {
         max-width: 850px;
         margin-top: 1.5rem;
-        font-size: clamp(4rem, 9vw, 8.6rem);
-        line-height: 0.86;
-        letter-spacing: -0.085em;
-        font-weight: 760;
+        color: #f5f5f7;
+        font-size: clamp(3.4rem, 9.2vw, 7.8rem);
+        line-height: 1.0;
+        letter-spacing: -0.08em;
+        font-weight: 820;
+        text-wrap: balance;
+      }
+
+      h1 span {
+        display: block;
       }
 
       .lead {
         max-width: 690px;
         margin-top: 1.8rem;
-        color: var(--muted);
-        font-size: clamp(1.08rem, 2vw, 1.32rem);
-        line-height: 1.65;
+        color: rgba(245, 245, 247, 0.72);
+        font-size: clamp(1.02rem, 1.8vw, 1.22rem);
+        line-height: 1.7;
+        font-weight: 420;
+        letter-spacing: -0.01em;
       }
 
       .hero-actions,
       .cta-actions {
         display: flex;
-        flex-wrap: wrap;
-        gap: 0.8rem;
-        margin-top: 2.2rem;
+        gap: 1rem;
+        margin-top: 2.6rem;
+      }
+
+      .hero-actions .button,
+      .cta-actions .button {
+        flex: 1 1 0;
+        max-width: 240px;
       }
 
       .button {
@@ -241,89 +286,229 @@
         align-items: center;
         justify-content: center;
         gap: 0.55rem;
-        min-height: 3.1rem;
-        padding-inline: 1.2rem;
-        border-radius: 1.05rem;
-        font-size: 0.9rem;
-        font-weight: 760;
+        min-height: 3.2rem;
+        padding-inline: 1.4rem;
+        border-radius: 1.15rem;
+        font-size: 0.92rem;
+        font-weight: 780;
+        letter-spacing: -0.01em;
         transition:
-          transform 0.2s ease,
-          background 0.2s ease,
-          border-color 0.2s ease;
+          transform 0.25s cubic-bezier(0.34, 1.56, 0.64, 1),
+          background 0.25s ease,
+          border-color 0.25s ease,
+          box-shadow 0.25s ease;
+        box-shadow: 0 4px 32px rgba(0, 0, 0, 0.12);
       }
 
       .button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 8px 48px rgba(0, 0, 0, 0.2);
+      }
+
+      .button:active {
         transform: translateY(-1px);
       }
 
       .button-primary {
         background: white;
-        color: black;
+        color: #050508;
+        font-weight: 800;
       }
 
       .button-primary:hover {
-        background: #efe7ff;
+        background: #f8f5ff;
+        color: #000;
       }
 
       .button-secondary {
-        border: 1px solid rgba(255,255,255,.12);
-        background: rgba(255,255,255,.04);
-        color: rgba(255,255,255,.84);
+        border: 1.5px solid rgba(255,255,255,.15);
+        background: rgba(255,255,255,.05);
+        color: rgba(255,255,255,.88);
+        backdrop-filter: blur(8px);
       }
 
       .button-secondary:hover {
-        border-color: rgba(255,255,255,.2);
-        background: rgba(255,255,255,.075);
+        border-color: rgba(255,255,255,.28);
+        background: rgba(255,255,255,.1);
+        backdrop-filter: blur(12px);
       }
 
-      .sigil-wrap {
+      .hero-console {
         position: relative;
         width: min(100%, 560px);
-        aspect-ratio: 1;
+        min-width: 0;
         margin-inline: auto;
+        padding: 1rem;
+        transform: translateY(-1rem);
+        border: 1px solid rgba(224, 210, 255, 0.14);
+        border-radius: 2rem;
+        background: #080812;
+        box-shadow:
+          0 32px 120px rgba(0, 0, 0, 0.45),
+          0 0 0 1px rgba(139, 92, 246, 0.08),
+          inset 0 0 0 1px rgba(255, 255, 255, 0.035);
       }
 
-      .sigil-glow {
-        position: absolute;
-        inset: 0;
-        border-radius: var(--radius-2xl);
-        background: rgba(139, 92, 246, 0.2);
-        filter: blur(60px);
-      }
-
-      .sigil-card {
-        position: relative;
-        display: grid;
-        place-items: center;
-        height: 100%;
-        padding: clamp(2rem, 6vw, 4rem);
-        border: 1px solid rgba(224, 210, 255, 0.13);
-        border-radius: var(--radius-2xl);
-        background:
-          radial-gradient(circle at 50% 28%, rgba(184, 146, 255, 0.18), transparent 48%),
-          linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.015));
-        box-shadow: var(--shadow);
-        overflow: hidden;
-      }
-
-      .sigil-card::after {
+      .hero-console::before {
         content: "";
         position: absolute;
-        inset: 1.2rem;
-        border: 1px solid rgba(255,255,255,.06);
-        border-radius: calc(var(--radius-2xl) - 1rem);
+        inset: -1.1rem;
+        z-index: -1;
+        border: 1px solid rgba(139, 92, 246, 0.12);
+        border-radius: 2.7rem;
+        box-shadow: 0 0 80px rgba(139, 92, 246, 0.16);
       }
 
-      .sigil {
-        position: relative;
-        z-index: 1;
-        width: min(100%, 23rem);
-        animation: pulse 4.2s ease-in-out infinite;
+      .console-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1rem;
+        padding: 0.85rem 0.9rem 1rem;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
       }
 
-      @keyframes pulse {
-        0%, 100% { transform: scale(1); filter: drop-shadow(0 0 22px rgba(139,92,246,.35)); }
-        50% { transform: scale(1.025); filter: drop-shadow(0 0 42px rgba(184,146,255,.55)); }
+      .console-brand {
+        display: flex;
+        min-width: 0;
+        align-items: center;
+        gap: 0.78rem;
+      }
+
+      .console-logo {
+        display: grid;
+        place-items: center;
+        width: 3.15rem;
+        height: 3.15rem;
+        border: 1px solid rgba(139, 92, 246, 0.28);
+        border-radius: 1.05rem;
+        background: #050508;
+        box-shadow: 0 0 34px rgba(139, 92, 246, 0.2);
+      }
+
+      .logo-console {
+        width: 2.25rem;
+        height: 2.25rem;
+      }
+
+      .console-title {
+        font-weight: 780;
+        letter-spacing: -0.02em;
+      }
+
+      .console-subtitle {
+        margin-top: 0.18rem;
+        color: rgba(255, 255, 255, 0.46);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-size: 0.74rem;
+      }
+
+      .console-status {
+        flex: 0 0 auto;
+        padding: 0.38rem 0.62rem;
+        border: 1px solid rgba(139, 92, 246, 0.24);
+        border-radius: 999px;
+        background: rgba(139, 92, 246, 0.1);
+        color: rgba(230, 216, 255, 0.88);
+        font-size: 0.68rem;
+        font-weight: 780;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .manager-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 0.75rem;
+        margin-top: 1rem;
+      }
+
+      .manager-card {
+        min-width: 0;
+        padding: 1rem;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 1.25rem;
+        background: rgba(255, 255, 255, 0.028);
+      }
+
+      .manager-card strong {
+        display: block;
+        font-size: 0.95rem;
+        letter-spacing: -0.02em;
+      }
+
+      .manager-card span {
+        display: block;
+        margin-top: 0.45rem;
+        color: rgba(255, 255, 255, 0.48);
+        font-size: 0.78rem;
+      }
+
+      .manager-pill {
+        display: inline-flex;
+        margin-top: 0.9rem;
+        padding: 0.38rem 0.62rem;
+        border: 1px solid rgba(139, 92, 246, 0.24);
+        border-radius: 999px;
+        background: rgba(139, 92, 246, 0.1);
+        color: rgba(230, 216, 255, 0.88);
+        font-size: 0.68rem;
+        font-style: normal;
+        font-weight: 780;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+      }
+
+      .console-terminal {
+        margin-top: 0.75rem;
+        padding: 1rem;
+        border: 1px solid rgba(139, 92, 246, 0.12);
+        border-radius: 1.25rem;
+        background: #050508;
+        overflow-x: auto;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-size: 0.78rem;
+        line-height: 1.72;
+      }
+
+      .console-terminal div {
+        overflow-wrap: anywhere;
+      }
+
+      .console-terminal .muted {
+        color: rgba(255, 255, 255, 0.44);
+      }
+
+      .console-terminal .accent {
+        color: rgba(184, 146, 255, 0.92);
+      }
+
+      .console-metrics {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 0.75rem;
+        margin-top: 0.75rem;
+      }
+
+      .console-metric {
+        padding: 0.85rem;
+        border: 1px solid rgba(255, 255, 255, 0.07);
+        border-radius: 1rem;
+        background: rgba(255, 255, 255, 0.024);
+      }
+
+      .console-metric span {
+        display: block;
+        color: rgba(255, 255, 255, 0.38);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-size: 0.68rem;
+      }
+
+      .console-metric strong {
+        display: block;
+        margin-top: 0.32rem;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-size: 1.08rem;
       }
 
       section {
@@ -510,9 +695,7 @@
       .install-card {
         padding: clamp(1.5rem, 6vw, 3rem);
         border-radius: 2.4rem;
-        background:
-          radial-gradient(circle at 50% 0%, rgba(139,92,246,.2), transparent 50%),
-          rgba(255,255,255,.035);
+        background: rgba(255,255,255,.035);
         text-align: center;
       }
 
@@ -631,12 +814,28 @@
         height: 1.25rem;
       }
 
+      @media (max-width: 1100px) {
+        .hero {
+          grid-template-columns: 1fr;
+          gap: 3rem;
+          min-height: auto;
+          padding-block: 3rem 6rem;
+        }
+
+        .hero-console {
+          width: min(100%, 620px);
+        }
+      }
+
       @media (max-width: 900px) {
         nav {
           display: none;
         }
 
-        .hero,
+        header {
+          padding-block: 1.2rem;
+        }
+
         .split,
         .feature-grid,
         .link-grid,
@@ -645,7 +844,18 @@
         }
 
         .hero {
-          padding-top: 2rem;
+          padding-top: 2.5rem;
+          gap: 3rem;
+          min-height: auto;
+          padding-bottom: 5rem;
+        }
+
+        h1 {
+          font-size: clamp(2.8rem, 8vw, 5.2rem);
+        }
+
+        .lead {
+          font-size: clamp(0.95rem, 1.4vw, 1.1rem);
         }
 
         .feature-card {
@@ -658,22 +868,73 @@
         }
       }
 
-      @media (max-width: 560px) {
+      @media (max-width: 640px) {
         .container {
-          width: min(100% - 2rem, 1180px);
+          width: min(100% - 1.8rem, 1180px);
+        }
+
+        header {
+          padding-block: 1.2rem;
         }
 
         h1 {
-          font-size: 4rem;
+          margin-top: 1.2rem;
+          font-size: clamp(2.35rem, 12vw, 3.15rem);
+          line-height: 0.98;
+          letter-spacing: -0.065em;
+        }
+
+        .lead {
+          margin-top: 1.5rem;
+          font-size: 0.95rem;
+          line-height: 1.65;
         }
 
         .hero-actions,
         .cta-actions {
           flex-direction: column;
+          gap: 0.75rem;
+          margin-top: 2rem;
         }
 
         .button {
           width: 100%;
+          min-height: 3rem;
+          font-size: 0.88rem;
+        }
+
+        .eyebrow {
+          padding: 0.45rem 0.8rem;
+          font-size: 0.68rem;
+        }
+
+        .hero-console {
+          margin-top: 2rem;
+          width: 100%;
+          padding: 0.75rem;
+          border-radius: 1.55rem;
+          transform: none;
+        }
+
+        .hero-console::before {
+          inset: -0.6rem;
+          border-radius: 2rem;
+        }
+
+        .console-header {
+          align-items: flex-start;
+        }
+
+        .console-status {
+          display: none;
+        }
+
+        .manager-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .console-metrics {
+          display: none;
         }
 
         .session-grid {
@@ -683,11 +944,33 @@
         .code-copy {
           align-items: stretch;
           flex-direction: column;
+          gap: 0.5rem;
+        }
+
+        .mini-grid {
+          grid-template-columns: 1fr;
+          gap: 0.65rem;
+        }
+
+        .mini {
+          padding: 0.75rem;
+          font-size: 0.75rem;
         }
       }
     </style>
   </head>
   <body>
+
+    <svg class="svg-sprite" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <symbol id="opencoven-mark" viewBox="0 0 1024 1024">
+        <path fill="currentColor" d="M512 82c121 90 213 219 280 389 21 53 52 101 94 144-82-14-152-48-210-102-35-33-65-72-90-117-19 68-44 129-74 182-30-53-55-114-74-182-25 45-55 84-90 117-58 54-128 88-210 102 42-43 73-91 94-144C299 301 391 172 512 82Z"/>
+        <path fill="#050508" d="M512 220c66 74 114 168 145 282-42-26-82-66-119-119-10 57-18 98-26 123-8-25-16-66-26-123-37 53-77 93-119 119 31-114 79-208 145-282Z"/>
+        <path fill="currentColor" d="M146 259l117 47-20 48-89-35c-17 58-10 111 21 158l-44 27c-48-74-43-158 15-245Zm732 0c58 87 63 171 15 245l-44-27c31-47 38-100 21-158l-89 35-20-48 117-47Z"/>
+        <path fill="currentColor" d="M512 314l76 177h-42v143h-68V491h-42l76-177Z"/>
+        <path fill="currentColor" d="M410 468c-34 47-44 103-30 166 13 56 46 101 99 136-24-58-27-112-10-162 13-39 34-74 63-105-46 10-84-2-122-35Zm204 0c34 47 44 103 30 166-13 56-46 101-99 136 24-58 27-112 10-162-13-39-34-74-63-105 46 10 84-2 122-35Z"/>
+        <path fill="currentColor" d="M397 760h230v48H397zM452 808h120l-34 73h-52l-34-73Zm60 52l46 108h-92l46-108Z"/>
+      </symbol>
+    </svg>
     <div class="background" aria-hidden="true">
       <div class="glow-top"></div>
       <div class="glow-side"></div>
@@ -699,7 +982,7 @@
     <div class="page">
       <header class="container">
         <a class="brand" href="#top" aria-label="OpenCoven home">
-          <span class="brand-mark"><svg width="28" height="28" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><defs><linearGradient id="mark-a" x1="512" y1="90" x2="512" y2="940" gradientUnits="userSpaceOnUse"><stop stop-color="#B892FF"/><stop offset=".58" stop-color="#8B5CF6"/><stop offset="1" stop-color="#5B3CFF"/></linearGradient></defs><g fill="url(#mark-a)"><path d="M250 300C180 330 150 400 180 460C210 520 280 540 340 510C300 500 260 460 260 410C260 360 300 330 350 330L250 300Z"/><path d="M774 300C844 330 874 400 844 460C814 520 744 540 684 510C724 500 764 460 764 410C764 360 724 330 674 330L774 300Z"/><path d="M512 140C420 240 360 360 320 520C290 640 240 720 180 780L360 940C340 820 360 700 400 600C440 500 470 420 512 360C554 420 584 500 624 600C664 700 684 820 664 940L844 780C784 720 734 640 704 520C664 360 604 240 512 140Z"/><path d="M512 260C460 340 420 440 400 560C440 600 584 600 624 560C604 440 564 340 512 260Z" fill="#050508"/><path d="M512 360C480 420 460 480 464 560C466 600 480 640 512 680C544 640 558 600 560 560C564 480 544 420 512 360Z"/><path d="M512 492L548 608H526V722H498V608H476L512 492Z" fill="#050508"/><path d="M438 536C392 603 395 690 470 746C438 670 458 605 498 554C476 562 456 572 438 536Z"/><path d="M586 536C632 603 629 690 554 746C586 670 566 605 526 554C548 562 568 572 586 536Z"/><rect x="438" y="746" width="148" height="22" rx="2"/><path d="M464 768H560L535 820H489L464 768Z"/><path d="M512 800L542 920H482L512 800Z"/></g></svg></span>
+          <span class="brand-mark"><svg class="logo logo-small" aria-hidden="true"><use href="#opencoven-mark"></use></svg></span>
           <span>OpenCoven</span>
         </a>
         <nav aria-label="Primary navigation">
@@ -717,7 +1000,7 @@
               <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8L12 3z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8L19 15z"/></svg>
               Rust-first harness substrate
             </div>
-            <h1>Manage the managers.</h1>
+            <h1><span>Manage the</span><span>managers.</span></h1>
             <p class="lead">
               Coven is a local runtime for the AI systems that run your work:
               Codex, Claude Code, and the next wave of coding harnesses. One project.
@@ -729,17 +1012,50 @@
                 <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14"/><path d="M13 5l7 7-7 7"/></svg>
               </a>
               <a class="button button-secondary" href="https://github.com/OpenCoven/coven">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2M9 5a2 2 0 0 0 2 2h2a2 2 0 0 0 2-2M9 5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2m-3 7h3m-3 4h3"/></svg>
                 View GitHub
               </a>
             </div>
           </div>
 
-          <div class="sigil-wrap" aria-hidden="true">
-            <div class="sigil-glow"></div>
-            <div class="sigil-card">
-              <svg class="sigil" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="mark-b" x1="512" y1="90" x2="512" y2="940" gradientUnits="userSpaceOnUse"><stop stop-color="#B892FF"/><stop offset=".58" stop-color="#8B5CF6"/><stop offset="1" stop-color="#5B3CFF"/></linearGradient></defs><g fill="url(#mark-b)"><path d="M250 300C180 330 150 400 180 460C210 520 280 540 340 510C300 500 260 460 260 410C260 360 300 330 350 330L250 300Z"/><path d="M774 300C844 330 874 400 844 460C814 520 744 540 684 510C724 500 764 460 764 410C764 360 724 330 674 330L774 300Z"/><path d="M512 140C420 240 360 360 320 520C290 640 240 720 180 780L360 940C340 820 360 700 400 600C440 500 470 420 512 360C554 420 584 500 624 600C664 700 684 820 664 940L844 780C784 720 734 640 704 520C664 360 604 240 512 140Z"/><path d="M512 260C460 340 420 440 400 560C440 600 584 600 624 560C604 440 564 340 512 260Z" fill="#050508"/><path d="M512 360C480 420 460 480 464 560C466 600 480 640 512 680C544 640 558 600 560 560C564 480 544 420 512 360Z"/><path d="M512 492L548 608H526V722H498V608H476L512 492Z" fill="#050508"/><path d="M438 536C392 603 395 690 470 746C438 670 458 605 498 554C476 562 456 572 438 536Z"/><path d="M586 536C632 603 629 690 554 746C586 670 566 605 526 554C548 562 568 572 586 536Z"/><rect x="438" y="746" width="148" height="22" rx="2"/><path d="M464 768H560L535 820H489L464 768Z"/><path d="M512 800L542 920H482L512 800Z"/></g></svg>
+          <aside class="hero-console" aria-label="Coven manager console preview">
+            <div class="console-header">
+              <div class="console-brand">
+                <span class="console-logo"><svg class="logo logo-console" aria-hidden="true"><use href="#opencoven-mark"></use></svg></span>
+                <div>
+                  <div class="console-title">Coven daemon</div>
+                  <div class="console-subtitle">localhost · project scoped</div>
+                </div>
+              </div>
+              <span class="console-status">live</span>
             </div>
-          </div>
+
+            <div class="manager-grid">
+              <div class="manager-card">
+                <strong>Codex</strong>
+                <span>fix failing tests</span>
+                <em class="manager-pill">running</em>
+              </div>
+              <div class="manager-card">
+                <strong>Claude Code</strong>
+                <span>polish UI copy</span>
+                <em class="manager-pill">attached</em>
+              </div>
+            </div>
+
+            <div class="console-terminal">
+              <div class="muted">$ coven sessions</div>
+              <div class="accent">codex-73k2  running   repo:opencoven/coven</div>
+              <div class="accent">claude-k1x9 attached  pane:comux/main</div>
+              <div class="muted">$ coven attach codex-73k2</div>
+            </div>
+
+            <div class="console-metrics">
+              <div class="console-metric"><span>scope</span><strong>repo</strong></div>
+              <div class="console-metric"><span>events</span><strong>1.2k</strong></div>
+              <div class="console-metric"><span>api</span><strong>local</strong></div>
+            </div>
+          </aside>
         </section>
 
         <section id="features" class="container">
@@ -866,7 +1182,7 @@
       <footer>
         <div class="container footer-inner">
           <div class="footer-brand">
-            <span class="footer-mark"><svg width="20" height="20" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><defs><linearGradient id="mark-c" x1="512" y1="90" x2="512" y2="940" gradientUnits="userSpaceOnUse"><stop stop-color="#B892FF"/><stop offset=".58" stop-color="#8B5CF6"/><stop offset="1" stop-color="#5B3CFF"/></linearGradient></defs><path fill="url(#mark-c)" d="M512 140C420 240 360 360 320 520C290 640 240 720 180 780L360 940C340 820 360 700 400 600C440 500 470 420 512 360C554 420 584 500 624 600C664 700 684 820 664 940L844 780C784 720 734 640 704 520C664 360 604 240 512 140Z"/></svg></span>
+            <span class="footer-mark"><svg class="logo logo-footer" aria-hidden="true"><use href="#opencoven-mark"></use></svg></span>
             <span>© 2026 OpenCoven. MIT licensed.</span>
           </div>
           <a href="https://x.com/OpenCvn">@OpenCvn</a>
