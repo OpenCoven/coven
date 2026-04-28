@@ -1,11 +1,13 @@
 # Coven Brand Assets
 
-The canonical OpenCoven logo assets live in [`assets/opencoven`](../assets/opencoven).
+The canonical OpenCoven logo is [`assets/opencoven/opencoven.svg`](../assets/opencoven/opencoven.svg).
+Raster PNGs in the same directory are derived package and platform preview assets.
 
 ## Logo Pack
 
 | Asset | Size | Intended use |
 | --- | --- | --- |
+| [`opencoven.svg`](../assets/opencoven/opencoven.svg) | Vector, 2272 x 2272 viewBox | Canonical logo source |
 | [`opencoven-16.png`](../assets/opencoven/opencoven-16.png) | 16 x 16 | Small favicon-scale surfaces |
 | [`opencoven-29.png`](../assets/opencoven/opencoven-29.png) | 29 x 29 | Compact platform icon slots |
 | [`opencoven-32.png`](../assets/opencoven/opencoven-32.png) | 32 x 32 | Standard favicon-scale surfaces |
@@ -22,9 +24,9 @@ The canonical OpenCoven logo assets live in [`assets/opencoven`](../assets/openc
 
 ## Package Copies
 
-The npm package READMEs use package-local copies of `opencoven-128.png`:
+The npm package READMEs use package-local copies of `opencoven.svg` so package previews do not depend on files outside the package tarball:
 
-- [`packages/cli/assets/opencoven-128.png`](../packages/cli/assets/opencoven-128.png)
-- [`packages/openclaw-coven/assets/opencoven-128.png`](../packages/openclaw-coven/assets/opencoven-128.png)
+- [`packages/cli/assets/opencoven.svg`](../packages/cli/assets/opencoven.svg)
+- [`packages/openclaw-coven/assets/opencoven.svg`](../packages/openclaw-coven/assets/opencoven.svg)
 
-Keep those copies in sync with [`assets/opencoven/opencoven-128.png`](../assets/opencoven/opencoven-128.png) when updating the logo.
+Keep those copies in sync with [`assets/opencoven/opencoven.svg`](../assets/opencoven/opencoven.svg) when updating the logo. Keep the `opencoven-*.png` files in sync when raster previews are regenerated.
