@@ -1,52 +1,10 @@
 # OpenCoven — Brand & Design System
 
-**Status:** Production-Ready | Last Updated: 2026-04-28
+This file is a pointer to the canonical design system document.
 
----
+**Source of truth:** [`../DESIGN.md`](../DESIGN.md)
 
-## 1. Brand Core
-
-### Positioning
-**OpenCoven** = collective intelligence + controlled power
-
-A system where agents, tools, and workflows converge under intentional orchestration.
-
-### Brand Traits
-- **Arcane, but precise** — mystical without chaos
-- **Technical, not gimmicky** — substance over flair
-- **Powerful, not loud** — confidence without shouting
-- **Minimal, but symbolic** — every element carries weight
-
-### Tone
-- Confident, restrained
-- Slightly esoteric but grounded in capability
-- No fluff, no hype language
-- Direct, authoritative, intellectually rigorous
-
----
-
-## 2. Logo System
-
-### Primary Mark: The Trident-Flame Sigil
-
-**Symbolism:**
-- **Trident** → control, direction, execution
-- **Flame** → intelligence, transformation, power
-- **Hood/crest** → orchestration layer, system boundary
-- **Side crescents** → awareness, sensing, reach
-
-### Usage Rules
-- **Default:** on black background (#000000)
-- **Minimum scale:** 24px (avoid detail loss in flame detail)
-- **Clear space:** margin = height of inner flame tip
-- **Aspect ratio:** preserve exact proportions across all variants
-
-### Logo Variants
-
-| Variant | Use Case | Notes |
-|---------|----------|-------|
-| Full Gradient (Primary) | Landing pages, social banners, hero sections | #6E4BFF → #A78BFF linear |
-| Solid White | Apple icons, small sizes, dark backgrounds | #ffffff only |
+Please make all design-system updates in the repo-root `DESIGN.md` to avoid documentation drift.
 | Solid Black | Light backgrounds, print | #000000 only |
 | Monoline (Optional) | Dev docs, diagrams, technical contexts | Single stroke, no fill |
 
