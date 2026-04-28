@@ -122,6 +122,8 @@ Coven is the room where harnesses run. The clients decide how to present and rou
 - [MVP plan](docs/MVP-PLAN.md)
 - [Future harnesses](docs/FUTURE-HARNESSES.md)
 - [Brand assets](docs/BRAND.md)
+- [Design system](DESIGN.md)
+- [Brand adherence checklist](docs/BRANDING-ADHERENCE.md)
 - [Security policy](SECURITY.md)
 
 ## Contributing

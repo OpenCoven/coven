@@ -1,0 +1,35 @@
+@import url("./assets/color-tokens.css");
+@import url("./assets/typography.css");
+/* Landing-page adherence overrides. Keep this file loaded after inline page styles. */
+:root {
+  --bg: var(--oc-black);
+  --panel: rgba(255, 255, 255, 0.035);
+  --panel-strong: rgba(255, 255, 255, 0.06);
+  --line: var(--oc-border-strong);
+  --line-soft: var(--oc-border-subtle);
+  --text: var(--oc-text);
+  --muted: var(--oc-text-muted);
+  --faint: var(--oc-text-faint);
+  --violet: var(--oc-purple-2);
+  --violet-2: var(--oc-purple-3);
+  --violet-3: var(--oc-purple-1);
+  --ink: var(--oc-surface-2);
+}
+
+body { background: var(--oc-black); }
+header, .eyebrow, .button-secondary, .feature-card, .link-card, .terminal-panel, .stat-card, .install-card { backdrop-filter: none !important; }
+header { background: rgba(0, 0, 0, 0.82); border-bottom-color: var(--oc-border-subtle); }
+h1 { letter-spacing: var(--oc-tracking-hero); }
+.section-kicker, .eyebrow, .manager-pill, .console-status { letter-spacing: var(--oc-tracking-label); }
+.brand-mark, .footer-mark, .console-logo { border-color: rgba(167, 139, 255, 0.22); background: var(--oc-black); }
+.logo { color: var(--oc-purple-3); }
+.button { transform: none !important; transition: background .2s ease, border-color .2s ease, box-shadow .2s ease, color .2s ease; }
+.button:hover, .button:active { transform: none !important; }
+.button-primary { background: var(--oc-purple-2); color: var(--oc-white); border: 1px solid rgba(167,139,255,.42); box-shadow: 0 0 0 1px rgba(167,139,255,.12), 0 0 34px rgba(124,92,255,.18); }
+.button-primary:hover { background: var(--oc-purple-1); color: var(--oc-white); box-shadow: var(--oc-hover-glow); }
+.button-secondary { border-color: var(--oc-border-subtle); background: rgba(255,255,255,.035); color: var(--oc-text); }
+.button-secondary:hover, .link-card:hover { border-color: rgba(167,139,255,.28); background: rgba(255,255,255,.05); box-shadow: var(--oc-hover-glow); }
+.hero-console, .terminal-panel, .install-card { background: var(--oc-surface-2); border-color: var(--oc-border-subtle); }
+.hero-console::before { box-shadow: 0 0 80px rgba(124, 92, 255, 0.14); border-color: rgba(124, 92, 255, 0.12); }
+a:focus-visible, button:focus-visible { outline: none; box-shadow: var(--oc-focus-ring); }
+.feature-icon, .manager-pill, .console-status, .live, .code-copy button { background: rgba(138,99,255,.1); border-color: rgba(167,139,255,.18); color: rgba(239,232,255,.92); }

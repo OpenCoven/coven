@@ -3,22 +3,32 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>OpenCoven — Local harness control for agentic work</title>
+    <title>OpenCoven — Orchestrate Intelligence</title>
     <meta
       name="description"
-      content="OpenCoven is a local, Rust-first harness substrate for running Codex and Claude Code as project-scoped, attachable sessions."
+      content="OpenCoven orchestrates multi-agent systems, tools, and workflows under intentional local control."
     />
     <meta property="og:title" content="OpenCoven" />
     <meta
       property="og:description"
-      content="Manage the managers. One project. Any harness. Visible work."
+      content="Multi-agent systems. Unified control. Real execution."
     />
     <meta property="og:type" content="website" />
-    <meta name="theme-color" content="#050508" />
+    <meta property="og:url" content="https://opencoven.ai/" />
+    <meta property="og:image" content="https://opencoven.ai/og.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:image" content="https://opencoven.ai/og.png" />
+    <link rel="icon" href="https://opencoven.ai/favicon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="https://opencoven.ai/apple-touch-icon.png" />
+    <meta name="theme-color" content="#000000" />
+    <link rel="stylesheet" href="./assets/color-tokens.css" />
+    <link rel="stylesheet" href="./assets/typography.css" />
     <style>
       :root {
         color-scheme: dark;
-        --bg: #050508;
+        --bg: var(--oc-black);
         --panel: rgba(255, 255, 255, 0.035);
         --panel-strong: rgba(255, 255, 255, 0.06);
         --line: rgba(255, 255, 255, 0.1);
@@ -26,10 +36,10 @@
         --text: rgba(255, 255, 255, 0.94);
         --muted: rgba(255, 255, 255, 0.62);
         --faint: rgba(255, 255, 255, 0.42);
-        --violet: #8b5cf6;
-        --violet-2: #b892ff;
-        --violet-3: #5b3cff;
-        --ink: #080812;
+        --violet: var(--oc-purple-2);
+        --violet-2: var(--oc-purple-3);
+        --violet-3: var(--oc-purple-1);
+        --ink: var(--oc-surface-2);
         --radius-xl: 2rem;
         --radius-2xl: 3.5rem;
         --shadow: 0 32px 120px rgba(0, 0, 0, 0.45);
@@ -128,7 +138,7 @@
         justify-content: space-between;
         padding-block: 1.5rem;
         border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-        backdrop-filter: blur(12px);
+        backdrop-filter: none;
         position: sticky;
         top: 0;
         z-index: 100;
@@ -147,7 +157,7 @@
         display: grid;
         place-items: center;
         border: 1px solid rgba(184, 146, 255, 0.2);
-        background: #0b0b12;
+        background: var(--oc-black);
         box-shadow: 0 0 0 1px rgba(139, 92, 246, 0.08), 0 20px 60px rgba(0, 0, 0, 0.35);
       }
 
@@ -222,7 +232,7 @@
         border: 1px solid rgba(184, 146, 255, 0.24);
         border-radius: 999px;
         background: rgba(184, 146, 255, 0.065);
-        backdrop-filter: blur(12px);
+        backdrop-filter: none;
         color: rgba(230, 216, 255, 0.92);
         font-size: 0.72rem;
         font-weight: 700;
@@ -246,7 +256,7 @@
       h1 {
         max-width: 850px;
         margin-top: 1.5rem;
-        color: #f5f5f7;
+        color: var(--oc-white);
         font-size: clamp(3.4rem, 9.2vw, 7.8rem);
         line-height: 1.0;
         letter-spacing: -0.08em;
@@ -293,7 +303,6 @@
         font-weight: 780;
         letter-spacing: -0.01em;
         transition:
-          transform 0.25s cubic-bezier(0.34, 1.56, 0.64, 1),
           background 0.25s ease,
           border-color 0.25s ease,
           box-shadow 0.25s ease;
@@ -301,36 +310,36 @@
       }
 
       .button:hover {
-        transform: translateY(-2px);
+        transform: none;
         box-shadow: 0 8px 48px rgba(0, 0, 0, 0.2);
       }
 
       .button:active {
-        transform: translateY(-1px);
+        transform: none;
       }
 
       .button-primary {
         background: white;
-        color: #050508;
+        color: var(--oc-black);
         font-weight: 800;
       }
 
       .button-primary:hover {
-        background: #f8f5ff;
-        color: #000;
+        background: var(--oc-purple-1);
+        color: var(--oc-white);
       }
 
       .button-secondary {
         border: 1.5px solid rgba(255,255,255,.15);
         background: rgba(255,255,255,.05);
         color: rgba(255,255,255,.88);
-        backdrop-filter: blur(8px);
+        backdrop-filter: none;
       }
 
       .button-secondary:hover {
         border-color: rgba(255,255,255,.28);
         background: rgba(255,255,255,.1);
-        backdrop-filter: blur(12px);
+        backdrop-filter: none;
       }
 
       .hero-console {
@@ -342,7 +351,7 @@
         transform: translateY(-1rem);
         border: 1px solid rgba(224, 210, 255, 0.14);
         border-radius: 2rem;
-        background: #080812;
+        background: var(--oc-surface-2);
         box-shadow:
           0 32px 120px rgba(0, 0, 0, 0.45),
           0 0 0 1px rgba(139, 92, 246, 0.08),
@@ -382,7 +391,7 @@
         height: 3.15rem;
         border: 1px solid rgba(139, 92, 246, 0.28);
         border-radius: 1.05rem;
-        background: #050508;
+        background: var(--oc-black);
         box-shadow: 0 0 34px rgba(139, 92, 246, 0.2);
       }
 
@@ -464,7 +473,7 @@
         padding: 1rem;
         border: 1px solid rgba(139, 92, 246, 0.12);
         border-radius: 1.25rem;
-        background: #050508;
+        background: var(--oc-black);
         overflow-x: auto;
         font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
         font-size: 0.78rem;
@@ -554,7 +563,7 @@
         border: 1px solid var(--line-soft);
         background: var(--panel);
         box-shadow: 0 24px 80px rgba(0,0,0,.24);
-        backdrop-filter: blur(18px);
+        backdrop-filter: none;
       }
 
       .feature-card {
@@ -766,13 +775,12 @@
         padding: 1.4rem;
         border-radius: 1.35rem;
         transition:
-          transform 0.2s ease,
           background 0.2s ease,
           border-color 0.2s ease;
       }
 
       .link-card:hover {
-        transform: translateY(-2px);
+        transform: none;
         border-color: rgba(184,146,255,.2);
         background: rgba(255,255,255,.06);
       }
@@ -958,13 +966,14 @@
         }
       }
     </style>
+    <link rel="stylesheet" href="./brand.css" />
   </head>
   <body>
 
     <svg class="svg-sprite" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
       <symbol id="opencoven-mark" viewBox="0 0 1024 1024">
         <path fill="currentColor" d="M512 82c121 90 213 219 280 389 21 53 52 101 94 144-82-14-152-48-210-102-35-33-65-72-90-117-19 68-44 129-74 182-30-53-55-114-74-182-25 45-55 84-90 117-58 54-128 88-210 102 42-43 73-91 94-144C299 301 391 172 512 82Z"/>
-        <path fill="#050508" d="M512 220c66 74 114 168 145 282-42-26-82-66-119-119-10 57-18 98-26 123-8-25-16-66-26-123-37 53-77 93-119 119 31-114 79-208 145-282Z"/>
+        <path fill="#000000" d="M512 220c66 74 114 168 145 282-42-26-82-66-119-119-10 57-18 98-26 123-8-25-16-66-26-123-37 53-77 93-119 119 31-114 79-208 145-282Z"/>
         <path fill="currentColor" d="M146 259l117 47-20 48-89-35c-17 58-10 111 21 158l-44 27c-48-74-43-158 15-245Zm732 0c58 87 63 171 15 245l-44-27c31-47 38-100 21-158l-89 35-20-48 117-47Z"/>
         <path fill="currentColor" d="M512 314l76 177h-42v143h-68V491h-42l76-177Z"/>
         <path fill="currentColor" d="M410 468c-34 47-44 103-30 166 13 56 46 101 99 136-24-58-27-112-10-162 13-39 34-74 63-105-46 10-84-2-122-35Zm204 0c34 47 44 103 30 166-13 56-46 101-99 136 24-58 27-112 10-162-13-39-34-74-63-105 46 10 84-2 122-35Z"/>
@@ -998,22 +1007,22 @@
           <div>
             <div class="eyebrow">
               <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8L12 3z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8L19 15z"/></svg>
-              Rust-first harness substrate
+              Collective intelligence · controlled power
             </div>
-            <h1><span>Manage the</span><span>managers.</span></h1>
+            <h1><span>Orchestrate</span><span>Intelligence.</span></h1>
             <p class="lead">
-              Coven is a local runtime for the AI systems that run your work:
-              Codex, Claude Code, and the next wave of coding harnesses. One project.
-              Any harness. Visible work.
+              Multi-agent systems. Unified control. Real execution.
+              Coven gives agents, tools, and workflows a local orchestration layer
+              where autonomous work remains visible, bounded, and deliberate.
             </p>
             <div class="hero-actions">
               <a class="button button-primary" href="#install">
-                Start with Coven
+                Get Started
                 <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14"/><path d="M13 5l7 7-7 7"/></svg>
               </a>
-              <a class="button button-secondary" href="https://github.com/OpenCoven/coven">
+              <a class="button button-secondary" href="https://github.com/OpenCoven/coven#readme">
                 <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2M9 5a2 2 0 0 0 2 2h2a2 2 0 0 0 2-2M9 5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2m-3 7h3m-3 4h3"/></svg>
-                View GitHub
+                View Docs
               </a>
             </div>
           </div>
