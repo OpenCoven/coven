@@ -7,8 +7,8 @@
   --oc-tracking-heading: -0.02em;
   --oc-tracking-hero: -0.055em;
   --oc-tracking-label: 0.14em;
-  --oc-line-body: 1.6;
-  --oc-line-heading: 1.05;
+  --oc-line-body: 1.4;
+  --oc-line-heading: 1.2;
 }
 
 body { font-family: var(--oc-font-ui); }

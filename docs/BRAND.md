@@ -31,4 +31,4 @@ The npm package READMEs use package-local copies of `opencoven.svg` so package p
 - [`packages/cli/assets/opencoven.svg`](../packages/cli/assets/opencoven.svg)
 - [`packages/openclaw-coven/assets/opencoven.svg`](../packages/openclaw-coven/assets/opencoven.svg)
 
-Keep those copies in sync with [`assets/opencoven/opencoven-128.png`](../assets/opencoven/opencoven-128.png) until package READMEs move to SVG rendering.
+Keep those copies in sync with [`assets/opencoven/opencoven.svg`](../assets/opencoven/opencoven.svg).
