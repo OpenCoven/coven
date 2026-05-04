@@ -172,13 +172,15 @@ function run(command, args, options = {}) {
   }
 }
 
-function publishEnv(dryRun) {
+export function publishEnv(dryRun, env = process.env) {
   if (dryRun) {
-    return process.env;
+    return env;
   }
+
+  const authToken = env.NPM_TOKEN || env.NODE_AUTH_TOKEN;
   return {
-    ...process.env,
-    NODE_AUTH_TOKEN: process.env.NPM_TOKEN
+    ...env,
+    NODE_AUTH_TOKEN: authToken
   };
 }
 

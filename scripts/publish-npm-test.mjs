@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { releaseVersion, targetPackageName, validatePublishVersion } from './publish-npm.mjs';
+import { publishEnv, releaseVersion, targetPackageName, validatePublishVersion } from './publish-npm.mjs';
 
 test('releaseVersion prefers explicit COVEN_NPM_VERSION and strips a leading v', () => {
   assert.equal(
@@ -32,4 +32,12 @@ test('validatePublishVersion allows real publish with explicit release version',
 
 test('macOS target publishes under human-facing native package name', () => {
   assert.equal(targetPackageName('macos'), '@opencoven/cli-macos');
+});
+
+test('publishEnv preserves setup-node NODE_AUTH_TOKEN when NPM_TOKEN is absent', () => {
+  assert.equal(publishEnv(false, { NODE_AUTH_TOKEN: 'from-setup-node', NPM_TOKEN: '' }).NODE_AUTH_TOKEN, 'from-setup-node');
+});
+
+test('publishEnv prefers explicit NPM_TOKEN when present', () => {
+  assert.equal(publishEnv(false, { NODE_AUTH_TOKEN: 'from-setup-node', NPM_TOKEN: 'from-secret' }).NODE_AUTH_TOKEN, 'from-secret');
 });
