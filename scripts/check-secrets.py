@@ -15,7 +15,11 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 EXCLUDED_PARTS = {".git", "target", "node_modules", ".coven", ".comux", ".comux-hooks"}
-EXCLUDED_PATHS = {"scripts/check-secrets.py"}
+EXCLUDED_PATHS = {"scripts/check-secrets.py", "scripts/check-secrets-test.py"}
+LOCKFILE_NAMES = ("pnpm-lock.yaml", "package-lock.json", "yarn.lock")
+LOCKFILE_PACKAGE_KEY = re.compile(r"^\s*(?:['\"]?/?@?[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?(?:@[A-Za-z0-9][^:'\"]*)?['\"]?)\s*:\s*(?:\{\})?\s*$")
+LOCKFILE_PACKAGE_VERSION_ENTRY = re.compile(r"^\s*['\"]?@?[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?['\"]?\s*:\s*\d+\.\d+\.\d+(?:[-+][A-Za-z0-9_.-]+)?\s*$")
+LOCKFILE_INTEGRITY_LINE = re.compile(r"\bintegrity\s*:\s*(?:sha256|sha384|sha512)-[A-Za-z0-9+/=]+")
 SECRET_RULES: list[tuple[str, re.Pattern[str]]] = [
     ("private_key", re.compile(r"-----BEGIN (?:RSA |DSA |EC |OPENSSH |PGP )?PRIVATE KEY-----")),
     ("aws_access_key", re.compile(r"AKIA[0-9A-Z]{16}")),
@@ -46,6 +50,27 @@ def entropy(value: str) -> float:
     return -sum((count / len(value)) * math.log2(count / len(value)) for count in counts.values())
 
 
+def is_lockfile_path(path: str) -> bool:
+    normalized = path.replace("\\", "/")
+    return any(normalized == lockfile or normalized.endswith(f"/{lockfile}") for lockfile in LOCKFILE_NAMES)
+
+
+def is_excluded_path(path: str) -> bool:
+    normalized = path.replace("\\", "/")
+    return normalized in EXCLUDED_PATHS
+
+
+def is_known_safe_lockfile_line(path: str, line: str) -> bool:
+    if not is_lockfile_path(path):
+        return False
+    stripped = line.strip()
+    return bool(
+        LOCKFILE_INTEGRITY_LINE.search(stripped)
+        or LOCKFILE_PACKAGE_KEY.match(stripped)
+        or LOCKFILE_PACKAGE_VERSION_ENTRY.match(stripped)
+    )
+
+
 def scan_text(text: str, path: str) -> list[tuple[str, int, str]]:
     hits: list[tuple[str, int, str]] = []
     for line_number, line in enumerate(text.splitlines(), 1):
@@ -54,6 +79,8 @@ def scan_text(text: str, path: str) -> list[tuple[str, int, str]]:
             if pattern.search(line) and not (allow and name != "private_key"):
                 hits.append((path, line_number, name))
         if allow:
+            continue
+        if is_known_safe_lockfile_line(path, line):
             continue
         for match in re.finditer(r"\b[A-Za-z0-9_+/@.-]{32,}\b", line):
             token = match.group(0)
@@ -76,7 +103,7 @@ def tracked_file_hits() -> list[tuple[str, int, str]]:
     files = sh("git", "ls-files").splitlines()
     hits: list[tuple[str, int, str]] = []
     for rel in files:
-        if rel in EXCLUDED_PATHS:
+        if is_excluded_path(rel):
             continue
         path = ROOT / rel
         if any(part in EXCLUDED_PARTS for part in path.relative_to(ROOT).parts):
@@ -94,7 +121,7 @@ def history_blob_hits() -> list[tuple[str, str, int, str]]:
         parts = row.split(" ", 1)
         sha = parts[0]
         rel = parts[1] if len(parts) > 1 else "<unknown>"
-        if rel in EXCLUDED_PATHS:
+        if is_excluded_path(rel):
             continue
         if sha in seen:
             continue
