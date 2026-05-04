@@ -14,6 +14,7 @@ mod api;
 mod daemon;
 mod harness;
 mod openclaw_repo;
+mod patch;
 mod project;
 mod pty_runner;
 mod store;
