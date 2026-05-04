@@ -6,7 +6,7 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
   - package-ecosystem: npm
-    directory: /packages/cli
+    directory: /packages/openclaw-coven
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
