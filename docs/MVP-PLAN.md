@@ -79,6 +79,7 @@ coven attach <session-id>
 - Minimal local API for comux and external plugin integration.
 - Npm-first distribution wrapper with native binary.
 - Clear public docs for early adopters.
+- `coven patch openclaw` as a CLI-first rescue loop for local OpenClaw source checkouts.
 
 ### Out of scope for MVP
 
@@ -118,6 +119,8 @@ coven run claude "polish this UI"
 8. comux can query sessions through the local API and show them as external/Coven-managed panes.
 9. The external OpenClaw plugin can invoke Coven for at least one local project task without requiring Coven code in the OpenClaw repo.
 10. The npm wrapper exposes the command as `coven`.
+11. A user can run `coven patch openclaw --dry-run --repo <openclaw-source>` and see a safe repair plan without launching a harness.
+12. A user can run `coven patch openclaw "<issue>" --repo <openclaw-source> --harness codex` to launch a supervised patch session that leaves changes uncommitted.
 
 ## 6. Product metrics
 

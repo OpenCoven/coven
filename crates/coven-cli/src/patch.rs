@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use crate::openclaw_repo::{GitState, OpenClawRepo};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,6 +128,8 @@ pub fn summarize_patch_report(report: &PatchOpenClawReport) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     fn request(issue: &str) -> PatchOpenClawRequest {
