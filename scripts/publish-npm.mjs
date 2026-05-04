@@ -131,6 +131,20 @@ export function defaultTargetName(platform, arch) {
   return `${platform}-${arch}`;
 }
 
+if ('NODE_TEST_CONTEXT' in process.env) {
+  const assert = await import('node:assert/strict');
+  const { test } = await import('node:test');
+
+  test('defaultTargetName maps darwin arm64 to macos', () => {
+    assert.strictEqual(defaultTargetName('darwin', 'arm64'), 'macos');
+  });
+
+  test('defaultTargetName falls back to platform-arch for non-special cases', () => {
+    assert.strictEqual(defaultTargetName('linux', 'x64'), 'linux-x64');
+    assert.strictEqual(defaultTargetName('darwin', 'x64'), 'darwin-x64');
+  });
+}
+
 export function validatePublishVersion(version, dryRun) {
   if (!dryRun && version === '0.0.0') {
     throw new Error('Refusing real npm publish with placeholder version 0.0.0. Set COVEN_NPM_VERSION or run from a v* tag.');
