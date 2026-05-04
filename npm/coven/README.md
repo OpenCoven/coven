@@ -13,4 +13,4 @@ The wrapper installs platform-specific native packages through `optionalDependen
 
 ## v0 platform scope
 
-The first publishing proof targets `@opencoven/cli-darwin-arm64` (macOS Apple Silicon). Other platform packages are listed for the stable package contract and will be filled out by follow-up release work. Installing on any other platform will result in a missing-platform-package error until those packages are published.
+The first publishing proof targets `@opencoven/cli-macos` for macOS Apple Silicon. Other platforms are intentionally not advertised yet; installing on unsupported platforms will report that only macOS Apple Silicon is available in v0.

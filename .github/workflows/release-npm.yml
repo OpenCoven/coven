@@ -21,7 +21,7 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  COVEN_NPM_TARGET: darwin-arm64
+  COVEN_NPM_TARGET: macos
 
 jobs:
   verify:
@@ -46,7 +46,7 @@ jobs:
       matrix:
         include:
           # v0 proves the wrapper end-to-end on Val's MB Black / macOS arm64 first.
-          - npm-target: darwin-arm64
+          - npm-target: macos
             rust-target: aarch64-apple-darwin
             runner: macos-latest
             binary: coven
@@ -73,10 +73,10 @@ jobs:
           node-version: 24
       - uses: actions/download-artifact@v6
         with:
-          name: coven-darwin-arm64
+          name: coven-macos
           path: target/aarch64-apple-darwin/release
       - run: chmod +x target/aarch64-apple-darwin/release/coven
-      - run: node scripts/publish-npm.mjs --target=darwin-arm64 --skip-build --dry-run
+      - run: node scripts/publish-npm.mjs --target=macos --skip-build --dry-run
 
   npm-publish:
     name: npm publish manual
@@ -92,7 +92,7 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
       - uses: actions/download-artifact@v6
         with:
-          name: coven-darwin-arm64
+          name: coven-macos
           path: target/aarch64-apple-darwin/release
       - run: chmod +x target/aarch64-apple-darwin/release/coven
       - name: Validate manual publish version
@@ -105,7 +105,7 @@ jobs:
             echo "Refusing to publish placeholder version ${{ inputs.version }}" >&2
             exit 1
           fi
-      - run: node scripts/publish-npm.mjs --target=darwin-arm64 --skip-build --publish
+      - run: node scripts/publish-npm.mjs --target=macos --skip-build --publish
         env:
           COVEN_NPM_VERSION: ${{ inputs.version }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}

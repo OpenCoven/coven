@@ -9,40 +9,12 @@ const repoRoot = path.resolve(__dirname, '..');
 const distRoot = path.join(repoRoot, 'npm', 'dist');
 
 const targets = {
-  'darwin-arm64': {
-    packageName: '@opencoven/cli-darwin-arm64',
+  macos: {
+    packageName: '@opencoven/cli-macos',
     os: 'darwin',
     cpu: 'arm64',
     rustTarget: 'aarch64-apple-darwin',
     binaryName: 'coven'
-  },
-  'darwin-x64': {
-    packageName: '@opencoven/cli-darwin-x64',
-    os: 'darwin',
-    cpu: 'x64',
-    rustTarget: 'x86_64-apple-darwin',
-    binaryName: 'coven'
-  },
-  'linux-x64': {
-    packageName: '@opencoven/cli-linux-x64',
-    os: 'linux',
-    cpu: 'x64',
-    rustTarget: 'x86_64-unknown-linux-gnu',
-    binaryName: 'coven'
-  },
-  'linux-arm64': {
-    packageName: '@opencoven/cli-linux-arm64',
-    os: 'linux',
-    cpu: 'arm64',
-    rustTarget: 'aarch64-unknown-linux-gnu',
-    binaryName: 'coven'
-  },
-  'win32-x64': {
-    packageName: '@opencoven/cli-win32-x64',
-    os: 'win32',
-    cpu: 'x64',
-    rustTarget: 'x86_64-pc-windows-msvc',
-    binaryName: 'coven.exe'
   }
 };
 
@@ -58,7 +30,7 @@ function main() {
     return found ? found.slice(prefix.length) : undefined;
   };
 
-  const targetName = optionValue('--target') ?? process.env.COVEN_NPM_TARGET ?? `${process.platform}-${process.arch}`;
+  const targetName = optionValue('--target') ?? process.env.COVEN_NPM_TARGET ?? defaultTargetName(process.platform, process.arch);
   const dryRun = args.has('--dry-run') || !args.has('--publish');
   const skipBuild = args.has('--skip-build');
   const version = releaseVersion(process.env, wrapperPackageVersion());
@@ -146,6 +118,17 @@ export function releaseVersion(env = process.env, packageVersion = wrapperPackag
   }
 
   return packageVersion;
+}
+
+export function targetPackageName(targetName) {
+  return targets[targetName]?.packageName;
+}
+
+export function defaultTargetName(platform, arch) {
+  if (platform === 'darwin' && arch === 'arm64') {
+    return 'macos';
+  }
+  return `${platform}-${arch}`;
 }
 
 export function validatePublishVersion(version, dryRun) {

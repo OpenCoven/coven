@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { releaseVersion, validatePublishVersion } from './publish-npm.mjs';
+import { releaseVersion, targetPackageName, validatePublishVersion } from './publish-npm.mjs';
 
 test('releaseVersion prefers explicit COVEN_NPM_VERSION and strips a leading v', () => {
   assert.equal(
@@ -28,4 +28,8 @@ test('validatePublishVersion allows dry-run with placeholder version', () => {
 
 test('validatePublishVersion allows real publish with explicit release version', () => {
   assert.doesNotThrow(() => validatePublishVersion('1.2.3', false));
+});
+
+test('macOS target publishes under human-facing native package name', () => {
+  assert.equal(targetPackageName('macos'), '@opencoven/cli-macos');
 });

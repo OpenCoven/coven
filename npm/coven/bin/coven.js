@@ -5,11 +5,7 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 
 const PLATFORM_PACKAGES = {
-  'darwin-arm64': '@opencoven/cli-darwin-arm64',
-  'darwin-x64': '@opencoven/cli-darwin-x64',
-  'linux-arm64': '@opencoven/cli-linux-arm64',
-  'linux-x64': '@opencoven/cli-linux-x64',
-  'win32-x64': '@opencoven/cli-win32-x64'
+  'darwin-arm64': '@opencoven/cli-macos'
 };
 
 const binaryName = process.platform === 'win32' ? 'coven.exe' : 'coven';
@@ -23,7 +19,7 @@ function wrapperVersion() {
 function resolveBinary() {
   if (!packageName) {
     throw new Error(
-      `Unsupported platform ${platformKey}. Coven publishes native packages for: ${Object.keys(PLATFORM_PACKAGES).join(', ')}.`
+      `Unsupported platform ${platformKey}. Coven v0 publishes native npm packages for macOS Apple Silicon only.`
     );
   }
 
@@ -31,7 +27,7 @@ function resolveBinary() {
     return require.resolve(`${packageName}/bin/${binaryName}`);
   } catch (error) {
     throw new Error(
-      `Could not find native Coven package ${packageName}. Reinstall @opencoven/cli so npm can install the optional dependency for ${platformKey}. Original error: ${error.message}`
+      `Could not find native Coven package ${packageName}. Reinstall @opencoven/cli so npm can install the macOS optional dependency. Original error: ${error.message}`
     );
   }
 }

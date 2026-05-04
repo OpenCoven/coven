@@ -17,11 +17,7 @@
     "url": "git+https://github.com/OpenCoven/coven.git"
   },
   "optionalDependencies": {
-    "@opencoven/cli-darwin-arm64": "0.0.0",
-    "@opencoven/cli-darwin-x64": "0.0.0",
-    "@opencoven/cli-linux-arm64": "0.0.0",
-    "@opencoven/cli-linux-x64": "0.0.0",
-    "@opencoven/cli-win32-x64": "0.0.0"
+    "@opencoven/cli-macos": "0.0.0"
   },
   "engines": {
     "node": ">=18"
