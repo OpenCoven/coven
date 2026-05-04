@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { publishEnv, releaseVersion, targetPackageName, validatePublishVersion } from './publish-npm.mjs';
+import { publishEnv, releaseVersion, targetPackageName, validatePublishToken, validatePublishVersion } from './publish-npm.mjs';
 
 test('releaseVersion prefers explicit COVEN_NPM_VERSION and strips a leading v', () => {
   assert.equal(
@@ -40,4 +40,20 @@ test('publishEnv preserves setup-node NODE_AUTH_TOKEN when NPM_TOKEN is absent',
 
 test('publishEnv prefers explicit NPM_TOKEN when present', () => {
   assert.equal(publishEnv(false, { NODE_AUTH_TOKEN: 'from-setup-node', NPM_TOKEN: 'from-secret' }).NODE_AUTH_TOKEN, 'from-secret');
+});
+
+test('validatePublishToken allows real publish when only NODE_AUTH_TOKEN is set', () => {
+  assert.doesNotThrow(() => validatePublishToken({ NODE_AUTH_TOKEN: 'from-setup-node' }, false));
+});
+
+test('validatePublishToken allows real publish when only NPM_TOKEN is set', () => {
+  assert.doesNotThrow(() => validatePublishToken({ NPM_TOKEN: 'from-secret' }, false));
+});
+
+test('validatePublishToken rejects real publish when neither token is set', () => {
+  assert.throws(() => validatePublishToken({}, false), /Refusing real npm publish without NPM_TOKEN or NODE_AUTH_TOKEN/);
+});
+
+test('validatePublishToken allows dry-run when no tokens are set', () => {
+  assert.doesNotThrow(() => validatePublishToken({}, true));
 });

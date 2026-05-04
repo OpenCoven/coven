@@ -41,9 +41,7 @@ function main() {
   }
 
   validatePublishVersion(version, dryRun);
-  if (!dryRun && process.env.NPM_TOKEN === undefined) {
-    fail('Refusing real npm publish without NPM_TOKEN. Prefer --dry-run until Val manually approves publishing.');
-  }
+  validatePublishToken(process.env, dryRun);
 
   if (!skipBuild) {
     run('cargo', ['build', '--release', '--target', target.rustTarget]);
@@ -148,6 +146,12 @@ if ('NODE_TEST_CONTEXT' in process.env) {
 export function validatePublishVersion(version, dryRun) {
   if (!dryRun && version === '0.0.0') {
     throw new Error('Refusing real npm publish with placeholder version 0.0.0. Set COVEN_NPM_VERSION or run from a v* tag.');
+  }
+}
+
+export function validatePublishToken(env, dryRun) {
+  if (!dryRun && !env.NPM_TOKEN && !env.NODE_AUTH_TOKEN) {
+    throw new Error('Refusing real npm publish without NPM_TOKEN or NODE_AUTH_TOKEN. Set one of these to authenticate with the npm registry.');
   }
 }
 
