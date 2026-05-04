@@ -1,10 +1,13 @@
 import {
+  createCovenPluginConfigSchema,
+  resolveCovenPluginConfig,
+} from "./src/config.js";
+import { CovenAcpRuntime, COVEN_BACKEND_ID } from "./src/runtime.js";
+import {
   registerAcpRuntimeBackend,
   unregisterAcpRuntimeBackend,
 } from "openclaw/plugin-sdk/acp-runtime";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
-import { createCovenPluginConfigSchema, resolveCovenPluginConfig } from "./src/config.js";
-import { CovenAcpRuntime, COVEN_BACKEND_ID } from "./src/runtime.js";
 
 const COVEN_PLUGIN_ID = "opencoven-coven";
 

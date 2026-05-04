@@ -11,6 +11,18 @@ This directory holds the product and architecture notes for Coven, the OpenCoven
 - [Brand assets](BRAND.md) — canonical logo, token, typography, and social asset pack.
 - [Brand adherence checklist](BRANDING-ADHERENCE.md) — implementation progress, exceptions, and risks.
 
+## OpenClaw rescue loop
+
+Coven can help repair a local OpenClaw source checkout without relying on a healthy OpenClaw runtime:
+
+```sh
+coven patch openclaw
+coven patch openclaw "fix Codex auth profile order after invalidated OAuth token"
+coven patch openclaw --repo ~/Documents/GitHub/openclaw/openclaw --harness codex --dry-run
+```
+
+The guided flow detects the repo, asks what is broken, launches a supervised Codex or Claude Code session, runs verification, and reports changed files. Coven does not commit or push in v0.
+
 ## Documentation stance
 
 Keep these docs aligned with VMUX-style clarity while staying specific to OpenCoven:

@@ -54,6 +54,14 @@ coven attach <session-id>
 
 `coven doctor` checks whether supported local harness CLIs are available. `coven run` creates a project-scoped session record, validates the working directory, and launches the selected harness through Coven-managed PTY execution.
 
+Coven also provides a rescue loop for OpenClaw contributors and users:
+
+```sh
+coven patch openclaw
+```
+
+If OpenClaw breaks, Coven gives you a predictable repair room: choose a repo, choose a harness, get a verified patch.
+
 ## What it does
 
 Coven is the local harness substrate for OpenCoven. It does not replace your coding agent, your UI, or OpenClaw. It gives them a shared room where project work can happen visibly and safely.

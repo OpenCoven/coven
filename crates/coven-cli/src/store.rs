@@ -218,6 +218,23 @@ pub fn insert_event(conn: &Connection, record: &EventRecord) -> Result<()> {
     Ok(())
 }
 
+pub fn insert_json_event(
+    conn: &Connection,
+    session_id: &str,
+    kind: &str,
+    payload: &serde_json::Value,
+    created_at: &str,
+) -> Result<()> {
+    let record = EventRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        session_id: session_id.to_string(),
+        kind: kind.to_string(),
+        payload_json: payload.to_string(),
+        created_at: created_at.to_string(),
+    };
+    insert_event(conn, &record)
+}
+
 pub fn list_events(conn: &Connection, session_id: &str) -> Result<Vec<EventRecord>> {
     let mut statement = conn
         .prepare(
@@ -410,6 +427,28 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "input");
         assert_eq!(events[0].payload_json, r#"{"data":"hello"}"#);
+        Ok(())
+    }
+
+    #[test]
+    fn inserts_json_event() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+        let session = session_record("session-1", "2026-04-27T06:00:00Z");
+        insert_session(&conn, &session)?;
+
+        insert_json_event(
+            &conn,
+            "session-1",
+            "patch_metadata",
+            &serde_json::json!({"target":"openclaw"}),
+            "2026-04-27T06:01:00Z",
+        )?;
+
+        let events = list_events(&conn, "session-1")?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "patch_metadata");
+        assert!(events[0].payload_json.contains("openclaw"));
         Ok(())
     }
 
