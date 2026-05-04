@@ -1,0 +1,111 @@
+name: Release npm packages
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish to npm for real. Requires npm-publish environment approval.'
+        required: true
+        default: false
+        type: boolean
+      version:
+        description: 'Release version to publish, without a leading v. Required when publish=true.'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  COVEN_NPM_TARGET: darwin-arm64
+
+jobs:
+  verify:
+    name: Release gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: python3 scripts/check-secrets.py
+
+  build-platform:
+    name: Build ${{ matrix.npm-target }}
+    runs-on: ${{ matrix.runner }}
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # v0 proves the wrapper end-to-end on Val's MB Black / macOS arm64 first.
+          - npm-target: darwin-arm64
+            rust-target: aarch64-apple-darwin
+            runner: macos-latest
+            binary: coven
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-target }}
+      - run: cargo build --release --target ${{ matrix.rust-target }}
+      - uses: actions/upload-artifact@v5
+        with:
+          name: coven-${{ matrix.npm-target }}
+          path: target/${{ matrix.rust-target }}/release/${{ matrix.binary }}
+          if-no-files-found: error
+
+  npm-dry-run:
+    name: npm publish dry-run
+    runs-on: ubuntu-latest
+    needs: build-platform
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v6
+        with:
+          name: coven-darwin-arm64
+          path: target/aarch64-apple-darwin/release
+      - run: chmod +x target/aarch64-apple-darwin/release/coven
+      - run: node scripts/publish-npm.mjs --target=darwin-arm64 --skip-build --dry-run
+
+  npm-publish:
+    name: npm publish manual
+    runs-on: ubuntu-latest
+    needs: build-platform
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish }}
+    environment: npm-publish
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: 'https://registry.npmjs.org'
+      - uses: actions/download-artifact@v6
+        with:
+          name: coven-darwin-arm64
+          path: target/aarch64-apple-darwin/release
+      - run: chmod +x target/aarch64-apple-darwin/release/coven
+      - name: Validate manual publish version
+        run: |
+          if [ -z "${{ inputs.version }}" ]; then
+            echo "workflow_dispatch publish requires a non-placeholder version input" >&2
+            exit 1
+          fi
+          if [ "${{ inputs.version }}" = "0.0.0" ] || [ "${{ inputs.version }}" = "v0.0.0" ]; then
+            echo "Refusing to publish placeholder version ${{ inputs.version }}" >&2
+            exit 1
+          fi
+      - run: node scripts/publish-npm.mjs --target=darwin-arm64 --skip-build --publish
+        env:
+          COVEN_NPM_VERSION: ${{ inputs.version }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
