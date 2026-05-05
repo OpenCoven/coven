@@ -341,3 +341,69 @@ Expose the same repair loop through the external `@opencoven/coven` OpenClaw plu
 - Whether comux should become the preferred visual review surface for patch sessions.
 - How recipe definitions should be distributed and versioned.
 - How to safely support custom harnesses or user-provided commands.
+
+## Amendment: single Supreme orchestrator (2026-05-05)
+
+Status: accepted, supersedes the bare CLI orchestration described above.
+
+### Motivation
+
+The v0 implementation routes `coven patch openclaw` through a direct CLI function that opens SQLite, launches a PTY, and writes events on its own. That conflicts with the operational model, which names the Rust daemon as the single local authority for process launch, PTY lifecycle, and event persistence. It also makes every invocation a one-shot — there is no shared identity across sessions, and resumption, status, or attach must rediscover state each time.
+
+We adopt a single persistent **Supreme** orchestrator that spans all Coven sessions, with **per-task Leads** spawned to drive individual repair runs.
+
+### Roles
+
+- **Supreme**: one local singleton, hosted by the existing Coven daemon. Owns the registry of active and historical Leads, repo locks, harness pool, and verification gating. Every `coven patch openclaw` invocation becomes a request to the Supreme.
+- **Lead**: one per patch run. Owns a single `PatchOpenClawRequest` from intake through verification and final report. Reports up to the Supreme; never spawns its own Leads.
+
+### Lifecycle
+
+1. CLI invocation builds a `PatchOpenClawRequest` exactly as today (interactive or fast).
+2. CLI ensures the Supreme is running (`coven daemon status` → start if absent in interactive mode; fail closed in `--non-interactive`).
+3. CLI submits the request to the Supreme over the local socket.
+4. Supreme assigns a Lead identity, stores the patch metadata as a session row, and spawns the Lead worker scoped to the selected repo root.
+5. Lead drives the harness PTY, writes output events through the daemon, runs verification, and produces the final report.
+6. CLI streams Lead progress (or summarizes on exit) through the same daemon API used by `coven attach`.
+7. On Lead exit, Supreme retains the Lead record so it appears in `coven sessions` and can be re-attached if `--keep-session` was set.
+
+### Concurrency rules
+
+- Supreme holds at most one active Lead per `repoRoot`. A second concurrent request against the same repo is rejected with a structured error in `--non-interactive` mode and offered an attach in interactive mode.
+- Across repos, multiple Leads may run, bounded by a daemon-side cap (default 4) that protects host load.
+- Verification gates run inside the Lead, never inside the Supreme, to keep the Supreme responsive.
+
+### Failure handling
+
+- If the Supreme is unreachable: interactive mode offers `coven daemon start`; non-interactive mode exits with a structured `daemon_unavailable` error.
+- If a Lead crashes mid-run: Supreme records `failed`, preserves prior events, and never auto-restarts. The user re-runs `coven patch openclaw` to start a fresh Lead.
+- If the daemon dies with Leads in flight: on next start, Supreme marks those Leads `interrupted` so status output is honest.
+
+### Surface area
+
+New local API endpoints, scoped narrowly:
+
+- `POST /patch/openclaw` — submit a `PatchOpenClawRequest`. Returns `{ leadId, sessionId }`.
+- `GET /patch/leads` — list active and recent Leads with repo, harness, status.
+- `GET /patch/leads/:id` — Lead detail including verification status.
+
+`POST /patch/openclaw` is built on the existing `POST /sessions` machinery; it does not introduce a new launch path. It validates `repoRoot` against the same canonicalization and harness allowlist rules.
+
+### CLI changes
+
+- `coven patch openclaw` posts to the Supreme by default. The current direct-launch code path is retired once the Supreme path passes integration tests.
+- `coven sessions` continues to list all sessions, with patch sessions identified by their `patch_metadata` event.
+- Add `coven patch leads` as a thin alias that filters `coven sessions` to patch Leads.
+
+### Migration
+
+- Phase A: wire `POST /patch/openclaw` in the daemon, keep the direct-launch fallback in the CLI behind an internal flag for tests.
+- Phase B: switch the default CLI path to Supreme; keep the direct path only for tests that exercise the Lead worker module without the daemon.
+- Phase C: remove the direct fallback once integration tests cover the Supreme path end to end.
+
+### Non-goals for this amendment
+
+- No remote Supreme. The Supreme is local-only; remote orchestration is out of scope.
+- No multi-tenant Supreme. One Supreme per local user, bound to `COVEN_HOME`.
+- No automatic Lead restart or self-healing.
+- No new Supreme-only persistence schema in v0; Leads reuse session/event tables with a `patch_metadata` event marker.
