@@ -15,6 +15,13 @@ const targets = {
     cpu: 'arm64',
     rustTarget: 'aarch64-apple-darwin',
     binaryName: 'coven'
+  },
+  'linux-x64': {
+    packageName: '@opencoven/cli-linux-x64',
+    os: 'linux',
+    cpu: 'x64',
+    rustTarget: 'x86_64-unknown-linux-gnu',
+    binaryName: 'coven'
   }
 };
 
@@ -33,6 +40,7 @@ function main() {
   const targetName = optionValue('--target') ?? process.env.COVEN_NPM_TARGET ?? defaultTargetName(process.platform, process.arch);
   const dryRun = args.has('--dry-run') || !args.has('--publish');
   const skipBuild = args.has('--skip-build');
+  const skipWrapper = args.has('--skip-wrapper');
   const version = releaseVersion(process.env, wrapperPackageVersion());
   const target = targets[targetName];
 
@@ -56,19 +64,22 @@ function main() {
   mkdirSync(distRoot, { recursive: true });
 
   const platformDir = writePlatformPackage(targetName, target, binaryPath, version);
-  const wrapperDir = writeWrapperPackage(version);
 
   run('npm', ['publish', dryRun ? '--dry-run' : '--access', dryRun ? undefined : 'public'].filter(Boolean), {
     cwd: platformDir,
     env: publishEnv(dryRun)
   });
-  run('npm', ['publish', dryRun ? '--dry-run' : '--access', dryRun ? undefined : 'public'].filter(Boolean), {
-    cwd: wrapperDir,
-    env: publishEnv(dryRun)
-  });
+
+  if (!skipWrapper) {
+    const wrapperDir = writeWrapperPackage(version);
+    run('npm', ['publish', dryRun ? '--dry-run' : '--access', dryRun ? undefined : 'public'].filter(Boolean), {
+      cwd: wrapperDir,
+      env: publishEnv(dryRun)
+    });
+  }
 
   console.log(`Prepared npm packages in ${distRoot}`);
-  console.log(`${dryRun ? 'Dry-run completed' : 'Publish completed'} for ${target.packageName} and @opencoven/cli at version ${version}.`);
+  console.log(`${dryRun ? 'Dry-run completed' : 'Publish completed'} for ${target.packageName}${skipWrapper ? '' : ' and @opencoven/cli'} at version ${version}.`);
 }
 
 function writePlatformPackage(targetName, target, binaryPath, version) {

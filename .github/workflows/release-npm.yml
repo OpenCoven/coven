@@ -45,10 +45,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # v0 proves the wrapper end-to-end on Val's MB Black / macOS arm64 first.
           - npm-target: macos
             rust-target: aarch64-apple-darwin
             runner: macos-latest
+            binary: coven
+          - npm-target: linux-x64
+            rust-target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
             binary: coven
     steps:
       - uses: actions/checkout@v6
@@ -76,7 +79,13 @@ jobs:
           name: coven-macos
           path: target/aarch64-apple-darwin/release
       - run: chmod +x target/aarch64-apple-darwin/release/coven
+      - uses: actions/download-artifact@v8
+        with:
+          name: coven-linux-x64
+          path: target/x86_64-unknown-linux-gnu/release
+      - run: chmod +x target/x86_64-unknown-linux-gnu/release/coven
       - run: node scripts/publish-npm.mjs --target=macos --skip-build --dry-run
+      - run: node scripts/publish-npm.mjs --target=linux-x64 --skip-build --dry-run --skip-wrapper
 
   npm-publish:
     name: npm publish manual
@@ -95,6 +104,11 @@ jobs:
           name: coven-macos
           path: target/aarch64-apple-darwin/release
       - run: chmod +x target/aarch64-apple-darwin/release/coven
+      - uses: actions/download-artifact@v8
+        with:
+          name: coven-linux-x64
+          path: target/x86_64-unknown-linux-gnu/release
+      - run: chmod +x target/x86_64-unknown-linux-gnu/release/coven
       - name: Validate manual publish version
         run: |
           if [ -z "${{ inputs.version }}" ]; then
@@ -105,6 +119,10 @@ jobs:
             echo "Refusing to publish placeholder version ${{ inputs.version }}" >&2
             exit 1
           fi
+      - run: node scripts/publish-npm.mjs --target=linux-x64 --skip-build --publish --skip-wrapper
+        env:
+          COVEN_NPM_VERSION: ${{ inputs.version }}
+          NPM_TOKEN: ${{ secrets.NPM_ACCESS_TOKEN }}
       - run: node scripts/publish-npm.mjs --target=macos --skip-build --publish
         env:
           COVEN_NPM_VERSION: ${{ inputs.version }}
