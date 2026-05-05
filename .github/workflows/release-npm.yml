@@ -108,4 +108,4 @@ jobs:
       - run: node scripts/publish-npm.mjs --target=macos --skip-build --publish
         env:
           COVEN_NPM_VERSION: ${{ inputs.version }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_ACCESS_TOKEN }}

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import { publishEnv, releaseVersion, targetPackageName, validatePublishToken, validatePublishVersion } from './publish-npm.mjs';
@@ -56,4 +57,15 @@ test('validatePublishToken rejects real publish when neither token is set', () =
 
 test('validatePublishToken allows dry-run when no tokens are set', () => {
   assert.doesNotThrow(() => validatePublishToken({}, true));
+});
+
+test('release workflow passes the configured npm publish secret to the publish script', () => {
+  const workflowPath = new URL(
+    ['..', '.github', 'workflows', 'release-npm.yml'].join('/'),
+    import.meta.url
+  );
+  const workflow = readFileSync(workflowPath, 'utf8');
+  const configuredSecret = ['NPM', 'ACCESS', 'TOKEN'].join('_');
+  const expectedLine = ['NPM_TOKEN:', '${{', `secrets.${configuredSecret}`, '}}'].join(' ');
+  assert.ok(workflow.includes(expectedLine));
 });
