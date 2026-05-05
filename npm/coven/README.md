@@ -13,4 +13,9 @@ The wrapper installs platform-specific native packages through `optionalDependen
 
 ## v0 platform scope
 
-The first publishing proof targets `@opencoven/cli-macos` for macOS Apple Silicon. Other platforms are intentionally not advertised yet; installing on unsupported platforms will report that only macOS Apple Silicon is available in v0.
+The first publishing proof targets:
+
+- `@opencoven/cli-macos` for macOS Apple Silicon
+- `@opencoven/cli-linux-x64` for glibc-based Linux x64 distributions
+
+Alpine Linux is not supported.

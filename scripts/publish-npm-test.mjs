@@ -35,6 +35,35 @@ test('macOS target publishes under human-facing native package name', () => {
   assert.equal(targetPackageName('macos'), '@opencoven/cli-macos');
 });
 
+test('linux x64 target publishes under linux native package name', () => {
+  assert.equal(targetPackageName('linux-x64'), '@opencoven/cli-linux-x64');
+});
+
+test('wrapper declares linux x64 native package as an optional dependency', () => {
+  const packagePath = new URL(['..', 'npm', 'coven', 'package.json'].join('/'), import.meta.url);
+  const packageJson = JSON.parse(readFileSync(packagePath, 'utf8'));
+  assert.equal(packageJson.optionalDependencies['@opencoven/cli-linux-x64'], '0.0.0');
+});
+
+test('wrapper binary maps linux x64 to linux native package and documents glibc requirement', () => {
+  const binPath = new URL(['..', 'npm', 'coven', 'bin', 'coven.js'].join('/'), import.meta.url);
+  const bin = readFileSync(binPath, 'utf8');
+  assert.match(bin, /'linux-x64': '@opencoven\/cli-linux-x64'/);
+  assert.match(bin, /glibc-based Linux x64/);
+});
+
+test('release workflow builds and dry-runs linux x64 package', () => {
+  const workflowPath = new URL(
+    ['..', '.github', 'workflows', 'release-npm.yml'].join('/'),
+    import.meta.url
+  );
+  const workflow = readFileSync(workflowPath, 'utf8');
+  assert.match(workflow, /npm-target: linux-x64/);
+  assert.match(workflow, /rust-target: x86_64-unknown-linux-gnu/);
+  assert.match(workflow, /node scripts\/publish-npm\.mjs --target=linux-x64 --skip-build --dry-run --skip-wrapper/);
+  assert.match(workflow, /node scripts\/publish-npm\.mjs --target=linux-x64 --skip-build --publish --skip-wrapper/);
+});
+
 test('publishEnv preserves setup-node NODE_AUTH_TOKEN when NPM_TOKEN is absent', () => {
   assert.equal(publishEnv(false, { NODE_AUTH_TOKEN: 'from-setup-node', NPM_TOKEN: '' }).NODE_AUTH_TOKEN, 'from-setup-node');
 });
