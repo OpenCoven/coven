@@ -9,14 +9,17 @@ Node package wrapper for the native **Coven** CLI.
 Coven is the OpenCoven harness substrate: a local Rust CLI/daemon for project-scoped Codex, Claude Code, and future harness sessions.
 
 ```bash
-npx @opencoven/cli doctor
+npx @opencoven/cli
 ```
 
 The user-facing command remains `coven`; OpenCoven is the package namespace.
 
+Run `coven` with no arguments for the beginner-friendly menu. It starts with setup checks and safe first commands before launching anything.
+
 ## Commands
 
 ```bash
+coven
 coven doctor
 coven daemon start
 coven run codex "fix tests"

@@ -35,7 +35,10 @@ const DEFAULT_TITLE_CHARS: usize = 48;
 
 #[derive(Parser, Debug)]
 #[command(name = "coven")]
-#[command(about = "Project-scoped harness substrate for agent sessions")]
+#[command(about = "Run project-scoped coding agents without memorizing harness commands")]
+#[command(
+    long_about = "Coven runs Codex, Claude Code, and future harnesses inside a local, project-scoped session ledger. Run `coven` with no arguments for a beginner-friendly menu."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -43,26 +46,31 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    #[command(about = "Check local setup and print next steps")]
     Doctor,
+    #[command(about = "Manage the local Coven daemon")]
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
     },
+    #[command(about = "Launch a project-scoped harness session")]
     Run {
+        #[arg(help = "Harness to run: codex or claude")]
         harness: String,
-        #[arg(required = true, num_args = 1..)]
+        #[arg(help = "Task for the harness", required = true, num_args = 1..)]
         prompt: Vec<String>,
-        #[arg(long)]
+        #[arg(long, help = "Working directory inside the current project")]
         cwd: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, help = "Readable title for `coven sessions`")]
         title: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Create the session record without launching the harness")]
         detach: bool,
     },
+    #[command(about = "List recent Coven sessions")]
     Sessions,
-    Attach {
-        session_id: String,
-    },
+    #[command(about = "Replay/follow a session and forward input to live daemon sessions")]
+    Attach { session_id: String },
+    #[command(about = "Guided repair flows")]
     Patch {
         #[command(subcommand)]
         command: PatchCommand,
@@ -120,6 +128,7 @@ fn main() -> Result<()> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MagicalTuiAction {
+    StartHere,
     RunHarness,
     PatchOpenClaw,
     Sessions,
@@ -135,11 +144,10 @@ enum MagicalTuiMove {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MagicalTuiItem {
-    rune: &'static str,
+    key: &'static str,
     label: &'static str,
-    charm: &'static str,
-    ritual: &'static str,
-    spell: &'static str,
+    description: &'static str,
+    command: &'static str,
     action: MagicalTuiAction,
 }
 
@@ -149,48 +157,50 @@ const ROSE: &str = "\x1b[38;5;218m";
 const MOON: &str = "\x1b[38;5;117m";
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
-const MAGICAL_TUI_INNER_WIDTH: usize = 68;
+const MAGICAL_TUI_INNER_WIDTH: usize = 74;
 
 fn magical_tui_items() -> &'static [MagicalTuiItem] {
     &[
         MagicalTuiItem {
-            rune: "☾",
-            label: "Run a harness",
-            charm: "Summon Codex or Claude Code",
-            ritual: "Moonlit harness circle for focused project work",
-            spell: "coven run <harness> <prompt...>",
+            key: "1",
+            label: "Start here",
+            description: "Setup check and a safe first command",
+            command: "coven doctor",
+            action: MagicalTuiAction::StartHere,
+        },
+        MagicalTuiItem {
+            key: "2",
+            label: "Run an agent",
+            description: "Launch Codex or Claude Code inside this project",
+            command: "coven run codex \"fix the failing tests\"",
             action: MagicalTuiAction::RunHarness,
         },
         MagicalTuiItem {
-            rune: "✦",
+            key: "3",
             label: "Patch OpenClaw",
-            charm: "Open the repair-room guided flow",
-            ritual: "OpenClaw repair-room with repo checks and safe verification",
-            spell: "coven patch openclaw",
+            description: "Guided repair room for a local OpenClaw checkout",
+            command: "coven patch openclaw",
             action: MagicalTuiAction::PatchOpenClaw,
         },
         MagicalTuiItem {
-            rune: "◇",
+            key: "4",
             label: "View sessions",
-            charm: "Peek at recent Coven work",
-            ritual: "Read the ledger of recent harness sessions",
-            spell: "coven sessions",
+            description: "See recent, running, and completed harness work",
+            command: "coven sessions",
             action: MagicalTuiAction::Sessions,
         },
         MagicalTuiItem {
-            rune: "✧",
+            key: "5",
             label: "Doctor",
-            charm: "Check familiar readiness",
-            ritual: "Inspect which harness familiars are awake",
-            spell: "coven doctor",
+            description: "Re-check installed harness CLIs and store paths",
+            command: "coven doctor",
             action: MagicalTuiAction::Doctor,
         },
         MagicalTuiItem {
-            rune: "⋆",
-            label: "Leave the circle",
-            charm: "Close Coven for now",
-            ritual: "Let the altar lights fade without changing anything",
-            spell: "q",
+            key: "q",
+            label: "Quit",
+            description: "Exit without changing anything",
+            command: "q",
             action: MagicalTuiAction::Quit,
         },
     ]
@@ -199,7 +209,9 @@ fn magical_tui_items() -> &'static [MagicalTuiItem] {
 fn run_magical_tui() -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         println!("{}", render_magical_tui_frame_plain(0));
-        println!("\nTip: run `coven run codex <prompt...>` or open `coven` in a terminal for the interactive menu.");
+        println!(
+            "\nTip: run `coven doctor` first, then `coven run codex \"fix the failing tests\"`."
+        );
         return Ok(());
     }
 
@@ -220,7 +232,15 @@ fn run_magical_tui() -> Result<()> {
                     selection = move_magical_tui_selection(selection, MagicalTuiMove::Down);
                 }
                 KeyCode::Enter => break magical_tui_items()[selection].action,
-                KeyCode::Esc | KeyCode::Char('q') => break MagicalTuiAction::Quit,
+                KeyCode::Char(value) => {
+                    if let Some(item) = magical_tui_items()
+                        .iter()
+                        .find(|item| item.key.chars().eq(std::iter::once(value)))
+                    {
+                        break item.action;
+                    }
+                }
+                KeyCode::Esc => break MagicalTuiAction::Quit,
                 _ => {}
             }
         }
@@ -233,6 +253,7 @@ fn run_magical_tui() -> Result<()> {
 
 fn run_magical_tui_action(action: MagicalTuiAction) -> Result<()> {
     match action {
+        MagicalTuiAction::StartHere => run_new_user_start_here(),
         MagicalTuiAction::RunHarness => run_guided_harness_session(),
         MagicalTuiAction::PatchOpenClaw => {
             run_patch_openclaw(vec![], None, None, None, false, false, true)
@@ -240,17 +261,34 @@ fn run_magical_tui_action(action: MagicalTuiAction) -> Result<()> {
         MagicalTuiAction::Sessions => list_sessions(),
         MagicalTuiAction::Doctor => run_doctor(),
         MagicalTuiAction::Quit => {
-            println!("{PURPLE}The circle fades. See you soon, little spellcaster. ✨{RESET}");
+            println!("{PURPLE}The circle fades. Nothing changed.{RESET}");
             Ok(())
         }
     }
 }
 
+fn run_new_user_start_here() -> Result<()> {
+    println!("{GOLD}Coven quick start{RESET}");
+    println!("Coven is a safe room for coding agents. It keeps each run tied to this project,");
+    println!("records the session, and lets other tools list or attach to the work later.\n");
+    println!("Recommended first run:");
+    println!("  1. coven doctor");
+    println!("  2. coven run codex \"explain this repo in 5 bullets\"");
+    println!("  3. coven sessions");
+    println!("\nSetup check:\n");
+    run_doctor()
+}
+
 fn run_guided_harness_session() -> Result<()> {
-    println!("{GOLD}✨ Let’s summon a harness familiar.{RESET}");
-    let harness = prompt_for_required_line("Harness [codex/claude]: ")?;
-    let prompt = prompt_for_required_line("What should it work on? ")?;
-    run_session(&harness, &[prompt], None, None, false)
+    println!("{GOLD}Run an agent in this project{RESET}");
+    println!("Coven will create a session record, validate the project root, then attach to the harness.\n");
+    let default_harness = default_harness_id().unwrap_or("codex");
+    let harness_prompt = format!("Harness [default: {default_harness}; options: codex, claude]: ");
+    let harness =
+        prompt_for_optional_line(&harness_prompt)?.unwrap_or_else(|| default_harness.to_string());
+    let prompt = prompt_for_required_line("Task for the agent: ")?;
+    let title = prompt_for_optional_line("Optional session title [enter to skip]: ")?;
+    run_session(&harness, &[prompt], None, title.as_deref(), false)
 }
 
 fn render_magical_tui_frame(selection: usize) -> String {
@@ -270,28 +308,23 @@ fn render_magical_tui_frame_with_color(selection: usize, color_enabled: bool) ->
     let reset = ansi(color_enabled, RESET);
     let mut frame = String::new();
     frame.push_str(&magical_tui_border('╭', '╮', purple, reset));
+    frame.push_str(&magical_tui_centered_row("Coven CLI", gold, purple, reset));
     frame.push_str(&magical_tui_centered_row(
-        "✧ Spellbook ✧",
-        gold,
-        purple,
-        reset,
-    ));
-    frame.push_str(&magical_tui_centered_row(
-        "Coven · purple + gold harness altar",
+        "Run coding agents in a project-scoped, observable session",
         rose,
         purple,
         reset,
     ));
     frame.push_str(&magical_tui_centered_row(
-        "Moonlit harness circle · tiny spells, real work, soft landing",
+        "New here? Pick Start here. Nothing runs until you choose it.",
         moon,
         purple,
         reset,
     ));
     frame.push_str(&magical_tui_border('├', '┤', purple, reset));
-    frame.push_str(&magical_tui_row("Runic keys", gold, purple, reset));
+    frame.push_str(&magical_tui_row("Choose an action", gold, purple, reset));
     frame.push_str(&magical_tui_row(
-        "↑/↓ or j/k to choose · Enter to cast · q/Esc to vanish",
+        "Use arrows or j/k, press Enter, or type 1-5. q/Esc exits.",
         dim,
         purple,
         reset,
@@ -300,28 +333,26 @@ fn render_magical_tui_frame_with_color(selection: usize, color_enabled: bool) ->
 
     for (index, item) in magical_tui_items().iter().enumerate() {
         let pointer = if index == selection { "▸" } else { " " };
-        let content = format!("{pointer} {} {:<17} {}", item.rune, item.label, item.charm);
+        let content = format!(
+            "{pointer} [{}] {:<15} {}",
+            item.key, item.label, item.description
+        );
         let color = if index == selection { gold } else { purple };
         frame.push_str(&magical_tui_row(&content, color, purple, reset));
     }
 
     let selected = magical_tui_items()[selection.min(magical_tui_items().len() - 1)];
     frame.push_str(&magical_tui_border('├', '┤', purple, reset));
-    frame.push_str(&magical_tui_row("Ritual preview", gold, purple, reset));
+    frame.push_str(&magical_tui_row("What happens next", gold, purple, reset));
+    frame.push_str(&magical_tui_row(selected.description, moon, purple, reset));
     frame.push_str(&magical_tui_row(
-        &format!("{} {}", selected.rune, selected.ritual),
-        moon,
-        purple,
-        reset,
-    ));
-    frame.push_str(&magical_tui_row(
-        &format!("Selected spell: {}", selected.spell),
+        &format!("Equivalent command: {}", selected.command),
         gold,
         purple,
         reset,
     ));
     frame.push_str(&magical_tui_row(
-        "Enter to cast · Esc/q to leave the circle",
+        "Coven stores sessions under ~/.coven unless COVEN_HOME is set.",
         dim,
         purple,
         reset,
@@ -393,17 +424,40 @@ fn move_magical_tui_selection(current: usize, direction: MagicalTuiMove) -> usiz
 }
 
 fn run_doctor() -> Result<()> {
-    println!("coven doctor");
-    for harness in harness::built_in_harnesses() {
+    println!("Coven doctor");
+    println!("Store: {}", coven_home_dir()?.display());
+    match std::env::current_dir()
+        .ok()
+        .and_then(|cwd| project::canonical_project_root(&cwd).ok())
+    {
+        Some(root) => println!("Project: {}", root.display()),
+        None => println!("Project: not inside a git/project root yet"),
+    }
+
+    println!("\nHarnesses:");
+    let harnesses = harness::built_in_harnesses();
+    for harness in &harnesses {
         let status = if harness.available {
-            "available"
+            "ready"
         } else {
             "missing"
         };
-        println!("- {} ({}): {status}", harness.label, harness.executable);
+        let marker = if harness.available { "OK" } else { "!!" };
+        println!(
+            "  [{marker}] {:<11} `{}` is {status}",
+            harness.label, harness.executable
+        );
         if !harness.available {
-            println!("  {}", harness.install_hint);
+            println!("       {}", harness.install_hint);
         }
+    }
+
+    println!("\nNext steps:");
+    if let Some(default) = default_harness_id() {
+        println!("  coven run {default} \"explain this repo in 5 bullets\"");
+        println!("  coven sessions");
+    } else {
+        println!("  Install or authenticate Codex/Claude Code, then run `coven doctor` again.");
     }
     Ok(())
 }
@@ -543,6 +597,17 @@ fn prompt_for_required_line(prompt: &str) -> Result<String> {
     Ok(line)
 }
 
+fn prompt_for_optional_line(prompt: &str) -> Result<Option<String>> {
+    print!("{prompt}");
+    io::stdout().flush().context("failed to flush prompt")?;
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .context("failed to read input")?;
+    let line = line.trim().to_string();
+    Ok((!line.is_empty()).then_some(line))
+}
+
 fn confirm_yes(prompt: &str) -> Result<bool> {
     print!("{prompt}");
     io::stdout().flush().context("failed to flush prompt")?;
@@ -562,6 +627,15 @@ fn choose_default_harness() -> Result<patch::HarnessId> {
         return Ok(patch::HarnessId::ClaudeCode);
     }
     anyhow::bail!("no supported harness is available; run `coven doctor` for setup guidance")
+}
+
+fn default_harness_id() -> Option<&'static str> {
+    let harnesses = harness::built_in_harnesses();
+    harnesses
+        .iter()
+        .find(|h| h.id == "codex" && h.available)
+        .or_else(|| harnesses.iter().find(|h| h.id == "claude" && h.available))
+        .map(|h| h.id)
 }
 
 fn launch_patch_session(request: &patch::PatchOpenClawRequest) -> Result<String> {
@@ -706,15 +780,15 @@ fn run_session(
 
     store::insert_session(&conn, &record)?;
 
-    println!(
-        "created session {} harness={} cwd={}",
-        record.id,
-        record.harness,
-        cwd.display()
-    );
+    println!("Coven session created");
+    println!("  id:      {}", record.id);
+    println!("  harness: {}", record.harness);
+    println!("  cwd:     {}", cwd.display());
+    println!("  title:   {}", record.title);
 
     if detach {
-        println!("detached session {}; harness was not spawned", record.id);
+        println!("\nDetached mode: session was recorded but the harness was not spawned.");
+        println!("View it later with `coven sessions`.");
         return Ok(());
     }
 
@@ -762,8 +836,13 @@ fn list_sessions() -> Result<()> {
     let sessions = store::list_sessions(&conn)?;
 
     if sessions.is_empty() {
-        println!("No Coven sessions yet. Create one with `coven run <harness> <prompt...>`.");
+        println!("No Coven sessions yet.");
+        println!("Start with:");
+        println!("  coven doctor");
+        println!("  coven run codex \"explain this repo in 5 bullets\"");
     } else {
+        println!("{:<12} {:<10} {:<8} TITLE", "SESSION", "STATUS", "HARNESS");
+        println!("{:<12} {:<10} {:<8} -----", "-------", "------", "-------");
         for session in sessions {
             println!("{}", format_session_line(&session));
         }
@@ -975,9 +1054,10 @@ fn coven_home_from_env(coven_home: Option<OsString>, home: Option<OsString>) -> 
 }
 
 fn format_session_line(session: &store::SessionRecord) -> String {
+    let short_id = first_chars(&session.id, 12);
     format!(
-        "{} {} {} {}",
-        session.id, session.status, session.harness, session.title
+        "{:<12} {:<10} {:<8} {}",
+        short_id, session.status, session.harness, session.title
     )
 }
 
@@ -1053,9 +1133,9 @@ mod tests {
         let frame = render_magical_tui_frame(1);
 
         assert!(frame.contains("Coven"));
-        assert!(frame.contains("purple"));
-        assert!(frame.contains("gold"));
-        assert!(frame.contains("Run a harness"));
+        assert!(frame.contains("New here?"));
+        assert!(frame.contains("Start here"));
+        assert!(frame.contains("Run an agent"));
         assert!(frame.contains("Patch OpenClaw"));
         assert!(frame.contains("Doctor"));
         assert!(frame.contains("▸"));
@@ -1077,21 +1157,21 @@ mod tests {
     fn magical_tui_frame_previews_selected_spell_command() {
         let frame = render_magical_tui_frame_plain(0);
 
-        assert!(frame.contains("Selected spell"));
-        assert!(frame.contains("coven run <harness> <prompt...>"));
-        assert!(frame.contains("Enter to cast"));
+        assert!(frame.contains("What happens next"));
+        assert!(frame.contains("Equivalent command"));
+        assert!(frame.contains("coven doctor"));
+        assert!(frame.contains("~/.coven"));
     }
 
     #[test]
-    fn magical_tui_frame_feels_like_a_spellbook() {
+    fn magical_tui_frame_is_newcomer_friendly() {
         let frame = render_magical_tui_frame_plain(1);
 
-        assert!(frame.contains("✧ Spellbook ✧"));
-        assert!(frame.contains("Moonlit harness circle"));
-        assert!(frame.contains("Ritual preview"));
-        assert!(frame.contains("OpenClaw repair-room"));
-        assert!(frame.contains("Runic keys"));
-        assert!(frame.contains("purple + gold"));
+        assert!(frame.contains("Run coding agents"));
+        assert!(frame.contains("Nothing runs until"));
+        assert!(frame.contains("Choose an action"));
+        assert!(frame.contains("Launch Codex or Claude Code"));
+        assert!(frame.contains("coven run codex"));
     }
 
     #[test]
@@ -1268,7 +1348,7 @@ mod tests {
 
         assert_eq!(
             format_session_line(&session),
-            "session-id created codex A useful session"
+            "session-id   created    codex    A useful session"
         );
     }
 }

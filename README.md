@@ -42,6 +42,16 @@ pnpm dlx @opencoven/cli doctor
 
 ## Quick Start
 
+New to Coven? Run the interactive menu first:
+
+```sh
+coven
+```
+
+The menu starts with **Start here**, checks your local setup, and shows the safest first command to try.
+
+Prefer copy/paste commands?
+
 ```sh
 cd /path/to/your/project
 coven doctor
@@ -79,6 +89,7 @@ Coven is the local harness substrate for OpenCoven. It does not replace your cod
 
 | Command | Action |
 |---|---|
+| `coven` | Open the beginner-friendly interactive menu |
 | `coven doctor` | Detect supported harness CLIs and print install hints |
 | `coven daemon start` | Start the local Coven daemon |
 | `coven daemon status` | Show daemon health, pid, and socket path |
