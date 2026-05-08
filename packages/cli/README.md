@@ -25,8 +25,14 @@ coven daemon start
 coven run codex "fix tests"
 coven run claude "polish this UI"
 coven sessions
+coven sessions --all
 coven attach <session-id>
+coven summon <session-id>
+coven archive <session-id>
+coven sacrifice <session-id> --yes
 ```
+
+Session rituals use Coven language while staying safe: archive hides old work without deleting it, summon restores archived work, and sacrifice permanently deletes only after explicit `--yes` confirmation.
 
 ## Status
 

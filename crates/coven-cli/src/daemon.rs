@@ -637,6 +637,7 @@ mod tests {
                 title: "hello from coven".to_string(),
                 status: "running".to_string(),
                 exit_code: None,
+                archived_at: None,
                 created_at: "2026-04-27T10:00:00Z".to_string(),
                 updated_at: "2026-04-27T10:00:00Z".to_string(),
             },
@@ -740,6 +741,7 @@ mod tests {
             title: format!("Session {id}"),
             status: "running".to_string(),
             exit_code: None,
+            archived_at: None,
             created_at: "2026-04-27T07:00:00Z".to_string(),
             updated_at: "2026-04-27T07:00:00Z".to_string(),
         }

@@ -59,6 +59,8 @@ coven daemon start
 coven run codex "fix the failing tests"
 coven run claude "polish this UI"
 coven sessions
+coven summon <session-id>
+coven archive <session-id>
 coven attach <session-id>
 ```
 
@@ -97,8 +99,14 @@ Coven is the local harness substrate for OpenCoven. It does not replace your cod
 | `coven run <harness> <prompt>` | Launch a project-scoped harness session |
 | `coven run <harness> <prompt> --cwd <path>` | Launch from a cwd inside the project root |
 | `coven run <harness> <prompt> --title <title>` | Set a readable session title |
-| `coven sessions` | List known sessions |
+| `coven sessions` | List active sessions |
+| `coven sessions --all` | List active and archived sessions |
 | `coven attach <session-id>` | Replay/follow session output and forward input |
+| `coven summon <session-id>` | Restore an archived session, then replay/follow it |
+| `coven archive <session-id>` | Hide a non-running session from the active list while preserving events |
+| `coven sacrifice <session-id> --yes` | Permanently delete a non-running session and its events |
+
+Session rituals are intentionally explicit. **Archive** is reversible and keeps the ledger. **Summon** brings an archived session back into the active list. **Sacrifice** is destructive, refuses live sessions, and requires `--yes` so beginners do not delete work by accident.
 
 ## Local API
 

@@ -12,6 +12,7 @@ pub struct SessionRecord {
     pub title: String,
     pub status: String,
     pub exit_code: Option<i32>,
+    pub archived_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -46,6 +47,7 @@ pub fn open_store(path: &Path) -> Result<Connection> {
             title TEXT NOT NULL,
             status TEXT NOT NULL,
             exit_code INTEGER,
+            archived_at TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -68,6 +70,7 @@ pub fn open_store(path: &Path) -> Result<Connection> {
     )
     .context("failed to initialize Coven store schema")?;
     ensure_exit_code_column(&conn)?;
+    ensure_archived_at_column(&conn)?;
 
     Ok(conn)
 }
@@ -92,6 +95,26 @@ fn ensure_exit_code_column(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_archived_at_column(conn: &Connection) -> Result<()> {
+    let mut statement = conn
+        .prepare("PRAGMA table_info(sessions)")
+        .context("failed to inspect sessions schema")?;
+    let has_archived_at = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .context("failed to query sessions schema")?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to read sessions schema")?
+        .into_iter()
+        .any(|column| column == "archived_at");
+
+    if !has_archived_at {
+        conn.execute("ALTER TABLE sessions ADD COLUMN archived_at TEXT", [])
+            .context("failed to add sessions.archived_at column")?;
+    }
+
+    Ok(())
+}
+
 pub fn insert_session(conn: &Connection, record: &SessionRecord) -> Result<()> {
     conn.execute(
         "INSERT INTO sessions (
@@ -101,9 +124,10 @@ pub fn insert_session(conn: &Connection, record: &SessionRecord) -> Result<()> {
             title,
             status,
             exit_code,
+            archived_at,
             created_at,
             updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             &record.id,
             &record.project_root,
@@ -111,6 +135,7 @@ pub fn insert_session(conn: &Connection, record: &SessionRecord) -> Result<()> {
             &record.title,
             &record.status,
             record.exit_code,
+            &record.archived_at,
             &record.created_at,
             &record.updated_at,
         ],
@@ -154,14 +179,30 @@ pub fn mark_running_sessions_orphaned(conn: &Connection, updated_at: &str) -> Re
 }
 
 pub fn get_session(conn: &Connection, session_id: &str) -> Result<Option<SessionRecord>> {
-    Ok(list_sessions(conn)?
+    Ok(list_sessions_including_archived(conn)?
         .into_iter()
         .find(|session| session.id == session_id))
 }
 
 pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionRecord>> {
+    list_sessions_with_archive_filter(conn, false)
+}
+
+pub fn list_sessions_including_archived(conn: &Connection) -> Result<Vec<SessionRecord>> {
+    list_sessions_with_archive_filter(conn, true)
+}
+
+fn list_sessions_with_archive_filter(
+    conn: &Connection,
+    include_archived: bool,
+) -> Result<Vec<SessionRecord>> {
+    let archive_filter = if include_archived {
+        ""
+    } else {
+        "WHERE archived_at IS NULL"
+    };
     let mut statement = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT
                 id,
                 project_root,
@@ -169,11 +210,13 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionRecord>> {
                 title,
                 status,
                 exit_code,
+                archived_at,
                 created_at,
                 updated_at
             FROM sessions
+            {archive_filter}
             ORDER BY created_at DESC, id DESC",
-        )
+        ))
         .context("failed to prepare session list query")?;
 
     let sessions = statement
@@ -185,8 +228,9 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionRecord>> {
                 title: row.get(3)?,
                 status: row.get(4)?,
                 exit_code: row.get(5)?,
-                created_at: row.get(6)?,
-                updated_at: row.get(7)?,
+                archived_at: row.get(6)?,
+                created_at: row.get(7)?,
+                updated_at: row.get(8)?,
             })
         })
         .context("failed to query sessions")?
@@ -194,6 +238,39 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionRecord>> {
         .context("failed to read sessions")?;
 
     Ok(sessions)
+}
+
+pub fn archive_session(conn: &Connection, session_id: &str, archived_at: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions
+         SET archived_at = ?2,
+             updated_at = ?2
+         WHERE id = ?1",
+        params![session_id, archived_at],
+    )
+    .with_context(|| format!("failed to archive session {session_id}"))?;
+
+    Ok(())
+}
+
+pub fn summon_session(conn: &Connection, session_id: &str, updated_at: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions
+         SET archived_at = NULL,
+             updated_at = ?2
+         WHERE id = ?1",
+        params![session_id, updated_at],
+    )
+    .with_context(|| format!("failed to summon session {session_id}"))?;
+
+    Ok(())
+}
+
+pub fn sacrifice_session(conn: &Connection, session_id: &str) -> Result<()> {
+    conn.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])
+        .with_context(|| format!("failed to sacrifice session {session_id}"))?;
+
+    Ok(())
 }
 
 pub fn insert_event(conn: &Connection, record: &EventRecord) -> Result<()> {
@@ -407,6 +484,54 @@ mod tests {
     }
 
     #[test]
+    fn archives_and_summons_sessions_without_losing_status() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+        let session = session_record("session-1", "2026-04-27T06:00:00Z");
+        insert_session(&conn, &session)?;
+
+        archive_session(&conn, "session-1", "2026-04-27T07:00:00Z")?;
+
+        assert!(list_sessions(&conn)?.is_empty());
+        let archived = list_sessions_including_archived(&conn)?;
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].status, "active");
+        assert_eq!(
+            archived[0].archived_at.as_deref(),
+            Some("2026-04-27T07:00:00Z")
+        );
+
+        summon_session(&conn, "session-1", "2026-04-27T08:00:00Z")?;
+
+        let active = list_sessions(&conn)?;
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].status, "active");
+        assert_eq!(active[0].archived_at, None);
+        assert_eq!(active[0].updated_at, "2026-04-27T08:00:00Z");
+        Ok(())
+    }
+
+    #[test]
+    fn sacrifices_session_and_cascades_events() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+        insert_session(&conn, &session_record("session-1", "2026-04-27T06:00:00Z"))?;
+        insert_json_event(
+            &conn,
+            "session-1",
+            "output",
+            &serde_json::json!({ "data": "hello" }),
+            "2026-04-27T06:01:00Z",
+        )?;
+
+        sacrifice_session(&conn, "session-1")?;
+
+        assert!(get_session(&conn, "session-1")?.is_none());
+        assert!(list_events(&conn, "session-1")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn inserts_and_lists_events_for_session() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let conn = open_store(&temp_dir.path().join("coven.db"))?;
@@ -460,6 +585,7 @@ mod tests {
             title: format!("Session {id}"),
             status: "active".to_string(),
             exit_code: None,
+            archived_at: None,
             created_at: created_at.to_string(),
             updated_at: created_at.to_string(),
         }

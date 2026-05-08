@@ -142,6 +142,7 @@ fn launch_session(
         title: launch.title.clone(),
         status: "running".to_string(),
         exit_code: None,
+        archived_at: None,
         created_at: now.clone(),
         updated_at: now,
     };
@@ -360,6 +361,7 @@ mod tests {
             title: "hello from coven".to_string(),
             status: "created".to_string(),
             exit_code: None,
+            archived_at: None,
             created_at: "2026-04-27T10:00:00Z".to_string(),
             updated_at: "2026-04-27T10:00:00Z".to_string(),
         };
@@ -762,6 +764,7 @@ mod tests {
             title: "hello from coven".to_string(),
             status: status.to_string(),
             exit_code: None,
+            archived_at: None,
             created_at: "2026-04-27T10:00:00Z".to_string(),
             updated_at: "2026-04-27T10:00:00Z".to_string(),
         };

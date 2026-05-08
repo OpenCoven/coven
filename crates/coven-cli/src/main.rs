@@ -67,9 +67,22 @@ enum Command {
         detach: bool,
     },
     #[command(about = "List recent Coven sessions")]
-    Sessions,
+    Sessions {
+        #[arg(long, help = "Include archived sessions")]
+        all: bool,
+    },
     #[command(about = "Replay/follow a session and forward input to live daemon sessions")]
     Attach { session_id: String },
+    #[command(about = "Summon an archived session back, then replay/follow it")]
+    Summon { session_id: String },
+    #[command(about = "Archive a completed session without deleting its events")]
+    Archive { session_id: String },
+    #[command(about = "Permanently delete a non-running session and its events")]
+    Sacrifice {
+        session_id: String,
+        #[arg(long, help = "Confirm permanent deletion")]
+        yes: bool,
+    },
     #[command(about = "Guided repair flows")]
     Patch {
         #[command(subcommand)]
@@ -120,8 +133,11 @@ fn main() -> Result<()> {
             title,
             detach,
         }) => run_session(&harness, &prompt, cwd.as_deref(), title.as_deref(), detach),
-        Some(Command::Sessions) => list_sessions(),
+        Some(Command::Sessions { all }) => list_sessions(all),
         Some(Command::Attach { session_id }) => attach_session(&session_id),
+        Some(Command::Summon { session_id }) => summon_session_command(&session_id),
+        Some(Command::Archive { session_id }) => archive_session_command(&session_id),
+        Some(Command::Sacrifice { session_id, yes }) => sacrifice_session_command(&session_id, yes),
         Some(Command::Patch { command }) => run_patch_command(command),
     }
 }
@@ -191,9 +207,9 @@ fn magical_tui_items() -> &'static [MagicalTuiItem] {
         MagicalTuiItem {
             key: "4",
             slash: "/sessions",
-            label: "View sessions",
-            description: "See recent, running, and completed harness work",
-            command: "coven sessions",
+            label: "Manage sessions",
+            description: "Summon, archive, or sacrifice old harness work",
+            command: "coven sessions --all",
             action: MagicalTuiAction::Sessions,
         },
         MagicalTuiItem {
@@ -267,7 +283,7 @@ fn run_magical_tui_action(action: MagicalTuiAction) -> Result<()> {
         MagicalTuiAction::PatchOpenClaw => {
             run_patch_openclaw(vec![], None, None, None, false, false, true)
         }
-        MagicalTuiAction::Sessions => list_sessions(),
+        MagicalTuiAction::Sessions => list_sessions(false),
         MagicalTuiAction::Doctor => run_doctor(),
         MagicalTuiAction::Quit => {
             println!("{PURPLE}The circle fades. Nothing changed.{RESET}");
@@ -765,6 +781,7 @@ fn launch_patch_session(request: &patch::PatchOpenClawRequest) -> Result<String>
         title: session_title(Some("Patch OpenClaw"), &brief),
         status: DEFAULT_SESSION_STATUS.to_string(),
         exit_code: None,
+        archived_at: None,
         created_at: now.clone(),
         updated_at: now.clone(),
     };
@@ -888,6 +905,7 @@ fn run_session(
         title: session_title(title, &prompt),
         status: DEFAULT_SESSION_STATUS.to_string(),
         exit_code: None,
+        archived_at: None,
         created_at: now.clone(),
         updated_at: now,
     };
@@ -944,25 +962,105 @@ fn run_session(
     }
 }
 
-fn list_sessions() -> Result<()> {
+fn list_sessions(include_archived: bool) -> Result<()> {
     let store_path = coven_store_path()?;
     let conn = store::open_store(&store_path)?;
-    let sessions = store::list_sessions(&conn)?;
+    let sessions = if include_archived {
+        store::list_sessions_including_archived(&conn)?
+    } else {
+        store::list_sessions(&conn)?
+    };
 
     if sessions.is_empty() {
-        println!("No Coven sessions yet.");
-        println!("Start with:");
+        if include_archived {
+            println!("No Coven sessions yet — active or archived.");
+        } else {
+            println!("No active Coven sessions yet.");
+        }
+        println!("Start or inspect with:");
         println!("  coven doctor");
         println!("  coven run codex \"explain this repo in 5 bullets\"");
+        println!("  coven sessions --all");
     } else {
-        println!("{:<12} {:<10} {:<8} TITLE", "SESSION", "STATUS", "HARNESS");
-        println!("{:<12} {:<10} {:<8} -----", "-------", "------", "-------");
+        println!(
+            "{:<12} {:<10} {:<8} {:<8} TITLE",
+            "SESSION", "STATUS", "HARNESS", "RITUAL"
+        );
+        println!(
+            "{:<12} {:<10} {:<8} {:<8} -----",
+            "-------", "------", "-------", "------"
+        );
         for session in sessions {
             println!("{}", format_session_line(&session));
         }
+        println!("\nRituals:");
+        println!(
+            "  coven summon <session-id>       # restore archived session, then replay/follow"
+        );
+        println!("  coven archive <session-id>      # hide from active list, keep events");
+        println!("  coven sacrifice <session-id> --yes  # permanently delete non-running session");
     }
 
     Ok(())
+}
+
+fn archive_session_command(session_id: &str) -> Result<()> {
+    let store_path = coven_store_path()?;
+    let conn = store::open_store(&store_path)?;
+    let Some(session) = store::get_session(&conn, session_id)? else {
+        anyhow::bail!("session `{session_id}` not found");
+    };
+    if session.status == RUNNING_SESSION_STATUS {
+        anyhow::bail!("session `{session_id}` is still running; stop it before archiving");
+    }
+
+    store::archive_session(&conn, session_id, &current_timestamp())?;
+    println!("archived session {session_id}");
+    println!(
+        "Summon it later with `coven summon {session_id}` or view it with `coven sessions --all`."
+    );
+    Ok(())
+}
+
+fn summon_session_command(session_id: &str) -> Result<()> {
+    let store_path = coven_store_path()?;
+    let conn = store::open_store(&store_path)?;
+    let Some(session) = store::get_session(&conn, session_id)? else {
+        anyhow::bail!("session `{session_id}` not found");
+    };
+
+    if session.archived_at.is_some() {
+        store::summon_session(&conn, session_id, &current_timestamp())?;
+        eprintln!("summoned session {session_id} from the archive");
+    }
+
+    attach_session(session_id)
+}
+
+fn sacrifice_session_command(session_id: &str, yes: bool) -> Result<()> {
+    confirm_sacrifice(session_id, yes)?;
+    let store_path = coven_store_path()?;
+    let conn = store::open_store(&store_path)?;
+    let Some(session) = store::get_session(&conn, session_id)? else {
+        anyhow::bail!("session `{session_id}` not found");
+    };
+    if session.status == RUNNING_SESSION_STATUS {
+        anyhow::bail!("session `{session_id}` is still running; do not sacrifice live work");
+    }
+
+    store::sacrifice_session(&conn, session_id)?;
+    println!("sacrificed session {session_id}; its event log was permanently deleted");
+    Ok(())
+}
+
+fn confirm_sacrifice(session_id: &str, yes: bool) -> Result<()> {
+    if yes {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "sacrifice permanently deletes session `{session_id}` and its events; rerun with --yes to confirm"
+        )
+    }
 }
 
 fn attach_session(session_id: &str) -> Result<()> {
@@ -1169,9 +1267,14 @@ fn coven_home_from_env(coven_home: Option<OsString>, home: Option<OsString>) -> 
 
 fn format_session_line(session: &store::SessionRecord) -> String {
     let short_id = first_chars(&session.id, 12);
+    let ritual = if session.archived_at.is_some() {
+        "archived"
+    } else {
+        "active"
+    };
     format!(
-        "{:<12} {:<10} {:<8} {}",
-        short_id, session.status, session.harness, session.title
+        "{:<12} {:<10} {:<8} {:<8} {}",
+        short_id, session.status, session.harness, ritual, session.title
     )
 }
 
@@ -1350,6 +1453,42 @@ mod tests {
     }
 
     #[test]
+    fn cli_accepts_coven_session_ritual_verbs() {
+        let sessions = Cli::parse_from(["coven", "sessions", "--all"]);
+        match sessions.command {
+            Some(Command::Sessions { all }) => assert!(all),
+            other => panic!("expected sessions command, got {other:?}"),
+        }
+
+        let summon = Cli::parse_from(["coven", "summon", "session-1"]);
+        match summon.command {
+            Some(Command::Summon { session_id }) => assert_eq!(session_id, "session-1"),
+            other => panic!("expected summon command, got {other:?}"),
+        }
+
+        let archive = Cli::parse_from(["coven", "archive", "session-1"]);
+        match archive.command {
+            Some(Command::Archive { session_id }) => assert_eq!(session_id, "session-1"),
+            other => panic!("expected archive command, got {other:?}"),
+        }
+
+        let sacrifice = Cli::parse_from(["coven", "sacrifice", "session-1", "--yes"]);
+        match sacrifice.command {
+            Some(Command::Sacrifice { session_id, yes }) => {
+                assert_eq!(session_id, "session-1");
+                assert!(yes);
+            }
+            other => panic!("expected sacrifice command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sacrifice_requires_explicit_yes() {
+        assert!(confirm_sacrifice("session-1", false).is_err());
+        assert!(confirm_sacrifice("session-1", true).is_ok());
+    }
+
+    #[test]
     fn printable_event_text_extracts_output_payload() {
         let event = store::EventRecord {
             id: "event-1".to_string(),
@@ -1480,13 +1619,14 @@ mod tests {
             title: "A useful session".to_string(),
             status: "created".to_string(),
             exit_code: None,
+            archived_at: None,
             created_at: "2026-04-27T06:00:00Z".to_string(),
             updated_at: "2026-04-27T06:00:00Z".to_string(),
         };
 
         assert_eq!(
             format_session_line(&session),
-            "session-id   created    codex    A useful session"
+            "session-id   created    codex    active   A useful session"
         );
     }
 }
