@@ -145,6 +145,7 @@ enum MagicalTuiMove {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MagicalTuiItem {
     key: &'static str,
+    slash: &'static str,
     label: &'static str,
     description: &'static str,
     command: &'static str,
@@ -157,12 +158,15 @@ const ROSE: &str = "\x1b[38;5;218m";
 const MOON: &str = "\x1b[38;5;117m";
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
-const MAGICAL_TUI_INNER_WIDTH: usize = 74;
+const MAGICAL_TUI_DEFAULT_INNER_WIDTH: usize = 74;
+const MAGICAL_TUI_MAX_INNER_WIDTH: usize = 88;
+const MAGICAL_TUI_MIN_INNER_WIDTH: usize = 42;
 
 fn magical_tui_items() -> &'static [MagicalTuiItem] {
     &[
         MagicalTuiItem {
             key: "1",
+            slash: "/start",
             label: "Start here",
             description: "Setup check and a safe first command",
             command: "coven doctor",
@@ -170,6 +174,7 @@ fn magical_tui_items() -> &'static [MagicalTuiItem] {
         },
         MagicalTuiItem {
             key: "2",
+            slash: "/run",
             label: "Run an agent",
             description: "Launch Codex or Claude Code inside this project",
             command: "coven run codex \"fix the failing tests\"",
@@ -177,6 +182,7 @@ fn magical_tui_items() -> &'static [MagicalTuiItem] {
         },
         MagicalTuiItem {
             key: "3",
+            slash: "/patch",
             label: "Patch OpenClaw",
             description: "Guided repair room for a local OpenClaw checkout",
             command: "coven patch openclaw",
@@ -184,6 +190,7 @@ fn magical_tui_items() -> &'static [MagicalTuiItem] {
         },
         MagicalTuiItem {
             key: "4",
+            slash: "/sessions",
             label: "View sessions",
             description: "See recent, running, and completed harness work",
             command: "coven sessions",
@@ -191,6 +198,7 @@ fn magical_tui_items() -> &'static [MagicalTuiItem] {
         },
         MagicalTuiItem {
             key: "5",
+            slash: "/doctor",
             label: "Doctor",
             description: "Re-check installed harness CLIs and store paths",
             command: "coven doctor",
@@ -198,6 +206,7 @@ fn magical_tui_items() -> &'static [MagicalTuiItem] {
         },
         MagicalTuiItem {
             key: "q",
+            slash: "/quit",
             label: "Quit",
             description: "Exit without changing anything",
             command: "q",
@@ -292,14 +301,24 @@ fn run_guided_harness_session() -> Result<()> {
 }
 
 fn render_magical_tui_frame(selection: usize) -> String {
-    render_magical_tui_frame_with_color(selection, true)
+    render_magical_tui_frame_with_color_and_width(selection, true, magical_tui_inner_width())
 }
 
 fn render_magical_tui_frame_plain(selection: usize) -> String {
-    render_magical_tui_frame_with_color(selection, false)
+    render_magical_tui_frame_with_color_and_width(selection, false, MAGICAL_TUI_DEFAULT_INNER_WIDTH)
 }
 
-fn render_magical_tui_frame_with_color(selection: usize, color_enabled: bool) -> String {
+#[cfg(test)]
+fn render_magical_tui_frame_plain_with_width(selection: usize, inner_width: usize) -> String {
+    render_magical_tui_frame_with_color_and_width(selection, false, inner_width)
+}
+
+fn render_magical_tui_frame_with_color_and_width(
+    selection: usize,
+    color_enabled: bool,
+    inner_width: usize,
+) -> String {
+    let inner_width = normalized_magical_tui_inner_width(inner_width);
     let purple = ansi(color_enabled, PURPLE);
     let gold = ansi(color_enabled, GOLD);
     let rose = ansi(color_enabled, ROSE);
@@ -307,66 +326,136 @@ fn render_magical_tui_frame_with_color(selection: usize, color_enabled: bool) ->
     let dim = ansi(color_enabled, DIM);
     let reset = ansi(color_enabled, RESET);
     let mut frame = String::new();
-    frame.push_str(&magical_tui_border('╭', '╮', purple, reset));
-    frame.push_str(&magical_tui_centered_row("Coven CLI", gold, purple, reset));
+    frame.push_str(&magical_tui_border('╭', '╮', purple, reset, inner_width));
     frame.push_str(&magical_tui_centered_row(
-        "Run coding agents in a project-scoped, observable session",
-        rose,
-        purple,
-        reset,
-    ));
-    frame.push_str(&magical_tui_centered_row(
-        "New here? Pick Start here. Nothing runs until you choose it.",
-        moon,
-        purple,
-        reset,
-    ));
-    frame.push_str(&magical_tui_border('├', '┤', purple, reset));
-    frame.push_str(&magical_tui_row("Choose an action", gold, purple, reset));
-    frame.push_str(&magical_tui_row(
-        "Use arrows or j/k, press Enter, or type 1-5. q/Esc exits.",
-        dim,
-        purple,
-        reset,
-    ));
-    frame.push_str(&magical_tui_border('├', '┤', purple, reset));
-
-    for (index, item) in magical_tui_items().iter().enumerate() {
-        let pointer = if index == selection { "▸" } else { " " };
-        let content = format!(
-            "{pointer} [{}] {:<15} {}",
-            item.key, item.label, item.description
-        );
-        let color = if index == selection { gold } else { purple };
-        frame.push_str(&magical_tui_row(&content, color, purple, reset));
-    }
-
-    let selected = magical_tui_items()[selection.min(magical_tui_items().len() - 1)];
-    frame.push_str(&magical_tui_border('├', '┤', purple, reset));
-    frame.push_str(&magical_tui_row("What happens next", gold, purple, reset));
-    frame.push_str(&magical_tui_row(selected.description, moon, purple, reset));
-    frame.push_str(&magical_tui_row(
-        &format!("Equivalent command: {}", selected.command),
+        "✦ Coven /command",
         gold,
         purple,
         reset,
+        inner_width,
+    ));
+    frame.push_str(&magical_tui_centered_row(
+        "Project-scoped agent sessions with a little moonlight",
+        rose,
+        purple,
+        reset,
+        inner_width,
     ));
     frame.push_str(&magical_tui_row(
-        "Coven stores sessions under ~/.coven unless COVEN_HOME is set.",
+        "  /  Type a number or choose a spell. Nothing runs until Enter.",
+        moon,
+        purple,
+        reset,
+        inner_width,
+    ));
+    frame.push_str(&magical_tui_border('├', '┤', purple, reset, inner_width));
+    frame.push_str(&magical_tui_row(
+        "Commands",
+        gold,
+        purple,
+        reset,
+        inner_width,
+    ));
+    frame.push_str(&magical_tui_row(
+        "↑/↓ or j/k move · 1-5 jump · Enter cast · q/Esc vanish",
         dim,
         purple,
         reset,
+        inner_width,
+    ));
+    frame.push_str(&magical_tui_border('├', '┤', purple, reset, inner_width));
+
+    for (index, item) in magical_tui_items().iter().enumerate() {
+        let pointer = if index == selection { "▸" } else { " " };
+        let content = magical_tui_command_row(pointer, item, inner_width);
+        let color = if index == selection { gold } else { purple };
+        frame.push_str(&magical_tui_row(
+            &content,
+            color,
+            purple,
+            reset,
+            inner_width,
+        ));
+    }
+
+    let selected = magical_tui_items()[selection.min(magical_tui_items().len() - 1)];
+    frame.push_str(&magical_tui_border('├', '┤', purple, reset, inner_width));
+    frame.push_str(&magical_tui_row(
+        "Preview",
+        gold,
+        purple,
+        reset,
+        inner_width,
+    ));
+    frame.push_str(&magical_tui_row(
+        selected.description,
+        moon,
+        purple,
+        reset,
+        inner_width,
+    ));
+    frame.push_str(&magical_tui_row(
+        &format!("{} → {}", selected.slash, selected.command),
+        gold,
+        purple,
+        reset,
+        inner_width,
+    ));
+    frame.push_str(&magical_tui_row(
+        "Store: ~/.coven by default · set COVEN_HOME to move the altar",
+        dim,
+        purple,
+        reset,
+        inner_width,
     ));
 
-    frame.push_str(&magical_tui_border('╰', '╯', purple, reset));
+    frame.push_str(&magical_tui_border('╰', '╯', purple, reset, inner_width));
     frame
 }
 
-fn magical_tui_border(left: char, right: char, color: &str, reset: &str) -> String {
-    format!(
-        "{color}{left}{}{right}{reset}\n",
-        "─".repeat(MAGICAL_TUI_INNER_WIDTH)
-    )
+fn magical_tui_command_row(pointer: &str, item: &MagicalTuiItem, inner_width: usize) -> String {
+    if inner_width >= 70 {
+        format!(
+            "{pointer} [{}] {:<10} {:<15} {}",
+            item.key, item.slash, item.label, item.description
+        )
+    } else if inner_width >= 52 {
+        format!(
+            "{pointer} {:<10} {:<15} {}",
+            item.slash, item.label, item.description
+        )
+    } else {
+        format!("{pointer} {:<10} {}", item.slash, item.label)
+    }
+}
+
+fn magical_tui_inner_width() -> usize {
+    crossterm::terminal::size()
+        .map(|(columns, _)| magical_tui_inner_width_for_columns(columns as usize))
+        .unwrap_or(MAGICAL_TUI_DEFAULT_INNER_WIDTH)
+}
+
+fn magical_tui_inner_width_for_columns(columns: usize) -> usize {
+    let available = columns.saturating_sub(2);
+    if available < MAGICAL_TUI_MIN_INNER_WIDTH {
+        available.max(24)
+    } else {
+        available.min(MAGICAL_TUI_MAX_INNER_WIDTH)
+    }
+}
+
+fn normalized_magical_tui_inner_width(inner_width: usize) -> usize {
+    inner_width.clamp(24, MAGICAL_TUI_MAX_INNER_WIDTH)
+}
+
+fn magical_tui_border(
+    left: char,
+    right: char,
+    color: &str,
+    reset: &str,
+    inner_width: usize,
+) -> String {
+    format!("{color}{left}{}{right}{reset}\n", "─".repeat(inner_width))
 }
 
 fn magical_tui_centered_row(
@@ -374,10 +463,11 @@ fn magical_tui_centered_row(
     text_color: &str,
     border_color: &str,
     reset: &str,
+    inner_width: usize,
 ) -> String {
-    let content = first_chars(content, MAGICAL_TUI_INNER_WIDTH);
+    let content = fit_chars(content, inner_width);
     let content_width = content.chars().count();
-    let padding = magical_tui_padding(content_width);
+    let padding = magical_tui_padding(content_width, inner_width);
     let left = padding / 2;
     let right = padding - left;
     magical_tui_row(
@@ -385,13 +475,20 @@ fn magical_tui_centered_row(
         text_color,
         border_color,
         reset,
+        inner_width,
     )
 }
 
-fn magical_tui_row(content: &str, text_color: &str, border_color: &str, reset: &str) -> String {
-    let content = first_chars(content, MAGICAL_TUI_INNER_WIDTH);
+fn magical_tui_row(
+    content: &str,
+    text_color: &str,
+    border_color: &str,
+    reset: &str,
+    inner_width: usize,
+) -> String {
+    let content = fit_chars(content, inner_width);
     let content_width = content.chars().count();
-    let padding = magical_tui_padding(content_width);
+    let padding = magical_tui_padding(content_width, inner_width);
     format!(
         "{border_color}│{reset}{text_color}{content}{}{reset}{border_color}│{reset}\n",
         " ".repeat(padding)
@@ -399,12 +496,29 @@ fn magical_tui_row(content: &str, text_color: &str, border_color: &str, reset: &
 }
 
 #[allow(clippy::implicit_saturating_sub)]
-fn magical_tui_padding(content_width: usize) -> usize {
-    if content_width >= MAGICAL_TUI_INNER_WIDTH {
+fn magical_tui_padding(content_width: usize, inner_width: usize) -> usize {
+    if content_width >= inner_width {
         0
     } else {
-        MAGICAL_TUI_INNER_WIDTH - content_width
+        inner_width - content_width
     }
+}
+
+fn fit_chars(value: &str, limit: usize) -> String {
+    let count = value.chars().count();
+    if count <= limit {
+        return value.to_string();
+    }
+    if limit == 0 {
+        return String::new();
+    }
+    if limit == 1 {
+        return "…".to_string();
+    }
+
+    let mut fitted = value.chars().take(limit - 1).collect::<String>();
+    fitted.push('…');
+    fitted
 }
 
 fn ansi(enabled: bool, code: &'static str) -> &'static str {
@@ -1130,10 +1244,10 @@ mod tests {
 
     #[test]
     fn magical_tui_frame_uses_purple_gold_branding_and_lists_core_actions() {
-        let frame = render_magical_tui_frame(1);
+        let frame = render_magical_tui_frame_plain(1);
 
         assert!(frame.contains("Coven"));
-        assert!(frame.contains("New here?"));
+        assert!(frame.contains("/command"));
         assert!(frame.contains("Start here"));
         assert!(frame.contains("Run an agent"));
         assert!(frame.contains("Patch OpenClaw"));
@@ -1157,8 +1271,8 @@ mod tests {
     fn magical_tui_frame_previews_selected_spell_command() {
         let frame = render_magical_tui_frame_plain(0);
 
-        assert!(frame.contains("What happens next"));
-        assert!(frame.contains("Equivalent command"));
+        assert!(frame.contains("Preview"));
+        assert!(frame.contains("/start"));
         assert!(frame.contains("coven doctor"));
         assert!(frame.contains("~/.coven"));
     }
@@ -1167,11 +1281,35 @@ mod tests {
     fn magical_tui_frame_is_newcomer_friendly() {
         let frame = render_magical_tui_frame_plain(1);
 
-        assert!(frame.contains("Run coding agents"));
-        assert!(frame.contains("Nothing runs until"));
-        assert!(frame.contains("Choose an action"));
+        assert!(frame.contains("Project-scoped agent sessions"));
+        assert!(frame.contains("Nothing runs until Enter"));
+        assert!(frame.contains("Commands"));
         assert!(frame.contains("Launch Codex or Claude Code"));
         assert!(frame.contains("coven run codex"));
+    }
+
+    #[test]
+    fn magical_tui_width_tracks_terminal_columns_without_overflowing() {
+        assert_eq!(
+            magical_tui_inner_width_for_columns(120),
+            MAGICAL_TUI_MAX_INNER_WIDTH
+        );
+        assert_eq!(magical_tui_inner_width_for_columns(80), 78);
+        assert_eq!(magical_tui_inner_width_for_columns(36), 34);
+    }
+
+    #[test]
+    fn magical_tui_frame_truncates_narrow_rows_with_ellipsis() {
+        let frame = render_magical_tui_frame_plain_with_width(1, 34);
+
+        assert!(frame.contains("/run"));
+        assert!(frame.contains('…'));
+        for line in frame.lines() {
+            assert!(
+                line.chars().count() <= 36,
+                "line exceeded requested narrow frame: {line}"
+            );
+        }
     }
 
     #[test]
