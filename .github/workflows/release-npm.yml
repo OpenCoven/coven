@@ -85,7 +85,11 @@ jobs:
           path: target/x86_64-unknown-linux-gnu/release
       - run: chmod +x target/x86_64-unknown-linux-gnu/release/coven
       - run: node scripts/publish-npm.mjs --target=macos --skip-build --dry-run
+        env:
+          COVEN_NPM_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
       - run: node scripts/publish-npm.mjs --target=linux-x64 --skip-build --dry-run --skip-wrapper
+        env:
+          COVEN_NPM_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
 
   npm-publish:
     name: npm publish manual
