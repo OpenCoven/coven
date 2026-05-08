@@ -46,6 +46,8 @@ New to Coven? Run the interactive menu first:
 
 ```sh
 coven
+# or explicitly:
+coven tui
 ```
 
 The menu starts with **Start here**, checks your local setup, and shows the safest first command to try.
@@ -92,6 +94,7 @@ Coven is the local harness substrate for OpenCoven. It does not replace your cod
 | Command | Action |
 |---|---|
 | `coven` | Open the beginner-friendly interactive menu |
+| `coven tui` | Explicitly open the slash-command TUI |
 | `coven doctor` | Detect supported harness CLIs and print install hints |
 | `coven daemon start` | Start the local Coven daemon |
 | `coven daemon status` | Show daemon health, pid, and socket path |

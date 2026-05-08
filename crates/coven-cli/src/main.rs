@@ -46,6 +46,8 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    #[command(about = "Open the slash-command TUI")]
+    Tui,
     #[command(about = "Check local setup and print next steps")]
     Doctor,
     #[command(about = "Manage the local Coven daemon")]
@@ -124,6 +126,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         None => run_magical_tui(),
+        Some(Command::Tui) => run_magical_tui(),
         Some(Command::Doctor) => run_doctor(),
         Some(Command::Daemon { command }) => run_daemon_command(command),
         Some(Command::Run {
@@ -145,10 +148,17 @@ fn main() -> Result<()> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MagicalTuiAction {
     StartHere,
+    OpenTui,
+    Doctor,
+    DaemonStatus,
     RunHarness,
     PatchOpenClaw,
     Sessions,
-    Doctor,
+    AllSessions,
+    AttachSession,
+    SummonSession,
+    ArchiveSession,
+    SacrificeSession,
     Quit,
 }
 
@@ -174,9 +184,9 @@ const ROSE: &str = "\x1b[38;5;218m";
 const MOON: &str = "\x1b[38;5;117m";
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
-const MAGICAL_TUI_DEFAULT_INNER_WIDTH: usize = 56;
-const MAGICAL_TUI_MAX_INNER_WIDTH: usize = 58;
-const MAGICAL_TUI_MIN_INNER_WIDTH: usize = 32;
+const MAGICAL_TUI_DEFAULT_INNER_WIDTH: usize = 24;
+const MAGICAL_TUI_MAX_INNER_WIDTH: usize = 24;
+const MAGICAL_TUI_MIN_INNER_WIDTH: usize = 24;
 
 fn magical_tui_items() -> &'static [MagicalTuiItem] {
     &[
@@ -189,7 +199,31 @@ fn magical_tui_items() -> &'static [MagicalTuiItem] {
             action: MagicalTuiAction::StartHere,
         },
         MagicalTuiItem {
+            key: "0",
+            slash: "/tui",
+            label: "Open TUI",
+            description: "Launch this slash-command palette explicitly",
+            command: "coven tui",
+            action: MagicalTuiAction::OpenTui,
+        },
+        MagicalTuiItem {
             key: "2",
+            slash: "/doctor",
+            label: "Doctor",
+            description: "Check store, project, and harness readiness",
+            command: "coven doctor",
+            action: MagicalTuiAction::Doctor,
+        },
+        MagicalTuiItem {
+            key: "3",
+            slash: "/daemon",
+            label: "Daemon status",
+            description: "See whether the local Coven daemon is awake",
+            command: "coven daemon status",
+            action: MagicalTuiAction::DaemonStatus,
+        },
+        MagicalTuiItem {
+            key: "4",
             slash: "/run",
             label: "Run an agent",
             description: "Launch Codex or Claude Code inside this project",
@@ -197,7 +231,7 @@ fn magical_tui_items() -> &'static [MagicalTuiItem] {
             action: MagicalTuiAction::RunHarness,
         },
         MagicalTuiItem {
-            key: "3",
+            key: "5",
             slash: "/patch",
             label: "Patch OpenClaw",
             description: "Guided repair room for a local OpenClaw checkout",
@@ -205,20 +239,52 @@ fn magical_tui_items() -> &'static [MagicalTuiItem] {
             action: MagicalTuiAction::PatchOpenClaw,
         },
         MagicalTuiItem {
-            key: "4",
+            key: "6",
             slash: "/sessions",
-            label: "Manage sessions",
-            description: "Summon, archive, or sacrifice old harness work",
-            command: "coven sessions --all",
+            label: "Active sessions",
+            description: "List live, non-archived Coven sessions",
+            command: "coven sessions",
             action: MagicalTuiAction::Sessions,
         },
         MagicalTuiItem {
-            key: "5",
-            slash: "/doctor",
-            label: "Doctor",
-            description: "Re-check installed harness CLIs and store paths",
-            command: "coven doctor",
-            action: MagicalTuiAction::Doctor,
+            key: "7",
+            slash: "/all",
+            label: "All sessions",
+            description: "List active and archived sessions together",
+            command: "coven sessions --all",
+            action: MagicalTuiAction::AllSessions,
+        },
+        MagicalTuiItem {
+            key: "8",
+            slash: "/attach",
+            label: "Attach session",
+            description: "Replay/follow a session by id",
+            command: "coven attach <session-id>",
+            action: MagicalTuiAction::AttachSession,
+        },
+        MagicalTuiItem {
+            key: "9",
+            slash: "/summon",
+            label: "Summon session",
+            description: "Restore an archived session, then follow it",
+            command: "coven summon <session-id>",
+            action: MagicalTuiAction::SummonSession,
+        },
+        MagicalTuiItem {
+            key: "a",
+            slash: "/archive",
+            label: "Archive session",
+            description: "Hide completed work without deleting events",
+            command: "coven archive <session-id>",
+            action: MagicalTuiAction::ArchiveSession,
+        },
+        MagicalTuiItem {
+            key: "x",
+            slash: "/sacrifice",
+            label: "Sacrifice session",
+            description: "Permanently delete a non-running session",
+            command: "coven sacrifice <session-id> --yes",
+            action: MagicalTuiAction::SacrificeSession,
         },
         MagicalTuiItem {
             key: "q",
@@ -245,7 +311,7 @@ fn run_magical_tui() -> Result<()> {
     let action = loop {
         execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0))
             .context("failed to redraw Coven menu")?;
-        print!("{}", render_magical_tui_frame(selection));
+        print!("{}", render_magical_tui_frame_for_raw_terminal(selection));
         io::stdout().flush().context("failed to flush Coven menu")?;
 
         if let Event::Key(key) = event::read().context("failed to read Coven menu input")? {
@@ -279,12 +345,19 @@ fn run_magical_tui() -> Result<()> {
 fn run_magical_tui_action(action: MagicalTuiAction) -> Result<()> {
     match action {
         MagicalTuiAction::StartHere => run_new_user_start_here(),
+        MagicalTuiAction::OpenTui => run_magical_tui(),
+        MagicalTuiAction::Doctor => run_doctor(),
+        MagicalTuiAction::DaemonStatus => run_daemon_command(DaemonCommand::Status),
         MagicalTuiAction::RunHarness => run_guided_harness_session(),
         MagicalTuiAction::PatchOpenClaw => {
             run_patch_openclaw(vec![], None, None, None, false, false, true)
         }
         MagicalTuiAction::Sessions => list_sessions(false),
-        MagicalTuiAction::Doctor => run_doctor(),
+        MagicalTuiAction::AllSessions => list_sessions(true),
+        MagicalTuiAction::AttachSession => run_guided_attach_session(),
+        MagicalTuiAction::SummonSession => run_guided_summon_session(),
+        MagicalTuiAction::ArchiveSession => run_guided_archive_session(),
+        MagicalTuiAction::SacrificeSession => run_guided_sacrifice_session(),
         MagicalTuiAction::Quit => {
             println!("{PURPLE}The circle fades. Nothing changed.{RESET}");
             Ok(())
@@ -316,8 +389,40 @@ fn run_guided_harness_session() -> Result<()> {
     run_session(&harness, &[prompt], None, title.as_deref(), false)
 }
 
+fn run_guided_attach_session() -> Result<()> {
+    let session_id = prompt_for_required_line("Session id to attach: ")?;
+    attach_session(&session_id)
+}
+
+fn run_guided_summon_session() -> Result<()> {
+    let session_id = prompt_for_required_line("Session id to summon: ")?;
+    summon_session_command(&session_id)
+}
+
+fn run_guided_archive_session() -> Result<()> {
+    let session_id = prompt_for_required_line("Session id to archive: ")?;
+    archive_session_command(&session_id)
+}
+
+fn run_guided_sacrifice_session() -> Result<()> {
+    let session_id = prompt_for_required_line("Session id to sacrifice: ")?;
+    let confirmation = prompt_for_required_line(
+        "Type `sacrifice` to permanently delete this session and its events: ",
+    )?;
+    if confirmation != "sacrifice" {
+        println!("{PURPLE}Sacrifice cancelled. Nothing changed.{RESET}");
+        return Ok(());
+    }
+
+    sacrifice_session_command(&session_id, true)
+}
+
 fn render_magical_tui_frame(selection: usize) -> String {
     render_magical_tui_frame_with_color_and_width(selection, true, magical_tui_inner_width())
+}
+
+fn render_magical_tui_frame_for_raw_terminal(selection: usize) -> String {
+    render_magical_tui_frame(selection).replace('\n', "\r\n")
 }
 
 fn render_magical_tui_frame_plain(selection: usize) -> String {
@@ -349,13 +454,13 @@ fn render_magical_tui_frame_with_color_and_width(
         inner_width,
     ));
     frame.push_str(&magical_tui_line(
-        "Project-scoped agent sessions",
+        "Project sessions",
         rose,
         reset,
         inner_width,
     ));
     frame.push_str(&magical_tui_line(
-        "Pick a command. Enter to cast.",
+        "Pick one. Enter casts.",
         moon,
         reset,
         inner_width,
@@ -363,7 +468,7 @@ fn render_magical_tui_frame_with_color_and_width(
     frame.push('\n');
     frame.push_str(&magical_tui_line("Commands", gold, reset, inner_width));
     frame.push_str(&magical_tui_line(
-        "Up/Down or j/k - Enter - q/Esc",
+        "1-9/a/x/q + Enter",
         dim,
         reset,
         inner_width,
@@ -393,7 +498,7 @@ fn render_magical_tui_frame_with_color_and_width(
         inner_width,
     ));
     frame.push_str(&magical_tui_line(
-        "Store: ~/.coven or COVEN_HOME",
+        "Store: ~/.coven",
         dim,
         reset,
         inner_width,
@@ -419,14 +524,14 @@ fn magical_tui_inner_width() -> usize {
 fn magical_tui_inner_width_for_columns(columns: usize) -> usize {
     let available = columns.saturating_sub(2);
     if available < MAGICAL_TUI_MIN_INNER_WIDTH {
-        available.max(24)
+        available.max(18)
     } else {
         available.min(MAGICAL_TUI_MAX_INNER_WIDTH)
     }
 }
 
 fn normalized_magical_tui_inner_width(inner_width: usize) -> usize {
-    inner_width.clamp(24, MAGICAL_TUI_MAX_INNER_WIDTH)
+    inner_width.clamp(18, MAGICAL_TUI_MAX_INNER_WIDTH)
 }
 
 fn fit_chars(value: &str, limit: usize) -> String {
@@ -1255,16 +1360,53 @@ mod tests {
     }
 
     #[test]
+    fn cli_accepts_explicit_tui_command() {
+        let cli = Cli::parse_from(["coven", "tui"]);
+
+        match cli.command {
+            Some(Command::Tui) => {}
+            other => panic!("expected tui command, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn magical_tui_frame_uses_purple_gold_branding_and_lists_core_actions() {
         let frame = render_magical_tui_frame_plain(1);
 
         assert!(frame.contains("Coven"));
         assert!(frame.contains("/command"));
-        assert!(frame.contains("Start here"));
-        assert!(frame.contains("Run an agent"));
-        assert!(frame.contains("Patch OpenClaw"));
-        assert!(frame.contains("Doctor"));
+        assert!(frame.contains("/start"));
+        assert!(frame.contains("/run"));
+        assert!(frame.contains("/patch"));
+        assert!(frame.contains("/doctor"));
         assert!(frame.contains(">"));
+    }
+
+    #[test]
+    fn magical_tui_lists_full_slash_command_suite() {
+        let slashes = magical_tui_items()
+            .iter()
+            .map(|item| item.slash)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            slashes,
+            vec![
+                "/start",
+                "/tui",
+                "/doctor",
+                "/daemon",
+                "/run",
+                "/patch",
+                "/sessions",
+                "/all",
+                "/attach",
+                "/summon",
+                "/archive",
+                "/sacrifice",
+                "/quit",
+            ]
+        );
     }
 
     #[test]
@@ -1291,12 +1433,12 @@ mod tests {
 
     #[test]
     fn magical_tui_frame_is_newcomer_friendly() {
-        let frame = render_magical_tui_frame_plain(1);
+        let frame = render_magical_tui_frame_plain(4);
 
-        assert!(frame.contains("Project-scoped agent sessions"));
-        assert!(frame.contains("Enter to cast"));
+        assert!(frame.contains("Project sessions"));
+        assert!(frame.contains("Enter casts"));
         assert!(frame.contains("Commands"));
-        assert!(frame.contains("Launch Codex or Claude Code"));
+        assert!(frame.contains("Launch Codex"));
         assert!(frame.contains("coven run codex"));
     }
 
@@ -1310,7 +1452,7 @@ mod tests {
             magical_tui_inner_width_for_columns(80),
             MAGICAL_TUI_MAX_INNER_WIDTH
         );
-        assert_eq!(magical_tui_inner_width_for_columns(36), 34);
+        assert_eq!(magical_tui_inner_width_for_columns(36), 24);
     }
 
     #[test]
@@ -1325,6 +1467,14 @@ mod tests {
                 "line exceeded requested narrow frame: {line}"
             );
         }
+    }
+
+    #[test]
+    fn magical_tui_raw_terminal_frame_uses_crlf_to_avoid_stair_step_rendering() {
+        let frame = render_magical_tui_frame_for_raw_terminal(0);
+
+        assert!(frame.contains("\r\n"));
+        assert!(!frame.replace("\r\n", "").contains('\n'));
     }
 
     #[test]

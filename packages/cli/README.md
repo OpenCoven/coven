@@ -14,12 +14,13 @@ npx @opencoven/cli
 
 The user-facing command remains `coven`; OpenCoven is the package namespace.
 
-Run `coven` with no arguments for the beginner-friendly menu. It starts with setup checks and safe first commands before launching anything.
+Run `coven` with no arguments, or `coven tui` explicitly, for the beginner-friendly slash-command menu. It starts with setup checks and safe first commands before launching anything.
 
 ## Commands
 
 ```bash
 coven
+coven tui
 coven doctor
 coven daemon start
 coven run codex "fix tests"
