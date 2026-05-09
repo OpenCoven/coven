@@ -31,7 +31,15 @@ cargo test --workspace --locked
 cargo run -p coven-cli -- doctor
 ```
 
-4. Exercise the CLI from a disposable project when changing runtime behavior:
+4. Run the contributor-safe smoke loop when changing daemon, session, attach, or session ritual behavior:
+
+```bash
+cargo test -p coven-cli --test smoke -- --nocapture
+```
+
+The smoke test uses an isolated temporary `COVEN_HOME` and injects a fake `codex` executable into `PATH`, so it does not require private Codex or Claude credentials.
+
+5. Exercise the CLI manually from a disposable project when changing runtime behavior:
 
 ```bash
 cargo run -p coven-cli -- daemon start
