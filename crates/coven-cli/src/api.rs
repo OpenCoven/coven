@@ -8,10 +8,13 @@ use uuid::Uuid;
 
 use crate::{daemon::DaemonStatus, project, store};
 
+pub const API_VERSION: &str = "v1";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HealthResponse {
     pub ok: bool,
+    pub api_version: &'static str,
     pub daemon: Option<DaemonStatus>,
 }
 
@@ -55,7 +58,11 @@ impl SessionRuntime for NoopSessionRuntime {
 }
 
 pub fn health_response(daemon: Option<DaemonStatus>) -> HealthResponse {
-    HealthResponse { ok: true, daemon }
+    HealthResponse {
+        ok: true,
+        api_version: API_VERSION,
+        daemon,
+    }
 }
 
 #[allow(dead_code)]
@@ -325,6 +332,7 @@ mod tests {
         let response = health_response(None);
 
         assert!(response.ok);
+        assert_eq!(response.api_version, API_VERSION);
         assert_eq!(response.daemon, None);
     }
 
@@ -346,6 +354,7 @@ mod tests {
         assert_eq!(response.status, 200);
         assert_eq!(response.content_type, "application/json");
         assert!(response.body.contains(r#""ok":true"#));
+        assert!(response.body.contains(r#""apiVersion":"v1""#));
         assert!(response.body.contains(r#""pid":12345"#));
         Ok(())
     }

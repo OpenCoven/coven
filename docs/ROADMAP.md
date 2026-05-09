@@ -55,14 +55,14 @@ Shipped:
 
 Now:
 
-- Harden the daemon API as a versioned public contract.
+- Keep the versioned daemon API contract and external-client compatibility work aligned. See [`docs/API-CONTRACT.md`](API-CONTRACT.md).
 - Add compatibility tests for the external OpenClaw plugin against versioned daemon responses.
 - Improve first-run onboarding and failure recovery for missing harness CLIs.
 - Keep the public docs aligned with the actual CLI/API surface.
 
 Next:
 
-- Stabilize a named Coven API version for comux and other local clients.
+- Add compatibility tests that pin the shipped `v1` contract for comux and other local clients.
 - Add stronger real-world smoke tests for daemon restart, attach, kill, archive, summon, and sacrifice flows.
 - Improve install verification across macOS and Linux package paths.
 - Turn the MVP checklist into linked GitHub issues/milestones.
@@ -155,7 +155,7 @@ Status: **mostly shipped**
 - [x] SQLite session/event ledger
 - [x] Daemon lifecycle
 - [x] Local sessions/events API
-- [ ] Versioned API contract
+- [x] Versioned API contract
 - [x] Compatibility tests for external clients
 
 ### Milestone B — Visible cockpit foundation

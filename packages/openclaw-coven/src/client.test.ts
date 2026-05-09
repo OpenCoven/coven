@@ -9,6 +9,7 @@ let tmpDir: string;
 
 beforeEach(async () => {
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-coven-client-"));
+  await fs.chmod(tmpDir, 0o700);
 });
 
 afterEach(async () => {
@@ -25,6 +26,7 @@ async function withServer(
     server.once("error", reject);
     server.listen(socketPath, () => resolve());
   });
+  await fs.chmod(socketPath, 0o600);
   try {
     await fn(socketPath);
   } finally {
@@ -39,11 +41,12 @@ describe("createCovenClient", () => {
     await withServer(
       (_req, res) => {
         res.setHeader("Content-Type", "application/json");
-        res.end(JSON.stringify({ ok: true, daemon: null }));
+        res.end(JSON.stringify({ ok: true, apiVersion: "v1", daemon: null }));
       },
       async (socketPath) => {
         await expect(createCovenClient(socketPath).health()).resolves.toEqual({
           ok: true,
+          apiVersion: "v1",
           daemon: null,
         });
       },
@@ -54,13 +57,14 @@ describe("createCovenClient", () => {
     await withServer(
       (_req, res) => {
         res.setHeader("Content-Type", "application/json");
-        res.end(JSON.stringify({ ok: true, daemon: null }));
+        res.end(JSON.stringify({ ok: true, apiVersion: "v1", daemon: null }));
       },
       async (socketPath) => {
         await expect(
           createCovenClient(socketPath, { socketRoot: tmpDir }).health(),
         ).resolves.toEqual({
           ok: true,
+          apiVersion: "v1",
           daemon: null,
         });
       },

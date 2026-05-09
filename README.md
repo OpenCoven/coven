@@ -132,6 +132,8 @@ The daemon exposes a small HTTP API over a Unix socket for first-party and exter
 
 Treat the socket API as the product contract. Clients may validate for UX, but the Rust daemon remains the authority boundary.
 
+Current stable contract: [`docs/API-CONTRACT.md`](docs/API-CONTRACT.md). `GET /health` exposes `apiVersion: "v1"` for client handshakes.
+
 ## Requirements
 
 - Rust stable toolchain

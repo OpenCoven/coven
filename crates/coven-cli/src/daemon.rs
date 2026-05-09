@@ -614,6 +614,7 @@ mod tests {
         server.join().expect("server thread panicked")?;
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains(r#""ok":true"#));
+        assert!(response.contains(r#""apiVersion":"v1""#));
         assert!(response.contains(r#""pid":12345"#));
         Ok(())
     }

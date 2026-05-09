@@ -88,7 +88,8 @@ The npm wrapper should only resolve and execute the native `coven` binary. It sh
 
 Externalization makes the socket API a product contract. Add compatibility protections before broad distribution:
 
-- include `apiVersion` and `covenVersion` in `GET /health`;
+- keep `apiVersion` in `GET /health` as the contract handshake for clients;
+- add `covenVersion` in `GET /health` only if clients need daemon build identity distinct from contract version;
 - use structured error codes for API failures;
 - paginate `GET /events` with a daemon-enforced limit;
 - keep unknown fields ignored where safe and unknown required behavior rejected;

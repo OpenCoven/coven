@@ -15,6 +15,7 @@ import {
   createCovenClient,
   type CovenClient,
   type CovenEventRecord,
+  type CovenHealthResponse,
   type CovenSessionRecord,
 } from "./client.js";
 import type { ResolvedCovenPluginConfig } from "./config.js";
@@ -29,6 +30,7 @@ const DEFAULT_HARNESSES: Record<string, string> = {
   claude: "claude",
   "claude-cli": "claude",
 };
+const SUPPORTED_COVEN_API_VERSION = "v1";
 const HEALTH_CHECK_TIMEOUT_MS = 5_000;
 const MAX_COVEN_PROMPT_BYTES = 500_000;
 const MIN_POLL_INTERVAL_MS = 25;
@@ -275,6 +277,15 @@ function terminalStatusEvent(session: CovenSessionRecord): AcpRuntimeEvent {
   };
 }
 
+function unsupportedApiVersionDetail(health: CovenHealthResponse): string | null {
+  if (health.apiVersion !== SUPPORTED_COVEN_API_VERSION) {
+    const actual =
+      typeof health.apiVersion === "string" && health.apiVersion ? health.apiVersion : "missing";
+    return `expected apiVersion ${SUPPORTED_COVEN_API_VERSION}, got ${actual}`;
+  }
+  return null;
+}
+
 export class CovenAcpRuntime implements AcpRuntime {
   private readonly config: ResolvedCovenPluginConfig;
   private readonly client: CovenClient;
@@ -497,6 +508,15 @@ export class CovenAcpRuntime implements AcpRuntime {
   async doctor(): Promise<AcpRuntimeDoctorReport> {
     try {
       const health = await this.client.health();
+      const unsupportedApiVersion = unsupportedApiVersionDetail(health);
+      if (unsupportedApiVersion) {
+        return {
+          ok: false,
+          code: "COVEN_UNSUPPORTED_API_VERSION",
+          message: "Coven daemon API version is not supported.",
+          details: [unsupportedApiVersion],
+        };
+      }
       return health.ok
         ? { ok: true, message: "Coven daemon is reachable." }
         : { ok: false, code: "COVEN_UNHEALTHY", message: "Coven daemon did not report healthy." };
@@ -547,7 +567,7 @@ export class CovenAcpRuntime implements AcpRuntime {
     );
     try {
       const health = await this.client.health(controller.signal);
-      return health.ok;
+      return health.ok && unsupportedApiVersionDetail(health) === null;
     } catch {
       return false;
     } finally {

@@ -2,6 +2,8 @@
 
 Coven is a local-first harness substrate. The Rust CLI/daemon is the authority layer; clients such as the CLI TUI, comux, and the optional OpenClaw plugin are presentation/integration layers.
 
+The versioned local socket API contract lives in [`docs/API-CONTRACT.md`](API-CONTRACT.md). Clients should use `GET /health` and its `apiVersion` field as the handshake before depending on session or event response shapes.
+
 ## Runtime topology
 
 ```mermaid

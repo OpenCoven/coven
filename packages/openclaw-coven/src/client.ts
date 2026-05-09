@@ -25,6 +25,7 @@ export type CovenEventRecord = {
 
 export type CovenHealthResponse = {
   ok: boolean;
+  apiVersion: string;
   daemon?: {
     pid: number;
     startedAt: string;
