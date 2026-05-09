@@ -156,7 +156,7 @@ Status: **mostly shipped**
 - [x] Daemon lifecycle
 - [x] Local sessions/events API
 - [ ] Versioned API contract
-- [ ] Compatibility tests for external clients
+- [x] Compatibility tests for external clients
 
 ### Milestone B — Visible cockpit foundation
 

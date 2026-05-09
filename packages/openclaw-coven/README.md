@@ -82,6 +82,19 @@ The plugin is a client, not a trust root. The Rust daemon must still validate pr
 - Restricts socket configuration to `<covenHome>/coven.sock`.
 - Rejects unknown ACP agent ids unless explicitly mapped in plugin config.
 
+## Version compatibility
+
+| Plugin version | Coven daemon | Notes |
+|---|---|---|
+| `@opencoven/coven@2026.4.28` | Coven 2026.4.x | Initial tested version pair. Fixture responses live in `src/fixtures/v2026.4/`. |
+
+The compatibility tests in `src/compat.test.ts` verify the plugin against the fixture files for the documented daemon API version. When the Rust daemon changes a response shape for `/health`, `/sessions`, or `/events`, update the matching fixture and re-run the tests.
+
+Fixture field names follow the Rust daemon's serialization rules:
+- `GET /health` — camelCase (`ok`, `daemon.pid`, `daemon.startedAt`, `daemon.socket`)
+- `GET /sessions`, `POST /sessions`, `GET /sessions/:id` — snake_case (`project_root`, `exit_code`, `created_at`, `updated_at`)
+- `GET /events` — snake_case (`session_id`, `payload_json`, `created_at`)
+
 ## Development notes
 
 The source lives in the Coven repo so the bridge can mature with the Coven daemon/API. Do not add Coven or OpenCoven code back into OpenClaw core as part of normal plugin work.

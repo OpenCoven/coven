@@ -19,5 +19,6 @@
 node_modules/
 packages/*/node_modules/
 *.tgz
+packages/*/pnpm-workspace.yaml
 
 /npm/dist/

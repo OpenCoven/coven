@@ -1,0 +1,8 @@
+{
+  "ok": true,
+  "daemon": {
+    "pid": 98765,
+    "startedAt": "2026-04-28T09:00:00.000Z",
+    "socket": "/home/user/.coven/coven.sock"
+  }
+}

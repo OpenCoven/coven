@@ -1,0 +1,11 @@
+{
+  "id": "550e8400-e29b-41d4-a716-446655440001",
+  "project_root": "/home/user/myproject",
+  "harness": "codex",
+  "title": "Fix failing tests",
+  "status": "running",
+  "exit_code": null,
+  "archived_at": null,
+  "created_at": "2026-04-28T09:10:00.000Z",
+  "updated_at": "2026-04-28T09:12:00.000Z"
+}
