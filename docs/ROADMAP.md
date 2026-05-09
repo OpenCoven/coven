@@ -38,7 +38,7 @@ Shipped:
 - Rust CLI command named `coven`.
 - Beginner-friendly `coven` / `coven tui` entrypoint.
 - `coven doctor` setup checks.
-- Local daemon lifecycle: `coven daemon start/status/stop`.
+- Local daemon lifecycle: `coven daemon start/status/restart/stop`.
 - Project-root and cwd boundary guard.
 - Built-in Codex and Claude Code harness adapters.
 - PTY-backed `coven run codex|claude <prompt>` sessions.
@@ -49,6 +49,7 @@ Shipped:
 - Versioned `v1` daemon API contract for external clients.
 - Compatibility tests for the external OpenClaw bridge against versioned daemon responses.
 - First-run recovery hints for missing Codex or Claude Code CLIs.
+- Real CLI smoke coverage for daemon restart, attach replay, kill, archive, summon, and sacrifice flows.
 - Published npm wrapper packages:
   - `@opencoven/cli`
   - `@opencoven/cli-macos`
@@ -63,7 +64,6 @@ Now:
 
 Next:
 
-- Add stronger real-world smoke tests for daemon restart, attach, kill, archive, summon, and sacrifice flows.
 - Improve install verification across macOS and Linux package paths.
 - Turn the MVP checklist into linked GitHub issues/milestones.
 

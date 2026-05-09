@@ -55,6 +55,19 @@ fn smoke_daemon_session_replay_and_safe_session_rituals() -> anyhow::Result<()> 
         "fake codex complete: smoke replay",
     )?;
 
+    let restart = run_coven(&coven, &coven_home, &path, &["daemon", "restart"])?;
+    assert_success("daemon restart", &restart);
+    assert_stdout_contains("daemon restart", &restart, "status=running");
+    wait_for_daemon_health(&coven_home)?;
+
+    let restarted_status = run_coven(&coven, &coven_home, &path, &["daemon", "status"])?;
+    assert_success("daemon restarted status", &restarted_status);
+    assert_stdout_contains(
+        "daemon restarted status",
+        &restarted_status,
+        "status=running",
+    );
+
     let attach = run_coven(&coven, &coven_home, &path, &["attach", &replay_session])?;
     assert_success("attach replay", &attach);
     assert_stdout_contains(

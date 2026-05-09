@@ -45,7 +45,7 @@ The Rust CLI/daemon should stay narrow and boring:
 - `coven sessions` opens the interactive session browser in terminals and prints table output for scripts/pipes.
 - `coven attach` replays and follows Coven-managed event output.
 - `coven archive`, `coven summon`, and `coven sacrifice --yes` manage completed session history without making users memorize ids in the TUI path.
-- `coven daemon start/status/stop` manages one local daemon state directory.
+- `coven daemon start/status/restart/stop` manages one local daemon state directory.
 - The daemon exposes a small local API over `<covenHome>/coven.sock`.
 - SQLite stores session metadata, archive state, and append-only event history.
 

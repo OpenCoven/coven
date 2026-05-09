@@ -61,6 +61,7 @@ Prefer copy/paste commands?
 cd /path/to/your/project
 coven doctor
 coven daemon start
+coven daemon restart
 coven run codex "fix the failing tests"
 coven run claude "polish this UI"
 coven sessions
@@ -101,6 +102,7 @@ Coven is the local harness substrate for OpenCoven. It does not replace your cod
 | `coven doctor` | Detect supported harness CLIs and print install hints |
 | `coven daemon start` | Start the local Coven daemon |
 | `coven daemon status` | Show daemon health, pid, and socket path |
+| `coven daemon restart` | Restart the local daemon and rebind the socket |
 | `coven daemon stop` | Stop the local daemon |
 | `coven run <harness> <prompt>` | Launch a project-scoped harness session |
 | `coven run <harness> <prompt> --cwd <path>` | Launch from a cwd inside the project root |

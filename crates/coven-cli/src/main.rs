@@ -120,6 +120,7 @@ enum PatchCommand {
 #[derive(Subcommand, Debug)]
 enum DaemonCommand {
     Start,
+    Restart,
     Status,
     Stop,
     #[command(hide = true)]
@@ -1266,6 +1267,16 @@ fn run_daemon_command(command: DaemonCommand) -> Result<()> {
                 status.pid, status.socket
             );
         }
+        DaemonCommand::Restart => {
+            let _ = daemon::stop_background_server(&home)?;
+            let current_exe =
+                std::env::current_exe().context("failed to resolve current executable")?;
+            let status = daemon::start_background_server(&home, &current_exe, current_timestamp())?;
+            println!(
+                "coven daemon status=running pid={} socket={}",
+                status.pid, status.socket
+            );
+        }
         DaemonCommand::Status => match daemon::read_status(&home)? {
             Some(status) => {
                 let health = api::health_response(Some(status.clone()));
@@ -1893,8 +1904,8 @@ mod tests {
     }
 
     #[test]
-    fn cli_accepts_daemon_start_status_stop_and_hidden_serve_commands() {
-        for subcommand in ["start", "status", "stop", "serve"] {
+    fn cli_accepts_daemon_start_status_stop_restart_and_hidden_serve_commands() {
+        for subcommand in ["start", "status", "stop", "restart", "serve"] {
             let cli = Cli::parse_from(["coven", "daemon", subcommand]);
             match cli.command {
                 Some(Command::Daemon { .. }) => {}

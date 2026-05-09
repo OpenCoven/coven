@@ -23,6 +23,7 @@ coven
 coven tui
 coven doctor
 coven daemon start
+coven daemon restart
 coven run codex "fix tests"
 coven run claude "polish this UI"
 coven sessions

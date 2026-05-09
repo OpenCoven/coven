@@ -77,7 +77,7 @@ flowchart TD
 
 - `coven` and `coven tui` open the beginner-friendly slash-command palette.
 - `coven doctor` checks store/project/harness readiness and prints next steps.
-- `coven daemon start/status/stop` manages the local daemon.
+- `coven daemon start/status/restart/stop` manages the local daemon.
 - `coven run codex|claude <prompt>` launches a project-scoped PTY session.
 - `coven sessions` opens the human session browser in a terminal; `--plain` keeps scriptable output.
 - Session browser actions surface readable choices: **Rejoin**, **View Log**, **Summon**, **Archive**, and **Sacrifice**.
