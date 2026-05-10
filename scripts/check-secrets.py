@@ -143,8 +143,8 @@ def main() -> int:
         print("Secret guard found possible sensitive values. Values are intentionally redacted.", file=sys.stderr)
         for path, line, rule in current:
             print(f"current:{path}:{line}:{rule}", file=sys.stderr)
-        for sha, path, line, rule in history:
-            print(f"history:{sha}:{path}:{line}:{rule}", file=sys.stderr)
+        if history:
+            print(f"history findings: {len(history)} entries (details redacted)", file=sys.stderr)
         return 1
     print("Secret guard passed: no current-tree or history findings.")
     return 0
