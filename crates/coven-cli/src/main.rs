@@ -1268,14 +1268,22 @@ fn run_daemon_command(command: DaemonCommand) -> Result<()> {
             );
         }
         DaemonCommand::Restart => {
-            let _ = daemon::stop_background_server(&home)?;
+            let was_running = daemon::stop_background_server(&home)?;
             let current_exe =
                 std::env::current_exe().context("failed to resolve current executable")?;
-            let status = daemon::start_background_server(&home, &current_exe, current_timestamp())?;
-            println!(
-                "coven daemon status=running pid={} socket={}",
-                status.pid, status.socket
-            );
+            let status =
+                daemon::start_background_server(&home, &current_exe, current_timestamp())?;
+            if was_running {
+                println!(
+                    "coven daemon status=restarted pid={} socket={}",
+                    status.pid, status.socket
+                );
+            } else {
+                println!(
+                    "coven daemon status=running pid={} socket={}",
+                    status.pid, status.socket
+                );
+            }
         }
         DaemonCommand::Status => match daemon::read_status(&home)? {
             Some(status) => {
