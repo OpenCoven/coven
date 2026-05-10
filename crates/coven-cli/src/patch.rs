@@ -198,12 +198,11 @@ pub fn summarize_patch_plan(request: &PatchOpenClawRequest) -> String {
 pub fn summarize_patch_report(report: &PatchOpenClawReport) -> String {
     format!(
         "Coven patch status: {status}\n\
-        Session: {session_id}\n\
+        Session: [redacted]\n\
         Changed files:{changed_files}\
         Verification:{verification}\
         Nothing was committed or pushed.",
         status = report.status,
-        session_id = report.session_id,
         changed_files = format_report_list(&report.changed_files, "none"),
         verification = format_report_list(&report.verification, "not run")
     )
