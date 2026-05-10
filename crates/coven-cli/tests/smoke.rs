@@ -57,7 +57,7 @@ fn smoke_daemon_session_replay_and_safe_session_rituals() -> anyhow::Result<()> 
 
     let restart = run_coven(&coven, &coven_home, &path, &["daemon", "restart"])?;
     assert_success("daemon restart", &restart);
-    assert_stdout_contains("daemon restart", &restart, "status=running");
+    assert_stdout_contains("daemon restart", &restart, "status=restarted");
     wait_for_daemon_health(&coven_home)?;
 
     let restarted_status = run_coven(&coven, &coven_home, &path, &["daemon", "status"])?;

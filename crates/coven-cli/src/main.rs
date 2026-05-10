@@ -1271,8 +1271,7 @@ fn run_daemon_command(command: DaemonCommand) -> Result<()> {
             let was_running = daemon::stop_background_server(&home)?;
             let current_exe =
                 std::env::current_exe().context("failed to resolve current executable")?;
-            let status =
-                daemon::start_background_server(&home, &current_exe, current_timestamp())?;
+            let status = daemon::start_background_server(&home, &current_exe, current_timestamp())?;
             if was_running {
                 println!(
                     "coven daemon status=restarted pid={} socket={}",

@@ -3,11 +3,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::io::{BufRead, BufReader, Read};
 #[cfg(unix)]
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -288,20 +289,129 @@ pub fn clear_status(coven_home: &Path) -> Result<bool> {
 }
 
 pub fn stop_background_server(coven_home: &Path) -> Result<bool> {
+    stop_background_server_with_controller(coven_home, &SystemDaemonStopController)
+}
+
+trait DaemonStopController {
+    fn signal_term(&self, pid: u32) -> Result<()>;
+    fn pid_is_alive(&self, pid: u32) -> bool;
+    fn wait_for_exit(&self, pid: u32, timeout: Duration) -> bool;
+    fn status_matches_running_daemon(&self, status: &DaemonStatus) -> bool;
+}
+
+struct SystemDaemonStopController;
+
+impl DaemonStopController for SystemDaemonStopController {
+    fn signal_term(&self, pid: u32) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let output = Command::new("kill")
+                .arg("-TERM")
+                .arg(pid.to_string())
+                .stdin(Stdio::null())
+                .output()
+                .with_context(|| format!("failed to signal Coven daemon pid {pid}"))?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                anyhow::bail!(
+                    "failed to signal Coven daemon pid {pid}: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            Ok(())
+        }
+    }
+
+    fn pid_is_alive(&self, pid: u32) -> bool {
+        #[cfg(unix)]
+        {
+            Command::new("kill")
+                .arg("-0")
+                .arg(pid.to_string())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            false
+        }
+    }
+
+    fn wait_for_exit(&self, pid: u32, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if !self.pid_is_alive(pid) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        !self.pid_is_alive(pid)
+    }
+
+    fn status_matches_running_daemon(&self, status: &DaemonStatus) -> bool {
+        #[cfg(unix)]
+        {
+            daemon_health_reports_pid(&status.socket, status.pid).unwrap_or(false)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = status;
+            true
+        }
+    }
+}
+
+fn stop_background_server_with_controller(
+    coven_home: &Path,
+    controller: &dyn DaemonStopController,
+) -> Result<bool> {
     let status = read_status(coven_home)?;
     let Some(status) = status else {
         return Ok(false);
     };
 
-    #[cfg(unix)]
-    {
-        let _ = Command::new("kill")
-            .arg("-TERM")
-            .arg(status.pid.to_string())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+    if !controller.status_matches_running_daemon(&status) {
+        if controller.pid_is_alive(status.pid) {
+            anyhow::bail!(
+                "Coven daemon pid {} could not be verified through its socket; not signaling or clearing daemon status",
+                status.pid
+            );
+        }
+        clear_status(coven_home)?;
+        let socket = daemon_socket_path(coven_home);
+        if socket.exists() {
+            std::fs::remove_file(&socket)
+                .with_context(|| format!("failed to remove daemon socket {}", socket.display()))?;
+        }
+        return Ok(true);
+    }
+
+    match controller.signal_term(status.pid) {
+        Ok(()) => {
+            if !controller.wait_for_exit(status.pid, Duration::from_secs(2)) {
+                anyhow::bail!(
+                    "Coven daemon pid {} did not exit after SIGTERM; not clearing daemon status",
+                    status.pid
+                );
+            }
+        }
+        Err(error) if controller.pid_is_alive(status.pid) => {
+            anyhow::bail!(
+                "failed to stop Coven daemon pid {}; not clearing daemon status: {error}",
+                status.pid
+            );
+        }
+        Err(_) => {}
     }
 
     clear_status(coven_home)?;
@@ -311,6 +421,32 @@ pub fn stop_background_server(coven_home: &Path) -> Result<bool> {
             .with_context(|| format!("failed to remove daemon socket {}", socket.display()))?;
     }
     Ok(true)
+}
+
+#[cfg(unix)]
+fn daemon_health_reports_pid(socket: &str, expected_pid: u32) -> Result<bool> {
+    let mut stream = UnixStream::connect(socket)
+        .with_context(|| format!("failed to connect to Coven daemon socket {socket}"))?;
+    stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: coven\r\n\r\n")
+        .context("failed to write Coven health request")?;
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .context("failed to finish Coven health request")?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .context("failed to read Coven health response")?;
+    let Some((_, body)) = response.split_once("\r\n\r\n") else {
+        return Ok(false);
+    };
+    let body: Value =
+        serde_json::from_str(body).context("failed to parse Coven health response")?;
+    Ok(body
+        .get("daemon")
+        .and_then(|daemon| daemon.get("pid"))
+        .and_then(Value::as_u64)
+        .is_some_and(|pid| pid == u64::from(expected_pid)))
 }
 
 #[cfg(unix)]
@@ -569,6 +705,120 @@ mod tests {
         assert_eq!(read_status(temp_dir.path())?, None);
         assert!(!clear_status(temp_dir.path())?);
         Ok(())
+    }
+
+    #[test]
+    fn stop_background_server_keeps_status_when_existing_daemon_survives() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let status = DaemonStatus {
+            pid: 12345,
+            started_at: "2026-04-27T10:00:00Z".to_string(),
+            socket: daemon_socket_path(temp_dir.path())
+                .to_string_lossy()
+                .into_owned(),
+        };
+        write_status(temp_dir.path(), &status)?;
+
+        let error = stop_background_server_with_controller(
+            temp_dir.path(),
+            &FakeStopController {
+                pid_alive: true,
+                exited_after_signal: false,
+                signal_error: None,
+                verified_daemon: true,
+                signaled: std::sync::Arc::default(),
+            },
+        )
+        .expect_err("stop should refuse to clear status while pid is alive");
+
+        assert!(error.to_string().contains("did not exit"));
+        assert_eq!(read_status(temp_dir.path())?, Some(status));
+        Ok(())
+    }
+
+    #[test]
+    fn stop_background_server_clears_stale_status_when_pid_is_gone() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let status = DaemonStatus {
+            pid: 12345,
+            started_at: "2026-04-27T10:00:00Z".to_string(),
+            socket: daemon_socket_path(temp_dir.path())
+                .to_string_lossy()
+                .into_owned(),
+        };
+        write_status(temp_dir.path(), &status)?;
+
+        assert!(stop_background_server_with_controller(
+            temp_dir.path(),
+            &FakeStopController {
+                pid_alive: false,
+                exited_after_signal: false,
+                signal_error: Some("No such process".to_string()),
+                verified_daemon: false,
+                signaled: std::sync::Arc::default(),
+            },
+        )?);
+
+        assert_eq!(read_status(temp_dir.path())?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn stop_background_server_refuses_unverified_live_pid_without_signaling() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let status = DaemonStatus {
+            pid: 12345,
+            started_at: "2026-04-27T10:00:00Z".to_string(),
+            socket: daemon_socket_path(temp_dir.path())
+                .to_string_lossy()
+                .into_owned(),
+        };
+        write_status(temp_dir.path(), &status)?;
+        let controller = FakeStopController {
+            pid_alive: true,
+            exited_after_signal: true,
+            signal_error: None,
+            verified_daemon: false,
+            signaled: std::sync::Arc::default(),
+        };
+
+        let error = stop_background_server_with_controller(temp_dir.path(), &controller)
+            .expect_err("stop should not signal an unverified live pid");
+
+        assert!(error.to_string().contains("could not be verified"));
+        assert_eq!(*controller.signaled.lock().unwrap(), 0);
+        assert_eq!(read_status(temp_dir.path())?, Some(status));
+        Ok(())
+    }
+
+    struct FakeStopController {
+        pid_alive: bool,
+        exited_after_signal: bool,
+        signal_error: Option<String>,
+        verified_daemon: bool,
+        signaled: std::sync::Arc<std::sync::Mutex<usize>>,
+    }
+
+    impl DaemonStopController for FakeStopController {
+        fn signal_term(&self, _pid: u32) -> Result<()> {
+            *self.signaled.lock().unwrap() += 1;
+            match &self.signal_error {
+                Some(error) => anyhow::bail!(error.clone()),
+                None => Ok(()),
+            }
+        }
+
+        fn pid_is_alive(&self, _pid: u32) -> bool {
+            self.pid_alive
+        }
+
+        fn wait_for_exit(&self, _pid: u32, _timeout: std::time::Duration) -> bool {
+            self.exited_after_signal
+        }
+
+        fn status_matches_running_daemon(&self, _status: &DaemonStatus) -> bool {
+            self.verified_daemon
+        }
     }
 
     #[test]
