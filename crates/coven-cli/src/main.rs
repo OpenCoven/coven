@@ -1478,7 +1478,7 @@ fn summon_session_command(session_id: &str) -> Result<()> {
 
     if session.archived_at.is_some() {
         store::summon_session(&conn, session_id, &current_timestamp())?;
-        eprintln!("summoned session {session_id} from the archive");
+        eprintln!("summoned session from the archive");
     }
 
     attach_session(session_id)
