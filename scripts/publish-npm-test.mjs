@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
-import { publishEnv, releaseVersion, targetPackageName, validatePublishToken, validatePublishVersion } from './publish-npm.mjs';
+import { defaultTargetName, publishEnv, releaseVersion, targetPackageName, validatePublishToken, validatePublishVersion } from './publish-npm.mjs';
 
 test('releaseVersion prefers explicit COVEN_NPM_VERSION and strips a leading v', () => {
   assert.equal(
@@ -39,10 +39,24 @@ test('linux x64 target publishes under linux native package name', () => {
   assert.equal(targetPackageName('linux-x64'), '@opencoven/cli-linux-x64');
 });
 
+test('windows target publishes under windows native package name', () => {
+  assert.equal(targetPackageName('windows'), '@opencoven/cli-windows');
+});
+
+test('defaultTargetName maps win32 x64 to windows', () => {
+  assert.equal(defaultTargetName('win32', 'x64'), 'windows');
+});
+
 test('wrapper declares linux x64 native package as an optional dependency', () => {
   const packagePath = new URL(['..', 'npm', 'coven', 'package.json'].join('/'), import.meta.url);
   const packageJson = JSON.parse(readFileSync(packagePath, 'utf8'));
   assert.equal(packageJson.optionalDependencies['@opencoven/cli-linux-x64'], '0.0.0');
+});
+
+test('wrapper declares windows native package as an optional dependency', () => {
+  const packagePath = new URL(['..', 'npm', 'coven', 'package.json'].join('/'), import.meta.url);
+  const packageJson = JSON.parse(readFileSync(packagePath, 'utf8'));
+  assert.equal(packageJson.optionalDependencies['@opencoven/cli-windows'], '0.0.0');
 });
 
 test('wrapper binary maps linux x64 to linux native package and documents glibc requirement', () => {
@@ -50,6 +64,13 @@ test('wrapper binary maps linux x64 to linux native package and documents glibc 
   const bin = readFileSync(binPath, 'utf8');
   assert.match(bin, /'linux-x64': '@opencoven\/cli-linux-x64'/);
   assert.match(bin, /glibc-based Linux x64/);
+});
+
+test('wrapper binary maps windows x64 to windows native package and exe binary', () => {
+  const binPath = new URL(['..', 'npm', 'coven', 'bin', 'coven.js'].join('/'), import.meta.url);
+  const bin = readFileSync(binPath, 'utf8');
+  assert.match(bin, /'win32-x64': '@opencoven\/cli-windows'/);
+  assert.match(bin, /process\.platform === 'win32' \? 'coven\.exe' : 'coven'/);
 });
 
 test('release workflow builds and dry-runs linux x64 package', () => {
@@ -62,6 +83,20 @@ test('release workflow builds and dry-runs linux x64 package', () => {
   assert.match(workflow, /rust-target: x86_64-unknown-linux-gnu/);
   assert.match(workflow, /node scripts\/publish-npm\.mjs --target=linux-x64 --skip-build --dry-run --skip-wrapper/);
   assert.match(workflow, /node scripts\/publish-npm\.mjs --target=linux-x64 --skip-build --publish --skip-wrapper/);
+});
+
+test('release workflow builds and dry-runs windows package', () => {
+  const workflowPath = new URL(
+    ['..', '.github', 'workflows', 'release-npm.yml'].join('/'),
+    import.meta.url
+  );
+  const workflow = readFileSync(workflowPath, 'utf8');
+  assert.match(workflow, /npm-target: windows/);
+  assert.match(workflow, /rust-target: x86_64-pc-windows-msvc/);
+  assert.match(workflow, /runner: windows-latest/);
+  assert.match(workflow, /binary: coven\.exe/);
+  assert.match(workflow, /node scripts\/publish-npm\.mjs --target=windows --skip-build --dry-run --skip-wrapper/);
+  assert.match(workflow, /node scripts\/publish-npm\.mjs --target=windows --skip-build --publish --skip-wrapper/);
 });
 
 test('publishEnv preserves setup-node NODE_AUTH_TOKEN when NPM_TOKEN is absent', () => {

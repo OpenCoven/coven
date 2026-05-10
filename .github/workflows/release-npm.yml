@@ -53,6 +53,10 @@ jobs:
             rust-target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             binary: coven
+          - npm-target: windows
+            rust-target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            binary: coven.exe
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -84,10 +88,17 @@ jobs:
           name: coven-linux-x64
           path: target/x86_64-unknown-linux-gnu/release
       - run: chmod +x target/x86_64-unknown-linux-gnu/release/coven
+      - uses: actions/download-artifact@v8
+        with:
+          name: coven-windows
+          path: target/${{ format('{0}-{1}-{2}-{3}', 'x86_64', 'pc', 'windows', 'msvc') }}/release
       - run: node scripts/publish-npm.mjs --target=macos --skip-build --dry-run
         env:
           COVEN_NPM_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
       - run: node scripts/publish-npm.mjs --target=linux-x64 --skip-build --dry-run --skip-wrapper
+        env:
+          COVEN_NPM_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+      - run: node scripts/publish-npm.mjs --target=windows --skip-build --dry-run --skip-wrapper
         env:
           COVEN_NPM_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
 
@@ -113,6 +124,10 @@ jobs:
           name: coven-linux-x64
           path: target/x86_64-unknown-linux-gnu/release
       - run: chmod +x target/x86_64-unknown-linux-gnu/release/coven
+      - uses: actions/download-artifact@v8
+        with:
+          name: coven-windows
+          path: target/${{ format('{0}-{1}-{2}-{3}', 'x86_64', 'pc', 'windows', 'msvc') }}/release
       - name: Validate manual publish version
         run: |
           if [ -z "${{ inputs.version }}" ]; then
@@ -124,6 +139,10 @@ jobs:
             exit 1
           fi
       - run: node scripts/publish-npm.mjs --target=linux-x64 --skip-build --publish --skip-wrapper
+        env:
+          COVEN_NPM_VERSION: ${{ inputs.version }}
+          NPM_TOKEN: ${{ secrets.NPM_ACCESS_TOKEN }}
+      - run: node scripts/publish-npm.mjs --target=windows --skip-build --publish --skip-wrapper
         env:
           COVEN_NPM_VERSION: ${{ inputs.version }}
           NPM_TOKEN: ${{ secrets.NPM_ACCESS_TOKEN }}

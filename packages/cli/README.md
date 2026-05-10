@@ -41,4 +41,4 @@ Session rituals use Coven language while staying safe: archive hides old work wi
 
 ## Status
 
-This wrapper is live for early adopters. The current published npm latest is `0.0.10` for `@opencoven/cli`, `@opencoven/cli-macos`, and `@opencoven/cli-linux-x64`. Coven itself is still an early local-first MVP, so command/API compatibility should be tracked in the repo docs and release notes.
+This wrapper is live for early adopters. The current published npm latest is `0.0.10` for `@opencoven/cli`, `@opencoven/cli-macos`, and `@opencoven/cli-linux-x64`; Windows x64 release wiring is staged as `@opencoven/cli-windows` for the next package release. Coven itself is still an early local-first MVP, so command/API compatibility should be tracked in the repo docs and release notes.

@@ -90,5 +90,6 @@ The npm wrapper packages are live for early adopters:
 - `@opencoven/cli`
 - `@opencoven/cli-macos`
 - `@opencoven/cli-linux-x64`
+- `@opencoven/cli-windows` once the next Windows-enabled release is published
 
-The source package versions stay template-like in the repo; release workflow dispatch supplies the published version and builds platform packages. As of the current documentation pass, npm latest is `0.0.10` for all three packages.
+The source package versions stay template-like in the repo; release workflow dispatch supplies the published version and builds platform packages. As of the current documentation pass, npm latest is `0.0.10` for the wrapper plus macOS/Linux packages; Windows x64 release wiring is staged for the next package release.

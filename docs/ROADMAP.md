@@ -50,6 +50,7 @@ Shipped:
 - Compatibility tests for the external OpenClaw bridge against versioned daemon responses.
 - First-run recovery hints for missing Codex or Claude Code CLIs.
 - Real CLI smoke coverage for daemon restart, attach replay, kill, archive, summon, and sacrifice flows.
+- Install verification and release wiring for macOS, Linux x64, and Windows x64 npm package paths.
 - Published npm wrapper packages:
   - `@opencoven/cli`
   - `@opencoven/cli-macos`
@@ -64,7 +65,6 @@ Now:
 
 Next:
 
-- Improve install verification across macOS and Linux package paths.
 - Turn the MVP checklist into linked GitHub issues/milestones.
 
 Later:

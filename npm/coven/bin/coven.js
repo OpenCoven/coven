@@ -6,7 +6,8 @@ const require = createRequire(import.meta.url);
 
 const PLATFORM_PACKAGES = {
   'darwin-arm64': '@opencoven/cli-macos',
-  'linux-x64': '@opencoven/cli-linux-x64'
+  'linux-x64': '@opencoven/cli-linux-x64',
+  'win32-x64': '@opencoven/cli-windows'
 };
 
 const binaryName = process.platform === 'win32' ? 'coven.exe' : 'coven';
@@ -20,7 +21,7 @@ function wrapperVersion() {
 function resolveBinary() {
   if (!packageName) {
     throw new Error(
-      `Unsupported platform ${platformKey}. Coven v0 publishes native npm packages for macOS Apple Silicon and glibc-based Linux x64.`
+      `Unsupported platform ${platformKey}. Coven v0 publishes native npm packages for macOS Apple Silicon, glibc-based Linux x64, and Windows x64.`
     );
   }
 
@@ -28,7 +29,7 @@ function resolveBinary() {
     return require.resolve(`${packageName}/bin/${binaryName}`);
   } catch (error) {
     throw new Error(
-      `Could not find native Coven package ${packageName}. Reinstall @opencoven/cli so npm can install the optional dependency for ${platformKey}. Linux x64 support requires a glibc-based distribution; Alpine is not supported. Original error: ${error.message}`
+      `Could not find native Coven package ${packageName}. Reinstall @opencoven/cli so npm can install the optional dependency for ${platformKey}. Linux x64 support requires a glibc-based distribution; Alpine is not supported. Windows support requires x64 Windows. Original error: ${error.message}`
     );
   }
 }

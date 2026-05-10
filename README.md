@@ -41,7 +41,7 @@ cargo build --workspace
 cargo run -p coven-cli -- doctor
 ```
 
-Current npm package latest: `0.0.10` for `@opencoven/cli`, `@opencoven/cli-macos`, and `@opencoven/cli-linux-x64`.
+Current npm package latest: `0.0.10` for `@opencoven/cli`, `@opencoven/cli-macos`, and `@opencoven/cli-linux-x64`. Windows x64 release wiring is staged for the next package release as `@opencoven/cli-windows`.
 
 ## Quick Start
 

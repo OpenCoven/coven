@@ -20,5 +20,6 @@ Current early-adopter packages target:
 
 - `@opencoven/cli-macos` for macOS Apple Silicon
 - `@opencoven/cli-linux-x64` for glibc-based Linux x64 distributions
+- `@opencoven/cli-windows` for Windows x64, starting with the next release that includes Windows artifacts
 
 Alpine Linux is not supported.
