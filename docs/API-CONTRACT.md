@@ -188,7 +188,7 @@ Endpoints that return this shape:
 | `sessionId`   | Yes      | Session to fetch events for.                           |
 | `afterSeq`    | No       | Return only events with `seq > afterSeq` (preferred).  |
 | `afterEventId`| No       | Compatibility cursor — resolves to a sequence position.|
-| `limit`       | No       | Maximum number of events to return (daemon-enforced).  |
+| `limit`       | No       | Maximum number of events to return (daemon-enforced, max 1000). |
 
 ### Response envelope
 

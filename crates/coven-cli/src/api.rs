@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::{control_plane, daemon::DaemonStatus, project, store};
 
+const MAX_EVENTS_LIMIT: i64 = 1_000;
 pub const COVEN_API_VERSION: &str = "v1";
 pub const COVEN_API_NAMED_VERSION: &str = "coven.daemon.v1";
 pub const COVEN_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -385,7 +386,7 @@ fn list_session_events(coven_home: &Path, session_id: &str, query: &str) -> Resu
     let after_event_id = query_param(query, "afterEventId").map(str::to_string);
     let limit = query_param(query, "limit")
         .and_then(|v| v.parse::<i64>().ok())
-        .map(|l| l.clamp(1, 1000));
+        .map(|l| l.clamp(1, MAX_EVENTS_LIMIT));
 
     let opts = store::EventsQueryOptions {
         after_seq,
@@ -420,6 +421,8 @@ fn insert_event(
     store::insert_event(
         conn,
         &store::EventRecord {
+            // seq is populated by SQLite's rowid on insertion; the 0 here is a
+            // placeholder that the INSERT statement ignores.
             seq: 0,
             id: Uuid::new_v4().to_string(),
             session_id: session_id.to_string(),

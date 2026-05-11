@@ -447,6 +447,8 @@ function normalizeSessionRecord(value: unknown): CovenSessionRecord {
 function normalizeEventRecord(value: unknown): CovenEventRecord {
   const record = requireRecord(value, "Coven event");
   return {
+    // seq is 0 for records received from daemons that pre-date coven.daemon.v1;
+    // production responses from a coven.daemon.v1 daemon always include seq > 0.
     seq: (record.seq as number) ?? 0,
     id: requireStringField(record, "id", "id"),
     sessionId: requireStringField(record, "sessionId", "session_id"),

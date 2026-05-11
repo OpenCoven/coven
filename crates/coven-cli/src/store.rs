@@ -311,6 +311,8 @@ pub fn insert_json_event(
     created_at: &str,
 ) -> Result<()> {
     let record = EventRecord {
+        // seq is populated by SQLite's rowid on insertion; 0 is a placeholder
+        // that the INSERT statement ignores.
         seq: 0,
         id: uuid::Uuid::new_v4().to_string(),
         session_id: session_id.to_string(),
@@ -347,6 +349,9 @@ pub fn list_events_with_options(
         None
     };
 
+    // The query is built dynamically based on which optional parameters are
+    // present.  All user-provided values are bound via parameterized placeholders
+    // (?1, ?2, ?3), so there is no SQL injection risk.
     let mut sql = String::from(
         "SELECT rowid AS seq, id, session_id, kind, payload_json, created_at
          FROM events WHERE session_id = ?1",
