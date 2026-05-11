@@ -1497,7 +1497,7 @@ fn sacrifice_session_command(session_id: &str, yes: bool) -> Result<()> {
     }
 
     store::sacrifice_session(&conn, session_id)?;
-    println!("sacrificed session {session_id}; its event log was permanently deleted");
+    println!("sacrificed session; its event log was permanently deleted");
     Ok(())
 }
 
