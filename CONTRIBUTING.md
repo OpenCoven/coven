@@ -9,6 +9,24 @@ Coven is built as a small, boring Rust authority layer with TypeScript integrati
 - Node.js 18+ and `pnpm` for package/plugin work
 - A supported harness CLI for manual smoke tests, usually Codex or Claude Code
 
+## Contributor First 10 Minutes
+
+Use this path for a fresh source checkout before opening a docs or code PR:
+
+```bash
+git clone https://github.com/OpenCoven/coven.git
+cd coven
+cargo build --workspace
+cargo run -p coven-cli -- doctor
+cargo test -p coven-cli --test smoke -- --nocapture
+```
+
+A healthy first pass means the workspace builds, `doctor` prints the local store/project/harness status, and the smoke test passes. It is okay if `doctor` reports Codex or Claude Code as missing as long as it gives install/setup guidance; install and authenticate a real harness only before running manual `coven run ...` sessions.
+
+The smoke test is safe for first-time contributors because it uses an isolated temporary `COVEN_HOME` and injects a fake `codex` executable into `PATH`. It does not require private Codex or Claude credentials.
+
+After this first pass, use the fuller local loop below. For product context, start with the [README](README.md) and [Getting started](docs/GETTING-STARTED.md) guide.
+
 ## Local Development
 
 1. Build the workspace:
