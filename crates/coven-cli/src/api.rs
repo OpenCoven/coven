@@ -8,16 +8,43 @@ use uuid::Uuid;
 
 use crate::{control_plane, daemon::DaemonStatus, project, store};
 
+const MAX_EVENTS_LIMIT: i64 = 1_000;
 pub const COVEN_API_VERSION: &str = "v1";
+pub const COVEN_API_NAMED_VERSION: &str = "coven.daemon.v1";
+pub const COVEN_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const SUPPORTED_API_VERSIONS: [&str; 1] = [COVEN_API_VERSION];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct HealthCapabilities {
+    pub sessions: bool,
+    pub events: bool,
+    pub event_cursor: String,
+    pub structured_errors: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HealthResponse {
-    pub api_version: String,
-    pub supported_api_versions: Vec<String>,
     pub ok: bool,
+    pub api_version: String,
+    pub coven_version: String,
+    pub capabilities: HealthCapabilities,
     pub daemon: Option<DaemonStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventCursor {
+    pub after_seq: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventsResponse {
+    pub events: Vec<store::EventRecord>,
+    pub next_cursor: Option<EventCursor>,
+    pub has_more: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,9 +88,15 @@ impl SessionRuntime for NoopSessionRuntime {
 
 pub fn health_response(daemon: Option<DaemonStatus>) -> HealthResponse {
     HealthResponse {
-        api_version: COVEN_API_VERSION.to_string(),
-        supported_api_versions: SUPPORTED_API_VERSIONS.map(str::to_string).to_vec(),
         ok: true,
+        api_version: COVEN_API_NAMED_VERSION.to_string(),
+        coven_version: COVEN_VERSION.to_string(),
+        capabilities: HealthCapabilities {
+            sessions: true,
+            events: true,
+            event_cursor: "sequence".to_string(),
+            structured_errors: true,
+        },
         daemon,
     }
 }
@@ -100,16 +133,19 @@ pub fn handle_request_with_runtime(
     let route = match normalize_api_route(route) {
         ApiRoute::Route(route) => route,
         ApiRoute::Unsupported(version) => {
-            return json_response(
+            return api_error(
                 404,
-                &json!({
-                    "error": "unsupported API version",
+                "invalid_request",
+                "Unsupported API version.",
+                Some(json!({
                     "apiVersion": version,
                     "supportedApiVersions": SUPPORTED_API_VERSIONS,
-                }),
+                })),
             );
         }
-        ApiRoute::Malformed => return json_response(404, &json!({ "error": "not found" })),
+        ApiRoute::Malformed => {
+            return api_error(404, "not_found", "Route not found.", None);
+        }
     };
     match (method, route.as_ref()) {
         ("GET", "/api-version") => json_response(
@@ -153,17 +189,27 @@ pub fn handle_request_with_runtime(
             let conn = store::open_store(&store_path(coven_home))?;
             match store::get_session(&conn, session_id)? {
                 Some(session) => json_response(200, &session),
-                None => json_response(404, &json!({ "error": "session not found" })),
+                None => api_error(
+                    404,
+                    "session_not_found",
+                    "Session was not found.",
+                    Some(json!({ "sessionId": session_id })),
+                ),
             }
         }
         ("GET", "/events") => {
-            let session_id = query_param(query.unwrap_or_default(), "sessionId");
-            match session_id {
-                Some(session_id) => list_session_events(coven_home, session_id),
-                None => json_response(400, &json!({ "error": "sessionId is required" })),
+            let q = query.unwrap_or_default();
+            match query_param(q, "sessionId") {
+                Some(session_id) => list_session_events(coven_home, session_id, q),
+                None => api_error(
+                    400,
+                    "invalid_request",
+                    "sessionId query parameter is required.",
+                    None,
+                ),
             }
         }
-        _ => json_response(404, &json!({ "error": "not found" })),
+        _ => api_error(404, "not_found", "Route not found.", None),
     }
 }
 
@@ -264,7 +310,12 @@ fn record_input(
 ) -> Result<ApiResponse> {
     let conn = store::open_store(&store_path(coven_home))?;
     let Some(session) = store::get_session(&conn, session_id)? else {
-        return json_response(404, &json!({ "error": "session not found" }));
+        return api_error(
+            404,
+            "session_not_found",
+            "Session was not found.",
+            Some(json!({ "sessionId": session_id })),
+        );
     };
     if session.status != "running" {
         return session_not_live_response(session_id);
@@ -288,7 +339,12 @@ fn kill_session(
 ) -> Result<ApiResponse> {
     let conn = store::open_store(&store_path(coven_home))?;
     let Some(session) = store::get_session(&conn, session_id)? else {
-        return json_response(404, &json!({ "error": "session not found" }));
+        return api_error(
+            404,
+            "session_not_found",
+            "Session was not found.",
+            Some(json!({ "sessionId": session_id })),
+        );
     };
     if session.status != "running" {
         return session_not_live_response(session_id);
@@ -307,22 +363,53 @@ fn kill_session(
 }
 
 fn session_not_live_response(session_id: &str) -> Result<ApiResponse> {
-    json_response(
+    api_error(
         409,
-        &json!({
-            "error": "session not live",
-            "sessionId": session_id,
-        }),
+        "session_not_live",
+        "Session is not live.",
+        Some(json!({ "sessionId": session_id })),
     )
 }
 
-fn list_session_events(coven_home: &Path, session_id: &str) -> Result<ApiResponse> {
+fn list_session_events(coven_home: &Path, session_id: &str, query: &str) -> Result<ApiResponse> {
     let conn = store::open_store(&store_path(coven_home))?;
     if store::get_session(&conn, session_id)?.is_none() {
-        return json_response(404, &json!({ "error": "session not found" }));
+        return api_error(
+            404,
+            "session_not_found",
+            "Session was not found.",
+            Some(json!({ "sessionId": session_id })),
+        );
     }
-    let events = store::list_events(&conn, session_id)?;
-    json_response(200, &events)
+
+    let after_seq = query_param(query, "afterSeq").and_then(|v| v.parse::<i64>().ok());
+    let after_event_id = query_param(query, "afterEventId").map(str::to_string);
+    let limit = query_param(query, "limit")
+        .and_then(|v| v.parse::<i64>().ok())
+        .map(|l| l.clamp(1, MAX_EVENTS_LIMIT));
+
+    let opts = store::EventsQueryOptions {
+        after_seq,
+        after_event_id,
+        limit,
+    };
+
+    let events = store::list_events_with_options(&conn, session_id, &opts)?;
+    let next_cursor = events.last().map(|e| EventCursor { after_seq: e.seq });
+    let has_more = if let Some(lim) = limit {
+        events.len() as i64 == lim
+    } else {
+        false
+    };
+
+    json_response(
+        200,
+        &EventsResponse {
+            events,
+            next_cursor,
+            has_more,
+        },
+    )
 }
 
 fn insert_event(
@@ -334,6 +421,9 @@ fn insert_event(
     store::insert_event(
         conn,
         &store::EventRecord {
+            // seq is populated by SQLite's rowid on insertion; the 0 here is a
+            // placeholder that the INSERT statement ignores.
+            seq: 0,
             id: Uuid::new_v4().to_string(),
             session_id: session_id.to_string(),
             kind: kind.to_string(),
@@ -375,6 +465,22 @@ pub(crate) fn current_timestamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
 
+fn api_error(
+    status: u16,
+    code: &str,
+    message: &str,
+    details: Option<Value>,
+) -> Result<ApiResponse> {
+    let mut error = json!({
+        "code": code,
+        "message": message,
+    });
+    if let Some(d) = details {
+        error["details"] = d;
+    }
+    json_response(status, &json!({ "error": error }))
+}
+
 fn json_response<T: Serialize>(status: u16, body: &T) -> Result<ApiResponse> {
     Ok(ApiResponse {
         status,
@@ -392,7 +498,12 @@ mod tests {
         let response = health_response(None);
 
         assert!(response.ok);
-        assert_eq!(response.api_version, COVEN_API_VERSION);
+        assert_eq!(response.api_version, COVEN_API_NAMED_VERSION);
+        assert_eq!(response.coven_version, COVEN_VERSION);
+        assert!(response.capabilities.sessions);
+        assert!(response.capabilities.events);
+        assert_eq!(response.capabilities.event_cursor, "sequence");
+        assert!(response.capabilities.structured_errors);
         assert_eq!(response.daemon, None);
     }
 
@@ -414,8 +525,10 @@ mod tests {
         assert_eq!(response.status, 200);
         assert_eq!(response.content_type, "application/json");
         assert!(response.body.contains(r#""ok":true"#));
-        assert!(response.body.contains(r#""apiVersion":"v1""#));
+        assert!(response.body.contains(r#""apiVersion":"coven.daemon.v1""#));
         assert!(response.body.contains(r#""pid":12345"#));
+        assert!(response.body.contains(r#""sessions":true"#));
+        assert!(response.body.contains(r#""structuredErrors":true"#));
         Ok(())
     }
 
@@ -426,8 +539,10 @@ mod tests {
         let response = handle_request("GET", "/api/v1/health", temp_dir.path(), None)?;
 
         assert_eq!(response.status, 200);
-        assert!(response.body.contains(r#""apiVersion":"v1""#));
-        assert!(response.body.contains(r#""supportedApiVersions":["v1"]"#));
+        assert!(response.body.contains(r#""apiVersion":"coven.daemon.v1""#));
+        assert!(response.body.contains(r#""covenVersion""#));
+        assert!(response.body.contains(r#""capabilities""#));
+        assert!(response.body.contains(r#""eventCursor":"sequence""#));
         assert!(response.body.contains(r#""ok":true"#));
         Ok(())
     }
@@ -439,7 +554,7 @@ mod tests {
         let response = handle_request("GET", "/api/v2/health", temp_dir.path(), None)?;
 
         assert_eq!(response.status, 404);
-        assert!(response.body.contains("unsupported API version"));
+        assert!(response.body.contains(r#""code":"invalid_request""#));
         Ok(())
     }
 
@@ -604,7 +719,7 @@ mod tests {
         let response = handle_request("GET", "/sessions/missing", temp_dir.path(), None)?;
 
         assert_eq!(response.status, 404);
-        assert!(response.body.contains("session not found"));
+        assert!(response.body.contains(r#""code":"session_not_found""#));
         Ok(())
     }
 
@@ -830,8 +945,8 @@ mod tests {
 
         assert_eq!(input.status, 409);
         assert_eq!(kill.status, 409);
-        assert!(input.body.contains("session not live"));
-        assert!(kill.body.contains("session not live"));
+        assert!(input.body.contains(r#""code":"session_not_live""#));
+        assert!(kill.body.contains(r#""code":"session_not_live""#));
         Ok(())
     }
 
@@ -851,8 +966,8 @@ mod tests {
 
         assert_eq!(input.status, 409);
         assert_eq!(kill.status, 409);
-        assert!(input.body.contains("session not live"));
-        assert!(kill.body.contains("session not live"));
+        assert!(input.body.contains(r#""code":"session_not_live""#));
+        assert!(kill.body.contains(r#""code":"session_not_live""#));
         Ok(())
     }
 
@@ -881,8 +996,8 @@ mod tests {
 
         assert_eq!(input.status, 409);
         assert_eq!(kill.status, 409);
-        assert!(input.body.contains("session not live"));
-        assert!(kill.body.contains("session not live"));
+        assert!(input.body.contains(r#""code":"session_not_live""#));
+        assert!(kill.body.contains(r#""code":"session_not_live""#));
         Ok(())
     }
 
@@ -901,8 +1016,8 @@ mod tests {
 
         assert_eq!(input.status, 404);
         assert_eq!(kill.status, 404);
-        assert!(input.body.contains("session not found"));
-        assert!(kill.body.contains("session not found"));
+        assert!(input.body.contains(r#""code":"session_not_found""#));
+        assert!(kill.body.contains(r#""code":"session_not_found""#));
         Ok(())
     }
 
@@ -990,6 +1105,120 @@ mod tests {
             updated_at: "2026-04-27T10:00:00Z".to_string(),
         };
         crate::store::insert_session(&conn, &session)?;
+        Ok(())
+    }
+
+    #[test]
+    fn events_response_has_paginated_envelope_with_next_cursor() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "session-1")?;
+
+        handle_request_with_body(
+            "POST",
+            "/sessions/session-1/input",
+            temp_dir.path(),
+            None,
+            Some(r#"{"data":"first"}"#),
+        )?;
+        handle_request_with_body(
+            "POST",
+            "/sessions/session-1/input",
+            temp_dir.path(),
+            None,
+            Some(r#"{"data":"second"}"#),
+        )?;
+
+        let events = handle_request("GET", "/events?sessionId=session-1", temp_dir.path(), None)?;
+
+        assert_eq!(events.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&events.body)?;
+        assert!(body["events"].is_array());
+        assert_eq!(body["events"].as_array().unwrap().len(), 2);
+        assert!(body["events"][0]["seq"].as_i64().unwrap() > 0);
+        assert!(
+            body["events"][1]["seq"].as_i64().unwrap() > body["events"][0]["seq"].as_i64().unwrap()
+        );
+        assert!(body["nextCursor"]["afterSeq"].as_i64().is_some());
+        assert_eq!(body["hasMore"], false);
+        Ok(())
+    }
+
+    #[test]
+    fn events_endpoint_supports_after_seq_cursor() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "session-1")?;
+
+        for data in &["a", "b", "c"] {
+            handle_request_with_body(
+                "POST",
+                "/sessions/session-1/input",
+                temp_dir.path(),
+                None,
+                Some(&format!(r#"{{"data":"{data}"}}"#)),
+            )?;
+        }
+
+        let all = handle_request("GET", "/events?sessionId=session-1", temp_dir.path(), None)?;
+        let all_body: serde_json::Value = serde_json::from_str(&all.body)?;
+        let first_seq = all_body["events"][0]["seq"].as_i64().unwrap();
+
+        let after = handle_request(
+            "GET",
+            &format!("/events?sessionId=session-1&afterSeq={first_seq}"),
+            temp_dir.path(),
+            None,
+        )?;
+        let after_body: serde_json::Value = serde_json::from_str(&after.body)?;
+        assert_eq!(after.status, 200);
+        assert_eq!(after_body["events"].as_array().unwrap().len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn events_endpoint_supports_limit_param() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "session-1")?;
+
+        for data in &["a", "b", "c", "d"] {
+            handle_request_with_body(
+                "POST",
+                "/sessions/session-1/input",
+                temp_dir.path(),
+                None,
+                Some(&format!(r#"{{"data":"{data}"}}"#)),
+            )?;
+        }
+
+        let limited = handle_request(
+            "GET",
+            "/events?sessionId=session-1&limit=2",
+            temp_dir.path(),
+            None,
+        )?;
+        let body: serde_json::Value = serde_json::from_str(&limited.body)?;
+        assert_eq!(limited.status, 200);
+        assert_eq!(body["events"].as_array().unwrap().len(), 2);
+        assert_eq!(body["hasMore"], true);
+        Ok(())
+    }
+
+    #[test]
+    fn events_endpoint_returns_structured_error_for_missing_session_id() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let response = handle_request("GET", "/events", temp_dir.path(), None)?;
+
+        assert_eq!(response.status, 400);
+        assert!(response.body.contains(r#""code":"invalid_request""#));
+        Ok(())
+    }
+
+    #[test]
+    fn events_endpoint_returns_structured_error_for_unknown_session() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let response = handle_request("GET", "/events?sessionId=ghost", temp_dir.path(), None)?;
+
+        assert_eq!(response.status, 404);
+        assert!(response.body.contains(r#""code":"session_not_found""#));
         Ok(())
     }
 }

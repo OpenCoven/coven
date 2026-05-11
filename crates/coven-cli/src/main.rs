@@ -2020,6 +2020,7 @@ mod tests {
     #[test]
     fn printable_event_text_extracts_output_payload() {
         let event = store::EventRecord {
+            seq: 0,
             id: "event-1".to_string(),
             session_id: "session-1".to_string(),
             kind: "output".to_string(),
@@ -2033,6 +2034,7 @@ mod tests {
     #[test]
     fn printable_event_text_formats_exit_payload() {
         let event = store::EventRecord {
+            seq: 0,
             id: "event-1".to_string(),
             session_id: "session-1".to_string(),
             kind: "exit".to_string(),

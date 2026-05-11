@@ -44,20 +44,25 @@ describe("createCovenClient", () => {
         res.setHeader("Content-Type", "application/json");
         res.end(
           JSON.stringify({
-            apiVersion: "v1",
-            supportedApiVersions: ["v1"],
             ok: true,
+            apiVersion: "coven.daemon.v1",
+            covenVersion: "0.0.0",
+            capabilities: {
+              sessions: true,
+              events: true,
+              eventCursor: "sequence",
+              structuredErrors: true,
+            },
             daemon: null,
           }),
         );
       },
       async (socketPath) => {
-        await expect(createCovenClient(socketPath).health()).resolves.toEqual({
-          apiVersion: "v1",
-          supportedApiVersions: ["v1"],
-          ok: true,
-          daemon: null,
-        });
+        const health = await createCovenClient(socketPath).health();
+        expect(health.ok).toBe(true);
+        expect(health.apiVersion).toBe("coven.daemon.v1");
+        expect(health.capabilities.structuredErrors).toBe(true);
+        expect(health.daemon).toBeNull();
       },
     );
   });
@@ -68,22 +73,23 @@ describe("createCovenClient", () => {
         res.setHeader("Content-Type", "application/json");
         res.end(
           JSON.stringify({
-            apiVersion: "v1",
-            supportedApiVersions: ["v1"],
             ok: true,
+            apiVersion: "coven.daemon.v1",
+            covenVersion: "0.0.0",
+            capabilities: {
+              sessions: true,
+              events: true,
+              eventCursor: "sequence",
+              structuredErrors: true,
+            },
             daemon: null,
           }),
         );
       },
       async (socketPath) => {
-        await expect(
-          createCovenClient(socketPath, { socketRoot: tmpDir }).health(),
-        ).resolves.toEqual({
-          apiVersion: "v1",
-          supportedApiVersions: ["v1"],
-          ok: true,
-          daemon: null,
-        });
+        const health = await createCovenClient(socketPath, { socketRoot: tmpDir }).health();
+        expect(health.ok).toBe(true);
+        expect(health.apiVersion).toBe("coven.daemon.v1");
       },
     );
   });
@@ -93,7 +99,7 @@ describe("createCovenClient", () => {
       (req, res) => {
         expect(req.url).toBe("/api/v1/events?sessionId=session-1&afterEventId=event-1");
         res.setHeader("Content-Type", "application/json");
-        res.end("[]");
+        res.end(JSON.stringify({ events: [], nextCursor: null, hasMore: false }));
       },
       async (socketPath) => {
         await expect(
@@ -140,20 +146,26 @@ describe("createCovenClient", () => {
       (_req, res) => {
         res.setHeader("Content-Type", "application/json");
         res.end(
-          JSON.stringify([
-            {
-              id: "event-1",
-              session_id: "session-1",
-              kind: "output",
-              payload_json: JSON.stringify({ data: "hello" }),
-              created_at: "2026-04-27T10:00:00Z",
-            },
-          ]),
+          JSON.stringify({
+            events: [
+              {
+                seq: 1,
+                id: "event-1",
+                session_id: "session-1",
+                kind: "output",
+                payload_json: JSON.stringify({ data: "hello" }),
+                created_at: "2026-04-27T10:00:00Z",
+              },
+            ],
+            nextCursor: { afterSeq: 1 },
+            hasMore: false,
+          }),
         );
       },
       async (socketPath) => {
         await expect(createCovenClient(socketPath).listEvents("session-1")).resolves.toEqual([
           {
+            seq: 1,
             id: "event-1",
             sessionId: "session-1",
             kind: "output",

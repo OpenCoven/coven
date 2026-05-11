@@ -16,6 +16,7 @@ export type CovenSessionRecord = {
 };
 
 export type CovenEventRecord = {
+  seq: number;
   id: string;
   sessionId: string;
   kind: string;
@@ -23,15 +24,29 @@ export type CovenEventRecord = {
   createdAt: string;
 };
 
+export type CovenHealthCapabilities = {
+  sessions: boolean;
+  events: boolean;
+  eventCursor: string;
+  structuredErrors: boolean;
+};
+
 export type CovenHealthResponse = {
   apiVersion: string;
-  supportedApiVersions: string[];
+  covenVersion: string;
+  capabilities: CovenHealthCapabilities;
   ok: boolean;
   daemon?: {
     pid: number;
     startedAt: string;
     socket: string;
   } | null;
+};
+
+export type CovenEventsResponse = {
+  events: CovenEventRecord[];
+  nextCursor: { afterSeq: number } | null;
+  hasMore: boolean;
 };
 
 export type LaunchCovenSessionInput = {
@@ -56,8 +71,14 @@ export interface CovenClient {
 }
 
 export type CovenListEventsOptions = {
+  afterSeq?: number;
   afterEventId?: string;
+  limit?: number;
 };
+
+const COVEN_API_URL_VERSION = "v1";
+const COVEN_API_CONTRACT_VERSION = "coven.daemon.v1";
+const COVEN_API_BASE_PATH = `/api/${COVEN_API_URL_VERSION}`;
 
 type RequestOptions = {
   socketPath: string;
@@ -95,8 +116,6 @@ export class CovenApiError extends Error {
   }
 }
 
-const COVEN_API_VERSION = "v1";
-const COVEN_API_BASE_PATH = `/api/${COVEN_API_VERSION}`;
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 const MAX_REQUEST_BYTES = 1_000_000;
 const MAX_RESPONSE_BYTES = 1_000_000;
@@ -402,14 +421,8 @@ function requireNullableNumberField(
 
 function normalizeHealthResponse(value: unknown): CovenHealthResponse {
   const record = requireRecord(value, "Coven health");
-  if (record.apiVersion !== COVEN_API_VERSION) {
+  if (record.apiVersion !== COVEN_API_CONTRACT_VERSION) {
     throw new Error(`Coven API version is unsupported: ${String(record.apiVersion)}`);
-  }
-  if (
-    !Array.isArray(record.supportedApiVersions) ||
-    !record.supportedApiVersions.includes(COVEN_API_VERSION)
-  ) {
-    throw new Error("Coven API supportedApiVersions is invalid");
   }
   if (typeof record.ok !== "boolean") {
     throw new Error("Coven response field ok is invalid");
@@ -434,6 +447,9 @@ function normalizeSessionRecord(value: unknown): CovenSessionRecord {
 function normalizeEventRecord(value: unknown): CovenEventRecord {
   const record = requireRecord(value, "Coven event");
   return {
+    // seq is 0 for records received from daemons that pre-date coven.daemon.v1;
+    // production responses from a coven.daemon.v1 daemon always include seq > 0.
+    seq: (record.seq as number) ?? 0,
     id: requireStringField(record, "id", "id"),
     sessionId: requireStringField(record, "sessionId", "session_id"),
     kind: requireStringField(record, "kind", "kind"),
@@ -443,10 +459,16 @@ function normalizeEventRecord(value: unknown): CovenEventRecord {
 }
 
 function normalizeEventRecords(value: unknown): CovenEventRecord[] {
-  if (!Array.isArray(value)) {
-    throw new Error("Coven events response must be an array");
+  // Accept either the paginated envelope { events, nextCursor, hasMore } or a
+  // plain array (legacy compatibility shim during the migration window).
+  if (Array.isArray(value)) {
+    return value.map(normalizeEventRecord);
   }
-  return value.map(normalizeEventRecord);
+  const envelope = requireRecord(value, "Coven events response");
+  if (!Array.isArray(envelope.events)) {
+    throw new Error("Coven events response must contain an events array");
+  }
+  return envelope.events.map(normalizeEventRecord);
 }
 
 export function createCovenClient(
@@ -486,9 +508,17 @@ export function createCovenClient(
       const params = new URLSearchParams({
         sessionId: requireSafeQueryId(sessionId, "Coven session id"),
       });
+      const afterSeq = options?.afterSeq;
+      if (typeof afterSeq === "number") {
+        params.set("afterSeq", String(afterSeq));
+      }
       const afterEventId = options?.afterEventId?.trim();
       if (afterEventId) {
         params.set("afterEventId", requireSafeQueryId(afterEventId, "Coven event id"));
+      }
+      const limit = options?.limit;
+      if (typeof limit === "number") {
+        params.set("limit", String(Math.max(1, Math.floor(limit))));
       }
       return requestJson<unknown>({
         socketPath,

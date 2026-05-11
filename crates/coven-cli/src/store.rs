@@ -19,11 +19,19 @@ pub struct SessionRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventRecord {
+    pub seq: i64,
     pub id: String,
     pub session_id: String,
     pub kind: String,
     pub payload_json: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Default)]
+pub struct EventsQueryOptions {
+    pub after_seq: Option<i64>,
+    pub after_event_id: Option<String>,
+    pub limit: Option<i64>,
 }
 
 pub fn open_store(path: &Path) -> Result<Connection> {
@@ -303,6 +311,9 @@ pub fn insert_json_event(
     created_at: &str,
 ) -> Result<()> {
     let record = EventRecord {
+        // seq is populated by SQLite's rowid on insertion; 0 is a placeholder
+        // that the INSERT statement ignores.
+        seq: 0,
         id: uuid::Uuid::new_v4().to_string(),
         session_id: session_id.to_string(),
         kind: kind.to_string(),
@@ -313,33 +324,79 @@ pub fn insert_json_event(
 }
 
 pub fn list_events(conn: &Connection, session_id: &str) -> Result<Vec<EventRecord>> {
-    let mut statement = conn
-        .prepare(
-            "SELECT
-                id,
-                session_id,
-                kind,
-                payload_json,
-                created_at
-            FROM events
-            WHERE session_id = ?1
-            ORDER BY created_at ASC, id ASC",
+    list_events_with_options(conn, session_id, &EventsQueryOptions::default())
+}
+
+pub fn list_events_with_options(
+    conn: &Connection,
+    session_id: &str,
+    opts: &EventsQueryOptions,
+) -> Result<Vec<EventRecord>> {
+    use rusqlite::OptionalExtension;
+
+    // Resolve the cursor to a rowid lower bound.
+    let after_rowid: Option<i64> = if let Some(seq) = opts.after_seq {
+        Some(seq)
+    } else if let Some(ref event_id) = opts.after_event_id {
+        conn.query_row(
+            "SELECT rowid FROM events WHERE id = ?1 AND session_id = ?2 LIMIT 1",
+            params![event_id, session_id],
+            |row| row.get::<_, i64>(0),
         )
+        .optional()
+        .context("failed to resolve event cursor by event id")?
+    } else {
+        None
+    };
+
+    // The query is built dynamically based on which optional parameters are
+    // present.  All user-provided values are bound via parameterized placeholders
+    // (?1, ?2, ?3), so there is no SQL injection risk.
+    let mut sql = String::from(
+        "SELECT rowid AS seq, id, session_id, kind, payload_json, created_at
+         FROM events WHERE session_id = ?1",
+    );
+    let has_cursor = after_rowid.is_some();
+    if has_cursor {
+        sql.push_str(" AND rowid > ?2");
+    }
+    sql.push_str(" ORDER BY rowid ASC");
+    if opts.limit.is_some() {
+        let pos = if has_cursor { "?3" } else { "?2" };
+        sql.push_str(&format!(" LIMIT {pos}"));
+    }
+
+    let mut statement = conn
+        .prepare(&sql)
         .context("failed to prepare event list query")?;
 
-    let events = statement
-        .query_map(params![session_id], |row| {
-            Ok(EventRecord {
-                id: row.get(0)?,
-                session_id: row.get(1)?,
-                kind: row.get(2)?,
-                payload_json: row.get(3)?,
-                created_at: row.get(4)?,
-            })
+    let map_row = |row: &rusqlite::Row<'_>| {
+        Ok(EventRecord {
+            seq: row.get(0)?,
+            id: row.get(1)?,
+            session_id: row.get(2)?,
+            kind: row.get(3)?,
+            payload_json: row.get(4)?,
+            created_at: row.get(5)?,
         })
-        .context("failed to query events")?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("failed to read events")?;
+    };
+
+    let events = match (after_rowid, opts.limit) {
+        (Some(after), Some(limit)) => statement
+            .query_map(params![session_id, after, limit], map_row)
+            .context("failed to query events")?,
+        (Some(after), None) => statement
+            .query_map(params![session_id, after], map_row)
+            .context("failed to query events")?,
+        (None, Some(limit)) => statement
+            .query_map(params![session_id, limit], map_row)
+            .context("failed to query events")?,
+        (None, None) => statement
+            .query_map(params![session_id], map_row)
+            .context("failed to query events")?,
+    }
+    .collect::<std::result::Result<Vec<_>, _>>()
+    .context("failed to read events")?;
 
     Ok(events)
 }
@@ -539,6 +596,7 @@ mod tests {
         insert_event(
             &conn,
             &EventRecord {
+                seq: 0,
                 id: "event-1".to_string(),
                 session_id: "session-1".to_string(),
                 kind: "input".to_string(),
@@ -574,6 +632,147 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "patch_metadata");
         assert!(events[0].payload_json.contains("openclaw"));
+        assert!(events[0].seq > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn events_have_monotonic_seq_fields() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+        insert_session(&conn, &session_record("session-1", "2026-04-27T06:00:00Z"))?;
+
+        for i in 1..=3 {
+            insert_json_event(
+                &conn,
+                "session-1",
+                "output",
+                &serde_json::json!({ "data": format!("line {i}") }),
+                "2026-04-27T06:01:00Z",
+            )?;
+        }
+
+        let events = list_events(&conn, "session-1")?;
+        assert_eq!(events.len(), 3);
+        assert!(events[0].seq > 0);
+        assert!(events[1].seq > events[0].seq);
+        assert!(events[2].seq > events[1].seq);
+        Ok(())
+    }
+
+    #[test]
+    fn list_events_with_after_seq_returns_tail() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+        insert_session(&conn, &session_record("session-1", "2026-04-27T06:00:00Z"))?;
+
+        for i in 1..=4 {
+            insert_json_event(
+                &conn,
+                "session-1",
+                "output",
+                &serde_json::json!({ "data": format!("line {i}") }),
+                "2026-04-27T06:01:00Z",
+            )?;
+        }
+
+        let all = list_events(&conn, "session-1")?;
+        let after_seq = all[1].seq;
+        let tail = list_events_with_options(
+            &conn,
+            "session-1",
+            &EventsQueryOptions {
+                after_seq: Some(after_seq),
+                ..Default::default()
+            },
+        )?;
+
+        assert_eq!(tail.len(), 2);
+        assert!(tail[0].seq > after_seq);
+        Ok(())
+    }
+
+    #[test]
+    fn list_events_with_after_event_id_returns_tail() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+        insert_session(&conn, &session_record("session-1", "2026-04-27T06:00:00Z"))?;
+
+        insert_event(
+            &conn,
+            &EventRecord {
+                seq: 0,
+                id: "event-a".to_string(),
+                session_id: "session-1".to_string(),
+                kind: "output".to_string(),
+                payload_json: r#"{"data":"a"}"#.to_string(),
+                created_at: "2026-04-27T06:01:00Z".to_string(),
+            },
+        )?;
+        insert_event(
+            &conn,
+            &EventRecord {
+                seq: 0,
+                id: "event-b".to_string(),
+                session_id: "session-1".to_string(),
+                kind: "output".to_string(),
+                payload_json: r#"{"data":"b"}"#.to_string(),
+                created_at: "2026-04-27T06:02:00Z".to_string(),
+            },
+        )?;
+        insert_event(
+            &conn,
+            &EventRecord {
+                seq: 0,
+                id: "event-c".to_string(),
+                session_id: "session-1".to_string(),
+                kind: "output".to_string(),
+                payload_json: r#"{"data":"c"}"#.to_string(),
+                created_at: "2026-04-27T06:03:00Z".to_string(),
+            },
+        )?;
+
+        let tail = list_events_with_options(
+            &conn,
+            "session-1",
+            &EventsQueryOptions {
+                after_event_id: Some("event-a".to_string()),
+                ..Default::default()
+            },
+        )?;
+
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0].id, "event-b");
+        assert_eq!(tail[1].id, "event-c");
+        Ok(())
+    }
+
+    #[test]
+    fn list_events_with_limit_returns_at_most_n_events() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+        insert_session(&conn, &session_record("session-1", "2026-04-27T06:00:00Z"))?;
+
+        for i in 1..=5 {
+            insert_json_event(
+                &conn,
+                "session-1",
+                "output",
+                &serde_json::json!({ "data": format!("line {i}") }),
+                "2026-04-27T06:01:00Z",
+            )?;
+        }
+
+        let limited = list_events_with_options(
+            &conn,
+            "session-1",
+            &EventsQueryOptions {
+                limit: Some(3),
+                ..Default::default()
+            },
+        )?;
+
+        assert_eq!(limited.len(), 3);
         Ok(())
     }
 

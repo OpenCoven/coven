@@ -78,6 +78,13 @@ describe("Coven daemon API compatibility — v2026.4", () => {
         async (socketPath) => {
           const health = await createCovenClient(socketPath).health();
           expect(health.ok).toBe(true);
+          expect(health.apiVersion).toBe("coven.daemon.v1");
+          expect(health.capabilities).toMatchObject({
+            sessions: true,
+            events: true,
+            eventCursor: "sequence",
+            structuredErrors: true,
+          });
           expect(health.daemon).toMatchObject({
             pid: expect.any(Number),
             startedAt: expect.any(String),
@@ -97,6 +104,7 @@ describe("Coven daemon API compatibility — v2026.4", () => {
         async (socketPath) => {
           const health = await createCovenClient(socketPath).health();
           expect(health.ok).toBe(true);
+          expect(health.apiVersion).toBe("coven.daemon.v1");
           expect(health.daemon).toBeNull();
         },
       );
@@ -164,6 +172,7 @@ describe("Coven daemon API compatibility — v2026.4", () => {
           );
           expect(events).toHaveLength(3);
           expect(events[0]).toMatchObject({
+            seq: 1,
             id: "event-0001",
             sessionId: "550e8400-e29b-41d4-a716-446655440001",
             kind: "output",
@@ -171,11 +180,13 @@ describe("Coven daemon API compatibility — v2026.4", () => {
             createdAt: "2026-04-28T09:10:01.000Z",
           });
           expect(events[1]).toMatchObject({
+            seq: 2,
             id: "event-0002",
             kind: "output",
             payloadJson: expect.stringContaining("Done"),
           });
           expect(events[2]).toMatchObject({
+            seq: 3,
             id: "event-0003",
             kind: "exit",
             payloadJson: expect.stringContaining("completed"),
@@ -197,6 +208,42 @@ describe("Coven daemon API compatibility — v2026.4", () => {
           const events = await createCovenClient(socketPath).listEvents(
             "550e8400-e29b-41d4-a716-446655440001",
             { afterEventId: "event-0001" },
+          );
+          expect(events).toHaveLength(3);
+        },
+      );
+    });
+
+    it("sends the afterSeq cursor when listing incremental events", async () => {
+      const fixture = await loadFixture("events-output-exit");
+      await withServer(
+        (req, res) => {
+          expect(req.url).toContain("afterSeq=2");
+          res.setHeader("Content-Type", "application/json");
+          res.end(fixture);
+        },
+        async (socketPath) => {
+          const events = await createCovenClient(socketPath).listEvents(
+            "550e8400-e29b-41d4-a716-446655440001",
+            { afterSeq: 2 },
+          );
+          expect(events).toHaveLength(3);
+        },
+      );
+    });
+
+    it("sends the limit parameter when listing events with a page size", async () => {
+      const fixture = await loadFixture("events-output-exit");
+      await withServer(
+        (req, res) => {
+          expect(req.url).toContain("limit=10");
+          res.setHeader("Content-Type", "application/json");
+          res.end(fixture);
+        },
+        async (socketPath) => {
+          const events = await createCovenClient(socketPath).listEvents(
+            "550e8400-e29b-41d4-a716-446655440001",
+            { limit: 10 },
           );
           expect(events).toHaveLength(3);
         },
@@ -401,15 +448,20 @@ describe("Coven daemon API compatibility — v2026.4", () => {
     it("throws when an event record is missing a required field (incompatible schema)", async () => {
       // A daemon that renames 'payload_json' (e.g., to 'payload') would break
       // event parsing. The client validates the field is present and throws.
-      const incompatible = JSON.stringify([
-        {
-          id: "event-1",
-          session_id: "some-session",
-          kind: "output",
-          // payload_json intentionally omitted
-          created_at: "2026-04-28T09:10:01.000Z",
-        },
-      ]);
+      const incompatible = JSON.stringify({
+        events: [
+          {
+            seq: 1,
+            id: "event-1",
+            session_id: "some-session",
+            kind: "output",
+            // payload_json intentionally omitted
+            created_at: "2026-04-28T09:10:01.000Z",
+          },
+        ],
+        nextCursor: null,
+        hasMore: false,
+      });
       await withServer(
         (_req, res) => {
           res.setHeader("Content-Type", "application/json");

@@ -1,7 +1,13 @@
 {
-  "apiVersion": "v1",
-  "supportedApiVersions": ["v1"],
   "ok": true,
+  "apiVersion": "coven.daemon.v1",
+  "covenVersion": "0.0.0",
+  "capabilities": {
+    "sessions": true,
+    "events": true,
+    "eventCursor": "sequence",
+    "structuredErrors": true
+  },
   "daemon": {
     "pid": 98765,
     "startedAt": "2026-04-28T09:00:00.000Z",

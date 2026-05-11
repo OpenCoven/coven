@@ -175,6 +175,7 @@ fn record_session_exit(
     crate::store::insert_event(
         &conn,
         &crate::store::EventRecord {
+            seq: 0,
             id: uuid::Uuid::new_v4().to_string(),
             session_id: session_id.to_string(),
             kind: "exit".to_string(),
@@ -198,6 +199,7 @@ fn record_session_event(
     crate::store::insert_event(
         &conn,
         &crate::store::EventRecord {
+            seq: 0,
             id: uuid::Uuid::new_v4().to_string(),
             session_id: session_id.to_string(),
             kind: kind.to_string(),
@@ -876,7 +878,7 @@ mod tests {
         server.join().expect("server thread panicked")?;
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains(r#""ok":true"#));
-        assert!(response.contains(r#""apiVersion":"v1""#));
+        assert!(response.contains(r#""apiVersion":"coven.daemon.v1""#));
         assert!(response.contains(r#""pid":12345"#));
         Ok(())
     }
