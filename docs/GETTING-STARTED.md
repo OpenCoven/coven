@@ -60,7 +60,14 @@ From a project directory:
 coven
 ```
 
-The default command opens the beginner-friendly TUI. Choose **Start here** or run the explicit checks:
+The default command opens the prompt-first TUI. You can either:
+
+- type a task directly and press Enter (e.g. `fix the failing tests` or a slash command like `/run codex fix the failing tests`);
+- select a menu item with arrow keys or its single-key shortcut and press Enter;
+- press `h` or type `/help` to see natural-language and slash-command examples;
+- press `Ctrl+C` or `Esc` to quit.
+
+If you prefer to run the explicit setup checks:
 
 ```sh
 coven doctor
@@ -149,6 +156,36 @@ Use `restart` when the socket or daemon state looks stale:
 ```sh
 coven daemon restart
 ```
+
+## Diagnostics and relief
+
+`coven pc` is a macOS-first system diagnostics and relief tool surfaced through the Coven CLI. All read operations are side-effect free.
+
+Inspect:
+
+```sh
+coven pc                  # full report: CPU, memory, disk, top processes
+coven pc status           # one-line health summary with 🟢/🟡/🔴 indicators
+coven pc status --json    # machine-readable health summary
+coven pc top --n 10       # top-N processes by CPU usage
+coven pc disk             # disk usage breakdown
+```
+
+Relief operations mutate system state and require an explicit `--confirm` gate:
+
+```sh
+coven pc kill <pid> --confirm     # SIGTERM with PID identity re-check
+coven pc cache clear --confirm    # clear ~/Library/Caches + /Library/Caches
+```
+
+Safety constraints in v1:
+
+- All write operations require `--confirm`. There is no bypass path.
+- Termination is SIGTERM only. No SIGKILL.
+- Process identity is re-checked immediately before SIGTERM to prevent PID reuse.
+- Cache clear uses a hardcoded path list. No glob expansion.
+- Process arguments are redacted by default; pass `--verbose` to inspect them.
+- No `sudo`, no LaunchAgent mutation, no system service control.
 
 ## Contributor verification loop
 

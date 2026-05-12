@@ -36,6 +36,10 @@ The OpenCoven local runtime substrate and command-line product.
 
 The user-facing command.
 
+## `coven pc`
+
+macOS-first system diagnostics and relief subcommand. Reports CPU, memory, disk, and top processes. Write operations (process kill, cache clear) are gated behind `--confirm`.
+
 ## `COVEN_HOME`
 
 The local directory where Coven stores daemon/socket/database state when configured. Runtime state should not be committed to source control.
@@ -67,6 +71,14 @@ The explicit repository or project boundary for a session.
 ## PTY
 
 Pseudoterminal. Coven uses PTYs so harnesses behave like terminal-native tools while their output can still be recorded and replayed.
+
+## Prompt-first TUI
+
+The default `coven` and `coven tui` interface. Accepts free-form task text or slash commands like `/run codex <task>` as input, alongside arrow-key menu navigation.
+
+## Relief
+
+Write-side operations in `coven pc` that mutate system state (process termination, cache deletion). Always require an explicit `--confirm` flag.
 
 ## Sacrifice
 
