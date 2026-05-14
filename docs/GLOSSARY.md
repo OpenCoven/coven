@@ -95,3 +95,23 @@ The local HTTP-over-Unix-socket API exposed by the daemon.
 ## Summon
 
 Restore an archived session to the active list and then replay/follow it.
+
+## Orchestration (Future)
+
+Multi-harness coordination layer (Phase 1-4). Lets users route tasks across harnesses (OpenClaw + Claude Code + Hermes), transfer context between them, and audit all work. Currently under development.
+
+## Handoff (Future)
+
+Explicit transfer of a task + full context from one harness to another. Phase 1 of orchestration.
+
+## Harness Capability (Future)
+
+A declared skill of a harness, used by the router for task matching. Example: `"code_fix"`, `"testing"`, `"research"`. Phase 2 of orchestration.
+
+## Router (Future)
+
+Orchestration component that automatically selects the best-fit harness for a task based on capability + availability + load. Phase 2 of orchestration.
+
+## Affinity (Future)
+
+A constraint on task routing. Example: "use OpenClaw's Cody agent", "requires GPU access". Phase 3 of orchestration.

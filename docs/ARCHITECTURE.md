@@ -100,6 +100,42 @@ desktop/apps -> Coven -> OpenMeow UI updates
 
 `GET /api/v1/capabilities` lets OpenMeow and other clients discover what Coven can route. `POST /api/v1/actions` gives clients a stable intent envelope without coupling them directly to brittle OS automation APIs.
 
+## Future: Multi-Harness Orchestration Layer (Phase 1-4)
+
+Coven v0 is single-harness per session. Future phases will add multi-harness orchestration:
+
+### What it does
+
+Orchestration lets users coordinate work across multiple harnesses (OpenClaw + Claude Code + Hermes, etc.) within a single project. Instead of manually switching harnesses, the orchestrator:
+
+1. **Routes tasks intelligently** — selects the best harness based on capability + availability
+2. **Transfers context** — hands off full state between harnesses with zero copy-paste
+3. **Enforces SLAs** — ensures tasks complete on time, escalating if harnesses are slow/unavailable
+4. **Audits work** — logs every handoff for compliance and debugging
+
+### Phase roadmap
+
+| Phase | Weeks | Focus | API Additions |
+|-------|-------|-------|---------------|
+| **v0 (Current)** | — | Single-harness sessions, adapters, socket API | Session + event endpoints |
+| **Phase 1** | 1-2 | Handoff protocol, context transfer | `POST /api/v1/handoff` |
+| **Phase 2** | 3-4 | Capability discovery, router, load balancing | `POST /api/v1/task/execute` |
+| **Phase 3** | 5-6 | Multi-instance, distributed context, affinity | Health heartbeat + node registration |
+| **Phase 4** | 7-8 | Audit dashboard, trace export, observability | Handoff ledger queries, metrics |
+
+### Expected changes to Coven
+
+- **Adapter interface refinement:** Adapters will declare `capabilities()` (e.g., `["code_fix", "testing"]`), `load()` (current task count), and `isHealthy()`.
+- **Handoff endpoints:** `POST /api/v1/handoff` to transfer task + context between harnesses.
+- **Task routing:** `POST /api/v1/task/execute` to submit work without specifying a harness; orchestrator routes automatically.
+- **No breaking changes:** v0 single-harness API remains unchanged; orchestration is opt-in above the layer.
+
+### Authority boundary remains
+
+The Rust daemon stays the authority boundary. Orchestration logic can be TypeScript/higher-level above the daemon, delegating safety-critical decisions (process spawning, cwd validation, capability checking) to Coven.
+
+---
+
 ## Current user-facing surface
 
 - `coven` and `coven tui` open the beginner-friendly slash-command palette.
