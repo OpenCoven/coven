@@ -33,6 +33,12 @@ pub enum DaemonStatusState {
     Stale(DaemonStatus),
 }
 
+#[derive(Debug, Deserialize)]
+struct DaemonHealthStatus {
+    ok: bool,
+    daemon: Option<DaemonStatus>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonSpawnSpec {
     pub program: PathBuf,
@@ -429,7 +435,13 @@ fn background_server_status_with_controller(
     coven_home: &Path,
     controller: &dyn DaemonStopController,
 ) -> Result<Option<DaemonStatusState>> {
-    let status = read_status(coven_home)?;
+    let status = match read_status(coven_home) {
+        Ok(status) => status,
+        Err(error) if is_daemon_status_parse_error(&error) => {
+            return recover_corrupt_status_for_status_command(coven_home);
+        }
+        Err(error) => return Err(error),
+    };
     let Some(status) = status else {
         return Ok(None);
     };
@@ -446,6 +458,27 @@ fn background_server_status_with_controller(
     Ok(None)
 }
 
+fn is_daemon_status_parse_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<serde_json::Error>().is_some())
+}
+
+fn recover_corrupt_status_for_status_command(
+    coven_home: &Path,
+) -> Result<Option<DaemonStatusState>> {
+    match daemon_status_from_default_socket(coven_home) {
+        Ok(Some(status)) => {
+            write_status(coven_home, &status)?;
+            Ok(Some(DaemonStatusState::Running(status)))
+        }
+        Ok(None) | Err(_) => {
+            clear_status(coven_home)?;
+            Ok(None)
+        }
+    }
+}
+
 fn clear_status_and_socket(coven_home: &Path) -> Result<()> {
     clear_status(coven_home)?;
     let socket = daemon_socket_path(coven_home);
@@ -457,7 +490,25 @@ fn clear_status_and_socket(coven_home: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
+fn daemon_status_from_default_socket(coven_home: &Path) -> Result<Option<DaemonStatus>> {
+    daemon_status_from_health_socket(&daemon_socket_path(coven_home).to_string_lossy())
+}
+
+#[cfg(not(unix))]
+fn daemon_status_from_default_socket(coven_home: &Path) -> Result<Option<DaemonStatus>> {
+    let _ = coven_home;
+    Ok(None)
+}
+
+#[cfg(unix)]
 fn daemon_health_reports_pid(socket: &str, expected_pid: u32) -> Result<bool> {
+    Ok(daemon_status_from_health_socket(socket)?
+        .map(|status| status.pid == expected_pid)
+        .unwrap_or(false))
+}
+
+#[cfg(unix)]
+fn daemon_status_from_health_socket(socket: &str) -> Result<Option<DaemonStatus>> {
     let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("failed to connect to Coven daemon socket {socket}"))?;
     stream
@@ -471,15 +522,15 @@ fn daemon_health_reports_pid(socket: &str, expected_pid: u32) -> Result<bool> {
         .read_to_string(&mut response)
         .context("failed to read Coven health response")?;
     let Some((_, body)) = response.split_once("\r\n\r\n") else {
-        return Ok(false);
+        return Ok(None);
     };
-    let body: Value =
+    let body: DaemonHealthStatus =
         serde_json::from_str(body).context("failed to parse Coven health response")?;
-    Ok(body
-        .get("daemon")
-        .and_then(|daemon| daemon.get("pid"))
-        .and_then(Value::as_u64)
-        .is_some_and(|pid| pid == u64::from(expected_pid)))
+    if body.ok {
+        Ok(body.daemon)
+    } else {
+        Ok(None)
+    }
 }
 
 #[cfg(unix)]
@@ -749,6 +800,47 @@ mod tests {
         assert!(clear_status(temp_dir.path())?);
         assert_eq!(read_status(temp_dir.path())?, None);
         assert!(!clear_status(temp_dir.path())?);
+        Ok(())
+    }
+
+    #[test]
+    fn read_status_still_errors_on_corrupt_daemon_status() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        std::fs::create_dir_all(temp_dir.path())?;
+        std::fs::write(daemon_status_path(temp_dir.path()), "{not json\n")?;
+
+        let error = read_status(temp_dir.path()).expect_err("read_status should remain strict");
+
+        assert!(error.to_string().contains("failed to parse daemon status"));
+        assert!(
+            daemon_status_path(temp_dir.path()).exists(),
+            "strict read should not clear corrupt metadata"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn background_server_status_clears_corrupt_metadata_without_daemon() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        std::fs::create_dir_all(temp_dir.path())?;
+        std::fs::write(daemon_status_path(temp_dir.path()), "{not json\n")?;
+
+        let state = background_server_status_with_controller(
+            temp_dir.path(),
+            &FakeStopController {
+                pid_alive: false,
+                exited_after_signal: false,
+                signal_error: None,
+                verified_daemon: false,
+                signaled: std::sync::Arc::default(),
+            },
+        )?;
+
+        assert_eq!(state, None);
+        assert!(
+            !daemon_status_path(temp_dir.path()).exists(),
+            "status command path should clear corrupt daemon metadata"
+        );
         Ok(())
     }
 

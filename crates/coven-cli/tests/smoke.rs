@@ -49,6 +49,74 @@ fn daemon_status_clears_stale_metadata_when_daemon_is_gone() -> anyhow::Result<(
 }
 
 #[test]
+fn daemon_status_clears_corrupt_metadata_when_daemon_is_gone() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    fs::create_dir_all(&coven_home)?;
+    fs::write(coven_home.join("daemon.json"), "{not json\n")?;
+
+    let output = run_coven(
+        &coven_bin(),
+        &coven_home,
+        &std::env::var_os("PATH").unwrap_or_default(),
+        &["daemon", "status"],
+    )?;
+
+    assert_success("daemon status with corrupt metadata", &output);
+    assert_stdout_contains(
+        "daemon status with corrupt metadata",
+        &output,
+        "status=stopped",
+    );
+    assert!(
+        !coven_home.join("daemon.json").exists(),
+        "corrupt daemon metadata should be cleared"
+    );
+    Ok(())
+}
+
+#[test]
+fn daemon_status_recovers_corrupt_metadata_from_live_daemon_health() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let coven = coven_bin();
+    let _daemon_guard = DaemonGuard {
+        coven: coven.clone(),
+        coven_home: coven_home.clone(),
+        path: path.clone(),
+    };
+
+    let start = run_coven(&coven, &coven_home, &path, &["daemon", "start"])?;
+    assert_success("daemon start", &start);
+    wait_for_daemon_health(&coven_home)?;
+
+    let status_path = coven_home.join("daemon.json");
+    let original_status = fs::read_to_string(&status_path)?;
+    let _restore_guard = DaemonStatusRestoreGuard {
+        path: status_path.clone(),
+        contents: original_status,
+    };
+    fs::write(&status_path, "{not json\n")?;
+
+    let output = run_coven(&coven, &coven_home, &path, &["daemon", "status"])?;
+
+    assert_success("daemon status with live corrupt metadata", &output);
+    assert_stdout_contains(
+        "daemon status with live corrupt metadata",
+        &output,
+        "status=running",
+    );
+    let recovered = fs::read_to_string(&status_path)?;
+    let recovered: Value = serde_json::from_str(&recovered)?;
+    assert!(
+        recovered.get("pid").and_then(Value::as_u64).is_some(),
+        "daemon status metadata should be restored from health"
+    );
+    Ok(())
+}
+
+#[test]
 fn smoke_daemon_session_replay_and_safe_session_rituals() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let coven_home = temp_dir.path().join("coven-home");
@@ -203,6 +271,17 @@ impl Drop for DaemonGuard {
             &self.path,
             &["daemon", "stop"],
         );
+    }
+}
+
+struct DaemonStatusRestoreGuard {
+    path: PathBuf,
+    contents: String,
+}
+
+impl Drop for DaemonStatusRestoreGuard {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.path, &self.contents);
     }
 }
 
