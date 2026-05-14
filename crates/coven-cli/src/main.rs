@@ -36,6 +36,7 @@ const DEFAULT_SESSION_STATUS: &str = "created";
 const RUNNING_SESSION_STATUS: &str = "running";
 const FAILED_SESSION_STATUS: &str = "failed";
 const DEFAULT_TITLE_CHARS: usize = 48;
+const PLAIN_SESSION_ID_COLUMN_WIDTH: usize = 36;
 
 #[derive(Parser, Debug)]
 #[command(name = "coven")]
@@ -1642,12 +1643,20 @@ fn list_sessions(include_archived: bool) -> Result<()> {
         println!("  coven sessions --all");
     } else {
         println!(
-            "{:<12} {:<10} {:<8} {:<8} TITLE",
-            "SESSION", "STATUS", "HARNESS", "RITUAL"
+            "{:<id_width$} {:<10} {:<8} {:<8} TITLE",
+            "SESSION",
+            "STATUS",
+            "HARNESS",
+            "RITUAL",
+            id_width = PLAIN_SESSION_ID_COLUMN_WIDTH
         );
         println!(
-            "{:<12} {:<10} {:<8} {:<8} -----",
-            "-------", "------", "-------", "------"
+            "{:<id_width$} {:<10} {:<8} {:<8} -----",
+            "-------",
+            "------",
+            "-------",
+            "------",
+            id_width = PLAIN_SESSION_ID_COLUMN_WIDTH
         );
         for session in sessions {
             println!("{}", format_session_line(&session));
@@ -1925,15 +1934,19 @@ fn coven_home_from_env(coven_home: Option<OsString>, home: Option<OsString>) -> 
 }
 
 fn format_session_line(session: &store::SessionRecord) -> String {
-    let short_id = first_chars(&session.id, 12);
     let ritual = if session.archived_at.is_some() {
         "archived"
     } else {
         "active"
     };
     format!(
-        "{:<12} {:<10} {:<8} {:<8} {}",
-        short_id, session.status, session.harness, ritual, session.title
+        "{:<id_width$} {:<10} {:<8} {:<8} {}",
+        session.id,
+        session.status,
+        session.harness,
+        ritual,
+        session.title,
+        id_width = PLAIN_SESSION_ID_COLUMN_WIDTH
     )
 }
 
@@ -2407,7 +2420,7 @@ mod tests {
     #[test]
     fn format_session_line_prints_id_status_harness_and_title() {
         let session = store::SessionRecord {
-            id: "session-id".to_string(),
+            id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
             project_root: "/tmp/project".to_string(),
             harness: "codex".to_string(),
             title: "A useful session".to_string(),
@@ -2420,7 +2433,7 @@ mod tests {
 
         assert_eq!(
             format_session_line(&session),
-            "session-id   created    codex    active   A useful session"
+            "550e8400-e29b-41d4-a716-446655440000 created    codex    active   A useful session"
         );
     }
 

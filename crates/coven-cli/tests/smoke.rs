@@ -140,7 +140,7 @@ fn smoke_daemon_session_replay_and_safe_session_rituals() -> anyhow::Result<()> 
 
     let active_sessions = run_coven(&coven, &coven_home, &path, &["sessions", "--plain"])?;
     assert_success("active sessions", &active_sessions);
-    assert_stdout_not_contains("active sessions", &active_sessions, &kill_session[..12]);
+    assert_stdout_not_contains("active sessions", &active_sessions, &kill_session);
 
     let archived_sessions = run_coven(
         &coven,
@@ -149,7 +149,7 @@ fn smoke_daemon_session_replay_and_safe_session_rituals() -> anyhow::Result<()> 
         &["sessions", "--all", "--plain"],
     )?;
     assert_success("archived sessions", &archived_sessions);
-    assert_stdout_contains("archived sessions", &archived_sessions, &kill_session[..12]);
+    assert_stdout_contains("archived sessions", &archived_sessions, &kill_session);
     assert_stdout_contains("archived sessions", &archived_sessions, "archived");
 
     let summon = run_coven(&coven, &coven_home, &path, &["summon", &kill_session])?;
@@ -157,7 +157,7 @@ fn smoke_daemon_session_replay_and_safe_session_rituals() -> anyhow::Result<()> 
 
     let restored_sessions = run_coven(&coven, &coven_home, &path, &["sessions", "--plain"])?;
     assert_success("restored sessions", &restored_sessions);
-    assert_stdout_contains("restored sessions", &restored_sessions, &kill_session[..12]);
+    assert_stdout_contains("restored sessions", &restored_sessions, &kill_session);
     assert_stdout_contains("restored sessions", &restored_sessions, "active");
 
     let sacrifice = run_coven(
@@ -176,11 +176,7 @@ fn smoke_daemon_session_replay_and_safe_session_rituals() -> anyhow::Result<()> 
         &["sessions", "--all", "--plain"],
     )?;
     assert_success("all sessions after sacrifice", &all_sessions);
-    assert_stdout_not_contains(
-        "all sessions after sacrifice",
-        &all_sessions,
-        &kill_session[..12],
-    );
+    assert_stdout_not_contains("all sessions after sacrifice", &all_sessions, &kill_session);
 
     let stop = run_coven(&coven, &coven_home, &path, &["daemon", "stop"])?;
     assert_success("daemon stop", &stop);
