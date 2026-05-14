@@ -178,26 +178,27 @@ Coven is the room where harnesses run. The clients decide how to present and rou
 
 ## Documentation
 
+### Getting Started
 - [Getting started](docs/GETTING-STARTED.md)
 - [Concepts](docs/CONCEPTS.md)
 - [Glossary](docs/GLOSSARY.md)
+
+### Orchestration (Multi-Harness Workflows)
+- [User guide: Orchestration](docs/USER-GUIDE-ORCHESTRATION.md) — **How to use multiple harnesses on one task**
+- [Orchestration quick reference](docs/ORCHESTRATION-QUICK-REFERENCE.md) — Command cheat sheet
+- [Common workflows](docs/ORCHESTRATION-WORKFLOWS.md) — Step-by-step guides (explore → edit, review chains, etc.)
+
+### Architecture & Reference
 - [Public roadmap](docs/ROADMAP.md)
 - [comux + Coven demo loop](docs/COMUX-DEMO-LOOP.md)
-- [Product spec](docs/PRODUCT-SPEC.md)
 - [Architecture diagrams](docs/ARCHITECTURE.md)
 - [Session lifecycle](docs/SESSION-LIFECYCLE.md)
 - [Operational model](docs/OPERATIONAL-MODEL.md)
 - [Safety model](docs/SAFETY-MODEL.md)
 - [Client integration guide](docs/CLIENT-INTEGRATION.md)
 - [Harness adapter guide](docs/HARNESS-ADAPTERS.md)
+- [API contract](docs/API-CONTRACT.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
-- [MVP plan](docs/MVP-PLAN.md)
-- [Future harnesses](docs/FUTURE-HARNESSES.md)
-- [Brand assets](docs/BRAND.md)
-- [Design system](DESIGN.md)
-- [Brand adherence checklist](docs/BRANDING-ADHERENCE.md)
-- [Documentation maintenance](docs/DOCS-MAINTENANCE.md)
-- [Security policy](SECURITY.md)
 
 ## Contributing
 
