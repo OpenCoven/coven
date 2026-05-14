@@ -12,6 +12,7 @@ The guiding promise: OpenCoven turns AI from a blank chatbox into a living works
 - [Concepts](CONCEPTS.md) — core nouns: harness, project root, session, daemon, client, control plane, and rituals.
 - [Glossary](GLOSSARY.md) — short definitions for recurring product and architecture terms.
 - [Public roadmap](ROADMAP.md) — community-facing progress snapshot across Coven, comux, and integrations.
+- [comux + Coven demo loop](COMUX-DEMO-LOOP.md) — Coven-side CLI/API contract for the visible comux cockpit flow.
 - [Product spec](PRODUCT-SPEC.md) — what Coven is and what belongs in MVP.
 - [Architecture diagrams](ARCHITECTURE.md) — runtime topology, session lifecycle, and authority boundary diagrams.
 - [Session lifecycle](SESSION-LIFECYCLE.md) — launch, attach/replay, archive, summon, sacrifice, orphan recovery, and events.

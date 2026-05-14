@@ -9,7 +9,7 @@ Talk to Coven through the local socket API. Do not duplicate Coven's path, harne
 Recommended handshake:
 
 1. Call `GET /api/v1/health`.
-2. Confirm `supportedApiVersions` includes `v1`.
+2. Confirm `apiVersion === "coven.daemon.v1"` and the needed `capabilities` fields are available.
 3. Call `GET /api/v1/capabilities` if using control-plane actions.
 4. Use versioned `/api/v1/...` routes only.
 
@@ -47,6 +47,7 @@ Good comux responsibilities:
 - launch sessions from visible project/worktree context;
 - open sessions in panes;
 - attach/rejoin live work;
+- read `coven sessions --json` for simple local discovery when daemon-level control is unnecessary;
 - show logs and artifacts;
 - help review diffs;
 - help merge, PR, archive, or clean up explicitly.
@@ -105,7 +106,7 @@ A native control room can make Coven easier to operate by showing:
 - logs and traces;
 - docs and troubleshooting links.
 
-Use `coven sessions --json` for active sessions and `coven sessions --json --all` when the client needs archived records too. The JSON shape is the same `SessionRecord` shape exposed by the daemon API, including `project_root`, `status`, `created_at`, `updated_at`, and nullable `archived_at`.
+Use `coven sessions --json` for active sessions and `coven sessions --json --all` when the client needs archived records too. The CLI returns a top-level object with a `sessions` array, and each record uses the same `SessionRecord` field names exposed by the daemon API, including `project_root`, `status`, `created_at`, `updated_at`, and nullable `archived_at`.
 
 The control room should still use the same socket API and capability handshake as other clients.
 

@@ -8,7 +8,7 @@ See [Authentication and local access](AUTH.md) for the current auth posture. In 
 
 ## Versioning
 
-The current public API contract is **`v1`**.
+The current public API contract is the named **`coven.daemon.v1`** contract served under the `/api/v1` route prefix.
 
 Versioned clients should use the `/api/v1` prefix:
 
@@ -35,9 +35,15 @@ Unknown `/api/<version>/...` prefixes fail closed with an `unsupported API versi
 
 ```json
 {
-  "apiVersion": "v1",
-  "supportedApiVersions": ["v1"],
   "ok": true,
+  "apiVersion": "coven.daemon.v1",
+  "covenVersion": "0.0.0",
+  "capabilities": {
+    "sessions": true,
+    "events": true,
+    "eventCursor": "sequence",
+    "structuredErrors": true
+  },
   "daemon": {
     "pid": 12345,
     "startedAt": "2026-05-09T12:00:00Z",
