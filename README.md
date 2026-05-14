@@ -71,9 +71,10 @@ coven run claude "polish this UI"
 coven sessions
 coven sessions --all
 coven sessions --plain
+coven sessions --json
 ```
 
-`coven doctor` checks whether supported local harness CLIs are available. `coven run` creates a project-scoped session record, validates the working directory, and launches the selected harness through Coven-managed PTY execution. In a terminal, `coven sessions` opens a human session browser where you can select work and choose visible actions like **Rejoin**, **View Log**, **Summon**, **Archive**, and **Sacrifice** without copying IDs; use `--plain` for scripts or table output.
+`coven doctor` checks whether supported local harness CLIs are available. `coven run` creates a project-scoped session record, validates the working directory, and launches the selected harness through Coven-managed PTY execution. In a terminal, `coven sessions` opens a human session browser where you can select work and choose visible actions like **Rejoin**, **View Log**, **Summon**, **Archive**, and **Sacrifice** without copying IDs; use `--plain` for scripts or `--json` for client discovery.
 
 Coven also provides a rescue loop for OpenClaw contributors and users:
 
@@ -117,6 +118,7 @@ OpenCoven is an open ecosystem for persistent AI familiars: named agents with me
 | `coven sessions --all` | Browse active and archived sessions in a terminal; print all when piped |
 | `coven sessions --manage` | Force the interactive session browser |
 | `coven sessions --plain` | Force plain table output for scripts/copying |
+| `coven sessions --json` | Print a JSON `sessions` array for clients such as comux |
 | `coven attach <session-id>` | Replay/follow session output and forward input |
 | `coven summon <session-id>` | Restore an archived session, then replay/follow it |
 | `coven archive <session-id>` | Hide a non-running session from the active list while preserving events |
@@ -126,7 +128,7 @@ Session rituals are intentionally explicit. **Archive** is reversible and keeps 
 
 ## Local API
 
-The daemon exposes a small versioned HTTP API over a Unix socket for first-party and external clients. The current public contract is **`v1`**; new clients should use the `/api/v1` prefix.
+The daemon exposes a small versioned HTTP API over a Unix socket for first-party and external clients. The current public contract is **`coven.daemon.v1`** served under the `/api/v1` prefix.
 
 Coven's current auth posture is same-user local access over `<covenHome>/coven.sock`. It does not use daemon OAuth, JWTs, bearer tokens, API keys, or browser cookies; provider auth stays with the harness CLIs such as Codex and Claude Code. See [`docs/AUTH.md`](docs/AUTH.md) before adding a new client, dashboard, remote bridge, or browser-facing transport.
 
@@ -143,7 +145,7 @@ Coven's current auth posture is same-user local access over `<covenHome>/coven.s
 
 Treat the socket API as the product contract. Clients may validate for UX, but the Rust daemon remains the authority boundary. See [`docs/API.md`](docs/API.md) for compatibility rules.
 
-Current stable contract: [`docs/API-CONTRACT.md`](docs/API-CONTRACT.md). `GET /api/v1/health` exposes `apiVersion: "v1"` and `supportedApiVersions: ["v1"]` for client handshakes.
+Current stable contract: [`docs/API-CONTRACT.md`](docs/API-CONTRACT.md). `GET /api/v1/health` exposes the named contract `apiVersion: "coven.daemon.v1"` and machine-readable capabilities for client handshakes.
 
 ## Requirements
 
@@ -180,6 +182,7 @@ Coven is the room where harnesses run. The clients decide how to present and rou
 - [Concepts](docs/CONCEPTS.md)
 - [Glossary](docs/GLOSSARY.md)
 - [Public roadmap](docs/ROADMAP.md)
+- [comux + Coven demo loop](docs/COMUX-DEMO-LOOP.md)
 - [Product spec](docs/PRODUCT-SPEC.md)
 - [Architecture diagrams](docs/ARCHITECTURE.md)
 - [Session lifecycle](docs/SESSION-LIFECYCLE.md)

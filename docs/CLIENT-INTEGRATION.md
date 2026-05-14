@@ -9,7 +9,7 @@ Talk to Coven through the local socket API. Do not duplicate Coven's path, harne
 Recommended handshake:
 
 1. Call `GET /api/v1/health`.
-2. Confirm `supportedApiVersions` includes `v1`.
+2. Confirm `apiVersion === "coven.daemon.v1"` and the needed `capabilities` fields are available.
 3. Call `GET /api/v1/capabilities` if using control-plane actions.
 4. Use versioned `/api/v1/...` routes only.
 
@@ -47,6 +47,7 @@ Good comux responsibilities:
 - launch sessions from visible project/worktree context;
 - open sessions in panes;
 - attach/rejoin live work;
+- read `coven sessions --json` for simple local discovery when daemon-level control is unnecessary;
 - show logs and artifacts;
 - help review diffs;
 - help merge, PR, archive, or clean up explicitly.

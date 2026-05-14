@@ -81,6 +81,8 @@ enum Command {
         manage: bool,
         #[arg(long, help = "Print a plain table instead of the session browser")]
         plain: bool,
+        #[arg(long, help = "Print sessions as JSON for clients such as comux")]
+        json: bool,
     },
     #[command(about = "Replay/follow a session and forward input to live daemon sessions")]
     Attach { session_id: String },
@@ -151,7 +153,12 @@ fn main() -> Result<()> {
             title,
             detach,
         }) => run_session(&harness, &prompt, cwd.as_deref(), title.as_deref(), detach),
-        Some(Command::Sessions { all, manage, plain }) => run_sessions_command(all, manage, plain),
+        Some(Command::Sessions {
+            all,
+            manage,
+            plain,
+            json,
+        }) => run_sessions_command(all, manage, plain, json),
         Some(Command::Attach { session_id }) => attach_session(&session_id),
         Some(Command::Summon { session_id }) => summon_session_command(&session_id),
         Some(Command::Archive { session_id }) => archive_session_command(&session_id),
@@ -217,6 +224,7 @@ enum SessionBrowserActionKind {
 enum SessionsCommandMode {
     Browser,
     List,
+    Json,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -584,15 +592,22 @@ fn run_guided_harness_session() -> Result<()> {
     run_session(&harness, &[prompt], None, title.as_deref(), false)
 }
 
-fn run_sessions_command(include_archived: bool, manage: bool, plain: bool) -> Result<()> {
+fn run_sessions_command(
+    include_archived: bool,
+    manage: bool,
+    plain: bool,
+    json: bool,
+) -> Result<()> {
     match sessions_command_mode(
         io::stdin().is_terminal(),
         io::stdout().is_terminal(),
         manage,
         plain,
+        json,
     ) {
         SessionsCommandMode::Browser => run_session_browser(include_archived),
-        SessionsCommandMode::List => list_sessions(include_archived),
+        SessionsCommandMode::List => list_sessions_plain(include_archived),
+        SessionsCommandMode::Json => list_sessions_json(include_archived),
     }
 }
 
@@ -601,8 +616,11 @@ fn sessions_command_mode(
     stdout_terminal: bool,
     manage: bool,
     plain: bool,
+    json: bool,
 ) -> SessionsCommandMode {
-    if plain {
+    if json {
+        SessionsCommandMode::Json
+    } else if plain {
         SessionsCommandMode::List
     } else if manage || (stdin_terminal && stdout_terminal) {
         SessionsCommandMode::Browser
@@ -1622,7 +1640,7 @@ fn run_session(
     }
 }
 
-fn list_sessions(include_archived: bool) -> Result<()> {
+fn list_sessions_plain(include_archived: bool) -> Result<()> {
     let store_path = coven_store_path()?;
     let conn = store::open_store(&store_path)?;
     let sessions = if include_archived {
@@ -1669,6 +1687,19 @@ fn list_sessions(include_archived: bool) -> Result<()> {
         println!("  coven sacrifice <session-id> --yes  # permanently delete non-running session");
     }
 
+    Ok(())
+}
+
+fn list_sessions_json(include_archived: bool) -> Result<()> {
+    let store_path = coven_store_path()?;
+    let conn = store::open_store(&store_path)?;
+    let sessions = if include_archived {
+        store::list_sessions_including_archived(&conn)?
+    } else {
+        store::list_sessions(&conn)?
+    };
+
+    println!("{}", render_sessions_json(&sessions)?);
     Ok(())
 }
 
@@ -1950,6 +1981,11 @@ fn format_session_line(session: &store::SessionRecord) -> String {
     )
 }
 
+fn render_sessions_json(sessions: &[store::SessionRecord]) -> Result<String> {
+    serde_json::to_string_pretty(&serde_json::json!({ "sessions": sessions }))
+        .context("failed to serialize sessions as JSON")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2228,10 +2264,16 @@ mod tests {
     fn cli_accepts_coven_session_ritual_verbs() {
         let sessions = Cli::parse_from(["coven", "sessions", "--all"]);
         match sessions.command {
-            Some(Command::Sessions { all, manage, plain }) => {
+            Some(Command::Sessions {
+                all,
+                manage,
+                plain,
+                json,
+            }) => {
                 assert!(all);
                 assert!(!manage);
                 assert!(!plain);
+                assert!(!json);
             }
             other => panic!("expected sessions command, got {other:?}"),
         }
@@ -2242,6 +2284,12 @@ mod tests {
                 assert!(manage);
                 assert!(plain);
             }
+            other => panic!("expected sessions command, got {other:?}"),
+        }
+
+        let json = Cli::parse_from(["coven", "sessions", "--json"]);
+        match json.command {
+            Some(Command::Sessions { json, .. }) => assert!(json),
             other => panic!("expected sessions command, got {other:?}"),
         }
 
@@ -2270,20 +2318,24 @@ mod tests {
     #[test]
     fn sessions_command_opens_browser_for_humans_and_plain_tables_for_scripts() {
         assert_eq!(
-            sessions_command_mode(true, true, false, false),
+            sessions_command_mode(true, true, false, false, false),
             SessionsCommandMode::Browser
         );
         assert_eq!(
-            sessions_command_mode(false, true, false, false),
+            sessions_command_mode(false, true, false, false, false),
             SessionsCommandMode::List
         );
         assert_eq!(
-            sessions_command_mode(false, false, true, false),
+            sessions_command_mode(false, false, true, false, false),
             SessionsCommandMode::Browser
         );
         assert_eq!(
-            sessions_command_mode(true, true, true, true),
+            sessions_command_mode(true, true, true, true, false),
             SessionsCommandMode::List
+        );
+        assert_eq!(
+            sessions_command_mode(true, true, true, true, true),
+            SessionsCommandMode::Json
         );
     }
 
@@ -2435,6 +2487,30 @@ mod tests {
             format_session_line(&session),
             "550e8400-e29b-41d4-a716-446655440000 created    codex    active   A useful session"
         );
+    }
+
+    #[test]
+    fn render_sessions_json_prints_client_friendly_session_array() -> Result<()> {
+        let session = store::SessionRecord {
+            id: "session-1".to_string(),
+            project_root: "/tmp/project".to_string(),
+            harness: "codex".to_string(),
+            title: "Demo loop".to_string(),
+            status: "running".to_string(),
+            exit_code: None,
+            archived_at: None,
+            created_at: "2026-05-14T07:00:00Z".to_string(),
+            updated_at: "2026-05-14T07:00:01Z".to_string(),
+        };
+
+        let rendered = render_sessions_json(&[session])?;
+        let body: serde_json::Value = serde_json::from_str(&rendered)?;
+
+        assert_eq!(body["sessions"][0]["id"], "session-1");
+        assert_eq!(body["sessions"][0]["project_root"], "/tmp/project");
+        assert_eq!(body["sessions"][0]["harness"], "codex");
+        assert_eq!(body["sessions"][0]["status"], "running");
+        Ok(())
     }
 
     #[test]
