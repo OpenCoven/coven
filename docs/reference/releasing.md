@@ -1,11 +1,14 @@
 ---
 summary: "Release flow for @opencoven/cli and platform packages."
+description: "Operator runbook for releasing Coven to npm: preflight checks, dry-run, publishing native packages, and postflight verification."
 read_when:
   - Cutting a release
-title: "Releasing"
+title: "Releasing Coven to npm"
 ---
 
-Coven publishes the npm wrapper and native platform packages from the **Release npm packages** GitHub Actions workflow. The source package versions stay `0.0.0`; the workflow dispatch version is the published npm version.
+Coven publishes the `@opencoven/cli` wrapper and its native platform packages (`@opencoven/cli-macos`, `@opencoven/cli-linux-x64`, `@opencoven/cli-windows`) from the **Release npm packages** GitHub Actions workflow.
+
+Use this page when you are cutting a release. The source package versions stay `0.0.0` in the repo; the workflow dispatch `version` input is the published npm version.
 
 ## Preflight
 

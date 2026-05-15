@@ -177,6 +177,7 @@
                 "group": "Project",
                 "pages": [
                   "PRODUCT-SPEC",
+                  "reference/releasing",
                   "reference/changelog"
                 ]
               }
