@@ -61,6 +61,24 @@ class SecretGuardLockfileTests(unittest.TestCase):
 
         self.assertEqual(hits, [("packages/openclaw-coven/pnpm-lock.yaml", 1, "generic_assignment")])
 
+    def test_opencoven_github_urls_do_not_trigger_high_entropy(self) -> None:
+        text = (
+            "The canonical brand system lives in "
+            "https://github.com/OpenCoven/coven/blob/main/DESIGN.md and "
+            "https://github.com/OpenCoven/coven/tree/main/brand."
+        )
+
+        hits = check_secrets.scan_text(text, "docs/BRAND.md")
+
+        self.assertEqual(hits, [])
+
+    def test_opencoven_local_worktree_paths_do_not_trigger_high_entropy(self) -> None:
+        text = "/Users/buns/Documents/GitHub/OpenCoven/coven/.worktrees/feat-tui-chat-module"
+
+        hits = check_secrets.scan_text(text, "docs/superpowers/plans/example.md")
+
+        self.assertEqual(hits, [])
+
     def test_lockfiles_are_not_excluded_from_scanning(self) -> None:
         self.assertFalse(check_secrets.is_excluded_path("packages/openclaw-coven/pnpm-lock.yaml"))
 
