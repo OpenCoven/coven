@@ -16,19 +16,19 @@ pub struct Rgb {
 pub mod brand {
     use super::Rgb;
     pub const PURPLE_1: Rgb = Rgb {
-        r: 0x6E,
-        g: 0x4B,
-        b: 0xFF,
+        r: 0x7A,
+        g: 0x6D,
+        b: 0xAA,
     };
     pub const PURPLE_2: Rgb = Rgb {
-        r: 0x8A,
-        g: 0x63,
-        b: 0xFF,
+        r: 0x9A,
+        g: 0x8E,
+        b: 0xCD,
     };
     pub const PURPLE_3: Rgb = Rgb {
-        r: 0xA7,
-        g: 0x8B,
-        b: 0xFF,
+        r: 0xC5,
+        g: 0xBD,
+        b: 0xED,
     };
     // Defined for future use; consumed via the `DANGER` / `SUCCESS` semantic tokens
     // in later phases (destructive prompts, ready-state indicators).
@@ -69,14 +69,14 @@ pub mod brand {
         b: 0x6B,
     };
     pub const SURFACE_1: Rgb = Rgb {
-        r: 0x05,
-        g: 0x05,
-        b: 0x07,
+        r: 0x0F,
+        g: 0x0A,
+        b: 0x14,
     };
     pub const SURFACE_2: Rgb = Rgb {
-        r: 0x08,
-        g: 0x08,
-        b: 0x12,
+        r: 0x1A,
+        g: 0x18,
+        b: 0x25,
     };
 }
 
@@ -386,7 +386,8 @@ mod tests {
             let line = line.split("/*").next().unwrap().trim();
             let line = line.trim_end_matches(';').trim();
             if let Some((name, value)) = line.split_once(':') {
-                out.insert(name.trim().to_string(), value.trim().to_string());
+                out.entry(name.trim().to_string())
+                    .or_insert_with(|| value.trim().to_string());
             }
         }
         out
@@ -609,9 +610,9 @@ mod tests {
 
     #[test]
     fn nearest_256_brand_tokens() {
-        assert_eq!(nearest_256(brand::PURPLE_3), 141);
-        assert_eq!(nearest_256(brand::PURPLE_2), 99);
-        assert_eq!(nearest_256(brand::PURPLE_1), 63);
+        assert_eq!(nearest_256(brand::PURPLE_3), 183);
+        assert_eq!(nearest_256(brand::PURPLE_2), 104);
+        assert_eq!(nearest_256(brand::PURPLE_1), 97);
         assert_eq!(nearest_256(brand::ACCENT_BLUE), 33);
         assert_eq!(nearest_256(brand::DANGER), 203);
         assert_eq!(nearest_256(brand::SUCCESS), 77);
@@ -647,7 +648,7 @@ mod tests {
         use ratatui::style::Color;
         assert_eq!(
             ratatui_color_with_mode(brand::PURPLE_3, TerminalMode::TrueColor),
-            Color::Rgb(0xA7, 0x8B, 0xFF),
+            Color::Rgb(0xC5, 0xBD, 0xED),
         );
     }
     #[test]
@@ -655,7 +656,7 @@ mod tests {
         use ratatui::style::Color;
         assert_eq!(
             ratatui_color_with_mode(brand::PURPLE_3, TerminalMode::Indexed256),
-            Color::Indexed(141),
+            Color::Indexed(183),
         );
     }
     #[test]
@@ -681,7 +682,7 @@ mod tests {
                 "{}",
                 Fg::with_mode(brand::PURPLE_3, TerminalMode::TrueColor)
             ),
-            "\x1b[38;2;167;139;255m",
+            "\x1b[38;2;197;189;237m",
         );
     }
     #[test]
@@ -691,7 +692,7 @@ mod tests {
                 "{}",
                 Fg::with_mode(brand::PURPLE_3, TerminalMode::Indexed256)
             ),
-            "\x1b[38;5;141m",
+            "\x1b[38;5;183m",
         );
     }
     #[test]
@@ -708,7 +709,7 @@ mod tests {
                 "{}",
                 Bg::with_mode(brand::SURFACE_2, TerminalMode::TrueColor)
             ),
-            "\x1b[48;2;8;8;18m",
+            "\x1b[48;2;26;24;37m",
         );
     }
     #[test]
