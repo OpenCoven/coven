@@ -18,9 +18,11 @@ pub mod brand {
     pub const PURPLE_1:    Rgb = Rgb { r: 0x6E, g: 0x4B, b: 0xFF };
     pub const PURPLE_2:    Rgb = Rgb { r: 0x8A, g: 0x63, b: 0xFF };
     pub const PURPLE_3:    Rgb = Rgb { r: 0xA7, g: 0x8B, b: 0xFF };
-    pub const ACCENT_BLUE: Rgb = Rgb { r: 0x0A, g: 0x84, b: 0xFF };
-    pub const DANGER:      Rgb = Rgb { r: 0xFF, g: 0x3B, b: 0x30 };
-    pub const SUCCESS:     Rgb = Rgb { r: 0x30, g: 0xD1, b: 0x58 };
+    // Defined for future use; consumed via the `DANGER` / `SUCCESS` semantic tokens
+    // in later phases (destructive prompts, ready-state indicators).
+    #[allow(dead_code)] pub const ACCENT_BLUE: Rgb = Rgb { r: 0x0A, g: 0x84, b: 0xFF };
+    #[allow(dead_code)] pub const DANGER:      Rgb = Rgb { r: 0xFF, g: 0x3B, b: 0x30 };
+    #[allow(dead_code)] pub const SUCCESS:     Rgb = Rgb { r: 0x30, g: 0xD1, b: 0x58 };
     /// rgba(255, 255, 255, 0.94) on black = round(255 * 0.94) = 240
     pub const TEXT:        Rgb = Rgb { r: 0xF0, g: 0xF0, b: 0xF0 };
     /// rgba(255, 255, 255, 0.64) on black = round(255 * 0.64) = 163
@@ -38,10 +40,13 @@ pub const PRIMARY_STRONG: Rgb = brand::PURPLE_2;
 pub const AGENT_LABEL:    Rgb = brand::PURPLE_2;
 pub const USER_LABEL:     Rgb = brand::PURPLE_1;
 pub const HINT_KEY:       Rgb = brand::TEXT;
-pub const HINT_LABEL:     Rgb = brand::TEXT_MUTED;
+// Defined for future use: HINT_LABEL distinguishes prose from keys in hint
+// bars; DANGER/SUCCESS will be wired to destructive prompts and ready-state
+// indicators in a later phase. Per spec, "defined and tested only" for Phase 1.
+#[allow(dead_code)] pub const HINT_LABEL:     Rgb = brand::TEXT_MUTED;
 pub const FIELD_LABEL:    Rgb = brand::TEXT_MUTED;
-pub const DANGER:         Rgb = brand::DANGER;
-pub const SUCCESS:        Rgb = brand::SUCCESS;
+#[allow(dead_code)] pub const DANGER:         Rgb = brand::DANGER;
+#[allow(dead_code)] pub const SUCCESS:        Rgb = brand::SUCCESS;
 pub const DIM:            Rgb = brand::TEXT_FAINT;
 pub const SURFACE:        Rgb = brand::SURFACE_1;
 pub const SURFACE_STRONG: Rgb = brand::SURFACE_2;
@@ -203,6 +208,9 @@ pub struct Fg {
     mode: TerminalMode,
 }
 
+// `Bg` is pre-wired alongside `Fg` for symmetry; full backgrounds via ANSI
+// escape land in a later phase (currently main.rs uses ratatui Style::bg).
+#[allow(dead_code)]
 pub struct Bg {
     rgb: Rgb,
     mode: TerminalMode,
@@ -215,6 +223,7 @@ pub struct Reset {
 impl Fg {
     pub(crate) fn with_mode(rgb: Rgb, mode: TerminalMode) -> Self { Self { rgb, mode } }
 }
+#[allow(dead_code)]
 impl Bg {
     pub(crate) fn with_mode(rgb: Rgb, mode: TerminalMode) -> Self { Self { rgb, mode } }
 }
@@ -226,6 +235,7 @@ impl Reset {
 pub fn fg(c: Rgb) -> Fg { Fg::with_mode(c, mode()) }
 
 /// Background escape for the active mode.
+#[allow(dead_code)]
 pub fn bg(c: Rgb) -> Bg { Bg::with_mode(c, mode()) }
 
 /// SGR-reset escape for the active mode. Empty in `NoColor`.
