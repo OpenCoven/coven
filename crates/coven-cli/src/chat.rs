@@ -10,7 +10,7 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Layout, Margin, Rect},
-    style::{Color, Style, Stylize},
+    style::{Color, Style},
     text::{Line, Span, Text},
     widgets::{
         Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
