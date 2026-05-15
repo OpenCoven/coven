@@ -3,8 +3,10 @@ summary: "Current Coven local socket API endpoints."
 read_when:
   - Looking up an endpoint
   - Building a client against `/api/v1`
-title: "API reference"
+title: "Coven API reference"
+description: "Endpoint reference for the Coven local socket API under /api/v1: health, capabilities, actions, sessions, events, and input forwarding."
 ---
+
 
 The Coven daemon exposes its public API as HTTP over a Unix socket under `<covenHome>/coven.sock`. The active contract is **`coven.daemon.v1`** served under `/api/v1`.
 

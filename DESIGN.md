@@ -1,6 +1,6 @@
 # OpenCoven — Brand & Design System
 
-**Status:** Production-Ready | Last Updated: 2026-04-28
+**Status:** Production-Ready | Last Updated: 2026-05-15 (Brand palette updated)
 
 ---
 

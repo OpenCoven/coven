@@ -1,3 +1,8 @@
+---
+title: "Session lifecycle"
+description: "How a Coven session moves through created, running, completed, failed, orphaned, archived, and summoned states from coven run to replay."
+---
+
 # Session Lifecycle
 
 This document explains what happens from `coven run` through completion, replay, archive, summon, and deletion.

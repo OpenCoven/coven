@@ -1,3 +1,8 @@
+---
+title: "Harness adapter guide"
+description: "The harness adapter shape Coven uses today, the bar for adding new harnesses, and how Codex and Claude Code map onto the v0 adapter surface."
+---
+
 # Harness Adapter Guide
 
 Coven v0 supports Codex and Claude Code. This guide describes the current adapter shape and the bar for adding more harnesses.

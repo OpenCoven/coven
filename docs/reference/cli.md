@@ -3,8 +3,10 @@ summary: "Current Coven CLI command surface."
 read_when:
   - Looking up a Coven CLI flag
   - Scripting against the Coven CLI
-title: "CLI reference"
+title: "Coven CLI reference"
+description: "Reference for the coven CLI commands: doctor, daemon, run, sessions, attach, archive, kill, summon, sacrifice, view, and TUI command flags."
 ---
+
 
 The user-facing command is always `coven`. Wrapper packages like `@opencoven/cli`, `@opencoven/cli-macos`, and `@opencoven/cli-linux-x64` install the same binary.
 

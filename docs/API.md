@@ -1,3 +1,8 @@
+---
+title: "Coven local socket API"
+description: "The Coven local HTTP API served over a Unix socket: health, capabilities, actions, sessions, events, and input forwarding under /api/v1."
+---
+
 # Coven Local API
 
 _Last updated: 2026-05-09_

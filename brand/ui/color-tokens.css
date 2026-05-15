@@ -1,35 +1,65 @@
-/* OpenCoven brand color tokens. Canonical values mirror DESIGN.md. */
+/* OpenCoven brand color tokens. Updated 2026-05-15. Canonical values mirror DESIGN.md. */
 :root {
-  color-scheme: dark;
+  color-scheme: light dark;
 
   /* Anchors */
   --oc-black: #000000;
   --oc-white: #ffffff;
 
-  /* Purple spectrum */
-  --oc-purple-1: #6E4BFF;
-  --oc-purple-2: #8A63FF;
-  --oc-purple-3: #A78BFF;
-  --oc-purple-glow: #7C5CFF;
+  /* Primary purple spectrum (muted lavender-grey) */
+  --oc-purple-primary: #9A8ECD;
+  --oc-purple-dark: #7A6DAA;
+  --oc-purple-light: #C5BDED;
+  --oc-purple-very-light: #E8E4F5;
+  --oc-purple-accent: #D4B5FF;
+  --oc-purple-accent-muted: #9D7FBF;
+
+  /* Legacy aliases for backward compatibility */
+  --oc-purple-1: #7A6DAA;     /* was #6E4BFF */
+  --oc-purple-2: #9A8ECD;     /* was #8A63FF */
+  --oc-purple-3: #C5BDED;     /* was #A78BFF */
+  --oc-purple-glow: #9A8ECD;  /* was #7C5CFF */
 
   /* Controlled accents */
   --oc-accent-blue: #0A84FF;
   --oc-danger: #FF3B30;
   --oc-success: #30D158;
 
-  /* Surfaces */
-  --oc-surface-0: var(--oc-black);
-  --oc-surface-1: #050507;
-  --oc-surface-2: #080812;
+  /* Surfaces (dark mode) */
+  --oc-surface-0: #000000;
+  --oc-surface-1: #0F0A14;
+  --oc-surface-2: #1A1825;
+  --oc-surface-3: #2A2438;
   --oc-border-subtle: rgba(255, 255, 255, 0.08);
   --oc-border-strong: rgba(255, 255, 255, 0.14);
+  --oc-border-purple: rgba(154, 142, 205, 0.2);
   --oc-text: rgba(255, 255, 255, 0.94);
   --oc-text-muted: rgba(255, 255, 255, 0.64);
   --oc-text-faint: rgba(255, 255, 255, 0.42);
 
-  /* Signature treatments: use sparingly. */
-  --oc-gradient-signature: linear-gradient(135deg, var(--oc-purple-1), var(--oc-purple-3));
-  --oc-radial-glow: radial-gradient(circle, rgba(138, 99, 255, 0.28) 0%, rgba(138, 99, 255, 0) 68%);
-  --oc-focus-ring: 0 0 0 2px rgba(124, 92, 255, 0.52), 0 0 32px rgba(124, 92, 255, 0.28);
-  --oc-hover-glow: 0 0 36px rgba(124, 92, 255, 0.26);
+  /* Light mode overrides */
+  @media (prefers-color-scheme: light) {
+    --oc-surface-0: #FAFBFD;
+    --oc-surface-1: #F5F6F9;
+    --oc-surface-2: #EDEEF3;
+    --oc-surface-3: #E8E4F5;
+    --oc-border-subtle: rgba(0, 0, 0, 0.08);
+    --oc-border-strong: rgba(0, 0, 0, 0.14);
+    --oc-border-purple: rgba(154, 142, 205, 0.25);
+    --oc-text: rgba(15, 10, 20, 0.94);
+    --oc-text-muted: rgba(15, 10, 20, 0.64);
+    --oc-text-faint: rgba(15, 10, 20, 0.42);
+  }
+
+  /* Signature treatments: use sparingly */
+  --oc-gradient-signature: linear-gradient(135deg, var(--oc-purple-dark), var(--oc-purple-light));
+  --oc-gradient-accent: linear-gradient(135deg, var(--oc-purple-accent-muted), var(--oc-purple-accent));
+  --oc-radial-glow: radial-gradient(circle, rgba(154, 142, 205, 0.28) 0%, rgba(154, 142, 205, 0) 68%);
+  --oc-radial-glow-bright: radial-gradient(circle, rgba(212, 181, 255, 0.2) 0%, rgba(212, 181, 255, 0) 60%);
+  --oc-focus-ring: 0 0 0 2px rgba(154, 142, 205, 0.52), 0 0 32px rgba(154, 142, 205, 0.28);
+  --oc-hover-glow: 0 0 36px rgba(154, 142, 205, 0.26);
+  --oc-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --oc-shadow-md: 0 4px 6px rgba(0, 0, 0, 0.07);
+  --oc-shadow-lg: 0 10px 15px rgba(0, 0, 0, 0.1);
+  --oc-shadow-purple: 0 4px 20px rgba(154, 142, 205, 0.15);
 }

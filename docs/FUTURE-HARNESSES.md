@@ -1,3 +1,8 @@
+---
+title: "Future harness notes"
+description: "Notes on what the Coven adapter seam must preserve before adding Hermes, Aider, Cline, Gemini CLI, or other future harness integrations."
+---
+
 # Future harness notes
 
 Coven v0 intentionally supports only the Codex and Claude Code adapters. This note records what the current adapter seam must preserve before adding additional harnesses such as Hermes.

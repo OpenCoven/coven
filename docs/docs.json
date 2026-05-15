@@ -2,29 +2,64 @@
   "$schema": "https://mintlify.com/docs.json",
   "name": "Coven",
   "description": "Coven is a local-first runtime for project-scoped coding-agent harness sessions, append-only events, and a versioned local socket API.",
+  "image": "/assets/opencoven-mark.svg",
   "theme": "mint",
+  "modeToggle": {
+    "default": "dark",
+    "options": ["light", "dark"]
+  },
   "icons": {
     "library": "lucide"
   },
+  "backgroundImage": "/assets/background.png",
   "logo": {
     "light": "/assets/opencoven-black.svg",
     "dark": "/assets/opencoven-white.svg"
+  },
+  "branding": {
+    "colorPalette": {
+      "primary": "#9A8ECD",
+      "primaryDark": "#7A6DAA",
+      "primaryLight": "#C5BDED",
+      "primaryVeryLight": "#E8E4F5",
+      "accent": "#D4B5FF",
+      "accentMuted": "#9D7FBF"
+    }
   },
   "fonts": {
     "body": {
       "family": "Fragment Mono"
     },
     "heading": {
-      "family": "DM Sans"
+      "family": "DM Sans",
+      "weight": "700"
+    },
+    "code": {
+      "family": "Fragment Mono",
+      "weight": "400"
     }
   },
   "favicon": "/assets/opencoven-mark.svg",
+  "metadata": {
+    "colorScheme": "light dark",
+    "themeColor": "#9A8ECD"
+  },
   "colors": {
-    "primary": "#7C5CFF",
-    "dark": "#6E4BFF",
-    "light": "#A78BFF"
+    "primary": "#9A8ECD",
+    "dark": "#7A6DAA",
+    "light": "#C5BDED"
   },
   "styling": {
+    "colors": {
+      "light": {
+        "background": "#FAFBFD",
+        "border": "#D9D3E8"
+      },
+      "dark": {
+        "background": "#1A1825",
+        "border": "#3D3547"
+      }
+    },
     "codeblocks": {
       "theme": {
         "dark": "min-dark",
@@ -52,6 +87,9 @@
     ]
   },
   "redirects": [],
+  "headings": {
+    "searchable": true
+  },
   "navigation": {
     "languages": [
       {
@@ -94,6 +132,11 @@
                 "group": "Sessions and harnesses",
                 "pages": [
                   "SESSION-LIFECYCLE",
+                  "harnesses/index",
+                  "harnesses/codex",
+                  "harnesses/claude-code",
+                  "harnesses/installing",
+                  "harnesses/provider-auth",
                   "HARNESS-ADAPTERS",
                   "FUTURE-HARNESSES"
                 ]
@@ -133,7 +176,8 @@
               {
                 "group": "Project",
                 "pages": [
-                  "PRODUCT-SPEC"
+                  "PRODUCT-SPEC",
+                  "reference/changelog"
                 ]
               }
             ]

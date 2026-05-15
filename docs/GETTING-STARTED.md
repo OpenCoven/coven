@@ -1,3 +1,8 @@
+---
+title: "Get started with Coven"
+description: "Install Coven, launch your first project-scoped Codex or Claude Code session, and verify the daemon, store, and harnesses with coven doctor."
+---
+
 # Getting Started with Coven
 
 This guide takes a new user from a fresh checkout or npm install to a visible project-scoped agent session.

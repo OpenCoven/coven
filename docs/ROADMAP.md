@@ -1,3 +1,8 @@
+---
+title: "OpenCoven public roadmap"
+description: "The OpenCoven public roadmap for Coven, comux, and OpenClaw integrations, with shipped, now, next, and later slices for the local agent runtime."
+---
+
 # OpenCoven Public Roadmap
 
 _Last updated: 2026-05-09_

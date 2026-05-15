@@ -1,7 +1,7 @@
 # Branding Adherence Checklist, Progress, Exceptions, and Risks
 
 **Status:** In progress
-**Source of truth:** [`../DESIGN.md`](../DESIGN.md)
+**Source of truth:** [`DESIGN.md`](https://github.com/OpenCoven/coven/blob/main/DESIGN.md)
 **Last updated:** 2026-04-28
 
 ## Progress

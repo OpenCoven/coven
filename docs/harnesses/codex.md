@@ -3,8 +3,10 @@ summary: "Run OpenAI Codex CLI under Coven supervision. Harness id `codex`."
 read_when:
   - Setting up Codex for Coven
   - Diagnosing Codex-specific harness failures
-title: "Codex"
+title: "Codex harness"
+description: "Run the OpenAI Codex CLI under Coven supervision with harness id codex, a project-rooted PTY, and the usual session, attach, and ritual flows."
 ---
+
 
 Codex is OpenAI's coding-agent CLI. Coven wraps it in a project-rooted PTY so launches, attaches, and rituals work the same as for any other harness.
 

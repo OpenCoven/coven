@@ -1,3 +1,8 @@
+---
+title: "Coven concepts and terminology"
+description: "Definitions for the nouns Coven uses across the CLI, daemon, API, and clients: harnesses, sessions, projects, rituals, summon, and sacrifice."
+---
+
 # Coven Concepts
 
 This page defines the nouns used across the Coven CLI, daemon, API, docs, and client integrations.

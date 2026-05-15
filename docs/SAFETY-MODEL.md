@@ -1,3 +1,8 @@
+---
+title: "Coven safety model"
+description: "Coven's local-first safety boundary: trust the Rust daemon, treat clients as untrusted, and keep harness provider credentials out of the runtime."
+---
+
 # Coven Safety Model
 
 Coven is local-first, but local does not mean harmless. It can launch agent harnesses in real repositories, forward input to live processes, and preserve logs. This document states the safety boundaries that docs, clients, and code should preserve.

@@ -1,3 +1,8 @@
+---
+title: "Troubleshoot Coven"
+description: "Diagnose Coven issues like missing coven commands, daemon socket errors, harness not found, orphaned sessions, and project-root rejections."
+---
+
 # Troubleshooting Coven
 
 Start with:

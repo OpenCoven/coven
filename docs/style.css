@@ -1,10 +1,12 @@
 /*
  * Coven docs site styling.
  *
- * Mirrors OpenClaw's docs.openclaw.ai treatment with the OpenCoven palette:
- *   primary  #7C5CFF (purple glow)
- *   dark     #6E4BFF
- *   light    #A78BFF
+ * Updated 2026-05-15 with new muted lavender-grey palette:
+ *   primary  #9A8ECD (muted purple)
+ *   dark     #7A6DAA (darker shade)
+ *   light    #C5BDED (lighter shade)
+ *   accent   #D4B5FF (bright accent)
+ *   accent-muted #9D7FBF (subtle accent)
  *
  * Brand source: brand/ui/color-tokens.css and DESIGN.md.
  */

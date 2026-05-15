@@ -1,3 +1,8 @@
+---
+title: "Authentication and local access"
+description: "Coven uses a same-user local Unix socket access model rather than OAuth or API keys. Learn what protects /api/v1 and what remote access requires."
+---
+
 # Authentication and Local Access
 
 _Last updated: 2026-05-14_

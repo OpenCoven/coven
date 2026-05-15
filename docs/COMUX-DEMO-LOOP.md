@@ -1,3 +1,8 @@
+---
+title: "comux and Coven demo loop"
+description: "The Coven-side contract for making Codex and Claude Code sessions discoverable as visible comux panes through the local socket API."
+---
+
 # comux + Coven Demo Loop
 
 This is the Coven-side contract for making Coven-managed Codex and Claude Code sessions visible in comux.

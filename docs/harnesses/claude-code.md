@@ -3,8 +3,10 @@ summary: "Run Anthropic Claude Code under Coven supervision. Harness id `claude`
 read_when:
   - Setting up Claude Code for Coven
   - Diagnosing Claude-specific harness failures
-title: "Claude Code"
+title: "Claude Code harness"
+description: "Run the Anthropic Claude Code CLI under Coven supervision with harness id claude, a project-rooted PTY, and the standard attach and ritual flows."
 ---
+
 
 Claude Code is Anthropic's coding-agent CLI. Coven wraps it in a project-rooted PTY so launches, attaches, and rituals work the same as for any other harness.
 
