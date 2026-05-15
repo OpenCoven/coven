@@ -219,7 +219,7 @@ fn nearest_256(c: Rgb) -> u8 {
 
     let gray = ((c.r as u16 + c.g as u16 + c.b as u16) / 3) as u8;
     let gray_idx = if gray < 8 { 16 }
-                   else if gray > 248 { 231 }
+                   else if gray > 247 { 231 }
                    else { 232 + (gray - 8) / 10 };
 
     if dist2(c, palette_rgb(cube_idx)) <= dist2(c, palette_rgb(gray_idx))
@@ -316,6 +316,7 @@ fn nearest_256_brand_tokens() {
     assert_eq!(nearest_256(Rgb {r:0,   g:0,   b:0  }),  16);
     assert_eq!(nearest_256(Rgb {r:255, g:255, b:255}), 231);
     assert_eq!(nearest_256(Rgb {r:128, g:128, b:128}), 244);
+    assert_eq!(nearest_256(Rgb {r:248, g:248, b:248}), 231);
 }
 ```
 
