@@ -6,6 +6,12 @@ read_when:
 title: "Changelog"
 ---
 
+## Week of May 15, 2026
+
+### Updates
+
+- **Brand-aligned TUI theme.** Both the prompt-first `coven tui` and the chat TUI now render with a unified, brand-aligned palette and consistent semantic tokens (primary, agent, user, hint, surface, dim). Colors automatically adapt to your terminal: truecolor for 24-bit terminals, 256-color downgrade for legacy terminals, and no color when output is piped or `NO_COLOR` is set. See [Environment variables](/help/environment).
+
 ## Week of May 11, 2026
 
 ### New features
