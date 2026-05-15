@@ -109,6 +109,67 @@ fn detect_mode() -> TerminalMode {
     })
 }
 
+// ── 256-color downgrade ──
+
+/// Round one 0..=255 channel into the 6-step xterm cube (0, 95, 135, 175, 215, 255).
+fn channel_to_cube_step(v: u8) -> u8 {
+    if v < 48 {
+        0
+    } else if v < 115 {
+        1
+    } else {
+        ((v as u16 - 35) / 40) as u8
+    }
+}
+
+/// xterm-256 palette RGB for indices 16..=255 (cube 16..=231, grayscale 232..=255).
+fn palette_rgb(idx: u8) -> Rgb {
+    if idx < 16 {
+        // Lower 16 are terminal-defined; we never produce them, but return black as a sentinel.
+        return Rgb { r: 0, g: 0, b: 0 };
+    }
+    if idx >= 232 {
+        let v = 8 + (idx - 232) as u16 * 10;
+        let v = v.min(255) as u8;
+        return Rgb { r: v, g: v, b: v };
+    }
+    let levels: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    let n = idx - 16;
+    let r = levels[(n / 36) as usize];
+    let g = levels[((n / 6) % 6) as usize];
+    let b = levels[(n % 6) as usize];
+    Rgb { r, g, b }
+}
+
+fn dist2(a: Rgb, b: Rgb) -> u32 {
+    let dr = a.r as i32 - b.r as i32;
+    let dg = a.g as i32 - b.g as i32;
+    let db = a.b as i32 - b.b as i32;
+    (dr * dr + dg * dg + db * db) as u32
+}
+
+fn nearest_256(c: Rgb) -> u8 {
+    let cube_idx = 16
+        + 36 * channel_to_cube_step(c.r)
+        +  6 * channel_to_cube_step(c.g)
+        +      channel_to_cube_step(c.b);
+
+    let gray = ((c.r as u16 + c.g as u16 + c.b as u16) / 3) as u8;
+    let gray_idx = if gray < 8 {
+        16
+    } else if gray > 248 {
+        231
+    } else {
+        232 + (gray - 8) / 10
+    };
+
+    if dist2(c, palette_rgb(cube_idx)) <= dist2(c, palette_rgb(gray_idx)) {
+        cube_idx
+    } else {
+        gray_idx
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,5 +301,18 @@ mod tests {
         let first = mode();
         let second = mode();
         assert_eq!(first, second, "mode() must return the same value on repeated calls");
+    }
+
+    #[test]
+    fn nearest_256_brand_tokens() {
+        assert_eq!(nearest_256(brand::PURPLE_3),    141);
+        assert_eq!(nearest_256(brand::PURPLE_2),     99);
+        assert_eq!(nearest_256(brand::PURPLE_1),     63);
+        assert_eq!(nearest_256(brand::ACCENT_BLUE),  33);
+        assert_eq!(nearest_256(brand::DANGER),      203);
+        assert_eq!(nearest_256(brand::SUCCESS),      77);
+        assert_eq!(nearest_256(Rgb { r: 0,   g: 0,   b: 0   }),  16);
+        assert_eq!(nearest_256(Rgb { r: 255, g: 255, b: 255 }), 231);
+        assert_eq!(nearest_256(Rgb { r: 128, g: 128, b: 128 }), 244);
     }
 }
