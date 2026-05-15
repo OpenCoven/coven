@@ -27,7 +27,7 @@ npm view @opencoven/cli-windows version dist-tags
 
 4. Confirm the changelog, package README status copy, and brand assets match the release.
 
-## Dry Run
+## Dry run
 
 Run the workflow with `publish=false` first. This builds all platform binaries and runs npm publish dry-runs without requiring npm credentials:
 
@@ -69,4 +69,4 @@ npm view @opencoven/cli-linux-x64 version dist-tags
 npm view @opencoven/cli-windows version dist-tags
 ```
 
-If any package did not publish, do not re-run blindly. Inspect the failed job, confirm which package versions exist on npm, and rerun only with a new version if npm has already accepted part of the release.
+If any package did not publish, do not re-run blindly. Inspect the failed job and confirm which package versions exist on npm. If npm has already accepted part of the release, rerun only with a new version.
