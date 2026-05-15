@@ -30,6 +30,7 @@ mod project;
 mod pty_runner;
 mod store;
 mod theme;
+mod tui;
 mod verification;
 
 const DEFAULT_COVEN_HOME_DIR: &str = ".coven";
