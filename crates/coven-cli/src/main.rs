@@ -2068,6 +2068,16 @@ mod tests {
     }
 
     #[test]
+    fn cli_accepts_chat_command() {
+        let cli = Cli::parse_from(["coven", "chat"]);
+
+        match cli.command {
+            Some(Command::Chat) => {}
+            other => panic!("expected chat command, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn magical_tui_frame_uses_purple_gold_branding_and_lists_core_actions() {
         let frame = render_magical_tui_frame_plain(1);
 

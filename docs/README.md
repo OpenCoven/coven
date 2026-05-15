@@ -1,4 +1,4 @@
-# Coven Documentation
+# OpenCoven Documentation
 
 This directory contains the public Coven docs app and the broader repo-local documentation corpus.
 
@@ -47,3 +47,13 @@ git diff --check
 ```
 
 Use stable, verified product language. Do not document future commands or endpoints as if they exist.
+
+## Canonical Language
+
+- Ecosystem/org: **OpenCoven**
+- Product/daemon/CLI: **Coven**
+- Command: `coven`
+- CLI package: `@opencoven/cli`
+- OpenClaw plugin package: `@opencoven/coven`
+- Community: `discord.gg/opencoven`
+- X / Twitter: `@OpenCvn`

@@ -1227,6 +1227,105 @@ mod tests {
     }
 
     #[test]
+    fn events_endpoint_combines_after_seq_cursor_with_limit() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "session-1")?;
+
+        for data in &["a", "b", "c"] {
+            handle_request_with_body(
+                "POST",
+                "/sessions/session-1/input",
+                temp_dir.path(),
+                None,
+                Some(&format!(r#"{{"data":"{data}"}}"#)),
+            )?;
+        }
+
+        let all = handle_request("GET", "/events?sessionId=session-1", temp_dir.path(), None)?;
+        let all_body: serde_json::Value = serde_json::from_str(&all.body)?;
+        let first_seq = all_body["events"][0]["seq"].as_i64().unwrap();
+
+        let page = handle_request(
+            "GET",
+            &format!("/events?sessionId=session-1&afterSeq={first_seq}&limit=1"),
+            temp_dir.path(),
+            None,
+        )?;
+
+        let body: serde_json::Value = serde_json::from_str(&page.body)?;
+        assert_eq!(page.status, 200);
+        assert_eq!(body["events"].as_array().unwrap().len(), 1);
+        assert!(body["events"][0]["seq"].as_i64().unwrap() > first_seq);
+        assert_eq!(body["nextCursor"]["afterSeq"], body["events"][0]["seq"]);
+        assert_eq!(body["hasMore"], true);
+        Ok(())
+    }
+
+    #[test]
+    fn events_endpoint_supports_after_event_id_cursor() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "session-1")?;
+
+        for data in &["a", "b", "c"] {
+            handle_request_with_body(
+                "POST",
+                "/sessions/session-1/input",
+                temp_dir.path(),
+                None,
+                Some(&format!(r#"{{"data":"{data}"}}"#)),
+            )?;
+        }
+
+        let all = handle_request("GET", "/events?sessionId=session-1", temp_dir.path(), None)?;
+        let all_body: serde_json::Value = serde_json::from_str(&all.body)?;
+        let first_event_id = all_body["events"][0]["id"].as_str().unwrap();
+        let second_event_id = all_body["events"][1]["id"].as_str().unwrap();
+        let third_event_id = all_body["events"][2]["id"].as_str().unwrap();
+
+        let after = handle_request(
+            "GET",
+            &format!("/events?sessionId=session-1&afterEventId={first_event_id}"),
+            temp_dir.path(),
+            None,
+        )?;
+        let after_body: serde_json::Value = serde_json::from_str(&after.body)?;
+        assert_eq!(after.status, 200);
+        assert_eq!(after_body["events"].as_array().unwrap().len(), 2);
+        assert_eq!(after_body["events"][0]["id"], second_event_id);
+        assert_eq!(after_body["events"][1]["id"], third_event_id);
+        Ok(())
+    }
+
+    #[test]
+    fn events_endpoint_clamps_zero_limit_to_one_event() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "session-1")?;
+
+        for data in &["a", "b"] {
+            handle_request_with_body(
+                "POST",
+                "/sessions/session-1/input",
+                temp_dir.path(),
+                None,
+                Some(&format!(r#"{{"data":"{data}"}}"#)),
+            )?;
+        }
+
+        let response = handle_request(
+            "GET",
+            "/events?sessionId=session-1&limit=0",
+            temp_dir.path(),
+            None,
+        )?;
+
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(response.status, 200);
+        assert_eq!(body["events"].as_array().unwrap().len(), 1);
+        assert_eq!(body["hasMore"], true);
+        Ok(())
+    }
+
+    #[test]
     fn events_endpoint_returns_structured_error_for_missing_session_id() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let response = handle_request("GET", "/events", temp_dir.path(), None)?;
