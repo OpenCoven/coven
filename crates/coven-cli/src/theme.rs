@@ -15,40 +15,90 @@ pub struct Rgb {
 /// Enforced by the `brand_tokens_mirror_color_tokens_css` test.
 pub mod brand {
     use super::Rgb;
-    pub const PURPLE_1:    Rgb = Rgb { r: 0x6E, g: 0x4B, b: 0xFF };
-    pub const PURPLE_2:    Rgb = Rgb { r: 0x8A, g: 0x63, b: 0xFF };
-    pub const PURPLE_3:    Rgb = Rgb { r: 0xA7, g: 0x8B, b: 0xFF };
+    pub const PURPLE_1: Rgb = Rgb {
+        r: 0x6E,
+        g: 0x4B,
+        b: 0xFF,
+    };
+    pub const PURPLE_2: Rgb = Rgb {
+        r: 0x8A,
+        g: 0x63,
+        b: 0xFF,
+    };
+    pub const PURPLE_3: Rgb = Rgb {
+        r: 0xA7,
+        g: 0x8B,
+        b: 0xFF,
+    };
     // Defined for future use; consumed via the `DANGER` / `SUCCESS` semantic tokens
     // in later phases (destructive prompts, ready-state indicators).
-    #[allow(dead_code)] pub const ACCENT_BLUE: Rgb = Rgb { r: 0x0A, g: 0x84, b: 0xFF };
-    #[allow(dead_code)] pub const DANGER:      Rgb = Rgb { r: 0xFF, g: 0x3B, b: 0x30 };
-    #[allow(dead_code)] pub const SUCCESS:     Rgb = Rgb { r: 0x30, g: 0xD1, b: 0x58 };
+    #[allow(dead_code)]
+    pub const ACCENT_BLUE: Rgb = Rgb {
+        r: 0x0A,
+        g: 0x84,
+        b: 0xFF,
+    };
+    #[allow(dead_code)]
+    pub const DANGER: Rgb = Rgb {
+        r: 0xFF,
+        g: 0x3B,
+        b: 0x30,
+    };
+    #[allow(dead_code)]
+    pub const SUCCESS: Rgb = Rgb {
+        r: 0x30,
+        g: 0xD1,
+        b: 0x58,
+    };
     /// rgba(255, 255, 255, 0.94) on black = round(255 * 0.94) = 240
-    pub const TEXT:        Rgb = Rgb { r: 0xF0, g: 0xF0, b: 0xF0 };
+    pub const TEXT: Rgb = Rgb {
+        r: 0xF0,
+        g: 0xF0,
+        b: 0xF0,
+    };
     /// rgba(255, 255, 255, 0.64) on black = round(255 * 0.64) = 163
-    pub const TEXT_MUTED:  Rgb = Rgb { r: 0xA3, g: 0xA3, b: 0xA3 };
+    pub const TEXT_MUTED: Rgb = Rgb {
+        r: 0xA3,
+        g: 0xA3,
+        b: 0xA3,
+    };
     /// rgba(255, 255, 255, 0.42) on black = round(255 * 0.42) = 107
-    pub const TEXT_FAINT:  Rgb = Rgb { r: 0x6B, g: 0x6B, b: 0x6B };
-    pub const SURFACE_1:   Rgb = Rgb { r: 0x05, g: 0x05, b: 0x07 };
-    pub const SURFACE_2:   Rgb = Rgb { r: 0x08, g: 0x08, b: 0x12 };
+    pub const TEXT_FAINT: Rgb = Rgb {
+        r: 0x6B,
+        g: 0x6B,
+        b: 0x6B,
+    };
+    pub const SURFACE_1: Rgb = Rgb {
+        r: 0x05,
+        g: 0x05,
+        b: 0x07,
+    };
+    pub const SURFACE_2: Rgb = Rgb {
+        r: 0x08,
+        g: 0x08,
+        b: 0x12,
+    };
 }
 
 // ── Semantic tokens (what callsites import) ──
 
-pub const PRIMARY:        Rgb = brand::PURPLE_3;
+pub const PRIMARY: Rgb = brand::PURPLE_3;
 pub const PRIMARY_STRONG: Rgb = brand::PURPLE_2;
-pub const AGENT_LABEL:    Rgb = brand::PURPLE_2;
-pub const USER_LABEL:     Rgb = brand::PURPLE_1;
-pub const HINT_KEY:       Rgb = brand::TEXT;
+pub const AGENT_LABEL: Rgb = brand::PURPLE_2;
+pub const USER_LABEL: Rgb = brand::PURPLE_1;
+pub const HINT_KEY: Rgb = brand::TEXT;
 // Defined for future use: HINT_LABEL distinguishes prose from keys in hint
 // bars; DANGER/SUCCESS will be wired to destructive prompts and ready-state
 // indicators in a later phase. Per spec, "defined and tested only" for Phase 1.
-#[allow(dead_code)] pub const HINT_LABEL:     Rgb = brand::TEXT_MUTED;
-pub const FIELD_LABEL:    Rgb = brand::TEXT_MUTED;
-#[allow(dead_code)] pub const DANGER:         Rgb = brand::DANGER;
-#[allow(dead_code)] pub const SUCCESS:        Rgb = brand::SUCCESS;
-pub const DIM:            Rgb = brand::TEXT_FAINT;
-pub const SURFACE:        Rgb = brand::SURFACE_1;
+#[allow(dead_code)]
+pub const HINT_LABEL: Rgb = brand::TEXT_MUTED;
+pub const FIELD_LABEL: Rgb = brand::TEXT_MUTED;
+#[allow(dead_code)]
+pub const DANGER: Rgb = brand::DANGER;
+#[allow(dead_code)]
+pub const SUCCESS: Rgb = brand::SUCCESS;
+pub const DIM: Rgb = brand::TEXT_FAINT;
+pub const SURFACE: Rgb = brand::SURFACE_1;
 pub const SURFACE_STRONG: Rgb = brand::SURFACE_2;
 
 // ── Terminal-mode detection ──
@@ -62,9 +112,9 @@ pub enum TerminalMode {
 
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct EnvInputs<'a> {
-    pub no_color:      Option<&'a str>,
-    pub colorterm:     Option<&'a str>,
-    pub term:          Option<&'a str>,
+    pub no_color: Option<&'a str>,
+    pub colorterm: Option<&'a str>,
+    pub term: Option<&'a str>,
     pub stdout_is_tty: bool,
 }
 
@@ -85,10 +135,10 @@ pub(crate) fn detect_mode_from(e: EnvInputs<'_>) -> TerminalMode {
     }
     // 4. TERM-based fallback.
     match e.term {
-        Some(t) if t.ends_with("-direct")   => TerminalMode::TrueColor,
+        Some(t) if t.ends_with("-direct") => TerminalMode::TrueColor,
         Some(t) if t.ends_with("-256color") => TerminalMode::Indexed256,
-        Some("dumb") | None                 => TerminalMode::NoColor,
-        Some(_)                             => TerminalMode::Indexed256,
+        Some("dumb") | None => TerminalMode::NoColor,
+        Some(_) => TerminalMode::Indexed256,
     }
 }
 
@@ -103,13 +153,13 @@ pub fn mode() -> TerminalMode {
 
 fn detect_mode() -> TerminalMode {
     use std::io::IsTerminal;
-    let no_color  = std::env::var("NO_COLOR").ok();
+    let no_color = std::env::var("NO_COLOR").ok();
     let colorterm = std::env::var("COLORTERM").ok();
-    let term      = std::env::var("TERM").ok();
+    let term = std::env::var("TERM").ok();
     detect_mode_from(EnvInputs {
-        no_color:      no_color.as_deref(),
-        colorterm:     colorterm.as_deref(),
-        term:          term.as_deref(),
+        no_color: no_color.as_deref(),
+        colorterm: colorterm.as_deref(),
+        term: term.as_deref(),
         stdout_is_tty: std::io::stdout().is_terminal(),
     })
 }
@@ -156,8 +206,8 @@ fn dist2(a: Rgb, b: Rgb) -> u32 {
 fn nearest_256(c: Rgb) -> u8 {
     let cube_idx = 16
         + 36 * channel_to_cube_step(c.r)
-        +  6 * channel_to_cube_step(c.g)
-        +      channel_to_cube_step(c.b);
+        + 6 * channel_to_cube_step(c.g)
+        + channel_to_cube_step(c.b);
 
     let gray = ((c.r as u16 + c.g as u16 + c.b as u16) / 3) as u8;
     let gray_idx = if gray < 8 {
@@ -186,9 +236,9 @@ pub fn ratatui_color(c: Rgb) -> RatColor {
 
 pub(crate) fn ratatui_color_with_mode(c: Rgb, m: TerminalMode) -> RatColor {
     match m {
-        TerminalMode::TrueColor  => RatColor::Rgb(c.r, c.g, c.b),
+        TerminalMode::TrueColor => RatColor::Rgb(c.r, c.g, c.b),
         TerminalMode::Indexed256 => RatColor::Indexed(nearest_256(c)),
-        TerminalMode::NoColor    => RatColor::Reset,
+        TerminalMode::NoColor => RatColor::Reset,
     }
 }
 
@@ -203,6 +253,7 @@ use std::fmt;
 
 /// Foreground-color ANSI escape. Use in format strings:
 /// `println!("{}Title{}", theme::fg(theme::PRIMARY), theme::reset())`
+#[derive(Copy, Clone, Debug)]
 pub struct Fg {
     rgb: Rgb,
     mode: TerminalMode,
@@ -211,42 +262,58 @@ pub struct Fg {
 // `Bg` is pre-wired alongside `Fg` for symmetry; full backgrounds via ANSI
 // escape land in a later phase (currently main.rs uses ratatui Style::bg).
 #[allow(dead_code)]
+#[derive(Copy, Clone, Debug)]
 pub struct Bg {
     rgb: Rgb,
     mode: TerminalMode,
 }
 
+#[derive(Copy, Clone, Debug)]
 pub struct Reset {
     mode: TerminalMode,
 }
 
 impl Fg {
-    pub(crate) fn with_mode(rgb: Rgb, mode: TerminalMode) -> Self { Self { rgb, mode } }
+    pub(crate) fn with_mode(rgb: Rgb, mode: TerminalMode) -> Self {
+        Self { rgb, mode }
+    }
 }
 #[allow(dead_code)]
 impl Bg {
-    pub(crate) fn with_mode(rgb: Rgb, mode: TerminalMode) -> Self { Self { rgb, mode } }
+    pub(crate) fn with_mode(rgb: Rgb, mode: TerminalMode) -> Self {
+        Self { rgb, mode }
+    }
 }
 impl Reset {
-    pub(crate) fn with_mode(mode: TerminalMode) -> Self { Self { mode } }
+    pub(crate) fn with_mode(mode: TerminalMode) -> Self {
+        Self { mode }
+    }
 }
 
 /// Foreground escape for the active mode.
-pub fn fg(c: Rgb) -> Fg { Fg::with_mode(c, mode()) }
+pub fn fg(c: Rgb) -> Fg {
+    Fg::with_mode(c, mode())
+}
 
 /// Background escape for the active mode.
 #[allow(dead_code)]
-pub fn bg(c: Rgb) -> Bg { Bg::with_mode(c, mode()) }
+pub fn bg(c: Rgb) -> Bg {
+    Bg::with_mode(c, mode())
+}
 
 /// SGR-reset escape for the active mode. Empty in `NoColor`.
-pub fn reset() -> Reset { Reset::with_mode(mode()) }
+pub fn reset() -> Reset {
+    Reset::with_mode(mode())
+}
 
 impl fmt::Display for Fg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.mode {
-            TerminalMode::TrueColor  => write!(f, "\x1b[38;2;{};{};{}m", self.rgb.r, self.rgb.g, self.rgb.b),
+            TerminalMode::TrueColor => {
+                write!(f, "\x1b[38;2;{};{};{}m", self.rgb.r, self.rgb.g, self.rgb.b)
+            }
             TerminalMode::Indexed256 => write!(f, "\x1b[38;5;{}m", nearest_256(self.rgb)),
-            TerminalMode::NoColor    => Ok(()),
+            TerminalMode::NoColor => Ok(()),
         }
     }
 }
@@ -254,9 +321,11 @@ impl fmt::Display for Fg {
 impl fmt::Display for Bg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.mode {
-            TerminalMode::TrueColor  => write!(f, "\x1b[48;2;{};{};{}m", self.rgb.r, self.rgb.g, self.rgb.b),
+            TerminalMode::TrueColor => {
+                write!(f, "\x1b[48;2;{};{};{}m", self.rgb.r, self.rgb.g, self.rgb.b)
+            }
             TerminalMode::Indexed256 => write!(f, "\x1b[48;5;{}m", nearest_256(self.rgb)),
-            TerminalMode::NoColor    => Ok(()),
+            TerminalMode::NoColor => Ok(()),
         }
     }
 }
@@ -265,7 +334,7 @@ impl fmt::Display for Reset {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.mode {
             TerminalMode::NoColor => Ok(()),
-            _                     => f.write_str("\x1b[0m"),
+            _ => f.write_str("\x1b[0m"),
         }
     }
 }
@@ -298,7 +367,11 @@ mod tests {
         let b: u16 = parts[2].parse().unwrap();
         let a: f64 = parts[3].parse().unwrap();
         let flat = |c: u16| (c as f64 * a).round() as u8;
-        Rgb { r: flat(r), g: flat(g), b: flat(b) }
+        Rgb {
+            r: flat(r),
+            g: flat(g),
+            b: flat(b),
+        }
     }
 
     /// Tiny purpose-built parser for `:root { --name: value; ... }`. Ignores everything else.
@@ -331,33 +404,77 @@ mod tests {
         let css = include_str!("../../../brand/ui/color-tokens.css");
         let vars = parse_css_vars(css);
 
-        assert_eq!(brand::PURPLE_1,    rgb_from_hex(&vars["--oc-purple-1"]),    "--oc-purple-1");
-        assert_eq!(brand::PURPLE_2,    rgb_from_hex(&vars["--oc-purple-2"]),    "--oc-purple-2");
-        assert_eq!(brand::PURPLE_3,    rgb_from_hex(&vars["--oc-purple-3"]),    "--oc-purple-3");
-        assert_eq!(brand::ACCENT_BLUE, rgb_from_hex(&vars["--oc-accent-blue"]), "--oc-accent-blue");
-        assert_eq!(brand::DANGER,      rgb_from_hex(&vars["--oc-danger"]),      "--oc-danger");
-        assert_eq!(brand::SUCCESS,     rgb_from_hex(&vars["--oc-success"]),     "--oc-success");
-        assert_eq!(brand::SURFACE_1,   rgb_from_hex(&vars["--oc-surface-1"]),   "--oc-surface-1");
-        assert_eq!(brand::SURFACE_2,   rgb_from_hex(&vars["--oc-surface-2"]),   "--oc-surface-2");
+        assert_eq!(
+            brand::PURPLE_1,
+            rgb_from_hex(&vars["--oc-purple-1"]),
+            "--oc-purple-1"
+        );
+        assert_eq!(
+            brand::PURPLE_2,
+            rgb_from_hex(&vars["--oc-purple-2"]),
+            "--oc-purple-2"
+        );
+        assert_eq!(
+            brand::PURPLE_3,
+            rgb_from_hex(&vars["--oc-purple-3"]),
+            "--oc-purple-3"
+        );
+        assert_eq!(
+            brand::ACCENT_BLUE,
+            rgb_from_hex(&vars["--oc-accent-blue"]),
+            "--oc-accent-blue"
+        );
+        assert_eq!(
+            brand::DANGER,
+            rgb_from_hex(&vars["--oc-danger"]),
+            "--oc-danger"
+        );
+        assert_eq!(
+            brand::SUCCESS,
+            rgb_from_hex(&vars["--oc-success"]),
+            "--oc-success"
+        );
+        assert_eq!(
+            brand::SURFACE_1,
+            rgb_from_hex(&vars["--oc-surface-1"]),
+            "--oc-surface-1"
+        );
+        assert_eq!(
+            brand::SURFACE_2,
+            rgb_from_hex(&vars["--oc-surface-2"]),
+            "--oc-surface-2"
+        );
 
-        assert_eq!(brand::TEXT,       flatten_on_black(&vars["--oc-text"]),       "--oc-text");
-        assert_eq!(brand::TEXT_MUTED, flatten_on_black(&vars["--oc-text-muted"]), "--oc-text-muted");
-        assert_eq!(brand::TEXT_FAINT, flatten_on_black(&vars["--oc-text-faint"]), "--oc-text-faint");
+        assert_eq!(
+            brand::TEXT,
+            flatten_on_black(&vars["--oc-text"]),
+            "--oc-text"
+        );
+        assert_eq!(
+            brand::TEXT_MUTED,
+            flatten_on_black(&vars["--oc-text-muted"]),
+            "--oc-text-muted"
+        );
+        assert_eq!(
+            brand::TEXT_FAINT,
+            flatten_on_black(&vars["--oc-text-faint"]),
+            "--oc-text-faint"
+        );
     }
 
     #[test]
     fn semantic_tokens_resolve_to_brand_tokens() {
-        assert_eq!(PRIMARY,        brand::PURPLE_3);
+        assert_eq!(PRIMARY, brand::PURPLE_3);
         assert_eq!(PRIMARY_STRONG, brand::PURPLE_2);
-        assert_eq!(AGENT_LABEL,    brand::PURPLE_2);
-        assert_eq!(USER_LABEL,     brand::PURPLE_1);
-        assert_eq!(HINT_KEY,       brand::TEXT);
-        assert_eq!(HINT_LABEL,     brand::TEXT_MUTED);
-        assert_eq!(FIELD_LABEL,    brand::TEXT_MUTED);
-        assert_eq!(DANGER,         brand::DANGER);
-        assert_eq!(SUCCESS,        brand::SUCCESS);
-        assert_eq!(DIM,            brand::TEXT_FAINT);
-        assert_eq!(SURFACE,        brand::SURFACE_1);
+        assert_eq!(AGENT_LABEL, brand::PURPLE_2);
+        assert_eq!(USER_LABEL, brand::PURPLE_1);
+        assert_eq!(HINT_KEY, brand::TEXT);
+        assert_eq!(HINT_LABEL, brand::TEXT_MUTED);
+        assert_eq!(FIELD_LABEL, brand::TEXT_MUTED);
+        assert_eq!(DANGER, brand::DANGER);
+        assert_eq!(SUCCESS, brand::SUCCESS);
+        assert_eq!(DIM, brand::TEXT_FAINT);
+        assert_eq!(SURFACE, brand::SURFACE_1);
         assert_eq!(SURFACE_STRONG, brand::SURFACE_2);
     }
 
@@ -366,33 +483,117 @@ mod tests {
         use TerminalMode::*;
         let cases: &[(EnvInputs<'_>, TerminalMode)] = &[
             // NO_COLOR=1 always wins, even with truecolor and TTY
-            (EnvInputs { no_color: Some("1"),  colorterm: Some("truecolor"), term: Some("xterm-256color"), stdout_is_tty: true  }, NoColor),
+            (
+                EnvInputs {
+                    no_color: Some("1"),
+                    colorterm: Some("truecolor"),
+                    term: Some("xterm-256color"),
+                    stdout_is_tty: true,
+                },
+                NoColor,
+            ),
             // Empty-string NO_COLOR treated as unset
-            (EnvInputs { no_color: Some(""),   colorterm: Some("truecolor"), term: Some("xterm-256color"), stdout_is_tty: true  }, TrueColor),
+            (
+                EnvInputs {
+                    no_color: Some(""),
+                    colorterm: Some("truecolor"),
+                    term: Some("xterm-256color"),
+                    stdout_is_tty: true,
+                },
+                TrueColor,
+            ),
             // COLORTERM=truecolor wins on a TTY
-            (EnvInputs { no_color: None,       colorterm: Some("truecolor"), term: Some("xterm-256color"), stdout_is_tty: true  }, TrueColor),
+            (
+                EnvInputs {
+                    no_color: None,
+                    colorterm: Some("truecolor"),
+                    term: Some("xterm-256color"),
+                    stdout_is_tty: true,
+                },
+                TrueColor,
+            ),
             // COLORTERM=24bit also yields truecolor
-            (EnvInputs { no_color: None,       colorterm: Some("24bit"),     term: Some("xterm-256color"), stdout_is_tty: true  }, TrueColor),
+            (
+                EnvInputs {
+                    no_color: None,
+                    colorterm: Some("24bit"),
+                    term: Some("xterm-256color"),
+                    stdout_is_tty: true,
+                },
+                TrueColor,
+            ),
             // TERM=*-direct yields truecolor even without COLORTERM
-            (EnvInputs { no_color: None,       colorterm: None,              term: Some("xterm-direct"),   stdout_is_tty: true  }, TrueColor),
+            (
+                EnvInputs {
+                    no_color: None,
+                    colorterm: None,
+                    term: Some("xterm-direct"),
+                    stdout_is_tty: true,
+                },
+                TrueColor,
+            ),
             // TERM=*-256color yields indexed 256
-            (EnvInputs { no_color: None,       colorterm: None,              term: Some("xterm-256color"), stdout_is_tty: true  }, Indexed256),
+            (
+                EnvInputs {
+                    no_color: None,
+                    colorterm: None,
+                    term: Some("xterm-256color"),
+                    stdout_is_tty: true,
+                },
+                Indexed256,
+            ),
             // Plain xterm: default to indexed 256
-            (EnvInputs { no_color: None,       colorterm: None,              term: Some("xterm"),          stdout_is_tty: true  }, Indexed256),
+            (
+                EnvInputs {
+                    no_color: None,
+                    colorterm: None,
+                    term: Some("xterm"),
+                    stdout_is_tty: true,
+                },
+                Indexed256,
+            ),
             // TERM=dumb forces no color
-            (EnvInputs { no_color: None,       colorterm: None,              term: Some("dumb"),           stdout_is_tty: true  }, NoColor),
+            (
+                EnvInputs {
+                    no_color: None,
+                    colorterm: None,
+                    term: Some("dumb"),
+                    stdout_is_tty: true,
+                },
+                NoColor,
+            ),
             // TERM unset forces no color
-            (EnvInputs { no_color: None,       colorterm: None,              term: None,                   stdout_is_tty: true  }, NoColor),
+            (
+                EnvInputs {
+                    no_color: None,
+                    colorterm: None,
+                    term: None,
+                    stdout_is_tty: true,
+                },
+                NoColor,
+            ),
             // Piped stdout always disables color, regardless of env
-            (EnvInputs { no_color: None,       colorterm: Some("truecolor"), term: Some("xterm-256color"), stdout_is_tty: false }, NoColor),
-            (EnvInputs { no_color: Some("1"),  colorterm: None,              term: None,                   stdout_is_tty: false }, NoColor),
+            (
+                EnvInputs {
+                    no_color: None,
+                    colorterm: Some("truecolor"),
+                    term: Some("xterm-256color"),
+                    stdout_is_tty: false,
+                },
+                NoColor,
+            ),
+            (
+                EnvInputs {
+                    no_color: Some("1"),
+                    colorterm: None,
+                    term: None,
+                    stdout_is_tty: false,
+                },
+                NoColor,
+            ),
         ];
         for (i, (inputs, expected)) in cases.iter().enumerate() {
-            assert_eq!(
-                detect_mode_from(*inputs),
-                *expected,
-                "row {i}: {inputs:?}",
-            );
+            assert_eq!(detect_mode_from(*inputs), *expected, "row {i}: {inputs:?}",);
         }
     }
 
@@ -400,21 +601,45 @@ mod tests {
     fn mode_returns_a_value_and_caches() {
         let first = mode();
         let second = mode();
-        assert_eq!(first, second, "mode() must return the same value on repeated calls");
+        assert_eq!(
+            first, second,
+            "mode() must return the same value on repeated calls"
+        );
     }
 
     #[test]
     fn nearest_256_brand_tokens() {
-        assert_eq!(nearest_256(brand::PURPLE_3),    141);
-        assert_eq!(nearest_256(brand::PURPLE_2),     99);
-        assert_eq!(nearest_256(brand::PURPLE_1),     63);
-        assert_eq!(nearest_256(brand::ACCENT_BLUE),  33);
-        assert_eq!(nearest_256(brand::DANGER),      203);
-        assert_eq!(nearest_256(brand::SUCCESS),      77);
-        assert_eq!(nearest_256(Rgb { r: 0,   g: 0,   b: 0   }),  16);
-        assert_eq!(nearest_256(Rgb { r: 255, g: 255, b: 255 }), 231);
-        assert_eq!(nearest_256(Rgb { r: 128, g: 128, b: 128 }), 244);
-        assert_eq!(nearest_256(Rgb { r: 248, g: 248, b: 248 }), 231);
+        assert_eq!(nearest_256(brand::PURPLE_3), 141);
+        assert_eq!(nearest_256(brand::PURPLE_2), 99);
+        assert_eq!(nearest_256(brand::PURPLE_1), 63);
+        assert_eq!(nearest_256(brand::ACCENT_BLUE), 33);
+        assert_eq!(nearest_256(brand::DANGER), 203);
+        assert_eq!(nearest_256(brand::SUCCESS), 77);
+        assert_eq!(nearest_256(Rgb { r: 0, g: 0, b: 0 }), 16);
+        assert_eq!(
+            nearest_256(Rgb {
+                r: 255,
+                g: 255,
+                b: 255
+            }),
+            231
+        );
+        assert_eq!(
+            nearest_256(Rgb {
+                r: 128,
+                g: 128,
+                b: 128
+            }),
+            244
+        );
+        assert_eq!(
+            nearest_256(Rgb {
+                r: 248,
+                g: 248,
+                b: 248
+            }),
+            231
+        );
     }
 
     #[test]
@@ -452,14 +677,20 @@ mod tests {
     #[test]
     fn fg_emits_truecolor_escape() {
         assert_eq!(
-            format!("{}", Fg::with_mode(brand::PURPLE_3, TerminalMode::TrueColor)),
+            format!(
+                "{}",
+                Fg::with_mode(brand::PURPLE_3, TerminalMode::TrueColor)
+            ),
             "\x1b[38;2;167;139;255m",
         );
     }
     #[test]
     fn fg_emits_indexed_256_escape() {
         assert_eq!(
-            format!("{}", Fg::with_mode(brand::PURPLE_3, TerminalMode::Indexed256)),
+            format!(
+                "{}",
+                Fg::with_mode(brand::PURPLE_3, TerminalMode::Indexed256)
+            ),
             "\x1b[38;5;141m",
         );
     }
@@ -473,7 +704,10 @@ mod tests {
     #[test]
     fn bg_emits_truecolor_escape() {
         assert_eq!(
-            format!("{}", Bg::with_mode(brand::SURFACE_2, TerminalMode::TrueColor)),
+            format!(
+                "{}",
+                Bg::with_mode(brand::SURFACE_2, TerminalMode::TrueColor)
+            ),
             "\x1b[48;2;8;8;18m",
         );
     }
@@ -490,7 +724,13 @@ mod tests {
     }
     #[test]
     fn reset_emits_sgr_zero_otherwise() {
-        assert_eq!(format!("{}", Reset::with_mode(TerminalMode::TrueColor)), "\x1b[0m");
-        assert_eq!(format!("{}", Reset::with_mode(TerminalMode::Indexed256)), "\x1b[0m");
+        assert_eq!(
+            format!("{}", Reset::with_mode(TerminalMode::TrueColor)),
+            "\x1b[0m"
+        );
+        assert_eq!(
+            format!("{}", Reset::with_mode(TerminalMode::Indexed256)),
+            "\x1b[0m"
+        );
     }
 }
