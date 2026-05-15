@@ -1,0 +1,499 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "name": "Coven",
+  "description": "Local-first runtime substrate for persistent AI familiars. Coven launches, supervises, and audits coding-agent harnesses inside explicit project boundaries, with a typed local socket API for clients like comux, OpenMeow, and the external OpenClaw plugin.",
+  "theme": "mint",
+  "icons": {
+    "library": "lucide"
+  },
+  "logo": {
+    "light": "/assets/opencoven-black.svg",
+    "dark": "/assets/opencoven-white.svg"
+  },
+  "fonts": {
+    "body": {
+      "family": "Fragment Mono"
+    },
+    "heading": {
+      "family": "DM Sans"
+    }
+  },
+  "favicon": "/assets/opencoven-mark.svg",
+  "colors": {
+    "primary": "#7C5CFF",
+    "dark": "#6E4BFF",
+    "light": "#A78BFF"
+  },
+  "styling": {
+    "codeblocks": {
+      "theme": {
+        "dark": "min-dark",
+        "light": "min-light"
+      }
+    }
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "GitHub",
+        "href": "https://github.com/OpenCoven/coven",
+        "icon": "github"
+      },
+      {
+        "label": "Releases",
+        "href": "https://github.com/OpenCoven/coven/releases",
+        "icon": "package"
+      },
+      {
+        "label": "Discord",
+        "href": "https://discord.gg/opencoven",
+        "icon": "discord"
+      }
+    ]
+  },
+  "redirects": [
+    {
+      "source": "/getting-started",
+      "destination": "/start/getting-started"
+    },
+    {
+      "source": "/concepts",
+      "destination": "/concepts/architecture"
+    },
+    {
+      "source": "/harnesses",
+      "destination": "/harnesses/index"
+    },
+    {
+      "source": "/familiars",
+      "destination": "/familiars/index"
+    },
+    {
+      "source": "/api",
+      "destination": "/reference/api"
+    },
+    {
+      "source": "/cli",
+      "destination": "/reference/cli"
+    }
+  ],
+  "navigation": {
+    "languages": [
+      {
+        "language": "en",
+        "tabs": [
+          {
+            "tab": "Get started",
+            "groups": [
+              {
+                "group": "Overview",
+                "pages": [
+                  "index",
+                  "start/showcase",
+                  "concepts/features"
+                ]
+              },
+              {
+                "group": "First steps",
+                "pages": [
+                  "start/getting-started",
+                  "start/quickstart",
+                  "start/onboarding",
+                  "start/doctor"
+                ]
+              },
+              {
+                "group": "Guides",
+                "pages": [
+                  "start/first-session",
+                  "start/openclaw-rescue",
+                  "start/coven-tui",
+                  "start/automation"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "Install",
+            "groups": [
+              {
+                "group": "Install overview",
+                "pages": [
+                  "install/index",
+                  "install/npm",
+                  "install/cargo",
+                  "install/from-source"
+                ]
+              },
+              {
+                "group": "Maintenance",
+                "pages": [
+                  "install/updating",
+                  "install/uninstall",
+                  "install/development-channels"
+                ]
+              },
+              {
+                "group": "Containers",
+                "pages": [
+                  "install/docker",
+                  "install/nix",
+                  "install/podman"
+                ]
+              },
+              {
+                "group": "Hosting",
+                "pages": [
+                  "install/macos",
+                  "install/linux",
+                  "install/windows",
+                  "install/wsl2",
+                  "install/raspberry-pi",
+                  "install/headless-server"
+                ]
+              },
+              {
+                "group": "Advanced setup",
+                "pages": [
+                  "install/coven-home",
+                  "install/launchd",
+                  "install/systemd"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "Harnesses",
+            "groups": [
+              {
+                "group": "Overview",
+                "pages": [
+                  "harnesses/index",
+                  "harnesses/what-is-a-harness",
+                  "announcements/comux-demo-loop"
+                ]
+              },
+              {
+                "group": "Supported harnesses",
+                "pages": [
+                  "harnesses/codex",
+                  "harnesses/claude-code"
+                ]
+              },
+              {
+                "group": "Planned harnesses",
+                "pages": [
+                  "harnesses/hermes",
+                  "harnesses/aider",
+                  "harnesses/gemini-cli",
+                  "harnesses/cline",
+                  "harnesses/custom"
+                ]
+              },
+              {
+                "group": "Configuration",
+                "pages": [
+                  "harnesses/installing",
+                  "harnesses/provider-auth",
+                  "harnesses/project-root",
+                  "harnesses/working-directory",
+                  "harnesses/title-and-metadata",
+                  "harnesses/troubleshooting"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "Familiars",
+            "groups": [
+              {
+                "group": "Fundamentals",
+                "pages": [
+                  "familiars/index",
+                  "familiars/what-is-a-familiar",
+                  "familiars/naming-and-voice",
+                  "familiars/roles",
+                  "familiars/personas",
+                  "familiars/identity"
+                ]
+              },
+              {
+                "group": "Sessions and memory",
+                "pages": [
+                  "sessions/index",
+                  "sessions/lifecycle",
+                  "sessions/events",
+                  "sessions/comux-json",
+                  {
+                    "group": "Memory",
+                    "pages": [
+                      "memory/index",
+                      "memory/working-memory",
+                      "memory/persistent-memory",
+                      "memory/episodic",
+                      "memory/semantic",
+                      "memory/search"
+                    ]
+                  },
+                  "sessions/compaction"
+                ]
+              },
+              {
+                "group": "Rituals",
+                "pages": [
+                  "rituals/index",
+                  "rituals/archive",
+                  "rituals/summon",
+                  "rituals/sacrifice"
+                ]
+              },
+              {
+                "group": "Multi-familiar",
+                "pages": [
+                  "familiars/multi-familiar",
+                  "familiars/handoff",
+                  "familiars/orchestration",
+                  "familiars/parallel-lanes"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "Capabilities",
+            "groups": [
+              {
+                "group": "Overview",
+                "pages": [
+                  "capabilities/index",
+                  "capabilities/discovery",
+                  "capabilities/action-routing"
+                ]
+              },
+              {
+                "group": "Tools",
+                "pages": [
+                  "tools/index",
+                  "tools/exec",
+                  "tools/apply-patch",
+                  "tools/desktop-automation",
+                  "tools/web-fetch",
+                  "tools/thinking"
+                ]
+              },
+              {
+                "group": "Skills",
+                "pages": [
+                  "tools/skills",
+                  "tools/creating-skills",
+                  "tools/slash-commands"
+                ]
+              },
+              {
+                "group": "Automation",
+                "pages": [
+                  "automation/index",
+                  "automation/cron",
+                  "automation/hooks",
+                  "automation/standing-orders"
+                ]
+              },
+              {
+                "group": "Plugins",
+                "pages": [
+                  "plugins/index",
+                  "plugins/manage",
+                  "plugins/building-plugins",
+                  "plugins/openclaw-bridge"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "Models",
+            "groups": [
+              {
+                "group": "Overview",
+                "pages": [
+                  "models/index",
+                  "models/provider-boundary",
+                  "models/why-coven-does-not-own-credentials"
+                ]
+              },
+              {
+                "group": "Provider auth",
+                "pages": [
+                  "models/anthropic",
+                  "models/openai",
+                  "models/google",
+                  "models/local-models"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "Platforms",
+            "groups": [
+              {
+                "group": "Desktop",
+                "pages": [
+                  "platforms/macos",
+                  "platforms/linux",
+                  "platforms/windows",
+                  "platforms/wsl2"
+                ]
+              },
+              {
+                "group": "Headless",
+                "pages": [
+                  "platforms/headless",
+                  "platforms/raspberry-pi",
+                  "platforms/cloud-vm"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "Daemon & Ops",
+            "groups": [
+              {
+                "group": "Daemon",
+                "pages": [
+                  "daemon/index",
+                  "daemon/lifecycle",
+                  "daemon/health",
+                  "daemon/configuration",
+                  "daemon/coven-home"
+                ]
+              },
+              {
+                "group": "Local API",
+                "pages": [
+                  "daemon/socket-api",
+                  "daemon/api-versioning",
+                  "daemon/error-envelope",
+                  "daemon/capabilities-handshake"
+                ]
+              },
+              {
+                "group": "Security",
+                "pages": [
+                  "daemon/auth-posture",
+                  "daemon/trust-boundary",
+                  "daemon/remote-access",
+                  "daemon/safety-model"
+                ]
+              },
+              {
+                "group": "Operations",
+                "pages": [
+                  "daemon/logs",
+                  "daemon/diagnostics",
+                  "daemon/orphan-recovery",
+                  "daemon/upgrades"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "Reference",
+            "groups": [
+              {
+                "group": "Architecture",
+                "pages": [
+                  "concepts/architecture",
+                  "concepts/runtime-topology",
+                  "concepts/authority-boundary",
+                  "concepts/control-plane",
+                  "concepts/store"
+                ]
+              },
+              {
+                "group": "API",
+                "pages": [
+                  "reference/api",
+                  "reference/api-contract",
+                  "reference/api-sessions",
+                  "reference/api-events",
+                  "reference/api-capabilities",
+                  "reference/api-actions"
+                ]
+              },
+              {
+                "group": "CLI",
+                "pages": [
+                  "reference/cli",
+                  "reference/cli-coven",
+                  "reference/cli-doctor",
+                  "reference/cli-daemon",
+                  "reference/cli-run",
+                  "reference/cli-sessions",
+                  "reference/cli-attach",
+                  "reference/cli-archive",
+                  "reference/cli-summon",
+                  "reference/cli-sacrifice",
+                  "reference/cli-patch"
+                ]
+              },
+              {
+                "group": "Adapters",
+                "pages": [
+                  "reference/harness-adapters",
+                  "reference/adapter-spec",
+                  "reference/future-harnesses"
+                ]
+              },
+              {
+                "group": "Releases",
+                "pages": [
+                  "reference/releasing",
+                  "reference/roadmap",
+                  "reference/changelog"
+                ]
+              },
+              {
+                "group": "Project",
+                "pages": [
+                  "reference/glossary",
+                  "reference/brand",
+                  "reference/credits",
+                  "reference/license"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "Help",
+            "groups": [
+              {
+                "group": "Common problems",
+                "pages": [
+                  "help/index",
+                  "help/troubleshooting",
+                  "help/daemon-wont-start",
+                  "help/harness-not-found",
+                  "help/session-stuck"
+                ]
+              },
+              {
+                "group": "Environment",
+                "pages": [
+                  "help/environment",
+                  "help/paths",
+                  "help/permissions"
+                ]
+              },
+              {
+                "group": "Asking for help",
+                "pages": [
+                  "help/diagnostics-bundle",
+                  "help/community",
+                  "help/filing-issues"
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

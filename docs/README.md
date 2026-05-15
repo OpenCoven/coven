@@ -6,6 +6,17 @@ OpenCoven is an open ecosystem for persistent AI familiars: named agents with me
 
 The guiding promise: OpenCoven turns AI from a blank chatbox into a living workspace of agents that remember, coordinate, and belong to the user.
 
+## Two layouts in this folder
+
+Coven's docs are in transition. Both layouts live here today:
+
+1. **Mintlify-style scaffold** (new). The page tree under `docs.json` powers a future `docs.opencoven.ai` site that mirrors the OpenClaw docs structure. Entry points:
+   - [`index.md`](index.md) — landing page.
+   - [`docs.json`](docs.json) — navigation tabs and groups.
+   - [`start/`](start/), [`install/`](install/), [`harnesses/`](harnesses/), [`familiars/`](familiars/), [`sessions/`](sessions/), [`memory/`](memory/), [`rituals/`](rituals/), [`capabilities/`](capabilities/), [`tools/`](tools/), [`automation/`](automation/), [`plugins/`](plugins/), [`models/`](models/), [`platforms/`](platforms/), [`daemon/`](daemon/), [`reference/`](reference/), [`help/`](help/).
+   - [`AGENTS.md`](AGENTS.md) — contributor rules for the docs site.
+2. **Flat canonical notes** (legacy, still authoritative for engineering). The all-caps files listed below remain the source-of-truth for the current Coven implementation. The Mintlify scaffold absorbs them over time.
+
 ## Start here
 
 - [Getting started](GETTING-STARTED.md) — first install, first daemon, first session, and contributor checks.
