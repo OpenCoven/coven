@@ -192,6 +192,74 @@ pub fn ratatui_style(c: Rgb) -> RatStyle {
     RatStyle::default().fg(ratatui_color(c))
 }
 
+// ── ANSI Display wrappers ──
+
+use std::fmt;
+
+/// Foreground-color ANSI escape. Use in format strings:
+/// `println!("{}Title{}", theme::fg(theme::PRIMARY), theme::reset())`
+pub struct Fg {
+    rgb: Rgb,
+    mode: TerminalMode,
+}
+
+pub struct Bg {
+    rgb: Rgb,
+    mode: TerminalMode,
+}
+
+pub struct Reset {
+    mode: TerminalMode,
+}
+
+impl Fg {
+    pub(crate) fn with_mode(rgb: Rgb, mode: TerminalMode) -> Self { Self { rgb, mode } }
+}
+impl Bg {
+    pub(crate) fn with_mode(rgb: Rgb, mode: TerminalMode) -> Self { Self { rgb, mode } }
+}
+impl Reset {
+    pub(crate) fn with_mode(mode: TerminalMode) -> Self { Self { mode } }
+}
+
+/// Foreground escape for the active mode.
+pub fn fg(c: Rgb) -> Fg { Fg::with_mode(c, mode()) }
+
+/// Background escape for the active mode.
+pub fn bg(c: Rgb) -> Bg { Bg::with_mode(c, mode()) }
+
+/// SGR-reset escape for the active mode. Empty in `NoColor`.
+pub fn reset() -> Reset { Reset::with_mode(mode()) }
+
+impl fmt::Display for Fg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.mode {
+            TerminalMode::TrueColor  => write!(f, "\x1b[38;2;{};{};{}m", self.rgb.r, self.rgb.g, self.rgb.b),
+            TerminalMode::Indexed256 => write!(f, "\x1b[38;5;{}m", nearest_256(self.rgb)),
+            TerminalMode::NoColor    => Ok(()),
+        }
+    }
+}
+
+impl fmt::Display for Bg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.mode {
+            TerminalMode::TrueColor  => write!(f, "\x1b[48;2;{};{};{}m", self.rgb.r, self.rgb.g, self.rgb.b),
+            TerminalMode::Indexed256 => write!(f, "\x1b[48;5;{}m", nearest_256(self.rgb)),
+            TerminalMode::NoColor    => Ok(()),
+        }
+    }
+}
+
+impl fmt::Display for Reset {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.mode {
+            TerminalMode::NoColor => Ok(()),
+            _                     => f.write_str("\x1b[0m"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,5 +437,50 @@ mod tests {
         let s: Style = ratatui_style(brand::PURPLE_3);
         let expected = Style::default().fg(ratatui_color(brand::PURPLE_3));
         assert_eq!(s, expected);
+    }
+
+    #[test]
+    fn fg_emits_truecolor_escape() {
+        assert_eq!(
+            format!("{}", Fg::with_mode(brand::PURPLE_3, TerminalMode::TrueColor)),
+            "\x1b[38;2;167;139;255m",
+        );
+    }
+    #[test]
+    fn fg_emits_indexed_256_escape() {
+        assert_eq!(
+            format!("{}", Fg::with_mode(brand::PURPLE_3, TerminalMode::Indexed256)),
+            "\x1b[38;5;141m",
+        );
+    }
+    #[test]
+    fn fg_emits_nothing_in_no_color() {
+        assert_eq!(
+            format!("{}", Fg::with_mode(brand::PURPLE_3, TerminalMode::NoColor)),
+            "",
+        );
+    }
+    #[test]
+    fn bg_emits_truecolor_escape() {
+        assert_eq!(
+            format!("{}", Bg::with_mode(brand::SURFACE_2, TerminalMode::TrueColor)),
+            "\x1b[48;2;8;8;18m",
+        );
+    }
+    #[test]
+    fn bg_emits_nothing_in_no_color() {
+        assert_eq!(
+            format!("{}", Bg::with_mode(brand::SURFACE_2, TerminalMode::NoColor)),
+            "",
+        );
+    }
+    #[test]
+    fn reset_is_empty_in_no_color() {
+        assert_eq!(format!("{}", Reset::with_mode(TerminalMode::NoColor)), "");
+    }
+    #[test]
+    fn reset_emits_sgr_zero_otherwise() {
+        assert_eq!(format!("{}", Reset::with_mode(TerminalMode::TrueColor)), "\x1b[0m");
+        assert_eq!(format!("{}", Reset::with_mode(TerminalMode::Indexed256)), "\x1b[0m");
     }
 }
