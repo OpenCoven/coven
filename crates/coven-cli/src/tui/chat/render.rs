@@ -3,14 +3,20 @@
 //! are private helpers it composes.
 
 use ratatui::{
-    Frame,
     layout::{Alignment, Constraint, Layout, Margin, Rect},
     style::{Color, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
+    widgets::{
+        Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
+        ScrollbarState, Wrap,
+    },
+    Frame,
 };
 
-use crate::theme::{self, AGENT_LABEL, DIM, HINT_KEY, PRIMARY, PRIMARY_STRONG, SURFACE, SURFACE_STRONG, USER_LABEL};
+use crate::theme::{
+    self, AGENT_LABEL, DIM, HINT_KEY, HINT_LABEL, PRIMARY, PRIMARY_STRONG, SURFACE, SURFACE_STRONG,
+    USER_LABEL,
+};
 
 use super::app::{App, InputMode, MessageRole, SPINNER_FRAMES};
 
@@ -58,7 +64,10 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let harness = app.active_agent_harness();
 
     let status_spans = vec![
-        Span::styled(" \u{2666} coven chat ", theme::ratatui_style(PRIMARY).bold()),
+        Span::styled(
+            " \u{2666} coven chat ",
+            theme::ratatui_style(PRIMARY).bold(),
+        ),
         Span::styled(" \u{2502} ", theme::ratatui_style(DIM)),
         Span::styled(
             format!("\u{25C9} {agent_name}"),
@@ -77,7 +86,8 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     ];
 
     let status_line = Line::from(status_spans);
-    let status = Paragraph::new(status_line).style(Style::default().bg(theme::ratatui_color(SURFACE)));
+    let status =
+        Paragraph::new(status_line).style(Style::default().bg(theme::ratatui_color(SURFACE)));
     f.render_widget(status, area);
 }
 
@@ -219,27 +229,30 @@ fn render_hint_bar(f: &mut Frame, app: &App, area: Rect) {
     let hints = if app.input_mode == InputMode::AgentSelect {
         vec![
             Span::styled(" \u{2191}\u{2193}", theme::ratatui_style(HINT_KEY).bold()),
-            Span::styled(" navigate  ", theme::ratatui_style(DIM)),
+            Span::styled(" navigate  ", theme::ratatui_style(HINT_LABEL)),
             Span::styled("Enter", theme::ratatui_style(HINT_KEY).bold()),
-            Span::styled(" select  ", theme::ratatui_style(DIM)),
+            Span::styled(" select  ", theme::ratatui_style(HINT_LABEL)),
             Span::styled("Esc", theme::ratatui_style(HINT_KEY).bold()),
-            Span::styled(" cancel", theme::ratatui_style(DIM)),
+            Span::styled(" cancel", theme::ratatui_style(HINT_LABEL)),
         ]
     } else {
         vec![
             Span::styled(" /help", theme::ratatui_style(HINT_KEY).bold()),
-            Span::styled(" commands  ", theme::ratatui_style(DIM)),
+            Span::styled(" commands  ", theme::ratatui_style(HINT_LABEL)),
             Span::styled("/agent", theme::ratatui_style(HINT_KEY).bold()),
-            Span::styled(" switch  ", theme::ratatui_style(DIM)),
+            Span::styled(" switch  ", theme::ratatui_style(HINT_LABEL)),
             Span::styled("Ctrl+C", theme::ratatui_style(HINT_KEY).bold()),
-            Span::styled(" quit  ", theme::ratatui_style(DIM)),
+            Span::styled(" quit  ", theme::ratatui_style(HINT_LABEL)),
             Span::styled("PgUp/PgDn", theme::ratatui_style(HINT_KEY).bold()),
-            Span::styled(" scroll", theme::ratatui_style(DIM)),
+            Span::styled(" scroll", theme::ratatui_style(HINT_LABEL)),
         ]
     };
 
-    let hint_line =
-        Paragraph::new(Line::from(hints)).style(Style::default().bg(theme::ratatui_color(SURFACE)).fg(theme::ratatui_color(DIM)));
+    let hint_line = Paragraph::new(Line::from(hints)).style(
+        Style::default()
+            .bg(theme::ratatui_color(SURFACE))
+            .fg(theme::ratatui_color(HINT_LABEL)),
+    );
     f.render_widget(hint_line, area);
 }
 
@@ -347,7 +360,9 @@ fn render_agent_select(f: &mut Frame, app: &App, area: Rect) {
             };
 
             let style = if is_selected {
-                theme::ratatui_style(PRIMARY_STRONG).bold().bg(theme::ratatui_color(SURFACE_STRONG))
+                theme::ratatui_style(PRIMARY_STRONG)
+                    .bold()
+                    .bg(theme::ratatui_color(SURFACE_STRONG))
             } else if !agent.available {
                 theme::ratatui_style(DIM)
             } else {

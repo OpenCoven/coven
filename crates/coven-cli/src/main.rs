@@ -868,7 +868,12 @@ fn render_session_browser_frame_plain(
     selected_session: usize,
     selected_action: usize,
 ) -> String {
-    render_session_browser_frame_with_mode(sessions, selected_session, selected_action, theme::TerminalMode::NoColor)
+    render_session_browser_frame_with_mode(
+        sessions,
+        selected_session,
+        selected_action,
+        theme::TerminalMode::NoColor,
+    )
 }
 
 fn render_session_browser_frame_for_raw_terminal(
@@ -876,8 +881,13 @@ fn render_session_browser_frame_for_raw_terminal(
     selected_session: usize,
     selected_action: usize,
 ) -> String {
-    render_session_browser_frame_with_mode(sessions, selected_session, selected_action, theme::mode())
-        .replace('\n', "\r\n")
+    render_session_browser_frame_with_mode(
+        sessions,
+        selected_session,
+        selected_action,
+        theme::mode(),
+    )
+    .replace('\n', "\r\n")
 }
 
 fn render_session_browser_frame_with_mode(
@@ -886,12 +896,12 @@ fn render_session_browser_frame_with_mode(
     selected_action: usize,
     mode: theme::TerminalMode,
 ) -> String {
-    let primary        = theme::Fg::with_mode(theme::PRIMARY, mode).to_string();
-    let primary_strong = theme::Fg::with_mode(theme::PRIMARY_STRONG, mode).to_string();
-    let field_label    = theme::Fg::with_mode(theme::FIELD_LABEL, mode).to_string();
-    let user_label     = theme::Fg::with_mode(theme::USER_LABEL, mode).to_string();
-    let dim            = theme::Fg::with_mode(theme::DIM, mode).to_string();
-    let reset          = theme::Reset::with_mode(mode).to_string();
+    let primary = theme::Fg::with_mode(theme::PRIMARY, mode);
+    let primary_strong = theme::Fg::with_mode(theme::PRIMARY_STRONG, mode);
+    let field_label = theme::Fg::with_mode(theme::FIELD_LABEL, mode);
+    let user_label = theme::Fg::with_mode(theme::USER_LABEL, mode);
+    let dim = theme::Fg::with_mode(theme::DIM, mode);
+    let reset = theme::Reset::with_mode(mode);
     let selected_session = selected_session.min(sessions.len().saturating_sub(1));
     let selected = &sessions[selected_session];
     let actions = session_browser_actions(selected);
@@ -916,9 +926,9 @@ fn render_session_browser_frame_with_mode(
     {
         let pointer = if index == selected_session { ">" } else { " " };
         let color = if index == selected_session {
-            primary_strong.as_str()
+            primary_strong
         } else {
-            primary.as_str()
+            primary
         };
         frame.push_str(&format!(
             "{color}{} {title:<30} {status:<9} {harness}{reset}\n",
@@ -960,9 +970,9 @@ fn render_session_browser_frame_with_mode(
     for (index, action) in actions.iter().enumerate() {
         let pointer = if index == selected_action { ">" } else { " " };
         let color = if index == selected_action {
-            primary_strong.as_str()
+            primary_strong
         } else {
-            primary.as_str()
+            primary
         };
         frame.push_str(&format!(
             "{color}{} [{}] {:<10} {}{reset}\n",
@@ -1020,7 +1030,12 @@ fn session_browser_action_row_to_index(
 }
 
 fn render_magical_tui_frame(selection: usize, input: &str) -> String {
-    render_magical_tui_frame_with_mode_and_width(selection, input, theme::mode(), magical_tui_inner_width())
+    render_magical_tui_frame_with_mode_and_width(
+        selection,
+        input,
+        theme::mode(),
+        magical_tui_inner_width(),
+    )
 }
 
 fn render_magical_tui_frame_for_raw_terminal(selection: usize, input: &str) -> String {
@@ -1038,7 +1053,12 @@ fn render_magical_tui_frame_plain(selection: usize) -> String {
 
 #[cfg(test)]
 fn render_magical_tui_frame_plain_with_width(selection: usize, inner_width: usize) -> String {
-    render_magical_tui_frame_with_mode_and_width(selection, "", theme::TerminalMode::NoColor, inner_width)
+    render_magical_tui_frame_with_mode_and_width(
+        selection,
+        "",
+        theme::TerminalMode::NoColor,
+        inner_width,
+    )
 }
 
 #[cfg(test)]
@@ -1047,7 +1067,12 @@ fn render_magical_tui_frame_plain_with_input(
     input: &str,
     inner_width: usize,
 ) -> String {
-    render_magical_tui_frame_with_mode_and_width(selection, input, theme::TerminalMode::NoColor, inner_width)
+    render_magical_tui_frame_with_mode_and_width(
+        selection,
+        input,
+        theme::TerminalMode::NoColor,
+        inner_width,
+    )
 }
 
 fn render_magical_tui_frame_with_mode_and_width(
@@ -1057,83 +1082,97 @@ fn render_magical_tui_frame_with_mode_and_width(
     inner_width: usize,
 ) -> String {
     let inner_width = normalized_magical_tui_inner_width(inner_width);
-    let primary        = theme::Fg::with_mode(theme::PRIMARY, mode).to_string();
-    let primary_strong = theme::Fg::with_mode(theme::PRIMARY_STRONG, mode).to_string();
-    let field_label    = theme::Fg::with_mode(theme::FIELD_LABEL, mode).to_string();
-    let user_label     = theme::Fg::with_mode(theme::USER_LABEL, mode).to_string();
-    let dim            = theme::Fg::with_mode(theme::DIM, mode).to_string();
-    let reset          = theme::Reset::with_mode(mode).to_string();
+    let primary = theme::Fg::with_mode(theme::PRIMARY, mode);
+    let primary_strong = theme::Fg::with_mode(theme::PRIMARY_STRONG, mode);
+    let field_label = theme::Fg::with_mode(theme::FIELD_LABEL, mode);
+    let user_label = theme::Fg::with_mode(theme::USER_LABEL, mode);
+    let dim = theme::Fg::with_mode(theme::DIM, mode);
+    let reset = theme::Reset::with_mode(mode);
     let mut frame = String::new();
-    frame.push_str(&magical_tui_line("COVEN", &primary_strong, &reset, inner_width));
+    frame.push_str(&magical_tui_line(
+        "COVEN",
+        primary_strong,
+        reset,
+        inner_width,
+    ));
     frame.push_str(&magical_tui_line(
         "Prompt-first agent console",
-        &field_label,
-        &reset,
+        field_label,
+        reset,
         inner_width,
     ));
     frame.push_str(&magical_tui_line(
         "Type natural language, or use slash commands.",
-        &user_label,
-        &reset,
+        user_label,
+        reset,
         inner_width,
     ));
     frame.push('\n');
     for line in magical_tui_graph_lines() {
-        frame.push_str(&magical_tui_line(line, &primary, &reset, inner_width));
+        frame.push_str(&magical_tui_line(line, primary, reset, inner_width));
     }
     frame.push('\n');
-    frame.push_str(&magical_tui_line("Input", &primary_strong, &reset, inner_width));
+    frame.push_str(&magical_tui_line(
+        "Input",
+        primary_strong,
+        reset,
+        inner_width,
+    ));
     frame.push_str(&magical_tui_line(
         &magical_tui_prompt_row(input, inner_width),
-        &user_label,
-        &reset,
+        user_label,
+        reset,
         inner_width,
     ));
     frame.push_str(&magical_tui_line(
         "Enter runs input. Empty Enter runs selected slash. Esc quits.",
-        &dim,
-        &reset,
+        dim,
+        reset,
         inner_width,
     ));
     frame.push('\n');
 
     frame.push_str(&magical_tui_line(
         "Slash commands",
-        &primary_strong,
-        &reset,
+        primary_strong,
+        reset,
         inner_width,
     ));
     for (index, item) in magical_tui_items().iter().enumerate() {
         let pointer = if index == selection { ">" } else { " " };
         let content = magical_tui_command_row(pointer, item, inner_width);
-        let color = if index == selection { primary_strong.as_str() } else { primary.as_str() };
-        frame.push_str(&magical_tui_line(&content, color, &reset, inner_width));
+        let color = if index == selection {
+            primary_strong
+        } else {
+            primary
+        };
+        frame.push_str(&magical_tui_line(&content, color, reset, inner_width));
     }
 
     let selected = magical_tui_items()[selection.min(magical_tui_items().len() - 1)];
     frame.push('\n');
     frame.push_str(&magical_tui_line(
         "Selected slash",
-        &primary_strong,
-        &reset,
+        primary_strong,
+        reset,
         inner_width,
     ));
     frame.push_str(&magical_tui_line(
         selected.description,
-        &user_label,
-        &reset,
+        user_label,
+        reset,
         inner_width,
     ));
     frame.push_str(&magical_tui_line(
         &format!("{} → {}", selected.slash, selected.command),
-        &primary_strong,
-        &reset,
+        primary_strong,
+        reset,
         inner_width,
     ));
     frame.push_str(&magical_tui_line(
         "Store: ~/.coven",
-        &dim,
-        &reset,
+        dim,
+        reset,
         inner_width,
     ));
     frame
@@ -1160,7 +1199,12 @@ fn magical_tui_prompt_row(input: &str, inner_width: usize) -> String {
     fit_chars(&format!("> {value}"), inner_width)
 }
 
-fn magical_tui_line(content: &str, text_color: &str, reset: &str, inner_width: usize) -> String {
+fn magical_tui_line(
+    content: &str,
+    text_color: impl std::fmt::Display,
+    reset: impl std::fmt::Display,
+    inner_width: usize,
+) -> String {
     format!("{text_color}{}{reset}\n", fit_chars(content, inner_width))
 }
 

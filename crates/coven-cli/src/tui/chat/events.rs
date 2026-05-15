@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{backend::CrosstermBackend, Terminal};
 
 use super::app::{App, InputMode, SlashCommandResult};
 use super::render::render_ui;

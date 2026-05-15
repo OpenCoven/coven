@@ -64,6 +64,34 @@ class SecretGuardLockfileTests(unittest.TestCase):
     def test_lockfiles_are_not_excluded_from_scanning(self) -> None:
         self.assertFalse(check_secrets.is_excluded_path("packages/openclaw-coven/pnpm-lock.yaml"))
 
+    def test_local_worktree_paths_do_not_trigger_high_entropy(self) -> None:
+        text = (
+            "cd /Users/buns/Documents/GitHub/OpenCoven/coven/.worktrees/feat-tui-chat-module\n"
+            "Expected: /Users/buns/Documents/GitHub/OpenCoven/coven/.worktrees/feat-tui-chat-module"
+        )
+
+        hits = check_secrets.scan_text(text, "docs/superpowers/plans/example.md")
+
+        self.assertEqual(hits, [])
+
+    def test_public_repo_links_do_not_trigger_high_entropy(self) -> None:
+        text = (
+            "[`DESIGN.md`](https://github.com/OpenCoven/coven/blob/main/DESIGN.md)\n"
+            "[`brand/`](https://github.com/OpenCoven/coven/tree/main/brand)"
+        )
+
+        hits = check_secrets.scan_text(text, "docs/BRAND.md")
+
+        self.assertEqual(hits, [])
+
+    def test_base64_like_values_still_trigger_high_entropy(self) -> None:
+        token = "m9R3tQv7WzK2pL5nX8cF1gJ4sD6hY0aB/EuIqOwPz9RkTlVxCyNmS3HdG7fA"
+        text = f"value: {token}\n"
+
+        hits = check_secrets.scan_text(text, "docs/example.md")
+
+        self.assertEqual(hits, [("docs/example.md", 1, "high_entropy")])
+
 
 if __name__ == "__main__":
     unittest.main()
