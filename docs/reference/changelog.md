@@ -10,7 +10,7 @@ title: "Changelog"
 
 ### Updates
 
-- **Brand-aligned TUI theme.** Both the prompt-first `coven tui` and the chat TUI now render with a unified, brand-aligned palette and consistent semantic tokens (primary, agent, user, hint, surface, dim). Colors automatically adapt to your terminal: truecolor for 24-bit terminals, 256-color downgrade for legacy terminals, and no color when output is piped or `NO_COLOR` is set. See [Environment variables](/help/environment).
+- **Brand-aligned TUI theme.** Both `coven tui` and `coven chat` now share a unified, brand-aligned palette with consistent semantic tokens for primary, agent, user, hint, surface, and dim styles. Colors adapt to your terminal automatically: truecolor on 24-bit terminals, 256-color on legacy terminals, and no color when output is piped or `NO_COLOR` is set. See [Environment variables](/help/environment).
 
 ## Week of May 11, 2026
 
