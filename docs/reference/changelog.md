@@ -6,6 +6,12 @@ read_when:
 title: "Coven changelog and release notes"
 ---
 
+## Week of May 15, 2026
+
+### Updates
+
+- **Brand-aligned TUI theme.** Both `coven tui` and `coven chat` now share a unified, brand-aligned palette with consistent semantic tokens for primary, agent, user, hint, surface, and dim styles. Colors adapt to your terminal automatically: truecolor on 24-bit terminals, 256-color on legacy terminals, and no color when output is piped or `NO_COLOR` is set. See [Environment variables](/help/environment).
+
 ## Week of May 11, 2026
 
 ### New features
