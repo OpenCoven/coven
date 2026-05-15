@@ -87,6 +87,28 @@ pub(crate) fn detect_mode_from(e: EnvInputs<'_>) -> TerminalMode {
     }
 }
 
+use std::sync::OnceLock;
+
+static MODE: OnceLock<TerminalMode> = OnceLock::new();
+
+/// Resolve the terminal mode for this process. Cached on first call.
+pub fn mode() -> TerminalMode {
+    *MODE.get_or_init(detect_mode)
+}
+
+fn detect_mode() -> TerminalMode {
+    use std::io::IsTerminal;
+    let no_color  = std::env::var("NO_COLOR").ok();
+    let colorterm = std::env::var("COLORTERM").ok();
+    let term      = std::env::var("TERM").ok();
+    detect_mode_from(EnvInputs {
+        no_color:      no_color.as_deref(),
+        colorterm:     colorterm.as_deref(),
+        term:          term.as_deref(),
+        stdout_is_tty: std::io::stdout().is_terminal(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,5 +233,12 @@ mod tests {
                 "row {i}: {inputs:?}",
             );
         }
+    }
+
+    #[test]
+    fn mode_returns_a_value_and_caches() {
+        let first = mode();
+        let second = mode();
+        assert_eq!(first, second, "mode() must return the same value on repeated calls");
     }
 }
