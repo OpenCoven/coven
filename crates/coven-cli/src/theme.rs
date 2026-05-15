@@ -31,6 +31,21 @@ pub mod brand {
     pub const SURFACE_2:   Rgb = Rgb { r: 0x08, g: 0x08, b: 0x12 };
 }
 
+// ── Semantic tokens (what callsites import) ──
+
+pub const PRIMARY:        Rgb = brand::PURPLE_3;
+pub const PRIMARY_STRONG: Rgb = brand::PURPLE_2;
+pub const AGENT_LABEL:    Rgb = brand::PURPLE_2;
+pub const USER_LABEL:     Rgb = brand::PURPLE_1;
+pub const HINT_KEY:       Rgb = brand::TEXT;
+pub const HINT_LABEL:     Rgb = brand::TEXT_MUTED;
+pub const FIELD_LABEL:    Rgb = brand::TEXT_MUTED;
+pub const DANGER:         Rgb = brand::DANGER;
+pub const SUCCESS:        Rgb = brand::SUCCESS;
+pub const DIM:            Rgb = brand::TEXT_FAINT;
+pub const SURFACE:        Rgb = brand::SURFACE_1;
+pub const SURFACE_STRONG: Rgb = brand::SURFACE_2;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,5 +119,21 @@ mod tests {
         assert_eq!(brand::TEXT,       flatten_on_black(&vars["--oc-text"]),       "--oc-text");
         assert_eq!(brand::TEXT_MUTED, flatten_on_black(&vars["--oc-text-muted"]), "--oc-text-muted");
         assert_eq!(brand::TEXT_FAINT, flatten_on_black(&vars["--oc-text-faint"]), "--oc-text-faint");
+    }
+
+    #[test]
+    fn semantic_tokens_resolve_to_brand_tokens() {
+        assert_eq!(PRIMARY,        brand::PURPLE_3);
+        assert_eq!(PRIMARY_STRONG, brand::PURPLE_2);
+        assert_eq!(AGENT_LABEL,    brand::PURPLE_2);
+        assert_eq!(USER_LABEL,     brand::PURPLE_1);
+        assert_eq!(HINT_KEY,       brand::TEXT);
+        assert_eq!(HINT_LABEL,     brand::TEXT_MUTED);
+        assert_eq!(FIELD_LABEL,    brand::TEXT_MUTED);
+        assert_eq!(DANGER,         brand::DANGER);
+        assert_eq!(SUCCESS,        brand::SUCCESS);
+        assert_eq!(DIM,            brand::TEXT_FAINT);
+        assert_eq!(SURFACE,        brand::SURFACE_1);
+        assert_eq!(SURFACE_STRONG, brand::SURFACE_2);
     }
 }
