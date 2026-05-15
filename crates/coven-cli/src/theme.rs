@@ -46,6 +46,47 @@ pub const DIM:            Rgb = brand::TEXT_FAINT;
 pub const SURFACE:        Rgb = brand::SURFACE_1;
 pub const SURFACE_STRONG: Rgb = brand::SURFACE_2;
 
+// ── Terminal-mode detection ──
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TerminalMode {
+    TrueColor,
+    Indexed256,
+    NoColor,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct EnvInputs<'a> {
+    pub no_color:      Option<&'a str>,
+    pub colorterm:     Option<&'a str>,
+    pub term:          Option<&'a str>,
+    pub stdout_is_tty: bool,
+}
+
+pub(crate) fn detect_mode_from(e: EnvInputs<'_>) -> TerminalMode {
+    // 1. NO_COLOR set to non-empty value always wins (per no-color.org;
+    //    empty-string treated as unset per supports-color convention).
+    if e.no_color.map(|v| !v.is_empty()).unwrap_or(false) {
+        return TerminalMode::NoColor;
+    }
+    // 2. Piped/redirected stdout — never emit escapes.
+    if !e.stdout_is_tty {
+        return TerminalMode::NoColor;
+    }
+    // 3. Explicit truecolor declaration.
+    match e.colorterm {
+        Some("truecolor") | Some("24bit") => return TerminalMode::TrueColor,
+        _ => {}
+    }
+    // 4. TERM-based fallback.
+    match e.term {
+        Some(t) if t.ends_with("-direct")   => TerminalMode::TrueColor,
+        Some(t) if t.ends_with("-256color") => TerminalMode::Indexed256,
+        Some("dumb") | None                 => TerminalMode::NoColor,
+        Some(_)                             => TerminalMode::Indexed256,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,5 +176,40 @@ mod tests {
         assert_eq!(DIM,            brand::TEXT_FAINT);
         assert_eq!(SURFACE,        brand::SURFACE_1);
         assert_eq!(SURFACE_STRONG, brand::SURFACE_2);
+    }
+
+    #[test]
+    fn detect_mode_from_table() {
+        use TerminalMode::*;
+        let cases: &[(EnvInputs<'_>, TerminalMode)] = &[
+            // NO_COLOR=1 always wins, even with truecolor and TTY
+            (EnvInputs { no_color: Some("1"),  colorterm: Some("truecolor"), term: Some("xterm-256color"), stdout_is_tty: true  }, NoColor),
+            // Empty-string NO_COLOR treated as unset
+            (EnvInputs { no_color: Some(""),   colorterm: Some("truecolor"), term: Some("xterm-256color"), stdout_is_tty: true  }, TrueColor),
+            // COLORTERM=truecolor wins on a TTY
+            (EnvInputs { no_color: None,       colorterm: Some("truecolor"), term: Some("xterm-256color"), stdout_is_tty: true  }, TrueColor),
+            // COLORTERM=24bit also yields truecolor
+            (EnvInputs { no_color: None,       colorterm: Some("24bit"),     term: Some("xterm-256color"), stdout_is_tty: true  }, TrueColor),
+            // TERM=*-direct yields truecolor even without COLORTERM
+            (EnvInputs { no_color: None,       colorterm: None,              term: Some("xterm-direct"),   stdout_is_tty: true  }, TrueColor),
+            // TERM=*-256color yields indexed 256
+            (EnvInputs { no_color: None,       colorterm: None,              term: Some("xterm-256color"), stdout_is_tty: true  }, Indexed256),
+            // Plain xterm: default to indexed 256
+            (EnvInputs { no_color: None,       colorterm: None,              term: Some("xterm"),          stdout_is_tty: true  }, Indexed256),
+            // TERM=dumb forces no color
+            (EnvInputs { no_color: None,       colorterm: None,              term: Some("dumb"),           stdout_is_tty: true  }, NoColor),
+            // TERM unset forces no color
+            (EnvInputs { no_color: None,       colorterm: None,              term: None,                   stdout_is_tty: true  }, NoColor),
+            // Piped stdout always disables color, regardless of env
+            (EnvInputs { no_color: None,       colorterm: Some("truecolor"), term: Some("xterm-256color"), stdout_is_tty: false }, NoColor),
+            (EnvInputs { no_color: Some("1"),  colorterm: None,              term: None,                   stdout_is_tty: false }, NoColor),
+        ];
+        for (i, (inputs, expected)) in cases.iter().enumerate() {
+            assert_eq!(
+                detect_mode_from(*inputs),
+                *expected,
+                "row {i}: {inputs:?}",
+            );
+        }
     }
 }
