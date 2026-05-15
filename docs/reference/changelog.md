@@ -1,9 +1,9 @@
 ---
 summary: "Per-release notes for the Coven runtime, CLI, and local API."
-description: "Weekly release notes for Coven covering new features, updates, and bug fixes across the runtime, CLI, TUI, and local socket API."
+description: "Weekly release notes for Coven covering new features, fixes, and breaking changes across the runtime, CLI, TUI, and local daemon socket API."
 read_when:
   - Looking up what changed
-title: "Changelog"
+title: "Coven changelog and release notes"
 ---
 
 ## Week of May 11, 2026
