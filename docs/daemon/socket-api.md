@@ -98,7 +98,9 @@ The `apiVersion` field is the contract clients pin against. Coven follows additi
   </Tab>
   <Tab title="Rust">
     ```rust
-    let stream = tokio::net::UnixStream::connect("~/.coven/coven.sock").await?;
+    let home = std::env::var("HOME")?;
+    let socket = std::path::PathBuf::from(home).join(".coven/coven.sock");
+    let stream = tokio::net::UnixStream::connect(socket).await?;
     // wrap in hyper or your preferred HTTP client
     ```
   </Tab>

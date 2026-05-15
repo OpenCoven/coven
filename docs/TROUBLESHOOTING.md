@@ -61,6 +61,28 @@ coven daemon restart
 
 If a client cannot connect, verify it is using the same `COVEN_HOME` as the CLI.
 
+## System health and pressure
+
+If sessions feel slow, the daemon is sluggish to start, or `coven doctor` succeeds but harness work stalls, the underlying machine may be under CPU, memory, or disk pressure.
+
+`coven pc` surfaces a local system report without launching a harness. All read operations are side-effect free:
+
+```sh
+coven pc                  # full report: CPU, memory, disk, top processes
+coven pc status           # one-line health summary
+coven pc top --n 10       # top-N processes by CPU usage
+coven pc disk             # disk usage breakdown
+```
+
+Relief operations mutate system state and require an explicit `--confirm` gate:
+
+```sh
+coven pc kill <pid> --confirm     # SIGTERM with PID identity re-check
+coven pc cache clear --confirm    # clear ~/Library/Caches + /Library/Caches
+```
+
+`coven pc` is currently macOS-first. See [Diagnostics and relief](GETTING-STARTED.md#diagnostics-and-relief) in Getting started for the full command reference.
+
 ## Stale running sessions
 
 If a daemon stopped while sessions were running, those records may become `orphaned` on the next daemon start.

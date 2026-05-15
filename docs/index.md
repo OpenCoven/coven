@@ -153,18 +153,11 @@ Coven state lives under `$COVEN_HOME` (defaulting to `~/.coven` on macOS/Linux).
 - If you **do nothing**, Coven uses your existing local harness logins.
 - If you want to lock it down, scope `$COVEN_HOME` per project root or per familiar.
 
-Example `coven.toml`:
+Example:
 
-```toml
-[daemon]
-home = "~/.coven"
-socket = "~/.coven/coven.sock"
-
-[harnesses.codex]
-enabled = true
-
-[harnesses.claude]
-enabled = true
+```bash
+export COVEN_HOME="$HOME/.local/share/coven"
+coven daemon restart
 ```
 
 ## Start here

@@ -102,7 +102,7 @@ function validatePage(page, markdownPath, rawContent) {
     throw new Error(`Navigation page "${page}" does not exist at ${path.relative(rootDir, markdownPath)}`);
   }
 
-  if (rawContent.includes('Stub — fill in')) {
+  if (/\bStub\s+[—-]\s+fill in\b/.test(rawContent)) {
     throw new Error(`Navigation page "${page}" is still a scaffold stub`);
   }
 }

@@ -20,9 +20,9 @@
   },
   "favicon": "/assets/opencoven-mark.svg",
   "colors": {
-    "primary": "#7C3AED",
-    "dark": "#7C3AED",
-    "light": "#A78BFA"
+    "primary": "#7C5CFF",
+    "dark": "#6E4BFF",
+    "light": "#A78BFF"
   },
   "styling": {
     "codeblocks": {

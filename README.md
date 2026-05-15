@@ -183,13 +183,11 @@ Coven is the room where harnesses run. The clients decide how to present and rou
 - [Concepts](docs/CONCEPTS.md)
 - [Glossary](docs/GLOSSARY.md)
 
-### Orchestration (Multi-Harness Workflows)
-- [User guide: Orchestration](docs/USER-GUIDE-ORCHESTRATION.md) — **How to use multiple harnesses on one task**
-- [Orchestration quick reference](docs/ORCHESTRATION-QUICK-REFERENCE.md) — Command cheat sheet
-- [Common workflows](docs/ORCHESTRATION-WORKFLOWS.md) — Step-by-step guides (explore → edit, review chains, etc.)
+### Future orchestration
+- [Public roadmap](docs/ROADMAP.md) — planned multi-harness handoff and routing work.
+- [Glossary](docs/GLOSSARY.md) — future orchestration terms without current CLI/API promises.
 
 ### Architecture & Reference
-- [Public roadmap](docs/ROADMAP.md)
 - [comux + Coven demo loop](docs/COMUX-DEMO-LOOP.md)
 - [Architecture diagrams](docs/ARCHITECTURE.md)
 - [Session lifecycle](docs/SESSION-LIFECYCLE.md)

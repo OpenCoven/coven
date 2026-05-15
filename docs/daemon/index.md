@@ -34,9 +34,8 @@ Clients (`coven` CLI/TUI, comux, OpenMeow, the external OpenClaw plugin) **never
 |---|---|
 | `$COVEN_HOME` | Root state directory. Default `~/.coven` on macOS/Linux. |
 | `$COVEN_HOME/coven.sock` | Unix socket the daemon binds. |
-| `$COVEN_HOME/coven.toml` | Optional config overrides. |
-| `$COVEN_HOME/store.db` | SQLite session ledger and event log. |
-| `$COVEN_HOME/logs/` | Per-day daemon logs. |
+| `$COVEN_HOME/coven.sqlite3` | SQLite session ledger and append-only event log. |
+| `$COVEN_HOME/daemon.json` | Background daemon pid, start time, and socket metadata. |
 
 See [`$COVEN_HOME`](/daemon/coven-home) for the full layout and how to relocate it.
 

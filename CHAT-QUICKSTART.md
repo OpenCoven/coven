@@ -3,7 +3,7 @@
 ## Build
 
 ```bash
-cd ~/Documents/GitHub/OpenCoven/coven
+cd /path/to/coven
 cargo build -p coven-cli
 ```
 

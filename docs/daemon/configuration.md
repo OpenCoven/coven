@@ -1,56 +1,41 @@
 ---
-summary: "coven.toml, environment variables, and overrides for the Coven daemon."
+summary: "Current daemon configuration surface."
 read_when:
   - Configuring a Coven install
-  - Relocating COVEN_HOME or changing the socket path
+  - Relocating COVEN_HOME
 title: "Configuration"
 ---
 
-Coven's daemon is configurable through three layers, in priority order:
+Coven's current daemon configuration surface is intentionally small.
 
-1. CLI flags on `coven daemon start`.
-2. `coven.toml` under `$COVEN_HOME`.
-3. Environment variables.
-4. Built-in defaults.
+## State directory
 
-## `coven.toml`
+Set `COVEN_HOME` to move Coven state away from the default `~/.coven`:
 
-```toml
-[daemon]
-home = "~/.coven"
-socket = "~/.coven/coven.sock"
-log_dir = "~/.coven/logs"
-
-[harnesses.codex]
-enabled = true
-
-[harnesses.claude]
-enabled = true
-
-[control_plane]
-desktop_automation = false
+```bash
+export COVEN_HOME="$HOME/.local/share/coven"
+coven daemon restart
 ```
 
-## Environment variables
+When `COVEN_HOME` is set, the daemon uses:
 
-| Variable | Purpose |
-|---|---|
-| `COVEN_HOME` | Override the state directory. |
-| `COVEN_SOCKET` | Override the socket path. |
-| `COVEN_LOG_LEVEL` | `error`, `warn`, `info` (default), `debug`, `trace`. |
-| `COVEN_DAEMON_FOREGROUND` | Run the daemon in the foreground; do not fork. |
+- `<COVEN_HOME>/coven.sock` for the Unix socket.
+- `<COVEN_HOME>/coven.sqlite3` for the session ledger and event log.
+- `<COVEN_HOME>/daemon.json` for background daemon metadata.
 
-See [Environment variables](/help/environment) for the complete list.
+## Unsupported knobs
 
-## Reload behaviour
+The current CLI does not read `coven.toml`, `COVEN_SOCKET`, `COVEN_LOG_LEVEL`, or `COVEN_DAEMON_FOREGROUND`. Do not rely on those names until support lands in the Rust daemon.
 
-The daemon reads its configuration at start. Restart after changes:
+## Applying changes
+
+Restart after changing `COVEN_HOME`:
 
 ```bash
 coven daemon restart
 ```
 
-`restart` rebinds the socket and reloads `coven.toml`.
+`restart` rebinds the socket under the selected state directory.
 
 ## Related
 

@@ -39,7 +39,7 @@ See [Authority boundary](/concepts/authority-boundary).
 ## Secret handling
 
 - Coven does not read provider API keys.
-- Coven does not log harness stdout containing user data unless the operator opts in.
+- Coven records harness output as append-only session events so attach, replay, and audit workflows can work. Treat `$COVEN_HOME` as sensitive local state.
 - Diagnostics bundles redact known secret-shaped tokens by default. See [Diagnostics bundle](/help/diagnostics-bundle).
 - Runtime state under `$COVEN_HOME` must not be committed to source control.
 

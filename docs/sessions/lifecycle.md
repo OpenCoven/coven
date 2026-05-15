@@ -19,7 +19,9 @@ stateDiagram-v2
   Completed --> Archived: coven archive
   Failed --> Archived: coven archive
   Killed --> Archived: coven archive
-  Archived --> Completed: coven summon
+  Archived --> Completed: coven summon (if originally completed)
+  Archived --> Failed: coven summon (if originally failed)
+  Archived --> Killed: coven summon (if originally killed)
   Archived --> [*]: coven sacrifice --yes
   Completed --> [*]: coven sacrifice --yes
 ```
@@ -74,7 +76,7 @@ These are the three rituals around finished sessions:
     Hide a non-running session. Reversible. Events preserved.
   </Card>
   <Card title="Summon" href="/rituals/summon" icon="moon-star">
-    Restore an archived session to the active list, then replay/follow it.
+    Restore an archived session to the active list with its original terminal status, then replay/follow it.
   </Card>
   <Card title="Sacrifice" href="/rituals/sacrifice" icon="flame">
     Permanently delete. Refuses live sessions. Requires `--yes`.

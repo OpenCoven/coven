@@ -36,7 +36,6 @@ Coven exposes finished sessions as **comux JSON** — a stable record shape that
   <Tab title="CLI">
     ```bash
     coven sessions --json
-    coven sessions --json --id ses_01HQ...
     ```
   </Tab>
   <Tab title="Socket API">

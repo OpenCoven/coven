@@ -22,11 +22,11 @@ Excluded from the public app:
 
 ## Local Build
 
-Use the repo's working Node runtime. On this machine, prefer nvm Node if Homebrew Node is broken:
+Use any supported Node.js runtime on your machine:
 
 ```sh
-PATH=/Users/buns/.nvm/versions/node/v24.13.0/bin:$PATH npm install
-PATH=/Users/buns/.nvm/versions/node/v24.13.0/bin:$PATH npm run docs:check
+npm install
+npm run docs:check
 ```
 
 The build writes static output to `dist/docs-site/`.
