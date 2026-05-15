@@ -19,7 +19,6 @@ use crossterm::{
 use uuid::Uuid;
 
 mod api;
-mod chat;
 mod control_plane;
 mod daemon;
 mod harness;
@@ -148,7 +147,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         None => run_magical_tui(),
-        Some(Command::Chat) => chat::run_chat(),
+        Some(Command::Chat) => tui::chat::run_chat(),
         Some(Command::Tui) => run_magical_tui(),
         Some(Command::Doctor) => run_doctor(),
         Some(Command::Daemon { command }) => run_daemon_command(command),
