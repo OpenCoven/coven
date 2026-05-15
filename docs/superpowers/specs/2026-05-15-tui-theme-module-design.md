@@ -311,8 +311,8 @@ fn nearest_256_brand_tokens() {
     assert_eq!(nearest_256(brand::PURPLE_2),          99);
     assert_eq!(nearest_256(brand::PURPLE_1),          63);
     assert_eq!(nearest_256(brand::ACCENT_BLUE),       33);
-    assert_eq!(nearest_256(brand::DANGER),           196);
-    assert_eq!(nearest_256(brand::SUCCESS),           41);
+    assert_eq!(nearest_256(brand::DANGER),           203);
+    assert_eq!(nearest_256(brand::SUCCESS),           77);
     assert_eq!(nearest_256(Rgb {r:0,   g:0,   b:0  }),  16);
     assert_eq!(nearest_256(Rgb {r:255, g:255, b:255}), 231);
     assert_eq!(nearest_256(Rgb {r:128, g:128, b:128}), 244);
