@@ -170,6 +170,28 @@ fn nearest_256(c: Rgb) -> u8 {
     }
 }
 
+// ── ratatui adapters ──
+
+use ratatui::style::{Color as RatColor, Style as RatStyle};
+
+/// Convert an `Rgb` token to a ratatui `Color`, respecting the active `TerminalMode`.
+pub fn ratatui_color(c: Rgb) -> RatColor {
+    ratatui_color_with_mode(c, mode())
+}
+
+pub(crate) fn ratatui_color_with_mode(c: Rgb, m: TerminalMode) -> RatColor {
+    match m {
+        TerminalMode::TrueColor  => RatColor::Rgb(c.r, c.g, c.b),
+        TerminalMode::Indexed256 => RatColor::Indexed(nearest_256(c)),
+        TerminalMode::NoColor    => RatColor::Reset,
+    }
+}
+
+/// Sugar over `Style::default().fg(ratatui_color(c))` — the most common idiom.
+pub fn ratatui_style(c: Rgb) -> RatStyle {
+    RatStyle::default().fg(ratatui_color(c))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,5 +337,37 @@ mod tests {
         assert_eq!(nearest_256(Rgb { r: 255, g: 255, b: 255 }), 231);
         assert_eq!(nearest_256(Rgb { r: 128, g: 128, b: 128 }), 244);
         assert_eq!(nearest_256(Rgb { r: 248, g: 248, b: 248 }), 231);
+    }
+
+    #[test]
+    fn ratatui_color_with_mode_truecolor() {
+        use ratatui::style::Color;
+        assert_eq!(
+            ratatui_color_with_mode(brand::PURPLE_3, TerminalMode::TrueColor),
+            Color::Rgb(0xA7, 0x8B, 0xFF),
+        );
+    }
+    #[test]
+    fn ratatui_color_with_mode_indexed_256() {
+        use ratatui::style::Color;
+        assert_eq!(
+            ratatui_color_with_mode(brand::PURPLE_3, TerminalMode::Indexed256),
+            Color::Indexed(141),
+        );
+    }
+    #[test]
+    fn ratatui_color_with_mode_no_color() {
+        use ratatui::style::Color;
+        assert_eq!(
+            ratatui_color_with_mode(brand::PURPLE_3, TerminalMode::NoColor),
+            Color::Reset,
+        );
+    }
+    #[test]
+    fn ratatui_style_returns_style_with_fg() {
+        use ratatui::style::Style;
+        let s: Style = ratatui_style(brand::PURPLE_3);
+        let expected = Style::default().fg(ratatui_color(brand::PURPLE_3));
+        assert_eq!(s, expected);
     }
 }
