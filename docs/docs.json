@@ -93,7 +93,7 @@
   "navigation": {
     "languages": [
       {
-        "language": "English",
+        "language": "en",
         "tabs": [
           {
             "tab": "Start",
@@ -178,6 +178,62 @@
                 "pages": [
                   "PRODUCT-SPEC",
                   "reference/changelog"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "language": "es",
+        "tabs": [
+          {
+            "tab": "Runtime",
+            "groups": [
+              {
+                "group": "Arquitectura",
+                "pages": [
+                  "es/ARCHITECTURE"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "Referencia",
+            "groups": [
+              {
+                "group": "Proyecto",
+                "pages": [
+                  "es/reference/changelog",
+                  "es/reference/releasing"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "language": "ru",
+        "tabs": [
+          {
+            "tab": "Runtime",
+            "groups": [
+              {
+                "group": "Архитектура",
+                "pages": [
+                  "ru/ARCHITECTURE"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "Справочник",
+            "groups": [
+              {
+                "group": "Проект",
+                "pages": [
+                  "ru/reference/changelog",
+                  "ru/reference/releasing"
                 ]
               }
             ]
