@@ -7,7 +7,9 @@ mod render;
 
 // Re-export the public types so callers see them at `tui::chat::*` instead of
 // having to reach into `tui::chat::app::*`. Matches the surface of the old
-// `chat::*` module from before the carve-out.
+// `chat::*` module from before the carve-out. The allow is necessary because
+// no callsite outside this module imports these types today; they're kept
+// `pub` per spec AC8 ("preserve visibility") so future phases can consume them.
 #[allow(unused_imports)]
 pub use app::{AgentInfo, ChatMessage, MessageRole};
 

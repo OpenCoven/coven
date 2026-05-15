@@ -8,7 +8,7 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use ratatui::{Terminal, backend::CrosstermBackend};
 
-use super::app::{App, SlashCommandResult};
+use super::app::{App, InputMode, SlashCommandResult};
 use super::render::render_ui;
 
 pub(super) fn run_event_loop(
@@ -22,7 +22,6 @@ pub(super) fn run_event_loop(
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(key) => {
-                    use super::app::InputMode;
                     if app.input_mode == InputMode::AgentSelect {
                         match key.code {
                             KeyCode::Up if app.agent_select_index > 0 => {
