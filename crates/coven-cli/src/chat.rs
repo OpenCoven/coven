@@ -21,14 +21,11 @@ use ratatui::{
 
 use crate::harness;
 
-// ── OpenCoven palette (256-color) ──────────────────────────────────────────
+// ── Theme imports (palette lives in crate::theme) ──────────────────────────
 
-const PURPLE: Color = Color::Indexed(141); // #af87ff — signature purple
-const GOLD: Color = Color::Indexed(220); // #ffd700 — accent gold
-const MOON: Color = Color::Indexed(117); // #87d7ff — cool accent
-const DIM_FG: Color = Color::Indexed(243); // muted gray
-const SURFACE: Color = Color::Indexed(235); // dark surface
-const SURFACE_LIGHT: Color = Color::Indexed(237); // slightly lighter surface
+use crate::theme::{
+    self, AGENT_LABEL, DIM, HINT_KEY, PRIMARY, PRIMARY_STRONG, SURFACE, SURFACE_STRONG, USER_LABEL,
+};
 
 // ── Data types ─────────────────────────────────────────────────────────────
 
@@ -478,7 +475,7 @@ fn render_ui(f: &mut Frame, app: &mut App) {
 
     // Guard against impossibly small terminals
     if area.width < 10 || area.height < 5 {
-        let msg = Paragraph::new("Terminal too small").style(Style::default().fg(PURPLE));
+        let msg = Paragraph::new("Terminal too small").style(theme::ratatui_style(PRIMARY));
         f.render_widget(msg, area);
         return;
     }
@@ -517,18 +514,18 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let harness = app.active_agent_harness();
 
     let status_spans = vec![
-        Span::styled(" \u{2666} coven chat ", Style::default().fg(PURPLE).bold()),
-        Span::styled(" \u{2502} ", Style::default().fg(DIM_FG)),
+        Span::styled(" \u{2666} coven chat ", theme::ratatui_style(PRIMARY).bold()),
+        Span::styled(" \u{2502} ", theme::ratatui_style(DIM)),
         Span::styled(
             format!("\u{25C9} {agent_name}"),
-            Style::default().fg(GOLD).bold(),
+            theme::ratatui_style(AGENT_LABEL).bold(),
         ),
-        Span::styled(format!(" ({harness})"), Style::default().fg(DIM_FG)),
-        Span::styled(" \u{2502} ", Style::default().fg(DIM_FG)),
+        Span::styled(format!(" ({harness})"), theme::ratatui_style(DIM)),
+        Span::styled(" \u{2502} ", theme::ratatui_style(DIM)),
         if app.is_responding {
             Span::styled(
                 format!("{} responding...", SPINNER_FRAMES[app.spinner_frame]),
-                Style::default().fg(MOON),
+                theme::ratatui_style(DIM),
             )
         } else {
             Span::styled("\u{2713} ready", Style::default().fg(Color::Green))
@@ -536,7 +533,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     ];
 
     let status_line = Line::from(status_spans);
-    let status = Paragraph::new(status_line).style(Style::default().bg(SURFACE));
+    let status = Paragraph::new(status_line).style(Style::default().bg(theme::ratatui_color(SURFACE)));
     f.render_widget(status, area);
 }
 
@@ -558,9 +555,9 @@ fn render_messages(f: &mut Frame, app: &mut App, area: Rect) {
 
         // Sender header
         let (sender_style, prefix) = match msg.role {
-            MessageRole::User => (Style::default().fg(MOON).bold(), "\u{25B6} You"),
-            MessageRole::Agent => (Style::default().fg(GOLD).bold(), ""),
-            MessageRole::System => (Style::default().fg(PURPLE).italic(), "\u{2731} "),
+            MessageRole::User => (theme::ratatui_style(USER_LABEL).bold(), "\u{25B6} You"),
+            MessageRole::Agent => (theme::ratatui_style(AGENT_LABEL).bold(), ""),
+            MessageRole::System => (theme::ratatui_style(PRIMARY).italic(), "\u{2731} "),
         };
 
         let sender_text = match msg.role {
@@ -589,7 +586,7 @@ fn render_messages(f: &mut Frame, app: &mut App, area: Rect) {
                 let style = match msg.role {
                     MessageRole::User => Style::default().fg(Color::White),
                     MessageRole::Agent => Style::default().fg(Color::Indexed(252)),
-                    MessageRole::System => Style::default().fg(PURPLE),
+                    MessageRole::System => theme::ratatui_style(PRIMARY),
                 };
                 lines.push(Line::from(Span::styled(format!("  {wl}"), style)));
             }
@@ -631,7 +628,7 @@ fn render_messages(f: &mut Frame, app: &mut App, area: Rect) {
                 .track_symbol(Some("\u{2502}"))
                 .thumb_symbol("\u{2588}")
                 .track_style(Style::default().fg(Color::Indexed(236)))
-                .thumb_style(Style::default().fg(PURPLE)),
+                .thumb_style(theme::ratatui_style(PRIMARY)),
             area,
             &mut scrollbar_state,
         );
@@ -648,15 +645,15 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
     let input_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(if app.input.starts_with('/') {
-            PURPLE
+            theme::ratatui_color(PRIMARY)
         } else {
             Color::Indexed(240)
         }))
         .title(Span::styled(
             format!(" {prompt_label} "),
-            Style::default().fg(PURPLE).bold(),
+            theme::ratatui_style(PRIMARY).bold(),
         ))
-        .style(Style::default().bg(SURFACE));
+        .style(Style::default().bg(theme::ratatui_color(SURFACE)));
 
     let input_widget = Paragraph::new(app.input.as_str())
         .block(input_block)
@@ -677,28 +674,28 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
 fn render_hint_bar(f: &mut Frame, app: &App, area: Rect) {
     let hints = if app.input_mode == InputMode::AgentSelect {
         vec![
-            Span::styled(" \u{2191}\u{2193}", Style::default().fg(GOLD)),
-            Span::styled(" navigate  ", Style::default().fg(DIM_FG)),
-            Span::styled("Enter", Style::default().fg(GOLD)),
-            Span::styled(" select  ", Style::default().fg(DIM_FG)),
-            Span::styled("Esc", Style::default().fg(GOLD)),
-            Span::styled(" cancel", Style::default().fg(DIM_FG)),
+            Span::styled(" \u{2191}\u{2193}", theme::ratatui_style(HINT_KEY).bold()),
+            Span::styled(" navigate  ", theme::ratatui_style(DIM)),
+            Span::styled("Enter", theme::ratatui_style(HINT_KEY).bold()),
+            Span::styled(" select  ", theme::ratatui_style(DIM)),
+            Span::styled("Esc", theme::ratatui_style(HINT_KEY).bold()),
+            Span::styled(" cancel", theme::ratatui_style(DIM)),
         ]
     } else {
         vec![
-            Span::styled(" /help", Style::default().fg(GOLD)),
-            Span::styled(" commands  ", Style::default().fg(DIM_FG)),
-            Span::styled("/agent", Style::default().fg(GOLD)),
-            Span::styled(" switch  ", Style::default().fg(DIM_FG)),
-            Span::styled("Ctrl+C", Style::default().fg(GOLD)),
-            Span::styled(" quit  ", Style::default().fg(DIM_FG)),
-            Span::styled("PgUp/PgDn", Style::default().fg(GOLD)),
-            Span::styled(" scroll", Style::default().fg(DIM_FG)),
+            Span::styled(" /help", theme::ratatui_style(HINT_KEY).bold()),
+            Span::styled(" commands  ", theme::ratatui_style(DIM)),
+            Span::styled("/agent", theme::ratatui_style(HINT_KEY).bold()),
+            Span::styled(" switch  ", theme::ratatui_style(DIM)),
+            Span::styled("Ctrl+C", theme::ratatui_style(HINT_KEY).bold()),
+            Span::styled(" quit  ", theme::ratatui_style(DIM)),
+            Span::styled("PgUp/PgDn", theme::ratatui_style(HINT_KEY).bold()),
+            Span::styled(" scroll", theme::ratatui_style(DIM)),
         ]
     };
 
     let hint_line =
-        Paragraph::new(Line::from(hints)).style(Style::default().bg(SURFACE).fg(DIM_FG));
+        Paragraph::new(Line::from(hints)).style(Style::default().bg(theme::ratatui_color(SURFACE)).fg(theme::ratatui_color(DIM)));
     f.render_widget(hint_line, area);
 }
 
@@ -753,11 +750,11 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
     for (section, commands) in &help_items {
         lines.push(Line::from(Span::styled(
             format!("  {section}"),
-            Style::default().fg(GOLD).bold(),
+            theme::ratatui_style(PRIMARY_STRONG).bold(),
         )));
         for (cmd, desc) in commands {
             lines.push(Line::from(vec![
-                Span::styled(format!("    {cmd:<22}"), Style::default().fg(PURPLE)),
+                Span::styled(format!("    {cmd:<22}"), theme::ratatui_style(PRIMARY)),
                 Span::styled(*desc, Style::default().fg(Color::White)),
             ]));
         }
@@ -767,12 +764,12 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
     let help_block = Block::default()
         .title(Span::styled(
             " \u{2731} Coven Commands ",
-            Style::default().fg(PURPLE).bold(),
+            theme::ratatui_style(PRIMARY).bold(),
         ))
         .title_alignment(Alignment::Center)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(PURPLE))
-        .style(Style::default().bg(SURFACE));
+        .border_style(theme::ratatui_style(PRIMARY))
+        .style(Style::default().bg(theme::ratatui_color(SURFACE)));
 
     let help_widget = Paragraph::new(Text::from(lines))
         .block(help_block)
@@ -806,9 +803,9 @@ fn render_agent_select(f: &mut Frame, app: &App, area: Rect) {
             };
 
             let style = if is_selected {
-                Style::default().fg(GOLD).bold().bg(SURFACE_LIGHT)
+                theme::ratatui_style(PRIMARY_STRONG).bold().bg(theme::ratatui_color(SURFACE_STRONG))
             } else if !agent.available {
-                Style::default().fg(DIM_FG)
+                theme::ratatui_style(DIM)
             } else {
                 Style::default().fg(Color::White)
             };
@@ -818,7 +815,7 @@ fn render_agent_select(f: &mut Frame, app: &App, area: Rect) {
                 Span::styled(&agent.label, style),
                 Span::styled(
                     format!(" ({}){availability}", agent.harness),
-                    Style::default().fg(DIM_FG),
+                    theme::ratatui_style(DIM),
                 ),
             ]))
         })
@@ -827,12 +824,12 @@ fn render_agent_select(f: &mut Frame, app: &App, area: Rect) {
     let agent_block = Block::default()
         .title(Span::styled(
             " \u{2736} Select Agent ",
-            Style::default().fg(GOLD).bold(),
+            theme::ratatui_style(PRIMARY_STRONG).bold(),
         ))
         .title_alignment(Alignment::Center)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(GOLD))
-        .style(Style::default().bg(SURFACE));
+        .border_style(theme::ratatui_style(PRIMARY_STRONG))
+        .style(Style::default().bg(theme::ratatui_color(SURFACE)));
 
     let list = List::new(items).block(agent_block);
     f.render_widget(list, popup_area);
