@@ -11,7 +11,8 @@ use clap::{Parser, Subcommand};
 use crossterm::{
     cursor::MoveTo,
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
@@ -394,6 +395,9 @@ fn run_magical_tui() -> Result<()> {
         io::stdout().flush().context("failed to flush Coven menu")?;
 
         if let Event::Key(key) = event::read().context("failed to read Coven menu input")? {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
             match key.code {
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     break Ok(MagicalTuiRequest::Action(MagicalTuiAction::Quit));
@@ -676,7 +680,7 @@ fn run_session_browser(include_archived: bool) -> Result<()> {
             .context("failed to flush Coven session browser")?;
 
         match event::read().context("failed to read session browser input")? {
-            Event::Key(key) => match key.code {
+            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                 KeyCode::Up | KeyCode::Char('k') => {
                     selected_session = move_session_browser_selection(
                         selected_session,
