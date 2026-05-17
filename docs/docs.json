@@ -190,6 +190,17 @@
         "language": "es",
         "tabs": [
           {
+            "tab": "Inicio",
+            "groups": [
+              {
+                "group": "Resumen",
+                "pages": [
+                  "es/install/windows"
+                ]
+              }
+            ]
+          },
+          {
             "tab": "Runtime",
             "groups": [
               {
@@ -217,6 +228,17 @@
       {
         "language": "ru",
         "tabs": [
+          {
+            "tab": "Старт",
+            "groups": [
+              {
+                "group": "Обзор",
+                "pages": [
+                  "ru/install/windows"
+                ]
+              }
+            ]
+          },
           {
             "tab": "Runtime",
             "groups": [
