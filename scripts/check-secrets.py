@@ -26,7 +26,6 @@ OPENCOVEN_GITHUB_URL = re.compile(r"https://github\.com/OpenCoven/coven/(?:blob|
 OPENCOVEN_LOCAL_WORKTREE = re.compile(
     r"/Users/[A-Za-z0-9_.-]+/Documents/GitHub/OpenCoven/coven/\.worktrees/[A-Za-z0-9_.-]+"
 )
-GITHUB_ADVISORY_URL = re.compile(r"https://github\.com/advisories/GHSA-[A-Za-z0-9-]+")
 SECRET_RULES: list[tuple[str, re.Pattern[str]]] = [
     ("private_key", re.compile(r"-----BEGIN (?:RSA |DSA |EC |OPENSSH |PGP )?PRIVATE KEY-----")),
     ("aws_access_key", re.compile(r"AKIA[0-9A-Z]{16}")),
@@ -114,7 +113,6 @@ def scan_text(text: str, path: str) -> list[tuple[str, int, str]]:
         if (
             OPENCOVEN_GITHUB_URL.search(line)
             or OPENCOVEN_LOCAL_WORKTREE.search(line)
-            or GITHUB_ADVISORY_URL.search(line)
         ):
             continue
         if is_known_safe_lockfile_line(path, line):
