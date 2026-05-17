@@ -3,7 +3,7 @@ title: "Coven local API contract (coven.daemon.v1)"
 description: "The versioned coven.daemon.v1 contract under /api/v1: health negotiation, capability discovery, error envelopes, and additive compatibility rules."
 ---
 
-# Coven Local API Contract
+# Coven local API contract
 
 The Coven daemon socket API is a public compatibility boundary for comux and external clients such as `@opencoven/coven`.
 

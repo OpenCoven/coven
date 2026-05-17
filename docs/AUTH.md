@@ -3,7 +3,7 @@ title: "Authentication and local access"
 description: "Coven uses a same-user local Unix socket access model rather than OAuth or API keys. Learn what protects /api/v1 and what remote access requires."
 ---
 
-# Authentication and Local Access
+# Authentication and local access
 
 _Last updated: 2026-05-14_
 
@@ -45,7 +45,7 @@ flowchart LR
 
 The boundary is filesystem permissions plus same-user process locality. Anything outside the dashed zone is rejected by design; introducing a remote, browser, or cross-user surface requires a separate auth design (not a tunnel of the existing socket).
 
-## What Protects The API Today
+## What protects the API today
 
 ### Unix socket locality
 
@@ -96,7 +96,7 @@ The plugin is disabled by default and must be explicitly selected as the ACP bac
 
 These client-side checks improve defense in depth. They do not replace Rust daemon enforcement.
 
-## What This Is Not
+## What this is not
 
 The current auth solution is not:
 
@@ -114,7 +114,7 @@ The current auth solution is not:
 
 If a future dashboard, mobile app, remote bridge, or browser-exposed service needs to talk to Coven, it needs an explicit additional auth and pairing design. Do not tunnel or proxy the raw daemon socket into a network service and call that authenticated.
 
-## Current Hardening Gap
+## Current hardening gap
 
 The TypeScript OpenClaw plugin client already performs strict socket trust-anchor validation.
 
@@ -129,7 +129,7 @@ Before broad distribution, Rust should fail closed when:
 - an existing socket path is a symlink or non-socket file; or
 - socket creation or cleanup would cross the trusted state directory boundary.
 
-## Requirements For New Clients
+## Requirements for new clients
 
 New Coven clients must:
 

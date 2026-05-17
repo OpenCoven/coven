@@ -3,7 +3,7 @@ title: "Client integration guide"
 description: "How comux, OpenMeow, OpenClaw, and other clients should talk to the Coven daemon socket API without duplicating runtime policy or authority."
 ---
 
-# Client Integration Guide
+# Client integration guide
 
 Coven is a runtime substrate. Clients should present, route, and observe work without taking over the authority boundary.
 
