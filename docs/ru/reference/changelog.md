@@ -1,6 +1,6 @@
 ---
 summary: "Заметки о выпусках среды выполнения, CLI и локального API Coven."
-description: "Еженедельные release notes для Coven, охватывающие новые возможности, исправления и несовместимые изменения в среде выполнения, CLI, TUI и socket API локального демона."
+description: "Еженедельные release notes Coven с новыми возможностями, исправлениями и несовместимыми изменениями среды выполнения, CLI, TUI и локального socket API."
 read_when:
   - Looking up what changed
 title: "Changelog и release notes Coven"
