@@ -3,6 +3,7 @@ summary: "What coven doctor checks and how to read its output."
 read_when:
   - Diagnosing a fresh install or a broken environment
 title: "Doctor"
+description: "Run coven doctor first after install. It reports COVEN_HOME writability, socket bind, harness CLIs on PATH, and SQLite store health."
 ---
 
 `coven doctor` is the first command to run after install. It reports:

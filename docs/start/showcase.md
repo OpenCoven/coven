@@ -3,6 +3,7 @@ summary: "Highlights of what Coven can do today and where it is heading."
 read_when:
   - Browsing for a one-page overview of Coven's value
 title: "Showcase"
+description: "Showcase landing for Coven: a local-first runtime that supervises every coding-agent harness inside explicit project roots with auditable rituals."
 ---
 
 <div class="showcase-hero">

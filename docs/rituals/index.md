@@ -4,6 +4,7 @@ read_when:
   - Cleaning up the active session list
   - Explaining destructive operations to a new user
 title: "Rituals"
+description: "Rituals are Coven's human-friendly session-management verbs: summon, attach, archive, sacrifice. Product language with precise, conservative safety behavior."
 ---
 
 Rituals are Coven's human-friendly session-management verbs. Ritual names are product language. The safety behavior underneath them stays precise and conservative.

@@ -4,6 +4,7 @@ read_when:
   - Looking up a Coven term
   - Onboarding a contributor or stakeholder
 title: "Glossary"
+description: "Glossary of Coven and OpenCoven terms: ACP, coven.daemon.v1, harness, adapter, familiar, ritual, project root, archive, sacrifice, and capability."
 ---
 
 ## ACP

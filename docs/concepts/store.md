@@ -3,6 +3,7 @@ summary: "Coven's local SQLite database: session ledger plus append-only event l
 read_when:
   - Inspecting Coven state on disk or recovering after a crash
 title: "Store"
+description: "The Coven store lives under COVEN_HOME and holds two tables: a sessions ledger and an append-only events log for every harness PTY run on the host."
 ---
 
 The store lives under `$COVEN_HOME` and holds two logical tables:

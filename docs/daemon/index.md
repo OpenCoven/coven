@@ -4,6 +4,7 @@ read_when:
   - Operating Coven on a workstation or server
   - Auditing what Coven validates vs. trusts from clients
 title: "Daemon"
+description: "Overview of the Coven daemon: a single Rust process per host that owns PTY lifecycle, the SQLite session ledger, the event log, and the local socket API."
 ---
 
 The Coven daemon is a single Rust process per host. It owns:

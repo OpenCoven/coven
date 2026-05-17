@@ -3,6 +3,7 @@ summary: "Install Coven, run doctor, start the daemon, and launch your first har
 read_when:
   - First time setting up Coven on a workstation
 title: "Getting started"
+description: "Install Coven, run coven doctor, and launch your first Codex or Claude Code harness session in about five minutes from one local Rust daemon."
 ---
 
 Install Coven, run `coven doctor`, and launch your first harness session in about five minutes. By the end you will have a running daemon, a project-rooted session record, and a working PTY attached to Codex or Claude Code.

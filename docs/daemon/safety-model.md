@@ -4,6 +4,7 @@ read_when:
   - Auditing Coven before adding a new client or remote bridge
   - Writing a security review for an integration
 title: "Safety model"
+description: "Four invariants of the Coven safety model: daemon as sole authority, same-user local socket trust, no stored credentials, and explicit destructive rituals."
 ---
 
 Coven's safety model rests on four invariants:

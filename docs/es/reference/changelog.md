@@ -6,11 +6,38 @@ read_when:
 title: "Changelog y notas de release de Coven"
 ---
 
+## Semana del 17 de mayo de 2026
+
+### Correcciones de errores
+
+- **La TUI ya no se cae en terminales pequeñas.** Tanto `coven tui` como `coven chat` ahora protegen sus cálculos de layout frente a tamaños de terminal muy pequeños, de modo que redimensionar a una ventana estrecha o baja ya no provoca el cierre de la sesión. Consulta [Coven TUI](/start/coven-tui).
+
+### Seguridad
+
+- **Aviso de seguridad de Ratatui resuelto.** Se actualizó la pila de renderizado de Ratatui para incorporar la versión parcheada del crate `lru`, resolviendo el aviso [GHSA-rhfx-m35p-ff5j](https://github.com/advisories/GHSA-rhfx-m35p-ff5j). No se requiere ninguna acción: basta con instalar la última versión.
+
 ## Semana del 15 de mayo de 2026
 
 ### Actualizaciones
 
 - **Tema TUI alineado con la marca.** Tanto `coven tui` como `coven chat` ahora comparten una paleta unificada y alineada con la marca, con tokens semánticos consistentes para los estilos primary, agent, user, hint, surface y dim. Los colores se adaptan a tu terminal automáticamente: truecolor en terminales de 24 bits, 256 colores en terminales legacy, y sin color cuando la salida está canalizada o `NO_COLOR` está configurado. Consulta [Variables de entorno](/help/environment).
+
+## Cómo leer este changelog
+
+```mermaid
+flowchart LR
+  Week["Entrada semanal\n(YYYY-MM-DD)"] --> New["### Nuevas funcionalidades"]
+  Week --> Upd["### Actualizaciones"]
+  Week --> Fix["### Correcciones de errores"]
+  Week --> Sec["### Seguridad (cuando aplique)"]
+
+  New --> Links["Cada elemento enlaza al documento canónico o al PR"]
+  Upd --> Links
+  Fix --> Links
+  Sec --> Links
+```
+
+Las entradas son semanales, primero las más recientes. Los elementos dentro de cada semana se agrupan por categoría. Cualquier cambio que afecte a la API pública (superficie de la CLI, rutas del socket, formas de respuesta) también aparece en [Contrato de la API](/API-CONTRACT) — el changelog es un puntero, no un sustituto.
 
 ## Semana del 11 de mayo de 2026
 

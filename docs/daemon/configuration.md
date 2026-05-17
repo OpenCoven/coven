@@ -4,6 +4,7 @@ read_when:
   - Configuring a Coven install
   - Relocating COVEN_HOME
 title: "Configuration"
+description: "Daemon configuration surface for Coven: COVEN_HOME, socket location, log paths, and the minimal knobs the Rust process reads on start and restart."
 ---
 
 Coven's current daemon configuration surface is intentionally small.

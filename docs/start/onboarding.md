@@ -3,6 +3,7 @@ summary: "Guided first run, project selection, harness verification, and ritual 
 read_when:
   - Walking a teammate through their first Coven setup
 title: "Onboarding"
+description: "The coven onboarding flow: confirm COVEN_HOME, run doctor, validate a project root, pick a harness, and launch your first supervised session."
 ---
 
 `coven` opens the interactive menu by default. The onboarding flow:

@@ -3,7 +3,7 @@ title: "Coven product spec"
 description: "The Coven product thesis, MVP scope, harness direction, CLI/TUI surface, daemon API, and OpenClaw integration plan for the local agent runtime."
 ---
 
-# Coven Product Spec
+# Coven product spec
 
 ## Product thesis
 

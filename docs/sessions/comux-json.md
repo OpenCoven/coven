@@ -4,6 +4,7 @@ read_when:
   - Building a client that replays Coven sessions
   - Designing the comux demo loop
 title: "comux JSON sessions"
+description: "Coven exposes finished sessions as stable comux JSON records so comux, OpenMeow, and external clients can replay history without the live PTY."
 ---
 
 Coven exposes finished sessions as **comux JSON** — a stable record shape that comux, OpenMeow, and external clients can replay without depending on the live PTY.

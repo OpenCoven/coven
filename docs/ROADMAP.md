@@ -3,7 +3,7 @@ title: "OpenCoven public roadmap"
 description: "The OpenCoven public roadmap for Coven, comux, and OpenClaw integrations, with shipped, now, next, and later slices for the local agent runtime."
 ---
 
-# OpenCoven Public Roadmap
+# OpenCoven public roadmap
 
 _Last updated: 2026-05-09_
 
@@ -237,7 +237,7 @@ Status: **next/lab**
 - [ ] comux shows the session for review
 - [ ] user explicitly merges, PRs, archives, or deletes work
 
-### Milestone F — Multi-Harness Orchestration (Phase 1-4)
+### Milestone F — Multi-harness orchestration (Phase 1-4)
 
 Status: **planned, TBD start**
 

@@ -4,6 +4,7 @@ read_when:
   - Understanding how Coven, comux, and clients fit together
   - Auditing trust boundaries before adding a new client
 title: "Architecture"
+description: "Conceptual map of Coven: the Rust daemon as authority, the CLI, TUI, comux, and OpenClaw clients, and the versioned local socket API contract that joins them."
 ---
 
 Coven is a local-first harness substrate. The Rust CLI/daemon is the authority layer; clients such as the CLI TUI, comux, and the optional OpenClaw plugin are presentation/integration layers.

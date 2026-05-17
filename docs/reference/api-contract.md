@@ -4,6 +4,7 @@ read_when:
   - Pinning a client to a Coven contract
   - Auditing whether a daemon upgrade is safe
 title: "API contract"
+description: "Reference for the coven.daemon.v1 local API contract: how Coven adds fields and endpoints safely and when breaking changes require a new contract version."
 ---
 
 Coven's local API is versioned as a **named contract**. The current value is `coven.daemon.v1`.

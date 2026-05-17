@@ -3,9 +3,9 @@ title: "Coven operational model"
 description: "How the Coven Rust daemon stays the authority boundary for project roots, PTY launch, sessions, events, and policy across all local clients."
 ---
 
-# Coven Operational Model
+# Coven operational model
 
-## Core Boundary
+## Core boundary
 
 Coven's Rust layer is the local authority boundary. It owns process launch, project-root validation, PTY lifecycle, daemon state, session/event persistence, and the local socket API.
 
@@ -31,7 +31,7 @@ OpenClaw core does not include OpenCoven or Coven. The OpenClaw integration live
 
 The current auth posture is documented in [Authentication and local access](/AUTH). Coven uses a same-user local Unix-socket access model today. It does not provide OAuth, JWT, bearer-token, API-key, cookie, RBAC, or remote network auth for the daemon API.
 
-## Trust Rules
+## Trust rules
 
 - Treat every socket client as untrusted, including first-party clients.
 - Never launch work without an explicit project root.
@@ -43,7 +43,7 @@ The current auth posture is documented in [Authentication and local access](/AUT
 - Do not store repository secrets, environment dumps, private URLs, or tokens in event logs intentionally.
 - Do not let OpenClaw, comux, or npm package configuration widen Rust launch authority.
 
-## Rust Responsibilities
+## Rust responsibilities
 
 The Rust CLI/daemon should stay narrow and boring:
 
@@ -69,7 +69,7 @@ The local API should remain stable and intentionally small. The current public c
 
 Legacy unversioned routes remain as early-MVP aliases, but external clients should treat `v1` as the compatibility boundary.
 
-## Client Responsibilities
+## Client responsibilities
 
 ### comux
 
@@ -90,11 +90,11 @@ The plugin:
 
 OpenClaw remains responsible for chat/session routing, ACP bindings, task state, permissions UX, and user-facing delivery. Coven remains responsible for local harness supervision.
 
-### npm CLI Wrapper
+### npm CLI wrapper
 
 The npm wrapper should only resolve and execute the native `coven` binary. It should not implement launch policy, path policy, or socket trust decisions that Rust does not also enforce.
 
-## Compatibility Policy
+## Compatibility policy
 
 Externalization makes the socket API a product contract. Add compatibility protections before broad distribution:
 
@@ -107,7 +107,7 @@ Externalization makes the socket API a product contract. Add compatibility prote
 - add plugin tests against representative daemon responses;
 - document breaking API changes in the Coven repo before updating the plugin.
 
-## Hardening Priorities
+## Hardening priorities
 
 1. Enforce private `COVEN_HOME` ownership and permissions in Rust before creating, binding, or removing daemon state.
 2. Add daemon request limits for request line length, header bytes, `Content-Length`, body bytes, and read duration.
@@ -117,7 +117,7 @@ Externalization makes the socket API a product contract. Add compatibility prote
 6. Add release gates for Rust dependency audit, npm/package dry runs, and plugin compatibility tests.
 7. Keep generic/custom command adapters out of v0 until policy and approval behavior are explicit.
 
-## Release Split
+## Release split
 
 Coven repo release gates:
 

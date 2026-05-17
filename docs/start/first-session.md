@@ -3,6 +3,7 @@ summary: "A guided walkthrough of running, attaching, and archiving one session.
 read_when:
   - You have Coven installed and want a concrete walkthrough
 title: "Your first session"
+description: "Walkthrough: launch your first Codex session in Coven, attach to it, watch it complete, and archive the result through the rituals surface."
 ---
 
 This walkthrough launches a Codex session, attaches to it, watches it complete, and archives the result.

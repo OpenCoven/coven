@@ -3,6 +3,7 @@ summary: "Capability discovery and action routing for clients that don't want to
 read_when:
   - Adding a new client that integrates with Coven
 title: "Control plane"
+description: "Coven's control plane lets clients discover capabilities and send typed action intents instead of poking brittle OS automation APIs directly."
 ---
 
 The control plane sits in front of adapters. It lets clients:

@@ -4,6 +4,7 @@ read_when:
   - Starting a troubleshooting session
   - Filing a Coven issue
 title: "Help"
+description: "Help index for Coven: troubleshooting, environment and paths, permissions, harness issues, stuck sessions, diagnostics bundles, and community channels."
 ---
 
 <Columns>
