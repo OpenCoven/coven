@@ -10,6 +10,7 @@ title: "Changelog y notas de release de Coven"
 
 ### Correcciones de errores
 
+- **Pulsaciones dobles corregidas en la TUI de Windows.** `coven tui` y el navegador de sesiones ahora solo reaccionan a eventos de pulsación de tecla en Windows, eliminando el bug de entrada duplicada en el que escribir `a` producía `aa`, las flechas saltaban dos filas y Enter se activaba dos veces. Consulta [Coven TUI](/start/coven-tui) e [Instalación en Windows](/install/windows).
 - **La TUI ya no se cae en terminales pequeñas.** Tanto `coven tui` como `coven chat` ahora protegen sus cálculos de layout frente a tamaños de terminal muy pequeños, de modo que redimensionar a una ventana estrecha o baja ya no provoca el cierre de la sesión. Consulta [Coven TUI](/start/coven-tui).
 
 ### Seguridad

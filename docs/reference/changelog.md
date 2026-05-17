@@ -10,6 +10,7 @@ title: "Coven changelog and release notes"
 
 ### Bug fixes
 
+- **Double keystrokes fixed on Windows TUI.** `coven tui` and the session browser now only react to key-press events on Windows, eliminating the duplicate input bug where typing `a` produced `aa`, arrow keys jumped two rows, and Enter activated twice. See [Coven TUI](/start/coven-tui) and [Windows install](/install/windows).
 - **TUI no longer panics on small terminals.** Both `coven tui` and `coven chat` now guard their layout math against very small terminal sizes, so resizing to a narrow or short window will no longer crash the session. See [Coven TUI](/start/coven-tui).
 
 ### Security
