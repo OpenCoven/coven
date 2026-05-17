@@ -11,7 +11,7 @@ title: "Changelog y notas de release de Coven"
 ### Correcciones de errores
 
 - **La TUI ya no se cae en terminales pequeñas.** Tanto `coven tui` como `coven chat` ahora protegen sus cálculos de layout frente a tamaños de terminal muy pequeños, de modo que redimensionar a una ventana estrecha o baja ya no provoca el cierre de la sesión. Consulta [Coven TUI](/start/coven-tui).
-- **Se acabaron las pulsaciones dobles en la TUI de Windows.** El menú de la TUI de Coven y el navegador de sesiones ahora filtran únicamente los eventos `Press`, de modo que al escribir `a` ya no se inserta `aa`, las flechas avanzan una fila por pulsación y Enter activa la selección una sola vez. No hay cambios de comportamiento en macOS ni en Linux. Consulta [Coven TUI](/start/coven-tui).
+- **Se acabaron las pulsaciones dobles en la TUI de Windows.** El menú de la TUI de Coven y el navegador de sesiones ahora filtran únicamente los eventos `Press`. Al escribir `a` ya no se inserta `aa`, las flechas avanzan una fila por pulsación y Enter activa la selección una sola vez. No hay cambios de comportamiento en macOS ni en Linux. Consulta [Coven TUI](/start/coven-tui).
 
 ### Seguridad
 
