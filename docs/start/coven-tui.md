@@ -137,9 +137,6 @@ coven attach <session-id>
 
 These verbs produce stable, scriptable output and are the same ones the TUI ultimately routes to.
 
-> **Image asset prompt (to be generated and dropped into `docs/images/coven-tui-hero.png`):** Render a 1920×1080 hero screenshot of the Coven TUI on a dark OpenCoven-themed terminal (`#1A1825` background, `#9A8ECD` accent). Frame: top header `coven · interactive` with OpenCoven mark, middle pane shows two example sessions (`session-1 · codex · running · "Fix failing tests"` and `session-2 · claude · completed · "Polish help text"`), bottom shows the prompt input bar with `>` cursor and the text `/run codex "describe this repo"`. Sidebar lists ritual shortcuts: `r Rejoin · v View Log · s Summon · a Archive · x Sacrifice`. Use `Fragment Mono` throughout.
-
-> **Image asset prompt (to be generated and dropped into `docs/images/coven-tui-ritual-menu.png`):** Render a 1600×900 close-up of the ritual menu overlay. Selected session header reads `session-2 · claude · archived · "Polish help text"`. Below, four cards in a vertical list: **View Log**, **Summon**, **Archive** (greyed/hidden), **Sacrifice**. The **Summon** card is highlighted with the OpenCoven accent (`#D4B5FF`). Caption strip at the bottom reads `Enter to confirm · Esc to cancel`.
 
 ## Related
 

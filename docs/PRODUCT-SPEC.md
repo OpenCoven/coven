@@ -130,4 +130,3 @@ Use these exact public handles/links when Coven docs or package metadata mention
 - Discord: `discord.gg/opencoven`
 - X / Twitter: `@OpenCvn`
 
-> **Image asset prompt (to be generated and dropped into `docs/images/product-spec-stack.svg`):** Vector stack diagram 1200×900, dark OpenCoven background (`#1A1825`). Four horizontal layers, bottom to top: **Local OS** (slate), **Coven daemon (Rust)** (`#9A8ECD`), **Socket API /api/v1** (`#C5BDED`), **Clients** (`#D4B5FF`) split into CLI/TUI, comux, OpenMeow, OpenClaw plugin. Above the clients, an "Intent capture → Visible work → Review/merge" arrow. To the side of the Coven daemon layer, two icons labelled "Codex PTY" and "Claude PTY" with dashed arrows pointing to their respective provider clouds outside the local boundary.

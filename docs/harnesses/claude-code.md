@@ -90,7 +90,6 @@ sequenceDiagram
 
 Claude Code's tool calls run inside the Claude process — Coven does not arbitrate them. The PTY captures their output as ordinary stdout/stderr.
 
-> **Image asset prompt (to be generated and dropped into `docs/images/harnesses-claude-launch.png`):** Render a 1600×900 split-screen mockup. Left half: a terminal showing `coven run claude "refactor for clarity"` and a live Claude attach stream. Right half: the Coven TUI session browser highlighting `claude · running · "Web refactor" · session-2` in the OpenCoven accent. Background `#1A1825`, primary `#9A8ECD`.
 
 ## Related
 

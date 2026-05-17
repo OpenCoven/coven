@@ -199,6 +199,4 @@ coven daemon restart
   </Card>
 </Columns>
 
-> **Image asset prompt (to be generated and dropped into `docs/images/index-hero.png`):** Render a 2400×1200 hero illustration on the OpenCoven dark palette. Centered: the OpenCoven mark (`/assets/opencoven-mark.svg`) at large size, lavender-grey (`#9A8ECD`). Around it, six small orbiting icons connected by faint lavender lines: `coven CLI`, `daemon`, `Codex PTY`, `Claude PTY`, `event log`, `socket /api/v1`. Subtle constellation aesthetic, no other text. Format: PNG with transparent background.
 
-> **Image asset prompt (to be generated and dropped into `docs/images/index-session-browser.png`):** Render a 1920×1080 illustrative screenshot of the Coven session browser: a vertical list of three sessions on a dark `#1A1825` background, alternating row tints with `#3D3547`. Rows: `session-1 · codex · running · "Fix the failing tests"`, `session-2 · claude · completed · "Polish help text"`, `session-3 · codex · archived · "Update README"`. The first row highlighted with the OpenCoven accent (`#D4B5FF`). Right side shows the ritual menu: Rejoin, View Log, Summon, Archive, Sacrifice. Use `Fragment Mono`.
