@@ -3,7 +3,7 @@ summary: "Coven is a local-first runtime substrate for persistent AI familiars. 
 read_when:
   - Introducing OpenCoven and Coven to newcomers
   - Choosing whether to install Coven for local agent work
-title: "Coven"
+title: "Coven: local-first runtime for coding-agent sessions"
 description: "Coven is a local-first runtime that supervises coding-agent CLIs in project-scoped sessions with append-only events and a local socket API."
 ---
 
