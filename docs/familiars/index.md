@@ -4,6 +4,7 @@ read_when:
   - Introducing OpenCoven's product layer to a stakeholder
   - Deciding whether to design a familiar or just run a harness
 title: "Familiars"
+description: "Familiars are OpenCoven's product layer above the Coven runtime: persistent named agents with memory, tools, identity, roles, and continuity."
 ---
 
 **Familiars** are OpenCoven's product layer above the Coven runtime: persistent named agents with memory, tools, identity, roles, and continuity. A familiar is not a faceless bot. It has a name, a purpose, a memory, a toolset, a voice, a role, and a place in a larger workflow.

@@ -1,6 +1,6 @@
 ---
 title: "Arquitectura del runtime de Coven"
-description: "Cómo se componen el daemon en Rust, la CLI, la TUI, el cockpit comux y el plugin OpenClaw de Coven alrededor de la API por socket local, los adaptadores PTY y el almacén de eventos."
+description: "Cómo el daemon Rust, la CLI, la TUI, el cockpit comux y el plugin OpenClaw se componen alrededor de la API por socket local y los adaptadores PTY."
 ---
 
 # Arquitectura de Coven

@@ -3,6 +3,7 @@ summary: "The shortest copy-pasteable path to a live Coven session."
 read_when:
   - You already know what Coven is and want commands
 title: "Quickstart"
+description: "Quickstart for Coven: install @opencoven/cli, run doctor, start the daemon, and summon your first Codex or Claude Code harness in a project root."
 ---
 
 ```bash

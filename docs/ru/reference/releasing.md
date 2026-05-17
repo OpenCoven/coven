@@ -3,6 +3,7 @@ summary: "Поток релизов для @opencoven/cli и пакетов пл
 read_when:
   - Cutting a release
 title: "Выпуск релизов"
+description: "Runbook для публикации Coven в npm: preflight, dry-run, нативные платформенные пакеты и postflight-проверки из workflow GitHub Actions."
 ---
 
 Coven публикует npm-wrapper и нативные платформенные пакеты из workflow GitHub Actions **Release npm packages**. Версии исходных пакетов остаются `0.0.0`; версия dispatch'а workflow — это публикуемая npm-версия.

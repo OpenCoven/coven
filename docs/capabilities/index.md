@@ -4,6 +4,7 @@ read_when:
   - Building a client that adapts to what Coven can do
   - Adding a new capability to Coven
 title: "Capabilities"
+description: "Capabilities are the discoverable feature set of the Coven daemon. Clients query GET /api/v1/capabilities before using sessions, events, or actions."
 ---
 
 A **capability** is a discoverable feature of the Coven daemon or one of its adapters. Clients call `GET /api/v1/capabilities` to find out what is available before they call anything else.

@@ -3,6 +3,7 @@ summary: "What Coven can do today — harnesses, sessions, rituals, capabilities
 read_when:
   - Comparing Coven's surface against another runtime
 title: "Features"
+description: "Feature reference for the Coven runtime: project-rooted launches, harness-neutral PTYs, append-only events, rituals, capability discovery, and action routing."
 ---
 
 <Columns>

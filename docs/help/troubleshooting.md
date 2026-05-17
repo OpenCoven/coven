@@ -3,6 +3,7 @@ summary: "Common setup, daemon, harness, session, and API problems and their fix
 read_when:
   - Diagnosing a broken Coven setup
 title: "Troubleshooting"
+description: "Common Coven problems and fixes: install hiccups, daemon and socket failures, harness errors, stuck sessions, and local socket API issues."
 ---
 
 Start with `coven doctor`. Everything below assumes you have already done that.

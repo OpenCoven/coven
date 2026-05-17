@@ -1,6 +1,6 @@
 ---
 summary: "Notas por release del runtime, la CLI y la API local de Coven."
-description: "Notas de release semanales de Coven que cubren nuevas funcionalidades, correcciones y cambios incompatibles en el runtime, la CLI, la TUI y la API por socket del daemon local."
+description: "Notas de release semanales de Coven: nuevas funcionalidades, correcciones y cambios incompatibles en el runtime, la CLI, la TUI y la API por socket."
 read_when:
   - Looking up what changed
 title: "Changelog y notas de release de Coven"

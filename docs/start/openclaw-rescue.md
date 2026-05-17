@@ -3,6 +3,7 @@ summary: "Use Coven to repair a broken OpenClaw checkout without a healthy OpenC
 read_when:
   - Your local OpenClaw is broken and you need a repair room
 title: "OpenClaw rescue loop"
+description: "How coven patch openclaw rescues a broken OpenClaw setup, including Codex auth profile order, harness selection, and dry-run repair plans."
 ---
 
 ```bash

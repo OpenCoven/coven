@@ -3,6 +3,7 @@ summary: "How the daemon, harnesses, store, and clients fit together."
 read_when:
   - Understanding which Coven component owns which responsibility
 title: "Runtime topology"
+description: "Runtime topology of Coven: how the developer, the coven CLI, TUI, comux, and OpenClaw connect to a single Rust daemon over a local Unix socket."
 ---
 
 ```mermaid

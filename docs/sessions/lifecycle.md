@@ -4,6 +4,7 @@ read_when:
   - Designing a client that follows session state
   - Debugging a stuck or orphaned session
 title: "Session lifecycle"
+description: "Coven session lifecycle: pending, running, exited, archived, and sacrificed states, with the daemon transitions and socket API calls that drive each."
 ---
 
 Every Coven session moves through the same states, regardless of which harness is driving it.

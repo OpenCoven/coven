@@ -4,6 +4,7 @@ read_when:
   - Building a client for the Coven daemon
   - Auditing what the socket exposes
 title: "Socket API"
+description: "The Coven daemon exposes a small versioned HTTP API over a Unix socket. Reference for the coven.daemon.v1 contract under the /api/v1 prefix."
 ---
 
 Coven exposes a small versioned HTTP API over a Unix socket. The current public contract is **`coven.daemon.v1`** served under the `/api/v1` prefix.

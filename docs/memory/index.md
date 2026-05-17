@@ -4,6 +4,7 @@ read_when:
   - Choosing a memory backend for a familiar
   - Designing memory continuity across sessions
 title: "Memory"
+description: "Memory is what turns a Coven harness session into a persistent familiar. Reference for the four memory layers: working, episodic, semantic, persistent."
 ---
 
 Memory is what turns a harness session into a persistent familiar. OpenCoven treats memory as a first-class concept with four layers:

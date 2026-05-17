@@ -3,6 +3,7 @@ summary: "The Rust daemon is Rank 0. Clients can ask; only the daemon decides."
 read_when:
   - Auditing what Coven validates vs. trusts from clients
 title: "Authority boundary"
+description: "Where the authority boundary sits in Coven: clients ask, but only the Rust daemon canonicalizes paths, spawns PTYs, and mutates the session ledger."
 ---
 
 ```mermaid

@@ -4,6 +4,7 @@ read_when:
   - Auditing where model credentials live in a Coven install
   - Setting up a fresh provider for an existing familiar
 title: "Models"
+description: "Coven is not a model gateway. Reference for how OpenCoven familiars use Anthropic, OpenAI, Google, and local models through harness-owned auth flows."
 ---
 
 Coven is **not** a model gateway. It does not store API keys, OAuth tokens, or session cookies for any model provider. Each harness keeps using its own local auth flow.
