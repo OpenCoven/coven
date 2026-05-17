@@ -6,6 +6,16 @@ read_when:
 title: "Changelog y notas de release de Coven"
 ---
 
+## Semana del 17 de mayo de 2026
+
+### Correcciones de errores
+
+- **La TUI ya no se cae en terminales pequeñas.** Tanto `coven tui` como `coven chat` ahora protegen sus cálculos de layout frente a tamaños de terminal muy pequeños, de modo que redimensionar a una ventana estrecha o baja ya no provoca el cierre de la sesión. Consulta [Coven TUI](/start/coven-tui).
+
+### Seguridad
+
+- **Aviso de seguridad de Ratatui resuelto.** Se actualizó la pila de renderizado de Ratatui para incorporar la versión parcheada del crate `lru`, resolviendo el aviso [GHSA-rhfx-m35p-ff5j](https://github.com/advisories/GHSA-rhfx-m35p-ff5j). No se requiere ninguna acción: basta con instalar la última versión.
+
 ## Semana del 15 de mayo de 2026
 
 ### Actualizaciones
