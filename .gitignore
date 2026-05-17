@@ -21,5 +21,7 @@ node_modules/
 packages/*/node_modules/
 *.tgz
 packages/*/pnpm-workspace.yaml
+__pycache__/
+*.pyc
 
 /npm/dist/
