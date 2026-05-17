@@ -8,22 +8,20 @@ description: "Coven es un runtime local-first que supervisa CLIs de agentes de c
 ---
 
 
-# Coven 🜨
-
-<p align="center">
-    <img
-        src="/assets/opencoven-icon.svg"
-        alt="OpenCoven"
-        width="320"
-    />
-</p>
-
-> _"Trae cualquier familiar al círculo."_
-
-<p align="center">
-  <strong>OpenCoven es un ecosistema abierto para familiares de IA persistentes. Coven es el sustrato de runtime local que supervisa cada harness — Codex, Claude Code y los futuros Hermes, Aider y Gemini CLIs — dentro de límites explícitos del proyecto.</strong><br />
-  Lanza una sesión, observa el PTY, adjúntate más tarde, archiva cuando termines. Un daemon, un socket, todos los familiares en igualdad de condiciones.
-</p>
+<div class="home-intro">
+  <img
+    class="home-intro-mark"
+    src="/assets/opencoven-icon.svg"
+    alt="OpenCoven"
+    width="88"
+    height="88"
+  />
+  <div>
+    <p class="home-intro-kicker"><strong>Trae cualquier familiar al círculo.</strong></p>
+    <p><strong>OpenCoven es un ecosistema abierto para familiares de IA persistentes. Coven es el sustrato de runtime local que supervisa cada harness — Codex, Claude Code y los futuros Hermes, Aider y Gemini CLIs — dentro de límites explícitos del proyecto.</strong></p>
+    <p>Lanza una sesión, observa el PTY, adjúntate más tarde, archiva cuando termines. Un daemon, un socket, todos los familiares en igualdad de condiciones.</p>
+  </div>
+</div>
 
 <Columns>
   <Card title="Empezar" href="/GETTING-STARTED" icon="rocket">
