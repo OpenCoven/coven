@@ -395,7 +395,7 @@ fn run_magical_tui() -> Result<()> {
         io::stdout().flush().context("failed to flush Coven menu")?;
 
         if let Event::Key(key) = event::read().context("failed to read Coven menu input")? {
-            if key.kind != KeyEventKind::Press {
+            if key.kind == KeyEventKind::Release {
                 continue;
             }
             match key.code {
