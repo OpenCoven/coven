@@ -12,6 +12,23 @@ title: "Changelog y notas de release de Coven"
 
 - **Tema TUI alineado con la marca.** Tanto `coven tui` como `coven chat` ahora comparten una paleta unificada y alineada con la marca, con tokens semánticos consistentes para los estilos primary, agent, user, hint, surface y dim. Los colores se adaptan a tu terminal automáticamente: truecolor en terminales de 24 bits, 256 colores en terminales legacy, y sin color cuando la salida está canalizada o `NO_COLOR` está configurado. Consulta [Variables de entorno](/help/environment).
 
+## Cómo leer este changelog
+
+```mermaid
+flowchart LR
+  Week["Entrada semanal\n(YYYY-MM-DD)"] --> New["### Nuevas funcionalidades"]
+  Week --> Upd["### Actualizaciones"]
+  Week --> Fix["### Correcciones de errores"]
+  Week --> Sec["### Seguridad (cuando aplique)"]
+
+  New --> Links["Cada elemento enlaza al documento canónico o al PR"]
+  Upd --> Links
+  Fix --> Links
+  Sec --> Links
+```
+
+Las entradas son semanales, primero las más recientes. Los elementos dentro de cada semana se agrupan por categoría. Cualquier cambio que afecte a la API pública (superficie de la CLI, rutas del socket, formas de respuesta) también aparece en [Contrato de la API](/API-CONTRACT) — el changelog es un puntero, no un sustituto.
+
 ## Semana del 11 de mayo de 2026
 
 ### Nuevas funcionalidades
