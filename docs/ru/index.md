@@ -12,16 +12,9 @@ description: "Coven — это local-first runtime, который управл�
 
 <p align="center">
     <img
-        src="/assets/opencoven-black.svg"
+        src="/assets/opencoven-icon.svg"
         alt="OpenCoven"
-        width="500"
-        class="dark:hidden"
-    />
-    <img
-        src="/assets/opencoven-white.svg"
-        alt="OpenCoven"
-        width="500"
-        class="hidden dark:block"
+        width="320"
     />
 </p>
 

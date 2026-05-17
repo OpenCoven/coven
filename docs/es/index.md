@@ -12,16 +12,9 @@ description: "Coven es un runtime local-first que supervisa CLIs de agentes de c
 
 <p align="center">
     <img
-        src="/assets/opencoven-black.svg"
+        src="/assets/opencoven-icon.svg"
         alt="OpenCoven"
-        width="500"
-        class="dark:hidden"
-    />
-    <img
-        src="/assets/opencoven-white.svg"
-        alt="OpenCoven"
-        width="500"
-        class="hidden dark:block"
+        width="320"
     />
 </p>
 
