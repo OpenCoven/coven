@@ -252,7 +252,10 @@ function decodeHtml(value) {
 }
 
 function stripTags(value) {
-  return decodeHtml(String(value).replace(/<[^>]*>/g, '')).replace(/\s+/g, ' ').trim();
+  return decodeHtml(String(value))
+    .replace(/[<>]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function collectToc(html) {
