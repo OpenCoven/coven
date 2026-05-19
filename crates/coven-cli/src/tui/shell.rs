@@ -14,8 +14,8 @@ use uuid::Uuid;
 
 use super::cast::{
     self, evaluate_gate, follow_until_exit, format_summary_note, render_cast_frame_for_terminal,
-    render_outcome, render_plan_intro, summary_already_recorded, CastIntent, CastOutcome, CastPlan,
-    CastSessionExit, FollowerObserver, FollowerPacer, GateOutcome, SafetyDecision,
+    render_outcome, render_plan_intro, CastIntent, CastOutcome, CastPlan, CastSessionExit,
+    FollowerObserver, FollowerPacer, GateOutcome, SafetyDecision,
 };
 use super::chat::client::{ChatClient, ChatEventQuery, DaemonChatClient, LaunchRequest};
 use super::{is_key_press, sessions};
@@ -723,8 +723,7 @@ fn write_cast_summary_event(
     // would re-trigger the summary writer at the end. Skip the write when a
     // summary already exists so the ledger keeps exactly one `cast.summary`
     // per session.
-    let existing = store::list_events(&conn, session_id)?;
-    if summary_already_recorded(&existing) {
+    if store::event_kind_exists(&conn, session_id, "cast.summary")? {
         return Ok(());
     }
     let payload = serde_json::json!({
