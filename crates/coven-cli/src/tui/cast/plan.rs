@@ -12,6 +12,11 @@ use super::safety::{classify_prompt_risk, CastRisk, SafetyDecision};
 /// What Cast intends to do in response to a single spell.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CastPlan {
+    /// The exact text the user typed (before any normalization or stripping).
+    /// Empty when the plan was constructed directly without raw input, e.g.
+    /// from a palette action; callers should always treat the raw spell as
+    /// the user-facing record in the outcome card.
+    pub(crate) raw_spell: String,
     pub(crate) intent: CastIntent,
     pub(crate) headline: String,
     pub(crate) steps: Vec<CastStep>,
@@ -25,6 +30,14 @@ pub(crate) struct CastPlan {
 impl CastPlan {
     pub(crate) fn risk(&self) -> CastRisk {
         self.decision.risk()
+    }
+
+    /// Attach the raw user spell to a plan. Used by `cast::plan_spell` to
+    /// preserve the user's literal text for the outcome card. Returns `self`
+    /// so it can be chained at the call site.
+    pub(crate) fn with_raw_spell(mut self, raw: impl Into<String>) -> Self {
+        self.raw_spell = raw.into();
+        self
     }
 }
 
@@ -210,6 +223,7 @@ fn natural_spell_plan(
         ));
     }
     CastPlan {
+        raw_spell: String::new(),
         intent,
         headline,
         steps,
@@ -253,6 +267,7 @@ fn harness_spell_plan(harness: CastHarness, prompt: &str, intent: CastIntent) ->
         ));
     }
     CastPlan {
+        raw_spell: String::new(),
         intent,
         headline,
         steps,
@@ -270,11 +285,12 @@ fn harness_spell_plan(harness: CastHarness, prompt: &str, intent: CastIntent) ->
 fn sacrifice_plan(session_id: &str, intent: CastIntent) -> CastPlan {
     let decision = SafetyDecision::Confirm {
         reason: "sacrifice permanently deletes a session and its events".to_string(),
-        suggestion: "Cast will require typed confirmation in the session browser before \
-                     proceeding with the delete."
+        suggestion: "Cast will ask you to type `sacrifice` to confirm before the daemon \
+                     deletes the session and its event log."
             .to_string(),
     };
     CastPlan {
+        raw_spell: String::new(),
         intent,
         headline: format!("Sacrifice session {}", short_id(session_id)),
         steps: vec![
@@ -284,7 +300,7 @@ fn sacrifice_plan(session_id: &str, intent: CastIntent) -> CastPlan {
             ),
             CastStep::new(
                 CastStepKind::Inform,
-                "Requires explicit typed confirmation before any delete",
+                "Cast will require typed `sacrifice` confirmation before any delete",
             ),
         ],
         decision,
@@ -303,6 +319,7 @@ fn simple_plan(intent: CastIntent, headline: &str, step: CastStep) -> CastPlan {
         _ => None,
     };
     CastPlan {
+        raw_spell: String::new(),
         intent,
         headline: headline.to_string(),
         steps: vec![step],

@@ -67,6 +67,15 @@ impl Default for DaemonChatClient {
 }
 
 impl DaemonChatClient {
+    /// Construct a client pinned to a specific Coven home directory. Used by
+    /// the Cast follower when it needs to spin up a second client on a
+    /// background thread without re-detecting `$COVEN_HOME`.
+    pub(crate) fn with_coven_home(coven_home: PathBuf) -> Self {
+        Self { coven_home }
+    }
+}
+
+impl DaemonChatClient {
     fn request_json<T: for<'de> Deserialize<'de>>(
         &self,
         method: &str,

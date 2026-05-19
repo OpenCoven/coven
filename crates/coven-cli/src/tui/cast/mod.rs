@@ -10,6 +10,8 @@
 //! all remain the authority. Cast is orchestration and presentation: it
 //! never bypasses the daemon and never invents a second runtime.
 
+pub(crate) mod follow;
+pub(crate) mod gate;
 pub(crate) mod intent;
 pub(crate) mod outcome;
 pub(crate) mod plan;
@@ -20,11 +22,13 @@ use anyhow::Result;
 
 use crate::harness;
 
+pub(crate) use follow::{follow_until_exit, CastSessionExit, FollowerObserver, FollowerPacer};
+pub(crate) use gate::{evaluate_gate, GateOutcome};
 pub(crate) use intent::{parse_spell, CastHarness, CastIntent};
 pub(crate) use outcome::CastOutcome;
 pub(crate) use plan::{build_plan, CastPlan};
 pub(crate) use render::{render_cast_frame_for_terminal, render_outcome, render_plan_intro};
-pub(crate) use safety::{CastRisk, SafetyDecision};
+pub(crate) use safety::SafetyDecision;
 
 // Re-exports used only by tests in `crate::tests` (main.rs). Bundled here
 // rather than scattered behind `cfg(test)` so the names live next to the
@@ -33,13 +37,18 @@ pub(crate) use safety::{CastRisk, SafetyDecision};
 pub(crate) use plan::CastStepKind;
 #[cfg(test)]
 pub(crate) use render::render_cast_frame_plain;
+#[cfg(test)]
+pub(crate) use safety::CastRisk;
 
 /// Build a plan from raw user text, using the installed harnesses on PATH
 /// to resolve the safe default. Tests should prefer `build_plan` directly
 /// with an injected resolver so PATH lookups stay out of the suite.
+///
+/// The raw user text is preserved on the returned plan so the outcome card
+/// can show the spell exactly as the user typed it.
 pub(crate) fn plan_spell(raw: &str) -> Result<CastPlan> {
     let intent = parse_spell(raw)?;
-    build_plan(intent, default_harness)
+    Ok(build_plan(intent, default_harness)?.with_raw_spell(raw))
 }
 
 /// Resolve Cast's safe default harness from the host's installed adapters.
@@ -79,5 +88,18 @@ mod tests {
     fn plan_spell_propagates_parser_errors() {
         let error = plan_spell("/banana").unwrap_err();
         assert!(error.to_string().contains("unknown Cast slash command"));
+    }
+
+    #[test]
+    fn plan_spell_preserves_raw_user_text_for_outcome_card() {
+        let plan = plan_spell("run claude polish the README").unwrap();
+        assert_eq!(plan.raw_spell, "run claude polish the README");
+    }
+
+    #[test]
+    fn plan_spell_preserves_raw_text_even_when_intent_is_session_action() {
+        let plan = plan_spell("/sacrifice abcdef123456").unwrap();
+        assert_eq!(plan.raw_spell, "/sacrifice abcdef123456");
+        assert!(matches!(plan.intent, CastIntent::SacrificeSession { .. }));
     }
 }

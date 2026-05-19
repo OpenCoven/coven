@@ -859,7 +859,7 @@ fn coven_home_from_env(coven_home: Option<OsString>, home: Option<OsString>) -> 
 mod tests {
     use super::*;
     use crate::tui::cast::{
-        build_plan, parse_spell, CastHarness, CastIntent, CastRisk, CastStepKind,
+        build_plan, parse_spell, CastHarness, CastIntent, CastRisk, CastStepKind, SafetyDecision,
     };
     use crate::tui::is_key_press;
     use crate::tui::sessions::{
@@ -1256,6 +1256,34 @@ mod tests {
         .unwrap();
 
         assert_eq!(plan.risk(), CastRisk::Confirm);
+    }
+
+    #[test]
+    fn cast_plan_for_sacrifice_describes_typed_confirm_in_copy() {
+        let plan = build_plan(parse_spell("/sacrifice abcdef123456").unwrap(), || {
+            Some(CastHarness::Codex)
+        })
+        .unwrap();
+
+        let inform_note = plan
+            .steps
+            .iter()
+            .find(|step| matches!(step.kind, CastStepKind::Inform))
+            .expect("sacrifice plan should include an inform step");
+        assert!(
+            inform_note.note.to_lowercase().contains("typed"),
+            "sacrifice inform should describe typed-word confirm, got {:?}",
+            inform_note.note
+        );
+        match plan.decision {
+            SafetyDecision::Confirm { suggestion, .. } => {
+                assert!(
+                    suggestion.contains("`sacrifice`"),
+                    "sacrifice suggestion should name the typed-confirm word, got {suggestion:?}"
+                );
+            }
+            other => panic!("expected confirm, got {other:?}"),
+        }
     }
 
     #[test]

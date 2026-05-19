@@ -1,4 +1,7 @@
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
+use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use crossterm::{
@@ -7,16 +10,20 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
 };
+use uuid::Uuid;
 
 use super::cast::{
-    self, render_cast_frame_for_terminal, render_outcome, render_plan_intro, CastIntent,
-    CastOutcome, CastPlan, CastRisk, SafetyDecision,
+    self, evaluate_gate, follow_until_exit, render_cast_frame_for_terminal, render_outcome,
+    render_plan_intro, CastIntent, CastOutcome, CastPlan, CastSessionExit, FollowerObserver,
+    FollowerPacer, GateOutcome, SafetyDecision,
 };
+use super::chat::client::{ChatClient, DaemonChatClient, LaunchRequest};
 use super::{is_key_press, sessions};
 use crate::{
-    archive_session_command, attach_session, default_harness_id, project, prompt_for_optional_line,
-    prompt_for_required_line, run_daemon_command, run_doctor, run_patch_openclaw, run_session,
-    sacrifice_session_command, summon_session_command, theme, DaemonCommand,
+    archive_session_command, attach_session, coven_home_dir, coven_store_path, current_timestamp,
+    daemon, default_harness_id, project, prompt_for_optional_line, prompt_for_required_line,
+    run_daemon_command, run_doctor, run_patch_openclaw, run_session, sacrifice_session_command,
+    store, summon_session_command, theme, DaemonCommand,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,6 +44,11 @@ pub(crate) enum MagicalTuiAction {
     Quit,
 }
 
+/// Legacy palette-input parser type. Phase 2 routes typed input through
+/// `cast::parse_spell` directly, but `parse_magical_tui_input` and this
+/// enum remain available to the test suite as an independent record of the
+/// slash-command surface area. Not used in production builds.
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum MagicalTuiRequest {
     Action(MagicalTuiAction),
@@ -67,6 +79,34 @@ pub(crate) struct MagicalTuiItem {
 const MAGICAL_TUI_DEFAULT_INNER_WIDTH: usize = 76;
 pub(crate) const MAGICAL_TUI_MAX_INNER_WIDTH: usize = 96;
 const MAGICAL_TUI_MIN_INNER_WIDTH: usize = 40;
+
+/// Restores terminal raw mode on all exit paths for the slash-command launcher.
+struct RawModeGuard {
+    enabled: bool,
+}
+
+impl RawModeGuard {
+    fn enter() -> Result<Self> {
+        enable_raw_mode().context("failed to enter Coven's magical terminal mode")?;
+        Ok(Self { enabled: true })
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        if self.enabled {
+            disable_raw_mode().context("failed to leave Coven's magical terminal mode")?;
+            self.enabled = false;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        if self.enabled {
+            let _ = disable_raw_mode();
+        }
+    }
+}
 
 pub(crate) fn magical_tui_items() -> &'static [MagicalTuiItem] {
     &[
@@ -193,8 +233,8 @@ pub(crate) fn run() -> Result<()> {
 
     let mut selection = 0;
     let mut input = String::new();
-    enable_raw_mode().context("failed to enter Coven's magical terminal mode")?;
-    let request_result: Result<MagicalTuiRequest> = loop {
+    let mut raw_mode = RawModeGuard::enter()?;
+    let choice = loop {
         execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0))
             .context("failed to redraw Coven menu")?;
         print!(
@@ -209,7 +249,7 @@ pub(crate) fn run() -> Result<()> {
             }
             match key.code {
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    break Ok(MagicalTuiRequest::Action(MagicalTuiAction::Quit));
+                    break LauncherChoice::Palette(MagicalTuiAction::Quit);
                 }
                 KeyCode::Up => {
                     selection = move_magical_tui_selection(selection, MagicalTuiMove::Up);
@@ -224,123 +264,64 @@ pub(crate) fn run() -> Result<()> {
                     input.clear();
                 }
                 KeyCode::Enter => {
-                    let trimmed_input = input.trim();
-                    if trimmed_input.is_empty() {
-                        break Ok(MagicalTuiRequest::Action(
-                            magical_tui_items()[selection].action,
-                        ));
+                    if input.trim().is_empty() {
+                        break LauncherChoice::Palette(magical_tui_items()[selection].action);
                     }
-                    if trimmed_input.starts_with('/') {
-                        break Ok(MagicalTuiRequest::NaturalPrompt(trimmed_input.to_string()));
-                    }
-                    break parse_magical_tui_input(&input);
+                    break LauncherChoice::TypedSpell(input.clone());
                 }
                 KeyCode::Char(value) => {
                     input.push(value);
                 }
-                KeyCode::Esc => break Ok(MagicalTuiRequest::Action(MagicalTuiAction::Quit)),
+                KeyCode::Esc => break LauncherChoice::Palette(MagicalTuiAction::Quit),
                 _ => {}
             }
         }
     };
-    disable_raw_mode().context("failed to leave Coven's magical terminal mode")?;
+    raw_mode.restore()?;
     println!();
 
-    run_magical_tui_request(request_result?)
+    // Palette buttons keep their existing direct dispatch. Typed input — slash
+    // commands and free text alike — flows through Cast so that the same
+    // intent parser, safety gate, and outcome card apply to every spell.
+    match choice {
+        LauncherChoice::Palette(action) => run_magical_tui_action(action),
+        LauncherChoice::TypedSpell(raw) => run_cast_spell(&raw),
+    }
 }
 
-fn run_magical_tui_request(request: MagicalTuiRequest) -> Result<()> {
-    match request {
-        // Palette buttons keep their existing direct dispatch. Cast layers in
-        // when the user actually types a spell.
-        MagicalTuiRequest::Action(action) => run_magical_tui_action(action),
-        // Free-text spells flow through Cast for parsing, planning, and the
-        // intro/outcome frames the user sees around session launches.
-        MagicalTuiRequest::NaturalPrompt(prompt) => run_cast_spell(&prompt),
-        MagicalTuiRequest::HarnessPrompt { harness, prompt } => {
-            let raw = format!("/{} {}", harness, prompt);
-            run_cast_spell(&raw)
-        }
-        MagicalTuiRequest::AttachSession(session_id) => attach_session(&session_id),
-        MagicalTuiRequest::SummonSession(session_id) => summon_session_command(&session_id),
-        MagicalTuiRequest::ArchiveSession(session_id) => archive_session_command(&session_id),
-        MagicalTuiRequest::SacrificeSession(session_id) => {
-            sacrifice_session_command(&session_id, false)
-        }
-    }
+/// What the launcher loop decided to dispatch after the user pressed Enter
+/// (or Esc / Ctrl+C). Typed input always flows through Cast; palette buttons
+/// stay on the direct `run_magical_tui_action` path.
+enum LauncherChoice {
+    Palette(MagicalTuiAction),
+    TypedSpell(String),
 }
 
 /// Cast entry point for free-text spells. Parses the raw input into a
 /// `CastIntent`, builds a plan, renders the intro card the user sees before
-/// any side effect, dispatches the matching handler, then renders the
-/// outcome card.
+/// any side effect, runs the safety gate, dispatches the matching handler,
+/// then renders the outcome card.
 fn run_cast_spell(raw: &str) -> Result<()> {
     let plan = cast::plan_spell(raw)?;
     print_plan_intro(&plan);
     dispatch_cast_plan(plan)
 }
 
-fn confirm_cast_plan(plan: &CastPlan) -> Result<bool> {
-    let mut stdout = io::stdout();
-
-    if !io::stdin().is_terminal() || !stdout.is_terminal() {
-        writeln!(stdout)?;
-        writeln!(
-            stdout,
-            "Confirmation required for \"{}\", but no interactive terminal is available. Cancelling.",
-            plan.headline
-        )?;
-        stdout.flush()?;
-        return Ok(false);
-    }
-
-    writeln!(stdout)?;
-    writeln!(stdout, "Confirmation required for: {}", plan.headline)?;
-    writeln!(
-        stdout,
-        "Press 'y' to continue, or 'n' / Esc / Enter to cancel."
-    )?;
-    stdout.flush()?;
-
-    loop {
-        if let Event::Key(key) = event::read()? {
-            match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    writeln!(stdout, "Confirmed.")?;
-                    stdout.flush()?;
-                    return Ok(true);
-                }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => {
-                    writeln!(stdout, "Cancelled.")?;
-                    stdout.flush()?;
-                    return Ok(false);
-                }
-                _ => {}
-            }
-        }
-    }
-}
-
+/// Cast's dispatcher. Runs the safety gate against the plan, then routes
+/// safe / confirmed plans to the existing CLI handlers. All destructive or
+/// confirmation-required side effects are guarded by the gate; the
+/// dispatcher itself does no risk classification.
 fn dispatch_cast_plan(plan: CastPlan) -> Result<()> {
-    match plan.risk() {
-        CastRisk::Reject => {
-            print_outcome(&plan_rejected_outcome(&plan));
+    let mut reader = stdin_line_reader;
+    match evaluate_gate(&plan, &mut reader)? {
+        GateOutcome::Cancelled { reason, next_step } => {
+            print_outcome(&plan_cancelled_outcome(&plan, &reason, next_step));
             return Ok(());
         }
-        CastRisk::Confirm => {
-            if !confirm_cast_plan(&plan)? {
-                print_outcome(&CastOutcome {
-                    request: plan.headline.clone(),
-                    launched: None,
-                    session_id: None,
-                    next_step: Some("Nothing was run.".to_string()),
-                    notes: vec!["Action cancelled before dispatch.".to_string()],
-                });
-                return Ok(());
-            }
-        }
-        CastRisk::Safe => {}
+        GateOutcome::Proceed => {}
     }
+
+    let request_text = outcome_request_text(&plan);
 
     let outcome = match plan.intent.clone() {
         CastIntent::NaturalSpell { prompt } => dispatch_default_spell(&plan, &prompt)?,
@@ -350,7 +331,7 @@ fn dispatch_cast_plan(plan: CastPlan) -> Result<()> {
         CastIntent::OpenSessions => {
             sessions::run_browser(false)?;
             CastOutcome {
-                request: plan.headline.clone(),
+                request: request_text,
                 launched: Some("Coven session browser (active)".to_string()),
                 session_id: None,
                 next_step: Some(
@@ -363,7 +344,7 @@ fn dispatch_cast_plan(plan: CastPlan) -> Result<()> {
         CastIntent::OpenAllSessions => {
             sessions::run_browser(true)?;
             CastOutcome {
-                request: plan.headline.clone(),
+                request: request_text,
                 launched: Some("Coven session browser (active + archived)".to_string()),
                 session_id: None,
                 next_step: Some(
@@ -376,7 +357,7 @@ fn dispatch_cast_plan(plan: CastPlan) -> Result<()> {
         CastIntent::AttachSession { session_id } => {
             attach_session(&session_id)?;
             CastOutcome {
-                request: plan.headline.clone(),
+                request: request_text,
                 launched: Some(format!("Attached to session {session_id}")),
                 session_id: Some(session_id),
                 next_step: Some(
@@ -388,7 +369,7 @@ fn dispatch_cast_plan(plan: CastPlan) -> Result<()> {
         CastIntent::SummonSession { session_id } => {
             summon_session_command(&session_id)?;
             CastOutcome {
-                request: plan.headline.clone(),
+                request: request_text,
                 launched: Some(format!("Summoned session {session_id}")),
                 session_id: Some(session_id),
                 next_step: Some(
@@ -400,7 +381,7 @@ fn dispatch_cast_plan(plan: CastPlan) -> Result<()> {
         CastIntent::ArchiveSession { session_id } => {
             archive_session_command(&session_id)?;
             CastOutcome {
-                request: plan.headline.clone(),
+                request: request_text,
                 launched: Some(format!("Archived session {session_id}")),
                 session_id: Some(session_id),
                 next_step: Some(
@@ -410,19 +391,22 @@ fn dispatch_cast_plan(plan: CastPlan) -> Result<()> {
             }
         }
         CastIntent::SacrificeSession { session_id } => {
+            // The gate already collected the typed `sacrifice` confirmation;
+            // calling the underlying handler with `--yes` is the documented
+            // way to bypass its own redundant prompt.
             sacrifice_session_command(&session_id, true)?;
             CastOutcome {
-                request: plan.headline.clone(),
+                request: request_text,
                 launched: Some(format!("Sacrificed session {session_id}")),
                 session_id: Some(session_id),
                 next_step: None,
-                notes: vec!["Sacrifice permanently deletes the session and its events.".to_string()],
+                notes: vec!["Sacrifice permanently deleted the session and its events.".to_string()],
             }
         }
         CastIntent::Doctor => {
             run_doctor()?;
             CastOutcome {
-                request: plan.headline.clone(),
+                request: request_text,
                 launched: Some("Coven doctor".to_string()),
                 session_id: None,
                 next_step: Some(
@@ -434,7 +418,7 @@ fn dispatch_cast_plan(plan: CastPlan) -> Result<()> {
         CastIntent::DaemonStatus => {
             run_daemon_command(DaemonCommand::Status)?;
             CastOutcome {
-                request: plan.headline.clone(),
+                request: request_text,
                 launched: Some("Coven daemon status".to_string()),
                 session_id: None,
                 next_step: Some("Run `coven daemon start` if status reported stopped.".to_string()),
@@ -443,21 +427,21 @@ fn dispatch_cast_plan(plan: CastPlan) -> Result<()> {
         }
         CastIntent::Help => {
             run_tui_help()?;
-            CastOutcome::for_request(plan.headline.clone())
+            CastOutcome::for_request(request_text)
         }
         CastIntent::StartHere => {
             run_new_user_start_here()?;
-            CastOutcome::for_request(plan.headline.clone())
+            CastOutcome::for_request(request_text)
         }
         CastIntent::OpenTui => {
             // Already in the launcher — show the palette help instead of
             // re-entering the raw-mode loop.
             run_tui_help()?;
-            CastOutcome::for_request(plan.headline.clone())
+            CastOutcome::for_request(request_text)
         }
         CastIntent::PatchOpenClaw => {
             run_patch_openclaw(vec![], None, None, None, false, false, true)?;
-            CastOutcome::for_request(plan.headline.clone())
+            CastOutcome::for_request(request_text)
         }
         CastIntent::Quit => {
             let primary = theme::fg(theme::PRIMARY);
@@ -471,45 +455,309 @@ fn dispatch_cast_plan(plan: CastPlan) -> Result<()> {
     Ok(())
 }
 
+/// The line the outcome card shows as the user's request. We prefer the raw
+/// spell text (what the user actually typed) so cancellations and successes
+/// look the same; we only fall back to the plan headline for plans that were
+/// not built from raw input (Phase 1 doesn't create those, but the
+/// defensive default keeps the field non-empty).
+fn outcome_request_text(plan: &CastPlan) -> String {
+    if plan.raw_spell.is_empty() {
+        plan.headline.clone()
+    } else {
+        plan.raw_spell.clone()
+    }
+}
+
+/// Default stdin reader for the safety gate. Treats empty input as cancel
+/// (returns `""`) instead of bubbling an error so the gate can render a
+/// clean "cancelled" outcome.
+fn stdin_line_reader(prompt: &str) -> Result<String> {
+    Ok(prompt_for_optional_line(prompt)?.unwrap_or_default())
+}
+
+fn plan_cancelled_outcome(plan: &CastPlan, reason: &str, next_step: Option<String>) -> CastOutcome {
+    CastOutcome {
+        request: outcome_request_text(plan),
+        launched: None,
+        session_id: None,
+        next_step,
+        notes: vec![reason.to_string()],
+    }
+}
+
 fn dispatch_default_spell(plan: &CastPlan, prompt: &str) -> Result<CastOutcome> {
     let Some(plan_harness) = plan.harness else {
         return Err(anyhow!(
             "no supported harness is available; run `coven doctor` first"
         ));
     };
-    let title = plan.title.as_deref();
-    run_session(
+    dispatch_cast_launch(
+        plan,
         plan_harness.harness.id(),
-        &[prompt.to_string()],
-        None,
-        title,
-        false,
-    )?;
-    Ok(CastOutcome {
-        request: prompt.to_string(),
-        launched: Some(format!(
+        prompt,
+        format!(
             "{} session (Cast default, project-scoped)",
             plan_harness.harness.label()
-        )),
-        session_id: None,
-        next_step: Some("Run `coven sessions` to see this session.".to_string()),
-        notes: plan_outcome_notes(plan),
-    })
+        ),
+    )
 }
 
 fn dispatch_harness_spell(plan: &CastPlan, harness_id: &str, prompt: &str) -> Result<CastOutcome> {
-    let title = plan.title.as_deref();
-    run_session(harness_id, &[prompt.to_string()], None, title, false)?;
-    Ok(CastOutcome {
-        request: prompt.to_string(),
-        launched: Some(format!(
+    dispatch_cast_launch(
+        plan,
+        harness_id,
+        prompt,
+        format!(
             "{} session (user-chosen, project-scoped)",
             harness_label(harness_id)
+        ),
+    )
+}
+
+/// Launch a project-scoped session and follow its events into the Cast TUI.
+///
+/// Phase 2 prefers the daemon-backed path so the follower can stream events
+/// with `afterSeq`, surface the exit status + exit code in the outcome card,
+/// and write a `cast.summary` event to the ledger when the run finishes. If
+/// the daemon is not running Cast falls back to the synchronous local PTY
+/// path Phase 1 used; the user can still read the transcript inline, but the
+/// outcome card will note the missing daemon and skip the follower-only
+/// fields.
+fn dispatch_cast_launch(
+    plan: &CastPlan,
+    harness_id: &str,
+    prompt: &str,
+    launched_label: String,
+) -> Result<CastOutcome> {
+    match daemon_runtime_state()? {
+        DaemonRuntimeState::Running => {
+            dispatch_via_daemon(plan, harness_id, prompt, &launched_label)
+        }
+        DaemonRuntimeState::NotReady(reason) => {
+            dispatch_via_local_pty(plan, harness_id, prompt, &launched_label, &reason)
+        }
+    }
+}
+
+enum DaemonRuntimeState {
+    Running,
+    NotReady(String),
+}
+
+fn daemon_runtime_state() -> Result<DaemonRuntimeState> {
+    let home = coven_home_dir()?;
+    match daemon::background_server_status(&home)? {
+        Some(daemon::DaemonStatusState::Running(_)) => Ok(DaemonRuntimeState::Running),
+        Some(daemon::DaemonStatusState::Stale(_)) => Ok(DaemonRuntimeState::NotReady(
+            "the local Coven daemon is recorded but unreachable; run `coven daemon restart`"
+                .to_string(),
         )),
-        session_id: None,
-        next_step: Some("Run `coven sessions` to see this session.".to_string()),
-        notes: plan_outcome_notes(plan),
+        None => Ok(DaemonRuntimeState::NotReady(
+            "the local Coven daemon is not running; run `coven daemon start` to enable Cast's \
+             event follower"
+                .to_string(),
+        )),
+    }
+}
+
+fn dispatch_via_daemon(
+    plan: &CastPlan,
+    harness_id: &str,
+    prompt: &str,
+    launched_label: &str,
+) -> Result<CastOutcome> {
+    let project_root = resolve_project_root_for_cast()?;
+    let title = plan
+        .title
+        .clone()
+        .unwrap_or_else(|| prompt.chars().take(48).collect());
+
+    let launch = LaunchRequest {
+        id: Uuid::new_v4().to_string(),
+        project_root: project_root.to_string_lossy().into_owned(),
+        cwd: project_root.to_string_lossy().into_owned(),
+        harness: harness_id.to_string(),
+        prompt: prompt.to_string(),
+        title,
+    };
+
+    let mut client = DaemonChatClient::default();
+    let session = client.launch_session(launch).with_context(|| {
+        format!(
+            "Cast failed to launch {} session via the daemon",
+            harness_label(harness_id)
+        )
+    })?;
+
+    println!();
+    println!(
+        "Cast transcript — session {} ({}). Press Enter at any time to send input.",
+        session.id, session.harness
+    );
+
+    // Forward user keystrokes from this process into the live daemon
+    // session so the user can follow up on a running spell without
+    // detaching. The thread is detached and exits when stdin closes or
+    // the host process exits.
+    maybe_spawn_cast_input_forwarder(coven_home_dir()?, session.id.clone());
+
+    let mut observer = TranscriptObserver::new(io::stdout());
+    let mut pacer = SleepPacer::new(Duration::from_millis(250));
+    let exit = follow_until_exit(&mut client, &session.id, &mut observer, &mut pacer)?;
+
+    write_cast_summary_event(&session.id, plan, harness_id, &exit)?;
+
+    let exit_summary = format_exit_summary(&exit);
+    let next_step = format!(
+        "Run `coven attach {}` to revisit, or `coven sessions` to list everything.",
+        session.id
+    );
+    let mut notes = plan_outcome_notes(plan);
+    notes.push(exit_summary.clone());
+
+    Ok(CastOutcome {
+        request: outcome_request_text(plan),
+        launched: Some(format!("{launched_label} via daemon")),
+        session_id: Some(session.id),
+        next_step: Some(next_step),
+        notes,
     })
+}
+
+fn dispatch_via_local_pty(
+    plan: &CastPlan,
+    harness_id: &str,
+    prompt: &str,
+    launched_label: &str,
+    daemon_reason: &str,
+) -> Result<CastOutcome> {
+    let title = plan.title.as_deref();
+    run_session(harness_id, &[prompt.to_string()], None, title, false)?;
+    let mut notes = plan_outcome_notes(plan);
+    notes.push(format!("Cast event follower skipped: {daemon_reason}."));
+    Ok(CastOutcome {
+        request: outcome_request_text(plan),
+        launched: Some(format!("{launched_label} (local PTY fallback)")),
+        session_id: None,
+        next_step: Some(
+            "Start the daemon for streamed transcripts: `coven daemon start`.".to_string(),
+        ),
+        notes,
+    })
+}
+
+fn resolve_project_root_for_cast() -> Result<PathBuf> {
+    let cwd = std::env::current_dir().context("failed to read current directory")?;
+    project::canonical_project_root(&cwd).with_context(|| {
+        format!(
+            "Cast could not resolve a project root from {}. Run `coven` inside a repo.",
+            cwd.display()
+        )
+    })
+}
+
+/// Stdout-backed observer that prints each output chunk verbatim and adds a
+/// Cast-styled completion line when the session exits. Holds a writer so
+/// tests can swap stdout for a buffer if they ever need to.
+struct TranscriptObserver<W: Write> {
+    out: W,
+}
+
+impl<W: Write> TranscriptObserver<W> {
+    fn new(out: W) -> Self {
+        Self { out }
+    }
+}
+
+impl<W: Write> FollowerObserver for TranscriptObserver<W> {
+    fn on_output(&mut self, chunk: &str) {
+        // Swallow individual write errors — best-effort transcript should
+        // not abort the follower because stdout is briefly unavailable.
+        let _ = self.out.write_all(chunk.as_bytes());
+        let _ = self.out.flush();
+    }
+
+    fn on_exit(&mut self, status: &str, exit_code: Option<i32>) {
+        let summary = match exit_code {
+            Some(code) => format!("\n[Cast: session {status} (exit code {code})]\n"),
+            None => format!("\n[Cast: session {status}]\n"),
+        };
+        let _ = self.out.write_all(summary.as_bytes());
+        let _ = self.out.flush();
+    }
+}
+
+/// Sleep-based pacer for the production follower. Tests use the test pacer
+/// in `cast::follow` so they never sleep.
+struct SleepPacer {
+    interval: Duration,
+}
+
+impl SleepPacer {
+    fn new(interval: Duration) -> Self {
+        Self { interval }
+    }
+}
+
+impl FollowerPacer for SleepPacer {
+    fn between_polls(&mut self) -> Result<()> {
+        thread::sleep(self.interval);
+        Ok(())
+    }
+}
+
+fn maybe_spawn_cast_input_forwarder(coven_home: PathBuf, session_id: String) {
+    if !io::stdin().is_terminal() {
+        return;
+    }
+    thread::spawn(move || {
+        let mut client = DaemonChatClient::with_coven_home(coven_home);
+        let stdin = io::stdin();
+        for line in stdin.lock().lines() {
+            let Ok(mut line) = line else {
+                break;
+            };
+            line.push('\n');
+            if client.send_input(&session_id, &line).is_err() {
+                // Session likely exited; stop forwarding silently.
+                break;
+            }
+        }
+    });
+}
+
+fn write_cast_summary_event(
+    session_id: &str,
+    plan: &CastPlan,
+    harness_id: &str,
+    exit: &CastSessionExit,
+) -> Result<()> {
+    let store_path = coven_store_path()?;
+    let conn = store::open_store(&store_path)?;
+    let payload = serde_json::json!({
+        "request": plan.raw_spell,
+        "headline": plan.headline,
+        "harness": harness_id,
+        "status": exit.status,
+        "exitCode": exit.exit_code,
+    });
+    store::insert_json_event(
+        &conn,
+        session_id,
+        "cast.summary",
+        &payload,
+        &current_timestamp(),
+    )
+}
+
+fn format_exit_summary(exit: &CastSessionExit) -> String {
+    match exit.exit_code {
+        Some(code) => format!(
+            "Session finished: status `{}`, exit code {code}",
+            exit.status
+        ),
+        None => format!("Session finished: status `{}`", exit.status),
+    }
 }
 
 fn plan_outcome_notes(plan: &CastPlan) -> Vec<String> {
@@ -518,26 +766,6 @@ fn plan_outcome_notes(plan: &CastPlan) -> Vec<String> {
         notes.push(format!("Risk: {reason}. {suggestion}"));
     }
     notes
-}
-
-fn plan_rejected_outcome(plan: &CastPlan) -> CastOutcome {
-    let (reason, alternative) = match &plan.decision {
-        SafetyDecision::Reject {
-            reason,
-            alternative,
-        } => (reason.clone(), alternative.clone()),
-        _ => (
-            "Cast rejected the spell.".to_string(),
-            "Try a more specific outcome.".to_string(),
-        ),
-    };
-    CastOutcome {
-        request: plan.headline.clone(),
-        launched: None,
-        session_id: None,
-        next_step: Some(alternative),
-        notes: vec![format!("Rejected: {reason}")],
-    }
 }
 
 fn harness_label(harness_id: &str) -> &'static str {
@@ -608,6 +836,7 @@ fn run_magical_tui_action(action: MagicalTuiAction) -> Result<()> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn parse_magical_tui_input(input: &str) -> Result<MagicalTuiRequest> {
     let input = input.trim();
     if input.is_empty() {
@@ -641,6 +870,7 @@ pub(crate) fn parse_magical_tui_input(input: &str) -> Result<MagicalTuiRequest> 
     }
 }
 
+#[cfg(test)]
 fn split_command(input: &str) -> (&str, &str) {
     if let Some(index) = input.find(char::is_whitespace) {
         (&input[..index], input[index..].trim())
@@ -649,6 +879,7 @@ fn split_command(input: &str) -> (&str, &str) {
     }
 }
 
+#[cfg(test)]
 fn parse_run_slash_command(rest: &str) -> Result<MagicalTuiRequest> {
     if rest.trim().is_empty() {
         return Ok(MagicalTuiRequest::Action(MagicalTuiAction::RunHarness));
@@ -666,6 +897,7 @@ fn parse_run_slash_command(rest: &str) -> Result<MagicalTuiRequest> {
     Ok(MagicalTuiRequest::NaturalPrompt(rest.trim().to_string()))
 }
 
+#[cfg(test)]
 fn parse_harness_slash_command(harness: &str, rest: &str) -> Result<MagicalTuiRequest> {
     let prompt = rest.trim();
     if prompt.is_empty() {
@@ -677,6 +909,7 @@ fn parse_harness_slash_command(harness: &str, rest: &str) -> Result<MagicalTuiRe
     })
 }
 
+#[cfg(test)]
 fn parse_session_slash_command(
     rest: &str,
     build: fn(String) -> MagicalTuiRequest,
