@@ -194,7 +194,7 @@ pub(crate) fn run() -> Result<()> {
     let mut selection = 0;
     let mut input = String::new();
     enable_raw_mode().context("failed to enter Coven's magical terminal mode")?;
-    let request: Result<MagicalTuiRequest> = loop {
+    let request_result: Result<MagicalTuiRequest> = loop {
         execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0))
             .context("failed to redraw Coven menu")?;
         print!(
@@ -224,13 +224,14 @@ pub(crate) fn run() -> Result<()> {
                     input.clear();
                 }
                 KeyCode::Enter => {
-                    if input.trim().is_empty() {
+                    let trimmed_input = input.trim();
+                    if trimmed_input.is_empty() {
                         break Ok(MagicalTuiRequest::Action(
                             magical_tui_items()[selection].action,
                         ));
                     }
-                    if input.trim_start().starts_with('/') {
-                        break Ok(MagicalTuiRequest::NaturalPrompt(input.trim().to_string()));
+                    if trimmed_input.starts_with('/') {
+                        break Ok(MagicalTuiRequest::NaturalPrompt(trimmed_input.to_string()));
                     }
                     break parse_magical_tui_input(&input);
                 }
@@ -245,7 +246,7 @@ pub(crate) fn run() -> Result<()> {
     disable_raw_mode().context("failed to leave Coven's magical terminal mode")?;
     println!();
 
-    run_magical_tui_request(request?)
+    run_magical_tui_request(request_result?)
 }
 
 fn run_magical_tui_request(request: MagicalTuiRequest) -> Result<()> {
