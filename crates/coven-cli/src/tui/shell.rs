@@ -805,13 +805,21 @@ fn attach_via_daemon(
         .get_session(session_id)
         .with_context(|| format!("Cast could not look up session `{session_id}` via the daemon"))?;
 
-    println!();
-    println!(
-        "Cast transcript — session {} ({}). Press Enter at any time to send input.",
-        session.id, session.harness
-    );
-
     let is_live = session.status == RUNNING_SESSION_STATUS;
+
+    println!();
+    if is_live {
+        println!(
+            "Cast transcript — session {} ({}). Press Enter at any time to send input.",
+            session.id, session.harness
+        );
+    } else {
+        println!(
+            "Cast transcript — session {} ({}) replay.",
+            session.id, session.harness
+        );
+    }
+
     if is_live {
         // Mirror the launch path: forward stdin lines into the daemon for
         // follow-up input while the follower streams output. The thread is
