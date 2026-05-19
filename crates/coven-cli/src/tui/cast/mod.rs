@@ -23,7 +23,7 @@ use anyhow::Result;
 
 use crate::harness;
 
-pub(crate) use attach::{find_cast_summary, format_summary_note, summary_already_recorded};
+pub(crate) use attach::{find_cast_summary, format_summary_note};
 pub(crate) use follow::{follow_until_exit, CastSessionExit, FollowerObserver, FollowerPacer};
 pub(crate) use gate::{evaluate_gate, GateOutcome};
 pub(crate) use intent::{parse_spell, CastHarness, CastIntent};

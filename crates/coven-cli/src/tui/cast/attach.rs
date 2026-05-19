@@ -3,8 +3,7 @@
 //! Phase 2 lets the user re-enter a previously-launched session through the
 //! same follower the launch path uses. The pure helpers in this module decode
 //! the `cast.summary` event Cast wrote at the end of the original run so the
-//! attach outcome card can describe what already happened — and tell the
-//! launch-side writer when a summary already exists so it does not double-log.
+//! attach outcome card can describe what already happened.
 
 use serde_json::Value;
 
@@ -35,12 +34,6 @@ pub(crate) fn find_cast_summary(events: &[store::EventRecord]) -> Option<CastAtt
         .rev()
         .find(|event| event.kind == CAST_SUMMARY_KIND)
         .map(decode_summary)
-}
-
-/// True when at least one `cast.summary` event has been recorded for this
-/// session. Producers use this to keep the summary writer idempotent.
-pub(crate) fn summary_already_recorded(events: &[store::EventRecord]) -> bool {
-    events.iter().any(|event| event.kind == CAST_SUMMARY_KIND)
 }
 
 /// One-line outcome-card note describing what Cast saw on the prior run.
@@ -205,18 +198,6 @@ mod tests {
 
         let summary = find_cast_summary(&events).expect("summary should still be returned");
         assert_eq!(summary, CastAttachSummary::default());
-    }
-
-    #[test]
-    fn summary_already_recorded_only_true_when_summary_event_present() {
-        let only_output = vec![output_event(1, "hi\n")];
-        assert!(!summary_already_recorded(&only_output));
-
-        let with_summary = vec![
-            output_event(1, "hi\n"),
-            summary_event(2, serde_json::json!({ "status": "completed" })),
-        ];
-        assert!(summary_already_recorded(&with_summary));
     }
 
     #[test]

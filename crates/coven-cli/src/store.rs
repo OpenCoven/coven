@@ -327,6 +327,21 @@ pub fn list_events(conn: &Connection, session_id: &str) -> Result<Vec<EventRecor
     list_events_with_options(conn, session_id, &EventsQueryOptions::default())
 }
 
+pub fn event_kind_exists(conn: &Connection, session_id: &str, kind: &str) -> Result<bool> {
+    use rusqlite::OptionalExtension;
+
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM events WHERE session_id = ?1 AND kind = ?2 LIMIT 1",
+            params![session_id, kind],
+            |_| Ok(()),
+        )
+        .optional()
+        .context("failed to query event kind existence")?
+        .is_some();
+    Ok(exists)
+}
+
 pub fn list_events_with_options(
     conn: &Connection,
     session_id: &str,
@@ -689,6 +704,31 @@ mod tests {
 
         assert_eq!(tail.len(), 2);
         assert!(tail[0].seq > after_seq);
+        Ok(())
+    }
+
+    #[test]
+    fn event_kind_exists_detects_kind_without_loading_event_payloads() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+        insert_session(&conn, &session_record("session-1", "2026-04-27T06:00:00Z"))?;
+        insert_json_event(
+            &conn,
+            "session-1",
+            "output",
+            &serde_json::json!({ "data": "hello" }),
+            "2026-04-27T06:01:00Z",
+        )?;
+        insert_json_event(
+            &conn,
+            "session-1",
+            "cast.summary",
+            &serde_json::json!({ "status": "completed", "exitCode": 0 }),
+            "2026-04-27T06:02:00Z",
+        )?;
+
+        assert!(!event_kind_exists(&conn, "session-1", "input")?);
+        assert!(event_kind_exists(&conn, "session-1", "cast.summary")?);
         Ok(())
     }
 
