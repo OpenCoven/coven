@@ -194,7 +194,7 @@ pub(crate) fn run() -> Result<()> {
     let mut selection = 0;
     let mut input = String::new();
     enable_raw_mode().context("failed to enter Coven's magical terminal mode")?;
-    let request = loop {
+    let request: Result<MagicalTuiRequest> = loop {
         execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0))
             .context("failed to redraw Coven menu")?;
         print!(
@@ -228,6 +228,9 @@ pub(crate) fn run() -> Result<()> {
                         break Ok(MagicalTuiRequest::Action(
                             magical_tui_items()[selection].action,
                         ));
+                    }
+                    if input.trim_start().starts_with('/') {
+                        break Ok(MagicalTuiRequest::NaturalPrompt(input.trim().to_string()));
                     }
                     break parse_magical_tui_input(&input);
                 }
@@ -292,12 +295,15 @@ fn confirm_cast_plan(plan: &CastPlan) -> Result<bool> {
 
     writeln!(stdout)?;
     writeln!(stdout, "Confirmation required for: {}", plan.headline)?;
-    writeln!(stdout, "Press 'y' to continue, or 'n' / Esc / Enter to cancel.")?;
+    writeln!(
+        stdout,
+        "Press 'y' to continue, or 'n' / Esc / Enter to cancel."
+    )?;
     stdout.flush()?;
 
     loop {
-        match event::read()? {
-            Event::Key(key) => match key.code {
+        if let Event::Key(key) = event::read()? {
+            match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     writeln!(stdout, "Confirmed.")?;
                     stdout.flush()?;
@@ -309,8 +315,7 @@ fn confirm_cast_plan(plan: &CastPlan) -> Result<bool> {
                     return Ok(false);
                 }
                 _ => {}
-            },
-            _ => {}
+            }
         }
     }
 }
@@ -404,7 +409,7 @@ fn dispatch_cast_plan(plan: CastPlan) -> Result<()> {
             }
         }
         CastIntent::SacrificeSession { session_id } => {
-            sacrifice_session_command(&session_id, false)?;
+            sacrifice_session_command(&session_id, true)?;
             CastOutcome {
                 request: plan.headline.clone(),
                 launched: Some(format!("Sacrificed session {session_id}")),

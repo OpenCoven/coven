@@ -7,7 +7,7 @@
 
 #[derive(Clone, Debug, Eq, PartialEq, Default)]
 pub(crate) struct CastOutcome {
-    /// The spell the user actually typed.
+    /// User-facing request text shown in the outcome card (often normalized).
     pub(crate) request: String,
     /// One-line summary of what Cast launched, if anything.
     pub(crate) launched: Option<String>,
