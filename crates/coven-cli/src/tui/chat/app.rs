@@ -661,6 +661,8 @@ impl App {
     }
 }
 
+/// Applies a capped exponential backoff so repeated event-poll failures do not
+/// flood the transcript or hammer the daemon when it is unavailable.
 fn event_poll_backoff(streak: u32) -> Duration {
     let millis = match streak {
         0 | 1 => 500,

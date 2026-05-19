@@ -51,6 +51,7 @@ pub(crate) const SESSION_BROWSER_FIRST_SESSION_ROW: usize = 5;
 const SESSION_BROWSER_MAX_VISIBLE_SESSIONS: usize = 8;
 const PLAIN_SESSION_ID_COLUMN_WIDTH: usize = 36;
 
+/// Restores raw mode and mouse capture on all exit paths for the session browser.
 struct BrowserTerminalGuard {
     raw_mode_enabled: bool,
     mouse_capture_enabled: bool,

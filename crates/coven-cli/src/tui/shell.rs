@@ -64,6 +64,7 @@ const MAGICAL_TUI_DEFAULT_INNER_WIDTH: usize = 76;
 pub(crate) const MAGICAL_TUI_MAX_INNER_WIDTH: usize = 96;
 const MAGICAL_TUI_MIN_INNER_WIDTH: usize = 40;
 
+/// Restores terminal raw mode on all exit paths for the slash-command launcher.
 struct RawModeGuard {
     enabled: bool,
 }
