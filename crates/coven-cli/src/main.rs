@@ -613,6 +613,15 @@ fn archive_session_command(session_id: &str) -> Result<()> {
 }
 
 fn summon_session_command(session_id: &str) -> Result<()> {
+    summon_only_command(session_id)?;
+    attach_session(session_id)
+}
+
+/// Un-archive a session if needed, without attaching. Returns the session
+/// record so callers (Cast's attach dispatcher) can decide what to do next.
+/// Pulled out of `summon_session_command` so the Cast TUI path can summon
+/// then re-enter through Cast's follower instead of the legacy attach loop.
+pub(crate) fn summon_only_command(session_id: &str) -> Result<store::SessionRecord> {
     let store_path = coven_store_path()?;
     let conn = store::open_store(&store_path)?;
     let Some(session) = store::get_session(&conn, session_id)? else {
@@ -624,7 +633,7 @@ fn summon_session_command(session_id: &str) -> Result<()> {
         eprintln!("summoned session from the archive");
     }
 
-    attach_session(session_id)
+    Ok(session)
 }
 
 fn sacrifice_session_command(session_id: &str, yes: bool) -> Result<()> {

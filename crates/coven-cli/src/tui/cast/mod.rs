@@ -10,6 +10,7 @@
 //! all remain the authority. Cast is orchestration and presentation: it
 //! never bypasses the daemon and never invents a second runtime.
 
+pub(crate) mod attach;
 pub(crate) mod follow;
 pub(crate) mod gate;
 pub(crate) mod intent;
@@ -22,6 +23,7 @@ use anyhow::Result;
 
 use crate::harness;
 
+pub(crate) use attach::{find_cast_summary, format_summary_note, summary_already_recorded};
 pub(crate) use follow::{follow_until_exit, CastSessionExit, FollowerObserver, FollowerPacer};
 pub(crate) use gate::{evaluate_gate, GateOutcome};
 pub(crate) use intent::{parse_spell, CastHarness, CastIntent};

@@ -13,17 +13,17 @@ use crossterm::{
 use uuid::Uuid;
 
 use super::cast::{
-    self, evaluate_gate, follow_until_exit, render_cast_frame_for_terminal, render_outcome,
-    render_plan_intro, CastIntent, CastOutcome, CastPlan, CastSessionExit, FollowerObserver,
-    FollowerPacer, GateOutcome, SafetyDecision,
+    self, evaluate_gate, follow_until_exit, format_summary_note, render_cast_frame_for_terminal,
+    render_outcome, render_plan_intro, summary_already_recorded, CastIntent, CastOutcome, CastPlan,
+    CastSessionExit, FollowerObserver, FollowerPacer, GateOutcome, SafetyDecision,
 };
-use super::chat::client::{ChatClient, DaemonChatClient, LaunchRequest};
+use super::chat::client::{ChatClient, ChatEventQuery, DaemonChatClient, LaunchRequest};
 use super::{is_key_press, sessions};
 use crate::{
     archive_session_command, attach_session, coven_home_dir, coven_store_path, current_timestamp,
     daemon, default_harness_id, project, prompt_for_optional_line, prompt_for_required_line,
     run_daemon_command, run_doctor, run_patch_openclaw, run_session, sacrifice_session_command,
-    store, summon_session_command, theme, DaemonCommand,
+    store, summon_only_command, theme, DaemonCommand, RUNNING_SESSION_STATUS,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -355,28 +355,13 @@ fn dispatch_cast_plan(plan: CastPlan) -> Result<()> {
             }
         }
         CastIntent::AttachSession { session_id } => {
-            attach_session(&session_id)?;
-            CastOutcome {
-                request: request_text,
-                launched: Some(format!("Attached to session {session_id}")),
-                session_id: Some(session_id),
-                next_step: Some(
-                    "Detach with Ctrl+C; the session keeps running under the daemon.".to_string(),
-                ),
-                notes: vec![],
-            }
+            attach_via_cast(&plan, &session_id, &request_text, AttachOrigin::Attach)?
         }
         CastIntent::SummonSession { session_id } => {
-            summon_session_command(&session_id)?;
-            CastOutcome {
-                request: request_text,
-                launched: Some(format!("Summoned session {session_id}")),
-                session_id: Some(session_id),
-                next_step: Some(
-                    "The session is now active again — attach to follow it.".to_string(),
-                ),
-                notes: vec![],
-            }
+            // Un-archive first (cheap, no follower), then re-enter through Cast
+            // so the resumed session also gets the Cast transcript / summary.
+            summon_only_command(&session_id)?;
+            attach_via_cast(&plan, &session_id, &request_text, AttachOrigin::Summon)?
         }
         CastIntent::ArchiveSession { session_id } => {
             archive_session_command(&session_id)?;
@@ -734,6 +719,14 @@ fn write_cast_summary_event(
 ) -> Result<()> {
     let store_path = coven_store_path()?;
     let conn = store::open_store(&store_path)?;
+    // Cast attach replays existing events through the same follower, which
+    // would re-trigger the summary writer at the end. Skip the write when a
+    // summary already exists so the ledger keeps exactly one `cast.summary`
+    // per session.
+    let existing = store::list_events(&conn, session_id)?;
+    if summary_already_recorded(&existing) {
+        return Ok(());
+    }
     let payload = serde_json::json!({
         "request": plan.raw_spell,
         "headline": plan.headline,
@@ -748,6 +741,192 @@ fn write_cast_summary_event(
         &payload,
         &current_timestamp(),
     )
+}
+
+/// What brought the user into this attach. Affects the outcome card's
+/// `launched` label so the user can tell the two flows apart.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AttachOrigin {
+    Attach,
+    Summon,
+}
+
+impl AttachOrigin {
+    fn verb_past(self) -> &'static str {
+        match self {
+            AttachOrigin::Attach => "Attached to",
+            AttachOrigin::Summon => "Summoned and attached to",
+        }
+    }
+}
+
+/// Cast-native attach. Live sessions stream through the follower with the
+/// same `afterSeq` cursor the launch path uses (so no duplicate output) and
+/// accept follow-up input from stdin. Completed sessions replay their full
+/// event log through the same observer so the user sees the same transcript
+/// shape, then surface any existing `cast.summary` in the outcome card.
+///
+/// Falls back to the legacy `attach_session` loop when the daemon is not
+/// reachable; the outcome card explains why the follower was skipped.
+fn attach_via_cast(
+    plan: &CastPlan,
+    session_id: &str,
+    request_text: &str,
+    origin: AttachOrigin,
+) -> Result<CastOutcome> {
+    match daemon_runtime_state()? {
+        DaemonRuntimeState::Running => attach_via_daemon(plan, session_id, request_text, origin),
+        DaemonRuntimeState::NotReady(reason) => {
+            attach_session(session_id)?;
+            Ok(CastOutcome {
+                request: request_text.to_string(),
+                launched: Some(format!(
+                    "{} session {session_id} (legacy attach fallback)",
+                    origin.verb_past()
+                )),
+                session_id: Some(session_id.to_string()),
+                next_step: Some(
+                    "Start the daemon for streamed transcripts: `coven daemon start`.".to_string(),
+                ),
+                notes: vec![format!("Cast event follower skipped: {reason}.")],
+            })
+        }
+    }
+}
+
+fn attach_via_daemon(
+    plan: &CastPlan,
+    session_id: &str,
+    request_text: &str,
+    origin: AttachOrigin,
+) -> Result<CastOutcome> {
+    let mut client = DaemonChatClient::default();
+    let session = client
+        .get_session(session_id)
+        .with_context(|| format!("Cast could not look up session `{session_id}` via the daemon"))?;
+
+    println!();
+    println!(
+        "Cast transcript — session {} ({}). Press Enter at any time to send input.",
+        session.id, session.harness
+    );
+
+    let is_live = session.status == RUNNING_SESSION_STATUS;
+    if is_live {
+        // Mirror the launch path: forward stdin lines into the daemon for
+        // follow-up input while the follower streams output. The thread is
+        // detached and exits when stdin closes.
+        maybe_spawn_cast_input_forwarder(coven_home_dir()?, session.id.clone());
+    }
+
+    let mut observer = TranscriptObserver::new(io::stdout());
+    let exit = if is_live {
+        let mut pacer = SleepPacer::new(Duration::from_millis(250));
+        Some(follow_until_exit(
+            &mut client,
+            &session.id,
+            &mut observer,
+            &mut pacer,
+        )?)
+    } else {
+        // For completed sessions, drain the historical event log once. The
+        // follower observer renders the transcript exactly as it did on the
+        // original run and reports the exit when it lands in the replay.
+        replay_completed_session(&mut client, &session.id, &mut observer)?
+    };
+
+    if is_live {
+        if let Some(exit) = exit.as_ref() {
+            // Idempotent — skips when a `cast.summary` already exists.
+            write_cast_summary_event(&session.id, plan, &session.harness, exit)?;
+        }
+    }
+
+    let mut notes = plan_outcome_notes(plan);
+    if let Some(exit) = exit.as_ref() {
+        notes.push(format_exit_summary(exit));
+    }
+    // For completed/replayed sessions, surface the original Cast summary so
+    // the user can see what the prior run was about. Live attaches just wrote
+    // the summary themselves, so showing it again would only echo the exit
+    // line we already printed.
+    if !is_live {
+        let history = client.list_events(ChatEventQuery {
+            session_id: &session.id,
+            after_seq: None,
+            limit: None,
+        })?;
+        if let Some(note) = cast::find_cast_summary(&history).and_then(|s| format_summary_note(&s))
+        {
+            notes.push(note);
+        }
+    }
+
+    let launched = if is_live {
+        format!(
+            "{} live session {} via daemon",
+            origin.verb_past(),
+            session.id
+        )
+    } else {
+        format!(
+            "{} completed session {} (replayed via daemon)",
+            origin.verb_past(),
+            session.id
+        )
+    };
+
+    let next_step = if is_live {
+        Some(format!(
+            "Run `coven attach {}` later to revisit; events are durable.",
+            session.id
+        ))
+    } else {
+        Some(format!(
+            "Run `coven sessions` to manage this session, or `/sacrifice {}` to delete it.",
+            session.id
+        ))
+    };
+
+    Ok(CastOutcome {
+        request: request_text.to_string(),
+        launched: Some(launched),
+        session_id: Some(session.id),
+        next_step,
+        notes,
+    })
+}
+
+/// Drain the historical event log for a non-running session through the same
+/// observer the live follower uses. Returns the decoded exit if the replay
+/// contains an `exit` event so the outcome card can show the original status.
+fn replay_completed_session(
+    client: &mut dyn ChatClient,
+    session_id: &str,
+    observer: &mut dyn FollowerObserver,
+) -> Result<Option<CastSessionExit>> {
+    let records = client.list_events(ChatEventQuery {
+        session_id,
+        after_seq: None,
+        limit: None,
+    })?;
+
+    let mut exit = None;
+    for record in records {
+        let decoded = cast::follow::decode_event(&record);
+        match &decoded {
+            cast::follow::CastFollowEvent::Output(chunk) => observer.on_output(chunk),
+            cast::follow::CastFollowEvent::Exit { status, exit_code } => {
+                observer.on_exit(status, *exit_code);
+                exit = Some(CastSessionExit {
+                    status: status.clone(),
+                    exit_code: *exit_code,
+                });
+            }
+            cast::follow::CastFollowEvent::Other { kind } => observer.on_other(kind),
+        }
+    }
+    Ok(exit)
 }
 
 fn format_exit_summary(exit: &CastSessionExit) -> String {
@@ -1274,4 +1453,151 @@ pub(crate) fn move_magical_tui_selection(current: usize, direction: MagicalTuiMo
 #[cfg(test)]
 pub(crate) fn render_frame_plain_for_test(selection: usize) -> String {
     render_magical_tui_frame_plain(selection)
+}
+
+#[cfg(test)]
+mod attach_tests {
+    use std::cell::RefCell;
+    use std::io::Cursor;
+
+    use super::*;
+    use crate::tui::chat::client::LaunchRequest;
+
+    /// Stub client that returns a canned event log on every `list_events` call
+    /// and records which session id was queried. Mirrors the stub in
+    /// `cast::follow` tests but kept local to shell.rs so the wiring (not the
+    /// already-tested decode pipeline) is what's under test here.
+    struct ReplayClient {
+        events: Vec<store::EventRecord>,
+        queries: RefCell<Vec<String>>,
+    }
+
+    impl ReplayClient {
+        fn new(events: Vec<store::EventRecord>) -> Self {
+            Self {
+                events,
+                queries: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ChatClient for ReplayClient {
+        fn launch_session(&mut self, _request: LaunchRequest) -> Result<store::SessionRecord> {
+            unimplemented!("not exercised by replay tests")
+        }
+
+        fn get_session(&mut self, _session_id: &str) -> Result<store::SessionRecord> {
+            unimplemented!("not exercised by replay tests")
+        }
+
+        fn list_sessions(&mut self) -> Result<Vec<store::SessionRecord>> {
+            unimplemented!("not exercised by replay tests")
+        }
+
+        fn list_events(&mut self, query: ChatEventQuery<'_>) -> Result<Vec<store::EventRecord>> {
+            self.queries.borrow_mut().push(query.session_id.to_string());
+            Ok(self.events.clone())
+        }
+
+        fn send_input(&mut self, _session_id: &str, _data: &str) -> Result<()> {
+            unimplemented!("not exercised by replay tests")
+        }
+
+        fn kill_session(&mut self, _session_id: &str) -> Result<()> {
+            unimplemented!("not exercised by replay tests")
+        }
+    }
+
+    fn output_event(seq: i64, data: &str) -> store::EventRecord {
+        store::EventRecord {
+            seq,
+            id: format!("event-{seq}"),
+            session_id: "session-1".to_string(),
+            kind: "output".to_string(),
+            payload_json: serde_json::json!({ "data": data }).to_string(),
+            created_at: "2026-05-19T00:00:00Z".to_string(),
+        }
+    }
+
+    fn exit_event(seq: i64, status: &str, exit_code: Option<i32>) -> store::EventRecord {
+        let payload = match exit_code {
+            Some(code) => serde_json::json!({ "status": status, "exitCode": code }),
+            None => serde_json::json!({ "status": status }),
+        };
+        store::EventRecord {
+            seq,
+            id: format!("event-{seq}"),
+            session_id: "session-1".to_string(),
+            kind: "exit".to_string(),
+            payload_json: payload.to_string(),
+            created_at: "2026-05-19T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn attach_origin_verb_labels_distinguish_attach_from_summon() {
+        assert_eq!(AttachOrigin::Attach.verb_past(), "Attached to");
+        assert_eq!(AttachOrigin::Summon.verb_past(), "Summoned and attached to");
+    }
+
+    #[test]
+    fn replay_completed_session_streams_full_transcript_into_observer() {
+        let mut client = ReplayClient::new(vec![
+            output_event(1, "hello\n"),
+            output_event(2, "world\n"),
+            exit_event(3, "completed", Some(0)),
+        ]);
+        let mut buffer: Cursor<Vec<u8>> = Cursor::new(Vec::new());
+        let mut observer = TranscriptObserver::new(&mut buffer);
+
+        let exit =
+            replay_completed_session(&mut client, "session-1", &mut observer).expect("replay");
+
+        let rendered = String::from_utf8(buffer.into_inner()).unwrap();
+        assert!(
+            rendered.contains("hello"),
+            "transcript missing first chunk: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("world"),
+            "transcript missing second chunk"
+        );
+        assert!(
+            rendered.contains("[Cast: session completed (exit code 0)]"),
+            "transcript should include Cast exit banner: {rendered:?}"
+        );
+
+        let exit = exit.expect("replay should surface the recorded exit");
+        assert_eq!(exit.status, "completed");
+        assert_eq!(exit.exit_code, Some(0));
+
+        let queries = client.queries.borrow();
+        assert_eq!(queries.len(), 1, "one full-history fetch is enough");
+        assert_eq!(queries[0], "session-1");
+    }
+
+    #[test]
+    fn replay_completed_session_returns_none_when_no_exit_event_in_log() {
+        let mut client = ReplayClient::new(vec![
+            output_event(1, "still going\n"),
+            output_event(2, "no exit yet\n"),
+        ]);
+        let mut buffer: Cursor<Vec<u8>> = Cursor::new(Vec::new());
+        let mut observer = TranscriptObserver::new(&mut buffer);
+
+        let exit =
+            replay_completed_session(&mut client, "session-1", &mut observer).expect("replay");
+
+        assert!(
+            exit.is_none(),
+            "replay must not invent an exit when the log has none"
+        );
+        let rendered = String::from_utf8(buffer.into_inner()).unwrap();
+        assert!(rendered.contains("still going"));
+        assert!(rendered.contains("no exit yet"));
+        assert!(
+            !rendered.contains("[Cast:"),
+            "no Cast exit banner without an exit event: {rendered:?}"
+        );
+    }
 }
