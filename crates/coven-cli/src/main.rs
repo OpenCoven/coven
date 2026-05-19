@@ -631,6 +631,10 @@ pub(crate) fn summon_only_command(session_id: &str) -> Result<store::SessionReco
     if session.archived_at.is_some() {
         store::summon_session(&conn, session_id, &current_timestamp())?;
         eprintln!("summoned session from the archive");
+        let Some(session) = store::get_session(&conn, session_id)? else {
+            anyhow::bail!("session `{session_id}` not found");
+        };
+        return Ok(session);
     }
 
     Ok(session)
