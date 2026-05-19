@@ -858,6 +858,9 @@ fn coven_home_from_env(coven_home: Option<OsString>, home: Option<OsString>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::cast::{
+        build_plan, parse_spell, CastHarness, CastIntent, CastRisk, CastStepKind, SafetyDecision,
+    };
     use crate::tui::is_key_press;
     use crate::tui::sessions::{
         format_session_line, render_session_browser_frame_plain, render_sessions_json,
@@ -866,11 +869,11 @@ mod tests {
         SESSION_BROWSER_FIRST_SESSION_ROW,
     };
     use crate::tui::shell::{
-        magical_tui_inner_width_for_columns, magical_tui_items, move_magical_tui_selection,
-        parse_magical_tui_input, render_magical_tui_frame_for_raw_terminal,
-        render_magical_tui_frame_plain, render_magical_tui_frame_plain_with_input,
-        render_magical_tui_frame_plain_with_width, MagicalTuiMove, MagicalTuiRequest,
-        MAGICAL_TUI_MAX_INNER_WIDTH,
+        cast_non_interactive_frame_for_test, magical_tui_inner_width_for_columns,
+        magical_tui_items, move_magical_tui_selection, parse_magical_tui_input,
+        render_magical_tui_frame_for_raw_terminal, render_magical_tui_frame_plain,
+        render_magical_tui_frame_plain_with_input, render_magical_tui_frame_plain_with_width,
+        MagicalTuiMove, MagicalTuiRequest, MAGICAL_TUI_MAX_INNER_WIDTH,
     };
     use crossterm::event::KeyEventKind;
 
@@ -1185,6 +1188,102 @@ mod tests {
             MagicalTuiRequest::AttachSession("abc123".to_string())
         );
         Ok(())
+    }
+
+    #[test]
+    fn cast_non_interactive_frame_introduces_cast_and_shows_examples() {
+        let project = PathBuf::from("/tmp/some-repo");
+        let frame = cast_non_interactive_frame_for_test(Some(&project), Some("codex"));
+
+        assert!(frame.contains("Cast"), "frame is missing the Cast salute");
+        assert!(frame.contains("Coven familiar"));
+        assert!(frame.contains("/tmp/some-repo"));
+        assert!(frame.contains("codex"));
+        assert!(frame.contains("fix the failing tests"));
+        assert!(frame.contains("run claude polish the README"));
+        assert!(frame.contains("/sessions"));
+    }
+
+    #[test]
+    fn cast_parses_natural_text_as_default_harness_spell() {
+        let intent = parse_spell("fix the failing tests").expect("parse");
+        match intent {
+            CastIntent::NaturalSpell { prompt } => assert_eq!(prompt, "fix the failing tests"),
+            other => panic!("expected natural spell, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cast_routes_run_claude_plain_language_to_claude() {
+        let intent = parse_spell("run claude polish the README").expect("parse");
+        match intent {
+            CastIntent::HarnessSpell { harness, prompt } => {
+                assert_eq!(harness, CastHarness::Claude);
+                assert_eq!(prompt, "polish the README");
+            }
+            other => panic!("expected harness spell, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cast_routes_sessions_keyword_to_session_browser() {
+        let intent = parse_spell("sessions").expect("parse");
+        assert!(matches!(intent, CastIntent::OpenSessions));
+    }
+
+    #[test]
+    fn cast_plan_picks_safe_default_harness_for_natural_spell() {
+        let plan = build_plan(parse_spell("fix the failing tests").unwrap(), || {
+            Some(CastHarness::Codex)
+        })
+        .unwrap();
+
+        assert_eq!(plan.risk(), CastRisk::Safe);
+        let harness = plan.harness.expect("default harness should be resolved");
+        assert_eq!(harness.harness, CastHarness::Codex);
+        assert!(plan
+            .steps
+            .iter()
+            .any(|step| step.kind == CastStepKind::LaunchSession));
+    }
+
+    #[test]
+    fn cast_plan_marks_publish_spells_as_confirmation_required() {
+        let plan = build_plan(
+            parse_spell("publish the new crate to crates.io").unwrap(),
+            || Some(CastHarness::Codex),
+        )
+        .unwrap();
+
+        assert_eq!(plan.risk(), CastRisk::Confirm);
+    }
+
+    #[test]
+    fn cast_plan_for_sacrifice_describes_typed_confirm_in_copy() {
+        let plan = build_plan(parse_spell("/sacrifice abcdef123456").unwrap(), || {
+            Some(CastHarness::Codex)
+        })
+        .unwrap();
+
+        let inform_note = plan
+            .steps
+            .iter()
+            .find(|step| matches!(step.kind, CastStepKind::Inform))
+            .expect("sacrifice plan should include an inform step");
+        assert!(
+            inform_note.note.to_lowercase().contains("typed"),
+            "sacrifice inform should describe typed-word confirm, got {:?}",
+            inform_note.note
+        );
+        match plan.decision {
+            SafetyDecision::Confirm { suggestion, .. } => {
+                assert!(
+                    suggestion.contains("`sacrifice`"),
+                    "sacrifice suggestion should name the typed-confirm word, got {suggestion:?}"
+                );
+            }
+            other => panic!("expected confirm, got {other:?}"),
+        }
     }
 
     #[test]

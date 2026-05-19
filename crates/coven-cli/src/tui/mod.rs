@@ -2,6 +2,7 @@
 
 use crossterm::event::KeyEventKind;
 
+pub(crate) mod cast;
 pub mod chat;
 pub(crate) mod sessions;
 pub(crate) mod shell;
