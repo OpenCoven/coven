@@ -1,0 +1,83 @@
+//! Cast: Coven's integrated first-party familiar.
+//!
+//! Phase 1 keeps Cast deterministic. The user types a spell, Cast parses it
+//! into a `CastIntent`, builds a `CastPlan` describing what would happen,
+//! checks the plan against a small safety classifier, and (for routable
+//! plans) reports a `CastOutcome` after the existing CLI handler does the
+//! real work.
+//!
+//! The Rust daemon, session ledger, harness adapters, and project-root guard
+//! all remain the authority. Cast is orchestration and presentation: it
+//! never bypasses the daemon and never invents a second runtime.
+
+pub(crate) mod intent;
+pub(crate) mod outcome;
+pub(crate) mod plan;
+pub(crate) mod render;
+pub(crate) mod safety;
+
+use anyhow::Result;
+
+use crate::harness;
+
+pub(crate) use intent::{parse_spell, CastHarness, CastIntent};
+pub(crate) use outcome::CastOutcome;
+pub(crate) use plan::{build_plan, CastPlan};
+pub(crate) use render::{render_cast_frame_for_terminal, render_outcome, render_plan_intro};
+pub(crate) use safety::{CastRisk, SafetyDecision};
+
+// Re-exports used only by tests in `crate::tests` (main.rs). Bundled here
+// rather than scattered behind `cfg(test)` so the names live next to the
+// rest of the Cast surface.
+#[cfg(test)]
+pub(crate) use plan::CastStepKind;
+#[cfg(test)]
+pub(crate) use render::render_cast_frame_plain;
+
+/// Build a plan from raw user text, using the installed harnesses on PATH
+/// to resolve the safe default. Tests should prefer `build_plan` directly
+/// with an injected resolver so PATH lookups stay out of the suite.
+pub(crate) fn plan_spell(raw: &str) -> Result<CastPlan> {
+    let intent = parse_spell(raw)?;
+    build_plan(intent, default_harness)
+}
+
+/// Resolve Cast's safe default harness from the host's installed adapters.
+/// Codex wins; Claude is the fallback; otherwise `None`.
+pub(crate) fn default_harness() -> Option<CastHarness> {
+    let harnesses = harness::built_in_harnesses();
+    if harnesses.iter().any(|h| h.id == "codex" && h.available) {
+        return Some(CastHarness::Codex);
+    }
+    if harnesses.iter().any(|h| h.id == "claude" && h.available) {
+        return Some(CastHarness::Claude);
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_spell_with_empty_input_opens_launcher() {
+        let plan = plan_spell("").unwrap();
+        assert!(matches!(plan.intent, CastIntent::OpenTui));
+    }
+
+    #[test]
+    fn plan_spell_with_natural_text_produces_a_launch_plan() {
+        let plan = plan_spell("fix the failing tests").unwrap();
+        assert!(matches!(plan.intent, CastIntent::NaturalSpell { .. }));
+        assert!(plan
+            .steps
+            .iter()
+            .any(|step| step.kind == CastStepKind::LaunchSession));
+    }
+
+    #[test]
+    fn plan_spell_propagates_parser_errors() {
+        let error = plan_spell("/banana").unwrap_err();
+        assert!(error.to_string().contains("unknown Cast slash command"));
+    }
+}

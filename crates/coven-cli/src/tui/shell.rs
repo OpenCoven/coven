@@ -8,9 +8,13 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
 };
 
+use super::cast::{
+    self, render_cast_frame_for_terminal, render_outcome, render_plan_intro, CastIntent,
+    CastOutcome, CastPlan, CastRisk, SafetyDecision,
+};
 use super::{is_key_press, sessions};
 use crate::{
-    archive_session_command, attach_session, default_harness_id, prompt_for_optional_line,
+    archive_session_command, attach_session, default_harness_id, project, prompt_for_optional_line,
     prompt_for_required_line, run_daemon_command, run_doctor, run_patch_openclaw, run_session,
     sacrifice_session_command, summon_session_command, theme, DaemonCommand,
 };
@@ -183,8 +187,7 @@ pub(crate) fn magical_tui_items() -> &'static [MagicalTuiItem] {
 
 pub(crate) fn run() -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        println!("{}", render_magical_tui_frame_plain(0));
-        println!("\nTip: run `coven tui` in a terminal, type a task, then press Enter.");
+        print_cast_non_interactive_frame();
         return Ok(());
     }
 
@@ -244,10 +247,15 @@ pub(crate) fn run() -> Result<()> {
 
 fn run_magical_tui_request(request: MagicalTuiRequest) -> Result<()> {
     match request {
+        // Palette buttons keep their existing direct dispatch. Cast layers in
+        // when the user actually types a spell.
         MagicalTuiRequest::Action(action) => run_magical_tui_action(action),
-        MagicalTuiRequest::NaturalPrompt(prompt) => run_default_prompt_session(&prompt),
+        // Free-text spells flow through Cast for parsing, planning, and the
+        // intro/outcome frames the user sees around session launches.
+        MagicalTuiRequest::NaturalPrompt(prompt) => run_cast_spell(&prompt),
         MagicalTuiRequest::HarnessPrompt { harness, prompt } => {
-            run_session(&harness, &[prompt], None, None, false)
+            let raw = format!("/{} {}", harness, prompt);
+            run_cast_spell(&raw)
         }
         MagicalTuiRequest::AttachSession(session_id) => attach_session(&session_id),
         MagicalTuiRequest::SummonSession(session_id) => summon_session_command(&session_id),
@@ -256,6 +264,265 @@ fn run_magical_tui_request(request: MagicalTuiRequest) -> Result<()> {
             sacrifice_session_command(&session_id, false)
         }
     }
+}
+
+/// Cast entry point for free-text spells. Parses the raw input into a
+/// `CastIntent`, builds a plan, renders the intro card the user sees before
+/// any side effect, dispatches the matching handler, then renders the
+/// outcome card.
+fn run_cast_spell(raw: &str) -> Result<()> {
+    let plan = cast::plan_spell(raw)?;
+    print_plan_intro(&plan);
+    dispatch_cast_plan(plan)
+}
+
+fn dispatch_cast_plan(plan: CastPlan) -> Result<()> {
+    match plan.risk() {
+        CastRisk::Reject => {
+            print_outcome(&plan_rejected_outcome(&plan));
+            return Ok(());
+        }
+        CastRisk::Confirm | CastRisk::Safe => {}
+    }
+
+    let outcome = match plan.intent.clone() {
+        CastIntent::NaturalSpell { prompt } => dispatch_default_spell(&plan, &prompt)?,
+        CastIntent::HarnessSpell { harness, prompt } => {
+            dispatch_harness_spell(&plan, harness.id(), &prompt)?
+        }
+        CastIntent::OpenSessions => {
+            sessions::run_browser(false)?;
+            CastOutcome {
+                request: plan.headline.clone(),
+                launched: Some("Coven session browser (active)".to_string()),
+                session_id: None,
+                next_step: Some(
+                    "Use the browser actions (Rejoin, View Log, Summon, Archive, Sacrifice)."
+                        .to_string(),
+                ),
+                notes: vec![],
+            }
+        }
+        CastIntent::OpenAllSessions => {
+            sessions::run_browser(true)?;
+            CastOutcome {
+                request: plan.headline.clone(),
+                launched: Some("Coven session browser (active + archived)".to_string()),
+                session_id: None,
+                next_step: Some(
+                    "Use the browser actions to summon archived sessions or archive completed ones."
+                        .to_string(),
+                ),
+                notes: vec![],
+            }
+        }
+        CastIntent::AttachSession { session_id } => {
+            attach_session(&session_id)?;
+            CastOutcome {
+                request: plan.headline.clone(),
+                launched: Some(format!("Attached to session {session_id}")),
+                session_id: Some(session_id),
+                next_step: Some(
+                    "Detach with Ctrl+C; the session keeps running under the daemon.".to_string(),
+                ),
+                notes: vec![],
+            }
+        }
+        CastIntent::SummonSession { session_id } => {
+            summon_session_command(&session_id)?;
+            CastOutcome {
+                request: plan.headline.clone(),
+                launched: Some(format!("Summoned session {session_id}")),
+                session_id: Some(session_id),
+                next_step: Some(
+                    "The session is now active again — attach to follow it.".to_string(),
+                ),
+                notes: vec![],
+            }
+        }
+        CastIntent::ArchiveSession { session_id } => {
+            archive_session_command(&session_id)?;
+            CastOutcome {
+                request: plan.headline.clone(),
+                launched: Some(format!("Archived session {session_id}")),
+                session_id: Some(session_id),
+                next_step: Some(
+                    "Use `/summon <id>` later to restore it; events are preserved.".to_string(),
+                ),
+                notes: vec![],
+            }
+        }
+        CastIntent::SacrificeSession { session_id } => {
+            sacrifice_session_command(&session_id, false)?;
+            CastOutcome {
+                request: plan.headline.clone(),
+                launched: Some(format!("Sacrificed session {session_id}")),
+                session_id: Some(session_id),
+                next_step: None,
+                notes: vec!["Sacrifice permanently deletes the session and its events.".to_string()],
+            }
+        }
+        CastIntent::Doctor => {
+            run_doctor()?;
+            CastOutcome {
+                request: plan.headline.clone(),
+                launched: Some("Coven doctor".to_string()),
+                session_id: None,
+                next_step: Some(
+                    "Install or auth any missing harness, then retry your spell.".to_string(),
+                ),
+                notes: vec![],
+            }
+        }
+        CastIntent::DaemonStatus => {
+            run_daemon_command(DaemonCommand::Status)?;
+            CastOutcome {
+                request: plan.headline.clone(),
+                launched: Some("Coven daemon status".to_string()),
+                session_id: None,
+                next_step: Some("Run `coven daemon start` if status reported stopped.".to_string()),
+                notes: vec![],
+            }
+        }
+        CastIntent::Help => {
+            run_tui_help()?;
+            CastOutcome::for_request(plan.headline.clone())
+        }
+        CastIntent::StartHere => {
+            run_new_user_start_here()?;
+            CastOutcome::for_request(plan.headline.clone())
+        }
+        CastIntent::OpenTui => {
+            // Already in the launcher — show the palette help instead of
+            // re-entering the raw-mode loop.
+            run_tui_help()?;
+            CastOutcome::for_request(plan.headline.clone())
+        }
+        CastIntent::PatchOpenClaw => {
+            run_patch_openclaw(vec![], None, None, None, false, false, true)?;
+            CastOutcome::for_request(plan.headline.clone())
+        }
+        CastIntent::Quit => {
+            let primary = theme::fg(theme::PRIMARY);
+            let reset = theme::reset();
+            println!("{primary}The circle fades. Nothing changed.{reset}");
+            return Ok(());
+        }
+    };
+
+    print_outcome(&outcome);
+    Ok(())
+}
+
+fn dispatch_default_spell(plan: &CastPlan, prompt: &str) -> Result<CastOutcome> {
+    let Some(plan_harness) = plan.harness else {
+        return Err(anyhow!(
+            "no supported harness is available; run `coven doctor` first"
+        ));
+    };
+    let title = plan.title.as_deref();
+    run_session(
+        plan_harness.harness.id(),
+        &[prompt.to_string()],
+        None,
+        title,
+        false,
+    )?;
+    Ok(CastOutcome {
+        request: prompt.to_string(),
+        launched: Some(format!(
+            "{} session (Cast default, project-scoped)",
+            plan_harness.harness.label()
+        )),
+        session_id: None,
+        next_step: Some("Run `coven sessions` to see this session.".to_string()),
+        notes: plan_outcome_notes(plan),
+    })
+}
+
+fn dispatch_harness_spell(plan: &CastPlan, harness_id: &str, prompt: &str) -> Result<CastOutcome> {
+    let title = plan.title.as_deref();
+    run_session(harness_id, &[prompt.to_string()], None, title, false)?;
+    Ok(CastOutcome {
+        request: prompt.to_string(),
+        launched: Some(format!(
+            "{} session (user-chosen, project-scoped)",
+            harness_label(harness_id)
+        )),
+        session_id: None,
+        next_step: Some("Run `coven sessions` to see this session.".to_string()),
+        notes: plan_outcome_notes(plan),
+    })
+}
+
+fn plan_outcome_notes(plan: &CastPlan) -> Vec<String> {
+    let mut notes = Vec::new();
+    if let SafetyDecision::Confirm { reason, suggestion } = &plan.decision {
+        notes.push(format!("Risk: {reason}. {suggestion}"));
+    }
+    notes
+}
+
+fn plan_rejected_outcome(plan: &CastPlan) -> CastOutcome {
+    let (reason, alternative) = match &plan.decision {
+        SafetyDecision::Reject {
+            reason,
+            alternative,
+        } => (reason.clone(), alternative.clone()),
+        _ => (
+            "Cast rejected the spell.".to_string(),
+            "Try a more specific outcome.".to_string(),
+        ),
+    };
+    CastOutcome {
+        request: plan.headline.clone(),
+        launched: None,
+        session_id: None,
+        next_step: Some(alternative),
+        notes: vec![format!("Rejected: {reason}")],
+    }
+}
+
+fn harness_label(harness_id: &str) -> &'static str {
+    match harness_id {
+        "codex" => "Codex",
+        "claude" => "Claude Code",
+        _ => "Harness",
+    }
+}
+
+fn print_plan_intro(plan: &CastPlan) {
+    let frame = render_plan_intro(plan);
+    if !frame.is_empty() {
+        println!("{frame}");
+    }
+}
+
+fn print_outcome(outcome: &CastOutcome) {
+    let frame = render_outcome(outcome);
+    if !frame.is_empty() {
+        print!("\n{frame}");
+    }
+}
+
+fn print_cast_non_interactive_frame() {
+    let project_root = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| project::canonical_project_root(&cwd).ok());
+    let default_harness_id = default_harness_id();
+    let frame = render_cast_frame_for_terminal(project_root.as_deref(), default_harness_id);
+    print!("{frame}");
+    println!("\nTip: run `coven` in a real terminal to open the Cast launcher and type a spell.");
+}
+
+/// Plain-text Cast frame for tests and pipe targets. Mirrors
+/// `print_cast_non_interactive_frame` minus the theme escapes and stdout.
+#[cfg(test)]
+pub(crate) fn cast_non_interactive_frame_for_test(
+    project_root: Option<&std::path::Path>,
+    default_harness: Option<&str>,
+) -> String {
+    super::cast::render_cast_frame_plain(project_root, default_harness)
 }
 
 fn run_magical_tui_action(action: MagicalTuiAction) -> Result<()> {
@@ -364,12 +631,6 @@ fn parse_session_slash_command(
     Ok(build(session_id.to_string()))
 }
 
-fn run_default_prompt_session(prompt: &str) -> Result<()> {
-    let harness = default_harness_id()
-        .ok_or_else(|| anyhow!("no supported harness is available; run `coven doctor` first"))?;
-    run_session(harness, &[prompt.to_string()], None, None, false)
-}
-
 fn run_tui_help() -> Result<()> {
     let primary_strong = theme::fg(theme::PRIMARY_STRONG);
     let reset = theme::reset();
@@ -426,6 +687,7 @@ pub(crate) fn render_magical_tui_frame_for_raw_terminal(selection: usize, input:
     render_magical_tui_frame(selection, input).replace('\n', "\r\n")
 }
 
+#[allow(dead_code)]
 pub(crate) fn render_magical_tui_frame_plain(selection: usize) -> String {
     render_magical_tui_frame_with_mode_and_width(
         selection,
