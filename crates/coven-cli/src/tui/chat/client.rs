@@ -11,7 +11,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::{api::EventsResponse, daemon, store};
+use crate::{
+    api::{EventsResponse, HealthResponse, COVEN_API_NAMED_VERSION},
+    daemon, store,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LaunchRequest {
@@ -56,12 +59,14 @@ pub(crate) trait ChatClient {
 
 pub(crate) struct DaemonChatClient {
     coven_home: PathBuf,
+    api_checked: bool,
 }
 
 impl Default for DaemonChatClient {
     fn default() -> Self {
         Self {
             coven_home: coven_home_dir(),
+            api_checked: false,
         }
     }
 }
@@ -71,13 +76,16 @@ impl DaemonChatClient {
     /// the Cast follower when it needs to spin up a second client on a
     /// background thread without re-detecting `$COVEN_HOME`.
     pub(crate) fn with_coven_home(coven_home: PathBuf) -> Self {
-        Self { coven_home }
+        Self {
+            coven_home,
+            api_checked: false,
+        }
     }
 }
 
 impl DaemonChatClient {
     fn request_json<T: for<'de> Deserialize<'de>>(
-        &self,
+        &mut self,
         method: &str,
         path: &str,
         body: Option<Value>,
@@ -91,12 +99,41 @@ impl DaemonChatClient {
         })
     }
 
-    fn request_empty(&self, method: &str, path: &str, body: Option<Value>) -> Result<()> {
+    fn request_empty(&mut self, method: &str, path: &str, body: Option<Value>) -> Result<()> {
         self.request(method, path, body).map(|_| ())
     }
 
-    fn request(&self, method: &str, path: &str, body: Option<Value>) -> Result<HttpResponse> {
+    fn request(&mut self, method: &str, path: &str, body: Option<Value>) -> Result<HttpResponse> {
+        if path != "/api/v1/health" {
+            self.ensure_api_contract()?;
+        }
+        self.raw_request(method, path, body)
+    }
+
+    fn raw_request(&self, method: &str, path: &str, body: Option<Value>) -> Result<HttpResponse> {
         request_daemon(&self.coven_home, method, path, body)
+    }
+
+    fn ensure_api_contract(&mut self) -> Result<()> {
+        if self.api_checked {
+            return Ok(());
+        }
+
+        let response = self.raw_request("GET", "/api/v1/health", None)?;
+        let health: HealthResponse = serde_json::from_str(&response.body).with_context(|| {
+            format!(
+                "failed to parse Coven daemon response for GET /api/v1/health: {}",
+                response.body
+            )
+        })?;
+        if health.api_version != COVEN_API_NAMED_VERSION {
+            anyhow::bail!(
+                "Coven daemon API mismatch: expected {COVEN_API_NAMED_VERSION}, got {}",
+                health.api_version
+            );
+        }
+        self.api_checked = true;
+        Ok(())
     }
 }
 
@@ -104,7 +141,7 @@ impl ChatClient for DaemonChatClient {
     fn launch_session(&mut self, request: LaunchRequest) -> Result<store::SessionRecord> {
         self.request_json(
             "POST",
-            "/sessions",
+            "/api/v1/sessions",
             Some(json!({
                 "projectRoot": request.project_root,
                 "cwd": request.cwd,
@@ -116,15 +153,15 @@ impl ChatClient for DaemonChatClient {
     }
 
     fn get_session(&mut self, session_id: &str) -> Result<store::SessionRecord> {
-        self.request_json("GET", &format!("/sessions/{session_id}"), None)
+        self.request_json("GET", &format!("/api/v1/sessions/{session_id}"), None)
     }
 
     fn list_sessions(&mut self) -> Result<Vec<store::SessionRecord>> {
-        self.request_json("GET", "/sessions", None)
+        self.request_json("GET", "/api/v1/sessions", None)
     }
 
     fn list_events(&mut self, query: ChatEventQuery<'_>) -> Result<Vec<store::EventRecord>> {
-        let mut path = format!("/events?sessionId={}", query.session_id);
+        let mut path = format!("/api/v1/events?sessionId={}", query.session_id);
         if let Some(after_seq) = query.after_seq {
             path.push_str(&format!("&afterSeq={after_seq}"));
         }
@@ -138,7 +175,7 @@ impl ChatClient for DaemonChatClient {
     fn send_input(&mut self, session_id: &str, data: &str) -> Result<()> {
         self.request_empty(
             "POST",
-            &format!("/sessions/{session_id}/input"),
+            &format!("/api/v1/sessions/{session_id}/input"),
             Some(json!({ "data": data })),
         )
     }
@@ -146,7 +183,7 @@ impl ChatClient for DaemonChatClient {
     fn kill_session(&mut self, session_id: &str) -> Result<()> {
         self.request_empty(
             "POST",
-            &format!("/sessions/{session_id}/kill"),
+            &format!("/api/v1/sessions/{session_id}/kill"),
             Some(json!({})),
         )
     }

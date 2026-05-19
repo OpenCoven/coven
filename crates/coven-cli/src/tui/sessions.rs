@@ -51,6 +51,64 @@ pub(crate) const SESSION_BROWSER_FIRST_SESSION_ROW: usize = 5;
 const SESSION_BROWSER_MAX_VISIBLE_SESSIONS: usize = 8;
 const PLAIN_SESSION_ID_COLUMN_WIDTH: usize = 36;
 
+/// Restores raw mode and mouse capture on all exit paths for the session browser.
+struct BrowserTerminalGuard {
+    raw_mode_enabled: bool,
+    mouse_capture_enabled: bool,
+}
+
+impl BrowserTerminalGuard {
+    fn enter() -> Result<Self> {
+        enable_raw_mode().context("failed to enter Coven session browser")?;
+        if let Err(error) = execute!(io::stdout(), EnableMouseCapture) {
+            let _ = disable_raw_mode();
+            return Err(anyhow::Error::from(error)
+                .context("failed to enable Coven session browser mouse support"));
+        }
+        Ok(Self {
+            raw_mode_enabled: true,
+            mouse_capture_enabled: true,
+        })
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        let mut first_error = None;
+
+        if self.mouse_capture_enabled {
+            if let Err(error) = execute!(io::stdout(), DisableMouseCapture) {
+                first_error.get_or_insert_with(|| {
+                    anyhow::Error::from(error)
+                        .context("failed to disable Coven session browser mouse support")
+                });
+            } else {
+                self.mouse_capture_enabled = false;
+            }
+        }
+
+        if self.raw_mode_enabled {
+            if let Err(error) = disable_raw_mode() {
+                first_error.get_or_insert_with(|| {
+                    anyhow::Error::from(error).context("failed to leave Coven session browser")
+                });
+            } else {
+                self.raw_mode_enabled = false;
+            }
+        }
+
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for BrowserTerminalGuard {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
 fn list_sessions_plain(include_archived: bool) -> Result<()> {
     let store_path = coven_store_path()?;
     let conn = store::open_store(&store_path)?;
@@ -176,9 +234,7 @@ pub(crate) fn run_browser(include_archived: bool) -> Result<()> {
 
     let mut selected_session = 0;
     let mut selected_action = 0;
-    enable_raw_mode().context("failed to enter Coven session browser")?;
-    execute!(io::stdout(), EnableMouseCapture)
-        .context("failed to enable Coven session browser mouse support")?;
+    let mut terminal = BrowserTerminalGuard::enter()?;
     let selected = loop {
         selected_action = selected_action.min(
             session_browser_actions(&sessions[selected_session])
@@ -285,9 +341,7 @@ pub(crate) fn run_browser(include_archived: bool) -> Result<()> {
             _ => {}
         }
     };
-    execute!(io::stdout(), DisableMouseCapture)
-        .context("failed to disable Coven session browser mouse support")?;
-    disable_raw_mode().context("failed to leave Coven session browser")?;
+    terminal.restore()?;
     println!();
 
     if let Some((session, action)) = selected {
@@ -531,14 +585,25 @@ pub(crate) fn session_browser_session_row_to_index(
     (index < displayed_count && index < total_count).then_some(index)
 }
 
+const SESSION_BROWSER_ROWS_BEFORE_SELECTED_SECTION: usize = 4;
+const SESSION_BROWSER_ROWS_AFTER_SELECTED_SECTION: usize = 4;
+
+fn session_browser_first_action_row(displayed_count: usize, has_more_sessions: bool) -> usize {
+    let more_sessions_row_count = usize::from(has_more_sessions);
+    SESSION_BROWSER_FIRST_SESSION_ROW
+        + displayed_count
+        + more_sessions_row_count
+        + SESSION_BROWSER_ROWS_BEFORE_SELECTED_SECTION
+        + SESSION_BROWSER_ROWS_AFTER_SELECTED_SECTION
+}
+
 pub(crate) fn session_browser_action_row_to_index(
     row: usize,
     displayed_count: usize,
     has_more_sessions: bool,
     action_count: usize,
 ) -> Option<usize> {
-    let extra_rows = usize::from(has_more_sessions);
-    let first_action_row = SESSION_BROWSER_FIRST_SESSION_ROW + displayed_count + extra_rows + 8;
+    let first_action_row = session_browser_first_action_row(displayed_count, has_more_sessions);
     let index = row.checked_sub(first_action_row)?;
     (index < action_count).then_some(index)
 }

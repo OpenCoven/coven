@@ -63,6 +63,9 @@ pub(super) struct App {
     pub(super) last_tick: Instant,
     pub(super) active_session_id: Option<String>,
     pub(super) last_event_seq: Option<i64>,
+    event_poll_backoff_until: Option<Instant>,
+    event_poll_failure_streak: u32,
+    last_event_poll_error: Option<String>,
     pub(super) sessions: Vec<store::SessionRecord>,
     pub(super) show_session_overlay: bool,
     pub(super) input_history: Vec<String>,
@@ -99,6 +102,9 @@ impl App {
             last_tick: Instant::now(),
             active_session_id: None,
             last_event_seq: None,
+            event_poll_backoff_until: None,
+            event_poll_failure_streak: 0,
+            last_event_poll_error: None,
             sessions: Vec::new(),
             show_session_overlay: false,
             input_history: Vec::new(),
@@ -328,6 +334,7 @@ impl App {
             Ok(session) => {
                 self.active_session_id = Some(session.id.clone());
                 self.last_event_seq = None;
+                self.reset_event_poll_failures();
                 self.push_system_message(&format!(
                     "Started daemon session {} ({})",
                     session.id, session.harness
@@ -353,6 +360,7 @@ impl App {
             Ok(session) => {
                 self.active_session_id = Some(session.id.clone());
                 self.last_event_seq = None;
+                self.reset_event_poll_failures();
                 self.push_system_message(&format!(
                     "Attached to daemon session {} ({}, {})",
                     session.id, session.harness, session.status
@@ -384,18 +392,44 @@ impl App {
         let Some(session_id) = self.active_session_id.clone() else {
             return;
         };
+        let now = Instant::now();
+        if self
+            .event_poll_backoff_until
+            .is_some_and(|until| until > now)
+        {
+            return;
+        }
         match self.client.list_events(ChatEventQuery {
             session_id: &session_id,
             after_seq: self.last_event_seq,
             limit: Some(200),
         }) {
             Ok(events) => {
+                self.reset_event_poll_failures();
                 for event in events {
                     self.last_event_seq = Some(event.seq);
                     self.push_event_message(&event);
                 }
             }
-            Err(error) => self.push_system_message(&format!("Event follow failed: {error}")),
+            Err(error) => self.record_event_poll_failure(error),
+        }
+    }
+
+    fn reset_event_poll_failures(&mut self) {
+        self.event_poll_backoff_until = None;
+        self.event_poll_failure_streak = 0;
+        self.last_event_poll_error = None;
+    }
+
+    fn record_event_poll_failure(&mut self, error: anyhow::Error) {
+        let message = error.to_string();
+        let repeated_error = self.last_event_poll_error.as_deref() == Some(message.as_str());
+        self.event_poll_failure_streak = self.event_poll_failure_streak.saturating_add(1);
+        self.event_poll_backoff_until =
+            Some(Instant::now() + event_poll_backoff(self.event_poll_failure_streak));
+        self.last_event_poll_error = Some(message.clone());
+        if !repeated_error {
+            self.push_system_message(&format!("Event follow failed: {message}"));
         }
     }
 
@@ -627,6 +661,19 @@ impl App {
     }
 }
 
+/// Applies a capped exponential backoff so repeated event-poll failures do not
+/// flood the transcript or hammer the daemon when it is unavailable.
+fn event_poll_backoff(streak: u32) -> Duration {
+    let millis = match streak {
+        0 | 1 => 500,
+        2 => 1_000,
+        3 => 2_000,
+        4 => 4_000,
+        _ => 5_000,
+    };
+    Duration::from_millis(millis)
+}
+
 // ── Discover agents from built-in harnesses ────────────────────────────────
 
 pub(super) fn discover_agents() -> Vec<AgentInfo> {
@@ -649,8 +696,9 @@ fn timestamp_now() -> String {
 
 fn split_first_arg(input: &str) -> Option<(&str, &str)> {
     let trimmed = input.trim();
-    let (first, rest) = trimmed.split_once(char::is_whitespace)?;
-    let rest = rest.trim();
+    let split_idx = trimmed.find(char::is_whitespace)?;
+    let first = &trimmed[..split_idx];
+    let rest = trimmed[split_idx..].trim();
     (!first.is_empty() && !rest.is_empty()).then_some((first, rest))
 }
 
@@ -694,6 +742,7 @@ mod tests {
         launched: Rc<RefCell<Vec<LaunchRequest>>>,
         sessions: Rc<RefCell<Vec<SessionRecord>>>,
         events: Rc<RefCell<Vec<EventRecord>>>,
+        event_error: Rc<RefCell<Option<String>>>,
     }
 
     impl RecordingChatClient {
@@ -734,6 +783,9 @@ mod tests {
                 query.session_id,
                 query.after_seq.unwrap_or(0)
             ));
+            if let Some(error) = self.event_error.borrow().clone() {
+                return Err(anyhow::anyhow!(error));
+            }
             Ok(self
                 .events
                 .borrow()
@@ -914,5 +966,34 @@ mod tests {
             .messages
             .iter()
             .any(|message| message.content.contains("hello from daemon")));
+    }
+
+    #[test]
+    fn poll_session_events_backs_off_and_coalesces_repeated_failures() {
+        let client = RecordingChatClient::default();
+        *client.event_error.borrow_mut() = Some("daemon unavailable".to_string());
+        let (mut app, mirror) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+
+        app.poll_session_events();
+        app.poll_session_events();
+        app.event_poll_backoff_until = Some(Instant::now() - Duration::from_millis(1));
+        app.poll_session_events();
+
+        let calls = mirror.calls.borrow();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| *call == "events:session-1:0")
+                .count(),
+            2
+        );
+        assert_eq!(
+            app.messages
+                .iter()
+                .filter(|message| message.content == "Event follow failed: daemon unavailable")
+                .count(),
+            1
+        );
     }
 }

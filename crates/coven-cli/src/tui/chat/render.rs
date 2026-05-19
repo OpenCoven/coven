@@ -253,6 +253,8 @@ fn render_hint_bar(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(" commands  ", theme::ratatui_style(HINT_LABEL)),
             Span::styled("/agent", theme::ratatui_style(HINT_KEY).bold()),
             Span::styled(" switch  ", theme::ratatui_style(HINT_LABEL)),
+            Span::styled("PgUp/PgDn", theme::ratatui_style(HINT_KEY).bold()),
+            Span::styled(" scroll  ", theme::ratatui_style(HINT_LABEL)),
             Span::styled("Shift+Enter", theme::ratatui_style(HINT_KEY).bold()),
             Span::styled(" newline  ", theme::ratatui_style(HINT_LABEL)),
             Span::styled("Ctrl+K", theme::ratatui_style(HINT_KEY).bold()),
