@@ -276,13 +276,64 @@ fn run_cast_spell(raw: &str) -> Result<()> {
     dispatch_cast_plan(plan)
 }
 
+fn confirm_cast_plan(plan: &CastPlan) -> Result<bool> {
+    let mut stdout = io::stdout();
+
+    if !io::stdin().is_terminal() || !stdout.is_terminal() {
+        writeln!(stdout)?;
+        writeln!(
+            stdout,
+            "Confirmation required for \"{}\", but no interactive terminal is available. Cancelling.",
+            plan.headline
+        )?;
+        stdout.flush()?;
+        return Ok(false);
+    }
+
+    writeln!(stdout)?;
+    writeln!(stdout, "Confirmation required for: {}", plan.headline)?;
+    writeln!(stdout, "Press 'y' to continue, or 'n' / Esc / Enter to cancel.")?;
+    stdout.flush()?;
+
+    loop {
+        match event::read()? {
+            Event::Key(key) => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    writeln!(stdout, "Confirmed.")?;
+                    stdout.flush()?;
+                    return Ok(true);
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => {
+                    writeln!(stdout, "Cancelled.")?;
+                    stdout.flush()?;
+                    return Ok(false);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+}
+
 fn dispatch_cast_plan(plan: CastPlan) -> Result<()> {
     match plan.risk() {
         CastRisk::Reject => {
             print_outcome(&plan_rejected_outcome(&plan));
             return Ok(());
         }
-        CastRisk::Confirm | CastRisk::Safe => {}
+        CastRisk::Confirm => {
+            if !confirm_cast_plan(&plan)? {
+                print_outcome(&CastOutcome {
+                    request: plan.headline.clone(),
+                    launched: None,
+                    session_id: None,
+                    next_step: Some("Nothing was run.".to_string()),
+                    notes: vec!["Action cancelled before dispatch.".to_string()],
+                });
+                return Ok(());
+            }
+        }
+        CastRisk::Safe => {}
     }
 
     let outcome = match plan.intent.clone() {
