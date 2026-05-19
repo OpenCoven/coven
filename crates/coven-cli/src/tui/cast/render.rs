@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use crate::theme::{self, TerminalMode};
+use crate::theme::{self, fit_chars, TerminalMode};
 
 use super::outcome::CastOutcome;
 use super::plan::{CastHarnessSource, CastPlan, CastStepKind};
@@ -251,22 +251,6 @@ fn step_kind_label(kind: CastStepKind) -> &'static str {
         CastStepKind::Diagnose => "diagnose",
         CastStepKind::Inform => "inform",
     }
-}
-
-fn fit_chars(value: &str, limit: usize) -> String {
-    let count = value.chars().count();
-    if count <= limit {
-        return value.to_string();
-    }
-    if limit == 0 {
-        return String::new();
-    }
-    if limit == 1 {
-        return "…".to_string();
-    }
-    let mut fitted: String = value.chars().take(limit - 1).collect();
-    fitted.push('…');
-    fitted
 }
 
 #[cfg(test)]

@@ -9,6 +9,7 @@ use crossterm::{
 };
 
 use super::is_key_press;
+use crate::theme::fit_chars;
 use crate::{
     archive_session_command, attach_session, coven_store_path, first_chars,
     prompt_for_required_line, sacrifice_session_command, store, summon_session_command, theme,
@@ -627,23 +628,6 @@ pub(crate) fn format_session_line(session: &store::SessionRecord) -> String {
 pub(crate) fn render_sessions_json(sessions: &[store::SessionRecord]) -> Result<String> {
     serde_json::to_string_pretty(&serde_json::json!({ "sessions": sessions }))
         .context("failed to serialize sessions as JSON")
-}
-
-fn fit_chars(value: &str, limit: usize) -> String {
-    let count = value.chars().count();
-    if count <= limit {
-        return value.to_string();
-    }
-    if limit == 0 {
-        return String::new();
-    }
-    if limit == 1 {
-        return "…".to_string();
-    }
-
-    let mut fitted = value.chars().take(limit - 1).collect::<String>();
-    fitted.push('…');
-    fitted
 }
 
 #[cfg(test)]

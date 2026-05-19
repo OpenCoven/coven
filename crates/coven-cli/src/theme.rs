@@ -68,6 +68,10 @@ pub mod brand {
         g: 0x6B,
         b: 0x6B,
     };
+    /// True-black canvas (`--oc-surface-0`). The terminal canvas/backdrop —
+    /// distinct from `SURFACE_1`, which is the brand chrome surface that sits
+    /// on top of it.
+    pub const SURFACE_0: Rgb = Rgb { r: 0, g: 0, b: 0 };
     pub const SURFACE_1: Rgb = Rgb {
         r: 0x0F,
         g: 0x0A,
@@ -78,6 +82,13 @@ pub mod brand {
         g: 0x18,
         b: 0x25,
     };
+    /// Lifted brand surface (`--oc-surface-3`) — used for scrollbar tracks
+    /// and other quiet recessed chrome where pure black is too harsh.
+    pub const SURFACE_3: Rgb = Rgb {
+        r: 0x2A,
+        g: 0x24,
+        b: 0x38,
+    };
 }
 
 // ── Semantic tokens (what callsites import) ──
@@ -87,19 +98,58 @@ pub const PRIMARY_STRONG: Rgb = brand::PURPLE_2;
 pub const AGENT_LABEL: Rgb = brand::PURPLE_2;
 pub const USER_LABEL: Rgb = brand::PURPLE_1;
 pub const HINT_KEY: Rgb = brand::TEXT;
-// Defined for future use: HINT_LABEL distinguishes prose from keys in hint
-// bars; DANGER/SUCCESS will be wired to destructive prompts and ready-state
-// indicators in a later phase. Per spec, "defined and tested only" for Phase 1.
-#[allow(dead_code)]
 pub const HINT_LABEL: Rgb = brand::TEXT_MUTED;
 pub const FIELD_LABEL: Rgb = brand::TEXT_MUTED;
-#[allow(dead_code)]
 pub const DANGER: Rgb = brand::DANGER;
-#[allow(dead_code)]
 pub const SUCCESS: Rgb = brand::SUCCESS;
 pub const DIM: Rgb = brand::TEXT_FAINT;
 pub const SURFACE: Rgb = brand::SURFACE_1;
 pub const SURFACE_STRONG: Rgb = brand::SURFACE_2;
+/// Body text — replaces the ad-hoc `Color::White` that screens were reaching
+/// for. Brand-aligned, near-white but never pure white.
+pub const TEXT: Rgb = brand::TEXT;
+/// Secondary body text — quieter than `TEXT`, brighter than `DIM`. Replaces
+/// hand-rolled 256-color indices for agent-side message bodies.
+pub const TEXT_DIM: Rgb = brand::TEXT_MUTED;
+/// Inactive border / divider color. Replaces hand-picked 256-color indices
+/// for input bezels and other quiet outlines.
+pub const BORDER_DIM: Rgb = brand::TEXT_FAINT;
+/// Scrollbar track and other recessed chrome (very dark, brand-tinted).
+pub const SCROLL_TRACK: Rgb = brand::SURFACE_3;
+/// Bottom-most canvas color behind every TUI screen.
+pub const BACKDROP: Rgb = brand::SURFACE_0;
+
+// ── Status semantics ──
+
+/// What a status indicator is communicating. Drives the color of "ready",
+/// "working", "error" etc. across the TUI so renderers never pick a raw
+/// `Color::Green` again. `Ready` is consumed today by the chat status bar;
+/// the other variants are pre-wired for the screen renderers landing in the
+/// next phase and are reachable via `status_token` / `status_style`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Status {
+    Ready,
+    #[allow(dead_code)]
+    Working,
+    #[allow(dead_code)]
+    Warning,
+    #[allow(dead_code)]
+    Error,
+    #[allow(dead_code)]
+    Idle,
+}
+
+/// Brand token for a status semantic. Use via `status_style` or
+/// `ratatui_style(status_token(...))`.
+pub fn status_token(status: Status) -> Rgb {
+    match status {
+        Status::Ready => SUCCESS,
+        Status::Working => PRIMARY,
+        Status::Warning => PRIMARY_STRONG,
+        Status::Error => DANGER,
+        Status::Idle => DIM,
+    }
+}
 
 // ── Terminal-mode detection ──
 
@@ -247,6 +297,12 @@ pub fn ratatui_style(c: Rgb) -> RatStyle {
     RatStyle::default().fg(ratatui_color(c))
 }
 
+/// Sugar over `ratatui_style(status_token(s))` — keeps status indicators
+/// in renderers tied to the `Status` semantic, not raw colors.
+pub fn status_style(status: Status) -> RatStyle {
+    ratatui_style(status_token(status))
+}
+
 // ── ANSI Display wrappers ──
 
 use std::fmt;
@@ -337,6 +393,78 @@ impl fmt::Display for Reset {
             _ => f.write_str("\x1b[0m"),
         }
     }
+}
+
+// ── Palette ──
+
+/// Pre-resolved foreground escapes for every common token, plus the matching
+/// `Reset`. Renderers building a raw-ANSI frame can grab one of these and
+/// stop writing `theme::Fg::with_mode(theme::PRIMARY, mode)` six times in a
+/// row. Phase 2 defines this helper and exercises it via tests; Phase 3
+/// will migrate the existing per-renderer boilerplate over.
+#[allow(dead_code)]
+#[derive(Copy, Clone, Debug)]
+pub struct Palette {
+    pub mode: TerminalMode,
+    pub primary: Fg,
+    pub primary_strong: Fg,
+    pub user_label: Fg,
+    pub agent_label: Fg,
+    pub field_label: Fg,
+    pub hint_key: Fg,
+    pub hint_label: Fg,
+    pub text: Fg,
+    pub text_dim: Fg,
+    pub dim: Fg,
+    pub reset: Reset,
+}
+
+/// Palette for the active terminal mode.
+#[allow(dead_code)]
+pub fn palette() -> Palette {
+    palette_for(mode())
+}
+
+/// Palette for an explicit mode (useful for tests and the plain-text
+/// renderers that pass `TerminalMode::NoColor`).
+pub fn palette_for(mode: TerminalMode) -> Palette {
+    Palette {
+        mode,
+        primary: Fg::with_mode(PRIMARY, mode),
+        primary_strong: Fg::with_mode(PRIMARY_STRONG, mode),
+        user_label: Fg::with_mode(USER_LABEL, mode),
+        agent_label: Fg::with_mode(AGENT_LABEL, mode),
+        field_label: Fg::with_mode(FIELD_LABEL, mode),
+        hint_key: Fg::with_mode(HINT_KEY, mode),
+        hint_label: Fg::with_mode(HINT_LABEL, mode),
+        text: Fg::with_mode(TEXT, mode),
+        text_dim: Fg::with_mode(TEXT_DIM, mode),
+        dim: Fg::with_mode(DIM, mode),
+        reset: Reset::with_mode(mode),
+    }
+}
+
+// ── Width helpers ──
+
+/// Truncate `value` to at most `limit` characters, using `…` as the last
+/// character when truncation happens. `chars().count()` is intentional: every
+/// terminal column we render today is a single character cell, and `…` itself
+/// is one cell. Wide-cell text (CJK, emoji) is out of scope for the current
+/// TUI screens; if that changes, swap this for `unicode_width`.
+pub fn fit_chars(value: &str, limit: usize) -> String {
+    let count = value.chars().count();
+    if count <= limit {
+        return value.to_string();
+    }
+    if limit == 0 {
+        return String::new();
+    }
+    if limit == 1 {
+        return "…".to_string();
+    }
+    let mut fitted: String = value.chars().take(limit - 1).collect();
+    fitted.push('…');
+    fitted
 }
 
 #[cfg(test)]
@@ -436,6 +564,11 @@ mod tests {
             "--oc-success"
         );
         assert_eq!(
+            brand::SURFACE_0,
+            rgb_from_hex(&vars["--oc-surface-0"]),
+            "--oc-surface-0"
+        );
+        assert_eq!(
             brand::SURFACE_1,
             rgb_from_hex(&vars["--oc-surface-1"]),
             "--oc-surface-1"
@@ -444,6 +577,11 @@ mod tests {
             brand::SURFACE_2,
             rgb_from_hex(&vars["--oc-surface-2"]),
             "--oc-surface-2"
+        );
+        assert_eq!(
+            brand::SURFACE_3,
+            rgb_from_hex(&vars["--oc-surface-3"]),
+            "--oc-surface-3"
         );
 
         assert_eq!(
@@ -477,6 +615,107 @@ mod tests {
         assert_eq!(DIM, brand::TEXT_FAINT);
         assert_eq!(SURFACE, brand::SURFACE_1);
         assert_eq!(SURFACE_STRONG, brand::SURFACE_2);
+        assert_eq!(TEXT, brand::TEXT);
+        assert_eq!(TEXT_DIM, brand::TEXT_MUTED);
+        assert_eq!(BORDER_DIM, brand::TEXT_FAINT);
+        assert_eq!(SCROLL_TRACK, brand::SURFACE_3);
+        assert_eq!(BACKDROP, brand::SURFACE_0);
+    }
+
+    #[test]
+    fn status_token_maps_each_variant_to_a_semantic_token() {
+        assert_eq!(status_token(Status::Ready), SUCCESS);
+        assert_eq!(status_token(Status::Working), PRIMARY);
+        assert_eq!(status_token(Status::Warning), PRIMARY_STRONG);
+        assert_eq!(status_token(Status::Error), DANGER);
+        assert_eq!(status_token(Status::Idle), DIM);
+    }
+
+    #[test]
+    fn status_style_in_no_color_mode_resolves_to_reset_fg() {
+        // We can't easily flip global mode in a test, but `status_style`
+        // composes `ratatui_style` over `status_token`. Spot-check the chain
+        // by asserting `ratatui_color_with_mode` collapses to Reset in
+        // NoColor — which is the property `status_style` inherits.
+        use ratatui::style::Color;
+        assert_eq!(
+            ratatui_color_with_mode(status_token(Status::Ready), TerminalMode::NoColor),
+            Color::Reset,
+        );
+        assert_eq!(
+            ratatui_color_with_mode(status_token(Status::Error), TerminalMode::NoColor),
+            Color::Reset,
+        );
+    }
+
+    #[test]
+    fn palette_in_no_color_mode_emits_no_escapes() {
+        let p = palette_for(TerminalMode::NoColor);
+        assert_eq!(p.mode, TerminalMode::NoColor);
+        for s in [
+            format!("{}", p.primary),
+            format!("{}", p.primary_strong),
+            format!("{}", p.user_label),
+            format!("{}", p.agent_label),
+            format!("{}", p.field_label),
+            format!("{}", p.hint_key),
+            format!("{}", p.hint_label),
+            format!("{}", p.text),
+            format!("{}", p.text_dim),
+            format!("{}", p.dim),
+            format!("{}", p.reset),
+        ] {
+            assert!(s.is_empty(), "expected empty in NoColor, got {s:?}");
+        }
+    }
+
+    #[test]
+    fn palette_in_true_color_mode_emits_truecolor_escapes() {
+        let p = palette_for(TerminalMode::TrueColor);
+        // PRIMARY = brand::PURPLE_3 = 0xC5 0xBD 0xED
+        assert_eq!(format!("{}", p.primary), "\x1b[38;2;197;189;237m");
+        // RESET is SGR-zero
+        assert_eq!(format!("{}", p.reset), "\x1b[0m");
+        // TEXT = brand::TEXT = 0xF0 0xF0 0xF0
+        assert_eq!(format!("{}", p.text), "\x1b[38;2;240;240;240m");
+    }
+
+    #[test]
+    fn palette_in_indexed_256_mode_emits_indexed_escapes() {
+        let p = palette_for(TerminalMode::Indexed256);
+        // PRIMARY → 183 (verified by nearest_256_brand_tokens)
+        assert_eq!(format!("{}", p.primary), "\x1b[38;5;183m");
+        // RESET still SGR-zero in Indexed256
+        assert_eq!(format!("{}", p.reset), "\x1b[0m");
+    }
+
+    #[test]
+    fn fit_chars_returns_input_when_already_within_limit() {
+        assert_eq!(fit_chars("hello", 10), "hello");
+        assert_eq!(fit_chars("hello", 5), "hello");
+    }
+
+    #[test]
+    fn fit_chars_truncates_with_ellipsis_when_over_limit() {
+        assert_eq!(fit_chars("hello world", 8), "hello w…");
+        assert_eq!(fit_chars("abcdef", 3), "ab…");
+    }
+
+    #[test]
+    fn fit_chars_handles_zero_and_one_limit_edge_cases() {
+        assert_eq!(fit_chars("anything", 0), "");
+        assert_eq!(fit_chars("anything", 1), "…");
+        // Empty input is always under any limit.
+        assert_eq!(fit_chars("", 0), "");
+        assert_eq!(fit_chars("", 5), "");
+    }
+
+    #[test]
+    fn fit_chars_counts_chars_not_bytes_for_multibyte_input() {
+        // 5 chars, each multi-byte. Already within a 5-cell limit.
+        assert_eq!(fit_chars("héllo", 5), "héllo");
+        // Truncating multi-byte input keeps char-aligned slices.
+        assert_eq!(fit_chars("héllo world", 6), "héllo…");
     }
 
     #[test]

@@ -4,7 +4,7 @@
 
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Margin, Rect},
-    style::{Color, Style},
+    style::Style,
     text::{Line, Span, Text},
     widgets::{
         Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
@@ -15,8 +15,8 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::theme::{
-    self, AGENT_LABEL, DIM, HINT_KEY, HINT_LABEL, PRIMARY, PRIMARY_STRONG, SURFACE, SURFACE_STRONG,
-    USER_LABEL,
+    self, Status, AGENT_LABEL, BACKDROP, BORDER_DIM, DIM, HINT_KEY, HINT_LABEL, PRIMARY,
+    PRIMARY_STRONG, SCROLL_TRACK, SURFACE, SURFACE_STRONG, TEXT, TEXT_DIM, USER_LABEL,
 };
 
 use super::app::{App, InputMode, MessageRole, SPINNER_FRAMES};
@@ -33,7 +33,7 @@ pub(super) fn render_ui(f: &mut Frame, app: &mut App) {
 
     // Background fill
     f.render_widget(
-        Block::default().style(Style::default().bg(Color::Black)),
+        Block::default().style(Style::default().bg(theme::ratatui_color(BACKDROP))),
         area,
     );
 
@@ -89,7 +89,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                 theme::ratatui_style(DIM),
             )
         } else {
-            Span::styled("\u{2713} ready", Style::default().fg(Color::Green))
+            Span::styled("\u{2713} ready", theme::status_style(Status::Ready))
         },
     ];
 
@@ -146,8 +146,8 @@ fn render_messages(f: &mut Frame, app: &mut App, area: Rect) {
             let wrapped = textwrap::wrap(content_line, wrap_width);
             for wl in wrapped {
                 let style = match msg.role {
-                    MessageRole::User => Style::default().fg(Color::White),
-                    MessageRole::Agent => Style::default().fg(Color::Indexed(252)),
+                    MessageRole::User => theme::ratatui_style(TEXT),
+                    MessageRole::Agent => theme::ratatui_style(TEXT_DIM),
                     MessageRole::System => theme::ratatui_style(PRIMARY),
                 };
                 lines.push(Line::from(Span::styled(format!("  {wl}"), style)));
@@ -171,7 +171,7 @@ fn render_messages(f: &mut Frame, app: &mut App, area: Rect) {
 
     let chat_block = Block::default()
         .borders(Borders::NONE)
-        .style(Style::default().bg(Color::Black));
+        .style(Style::default().bg(theme::ratatui_color(BACKDROP)));
 
     let messages_widget = Paragraph::new(Text::from(visible_lines))
         .block(chat_block)
@@ -189,7 +189,7 @@ fn render_messages(f: &mut Frame, app: &mut App, area: Rect) {
                 .end_symbol(None)
                 .track_symbol(Some("\u{2502}"))
                 .thumb_symbol("\u{2588}")
-                .track_style(Style::default().fg(Color::Indexed(236)))
+                .track_style(theme::ratatui_style(SCROLL_TRACK))
                 .thumb_style(theme::ratatui_style(PRIMARY)),
             area,
             &mut scrollbar_state,
@@ -209,7 +209,7 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::default().fg(if app.input.starts_with('/') {
             theme::ratatui_color(PRIMARY)
         } else {
-            Color::Indexed(240)
+            theme::ratatui_color(BORDER_DIM)
         }))
         .title(Span::styled(
             format!(" {prompt_label} "),
@@ -219,7 +219,7 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
 
     let input_widget = Paragraph::new(app.input.as_str())
         .block(input_block)
-        .style(Style::default().fg(Color::White))
+        .style(theme::ratatui_style(TEXT))
         .wrap(Wrap { trim: false });
 
     f.render_widget(input_widget, area);
@@ -330,7 +330,7 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
         for (cmd, desc) in commands {
             lines.push(Line::from(vec![
                 Span::styled(format!("    {cmd:<22}"), theme::ratatui_style(PRIMARY)),
-                Span::styled(*desc, Style::default().fg(Color::White)),
+                Span::styled(*desc, theme::ratatui_style(TEXT)),
             ]));
         }
         lines.push(Line::from(""));
@@ -384,7 +384,7 @@ fn render_agent_select(f: &mut Frame, app: &App, area: Rect) {
             } else if !agent.available {
                 theme::ratatui_style(DIM)
             } else {
-                Style::default().fg(Color::White)
+                theme::ratatui_style(TEXT)
             };
 
             ListItem::new(Line::from(vec![
@@ -449,7 +449,7 @@ fn render_session_overlay(f: &mut Frame, app: &App, area: Rect) {
                 Span::styled(format!(" {marker} "), theme::ratatui_style(PRIMARY)),
                 Span::styled(
                     format!("{:<8}", session.status),
-                    Style::default().fg(Color::Green),
+                    theme::status_style(Status::Ready),
                 ),
                 Span::styled(
                     format!(" {:<7} ", session.harness),
@@ -465,7 +465,7 @@ fn render_session_overlay(f: &mut Frame, app: &App, area: Rect) {
                         &session.title,
                         popup_area.width.saturating_sub(36) as usize,
                     ),
-                    Style::default().fg(Color::White),
+                    theme::ratatui_style(TEXT),
                 ),
             ]));
         }

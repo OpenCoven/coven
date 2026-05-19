@@ -893,7 +893,7 @@ mod tests {
     #[test]
     fn tui_launcher_and_session_browser_are_owned_by_tui_modules() {
         let shell_frame = tui::shell::render_frame_plain_for_test(0);
-        assert!(shell_frame.contains("CovenCLI"));
+        assert!(shell_frame.contains("Cast"));
 
         let sessions = [test_session_record(
             "session-alpha-1234567890",
@@ -990,19 +990,22 @@ mod tests {
     }
 
     #[test]
-    fn magical_tui_frame_uses_purple_gold_branding_and_lists_core_actions() {
+    fn magical_tui_frame_opens_with_cast_identity_and_lists_core_commands() {
         let frame = render_magical_tui_frame_plain(1);
 
-        assert!(frame.contains("CovenCLI"));
-        assert!(frame.contains("Welcome back to the Coven."));
-        assert!(frame.contains("OpenCoven terminal home"));
-        assert!(frame.contains("[coven]"));
+        // Identity line replaces the old "CovenCLI" header + "Welcome back" salute.
+        assert!(frame.contains("Cast"));
+        assert!(!frame.contains("CovenCLI"));
+        assert!(!frame.contains("Welcome back"));
+        // Core commands still render in the visible window (selection 1).
         assert!(frame.contains("/start"));
         assert!(frame.contains("/help"));
         assert!(frame.contains("/run"));
-        assert!(frame.contains("/patch"));
-        assert!(frame.contains("/doctor"));
-        assert!(frame.contains(">"));
+        // Selection arrow uses the thin guillemet (U+203A), not ASCII `>`.
+        assert!(
+            frame.contains('›'),
+            "selected row should render with U+203A"
+        );
     }
 
     #[test]
@@ -1046,24 +1049,35 @@ mod tests {
     }
 
     #[test]
-    fn magical_tui_frame_previews_selected_spell_command() {
+    fn magical_tui_frame_previews_selected_action() {
         let frame = render_magical_tui_frame_plain(0);
 
-        assert!(frame.contains("Selected command"));
+        // The "Selected command" panel collapses to compact spell/detail rows.
+        assert!(frame.contains("spell"));
+        assert!(frame.contains("detail"));
         assert!(frame.contains("/start"));
-        assert!(frame.contains("coven doctor"));
-        assert!(frame.contains("~/.coven"));
+        assert!(frame.contains("Setup check"));
+        // The decorative "Store: ~/.coven" footer is gone per design contract.
+        assert!(!frame.contains("Store:"));
     }
 
     #[test]
-    fn magical_tui_frame_is_newcomer_friendly() {
+    fn magical_tui_frame_surfaces_command_rail_and_snapshot_for_newcomers() {
         let frame = render_magical_tui_frame_plain(5);
 
-        assert!(frame.contains("Ask anything"));
-        assert!(frame.contains("Empty Enter runs selected slash"));
-        assert!(frame.contains("Slash commands"));
-        assert!(frame.contains("Launch Codex"));
-        assert!(frame.contains("coven run codex"));
+        // Two-lane body: left command rail + right snapshot lane.
+        assert!(frame.contains("Commands"));
+        assert!(frame.contains("Snapshot"));
+        // Snapshot label column is rendered in lowercase per the contract.
+        assert!(frame.contains("project"));
+        assert!(frame.contains("harness"));
+        assert!(frame.contains("daemon"));
+        // /run is in the visible window when selection sits on it.
+        assert!(frame.contains("/run"));
+        assert!(frame.contains("Run an agent"));
+        // Single-line footer hint, dot-separated.
+        assert!(frame.contains("enter run"));
+        assert!(frame.contains("esc quit"));
     }
 
     #[test]
@@ -1074,50 +1088,94 @@ mod tests {
     }
 
     #[test]
-    fn magical_tui_frame_renders_prompt_as_a_bordered_input_box() {
+    fn magical_tui_frame_wraps_prompt_in_thin_horizontal_rules() {
         let frame = render_magical_tui_frame_plain_with_input(0, "summarize the repo", 76);
 
-        assert!(frame.contains("+-- Ask anything "));
-        assert!(frame.contains("| > summarize the repo"));
-        assert!(frame.contains("Ctrl+U clears"));
-    }
-
-    #[test]
-    fn magical_tui_frame_includes_obsidian_style_graph() {
-        let frame = render_magical_tui_frame_plain(0);
-
-        assert!(frame.contains("[memory] -- [coven] -- [sessions]"));
-        assert!(frame.contains("[gateway]"));
-    }
-
-    #[test]
-    fn magical_tui_frame_emulates_intricate_claude_code_home_without_emoji() {
-        let frame = render_magical_tui_frame_plain(0);
-
-        assert!(frame.contains("workspace"));
-        assert!(frame.contains("harness shelf"));
-        assert!(frame.contains("Codex ready"));
-        assert!(frame.contains("Claude Code ready"));
-        assert!(frame.contains("Release notes"));
-        assert!(frame.contains("Tips"));
+        // No `+--+` corner art; single horizontal rule above and below the prompt.
+        assert!(!frame.contains("+--"));
+        assert!(!frame.contains("Ask anything"));
         assert!(
-            frame
-                .chars()
-                .all(|ch| ch == '\n' || ch == '\r' || ch.is_ascii()),
-            "TUI should stay icon/ASCII-only"
+            frame.contains("─"),
+            "prompt should be flanked by thin rules"
         );
+        // The prompt itself is the bare `> input` line, no inner `|` bezels.
+        assert!(frame.contains("> summarize the repo"));
+        assert!(!frame.contains("| > summarize the repo"));
     }
 
     #[test]
-    fn magical_tui_frame_reads_like_a_claude_code_style_terminal_home() {
+    fn magical_tui_frame_drops_decorative_graph_and_task_inbox() {
         let frame = render_magical_tui_frame_plain(0);
 
-        assert!(frame.contains("System snapshot"));
-        assert!(frame.contains("Model lane"));
-        assert!(frame.contains("Workspace map"));
-        assert!(frame.contains("Task inbox"));
-        assert!(frame.contains("Context"));
-        assert!(frame.contains("Approvals"));
+        // Workspace map graph art, task inbox, and "Selected command" panel
+        // are all removed per the Phase 1 design contract.
+        assert!(!frame.contains("[memory]"));
+        assert!(!frame.contains("[gateway]"));
+        assert!(!frame.contains("[ ] inspect repo"));
+        assert!(!frame.contains("Workspace map"));
+        assert!(!frame.contains("Task inbox"));
+        assert!(!frame.contains("Selected command"));
+    }
+
+    #[test]
+    fn magical_tui_frame_avoids_emoji_and_decorative_ascii_chrome() {
+        let frame = render_magical_tui_frame_plain(0);
+
+        // No emoji or pictographs sneak in (BMP-only, no codepoints past U+2FFF
+        // except whitelisted typography we use in the frame).
+        for ch in frame.chars() {
+            let code = ch as u32;
+            let allowed = ch == '\n'
+                || ch == '\r'
+                || ch.is_ascii()
+                || ch == '─'   // U+2500 thin horizontal rule
+                || ch == '›'   // U+203A selected-row marker
+                || ch == '·'   // U+00B7 separator
+                || ch == '↑'
+                || ch == '↓'
+                || ch == '…'; // U+2026 truncation marker from fit_chars
+            assert!(
+                allowed,
+                "unexpected glyph in launcher frame: {ch:?} (U+{code:04X})"
+            );
+        }
+        // No ASCII corner-box chrome remains.
+        assert!(!frame.contains("+--"));
+        assert!(!frame.contains("--+"));
+    }
+
+    #[test]
+    fn magical_tui_frame_follows_phase1_hierarchy() {
+        let frame = render_magical_tui_frame_plain(0);
+
+        // identity → prompt → commands + snapshot → action preview → footer
+        assert!(frame.contains("Cast"));
+        assert!(frame.contains("Commands"));
+        assert!(frame.contains("Snapshot"));
+        assert!(frame.contains("spell"));
+        assert!(frame.contains("detail"));
+        // Single-line dim footer, no `|` separators.
+        assert!(frame.contains("enter run"));
+        assert!(frame.contains("↑↓ select"));
+        assert!(frame.contains("esc quit"));
+        assert!(frame.contains("ctrl+u clear"));
+        assert!(!frame.contains("Empty Enter"));
+    }
+
+    #[test]
+    fn magical_tui_frame_keeps_blank_input_placeholder_dim() {
+        let frame = render_magical_tui_frame_plain(0);
+        // Empty prompt shows the placeholder copy; no `Ask anything` label.
+        assert!(frame.contains("> type a task or /run codex"));
+    }
+
+    #[test]
+    fn magical_tui_frame_windows_long_command_list_with_scroll_hint() {
+        // Selection sits well past the visible window — scroll hint must
+        // appear and the selected slash must still be in the rendered rail.
+        let frame = render_magical_tui_frame_plain(12); // /sacrifice
+        assert!(frame.contains("/sacrifice"));
+        assert!(frame.contains("of 14"));
     }
 
     #[test]
