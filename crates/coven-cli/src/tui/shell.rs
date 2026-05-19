@@ -827,14 +827,17 @@ fn attach_via_daemon(
     }
 
     let mut observer = TranscriptObserver::new(io::stdout());
-    let exit = if is_live {
+    let (exit, replay_summary_note) = if is_live {
         let mut pacer = SleepPacer::new(Duration::from_millis(250));
-        Some(follow_until_exit(
-            &mut client,
-            &session.id,
-            &mut observer,
-            &mut pacer,
-        )?)
+        (
+            Some(follow_until_exit(
+                &mut client,
+                &session.id,
+                &mut observer,
+                &mut pacer,
+            )?),
+            None,
+        )
     } else {
         // For completed sessions, drain the historical event log once. The
         // follower observer renders the transcript exactly as it did on the
@@ -858,13 +861,7 @@ fn attach_via_daemon(
     // the summary themselves, so showing it again would only echo the exit
     // line we already printed.
     if !is_live {
-        let history = client.list_events(ChatEventQuery {
-            session_id: &session.id,
-            after_seq: None,
-            limit: None,
-        })?;
-        if let Some(note) = cast::find_cast_summary(&history).and_then(|s| format_summary_note(&s))
-        {
+        if let Some(note) = replay_summary_note {
             notes.push(note);
         }
     }
@@ -906,17 +903,19 @@ fn attach_via_daemon(
 
 /// Drain the historical event log for a non-running session through the same
 /// observer the live follower uses. Returns the decoded exit if the replay
-/// contains an `exit` event so the outcome card can show the original status.
+/// contains an `exit` event so the outcome card can show the original status,
+/// plus the rendered `cast.summary` note (if present) from the same event set.
 fn replay_completed_session(
     client: &mut dyn ChatClient,
     session_id: &str,
     observer: &mut dyn FollowerObserver,
-) -> Result<Option<CastSessionExit>> {
+) -> Result<(Option<CastSessionExit>, Option<String>)> {
     let records = client.list_events(ChatEventQuery {
         session_id,
         after_seq: None,
         limit: None,
     })?;
+    let summary_note = cast::find_cast_summary(&records).and_then(|s| format_summary_note(&s));
 
     let mut exit = None;
     for record in records {
@@ -933,7 +932,7 @@ fn replay_completed_session(
             cast::follow::CastFollowEvent::Other { kind } => observer.on_other(kind),
         }
     }
-    Ok(exit)
+    Ok((exit, summary_note))
 }
 
 fn format_exit_summary(exit: &CastSessionExit) -> String {
@@ -1541,6 +1540,23 @@ mod attach_tests {
         }
     }
 
+    fn cast_summary_event(seq: i64, request: &str) -> store::EventRecord {
+        store::EventRecord {
+            seq,
+            id: format!("event-{seq}"),
+            session_id: "session-1".to_string(),
+            kind: "cast.summary".to_string(),
+            payload_json: serde_json::json!({
+                "request": request,
+                "status": "completed",
+                "exitCode": 0,
+                "harness": "codex"
+            })
+            .to_string(),
+            created_at: "2026-05-19T00:00:00Z".to_string(),
+        }
+    }
+
     #[test]
     fn attach_origin_verb_labels_distinguish_attach_from_summon() {
         assert_eq!(AttachOrigin::Attach.verb_past(), "Attached to");
@@ -1557,7 +1573,7 @@ mod attach_tests {
         let mut buffer: Cursor<Vec<u8>> = Cursor::new(Vec::new());
         let mut observer = TranscriptObserver::new(&mut buffer);
 
-        let exit =
+        let (exit, summary_note) =
             replay_completed_session(&mut client, "session-1", &mut observer).expect("replay");
 
         let rendered = String::from_utf8(buffer.into_inner()).unwrap();
@@ -1577,6 +1593,10 @@ mod attach_tests {
         let exit = exit.expect("replay should surface the recorded exit");
         assert_eq!(exit.status, "completed");
         assert_eq!(exit.exit_code, Some(0));
+        assert!(
+            summary_note.is_none(),
+            "no summary note without cast.summary"
+        );
 
         let queries = client.queries.borrow();
         assert_eq!(queries.len(), 1, "one full-history fetch is enough");
@@ -1592,7 +1612,7 @@ mod attach_tests {
         let mut buffer: Cursor<Vec<u8>> = Cursor::new(Vec::new());
         let mut observer = TranscriptObserver::new(&mut buffer);
 
-        let exit =
+        let (exit, summary_note) =
             replay_completed_session(&mut client, "session-1", &mut observer).expect("replay");
 
         assert!(
@@ -1606,5 +1626,31 @@ mod attach_tests {
             !rendered.contains("[Cast:"),
             "no Cast exit banner without an exit event: {rendered:?}"
         );
+        assert!(
+            summary_note.is_none(),
+            "no summary note without cast.summary"
+        );
+    }
+
+    #[test]
+    fn replay_completed_session_returns_cast_summary_note_from_same_history_fetch() {
+        let mut client = ReplayClient::new(vec![
+            output_event(1, "hello\n"),
+            cast_summary_event(2, "fix tests"),
+            exit_event(3, "completed", Some(0)),
+        ]);
+        let mut buffer: Cursor<Vec<u8>> = Cursor::new(Vec::new());
+        let mut observer = TranscriptObserver::new(&mut buffer);
+
+        let (exit, summary_note) =
+            replay_completed_session(&mut client, "session-1", &mut observer).expect("replay");
+
+        assert_eq!(exit.and_then(|v| v.exit_code), Some(0));
+        let note = summary_note.expect("summary note should be rendered");
+        assert!(note.contains("Prior Cast summary"));
+        assert!(note.contains("request `fix tests`"));
+
+        let queries = client.queries.borrow();
+        assert_eq!(queries.len(), 1, "summary note should reuse replay history");
     }
 }
