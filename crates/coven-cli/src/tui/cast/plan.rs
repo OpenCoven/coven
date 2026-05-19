@@ -270,8 +270,8 @@ fn harness_spell_plan(harness: CastHarness, prompt: &str, intent: CastIntent) ->
 fn sacrifice_plan(session_id: &str, intent: CastIntent) -> CastPlan {
     let decision = SafetyDecision::Confirm {
         reason: "sacrifice permanently deletes a session and its events".to_string(),
-        suggestion: "Cast will route this to `coven sacrifice <id> --yes`, which prompts for \
-                     typed confirmation in the session browser."
+        suggestion: "Cast will require typed confirmation in the session browser before \
+                     proceeding with the delete."
             .to_string(),
     };
     CastPlan {
