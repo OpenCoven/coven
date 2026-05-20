@@ -6,6 +6,34 @@ read_when:
 title: "Coven changelog and release notes"
 ---
 
+## Week of May 20, 2026
+
+### New features
+
+- **Cast launcher.** `coven` (or the explicit `coven tui`) now opens **Cast**, the prompt-first launcher built against a single visual contract: a `Cast` identity row in brand purple, a thin-rule prompt area, a two-lane **Commands** rail + **Snapshot** body, a windowed list of slash commands with a `N of 14` scroll hint, an action preview, and a single `enter run · ↑↓ select · esc quit · ctrl+u clear` footer. The launcher resizes safely from 18 cols up to 96. See [Coven TUI](/start/coven-tui).
+- **`/quest <goal>` — sequential goal flow.** A new spell decomposes any goal into a Quest with three default phases (**design → implement → verify**). Cast renders a handoff card before each phase showing the carried context and the verbatim sub-prompt the harness will see. At each prompt the user can press Enter to approve, type a replacement sub-prompt, `/skip [reason]` to skip the phase, or `/cancel [reason]` to stop the quest. Natural-language triggers (`start a quest to …`, `quest: …`) work too. See [Cast quest flow](/design/cast-quest-flow).
+- **Resume an interrupted quest by attaching.** `coven attach <anchor-session>` on a quest's anchor session replays the quest's event log, reconstructs the in-memory Quest, and hands control back to the phase loop — so a Ctrl-C'd quest can be resumed exactly where it left off. Crashed-mid-phase work surfaces as Running so you can decide to re-run or skip.
+- **Quest event ledger.** Every quest writes `cast.quest.{started, phase_started, phase_completed, phase_skipped, phase_edited, advanced, completed}` events on its anchor session — durable, queryable, and the source of truth for re-attach. Works in the daemon path (anchor = phase 0's session) **and** the local-PTY fallback path (anchor = a synthesized `quest-<uuid>` row in the local sessions table).
+- **Cast plan and outcome cards.** Every spell now renders a plan card *before* any side effect (showing the resolved harness, the safety decision, the steps Cast will take) and an outcome card *after* (showing what landed, session ids, and concrete next steps).
+- **Per-spell safety gate.** Cast's risk classifier inspects every spell for confirmation-required keywords (publish, push, deploy, sacrifice, etc.) and routes them through a typed confirmation before the harness sees them. Sacrifice still requires you to type the word `sacrifice` to proceed.
+
+### Updates
+
+- **Non-interactive Cast frame** (printed when `coven` is piped or run in CI) tightened to identity + one subtitle line + Context (project, harness) + Example spells + Slash spells + one dim footer hint. No second-person greeting; field labels are lowercase in a fixed 14-char column.
+- **Structured failure detection in quest handoffs.** Non-zero exit codes — including `exit 2`, SIGKILL `137`, SIGINT `130` — now produce failure framing in the next phase's sub-prompt. Previously only the literal string `exit 1` matched.
+- **Quest cursor advances past Skipped phases at the data layer.** `advance` and `skip_phase` walk the cursor forward to the next pending phase, so a skipped middle phase no longer strands the loop on a non-pending row.
+- **`BORDER_SUBTLE` / `BORDER_STRONG` brand tokens** wired into the launcher prompt rules — top rule subtle, bottom rule strong — so focus reads visually without overemphasizing the prompt.
+- **Cast attach surfaces a quest-anchor note** alongside the existing `cast.summary` line when you attach to a completed quest's anchor session.
+- **Daemon-backed Cast attach.** `/attach` and `/summon` route through Cast so the resumed session also gets a Cast transcript and writes a `cast.summary` event when it exits.
+- **TUI shell and session browser** extracted into focused modules (`tui/shell.rs`, `tui/sessions.rs`) so future surfaces can extend either without enlarging `main.rs`.
+- **`sysinfo` bumped to 0.39.2** (was 0.30.13) and **`unicode-width` to 0.2.2** (was 0.2.0) via dependabot.
+
+### Bug fixes
+
+- **Re-attach reconstructs quests written by the local-PTY path.** Quests run without the daemon now write events to a synthetic anchor session in the local store, so `/attach <quest-id>` finds them.
+- **Avoid full event-log scan for the `cast.summary` existence check.** Cast now uses a fast `event_kind_exists` query instead of fetching every event for a session every time it writes a summary.
+- **Resolved a duplicate `list_events` fetch** during cast attach's summary lookup — the existing replay history is reused.
+
 ## Week of May 17, 2026
 
 ### Bug fixes
