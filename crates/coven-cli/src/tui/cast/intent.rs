@@ -73,6 +73,12 @@ pub(crate) enum CastIntent {
     StartHere,
     OpenTui,
     PatchOpenClaw,
+    /// Multi-phase sequential goal. Cast turns the goal into a `Quest`
+    /// (design → implement → verify by default) and dispatches each phase
+    /// in order. See `cast::quest` and `docs/design/cast-quest-flow.md`.
+    Quest {
+        goal: String,
+    },
     Quit,
 }
 
@@ -90,6 +96,10 @@ pub(crate) fn parse_spell(raw: &str) -> Result<CastIntent> {
 
     if let Some(plain_intent) = parse_plain_command(input) {
         return Ok(plain_intent);
+    }
+
+    if let Some(quest_intent) = parse_natural_quest_trigger(input) {
+        return Ok(quest_intent);
     }
 
     if let Some(harness_spell) = parse_natural_harness_prefix(input) {
@@ -131,6 +141,7 @@ fn parse_slash_command(input: &str) -> Result<Option<CastIntent>> {
         "/sacrifice" => session_id_intent(rest, "/sacrifice", |session_id| {
             CastIntent::SacrificeSession { session_id }
         })?,
+        "/quest" => parse_quest_slash(rest)?,
         "/quit" | "/exit" => CastIntent::Quit,
         unknown => {
             return Err(anyhow!(
@@ -154,6 +165,39 @@ fn parse_plain_command(input: &str) -> Option<CastIntent> {
         "tui" | "menu" | "home" => Some(CastIntent::OpenTui),
         _ => None,
     }
+}
+
+/// Recognise plain-language quest triggers. Returns the *original-case*
+/// goal text so the rest of the pipeline can render the user's words back
+/// at them. Matches `start a quest to …`, `begin a quest to …`, and the
+/// shorter `quest <goal>` (must have at least one whitespace separator so
+/// a bare `quest` keyword is unambiguous — currently unclaimed).
+fn parse_natural_quest_trigger(input: &str) -> Option<CastIntent> {
+    let lower = input.to_ascii_lowercase();
+    let triggers = [
+        "start a quest to ",
+        "start a quest for ",
+        "begin a quest to ",
+        "begin a quest for ",
+        "quest to ",
+        "quest for ",
+        "quest: ",
+    ];
+    for trigger in triggers {
+        if let Some(rest) = lower.strip_prefix(trigger) {
+            let goal = input[trigger.len()..].trim();
+            // Defensive: lower-only strip can desync from original casing
+            // when whitespace differs. `rest` is just the length anchor.
+            let _ = rest;
+            if goal.is_empty() {
+                return None;
+            }
+            return Some(CastIntent::Quest {
+                goal: goal.to_string(),
+            });
+        }
+    }
+    None
 }
 
 /// Translate plain-language "run claude X" / "use codex X" / "ask codex X"
@@ -211,6 +255,18 @@ fn parse_run_slash(rest: &str) -> Result<CastIntent> {
     // so the user can still pass through to the default harness.
     Ok(CastIntent::NaturalSpell {
         prompt: rest.to_string(),
+    })
+}
+
+fn parse_quest_slash(rest: &str) -> Result<CastIntent> {
+    let goal = rest.trim();
+    if goal.is_empty() {
+        return Err(anyhow!(
+            "`/quest` needs a goal. Example: `/quest fix the failing tests`."
+        ));
+    }
+    Ok(CastIntent::Quest {
+        goal: goal.to_string(),
     })
 }
 
@@ -437,6 +493,56 @@ mod tests {
     fn unknown_slash_is_an_error() {
         let error = parse_spell("/banana split").unwrap_err();
         assert!(error.to_string().contains("unknown Cast slash command"));
+    }
+
+    #[test]
+    fn slash_quest_requires_a_goal() {
+        let error = parse_spell("/quest").unwrap_err();
+        assert!(error.to_string().contains("`/quest` needs a goal"));
+        let error = parse_spell("/quest   ").unwrap_err();
+        assert!(error.to_string().contains("`/quest` needs a goal"));
+    }
+
+    #[test]
+    fn slash_quest_with_goal_produces_quest_intent() {
+        assert_eq!(
+            intent("/quest fix the failing tests"),
+            CastIntent::Quest {
+                goal: "fix the failing tests".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn natural_language_quest_triggers_produce_quest_intent() {
+        let cases = [
+            "start a quest to ship the redesign",
+            "Begin a quest to ship the redesign",
+            "quest to ship the redesign",
+            "quest: ship the redesign",
+        ];
+        for raw in cases {
+            assert_eq!(
+                intent(raw),
+                CastIntent::Quest {
+                    goal: "ship the redesign".to_string(),
+                },
+                "raw input `{raw}` should parse as a quest",
+            );
+        }
+    }
+
+    #[test]
+    fn bare_quest_keyword_without_goal_falls_through_to_natural_spell() {
+        // "quest" alone is too ambiguous to launch — leave it as a natural
+        // spell so the user sees what Cast would route a non-keyword
+        // through. `/quest` (slash form) still errors clearly above.
+        assert_eq!(
+            intent("quest"),
+            CastIntent::NaturalSpell {
+                prompt: "quest".to_string(),
+            }
+        );
     }
 
     #[test]

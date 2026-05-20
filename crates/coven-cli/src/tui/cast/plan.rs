@@ -170,12 +170,54 @@ where
             "Open the guided OpenClaw patch room",
             CastStep::new(CastStepKind::Inform, "Walk through `coven patch openclaw`"),
         ),
+        CastIntent::Quest { ref goal } => quest_plan(goal, intent.clone(), &default_harness),
         CastIntent::Quit => simple_plan(
             intent,
             "Close Cast without changing anything",
             CastStep::new(CastStepKind::Inform, "Exit the launcher"),
         ),
     })
+}
+
+/// Plan card for `/quest <goal>`. The quest itself is safe to *announce* —
+/// no side effects until a phase is dispatched. Each phase reruns the
+/// safety gate against its own sub-prompt before the harness sees it, so
+/// the quest plan card doesn't need to reclassify the goal text.
+fn quest_plan(
+    goal: &str,
+    intent: CastIntent,
+    default_harness: &dyn Fn() -> Option<CastHarness>,
+) -> CastPlan {
+    let title = derive_title(goal);
+    let headline = format!("Begin quest: {title}");
+    let harness = default_harness().map(|harness| CastPlanHarness {
+        harness,
+        source: CastHarnessSource::SafeDefault,
+    });
+    let harness_note = match harness {
+        Some(plan_harness) => format!(
+            "Each phase delegates to {} unless you override the sub-prompt",
+            plan_harness.harness.label()
+        ),
+        None => "No harness ready — run `coven doctor` to install Codex or Claude Code".to_string(),
+    };
+    let steps = vec![
+        CastStep::new(CastStepKind::Inform, "design — scope the work"),
+        CastStep::new(CastStepKind::Inform, "implement — make the change"),
+        CastStep::new(CastStepKind::Inform, "verify — confirm the change"),
+        CastStep::new(CastStepKind::Inform, harness_note),
+    ];
+    CastPlan {
+        raw_spell: String::new(),
+        intent,
+        headline,
+        steps,
+        decision: SafetyDecision::Proceed,
+        harness,
+        session_id: None,
+        prompt: Some(goal.to_string()),
+        title: Some(title),
+    }
 }
 
 fn natural_spell_plan(
@@ -514,6 +556,53 @@ mod tests {
             .iter()
             .any(|step| step.kind == CastStepKind::Attach));
         assert!(plan.headline.contains("abcdef123456"));
+    }
+
+    #[test]
+    fn quest_intent_produces_three_phase_plan_with_default_harness() {
+        let plan = build_plan(
+            CastIntent::Quest {
+                goal: "ship the launcher redesign".to_string(),
+            },
+            codex,
+        )
+        .unwrap();
+
+        assert!(matches!(plan.intent, CastIntent::Quest { .. }));
+        assert_eq!(plan.risk(), CastRisk::Safe);
+        assert!(plan.headline.starts_with("Begin quest:"));
+        assert!(plan.headline.contains("ship the launcher redesign"));
+
+        let notes: Vec<&str> = plan.steps.iter().map(|s| s.note.as_str()).collect();
+        assert!(notes.iter().any(|n| n.starts_with("design")));
+        assert!(notes.iter().any(|n| n.starts_with("implement")));
+        assert!(notes.iter().any(|n| n.starts_with("verify")));
+        assert!(
+            notes.iter().any(|n| n.contains("Codex")),
+            "harness note should name the resolved default, got {notes:?}",
+        );
+
+        let harness = plan.harness.expect("default harness should be resolved");
+        assert_eq!(harness.harness, CastHarness::Codex);
+        assert_eq!(harness.source, CastHarnessSource::SafeDefault);
+    }
+
+    #[test]
+    fn quest_intent_with_no_default_harness_surfaces_doctor_hint() {
+        let plan = build_plan(
+            CastIntent::Quest {
+                goal: "rewrite the README".to_string(),
+            },
+            none,
+        )
+        .unwrap();
+
+        assert!(plan.harness.is_none());
+        let notes: Vec<&str> = plan.steps.iter().map(|s| s.note.as_str()).collect();
+        assert!(
+            notes.iter().any(|n| n.contains("coven doctor")),
+            "missing-harness note should point at `coven doctor`, got {notes:?}",
+        );
     }
 
     #[test]

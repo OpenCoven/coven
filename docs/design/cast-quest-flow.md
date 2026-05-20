@@ -139,5 +139,14 @@ This module deliberately stops short of the shell wiring so Phase 5's contract �
 - [x] `skip_phase` rolls the cursor past a phase the user judged unnecessary.
 - [x] `render_quest_handoff` shows the source phase, prior status, carried context, target harness, and the sub-prompt text the harness will see.
 - [x] 15 new unit tests cover the composer, advancer, edits, skip, failure framing, and the render card (incl. long sub-prompts and quest exhaustion).
-- [ ] Shell wiring for `/quest <goal>` — Phase 6.
-- [ ] Quest event ledger entries (`cast.quest.*`) so re-attach can reconstruct state — Phase 6.
+- [x] Shell wiring for `/quest <goal>` — landed in Phase 7. `dispatch_cast_quest` in `tui/shell.rs` loops phases, gates each sub-prompt, dispatches via `dispatch_cast_launch`, and advances on each `cast.summary`-derived `QuestPhaseSummary`.
+- [x] Quest event ledger entries (`cast.quest.*`) — landed in Phase 7. `cast.quest.{started, phase_started, phase_completed, advanced, completed}` are written to the first phase's session (the "anchor"). `cast::find_cast_quest_info` decodes them so `/attach <anchor>` surfaces a one-line quest-anchor note alongside the cast.summary.
+
+## 8. Deferred to a later phase
+
+Per the Phase 7 scope decision, four things did **not** land and are tracked for the next slice:
+
+- **Edit / skip UX per phase.** Phase 7 auto-advances every phase. `set_phase_sub_prompt`, `skip_phase`, `compose_sub_prompt`, `QuestHandoff`, and `QuestPhaseStatus::Skipped` are still in the crate surface but reachable only through tests; their `#[allow(dead_code)]` notes call this out.
+- **Full re-attach state rebuild.** `/attach <anchor>` currently prints a one-line note ("phase N/M, in progress / complete"). Replaying `cast.quest.*` events to reconstruct a `Quest` and re-render the next handoff card is the long pole and a separate phase.
+- **Local-PTY fallback ledger.** Quest event writes are best-effort and skipped silently when `dispatch_cast_launch` falls back to the synchronous local PTY path (no daemon, no session id, no anchor). Re-attach will not find a quest there.
+- **`QuestPhaseStatus::Running` transition.** The shell loop transitions Pending → Complete directly (synchronous dispatch). A future async / detached-quest UX would set Running between the two.

@@ -13,6 +13,18 @@ use crate::store;
 /// `shell::write_cast_summary_event` for the producer side.
 pub(crate) const CAST_SUMMARY_KIND: &str = "cast.summary";
 
+/// Event kind Cast writes on the anchor session when a quest begins. See
+/// `shell::dispatch_cast_quest` for the producer side.
+pub(crate) const CAST_QUEST_STARTED_KIND: &str = "cast.quest.started";
+
+/// Event kind Cast writes on the anchor session when a quest's last phase
+/// has finished.
+pub(crate) const CAST_QUEST_COMPLETED_KIND: &str = "cast.quest.completed";
+
+/// Event kind Cast writes on the anchor session right after each phase
+/// finishes. Used by the re-attach detector to compute the phase index.
+pub(crate) const CAST_QUEST_PHASE_COMPLETED_KIND: &str = "cast.quest.phase_completed";
+
 /// Decoded `cast.summary` event. All fields are optional because Cast may
 /// have written a partial payload (e.g. an older Cast that didn't record
 /// `headline`), and the renderer should degrade gracefully.
@@ -34,6 +46,88 @@ pub(crate) fn find_cast_summary(events: &[store::EventRecord]) -> Option<CastAtt
         .rev()
         .find(|event| event.kind == CAST_SUMMARY_KIND)
         .map(decode_summary)
+}
+
+/// Decoded `cast.quest.started` event plus the count of
+/// `cast.quest.phase_completed` events seen on the same session. Both come
+/// from the *anchor* session of a quest (per the Phase 7 first-session
+/// anchor decision).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CastQuestAttachInfo {
+    pub(crate) title: Option<String>,
+    pub(crate) goal: Option<String>,
+    pub(crate) harness: Option<String>,
+    pub(crate) total_phases: Option<usize>,
+    pub(crate) completed_phases: usize,
+    pub(crate) is_complete: bool,
+}
+
+/// Detect that `events` belong to a quest's anchor session. Returns
+/// `None` when no `cast.quest.started` event is present (i.e., the session
+/// is a plain Cast launch, not a quest anchor). Currently used as a
+/// minimal re-attach aid: callers print a note pointing the user at the
+/// quest title and progress so they can re-run `/quest <goal>` if they
+/// want to continue. Full state rebuild (replay handoffs, render the next
+/// card) is deferred to a later phase.
+pub(crate) fn find_cast_quest_info(events: &[store::EventRecord]) -> Option<CastQuestAttachInfo> {
+    let started = events
+        .iter()
+        .rev()
+        .find(|event| event.kind == CAST_QUEST_STARTED_KIND)?;
+    let payload = serde_json::from_str::<Value>(&started.payload_json).unwrap_or(Value::Null);
+    let title = payload
+        .get("title")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let goal = payload
+        .get("goal")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let harness = payload
+        .get("harness")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let total_phases = payload
+        .get("phases")
+        .and_then(Value::as_array)
+        .map(|arr| arr.len());
+    let completed_phases = events
+        .iter()
+        .filter(|event| event.kind == CAST_QUEST_PHASE_COMPLETED_KIND)
+        .count();
+    let is_complete = events
+        .iter()
+        .any(|event| event.kind == CAST_QUEST_COMPLETED_KIND);
+    Some(CastQuestAttachInfo {
+        title,
+        goal,
+        harness,
+        total_phases,
+        completed_phases,
+        is_complete,
+    })
+}
+
+/// One-line note for the attach outcome card describing the quest this
+/// session anchors. Returns `None` when the info carries no usable text
+/// (defensive — `find_cast_quest_info` already short-circuits on the
+/// happy path).
+pub(crate) fn format_quest_attach_note(info: &CastQuestAttachInfo) -> Option<String> {
+    let title = info.title.as_deref().unwrap_or("(untitled quest)");
+    let progress = match info.total_phases {
+        Some(total) if total > 0 => format!("phase {}/{total}", info.completed_phases.min(total)),
+        _ => format!("{} phases run", info.completed_phases),
+    };
+    let state = if info.is_complete {
+        "complete"
+    } else if info.completed_phases == 0 {
+        "starting"
+    } else {
+        "in progress"
+    };
+    Some(format!(
+        "Quest anchor — `{title}` ({progress}, {state}). Re-run `/quest <goal>` to continue."
+    ))
 }
 
 /// One-line outcome-card note describing what Cast saw on the prior run.
@@ -252,6 +346,112 @@ mod tests {
             note.contains('…'),
             "long request should be truncated with ellipsis: {note}"
         );
+    }
+
+    fn quest_started_event(seq: i64, payload: serde_json::Value) -> store::EventRecord {
+        store::EventRecord {
+            seq,
+            id: format!("event-{seq}"),
+            session_id: "session-1".to_string(),
+            kind: CAST_QUEST_STARTED_KIND.to_string(),
+            payload_json: payload.to_string(),
+            created_at: "2026-05-20T00:00:00Z".to_string(),
+        }
+    }
+
+    fn quest_kind_event(seq: i64, kind: &str) -> store::EventRecord {
+        store::EventRecord {
+            seq,
+            id: format!("event-{seq}"),
+            session_id: "session-1".to_string(),
+            kind: kind.to_string(),
+            payload_json: "{}".to_string(),
+            created_at: "2026-05-20T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn find_cast_quest_info_returns_none_when_no_quest_event_exists() {
+        let events = vec![output_event(1, "hello\n")];
+        assert!(find_cast_quest_info(&events).is_none());
+    }
+
+    #[test]
+    fn find_cast_quest_info_decodes_title_goal_harness_and_phase_count() {
+        let events = vec![quest_started_event(
+            1,
+            serde_json::json!({
+                "title": "Ship phase 7",
+                "goal": "ship phase 7",
+                "harness": "codex",
+                "phases": ["design", "implement", "verify"],
+            }),
+        )];
+        let info = find_cast_quest_info(&events).expect("quest info should be present");
+        assert_eq!(info.title.as_deref(), Some("Ship phase 7"));
+        assert_eq!(info.goal.as_deref(), Some("ship phase 7"));
+        assert_eq!(info.harness.as_deref(), Some("codex"));
+        assert_eq!(info.total_phases, Some(3));
+        assert_eq!(info.completed_phases, 0);
+        assert!(!info.is_complete);
+    }
+
+    #[test]
+    fn find_cast_quest_info_counts_phase_completed_events() {
+        let events = vec![
+            quest_started_event(
+                1,
+                serde_json::json!({
+                    "title": "Ship phase 7",
+                    "phases": ["design", "implement", "verify"],
+                }),
+            ),
+            quest_kind_event(2, CAST_QUEST_PHASE_COMPLETED_KIND),
+            quest_kind_event(3, CAST_QUEST_PHASE_COMPLETED_KIND),
+        ];
+        let info = find_cast_quest_info(&events).expect("quest info should be present");
+        assert_eq!(info.completed_phases, 2);
+        assert!(!info.is_complete);
+    }
+
+    #[test]
+    fn find_cast_quest_info_marks_complete_when_completed_event_is_present() {
+        let events = vec![
+            quest_started_event(1, serde_json::json!({ "title": "X", "phases": ["a"] })),
+            quest_kind_event(2, CAST_QUEST_PHASE_COMPLETED_KIND),
+            quest_kind_event(3, CAST_QUEST_COMPLETED_KIND),
+        ];
+        let info = find_cast_quest_info(&events).expect("quest info should be present");
+        assert!(info.is_complete);
+    }
+
+    #[test]
+    fn format_quest_attach_note_describes_in_progress_quest() {
+        let info = CastQuestAttachInfo {
+            title: Some("Ship phase 7".to_string()),
+            total_phases: Some(3),
+            completed_phases: 1,
+            ..Default::default()
+        };
+        let note = format_quest_attach_note(&info).expect("note should be produced");
+        assert!(note.contains("Quest anchor"));
+        assert!(note.contains("Ship phase 7"));
+        assert!(note.contains("phase 1/3"));
+        assert!(note.contains("in progress"));
+    }
+
+    #[test]
+    fn format_quest_attach_note_describes_complete_quest() {
+        let info = CastQuestAttachInfo {
+            title: Some("Ship phase 7".to_string()),
+            total_phases: Some(3),
+            completed_phases: 3,
+            is_complete: true,
+            ..Default::default()
+        };
+        let note = format_quest_attach_note(&info).expect("note should be produced");
+        assert!(note.contains("phase 3/3"));
+        assert!(note.contains("complete"));
     }
 
     #[test]
