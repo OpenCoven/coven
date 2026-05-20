@@ -9,7 +9,7 @@ description: "The OpenCoven public roadmap for Coven, comux, and OpenClaw integr
 
 # OpenCoven public roadmap
 
-_Last updated: 2026-05-09_
+_Last updated: 2026-05-19_
 
 This roadmap is the public progress ledger for **OpenCoven**, **Coven**, and **comux**.
 
@@ -69,6 +69,7 @@ Shipped:
 
 Now:
 
+- **Cast launcher redesign** (Phases 1–6 on `cast/*` branches): collapses the Coven launcher chrome into a single-prompt surface with a two-lane Commands + Snapshot body, plan/outcome cards for every spell, and a sequential quest flow that hands off between phases with deterministic sub-prompts. The visual contract lives in [`docs/design/cast-tui-contract.md`](/design/cast-tui-contract) and the quest flow in [`docs/design/cast-quest-flow.md`](/design/cast-quest-flow). PR #99 is the current review slice (Phase 6 verification + readiness).
 - Keep the versioned daemon API contract and external-client compatibility work aligned. See [`docs/API-CONTRACT.md`](/API-CONTRACT).
 - Keep the public docs aligned with the actual CLI/API surface.
 
