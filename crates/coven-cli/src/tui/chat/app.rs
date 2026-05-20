@@ -163,6 +163,16 @@ impl App {
         });
     }
 
+    fn push_or_append_agent_message(&mut self, agent_name: &str, content: &str) {
+        if let Some(last) = self.messages.last_mut() {
+            if matches!(last.role, MessageRole::Agent) && last.sender == agent_name {
+                last.content.push_str(content);
+                return;
+            }
+        }
+        self.push_agent_message(agent_name, content);
+    }
+
     pub(super) fn active_agent_label(&self) -> &str {
         self.active_agent
             .and_then(|idx| self.agents.get(idx))
@@ -438,7 +448,9 @@ impl App {
             "output" => {
                 if let Some(data) = event_payload_text(event, "data") {
                     let sender = self.active_agent_label().to_string();
-                    self.push_agent_message(&sender, &data);
+                    if let Some(text) = clean_terminal_output(&data) {
+                        self.push_or_append_agent_message(&sender, &text);
+                    }
                 }
             }
             "exit" => {
@@ -710,6 +722,66 @@ fn event_payload_text(event: &store::EventRecord, field: &str) -> Option<String>
         .map(ToOwned::to_owned)
 }
 
+fn clean_terminal_output(data: &str) -> Option<String> {
+    let mut output = String::new();
+    let mut chars = data.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\x1b' => skip_escape_sequence(&mut chars),
+            '\r' => {}
+            '\n' | '\t' => output.push(ch),
+            '\x08' => {
+                output.pop();
+            }
+            ch if ch.is_control() => {}
+            ch => output.push(ch),
+        }
+    }
+
+    (!output.trim().is_empty()).then_some(output)
+}
+
+fn skip_escape_sequence<I>(chars: &mut std::iter::Peekable<I>)
+where
+    I: Iterator<Item = char>,
+{
+    let Some(introducer) = chars.next() else {
+        return;
+    };
+    match introducer {
+        '[' => skip_csi_sequence(chars),
+        ']' => skip_until_string_terminator(chars),
+        'P' | '^' | '_' | 'X' => skip_until_string_terminator(chars),
+        _ => {}
+    }
+}
+
+fn skip_csi_sequence<I>(chars: &mut std::iter::Peekable<I>)
+where
+    I: Iterator<Item = char>,
+{
+    for ch in chars.by_ref() {
+        if ('\u{40}'..='\u{7e}').contains(&ch) {
+            break;
+        }
+    }
+}
+
+fn skip_until_string_terminator<I>(chars: &mut std::iter::Peekable<I>)
+where
+    I: Iterator<Item = char>,
+{
+    while let Some(ch) = chars.next() {
+        if ch == '\x07' {
+            break;
+        }
+        if ch == '\x1b' && chars.peek() == Some(&'\\') {
+            chars.next();
+            break;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -966,6 +1038,35 @@ mod tests {
             .messages
             .iter()
             .any(|message| message.content.contains("hello from daemon")));
+    }
+
+    #[test]
+    fn chat_output_events_are_terminal_sanitized_and_coalesced() {
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "codex",
+            "Existing",
+            "running",
+        ));
+        client.events.borrow_mut().extend([
+            output_event(1, "session-1", "\x1b[?2004h\x1b[39;49m"),
+            output_event(2, "session-1", "\x1b[2J\x1b[1;1HHello"),
+            output_event(3, "session-1", "\x1b[39;49m world\x1b[0m\r\n"),
+        ]);
+        let (mut app, _) = app_with_client(client);
+
+        app.handle_slash_command("/attach session-1");
+
+        let agent_messages: Vec<_> = app
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, MessageRole::Agent))
+            .collect();
+        assert_eq!(agent_messages.len(), 1);
+        assert_eq!(agent_messages[0].content, "Hello world\n");
+        assert!(!agent_messages[0].content.contains('\x1b'));
+        assert!(!agent_messages[0].content.contains("[39;49m"));
+        assert!(!agent_messages[0].content.contains("[?2004h"));
     }
 
     #[test]
