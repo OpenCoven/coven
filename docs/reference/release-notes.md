@@ -33,6 +33,7 @@ title: "Coven changelog and release notes"
 - **Re-attach reconstructs quests written by the local-PTY path.** Quests run without the daemon now write events to a synthetic anchor session in the local store, so `/attach <quest-id>` finds them.
 - **Avoid full event-log scan for the `cast.summary` existence check.** Cast now uses a fast `event_kind_exists` query instead of fetching every event for a session every time it writes a summary.
 - **Resolved a duplicate `list_events` fetch** during cast attach's summary lookup — the existing replay history is reused.
+- **Sanitized terminal output in `coven chat` (v0.0.17).** Raw ANSI escape sequences (CSI cursor moves, OSC titles, OSC 8 hyperlinks, DCS/SOS/PM/APC payloads, color resets) and stray `\r` from attached daemon sessions no longer pollute the chat transcript. Consecutive output chunks from the same agent coalesce into a single message instead of creating a fresh bubble per event, and harness backspace (`\x08`) characters collapse into the prior glyph so in-place rewrites (progress spinners, status redraws) don't leave stale text behind. Pure cursor-visibility / mode-toggle chunks are dropped instead of surfacing as empty bubbles.
 
 ### Security
 
