@@ -168,9 +168,34 @@ Phase 7's `/attach <anchor>` only printed a one-line note when a session belonge
 
 The event-kind constants live in `tui/cast/quest.rs` (`CAST_QUEST_*_KIND`) and are consumed by both the writer in `tui/shell.rs` and the reconstructor in `tui/cast/attach.rs`, so the two halves stay in sync by construction.
 
-## 10. Deferred to a later phase
+## 10. Loose-end closeouts (Phase 10)
 
-Two §7 deferrals are still open:
+The two §7 deferrals that survived Phase 9 are now closed.
 
-- **Local-PTY fallback ledger.** Quest event writes are best-effort and skipped silently when `dispatch_cast_launch` falls back to the synchronous local PTY path (no daemon, no session id, no anchor). Re-attach will not find a quest there.
-- **`QuestPhaseStatus::Running` transition.** The shell loop transitions Pending → Complete directly (synchronous dispatch). A future async / detached-quest UX would set Running between the two.
+### 10.1 Local-PTY fallback ledger
+
+When `dispatch_cast_quest` detects that the daemon is **not** running, it now synthesizes a `quest-<uuid>` row in the local `sessions` table via `create_local_quest_anchor` and uses it as the anchor for every `cast.quest.*` event in that quest. The synthetic session has:
+
+- `harness = "cast-quest"` (distinguishes it from a real harness session; a future browser filter can hide it).
+- `title = "Quest: <quest.title>"`.
+- `project_root` derived from the user's cwd (falls back to `(unknown)` if no project root resolves).
+- A `cast.quest.started` event with `synthetic: true` in the payload.
+
+Subsequent phases that run via the local PTY fallback still carry `session_id: null` in their `cast.quest.phase_*` payloads (there is no daemon session id to record), but the anchor's event log is complete enough for `reconstruct_quest` to replay state and for `coven attach <quest-id>` to resume.
+
+### 10.2 `QuestPhaseStatus::Running` transition
+
+The shell loop now calls `mark_phase_running(quest, idx, session_id)` between `dispatch_cast_launch` returning and `advance` writing the summary. In synchronous flow the Running state is held for a fraction of a second before advance overwrites it with Complete, but the transition is meaningful for replay:
+
+- The reconstructor in `cast/attach.rs` now applies the same transition on `cast.quest.phase_started` events. If Cast crashed between dispatch and advance, the anchor will hold a `phase_started` without a matching `phase_completed`; replay leaves that phase Running so resume can surface "this phase was already started".
+- If a later `phase_completed` event exists, the reconstructor's `advance` call overwrites Running with Complete — the Running mark is invisible on the happy path.
+
+`mark_phase_running` errors if the phase is not currently Pending, which prevents accidental re-marking on resumed quests.
+
+## 11. Future work
+
+No further open deferrals from §7/§8/§9 remain. Items that could be picked up later but were never on the §7 list:
+
+- **Multi-line edit UX** for `set_phase_sub_prompt`. The Phase 8 single-line replacement still applies; an `$EDITOR`-integrated path would let users author longer sub-prompts without paste-as-one-line tricks.
+- **Browser filter for synthetic quest anchors.** The Phase 10 `cast-quest` harness rows currently show up in `coven sessions` listings. Filtering them by default (with `--all` to reveal) would clean up the browser for users who run many local-PTY quests.
+- **Async / detached quests.** The Running state is now real but only transient. A future async UX could leave a quest in Running while Cast detaches, then advance later from a callback.

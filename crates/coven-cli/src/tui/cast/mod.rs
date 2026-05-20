@@ -34,11 +34,11 @@ pub(crate) use intent::{parse_spell, CastHarness, CastIntent};
 pub(crate) use outcome::CastOutcome;
 pub(crate) use plan::{build_plan, CastPlan};
 pub(crate) use quest::{
-    advance as advance_quest, parse_phase_action, quest_from_goal, set_phase_sub_prompt,
-    skip_phase, PhaseInteraction, Quest, QuestPhase, QuestPhaseStatus, QuestPhaseSummary,
-    CAST_QUEST_ADVANCED_KIND, CAST_QUEST_COMPLETED_KIND, CAST_QUEST_PHASE_COMPLETED_KIND,
-    CAST_QUEST_PHASE_EDITED_KIND, CAST_QUEST_PHASE_SKIPPED_KIND, CAST_QUEST_PHASE_STARTED_KIND,
-    CAST_QUEST_STARTED_KIND,
+    advance as advance_quest, mark_phase_running, parse_phase_action, quest_from_goal,
+    set_phase_sub_prompt, skip_phase, PhaseInteraction, Quest, QuestPhase, QuestPhaseStatus,
+    QuestPhaseSummary, CAST_QUEST_ADVANCED_KIND, CAST_QUEST_COMPLETED_KIND,
+    CAST_QUEST_PHASE_COMPLETED_KIND, CAST_QUEST_PHASE_EDITED_KIND, CAST_QUEST_PHASE_SKIPPED_KIND,
+    CAST_QUEST_PHASE_STARTED_KIND, CAST_QUEST_STARTED_KIND,
 };
 // `compose_sub_prompt` and `QuestHandoff` are exercised by the in-module
 // test suite; they remain in the public crate surface so a future async /

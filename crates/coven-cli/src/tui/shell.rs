@@ -14,13 +14,13 @@ use uuid::Uuid;
 
 use super::cast::{
     self, advance_quest, build_plan, evaluate_gate, find_cast_summary, follow_until_exit,
-    format_summary_note, parse_phase_action, quest_from_goal, render_cast_frame_for_terminal,
-    render_outcome, render_plan_intro, render_quest_handoff, set_phase_sub_prompt, skip_phase,
-    CastHarness, CastIntent, CastOutcome, CastPlan, CastSessionExit, FollowerObserver,
-    FollowerPacer, GateOutcome, PhaseInteraction, Quest, QuestPhase, QuestPhaseStatus,
-    QuestPhaseSummary, SafetyDecision, CAST_QUEST_ADVANCED_KIND, CAST_QUEST_COMPLETED_KIND,
-    CAST_QUEST_PHASE_COMPLETED_KIND, CAST_QUEST_PHASE_EDITED_KIND, CAST_QUEST_PHASE_SKIPPED_KIND,
-    CAST_QUEST_PHASE_STARTED_KIND, CAST_QUEST_STARTED_KIND,
+    format_summary_note, mark_phase_running, parse_phase_action, quest_from_goal,
+    render_cast_frame_for_terminal, render_outcome, render_plan_intro, render_quest_handoff,
+    set_phase_sub_prompt, skip_phase, CastHarness, CastIntent, CastOutcome, CastPlan,
+    CastSessionExit, FollowerObserver, FollowerPacer, GateOutcome, PhaseInteraction, Quest,
+    QuestPhase, QuestPhaseStatus, QuestPhaseSummary, SafetyDecision, CAST_QUEST_ADVANCED_KIND,
+    CAST_QUEST_COMPLETED_KIND, CAST_QUEST_PHASE_COMPLETED_KIND, CAST_QUEST_PHASE_EDITED_KIND,
+    CAST_QUEST_PHASE_SKIPPED_KIND, CAST_QUEST_PHASE_STARTED_KIND, CAST_QUEST_STARTED_KIND,
 };
 use super::chat::client::{ChatClient, ChatEventQuery, DaemonChatClient, LaunchRequest};
 use super::{is_key_press, sessions};
@@ -516,7 +516,72 @@ fn dispatch_cast_quest(plan: &CastPlan, goal: &str) -> Result<CastOutcome> {
     let default_harness = plan.harness.map(|h| h.harness);
     let quest = quest_from_goal(goal, default_harness);
     let request_text = outcome_request_text(plan);
-    run_quest_loop(quest, None, default_harness, goal, request_text)
+
+    // Phase 10: in the daemon-running path, the anchor is established
+    // lazily by phase 0's session (same as Phase 7). In the local-PTY
+    // fallback path there is no daemon session to inherit, so synthesize
+    // a `quest-<uuid>` row up front. Both paths reach `run_quest_loop`
+    // with the same shape; only the anchor's origin differs.
+    let initial_anchor = match daemon_runtime_state()? {
+        DaemonRuntimeState::Running => None,
+        DaemonRuntimeState::NotReady(_) => {
+            Some(create_local_quest_anchor(&quest, default_harness)?)
+        }
+    };
+
+    run_quest_loop(quest, initial_anchor, default_harness, goal, request_text)
+}
+
+/// Insert a synthetic `quest-<uuid>` row into the local sessions table
+/// and write `cast.quest.started` to it. Returns the anchor session id
+/// so `run_quest_loop` can attach later `cast.quest.*` events.
+///
+/// The synthetic session has `harness = "cast-quest"` so a future
+/// session-browser filter can hide it from the main list if we want; for
+/// now it is visible (and labelled "Quest: <title>") so power users can
+/// inspect the event log directly.
+fn create_local_quest_anchor(
+    quest: &Quest,
+    default_harness: Option<CastHarness>,
+) -> Result<String> {
+    let id = format!("quest-{}", Uuid::new_v4());
+    let project_root = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| project::canonical_project_root(&cwd).ok())
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "(unknown)".to_string());
+    let store_path = coven_store_path()?;
+    let conn = store::open_store(&store_path)?;
+    let timestamp = current_timestamp();
+    let record = store::SessionRecord {
+        id: id.clone(),
+        project_root,
+        harness: "cast-quest".to_string(),
+        title: format!("Quest: {}", quest.title),
+        status: "active".to_string(),
+        exit_code: None,
+        archived_at: None,
+        created_at: timestamp.clone(),
+        updated_at: timestamp.clone(),
+    };
+    store::insert_session(&conn, &record)?;
+    let harness_label = default_harness
+        .map(|h| h.id().to_string())
+        .unwrap_or_else(|| "(unset)".to_string());
+    store::insert_json_event(
+        &conn,
+        &id,
+        CAST_QUEST_STARTED_KIND,
+        &serde_json::json!({
+            "title": quest.title,
+            "goal": quest.goal,
+            "harness": harness_label,
+            "phases": quest.phases.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+            "synthetic": true,
+        }),
+        &timestamp,
+    )?;
+    Ok(id)
 }
 
 /// Resume a quest from a [`ReconstructedQuest`] decoded out of the
@@ -695,6 +760,19 @@ fn run_quest_loop(
                 }),
             );
         }
+
+        // Phase 10: explicit Pending → Running transition. The shell loop
+        // dispatches synchronously so Running is held for a fraction of a
+        // second before `advance` writes Complete, but the transition
+        // matters for the reconstructor: if Cast crashes between dispatch
+        // and advance, replay sees phase_started without phase_completed
+        // and can mark the phase Running. Empty session id (local-PTY
+        // fallback) is preserved as-is — the reconstructor accepts it.
+        let _ = mark_phase_running(
+            &mut quest,
+            idx,
+            phase_session_id.clone().unwrap_or_default(),
+        );
 
         let summary = phase_summary_from_session(phase_session_id.as_deref());
         completed_notes.push(format_phase_note(&quest.phases[idx].name, &summary));

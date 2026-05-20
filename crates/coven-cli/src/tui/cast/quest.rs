@@ -288,6 +288,34 @@ pub(crate) fn set_phase_sub_prompt(
     Ok(())
 }
 
+/// Transition a Pending phase to Running, recording the daemon session
+/// id Cast just launched it as. The shell loop calls this immediately
+/// after `dispatch_cast_launch` returns and before `advance` writes the
+/// final summary, so any reconstructor that sees a `phase_started` event
+/// without a matching `phase_completed` can mark the phase Running
+/// instead of leaving it Pending.
+///
+/// Errors when the phase is not Pending. Cast does not "restart" a phase
+/// that already completed or was skipped.
+pub(crate) fn mark_phase_running(
+    quest: &mut Quest,
+    index: usize,
+    session_id: String,
+) -> Result<()> {
+    let phase = quest
+        .phases
+        .get_mut(index)
+        .ok_or_else(|| anyhow!("quest phase index {index} out of range"))?;
+    if !matches!(phase.status, QuestPhaseStatus::Pending) {
+        return Err(anyhow!(
+            "phase `{}` is not pending; only pending phases can be marked running",
+            phase.name
+        ));
+    }
+    phase.status = QuestPhaseStatus::Running { session_id };
+    Ok(())
+}
+
 /// Skip a pending phase with a recorded reason. Useful when the prior
 /// phase already satisfied this phase's goal (e.g. tests passed during
 /// implement, so verify becomes a no-op).
@@ -654,6 +682,32 @@ mod tests {
 
         let label = phase_status_label(&QuestPhaseSummary::default());
         assert_eq!(label, "complete");
+    }
+
+    #[test]
+    fn mark_phase_running_transitions_pending_to_running_with_session_id() {
+        let mut q = quest("ship phase 10");
+        mark_phase_running(&mut q, 0, "session-design".to_string()).unwrap();
+        match &q.phases[0].status {
+            QuestPhaseStatus::Running { session_id } => {
+                assert_eq!(session_id, "session-design");
+            }
+            other => panic!("expected Running, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mark_phase_running_rejects_non_pending_phases() {
+        let mut q = quest("ship phase 10");
+        // First mark phase 0 Running, then try again — should fail.
+        mark_phase_running(&mut q, 0, "session-design".to_string()).unwrap();
+        let err = mark_phase_running(&mut q, 0, "session-again".to_string()).unwrap_err();
+        assert!(err.to_string().contains("not pending"));
+
+        // Skipped phases also reject.
+        skip_phase(&mut q, 2, "tested in CI".to_string()).unwrap();
+        let err = mark_phase_running(&mut q, 2, "session-verify".to_string()).unwrap_err();
+        assert!(err.to_string().contains("not pending"));
     }
 
     #[test]
