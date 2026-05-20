@@ -238,14 +238,20 @@ pub(crate) fn compose_sub_prompt(phase: &QuestPhase, quest_goal: &str) -> String
 pub(crate) fn advance(quest: &mut Quest, summary: QuestPhaseSummary) -> Option<usize> {
     let current = quest.current_index()?;
     let from_name = quest.phases[current].name.clone();
+    let failed = phase_failed(&summary);
     let prior_status_label = phase_status_label(&summary);
-    let reason = handoff_reason(&from_name, &prior_status_label);
+    let reason = handoff_reason(&from_name, &prior_status_label, failed);
     let carried = summary.carried_context.clone();
 
     quest.phases[current].status = QuestPhaseStatus::Complete(summary);
-    quest.cursor = current + 1;
+    // Advance the cursor to the next *pending* phase so we never leave
+    // it pointing at a Skipped or Complete row. When no pending phase
+    // remains, park the cursor at `phases.len()` so `current_index`
+    // reports the quest as exhausted.
+    let next_index = next_pending_index(quest, current + 1);
+    quest.cursor = next_index.unwrap_or(quest.phases.len());
 
-    let next_index = quest.current_index()?;
+    let next_index = next_index?;
     let goal = quest.goal.clone();
     let next = &mut quest.phases[next_index];
     next.handoff = Some(QuestHandoff {
@@ -336,7 +342,10 @@ pub(crate) fn skip_phase(quest: &mut Quest, index: usize, reason: String) -> Res
     }
     phase.status = QuestPhaseStatus::Skipped { reason };
     if quest.cursor == index {
-        quest.cursor = index + 1;
+        // Skipping the current phase walks the cursor forward to the
+        // next pending row — never leaves it pointing at a Skipped or
+        // Complete phase.
+        quest.cursor = next_pending_index(quest, index + 1).unwrap_or(quest.phases.len());
     }
     Ok(())
 }
@@ -437,12 +446,26 @@ fn phase_status_label(summary: &QuestPhaseSummary) -> String {
     }
 }
 
-fn handoff_reason(from_phase: &str, prior_status_label: &str) -> String {
-    let lower = prior_status_label.to_ascii_lowercase();
-    let failed = lower.starts_with("failed")
-        || lower.contains("error")
-        || lower.contains("exit 1")
-        || lower.contains("interrupted");
+/// Whether a phase summary should be framed as a failure when composing
+/// the next sub-prompt. Keyed on structured data first: any non-zero exit
+/// code is a failure regardless of the status string. The status-string
+/// fallback catches cases where `exit_code` is `None` (e.g. interrupted
+/// runs that never produced an exit code).
+fn phase_failed(summary: &QuestPhaseSummary) -> bool {
+    if let Some(code) = summary.exit_code {
+        if code != 0 {
+            return true;
+        }
+    }
+    summary.exit_status.as_deref().is_some_and(|status| {
+        matches!(
+            status.trim().to_ascii_lowercase().as_str(),
+            "failed" | "error" | "interrupted"
+        )
+    })
+}
+
+fn handoff_reason(from_phase: &str, prior_status_label: &str, failed: bool) -> String {
     if failed {
         format!(
             "Phase `{from_phase}` finished with `{prior_status_label}` — incorporate the failure context before continuing."
@@ -452,6 +475,16 @@ fn handoff_reason(from_phase: &str, prior_status_label: &str) -> String {
             "Phase `{from_phase}` finished with `{prior_status_label}` — carry its result into the next sub-prompt."
         )
     }
+}
+
+/// First index >= `start` whose phase is still Pending. Used by
+/// `advance` and `skip_phase` so the cursor always lands on real work
+/// (never on a row that was already completed or explicitly skipped).
+fn next_pending_index(quest: &Quest, start: usize) -> Option<usize> {
+    quest.phases[start..]
+        .iter()
+        .position(|phase| matches!(phase.status, QuestPhaseStatus::Pending))
+        .map(|offset| start + offset)
 }
 
 fn derive_quest_title(goal: &str) -> String {
@@ -651,12 +684,64 @@ mod tests {
                 ..QuestPhaseSummary::default()
             },
         );
-        // Implement completes; cursor lands on the skipped verify (2). The
-        // next `current()` call shows verify as skipped so the shell can
-        // jump past it without re-prompting.
+        // Implement completes; verify is already Skipped, so advance walks
+        // the cursor straight past it — the quest is exhausted, not
+        // stranded on a Skipped row.
+        assert!(q.is_complete());
+        assert_eq!(q.cursor, q.phases.len());
+        assert!(q.current().is_none());
+        assert!(matches!(
+            q.phases[2].status,
+            QuestPhaseStatus::Skipped { .. }
+        ));
+    }
+
+    #[test]
+    fn advance_skips_over_skipped_phases_and_preserves_skip_reason() {
+        let mut q = quest("publish a release");
+        skip_phase(&mut q, 1, "implementation already done".to_string()).unwrap();
+
+        let next = advance(
+            &mut q,
+            QuestPhaseSummary {
+                exit_status: Some("completed".to_string()),
+                exit_code: Some(0),
+                ..QuestPhaseSummary::default()
+            },
+        );
+
+        assert_eq!(
+            next,
+            Some(2),
+            "advance should jump straight to the next pending phase"
+        );
         assert_eq!(q.cursor, 2);
-        let current = q.current().expect("verify exists");
-        assert!(matches!(current.status, QuestPhaseStatus::Skipped { .. }));
+        assert!(matches!(
+            q.phases[1].status,
+            QuestPhaseStatus::Skipped { ref reason } if reason == "implementation already done"
+        ));
+    }
+
+    #[test]
+    fn non_zero_exit_codes_use_failure_handoff_reason() {
+        let mut q = quest("verify build");
+        advance(
+            &mut q,
+            QuestPhaseSummary {
+                // status string says "completed" — the failure framing
+                // must come from the structured exit_code, not the label.
+                exit_status: Some("completed".to_string()),
+                exit_code: Some(2),
+                ..QuestPhaseSummary::default()
+            },
+        );
+
+        let handoff = q.phases[1].handoff.as_ref().expect("handoff attached");
+        assert!(
+            handoff.reason.contains("incorporate the failure context"),
+            "non-zero exit codes must produce failure framing, got: {}",
+            handoff.reason
+        );
     }
 
     #[test]
