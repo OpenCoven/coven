@@ -11,6 +11,7 @@ use crate::theme::{self, fit_chars, palette_for, Fg, Palette, TerminalMode};
 
 use super::outcome::CastOutcome;
 use super::plan::{CastHarnessSource, CastPlan, CastStepKind};
+use super::quest::{Quest, QuestPhase, QuestPhaseStatus};
 use super::safety::{CastRisk, SafetyDecision};
 
 const CAST_INTRO_INNER_WIDTH: usize = 76;
@@ -228,6 +229,129 @@ fn render_outcome_with_mode(outcome: &CastOutcome, mode: TerminalMode) -> String
     }
 
     frame
+}
+
+/// Cast's quest handoff card: shown between phases of a sequential quest
+/// so the user can read what the prior phase produced and exactly what the
+/// next phase's sub-prompt will be before approving the handoff. The card
+/// is a *visible delegation announcement* — it never executes anything; it
+/// just makes Cast's deterministic composer inspectable.
+#[allow(dead_code)]
+pub(crate) fn render_quest_handoff(quest: &Quest, next_index: usize) -> String {
+    render_quest_handoff_with_mode(quest, next_index, theme::mode())
+}
+
+#[allow(dead_code)]
+pub(crate) fn render_quest_handoff_plain(quest: &Quest, next_index: usize) -> String {
+    render_quest_handoff_with_mode(quest, next_index, TerminalMode::NoColor)
+}
+
+fn render_quest_handoff_with_mode(quest: &Quest, next_index: usize, mode: TerminalMode) -> String {
+    let p = palette_for(mode);
+    let mut frame = String::new();
+
+    push_section_header(&mut frame, &p, "Cast handoff");
+    push_label_row(&mut frame, &p, "quest", &quest.title);
+    push_label_row(
+        &mut frame,
+        &p,
+        "phase",
+        &quest_phase_position_label(quest, next_index),
+    );
+
+    if let Some(next) = quest.phases.get(next_index) {
+        if let Some(handoff) = &next.handoff {
+            push_label_row(&mut frame, &p, "from", &handoff.from_phase);
+            push_label_row(&mut frame, &p, "prior", &handoff.prior_status);
+            push_continuation_row(&mut frame, &p, &handoff.reason);
+            if !handoff.carried_context.is_empty() {
+                frame.push('\n');
+                push_section_header(&mut frame, &p, "Carried context");
+                for fact in handoff.carried_context.iter().take(4) {
+                    push_note_row(&mut frame, &p, fact);
+                }
+            }
+        } else {
+            push_label_row(&mut frame, &p, "from", "(quest start)");
+        }
+
+        let harness_label = next
+            .harness
+            .map(|h| h.label())
+            .unwrap_or("(default harness)");
+        let edited_marker = if next.edited_by_user {
+            " · user-edited"
+        } else {
+            ""
+        };
+        push_label_row(
+            &mut frame,
+            &p,
+            "delegate to",
+            &format!("{harness_label}{edited_marker}"),
+        );
+
+        frame.push('\n');
+        push_section_header(&mut frame, &p, "Sub-prompt");
+        for line in clip_sub_prompt_lines(&next.sub_prompt) {
+            push_sub_prompt_line(&mut frame, &p, &line);
+        }
+
+        frame.push('\n');
+        push_footer_hint(&mut frame, &p, quest_handoff_footer_hint(next));
+    } else {
+        push_label_row(&mut frame, &p, "status", "quest complete");
+        frame.push('\n');
+        push_footer_hint(&mut frame, &p, "no further phases · type a new spell");
+    }
+
+    frame
+}
+
+fn quest_phase_position_label(quest: &Quest, next_index: usize) -> String {
+    let total = quest.phases.len();
+    let phase_name = quest
+        .phases
+        .get(next_index)
+        .map(|p| p.name.as_str())
+        .unwrap_or("(end)");
+    let position = (next_index + 1).min(total.max(1));
+    format!("{position}/{total} · {phase_name}")
+}
+
+fn quest_handoff_footer_hint(next: &QuestPhase) -> &'static str {
+    match &next.status {
+        QuestPhaseStatus::Pending => {
+            "enter approves the sub-prompt · type to edit · esc cancels"
+        }
+        QuestPhaseStatus::Running { .. } => "phase running · attach to follow",
+        QuestPhaseStatus::Complete(_) => "phase already complete · advance again",
+        QuestPhaseStatus::Skipped { .. } => "phase skipped · advance to continue",
+    }
+}
+
+/// Keep the visible sub-prompt block bounded; long composer output (with
+/// many carried-context bullets) would push the footer out of the user's
+/// view. We cap at 8 lines, with an ellipsis line at the end so the user
+/// knows there is more text the harness will receive.
+const SUB_PROMPT_VISIBLE_LINES: usize = 8;
+
+fn clip_sub_prompt_lines(sub_prompt: &str) -> Vec<String> {
+    let lines: Vec<&str> = sub_prompt.lines().collect();
+    if lines.len() <= SUB_PROMPT_VISIBLE_LINES {
+        return lines.iter().map(|l| (*l).to_string()).collect();
+    }
+    let mut out: Vec<String> = lines
+        .iter()
+        .take(SUB_PROMPT_VISIBLE_LINES - 1)
+        .map(|l| (*l).to_string())
+        .collect();
+    out.push(format!("… {} more lines", lines.len() - (SUB_PROMPT_VISIBLE_LINES - 1)));
+    out
+}
+
+fn push_sub_prompt_line(frame: &mut String, p: &Palette, line: &str) {
+    frame.push_str(&format!("  {}{}{}\n", p.text, line, p.reset));
 }
 
 /// What the user typed (or, if Cast built the plan without raw input, the
@@ -642,6 +766,130 @@ mod tests {
             !frame.contains("note 4"),
             "outcome should clip to 3 notes, frame:\n{frame}"
         );
+    }
+
+    #[test]
+    fn quest_handoff_card_shows_source_phase_status_and_next_sub_prompt() {
+        use crate::tui::cast::quest::{
+            advance, quest_from_goal, QuestPhaseSummary,
+        };
+
+        let mut quest = quest_from_goal(
+            "ship phase 5 sub-prompting",
+            Some(CastHarness::Codex),
+        );
+        let next = advance(
+            &mut quest,
+            QuestPhaseSummary {
+                session_id: Some("session-abc123".to_string()),
+                exit_status: Some("completed".to_string()),
+                exit_code: Some(0),
+                carried_context: vec![
+                    "added `cast::quest` module".to_string(),
+                    "drafted handoff card".to_string(),
+                ],
+            },
+        )
+        .expect("advance should yield the implement phase");
+
+        let frame = render_quest_handoff_plain(&quest, next);
+
+        assert!(frame.contains("Cast handoff"), "missing header, frame:\n{frame}");
+        assert_label_column(&frame, "quest");
+        assert_label_column(&frame, "phase");
+        assert_label_column(&frame, "from");
+        assert_label_column(&frame, "prior");
+        assert_label_column(&frame, "delegate to");
+
+        assert!(frame.contains("ship phase 5 sub-prompting"));
+        assert!(frame.contains("2/3 · implement"));
+        assert!(frame.contains("Codex"));
+        assert!(
+            frame.contains("Phase `design` finished with `completed (exit 0)`"),
+            "handoff reason should describe prior status, frame:\n{frame}"
+        );
+        assert!(
+            frame.contains("Sub-prompt"),
+            "render must surface the next sub-prompt block"
+        );
+        assert!(
+            frame.contains("ship phase 5 sub-prompting"),
+            "sub-prompt should echo the user's goal verbatim"
+        );
+        assert!(frame.contains("added `cast::quest` module"));
+        assert_no_ansi_leakage(&frame);
+    }
+
+    #[test]
+    fn quest_handoff_card_marks_user_edited_sub_prompt_so_users_can_tell() {
+        use crate::tui::cast::quest::{
+            advance, quest_from_goal, set_phase_sub_prompt, QuestPhaseSummary,
+        };
+
+        let mut quest = quest_from_goal("rotate the daemon socket", Some(CastHarness::Codex));
+        set_phase_sub_prompt(
+            &mut quest,
+            1,
+            "Move the socket to `$XDG_RUNTIME_DIR/coven.sock`.".to_string(),
+        )
+        .unwrap();
+        let next = advance(
+            &mut quest,
+            QuestPhaseSummary {
+                exit_status: Some("completed".to_string()),
+                exit_code: Some(0),
+                ..QuestPhaseSummary::default()
+            },
+        )
+        .unwrap();
+
+        let frame = render_quest_handoff_plain(&quest, next);
+        assert!(
+            frame.contains("user-edited"),
+            "user-authored sub_prompts should be flagged, frame:\n{frame}"
+        );
+        assert!(frame.contains("Move the socket to `$XDG_RUNTIME_DIR/coven.sock`."));
+    }
+
+    #[test]
+    fn quest_handoff_card_handles_quest_complete_state_with_no_panic() {
+        use crate::tui::cast::quest::{advance, quest_from_goal, QuestPhaseSummary};
+
+        let mut quest = quest_from_goal("trivial", Some(CastHarness::Codex));
+        // Drain all phases.
+        advance(&mut quest, QuestPhaseSummary::default());
+        advance(&mut quest, QuestPhaseSummary::default());
+        advance(&mut quest, QuestPhaseSummary::default());
+        assert!(quest.is_complete());
+
+        // Asking for the handoff at the past-the-end cursor must not panic.
+        let frame = render_quest_handoff_plain(&quest, quest.phases.len());
+        assert!(frame.contains("quest complete"), "frame:\n{frame}");
+    }
+
+    #[test]
+    fn quest_handoff_card_clips_very_long_sub_prompts() {
+        use crate::tui::cast::quest::{
+            advance, quest_from_goal, set_phase_sub_prompt, QuestPhaseSummary,
+        };
+
+        let mut quest = quest_from_goal("anything", Some(CastHarness::Codex));
+        // Compose a sub-prompt with many lines so the renderer clips.
+        let long: String = (0..30)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        set_phase_sub_prompt(&mut quest, 1, long).unwrap();
+        let next = advance(&mut quest, QuestPhaseSummary::default()).unwrap();
+
+        let frame = render_quest_handoff_plain(&quest, next);
+        assert!(frame.contains("line 0"));
+        assert!(
+            frame.contains("more lines"),
+            "long sub_prompt should be clipped with a `… N more lines` indicator, frame:\n{frame}"
+        );
+        // The last few lines should NOT appear once we clip.
+        assert!(!frame.contains("line 29"));
     }
 
     #[test]
