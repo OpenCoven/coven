@@ -33,17 +33,14 @@ pub(crate) use intent::{parse_spell, CastHarness, CastIntent};
 pub(crate) use outcome::CastOutcome;
 pub(crate) use plan::{build_plan, CastPlan};
 pub(crate) use quest::{
-    advance as advance_quest, quest_from_goal, Quest, QuestPhase, QuestPhaseSummary,
+    advance as advance_quest, parse_phase_action, quest_from_goal, set_phase_sub_prompt,
+    skip_phase, PhaseInteraction, Quest, QuestPhase, QuestPhaseStatus, QuestPhaseSummary,
 };
-// `compose_sub_prompt`, `set_phase_sub_prompt`, `skip_phase`, `QuestHandoff`,
-// and `QuestPhaseStatus` are exercised by the in-module test suite and the
-// edit / skip UX deferred per the Phase 7 scope decision; keep them in the
-// public crate surface so the future UX can pick them up without further
-// plumbing.
+// `compose_sub_prompt` and `QuestHandoff` are exercised by the in-module
+// test suite; they remain in the public crate surface so a future async /
+// detached-quest UX can read them without further plumbing.
 #[allow(unused_imports)]
-pub(crate) use quest::{
-    compose_sub_prompt, set_phase_sub_prompt, skip_phase, QuestHandoff, QuestPhaseStatus,
-};
+pub(crate) use quest::{compose_sub_prompt, QuestHandoff};
 pub(crate) use render::{
     render_cast_frame_for_terminal, render_outcome, render_plan_intro, render_quest_handoff,
 };

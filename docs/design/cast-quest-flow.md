@@ -142,11 +142,25 @@ This module deliberately stops short of the shell wiring so Phase 5's contract �
 - [x] Shell wiring for `/quest <goal>` — landed in Phase 7. `dispatch_cast_quest` in `tui/shell.rs` loops phases, gates each sub-prompt, dispatches via `dispatch_cast_launch`, and advances on each `cast.summary`-derived `QuestPhaseSummary`.
 - [x] Quest event ledger entries (`cast.quest.*`) — landed in Phase 7. `cast.quest.{started, phase_started, phase_completed, advanced, completed}` are written to the first phase's session (the "anchor"). `cast::find_cast_quest_info` decodes them so `/attach <anchor>` surfaces a one-line quest-anchor note alongside the cast.summary.
 
-## 8. Deferred to a later phase
+## 8. Edit / skip UX per phase (Phase 8)
 
-Per the Phase 7 scope decision, four things did **not** land and are tracked for the next slice:
+After Phase 7 auto-advance landed, Phase 8 wired the §5 approve / edit / skip / cancel loop into `dispatch_cast_quest`:
 
-- **Edit / skip UX per phase.** Phase 7 auto-advances every phase. `set_phase_sub_prompt`, `skip_phase`, `compose_sub_prompt`, `QuestHandoff`, and `QuestPhaseStatus::Skipped` are still in the crate surface but reachable only through tests; their `#[allow(dead_code)]` notes call this out.
+- **`PhaseInteraction` + `parse_phase_action`** (in `tui/cast/quest.rs`) — pure parser, four variants:
+  - Empty input → `Approve` (run the phase as Cast composed it).
+  - `/skip [reason]` → `Skip { reason }` with a default reason when omitted.
+  - `/cancel [reason]` → `Cancel { reason }` with a default reason when omitted.
+  - Anything else → `Edit { sub_prompt }` (single-line replacement; the shell loop applies it via `set_phase_sub_prompt`, re-renders the handoff card, and re-prompts so the user can refine, approve, skip, or cancel).
+- **`run_phase_interaction`** (in `tui/shell.rs`) — drives the prompt loop with an injectable reader so it is testable without stdin. `Edit` is consumed inside the loop; callers only see one of the three terminal actions.
+- **`cast.quest.phase_skipped`** event is written to the anchor when the user skips, alongside the other `cast.quest.*` reconstruction aids.
+- **Footer hint** on the Pending handoff card now reads `enter approve · type to replace · /skip [reason] · /cancel [reason]`, matching the parser exactly.
+
+The Edit flow is intentionally a **single-line full replacement** because the per-phase prompt is one line of cooked stdin. Pasting a multi-line block typically arrives as one line on the prompt; for richer multi-line editing the user can use `$EDITOR` outside Cast and paste back. A future phase could swap in a multi-line editor surface.
+
+## 9. Deferred to a later phase
+
+Three §7 deferrals from Phase 7 are still open:
+
 - **Full re-attach state rebuild.** `/attach <anchor>` currently prints a one-line note ("phase N/M, in progress / complete"). Replaying `cast.quest.*` events to reconstruct a `Quest` and re-render the next handoff card is the long pole and a separate phase.
 - **Local-PTY fallback ledger.** Quest event writes are best-effort and skipped silently when `dispatch_cast_launch` falls back to the synchronous local PTY path (no daemon, no session id, no anchor). Re-attach will not find a quest there.
 - **`QuestPhaseStatus::Running` transition.** The shell loop transitions Pending → Complete directly (synchronous dispatch). A future async / detached-quest UX would set Running between the two.

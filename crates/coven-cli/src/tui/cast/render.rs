@@ -314,7 +314,9 @@ fn quest_phase_position_label(quest: &Quest, next_index: usize) -> String {
 
 fn quest_handoff_footer_hint(next: &QuestPhase) -> &'static str {
     match &next.status {
-        QuestPhaseStatus::Pending => "enter approves the sub-prompt · type to edit · esc cancels",
+        QuestPhaseStatus::Pending => {
+            "enter approve · type to replace · /skip [reason] · /cancel [reason]"
+        }
         QuestPhaseStatus::Running { .. } => "phase running · attach to follow",
         QuestPhaseStatus::Complete(_) => "phase already complete · advance again",
         QuestPhaseStatus::Skipped { .. } => "phase skipped · advance to continue",

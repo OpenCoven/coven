@@ -301,6 +301,89 @@ pub(crate) fn skip_phase(quest: &mut Quest, index: usize, reason: String) -> Res
     Ok(())
 }
 
+/// What the user chose to do at a phase-interaction prompt. The shell
+/// loop in `tui::shell::dispatch_cast_quest` reads one line of input per
+/// phase and turns it into one of these via [`parse_phase_action`].
+///
+/// Phase 8 keeps the parser pure (string in, enum out) so the side-effect
+/// boundary lives entirely in the shell. The parser owns the UX rules;
+/// the shell owns the side effects.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PhaseInteraction {
+    /// Enter on an empty line — run the phase as Cast composed it.
+    Approve,
+    /// User typed `/skip` (with or without a reason). The phase is marked
+    /// `Skipped` and the cursor rolls forward.
+    Skip { reason: String },
+    /// User typed `/cancel` — the quest aborts cleanly with the supplied
+    /// reason on the outcome card.
+    Cancel { reason: String },
+    /// User typed free-text — Cast replaces the current phase's
+    /// `sub_prompt` verbatim and re-renders the handoff card so the user
+    /// can re-approve, edit again, skip, or cancel.
+    Edit { sub_prompt: String },
+}
+
+const PHASE_SKIP_DEFAULT_REASON: &str = "skipped by the user";
+const PHASE_CANCEL_DEFAULT_REASON: &str = "cancelled by the user";
+
+/// Parse one line of user input at the phase-interaction prompt. The
+/// rules are intentionally narrow:
+///
+/// - Empty (after trimming) → `Approve`.
+/// - `/skip` or `/skip <reason>` → `Skip` with the trimmed reason, or a
+///   default reason when the user omitted one.
+/// - `/cancel` or `/cancel <reason>` → `Cancel` with the trimmed reason
+///   or a default reason.
+/// - Anything else → `Edit` with the typed text as the new sub-prompt
+///   (single-line replacement; the shell loop re-renders the handoff and
+///   re-prompts so the user can refine before approving).
+pub(crate) fn parse_phase_action(line: &str) -> PhaseInteraction {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return PhaseInteraction::Approve;
+    }
+    if let Some(rest) = strip_command_prefix(trimmed, "/skip") {
+        return PhaseInteraction::Skip {
+            reason: non_empty_reason(rest, PHASE_SKIP_DEFAULT_REASON),
+        };
+    }
+    if let Some(rest) = strip_command_prefix(trimmed, "/cancel") {
+        return PhaseInteraction::Cancel {
+            reason: non_empty_reason(rest, PHASE_CANCEL_DEFAULT_REASON),
+        };
+    }
+    PhaseInteraction::Edit {
+        sub_prompt: trimmed.to_string(),
+    }
+}
+
+/// Strip a `/command` (or `/command <rest>`) prefix and return the
+/// remainder. Returns `None` when the input doesn't start with that
+/// command. Matches the exact command followed by either end-of-input or
+/// whitespace so `/cancel` doesn't swallow `/cancellation-policy` typed
+/// as an edit.
+fn strip_command_prefix<'a>(input: &'a str, command: &str) -> Option<&'a str> {
+    if input == command {
+        return Some("");
+    }
+    let with_space = input.strip_prefix(command)?;
+    if with_space.starts_with(char::is_whitespace) {
+        Some(with_space.trim_start())
+    } else {
+        None
+    }
+}
+
+fn non_empty_reason(reason: &str, default: &str) -> String {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() {
+        default.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn phase_status_label(summary: &QuestPhaseSummary) -> String {
     if let Some(status) = &summary.exit_status {
         match summary.exit_code {
@@ -559,6 +642,89 @@ mod tests {
 
         let label = phase_status_label(&QuestPhaseSummary::default());
         assert_eq!(label, "complete");
+    }
+
+    #[test]
+    fn parse_phase_action_treats_empty_input_as_approve() {
+        assert_eq!(parse_phase_action(""), PhaseInteraction::Approve);
+        assert_eq!(parse_phase_action("   "), PhaseInteraction::Approve);
+        assert_eq!(parse_phase_action("\n"), PhaseInteraction::Approve);
+    }
+
+    #[test]
+    fn parse_phase_action_recognises_skip_with_and_without_reason() {
+        assert_eq!(
+            parse_phase_action("/skip"),
+            PhaseInteraction::Skip {
+                reason: PHASE_SKIP_DEFAULT_REASON.to_string(),
+            }
+        );
+        assert_eq!(
+            parse_phase_action("/skip verify happens in CI"),
+            PhaseInteraction::Skip {
+                reason: "verify happens in CI".to_string(),
+            }
+        );
+        // Trailing whitespace on the reason is trimmed.
+        assert_eq!(
+            parse_phase_action("/skip   already covered   "),
+            PhaseInteraction::Skip {
+                reason: "already covered".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_phase_action_recognises_cancel_with_and_without_reason() {
+        assert_eq!(
+            parse_phase_action("/cancel"),
+            PhaseInteraction::Cancel {
+                reason: PHASE_CANCEL_DEFAULT_REASON.to_string(),
+            }
+        );
+        assert_eq!(
+            parse_phase_action("/cancel changed my mind"),
+            PhaseInteraction::Cancel {
+                reason: "changed my mind".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_phase_action_treats_other_text_as_edit() {
+        assert_eq!(
+            parse_phase_action("Implement only the SQL helpers"),
+            PhaseInteraction::Edit {
+                sub_prompt: "Implement only the SQL helpers".to_string(),
+            }
+        );
+        // Leading/trailing whitespace is trimmed.
+        assert_eq!(
+            parse_phase_action("   add unit tests too   "),
+            PhaseInteraction::Edit {
+                sub_prompt: "add unit tests too".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_phase_action_does_not_swallow_lookalike_commands_in_edit_text() {
+        // `/cancellation-policy` is a plausible edit (a noun phrase the
+        // user types as the new sub-prompt). The strict prefix matcher
+        // must not treat it as `/cancel`.
+        assert_eq!(
+            parse_phase_action("/cancellation-policy"),
+            PhaseInteraction::Edit {
+                sub_prompt: "/cancellation-policy".to_string(),
+            }
+        );
+        // `/skipper` likewise stays an edit.
+        assert_eq!(
+            parse_phase_action("/skipper"),
+            PhaseInteraction::Edit {
+                sub_prompt: "/skipper".to_string(),
+            }
+        );
     }
 
     #[test]

@@ -14,9 +14,10 @@ use uuid::Uuid;
 
 use super::cast::{
     self, advance_quest, build_plan, evaluate_gate, find_cast_summary, follow_until_exit,
-    format_summary_note, quest_from_goal, render_cast_frame_for_terminal, render_outcome,
-    render_plan_intro, render_quest_handoff, CastHarness, CastIntent, CastOutcome, CastPlan,
-    CastSessionExit, FollowerObserver, FollowerPacer, GateOutcome, Quest, QuestPhase,
+    format_summary_note, parse_phase_action, quest_from_goal, render_cast_frame_for_terminal,
+    render_outcome, render_plan_intro, render_quest_handoff, set_phase_sub_prompt, skip_phase,
+    CastHarness, CastIntent, CastOutcome, CastPlan, CastSessionExit, FollowerObserver,
+    FollowerPacer, GateOutcome, PhaseInteraction, Quest, QuestPhase, QuestPhaseStatus,
     QuestPhaseSummary, SafetyDecision,
 };
 use super::chat::client::{ChatClient, ChatEventQuery, DaemonChatClient, LaunchRequest};
@@ -510,6 +511,7 @@ fn dispatch_harness_spell(plan: &CastPlan, harness_id: &str, prompt: &str) -> Re
 const CAST_QUEST_STARTED: &str = "cast.quest.started";
 const CAST_QUEST_PHASE_STARTED: &str = "cast.quest.phase_started";
 const CAST_QUEST_PHASE_COMPLETED: &str = "cast.quest.phase_completed";
+const CAST_QUEST_PHASE_SKIPPED: &str = "cast.quest.phase_skipped";
 const CAST_QUEST_ADVANCED: &str = "cast.quest.advanced";
 const CAST_QUEST_COMPLETED: &str = "cast.quest.completed";
 
@@ -528,9 +530,58 @@ fn dispatch_cast_quest(plan: &CastPlan, goal: &str) -> Result<CastOutcome> {
     let request_text = outcome_request_text(plan);
 
     while let Some(idx) = quest.current_index() {
+        // Phases the user (or a prior skip_phase call) already marked as
+        // Skipped are walked past without re-prompting. The cursor was
+        // already nudged forward by `skip_phase`, but defensively handle
+        // the case here so a future async UX that bumps `cursor` without
+        // calling `skip_phase` still behaves.
+        if matches!(quest.phases[idx].status, QuestPhaseStatus::Skipped { .. }) {
+            quest.cursor = idx + 1;
+            continue;
+        }
+
         println!();
         print!("{}", render_quest_handoff(&quest, idx));
         println!();
+
+        let mut reader = stdin_line_reader;
+        match run_phase_interaction(&mut quest, idx, &mut reader)? {
+            PhaseInteraction::Cancel { reason } => {
+                let phase_name = quest.phases[idx].name.clone();
+                completed_notes.push(format!("Phase `{phase_name}` cancelled: {reason}"));
+                return Ok(quest_outcome(
+                    &request_text,
+                    &quest,
+                    anchor_session_id.clone(),
+                    completed_notes,
+                    Some("Re-run `/quest <goal>` to start over.".to_string()),
+                    Some(format!(
+                        "Quest cancelled at phase `{phase_name}` — {reason}."
+                    )),
+                ));
+            }
+            PhaseInteraction::Skip { reason } => {
+                let phase_name = quest.phases[idx].name.clone();
+                skip_phase(&mut quest, idx, reason.clone())?;
+                completed_notes.push(format!("Phase `{phase_name}`: skipped — {reason}"));
+                if let Some(anchor) = anchor_session_id.as_deref() {
+                    write_quest_event(
+                        anchor,
+                        CAST_QUEST_PHASE_SKIPPED,
+                        serde_json::json!({
+                            "phase": phase_name,
+                            "index": idx,
+                            "reason": reason,
+                        }),
+                    );
+                }
+                continue;
+            }
+            PhaseInteraction::Edit { .. } => {
+                unreachable!("Edit is consumed inside run_phase_interaction's inner loop")
+            }
+            PhaseInteraction::Approve => {}
+        }
 
         let phase_harness = match resolve_phase_harness(&quest.phases[idx], default_harness) {
             Some(harness) => harness,
@@ -551,7 +602,6 @@ fn dispatch_cast_quest(plan: &CastPlan, goal: &str) -> Result<CastOutcome> {
 
         let phase_plan = quest_phase_plan(&quest, idx, phase_harness, goal)?;
 
-        let mut reader = stdin_line_reader;
         match evaluate_gate(&phase_plan, &mut reader)? {
             GateOutcome::Cancelled { reason, next_step } => {
                 completed_notes.push(format!(
@@ -680,6 +730,43 @@ fn resolve_phase_harness(
     default_harness: Option<CastHarness>,
 ) -> Option<CastHarness> {
     phase.harness.or(default_harness)
+}
+
+/// One line of phase-prompt help, matching the handoff card's footer hint.
+/// The wording is duplicated here (the card is rendered separately) but
+/// kept short and contract-aligned per §2.6 of `cast-tui-contract.md`.
+const PHASE_PROMPT_HINT: &str =
+    "enter approve · type to replace · /skip [reason] · /cancel [reason]";
+
+/// Drive the per-phase interaction described in
+/// `docs/design/cast-quest-flow.md` §5: render → prompt → loop on edits →
+/// resolve to Approve / Skip / Cancel.
+///
+/// `Edit` is consumed inside this function (the handoff card re-renders
+/// with the new sub-prompt and the user is prompted again) so callers
+/// only see one of the three terminal actions.
+fn run_phase_interaction<R>(
+    quest: &mut Quest,
+    idx: usize,
+    reader: &mut R,
+) -> Result<PhaseInteraction>
+where
+    R: FnMut(&str) -> Result<String>,
+{
+    loop {
+        let phase_name = quest.phases[idx].name.clone();
+        let prompt = format!("Phase `{phase_name}` — {PHASE_PROMPT_HINT}: ");
+        let line = reader(&prompt)?;
+        match parse_phase_action(&line) {
+            PhaseInteraction::Edit { sub_prompt } => {
+                set_phase_sub_prompt(quest, idx, sub_prompt)?;
+                println!();
+                print!("{}", render_quest_handoff(quest, idx));
+                println!();
+            }
+            terminal => return Ok(terminal),
+        }
+    }
 }
 
 /// Synthesize a per-phase `CastPlan` so the existing safety gate can vet
@@ -1380,6 +1467,63 @@ fn parse_harness_slash_command(harness: &str, rest: &str) -> Result<MagicalTuiRe
         harness: harness.to_string(),
         prompt: prompt.to_string(),
     })
+}
+
+#[cfg(test)]
+mod quest_interaction_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    fn scripted_reader(script: Vec<&'static str>) -> impl FnMut(&str) -> Result<String> {
+        let lines = RefCell::new(script.into_iter());
+        move |_prompt: &str| {
+            Ok(lines
+                .borrow_mut()
+                .next()
+                .map(str::to_string)
+                .unwrap_or_default())
+        }
+    }
+
+    #[test]
+    fn run_phase_interaction_returns_approve_on_empty_input() {
+        let mut quest = quest_from_goal("polish the README", Some(CastHarness::Codex));
+        let mut reader = scripted_reader(vec![""]);
+        let action = run_phase_interaction(&mut quest, 0, &mut reader).unwrap();
+        assert_eq!(action, PhaseInteraction::Approve);
+    }
+
+    #[test]
+    fn run_phase_interaction_loops_on_edit_until_terminal_action() {
+        let mut quest = quest_from_goal("polish the README", Some(CastHarness::Codex));
+        let original = quest.phases[0].sub_prompt.clone();
+        // First line is an edit → second line skips. The function must
+        // apply the edit, mark the phase as user-edited, then return Skip.
+        let mut reader = scripted_reader(vec!["draft just the headlines", "/skip already covered"]);
+        let action = run_phase_interaction(&mut quest, 0, &mut reader).unwrap();
+        assert_eq!(
+            action,
+            PhaseInteraction::Skip {
+                reason: "already covered".to_string(),
+            }
+        );
+        assert!(quest.phases[0].edited_by_user);
+        assert_eq!(quest.phases[0].sub_prompt, "draft just the headlines");
+        assert_ne!(quest.phases[0].sub_prompt, original);
+    }
+
+    #[test]
+    fn run_phase_interaction_returns_cancel_with_default_reason() {
+        let mut quest = quest_from_goal("polish the README", Some(CastHarness::Codex));
+        let mut reader = scripted_reader(vec!["/cancel"]);
+        let action = run_phase_interaction(&mut quest, 0, &mut reader).unwrap();
+        match action {
+            PhaseInteraction::Cancel { reason } => {
+                assert!(!reason.is_empty(), "default reason should be non-empty");
+            }
+            other => panic!("expected Cancel, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
