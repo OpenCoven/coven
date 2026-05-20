@@ -1283,15 +1283,14 @@ fn render_magical_tui_frame_with_mode_and_width(
     );
     push_line(&mut frame, "", palette.text, palette.reset, inner_width);
 
-    // 2. Prompt area — single thin rule above and below, no inner bezels.
+    // 2. Prompt area — quiet rule above, emphasized rule below. The bottom
+    //    rule is the focus underline: the launcher prompt is always the
+    //    interactive element, so it gets `BORDER_STRONG`; the top rule is a
+    //    plain panel separator (`BORDER_SUBTLE`).
     let rule: String = "─".repeat(inner_width);
-    push_line(
-        &mut frame,
-        &rule,
-        palette.field_label,
-        palette.reset,
-        inner_width,
-    );
+    let border_subtle = theme::Fg::with_mode(theme::BORDER_SUBTLE, mode);
+    let border_strong = theme::Fg::with_mode(theme::BORDER_STRONG, mode);
+    push_line(&mut frame, &rule, border_subtle, palette.reset, inner_width);
     let (prompt_text, prompt_color) = if input.is_empty() {
         (format!("> {LAUNCHER_PROMPT_PLACEHOLDER}"), palette.dim)
     } else {
@@ -1304,13 +1303,7 @@ fn render_magical_tui_frame_with_mode_and_width(
         palette.reset,
         inner_width,
     );
-    push_line(
-        &mut frame,
-        &rule,
-        palette.field_label,
-        palette.reset,
-        inner_width,
-    );
+    push_line(&mut frame, &rule, border_strong, palette.reset, inner_width);
     push_line(&mut frame, "", palette.text, palette.reset, inner_width);
 
     // 3. Two-lane body: Commands rail (windowed) + Snapshot rows.
