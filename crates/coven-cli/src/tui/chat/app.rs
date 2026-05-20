@@ -1017,8 +1017,20 @@ mod tests {
 
         app.handle_input();
 
-        assert!(app.active_session_id().is_some());
+        let session_id = app.active_session_id().expect("session should be active");
         assert!(app.is_responding);
+
+        app.push_event_message(&EventRecord {
+            seq: 1,
+            id: "event-1".to_string(),
+            session_id,
+            kind: "exit".to_string(),
+            payload_json: serde_json::json!({ "status": "completed" }).to_string(),
+            created_at: "2026-05-19T00:00:00Z".to_string(),
+        });
+
+        assert_eq!(app.active_session_id(), None);
+        assert!(!app.is_responding);
     }
 
     #[test]
