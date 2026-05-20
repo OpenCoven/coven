@@ -18,7 +18,9 @@ use super::cast::{
     render_outcome, render_plan_intro, render_quest_handoff, set_phase_sub_prompt, skip_phase,
     CastHarness, CastIntent, CastOutcome, CastPlan, CastSessionExit, FollowerObserver,
     FollowerPacer, GateOutcome, PhaseInteraction, Quest, QuestPhase, QuestPhaseStatus,
-    QuestPhaseSummary, SafetyDecision,
+    QuestPhaseSummary, SafetyDecision, CAST_QUEST_ADVANCED_KIND, CAST_QUEST_COMPLETED_KIND,
+    CAST_QUEST_PHASE_COMPLETED_KIND, CAST_QUEST_PHASE_EDITED_KIND, CAST_QUEST_PHASE_SKIPPED_KIND,
+    CAST_QUEST_PHASE_STARTED_KIND, CAST_QUEST_STARTED_KIND,
 };
 use super::chat::client::{ChatClient, ChatEventQuery, DaemonChatClient, LaunchRequest};
 use super::{is_key_press, sessions};
@@ -503,18 +505,6 @@ fn dispatch_harness_spell(plan: &CastPlan, harness_id: &str, prompt: &str) -> Re
     )
 }
 
-/// Event kind prefix Cast writes to the anchor session's event log so a
-/// future `coven attach <anchor>` can detect that the session belongs to a
-/// quest. Per the Phase 7 scope decision (first-session anchor), every
-/// `cast.quest.*` event lives on phase-0's session; later phases still
-/// emit their own `cast.summary` events on their own sessions.
-const CAST_QUEST_STARTED: &str = "cast.quest.started";
-const CAST_QUEST_PHASE_STARTED: &str = "cast.quest.phase_started";
-const CAST_QUEST_PHASE_COMPLETED: &str = "cast.quest.phase_completed";
-const CAST_QUEST_PHASE_SKIPPED: &str = "cast.quest.phase_skipped";
-const CAST_QUEST_ADVANCED: &str = "cast.quest.advanced";
-const CAST_QUEST_COMPLETED: &str = "cast.quest.completed";
-
 /// Loop a deterministic Cast quest through its phases. Each iteration
 /// renders the handoff card, gates the phase's sub-prompt, dispatches via
 /// `dispatch_cast_launch`, then advances the quest with a summary built
@@ -524,10 +514,48 @@ const CAST_QUEST_COMPLETED: &str = "cast.quest.completed";
 /// (no session id means no anchor and no ledger writes).
 fn dispatch_cast_quest(plan: &CastPlan, goal: &str) -> Result<CastOutcome> {
     let default_harness = plan.harness.map(|h| h.harness);
-    let mut quest = quest_from_goal(goal, default_harness);
-    let mut anchor_session_id: Option<String> = None;
-    let mut completed_notes: Vec<String> = Vec::new();
+    let quest = quest_from_goal(goal, default_harness);
     let request_text = outcome_request_text(plan);
+    run_quest_loop(quest, None, default_harness, goal, request_text)
+}
+
+/// Resume a quest from a [`ReconstructedQuest`] decoded out of the
+/// anchor session's event log. The quest already has its cursor at the
+/// next pending phase (or past every phase, in which case the caller is
+/// expected to short-circuit). All side effects — handoff card, gate,
+/// dispatch, advance — flow through the same `run_quest_loop` the fresh
+/// `/quest <goal>` path uses, so resumed and fresh quests behave
+/// identically from the first surviving phase onward.
+fn resume_cast_quest(
+    reconstructed: cast::ReconstructedQuest,
+    request_text: String,
+) -> Result<CastOutcome> {
+    let default_harness = reconstructed
+        .quest
+        .phases
+        .iter()
+        .find_map(|phase| phase.harness);
+    let goal = reconstructed.quest.goal.clone();
+    run_quest_loop(
+        reconstructed.quest,
+        Some(reconstructed.anchor_session_id),
+        default_harness,
+        &goal,
+        request_text,
+    )
+}
+
+/// Per-phase loop shared by fresh `/quest <goal>` runs
+/// ([`dispatch_cast_quest`]) and re-attach resumes
+/// ([`resume_cast_quest`]).
+fn run_quest_loop(
+    mut quest: Quest,
+    mut anchor_session_id: Option<String>,
+    default_harness: Option<CastHarness>,
+    goal: &str,
+    request_text: String,
+) -> Result<CastOutcome> {
+    let mut completed_notes: Vec<String> = Vec::new();
 
     while let Some(idx) = quest.current_index() {
         // Phases the user (or a prior skip_phase call) already marked as
@@ -545,7 +573,7 @@ fn dispatch_cast_quest(plan: &CastPlan, goal: &str) -> Result<CastOutcome> {
         println!();
 
         let mut reader = stdin_line_reader;
-        match run_phase_interaction(&mut quest, idx, &mut reader)? {
+        match run_phase_interaction(&mut quest, idx, anchor_session_id.as_deref(), &mut reader)? {
             PhaseInteraction::Cancel { reason } => {
                 let phase_name = quest.phases[idx].name.clone();
                 completed_notes.push(format!("Phase `{phase_name}` cancelled: {reason}"));
@@ -567,7 +595,7 @@ fn dispatch_cast_quest(plan: &CastPlan, goal: &str) -> Result<CastOutcome> {
                 if let Some(anchor) = anchor_session_id.as_deref() {
                     write_quest_event(
                         anchor,
-                        CAST_QUEST_PHASE_SKIPPED,
+                        CAST_QUEST_PHASE_SKIPPED_KIND,
                         serde_json::json!({
                             "phase": phase_name,
                             "index": idx,
@@ -640,7 +668,7 @@ fn dispatch_cast_quest(plan: &CastPlan, goal: &str) -> Result<CastOutcome> {
                 anchor_session_id = Some(sid.clone());
                 write_quest_event(
                     sid,
-                    CAST_QUEST_STARTED,
+                    CAST_QUEST_STARTED_KIND,
                     serde_json::json!({
                         "title": quest.title,
                         "goal": quest.goal,
@@ -658,7 +686,7 @@ fn dispatch_cast_quest(plan: &CastPlan, goal: &str) -> Result<CastOutcome> {
         if let Some(anchor) = anchor_session_id.as_deref() {
             write_quest_event(
                 anchor,
-                CAST_QUEST_PHASE_STARTED,
+                CAST_QUEST_PHASE_STARTED_KIND,
                 serde_json::json!({
                     "phase": quest.phases[idx].name,
                     "index": idx,
@@ -674,7 +702,7 @@ fn dispatch_cast_quest(plan: &CastPlan, goal: &str) -> Result<CastOutcome> {
         if let Some(anchor) = anchor_session_id.as_deref() {
             write_quest_event(
                 anchor,
-                CAST_QUEST_PHASE_COMPLETED,
+                CAST_QUEST_PHASE_COMPLETED_KIND,
                 serde_json::json!({
                     "phase": quest.phases[idx].name,
                     "index": idx,
@@ -689,7 +717,7 @@ fn dispatch_cast_quest(plan: &CastPlan, goal: &str) -> Result<CastOutcome> {
         if let Some(anchor) = anchor_session_id.as_deref() {
             write_quest_event(
                 anchor,
-                CAST_QUEST_ADVANCED,
+                CAST_QUEST_ADVANCED_KIND,
                 serde_json::json!({
                     "from_index": idx,
                     "next_index": next,
@@ -701,7 +729,7 @@ fn dispatch_cast_quest(plan: &CastPlan, goal: &str) -> Result<CastOutcome> {
     if let Some(anchor) = anchor_session_id.as_deref() {
         write_quest_event(
             anchor,
-            CAST_QUEST_COMPLETED,
+            CAST_QUEST_COMPLETED_KIND,
             serde_json::json!({
                 "title": quest.title,
                 "phase_count": quest.phases.len(),
@@ -745,9 +773,17 @@ const PHASE_PROMPT_HINT: &str =
 /// `Edit` is consumed inside this function (the handoff card re-renders
 /// with the new sub-prompt and the user is prompted again) so callers
 /// only see one of the three terminal actions.
+///
+/// `anchor_session_id` is `Some` once phase 0 has launched and the anchor
+/// session exists; in that case each edit also writes a
+/// `cast.quest.phase_edited` event so a future re-attach can rebuild the
+/// user's sub-prompt verbatim. When `None` (typically before phase 0
+/// dispatches), edits are applied in-memory only — replay will fall back
+/// to the composed sub-prompt for that phase.
 fn run_phase_interaction<R>(
     quest: &mut Quest,
     idx: usize,
+    anchor_session_id: Option<&str>,
     reader: &mut R,
 ) -> Result<PhaseInteraction>
 where
@@ -759,7 +795,18 @@ where
         let line = reader(&prompt)?;
         match parse_phase_action(&line) {
             PhaseInteraction::Edit { sub_prompt } => {
-                set_phase_sub_prompt(quest, idx, sub_prompt)?;
+                set_phase_sub_prompt(quest, idx, sub_prompt.clone())?;
+                if let Some(anchor) = anchor_session_id {
+                    write_quest_event(
+                        anchor,
+                        CAST_QUEST_PHASE_EDITED_KIND,
+                        serde_json::json!({
+                            "phase": phase_name,
+                            "index": idx,
+                            "sub_prompt": sub_prompt,
+                        }),
+                    );
+                }
                 println!();
                 print!("{}", render_quest_handoff(quest, idx));
                 println!();
@@ -1226,13 +1273,37 @@ fn attach_via_daemon(
     // the user can see what the prior run was about. Live attaches just wrote
     // the summary themselves, so showing it again would only echo the exit
     // line we already printed. We also use the same history query to detect
-    // a quest anchor (Phase 7 minimal re-attach aid — detect + inform).
+    // a quest anchor and (Phase 9) to *resume* the quest loop at the next
+    // pending phase when the user attaches mid-quest.
     if !is_live {
         let history = client.list_events(ChatEventQuery {
             session_id: &session.id,
             after_seq: None,
             limit: None,
         })?;
+
+        // Phase 9: if this session is a quest anchor with work left, hand
+        // off to the resume loop. The returned outcome replaces the
+        // standard attach outcome — the quest is the user's foreground
+        // activity now. Completed quests fall through to the
+        // detect-and-inform note that Phase 7 introduced.
+        if let Some(reconstructed) = cast::reconstruct_quest(&history) {
+            if !reconstructed.is_complete && reconstructed.quest.current_index().is_some() {
+                println!();
+                println!(
+                    "Cast resuming quest `{}` from phase {}/{} …",
+                    reconstructed.quest.title,
+                    reconstructed
+                        .quest
+                        .current_index()
+                        .map(|i| i + 1)
+                        .unwrap_or(reconstructed.quest.phases.len()),
+                    reconstructed.quest.phases.len(),
+                );
+                return resume_cast_quest(reconstructed, request_text.to_string());
+            }
+        }
+
         if let Some(note) = cast::find_cast_summary(&history).and_then(|s| format_summary_note(&s))
         {
             notes.push(note);
@@ -1489,7 +1560,7 @@ mod quest_interaction_tests {
     fn run_phase_interaction_returns_approve_on_empty_input() {
         let mut quest = quest_from_goal("polish the README", Some(CastHarness::Codex));
         let mut reader = scripted_reader(vec![""]);
-        let action = run_phase_interaction(&mut quest, 0, &mut reader).unwrap();
+        let action = run_phase_interaction(&mut quest, 0, None, &mut reader).unwrap();
         assert_eq!(action, PhaseInteraction::Approve);
     }
 
@@ -1500,7 +1571,7 @@ mod quest_interaction_tests {
         // First line is an edit → second line skips. The function must
         // apply the edit, mark the phase as user-edited, then return Skip.
         let mut reader = scripted_reader(vec!["draft just the headlines", "/skip already covered"]);
-        let action = run_phase_interaction(&mut quest, 0, &mut reader).unwrap();
+        let action = run_phase_interaction(&mut quest, 0, None, &mut reader).unwrap();
         assert_eq!(
             action,
             PhaseInteraction::Skip {
@@ -1516,7 +1587,7 @@ mod quest_interaction_tests {
     fn run_phase_interaction_returns_cancel_with_default_reason() {
         let mut quest = quest_from_goal("polish the README", Some(CastHarness::Codex));
         let mut reader = scripted_reader(vec!["/cancel"]);
-        let action = run_phase_interaction(&mut quest, 0, &mut reader).unwrap();
+        let action = run_phase_interaction(&mut quest, 0, None, &mut reader).unwrap();
         match action {
             PhaseInteraction::Cancel { reason } => {
                 assert!(!reason.is_empty(), "default reason should be non-empty");

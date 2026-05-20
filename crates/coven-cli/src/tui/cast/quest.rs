@@ -26,6 +26,18 @@ use anyhow::{anyhow, Result};
 
 use super::intent::CastHarness;
 
+/// Canonical event kinds Cast writes to the *anchor* session of a quest.
+/// The reconstructor in `cast::attach` and the writer in `tui::shell`
+/// both reference these so the two stay in sync. See
+/// `docs/design/cast-quest-flow.md` §8 for the writer contract.
+pub(crate) const CAST_QUEST_STARTED_KIND: &str = "cast.quest.started";
+pub(crate) const CAST_QUEST_PHASE_STARTED_KIND: &str = "cast.quest.phase_started";
+pub(crate) const CAST_QUEST_PHASE_COMPLETED_KIND: &str = "cast.quest.phase_completed";
+pub(crate) const CAST_QUEST_PHASE_SKIPPED_KIND: &str = "cast.quest.phase_skipped";
+pub(crate) const CAST_QUEST_PHASE_EDITED_KIND: &str = "cast.quest.phase_edited";
+pub(crate) const CAST_QUEST_ADVANCED_KIND: &str = "cast.quest.advanced";
+pub(crate) const CAST_QUEST_COMPLETED_KIND: &str = "cast.quest.completed";
+
 /// A sequential goal Cast is guiding the user through. Owns the original
 /// user request and an ordered list of [`QuestPhase`]s. `cursor` points at
 /// the next phase that has not yet completed or been skipped.

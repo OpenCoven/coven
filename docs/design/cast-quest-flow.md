@@ -157,10 +157,20 @@ After Phase 7 auto-advance landed, Phase 8 wired the §5 approve / edit / skip /
 
 The Edit flow is intentionally a **single-line full replacement** because the per-phase prompt is one line of cooked stdin. Pasting a multi-line block typically arrives as one line on the prompt; for richer multi-line editing the user can use `$EDITOR` outside Cast and paste back. A future phase could swap in a multi-line editor surface.
 
-## 9. Deferred to a later phase
+## 9. Re-attach quest resume (Phase 9)
 
-Three §7 deferrals from Phase 7 are still open:
+Phase 7's `/attach <anchor>` only printed a one-line note when a session belonged to a quest. Phase 9 replays the anchor's event log into a live `Quest` and resumes the phase loop where the user left off.
 
-- **Full re-attach state rebuild.** `/attach <anchor>` currently prints a one-line note ("phase N/M, in progress / complete"). Replaying `cast.quest.*` events to reconstruct a `Quest` and re-render the next handoff card is the long pole and a separate phase.
+- **`reconstruct_quest`** (in `tui/cast/attach.rs`) — pure function. Reads `cast.quest.started` for the goal + harness + phase names, then walks subsequent `cast.quest.{phase_completed, phase_skipped, phase_edited, completed}` events in order, applying each to a fresh `quest_from_goal` build. Returns a `ReconstructedQuest { quest, is_complete, anchor_session_id }`. Malformed payloads and out-of-range indices are skipped silently so a corrupt event log never blocks the resume path.
+- **`cast.quest.phase_edited`** event was added in Phase 9 so user edits persist across re-attaches. Written from inside `run_phase_interaction` whenever an anchor is already established (phase 1+). Edits made before phase 0 dispatches still apply in-memory but fall back to the composed sub-prompt on replay.
+- **`resume_cast_quest`** (in `tui/shell.rs`) — accepts a `ReconstructedQuest` and a request label, then hands off to the shared `run_quest_loop` extracted from `dispatch_cast_quest`. Resumed quests and fresh quests share every side effect (gate, dispatch, advance, event writes) from the first surviving pending phase onward.
+- **`attach_via_daemon` routing** — when a non-live attach lands on an anchor session and the reconstructed quest has work left, control flow returns the resume outcome directly. Completed quests still render the Phase 7 detect-and-inform note alongside the standard `cast.summary` line.
+
+The event-kind constants live in `tui/cast/quest.rs` (`CAST_QUEST_*_KIND`) and are consumed by both the writer in `tui/shell.rs` and the reconstructor in `tui/cast/attach.rs`, so the two halves stay in sync by construction.
+
+## 10. Deferred to a later phase
+
+Two §7 deferrals are still open:
+
 - **Local-PTY fallback ledger.** Quest event writes are best-effort and skipped silently when `dispatch_cast_launch` falls back to the synchronous local PTY path (no daemon, no session id, no anchor). Re-attach will not find a quest there.
 - **`QuestPhaseStatus::Running` transition.** The shell loop transitions Pending → Complete directly (synchronous dispatch). A future async / detached-quest UX would set Running between the two.

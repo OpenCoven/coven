@@ -9,21 +9,19 @@ use serde_json::Value;
 
 use crate::store;
 
+use super::intent::CastHarness;
+use super::quest::{
+    advance, quest_from_goal, set_phase_sub_prompt, skip_phase, Quest, QuestPhaseSummary,
+    CAST_QUEST_PHASE_EDITED_KIND, CAST_QUEST_PHASE_SKIPPED_KIND,
+};
+
 /// Event kind Cast writes when a launched session finishes. See
 /// `shell::write_cast_summary_event` for the producer side.
 pub(crate) const CAST_SUMMARY_KIND: &str = "cast.summary";
 
-/// Event kind Cast writes on the anchor session when a quest begins. See
-/// `shell::dispatch_cast_quest` for the producer side.
-pub(crate) const CAST_QUEST_STARTED_KIND: &str = "cast.quest.started";
-
-/// Event kind Cast writes on the anchor session when a quest's last phase
-/// has finished.
-pub(crate) const CAST_QUEST_COMPLETED_KIND: &str = "cast.quest.completed";
-
-/// Event kind Cast writes on the anchor session right after each phase
-/// finishes. Used by the re-attach detector to compute the phase index.
-pub(crate) const CAST_QUEST_PHASE_COMPLETED_KIND: &str = "cast.quest.phase_completed";
+use super::quest::{
+    CAST_QUEST_COMPLETED_KIND, CAST_QUEST_PHASE_COMPLETED_KIND, CAST_QUEST_STARTED_KIND,
+};
 
 /// Decoded `cast.summary` event. All fields are optional because Cast may
 /// have written a partial payload (e.g. an older Cast that didn't record
@@ -105,6 +103,92 @@ pub(crate) fn find_cast_quest_info(events: &[store::EventRecord]) -> Option<Cast
         total_phases,
         completed_phases,
         is_complete,
+    })
+}
+
+/// Replayed quest state plus the anchor session id we attached to. The
+/// re-attach path in `tui::shell::attach_via_daemon` uses this to either
+/// resume the quest loop at the next pending phase or, when the quest is
+/// already complete, surface a summary note.
+#[derive(Clone, Debug)]
+pub(crate) struct ReconstructedQuest {
+    pub(crate) quest: Quest,
+    pub(crate) is_complete: bool,
+    pub(crate) anchor_session_id: String,
+}
+
+/// Replay `cast.quest.*` events from an anchor session to rebuild a
+/// `Quest` in the state it was in when the user last interacted with it.
+///
+/// Returns `None` when `events` does not contain a `cast.quest.started`
+/// payload (the session is not a quest anchor). The reconstructor is
+/// best-effort: malformed event payloads and out-of-range indices are
+/// skipped silently so a corrupt event log never blocks the resume path.
+pub(crate) fn reconstruct_quest(events: &[store::EventRecord]) -> Option<ReconstructedQuest> {
+    let started = events
+        .iter()
+        .find(|event| event.kind == CAST_QUEST_STARTED_KIND)?;
+    let payload = serde_json::from_str::<Value>(&started.payload_json).ok()?;
+    let goal = payload.get("goal").and_then(Value::as_str)?.to_string();
+    let default_harness = payload
+        .get("harness")
+        .and_then(Value::as_str)
+        .and_then(CastHarness::from_token);
+
+    let mut quest = quest_from_goal(&goal, default_harness);
+    let mut is_complete = false;
+
+    for event in events {
+        match event.kind.as_str() {
+            kind if kind == CAST_QUEST_PHASE_EDITED_KIND => {
+                let payload =
+                    serde_json::from_str::<Value>(&event.payload_json).unwrap_or(Value::Null);
+                let idx = payload.get("index").and_then(Value::as_u64);
+                let sub_prompt = payload.get("sub_prompt").and_then(Value::as_str);
+                if let (Some(idx), Some(text)) = (idx, sub_prompt) {
+                    let _ = set_phase_sub_prompt(&mut quest, idx as usize, text.to_string());
+                }
+            }
+            kind if kind == CAST_QUEST_PHASE_COMPLETED_KIND => {
+                let payload =
+                    serde_json::from_str::<Value>(&event.payload_json).unwrap_or(Value::Null);
+                let summary = QuestPhaseSummary {
+                    session_id: payload
+                        .get("session_id")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    exit_status: payload
+                        .get("exit_status")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    exit_code: payload
+                        .get("exit_code")
+                        .and_then(Value::as_i64)
+                        .map(|v| v as i32),
+                    carried_context: Vec::new(),
+                };
+                advance(&mut quest, summary);
+            }
+            kind if kind == CAST_QUEST_PHASE_SKIPPED_KIND => {
+                let payload =
+                    serde_json::from_str::<Value>(&event.payload_json).unwrap_or(Value::Null);
+                let idx = payload.get("index").and_then(Value::as_u64);
+                let reason = payload.get("reason").and_then(Value::as_str);
+                if let (Some(idx), Some(reason)) = (idx, reason) {
+                    let _ = skip_phase(&mut quest, idx as usize, reason.to_string());
+                }
+            }
+            kind if kind == CAST_QUEST_COMPLETED_KIND => {
+                is_complete = true;
+            }
+            _ => {}
+        }
+    }
+
+    Some(ReconstructedQuest {
+        quest,
+        is_complete,
+        anchor_session_id: started.session_id.clone(),
     })
 }
 
@@ -452,6 +536,173 @@ mod tests {
         let note = format_quest_attach_note(&info).expect("note should be produced");
         assert!(note.contains("phase 3/3"));
         assert!(note.contains("complete"));
+    }
+
+    fn phase_completed_event(
+        seq: i64,
+        idx: usize,
+        status: &str,
+        exit_code: i32,
+    ) -> store::EventRecord {
+        store::EventRecord {
+            seq,
+            id: format!("event-{seq}"),
+            session_id: "anchor".to_string(),
+            kind: CAST_QUEST_PHASE_COMPLETED_KIND.to_string(),
+            payload_json: serde_json::json!({
+                "phase": format!("p{idx}"),
+                "index": idx,
+                "session_id": format!("session-{idx}"),
+                "exit_status": status,
+                "exit_code": exit_code,
+            })
+            .to_string(),
+            created_at: "2026-05-20T00:00:00Z".to_string(),
+        }
+    }
+
+    fn phase_skipped_event(seq: i64, idx: usize, reason: &str) -> store::EventRecord {
+        store::EventRecord {
+            seq,
+            id: format!("event-{seq}"),
+            session_id: "anchor".to_string(),
+            kind: CAST_QUEST_PHASE_SKIPPED_KIND.to_string(),
+            payload_json: serde_json::json!({
+                "phase": format!("p{idx}"),
+                "index": idx,
+                "reason": reason,
+            })
+            .to_string(),
+            created_at: "2026-05-20T00:00:00Z".to_string(),
+        }
+    }
+
+    fn phase_edited_event(seq: i64, idx: usize, sub_prompt: &str) -> store::EventRecord {
+        store::EventRecord {
+            seq,
+            id: format!("event-{seq}"),
+            session_id: "anchor".to_string(),
+            kind: CAST_QUEST_PHASE_EDITED_KIND.to_string(),
+            payload_json: serde_json::json!({
+                "phase": format!("p{idx}"),
+                "index": idx,
+                "sub_prompt": sub_prompt,
+            })
+            .to_string(),
+            created_at: "2026-05-20T00:00:00Z".to_string(),
+        }
+    }
+
+    fn started_event_with(session_id: &str, goal: &str, harness: &str) -> store::EventRecord {
+        store::EventRecord {
+            seq: 1,
+            id: "event-1".to_string(),
+            session_id: session_id.to_string(),
+            kind: CAST_QUEST_STARTED_KIND.to_string(),
+            payload_json: serde_json::json!({
+                "title": "Test quest",
+                "goal": goal,
+                "harness": harness,
+                "phases": ["design", "implement", "verify"],
+            })
+            .to_string(),
+            created_at: "2026-05-20T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn reconstruct_quest_returns_none_when_no_started_event() {
+        let events = vec![output_event(1, "noise")];
+        assert!(reconstruct_quest(&events).is_none());
+    }
+
+    #[test]
+    fn reconstruct_quest_rebuilds_initial_state_with_cursor_at_zero() {
+        let events = vec![started_event_with("anchor-id", "ship phase 9", "codex")];
+        let recon = reconstruct_quest(&events).expect("should reconstruct");
+        assert_eq!(recon.anchor_session_id, "anchor-id");
+        assert!(!recon.is_complete);
+        assert_eq!(recon.quest.cursor, 0);
+        assert_eq!(recon.quest.goal, "ship phase 9");
+    }
+
+    #[test]
+    fn reconstruct_quest_replays_phase_completed_events_to_advance_cursor() {
+        let events = vec![
+            started_event_with("anchor-id", "ship phase 9", "codex"),
+            phase_completed_event(2, 0, "completed", 0),
+        ];
+        let recon = reconstruct_quest(&events).expect("should reconstruct");
+        assert_eq!(recon.quest.cursor, 1);
+        assert!(!recon.is_complete);
+    }
+
+    #[test]
+    fn reconstruct_quest_applies_user_edits_before_completion() {
+        let events = vec![
+            started_event_with("anchor-id", "ship phase 9", "codex"),
+            phase_edited_event(2, 0, "REPLACED design sub-prompt"),
+            phase_completed_event(3, 0, "completed", 0),
+        ];
+        let recon = reconstruct_quest(&events).expect("should reconstruct");
+        assert!(
+            recon.quest.phases[0].edited_by_user,
+            "phase 0 should be marked edited"
+        );
+        // After completion the phase status is Complete, but the
+        // sub_prompt retains the user's text for re-attach inspection.
+        assert_eq!(
+            recon.quest.phases[0].sub_prompt,
+            "REPLACED design sub-prompt"
+        );
+    }
+
+    #[test]
+    fn reconstruct_quest_replays_skip_and_advances_past_it() {
+        let events = vec![
+            started_event_with("anchor-id", "ship phase 9", "codex"),
+            phase_skipped_event(2, 0, "already covered"),
+        ];
+        let recon = reconstruct_quest(&events).expect("should reconstruct");
+        // Skipping phase 0 rolls the cursor forward to phase 1.
+        assert_eq!(recon.quest.cursor, 1);
+    }
+
+    #[test]
+    fn reconstruct_quest_marks_is_complete_when_completed_event_present() {
+        let events = vec![
+            started_event_with("anchor-id", "ship phase 9", "codex"),
+            phase_completed_event(2, 0, "completed", 0),
+            phase_completed_event(3, 1, "completed", 0),
+            phase_completed_event(4, 2, "completed", 0),
+            store::EventRecord {
+                seq: 5,
+                id: "event-5".to_string(),
+                session_id: "anchor".to_string(),
+                kind: CAST_QUEST_COMPLETED_KIND.to_string(),
+                payload_json: serde_json::json!({"title": "Test quest"}).to_string(),
+                created_at: "2026-05-20T00:00:00Z".to_string(),
+            },
+        ];
+        let recon = reconstruct_quest(&events).expect("should reconstruct");
+        assert!(recon.is_complete);
+        assert_eq!(recon.quest.cursor, 3, "cursor should be past all phases");
+    }
+
+    #[test]
+    fn reconstruct_quest_skips_malformed_event_payloads_without_failing() {
+        let mut bad_completed = phase_completed_event(2, 0, "completed", 0);
+        bad_completed.payload_json = "not json".to_string();
+        let events = vec![
+            started_event_with("anchor-id", "ship phase 9", "codex"),
+            bad_completed,
+            phase_completed_event(3, 0, "completed", 0),
+        ];
+        let recon = reconstruct_quest(&events).expect("should reconstruct");
+        // The first (malformed) event still triggers an advance because
+        // `unwrap_or(Value::Null)` yields a default summary; both advances
+        // run, so cursor lands at 2.
+        assert_eq!(recon.quest.cursor, 2);
     }
 
     #[test]

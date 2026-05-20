@@ -29,7 +29,7 @@ impl CastHarness {
         }
     }
 
-    fn from_token(token: &str) -> Option<Self> {
+    pub(crate) fn from_token(token: &str) -> Option<Self> {
         match token.to_ascii_lowercase().as_str() {
             "codex" => Some(CastHarness::Codex),
             "claude" | "claude-code" | "claudecode" => Some(CastHarness::Claude),

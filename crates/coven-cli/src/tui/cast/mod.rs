@@ -26,6 +26,7 @@ use crate::harness;
 
 pub(crate) use attach::{
     find_cast_quest_info, find_cast_summary, format_quest_attach_note, format_summary_note,
+    reconstruct_quest, ReconstructedQuest,
 };
 pub(crate) use follow::{follow_until_exit, CastSessionExit, FollowerObserver, FollowerPacer};
 pub(crate) use gate::{evaluate_gate, GateOutcome};
@@ -35,6 +36,9 @@ pub(crate) use plan::{build_plan, CastPlan};
 pub(crate) use quest::{
     advance as advance_quest, parse_phase_action, quest_from_goal, set_phase_sub_prompt,
     skip_phase, PhaseInteraction, Quest, QuestPhase, QuestPhaseStatus, QuestPhaseSummary,
+    CAST_QUEST_ADVANCED_KIND, CAST_QUEST_COMPLETED_KIND, CAST_QUEST_PHASE_COMPLETED_KIND,
+    CAST_QUEST_PHASE_EDITED_KIND, CAST_QUEST_PHASE_SKIPPED_KIND, CAST_QUEST_PHASE_STARTED_KIND,
+    CAST_QUEST_STARTED_KIND,
 };
 // `compose_sub_prompt` and `QuestHandoff` are exercised by the in-module
 // test suite; they remain in the public crate surface so a future async /
