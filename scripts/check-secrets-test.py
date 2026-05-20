@@ -162,6 +162,59 @@ class SecretGuardLockfileTests(unittest.TestCase):
 
         self.assertEqual(hits, [("docs/example.md", 1, "high_entropy")])
 
+    def test_screaming_snake_constant_method_call_is_not_a_secret(self) -> None:
+        text = (
+            "            kind: CAST_QUEST_PHASE_COMPLETED_KIND.to_string(),\n"
+            "            kind: CAST_QUEST_COMPLETED_KIND.to_string(),\n"
+        )
+
+        hits = check_secrets.scan_text(text, "crates/coven-cli/src/tui/cast/attach.rs")
+
+        self.assertEqual(hits, [])
+
+    def test_long_snake_case_test_function_name_is_not_a_secret(self) -> None:
+        text = "    fn non_zero_exit_codes_use_failure_handoff_reason() {\n"
+
+        hits = check_secrets.scan_text(text, "crates/coven-cli/src/tui/cast/quest.rs")
+
+        self.assertEqual(hits, [])
+
+    def test_high_entropy_token_without_identifier_shape_still_trips(self) -> None:
+        # No underscores or dots, mixed case + slash + digits — clearly not a
+        # programming identifier. Must still be reported even when the line
+        # happens to also contain a real identifier-looking token.
+        token = "m9R3tQv7WzK2pL5nX8cF1gJ4sD6hY0aB/EuIqOwPz9RkTlVxCyNmS3HdG7fA"
+        text = f"// CAST_QUEST_PHASE_COMPLETED_KIND.to_string() => {token}\n"
+
+        hits = check_secrets.scan_text(text, "docs/example.md")
+
+        self.assertEqual(hits, [("docs/example.md", 1, "high_entropy")])
+
+    def test_identifier_heuristic_rejects_mixed_case_segments(self) -> None:
+        # Segments mix upper and lower case within a single segment — not the
+        # snake_case / SCREAMING_SNAKE_CASE shape we want to whitelist. The
+        # heuristic should return False so the entropy rule still applies.
+        self.assertFalse(
+            check_secrets.is_programming_identifier_token(
+                "MixedCaseToken_AnotherMixedCase_YetMoreMixed_AndAgain_FinalSegment"
+            )
+        )
+
+    def test_identifier_heuristic_rejects_non_identifier_chars(self) -> None:
+        # Tokens containing `/` or `+` are typical of base64/credential blobs.
+        self.assertFalse(
+            check_secrets.is_programming_identifier_token(
+                "abc_def_ghi/jkl_mno_pqr+stu_vwx"
+            )
+        )
+
+    def test_identifier_heuristic_requires_three_segments(self) -> None:
+        # A token with only one underscore (two segments) is too generic to
+        # safely whitelist; the entropy rule should still see it.
+        self.assertFalse(
+            check_secrets.is_programming_identifier_token("supersecret_payloadblob")
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

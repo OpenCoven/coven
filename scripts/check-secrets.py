@@ -101,6 +101,35 @@ def is_github_advisory_url_like_token(token: str) -> bool:
     return normalized.startswith("github.com/advisories/GHSA-")
 
 
+def is_programming_identifier_token(token: str) -> bool:
+    """Whether `token` looks like a snake_case / SCREAMING_SNAKE_CASE identifier
+    (optionally suffixed with a `.method` call), which is common in Rust source
+    and is never a credential.
+
+    The guard keeps the rest of the high-entropy path strict by requiring the
+    token to be composed only of `[A-Za-z0-9_.]`, to be split into at least
+    three segments by `_`/`.`, and for every segment to be a simple word-like
+    chunk (single-case alphabetic with optional trailing digits). Real API
+    tokens have no underscores or dots, mix case within a segment, or contain
+    non-identifier characters such as `/` `+` `-`, so they continue to fail
+    this check and trip the entropy rule as before.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_.]+", token):
+        return False
+    segments = [seg for seg in re.split(r"[._]", token) if seg]
+    if len(segments) < 3:
+        return False
+    for seg in segments:
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", seg):
+            return False
+        letters = "".join(ch for ch in seg if ch.isalpha())
+        if not (letters.islower() or letters.isupper()):
+            return False
+        if len(seg) > 24:
+            return False
+    return True
+
+
 def scan_text(text: str, path: str) -> list[tuple[str, int, str]]:
     hits: list[tuple[str, int, str]] = []
     for line_number, line in enumerate(text.splitlines(), 1):
@@ -125,6 +154,7 @@ def scan_text(text: str, path: str) -> list[tuple[str, int, str]]:
                 is_local_path_like_token(token)
                 or is_public_repo_url_like_token(token)
                 or is_github_advisory_url_like_token(token)
+                or is_programming_identifier_token(token)
             ):
                 continue
             if entropy(token) >= 4.3:
