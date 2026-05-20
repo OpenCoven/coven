@@ -983,7 +983,6 @@ fn print_cast_non_interactive_frame() {
     let default_harness_id = default_harness_id();
     let frame = render_cast_frame_for_terminal(project_root.as_deref(), default_harness_id);
     print!("{frame}");
-    println!("\nTip: run `coven` in a real terminal to open the Cast launcher and type a spell.");
 }
 
 /// Plain-text Cast frame for tests and pipe targets. Mirrors

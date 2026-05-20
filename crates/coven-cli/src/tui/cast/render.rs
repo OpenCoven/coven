@@ -27,11 +27,11 @@ const CHIP_SAFE: &str = "[  SAFE  ]";
 const CHIP_CONFIRM: &str = "[CONFIRM ]";
 const CHIP_REJECT: &str = "[ REJECT ]";
 
-/// One-line salute at the top of every Cast frame. Used by both the
-/// interactive launcher (woven into the shell frame) and the non-interactive
-/// fallback so logs and pipes always show the familiar's name.
+/// One-line subtitle under the `Cast` identity row in the non-interactive
+/// frame. Stays brand-aligned without second-person greeting or the
+/// "is ready" lampshading the design contract calls out.
 pub(crate) fn cast_salute() -> &'static str {
-    "Cast, your Coven familiar, is ready. Type a spell, or use a slash command."
+    "Coven familiar · type a spell or pick a slash"
 }
 
 /// A short Cast frame for non-interactive mode: who Cast is, what spells look
@@ -59,54 +59,47 @@ fn render_cast_frame_with_mode(
     default_harness: Option<&str>,
     mode: TerminalMode,
 ) -> String {
-    let primary_strong = theme::Fg::with_mode(theme::PRIMARY_STRONG, mode);
-    let primary = theme::Fg::with_mode(theme::PRIMARY, mode);
-    let field_label = theme::Fg::with_mode(theme::FIELD_LABEL, mode);
-    let user_label = theme::Fg::with_mode(theme::USER_LABEL, mode);
-    let dim = theme::Fg::with_mode(theme::DIM, mode);
-    let reset = theme::Reset::with_mode(mode);
+    let p = palette_for(mode);
     let inner_width = CAST_INTRO_INNER_WIDTH;
     let mut frame = String::new();
 
+    // Identity + subtitle (the subtitle is the only place "Coven familiar"
+    // appears now — no second-person greeting, no "is ready" lampshading).
+    push_section_header(&mut frame, &p, "Cast");
     frame.push_str(&format!(
-        "{primary_strong}Cast — your Coven familiar{reset}\n"
-    ));
-    frame.push_str(&format!(
-        "{field_label}{}{reset}\n",
-        fit_chars(cast_salute(), inner_width)
+        "{}{}{}\n",
+        p.field_label,
+        fit_chars(cast_salute(), inner_width),
+        p.reset,
     ));
     frame.push('\n');
 
-    frame.push_str(&format!("{primary_strong}Context{reset}\n"));
+    push_section_header(&mut frame, &p, "Context");
     let project = project_root
         .map(|root| root.display().to_string())
         .unwrap_or_else(|| "not inside a project root — run from a repo".to_string());
-    frame.push_str(&format!(
-        "{field_label}Project{reset}        {}\n",
-        fit_chars(&project, inner_width.saturating_sub(15))
-    ));
+    push_label_row(&mut frame, &p, "project", &project);
     let harness = default_harness.unwrap_or("none ready — run `coven doctor`");
-    frame.push_str(&format!(
-        "{field_label}Default harness{reset} {}\n",
-        fit_chars(harness, inner_width.saturating_sub(15))
-    ));
+    push_label_row(&mut frame, &p, "harness", harness);
     frame.push('\n');
 
-    frame.push_str(&format!("{primary_strong}Example spells{reset}\n"));
+    push_section_header(&mut frame, &p, "Example spells");
     for spell in cast_example_spells() {
-        frame.push_str(&format!("{primary}  {}{reset}\n", spell));
+        frame.push_str(&format!("  {}{}{}\n", p.text, spell, p.reset));
     }
     frame.push('\n');
 
-    frame.push_str(&format!("{primary_strong}Slash spells{reset}\n"));
+    push_section_header(&mut frame, &p, "Slash spells");
     for spell in cast_example_slashes() {
-        frame.push_str(&format!("{user_label}  {}{reset}\n", spell));
+        frame.push_str(&format!("  {}{}{}\n", p.user_label, spell, p.reset));
     }
     frame.push('\n');
 
-    frame.push_str(&format!(
-        "{dim}Tip: in a terminal, `coven` opens the Cast launcher. Empty input opens the slash palette.{reset}\n"
-    ));
+    push_footer_hint(
+        &mut frame,
+        &p,
+        "run `coven` in a terminal to open the launcher · empty input runs a slash",
+    );
     frame
 }
 
