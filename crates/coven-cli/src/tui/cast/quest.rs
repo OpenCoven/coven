@@ -16,11 +16,11 @@
 //!
 //! Integration boundary: this module is pure. The Cast shell wires the
 //! quest into its existing gate / follow / outcome surfaces; `quest.rs`
-//! does no IO and never reaches the daemon directly. Until the shell
-//! integration lands, the surface is exercised only by the in-module test
-//! suite — `#![allow(dead_code)]` keeps the warning noise off the seam.
-
-#![allow(dead_code)]
+//! does no IO and never reaches the daemon directly. Phase 7 lands the
+//! shell wiring, so the module is no longer dead — but `skip_phase`,
+//! `set_phase_sub_prompt`, and `compose_sub_prompt` remain reachable only
+//! through future UX (edit / skip prompts deferred per the Phase 7 scope
+//! decision). Their `#[allow(dead_code)]` annotations document that.
 
 use anyhow::{anyhow, Result};
 
@@ -56,9 +56,19 @@ pub(crate) struct QuestPhase {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum QuestPhaseStatus {
     Pending,
-    Running { session_id: String },
+    /// Reserved for a future "live attach to a running quest phase" UX —
+    /// the shell loop in Phase 7 transitions Pending → Complete directly.
+    #[allow(dead_code)]
+    Running {
+        session_id: String,
+    },
     Complete(QuestPhaseSummary),
-    Skipped { reason: String },
+    /// Set by `skip_phase` (currently only exercised by tests; the
+    /// auto-advance loop never skips on its own).
+    #[allow(dead_code)]
+    Skipped {
+        reason: String,
+    },
 }
 
 /// Structured outcome of a single phase. Cast feeds this into the next
@@ -93,10 +103,17 @@ impl Quest {
         }
     }
 
+    /// Convenience accessor for the current phase. Exercised by the
+    /// in-module tests; the shell loop currently indexes `quest.phases`
+    /// directly so it can borrow mutably elsewhere.
+    #[allow(dead_code)]
     pub(crate) fn current(&self) -> Option<&QuestPhase> {
         self.current_index().map(|idx| &self.phases[idx])
     }
 
+    /// Convenience predicate used by the in-module test suite to assert
+    /// quest exhaustion; the shell loop reads `current_index` directly.
+    #[allow(dead_code)]
     pub(crate) fn is_complete(&self) -> bool {
         self.cursor >= self.phases.len()
     }
@@ -235,6 +252,10 @@ pub(crate) fn advance(quest: &mut Quest, summary: QuestPhaseSummary) -> Option<u
 /// user-edited so a later [`advance`] does not silently regenerate the
 /// text. Errors out if the phase is not pending — Cast does not rewrite
 /// already-running or completed phases.
+///
+/// Reserved for the edit-sub-prompt UX deferred per Phase 7's scope
+/// decision; currently only the in-module test suite calls it.
+#[allow(dead_code)]
 pub(crate) fn set_phase_sub_prompt(
     quest: &mut Quest,
     index: usize,
@@ -258,6 +279,10 @@ pub(crate) fn set_phase_sub_prompt(
 /// Skip a pending phase with a recorded reason. Useful when the prior
 /// phase already satisfied this phase's goal (e.g. tests passed during
 /// implement, so verify becomes a no-op).
+///
+/// Reserved for the skip-phase UX deferred per Phase 7's scope decision;
+/// currently only the in-module test suite calls it.
+#[allow(dead_code)]
 pub(crate) fn skip_phase(quest: &mut Quest, index: usize, reason: String) -> Result<()> {
     let phase = quest
         .phases

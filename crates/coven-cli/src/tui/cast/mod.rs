@@ -24,20 +24,29 @@ use anyhow::Result;
 
 use crate::harness;
 
-pub(crate) use attach::{find_cast_summary, format_summary_note};
+pub(crate) use attach::{
+    find_cast_quest_info, find_cast_summary, format_quest_attach_note, format_summary_note,
+};
 pub(crate) use follow::{follow_until_exit, CastSessionExit, FollowerObserver, FollowerPacer};
 pub(crate) use gate::{evaluate_gate, GateOutcome};
 pub(crate) use intent::{parse_spell, CastHarness, CastIntent};
 pub(crate) use outcome::CastOutcome;
 pub(crate) use plan::{build_plan, CastPlan};
+pub(crate) use quest::{
+    advance as advance_quest, quest_from_goal, Quest, QuestPhase, QuestPhaseSummary,
+};
+// `compose_sub_prompt`, `set_phase_sub_prompt`, `skip_phase`, `QuestHandoff`,
+// and `QuestPhaseStatus` are exercised by the in-module test suite and the
+// edit / skip UX deferred per the Phase 7 scope decision; keep them in the
+// public crate surface so the future UX can pick them up without further
+// plumbing.
 #[allow(unused_imports)]
 pub(crate) use quest::{
-    advance as advance_quest, compose_sub_prompt, quest_from_goal, set_phase_sub_prompt,
-    skip_phase, Quest, QuestHandoff, QuestPhase, QuestPhaseStatus, QuestPhaseSummary,
+    compose_sub_prompt, set_phase_sub_prompt, skip_phase, QuestHandoff, QuestPhaseStatus,
 };
-#[allow(unused_imports)]
-pub(crate) use render::render_quest_handoff;
-pub(crate) use render::{render_cast_frame_for_terminal, render_outcome, render_plan_intro};
+pub(crate) use render::{
+    render_cast_frame_for_terminal, render_outcome, render_plan_intro, render_quest_handoff,
+};
 pub(crate) use safety::SafetyDecision;
 
 // Re-exports used only by tests in `crate::tests` (main.rs). Bundled here

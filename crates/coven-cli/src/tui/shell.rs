@@ -13,9 +13,11 @@ use crossterm::{
 use uuid::Uuid;
 
 use super::cast::{
-    self, evaluate_gate, follow_until_exit, format_summary_note, render_cast_frame_for_terminal,
-    render_outcome, render_plan_intro, CastIntent, CastOutcome, CastPlan, CastSessionExit,
-    FollowerObserver, FollowerPacer, GateOutcome, SafetyDecision,
+    self, advance_quest, build_plan, evaluate_gate, find_cast_summary, follow_until_exit,
+    format_summary_note, quest_from_goal, render_cast_frame_for_terminal, render_outcome,
+    render_plan_intro, render_quest_handoff, CastHarness, CastIntent, CastOutcome, CastPlan,
+    CastSessionExit, FollowerObserver, FollowerPacer, GateOutcome, Quest, QuestPhase,
+    QuestPhaseSummary, SafetyDecision,
 };
 use super::chat::client::{ChatClient, ChatEventQuery, DaemonChatClient, LaunchRequest};
 use super::{is_key_press, sessions};
@@ -428,6 +430,7 @@ fn dispatch_cast_plan(plan: CastPlan) -> Result<()> {
             run_patch_openclaw(vec![], None, None, None, false, false, true)?;
             CastOutcome::for_request(request_text)
         }
+        CastIntent::Quest { goal } => dispatch_cast_quest(&plan, &goal)?,
         CastIntent::Quit => {
             let primary = theme::fg(theme::PRIMARY);
             let reset = theme::reset();
@@ -497,6 +500,285 @@ fn dispatch_harness_spell(plan: &CastPlan, harness_id: &str, prompt: &str) -> Re
             harness_label(harness_id)
         ),
     )
+}
+
+/// Event kind prefix Cast writes to the anchor session's event log so a
+/// future `coven attach <anchor>` can detect that the session belongs to a
+/// quest. Per the Phase 7 scope decision (first-session anchor), every
+/// `cast.quest.*` event lives on phase-0's session; later phases still
+/// emit their own `cast.summary` events on their own sessions.
+const CAST_QUEST_STARTED: &str = "cast.quest.started";
+const CAST_QUEST_PHASE_STARTED: &str = "cast.quest.phase_started";
+const CAST_QUEST_PHASE_COMPLETED: &str = "cast.quest.phase_completed";
+const CAST_QUEST_ADVANCED: &str = "cast.quest.advanced";
+const CAST_QUEST_COMPLETED: &str = "cast.quest.completed";
+
+/// Loop a deterministic Cast quest through its phases. Each iteration
+/// renders the handoff card, gates the phase's sub-prompt, dispatches via
+/// `dispatch_cast_launch`, then advances the quest with a summary built
+/// from the session's `cast.summary` event. `cast.quest.*` events are
+/// written to the anchor (first-phase) session as a re-attach aid; they
+/// are best-effort and skipped silently when the daemon is not running
+/// (no session id means no anchor and no ledger writes).
+fn dispatch_cast_quest(plan: &CastPlan, goal: &str) -> Result<CastOutcome> {
+    let default_harness = plan.harness.map(|h| h.harness);
+    let mut quest = quest_from_goal(goal, default_harness);
+    let mut anchor_session_id: Option<String> = None;
+    let mut completed_notes: Vec<String> = Vec::new();
+    let request_text = outcome_request_text(plan);
+
+    while let Some(idx) = quest.current_index() {
+        println!();
+        print!("{}", render_quest_handoff(&quest, idx));
+        println!();
+
+        let phase_harness = match resolve_phase_harness(&quest.phases[idx], default_harness) {
+            Some(harness) => harness,
+            None => {
+                return Ok(quest_outcome(
+                    &request_text,
+                    &quest,
+                    anchor_session_id.clone(),
+                    completed_notes,
+                    Some(
+                        "No harness ready. Run `coven doctor`, then retry `/quest <goal>`."
+                            .to_string(),
+                    ),
+                    Some("Quest paused — no harness available for the next phase.".to_string()),
+                ));
+            }
+        };
+
+        let phase_plan = quest_phase_plan(&quest, idx, phase_harness, goal)?;
+
+        let mut reader = stdin_line_reader;
+        match evaluate_gate(&phase_plan, &mut reader)? {
+            GateOutcome::Cancelled { reason, next_step } => {
+                completed_notes.push(format!(
+                    "Phase `{}` cancelled: {reason}",
+                    quest.phases[idx].name
+                ));
+                return Ok(quest_outcome(
+                    &request_text,
+                    &quest,
+                    anchor_session_id.clone(),
+                    completed_notes,
+                    next_step,
+                    Some(format!(
+                        "Quest cancelled at phase `{}`.",
+                        quest.phases[idx].name
+                    )),
+                ));
+            }
+            GateOutcome::Proceed => {}
+        }
+
+        let phase_outcome = dispatch_cast_launch(
+            &phase_plan,
+            phase_harness.id(),
+            &quest.phases[idx].sub_prompt,
+            format!(
+                "Quest phase `{}` ({})",
+                quest.phases[idx].name,
+                phase_harness.label()
+            ),
+        )?;
+
+        let phase_session_id = phase_outcome.session_id.clone();
+        if anchor_session_id.is_none() {
+            if let Some(sid) = &phase_session_id {
+                anchor_session_id = Some(sid.clone());
+                write_quest_event(
+                    sid,
+                    CAST_QUEST_STARTED,
+                    serde_json::json!({
+                        "title": quest.title,
+                        "goal": quest.goal,
+                        "harness": phase_harness.id(),
+                        "phases": quest
+                            .phases
+                            .iter()
+                            .map(|p| p.name.clone())
+                            .collect::<Vec<_>>(),
+                    }),
+                );
+            }
+        }
+
+        if let Some(anchor) = anchor_session_id.as_deref() {
+            write_quest_event(
+                anchor,
+                CAST_QUEST_PHASE_STARTED,
+                serde_json::json!({
+                    "phase": quest.phases[idx].name,
+                    "index": idx,
+                    "session_id": phase_session_id,
+                    "harness": phase_harness.id(),
+                }),
+            );
+        }
+
+        let summary = phase_summary_from_session(phase_session_id.as_deref());
+        completed_notes.push(format_phase_note(&quest.phases[idx].name, &summary));
+
+        if let Some(anchor) = anchor_session_id.as_deref() {
+            write_quest_event(
+                anchor,
+                CAST_QUEST_PHASE_COMPLETED,
+                serde_json::json!({
+                    "phase": quest.phases[idx].name,
+                    "index": idx,
+                    "session_id": summary.session_id,
+                    "exit_status": summary.exit_status,
+                    "exit_code": summary.exit_code,
+                }),
+            );
+        }
+
+        let next = advance_quest(&mut quest, summary);
+        if let Some(anchor) = anchor_session_id.as_deref() {
+            write_quest_event(
+                anchor,
+                CAST_QUEST_ADVANCED,
+                serde_json::json!({
+                    "from_index": idx,
+                    "next_index": next,
+                }),
+            );
+        }
+    }
+
+    if let Some(anchor) = anchor_session_id.as_deref() {
+        write_quest_event(
+            anchor,
+            CAST_QUEST_COMPLETED,
+            serde_json::json!({
+                "title": quest.title,
+                "phase_count": quest.phases.len(),
+            }),
+        );
+    }
+
+    Ok(quest_outcome(
+        &request_text,
+        &quest,
+        anchor_session_id,
+        completed_notes,
+        Some(
+            "Use `/sessions` to inspect each phase, or `/attach <anchor-id>` to read the quest event log."
+                .to_string(),
+        ),
+        Some(format!("Quest `{}` complete.", quest.title)),
+    ))
+}
+
+/// Each phase prefers the harness recorded on the phase (so a future UX
+/// could let the user route phase N to a different harness) and falls back
+/// to the quest-wide default. Returns `None` only when neither is set.
+fn resolve_phase_harness(
+    phase: &QuestPhase,
+    default_harness: Option<CastHarness>,
+) -> Option<CastHarness> {
+    phase.harness.or(default_harness)
+}
+
+/// Synthesize a per-phase `CastPlan` so the existing safety gate can vet
+/// the resolved sub-prompt before each launch. The plan is built from a
+/// `HarnessSpell` intent so the classifier reads the *sub-prompt* content,
+/// not the original quest goal verbatim.
+fn quest_phase_plan(
+    quest: &Quest,
+    idx: usize,
+    harness: CastHarness,
+    goal: &str,
+) -> Result<CastPlan> {
+    let phase = &quest.phases[idx];
+    let intent = CastIntent::HarnessSpell {
+        harness,
+        prompt: phase.sub_prompt.clone(),
+    };
+    Ok(
+        build_plan(intent, || Some(harness))?.with_raw_spell(format!(
+            "/quest {goal} (phase {phase_num}/{total}: {name})",
+            phase_num = idx + 1,
+            total = quest.phases.len(),
+            name = phase.name,
+        )),
+    )
+}
+
+/// Build a `QuestPhaseSummary` from the session's `cast.summary` event.
+/// Returns a default summary (no exit info) when the session id is absent
+/// (local-PTY fallback) or the store cannot be opened.
+fn phase_summary_from_session(session_id: Option<&str>) -> QuestPhaseSummary {
+    let Some(sid) = session_id else {
+        return QuestPhaseSummary::default();
+    };
+    let Ok(store_path) = coven_store_path() else {
+        return QuestPhaseSummary {
+            session_id: Some(sid.to_string()),
+            ..Default::default()
+        };
+    };
+    let Ok(conn) = store::open_store(&store_path) else {
+        return QuestPhaseSummary {
+            session_id: Some(sid.to_string()),
+            ..Default::default()
+        };
+    };
+    let Ok(events) = store::list_events(&conn, sid) else {
+        return QuestPhaseSummary {
+            session_id: Some(sid.to_string()),
+            ..Default::default()
+        };
+    };
+    let summary = find_cast_summary(&events);
+    QuestPhaseSummary {
+        session_id: Some(sid.to_string()),
+        exit_status: summary.as_ref().and_then(|s| s.status.clone()),
+        exit_code: summary.as_ref().and_then(|s| s.exit_code),
+        carried_context: Vec::new(),
+    }
+}
+
+fn format_phase_note(name: &str, summary: &QuestPhaseSummary) -> String {
+    match (&summary.exit_status, summary.exit_code) {
+        (Some(status), Some(code)) => format!("Phase `{name}`: {status} (exit {code})"),
+        (Some(status), None) => format!("Phase `{name}`: {status}"),
+        (None, Some(code)) => format!("Phase `{name}`: exit {code}"),
+        (None, None) => format!("Phase `{name}`: complete"),
+    }
+}
+
+fn quest_outcome(
+    request: &str,
+    quest: &Quest,
+    anchor_session_id: Option<String>,
+    notes: Vec<String>,
+    next_step: Option<String>,
+    launched: Option<String>,
+) -> CastOutcome {
+    CastOutcome {
+        request: request.to_string(),
+        launched: launched.or_else(|| Some(format!("Quest `{}`", quest.title))),
+        session_id: anchor_session_id,
+        next_step,
+        notes,
+    }
+}
+
+/// Best-effort writer for `cast.quest.*` events. Failures are intentionally
+/// swallowed: the harness output is the source of truth; these events are
+/// reconstruction aids. The daemon may have a different connection open
+/// simultaneously; SQLite's WAL/locking handles that.
+fn write_quest_event(session_id: &str, kind: &str, payload: serde_json::Value) {
+    let Ok(store_path) = coven_store_path() else {
+        return;
+    };
+    let Ok(conn) = store::open_store(&store_path) else {
+        return;
+    };
+    let _ = store::insert_json_event(&conn, session_id, kind, &payload, &current_timestamp());
 }
 
 /// Launch a project-scoped session and follow its events into the Cast TUI.
@@ -856,7 +1138,8 @@ fn attach_via_daemon(
     // For completed/replayed sessions, surface the original Cast summary so
     // the user can see what the prior run was about. Live attaches just wrote
     // the summary themselves, so showing it again would only echo the exit
-    // line we already printed.
+    // line we already printed. We also use the same history query to detect
+    // a quest anchor (Phase 7 minimal re-attach aid — detect + inform).
     if !is_live {
         let history = client.list_events(ChatEventQuery {
             session_id: &session.id,
@@ -864,6 +1147,11 @@ fn attach_via_daemon(
             limit: None,
         })?;
         if let Some(note) = cast::find_cast_summary(&history).and_then(|s| format_summary_note(&s))
+        {
+            notes.push(note);
+        }
+        if let Some(note) = cast::find_cast_quest_info(&history)
+            .and_then(|info| cast::format_quest_attach_note(&info))
         {
             notes.push(note);
         }
