@@ -237,6 +237,60 @@ class SecretGuardLockfileTests(unittest.TestCase):
             )
         )
 
+    def test_sha_pinned_github_action_ref_is_not_a_secret(self) -> None:
+        # SHA-pinning third-party actions is an OpenSSF best practice; the
+        # resulting `<owner>/<repo>@<40-hex>` token should not trip the entropy
+        # rule even though the trailing SHA is high-entropy.
+        text = "\n".join(
+            [
+                "      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.0",
+                "      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable",
+            ]
+        )
+
+        hits = check_secrets.scan_text(text, ".github/workflows/release-npm.yml")
+
+        self.assertEqual(hits, [])
+
+    def test_rust_target_triple_path_is_not_a_secret(self) -> None:
+        # `target/x86_64-pc-windows-msvc/release` is read as one 37-char token
+        # by the entropy regex; the heuristic must accept it because the `64`
+        # segment is all-digits.
+        text = "          path: target/x86_64-pc-windows-msvc/release\n"
+
+        hits = check_secrets.scan_text(text, ".github/workflows/release-npm.yml")
+
+        self.assertEqual(hits, [])
+
+    def test_identifier_heuristic_rejects_pure_digit_segment_tokens(self) -> None:
+        # A token whose every segment is pure digits has no name shape; the
+        # entropy rule must still see it, even though it splits cleanly.
+        self.assertFalse(
+            check_secrets.is_programming_identifier_token(
+                "12345678.12345678.12345678.12345678"
+            )
+        )
+
+    def test_sha_ref_heuristic_requires_exactly_40_hex_chars(self) -> None:
+        # 40-char hex SHA is the only ref shape we whitelist; tags, branches,
+        # short hex prefixes, and non-hex refs must still trip the entropy rule.
+        self.assertTrue(
+            check_secrets.is_github_action_sha_ref_token(
+                "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"
+            )
+        )
+        self.assertFalse(
+            check_secrets.is_github_action_sha_ref_token("actions/checkout@de0fac2")
+        )
+        self.assertFalse(
+            check_secrets.is_github_action_sha_ref_token("actions/checkout@v6")
+        )
+        self.assertFalse(
+            check_secrets.is_github_action_sha_ref_token(
+                "actions/checkout@m9R3tQv7WzK2pL5nX8cF1gJ4sD6hY0aBEuIqOwPz9RkT"
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

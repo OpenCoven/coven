@@ -202,6 +202,33 @@ Coven is the room where harnesses run. The clients decide how to present and rou
 
 See **[CONTRIBUTING.md](./CONTRIBUTING.md)** for the recommended local development loop, release checks, and OpenCoven documentation rules.
 
+## Releasing
+
+Releases are **driven by a signed git tag**. Source versions stay `0.0.0` in the tree; the tag name (`v0.0.17` → `0.0.17`) is stamped into the wrapper and native packages by `scripts/publish-npm.mjs` at publish time. The full operator runbook, including the one-time npm trusted-publisher setup, is [`docs/reference/releasing.md`](docs/reference/releasing.md).
+
+Pre-flight locally (runs the secret-guard scan, packs the wrapper + native package, installs them into a throwaway project, and confirms the wrapper resolves and starts the native binary):
+
+```sh
+node scripts/test-cli-prepublish.mjs
+```
+
+Cut the release:
+
+```sh
+git tag -s v<X.Y.Z> -m "Coven v<X.Y.Z>"
+git push origin v<X.Y.Z>
+```
+
+That single push triggers `.github/workflows/release-npm.yml`, which:
+
+1. Runs the full Rust gate matrix (`fmt --check`, `clippy -D warnings`, `cargo test --workspace --locked`, secret-guard scan).
+2. **Refuses to proceed** unless the pushed tag is annotated and GitHub has cryptographically verified the maintainer's signature.
+3. Builds release binaries for macOS Apple Silicon, glibc-based Linux x64, and Windows x64.
+4. Runs `npm publish --dry-run` for every tarball as a final gate.
+5. Authenticates to npm via **GitHub Actions OIDC trusted publishing** and runs `npm publish --provenance --access public` for the three native packages and the wrapper. Every published tarball ships with a provenance attestation linking it to this exact workflow run and commit SHA.
+
+There is no `NPM_TOKEN` secret to rotate and no `workflow_dispatch` manual button — the signed tag is the only release lever. If the workflow ever refuses the tag, see [`docs/reference/releasing.md#recovering-from-a-refused-release`](docs/reference/releasing.md#recovering-from-a-refused-release).
+
 ## Community
 
 - Discord: `discord.gg/opencoven`

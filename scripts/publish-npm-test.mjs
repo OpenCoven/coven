@@ -2,7 +2,12 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
-import { defaultTargetName, publishEnv, releaseVersion, targetPackageName, validatePublishToken, validatePublishVersion } from './publish-npm.mjs';
+import { defaultTargetName, isOidcContext, publishArgs, publishEnv, releaseVersion, targetPackageName, validatePublishToken, validatePublishVersion } from './publish-npm.mjs';
+
+const OIDC_ENV = {
+  ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'fake-oidc-token',
+  ACTIONS_ID_TOKEN_REQUEST_URL: 'https://token.actions.githubusercontent.com/'
+};
 
 test('releaseVersion prefers explicit COVEN_NPM_VERSION and strips a leading v', () => {
   assert.equal(
@@ -115,21 +120,130 @@ test('validatePublishToken allows real publish when only NPM_TOKEN is set', () =
   assert.doesNotThrow(() => validatePublishToken({ NPM_TOKEN: 'from-secret' }, false));
 });
 
-test('validatePublishToken rejects real publish when neither token is set', () => {
-  assert.throws(() => validatePublishToken({}, false), /Refusing real npm publish without NPM_TOKEN or NODE_AUTH_TOKEN/);
+test('validatePublishToken rejects real publish when neither token nor OIDC is available', () => {
+  assert.throws(() => validatePublishToken({}, false), /OIDC trusted publishing/);
 });
 
 test('validatePublishToken allows dry-run when no tokens are set', () => {
   assert.doesNotThrow(() => validatePublishToken({}, true));
 });
 
-test('release workflow passes the configured npm publish secret to the publish script', () => {
+test('isOidcContext requires both OIDC env vars to be present', () => {
+  assert.equal(isOidcContext(OIDC_ENV), true);
+  assert.equal(isOidcContext({ ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'only-token' }), false);
+  assert.equal(isOidcContext({ ACTIONS_ID_TOKEN_REQUEST_URL: 'only-url' }), false);
+  assert.equal(isOidcContext({}), false);
+});
+
+test('validatePublishToken accepts OIDC context without any npm token', () => {
+  assert.doesNotThrow(() => validatePublishToken(OIDC_ENV, false));
+});
+
+test('publishEnv leaves OIDC context untouched and does not smuggle in NODE_AUTH_TOKEN', () => {
+  const result = publishEnv(false, { ...OIDC_ENV, NPM_TOKEN: 'should-not-be-used' });
+  assert.equal(result.NODE_AUTH_TOKEN, undefined, 'OIDC publish must not inherit NODE_AUTH_TOKEN');
+  assert.equal(result.NPM_TOKEN, 'should-not-be-used', 'unrelated env keys must pass through unchanged');
+});
+
+test('publishArgs adds --provenance and --access public only when OIDC is active for real publish', () => {
+  assert.deepEqual(publishArgs(false, OIDC_ENV), ['publish', '--access', 'public', '--provenance']);
+  assert.deepEqual(publishArgs(false, {}), ['publish', '--access', 'public']);
+  assert.deepEqual(publishArgs(true, OIDC_ENV), ['publish', '--dry-run']);
+  assert.deepEqual(publishArgs(true, {}), ['publish', '--dry-run']);
+});
+
+test('release workflow uses OIDC trusted publishing instead of a long-lived npm token', () => {
   const workflowPath = new URL(
     ['..', '.github', 'workflows', 'release-npm.yml'].join('/'),
     import.meta.url
   );
   const workflow = readFileSync(workflowPath, 'utf8');
-  const configuredSecret = ['NPM', 'ACCESS', 'TOKEN'].join('_');
-  const expectedLine = ['NPM_TOKEN:', '${{', `secrets.${configuredSecret}`, '}}'].join(' ');
-  assert.ok(workflow.includes(expectedLine));
+  assert.match(
+    workflow,
+    /npm-publish:[\s\S]*?permissions:[\s\S]*?id-token: write/,
+    'npm-publish job must request id-token: write so npm publish --provenance can use OIDC'
+  );
+  // Build the legacy token reference at runtime so this test file itself does not
+  // contain a literal NPM_TOKEN line that could be mistaken for a check that
+  // expects the old behaviour.
+  const legacyTokenRef = ['NPM', '_', 'TOKEN', ':'].join('');
+  assert.equal(
+    workflow.includes(legacyTokenRef),
+    false,
+    'release workflow must not reference NPM_TOKEN once OIDC trusted publishing is configured'
+  );
+  const legacySecretRef = ['secrets.', 'NPM', '_', 'ACCESS', '_', 'TOKEN'].join('');
+  assert.equal(
+    workflow.includes(legacySecretRef),
+    false,
+    'release workflow must not read the legacy NPM_ACCESS_TOKEN secret under OIDC'
+  );
+});
+
+test('release workflow verifies the signed release tag before building or publishing', () => {
+  const workflowPath = new URL(
+    ['..', '.github', 'workflows', 'release-npm.yml'].join('/'),
+    import.meta.url
+  );
+  const workflow = readFileSync(workflowPath, 'utf8');
+  assert.match(workflow, /verify-tag:/, 'workflow must declare a verify-tag job');
+  assert.match(
+    workflow,
+    /build-platform:[\s\S]*?needs:[\s\S]*?verify-tag/,
+    'build-platform must depend on verify-tag so unsigned tags never reach the build matrix'
+  );
+  assert.match(
+    workflow,
+    /\.verification\.verified/,
+    'verify-tag must consult GitHub`s signature verification API'
+  );
+  assert.match(
+    workflow,
+    /lightweight tag/,
+    'verify-tag must explicitly reject lightweight (unsigned) tags'
+  );
+});
+
+test('release workflow triggers only on signed v* tag pushes (no workflow_dispatch fallback)', () => {
+  const workflowPath = new URL(
+    ['..', '.github', 'workflows', 'release-npm.yml'].join('/'),
+    import.meta.url
+  );
+  const workflow = readFileSync(workflowPath, 'utf8');
+  assert.match(workflow, /on:\s*\n\s*push:\s*\n\s*tags:\s*\n\s*- 'v\*'/);
+  assert.equal(
+    /workflow_dispatch:/.test(workflow),
+    false,
+    'workflow_dispatch trigger must be removed so manual unsigned publishes are impossible'
+  );
+});
+
+test('release workflow pins all third-party actions to immutable commit SHAs', () => {
+  const workflowPath = new URL(
+    ['..', '.github', 'workflows', 'release-npm.yml'].join('/'),
+    import.meta.url
+  );
+  const workflow = readFileSync(workflowPath, 'utf8');
+  const usesLines = workflow.split('\n').filter((line) => /^\s*-\s*uses:\s/.test(line));
+  assert.ok(usesLines.length > 0, 'expected at least one `uses:` line in the release workflow');
+  for (const line of usesLines) {
+    const match = line.match(/uses:\s*([^@]+)@([^\s#]+)/);
+    assert.ok(match, `could not parse uses line: ${line}`);
+    const ref = match[2];
+    assert.match(
+      ref,
+      /^[0-9a-f]{40}$/,
+      `action ${match[1]} must be pinned to a 40-char commit SHA, found "${ref}" on line: ${line}`
+    );
+  }
+});
+
+test('release workflow concurrency keeps overlapping releases from interleaving', () => {
+  const workflowPath = new URL(
+    ['..', '.github', 'workflows', 'release-npm.yml'].join('/'),
+    import.meta.url
+  );
+  const workflow = readFileSync(workflowPath, 'utf8');
+  assert.match(workflow, /^concurrency:\s*\n\s*group:\s*release-npm/m);
+  assert.match(workflow, /cancel-in-progress:\s*false/);
 });

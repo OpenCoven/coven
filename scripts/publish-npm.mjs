@@ -72,14 +72,14 @@ function main() {
 
   const platformDir = writePlatformPackage(targetName, target, binaryPath, version);
 
-  run('npm', ['publish', dryRun ? '--dry-run' : '--access', dryRun ? undefined : 'public'].filter(Boolean), {
+  run('npm', publishArgs(dryRun), {
     cwd: platformDir,
     env: publishEnv(dryRun)
   });
 
   if (!skipWrapper) {
     const wrapperDir = writeWrapperPackage(version);
-    run('npm', ['publish', dryRun ? '--dry-run' : '--access', dryRun ? undefined : 'public'].filter(Boolean), {
+    run('npm', publishArgs(dryRun), {
       cwd: wrapperDir,
       env: publishEnv(dryRun)
     });
@@ -175,9 +175,36 @@ export function validatePublishVersion(version, dryRun) {
 }
 
 export function validatePublishToken(env, dryRun) {
-  if (!dryRun && !env.NPM_TOKEN && !env.NODE_AUTH_TOKEN) {
-    throw new Error('Refusing real npm publish without NPM_TOKEN or NODE_AUTH_TOKEN. Set one of these to authenticate with the npm registry.');
+  if (dryRun) {
+    return;
   }
+  if (isOidcContext(env)) {
+    // Authenticated via GitHub Actions OIDC trusted publishing — no long-lived
+    // npm token needed. `npm publish --provenance` will exchange the OIDC
+    // token for a short-lived registry credential.
+    return;
+  }
+  if (!env.NPM_TOKEN && !env.NODE_AUTH_TOKEN) {
+    throw new Error('Refusing real npm publish without OIDC trusted publishing or an NPM_TOKEN / NODE_AUTH_TOKEN fallback.');
+  }
+}
+
+export function isOidcContext(env = process.env) {
+  // Both vars are injected by GitHub Actions when `permissions.id-token: write`
+  // is granted to the job. Their presence indicates the job can mint OIDC
+  // tokens; absence means we must fall back to a static npm token.
+  return Boolean(env.ACTIONS_ID_TOKEN_REQUEST_TOKEN && env.ACTIONS_ID_TOKEN_REQUEST_URL);
+}
+
+export function publishArgs(dryRun, env = process.env) {
+  if (dryRun) {
+    return ['publish', '--dry-run'];
+  }
+  const args = ['publish', '--access', 'public'];
+  if (isOidcContext(env)) {
+    args.push('--provenance');
+  }
+  return args;
 }
 
 function wrapperPackageVersion() {
@@ -203,6 +230,12 @@ function run(command, args, options = {}) {
 
 export function publishEnv(dryRun, env = process.env) {
   if (dryRun) {
+    return env;
+  }
+  if (isOidcContext(env)) {
+    // npm 11+ auto-detects OIDC via ACTIONS_ID_TOKEN_REQUEST_* and does not
+    // read NODE_AUTH_TOKEN. Leaving the env untouched avoids accidentally
+    // smuggling in a stale token from a misconfigured fallback path.
     return env;
   }
 

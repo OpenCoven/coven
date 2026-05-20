@@ -101,34 +101,54 @@ def is_github_advisory_url_like_token(token: str) -> bool:
     return normalized.startswith("github.com/advisories/GHSA-")
 
 
+_GITHUB_ACTION_SHA_REF = re.compile(
+    r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+@[0-9a-f]{40}$"
+)
+
+
+def is_github_action_sha_ref_token(token: str) -> bool:
+    """Whether `token` is a GitHub Actions `uses:` reference pinned to a 40-char
+    commit SHA, e.g. ``actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd``.
+    SHA-pinned refs are an OpenSSF best practice (they prevent action authors
+    from silently moving a version tag onto a malicious commit) but the trailing
+    40-hex SHA otherwise pushes the workflow line over the entropy threshold.
+    """
+    return bool(_GITHUB_ACTION_SHA_REF.match(token))
+
+
 def is_programming_identifier_token(token: str) -> bool:
     """Whether `token` looks like a snake_case / SCREAMING_SNAKE_CASE identifier
-    (optionally suffixed with a `.method` call) or a workflow-style relative
-    file path (e.g. `github/workflows/release-npm.yml`). Neither shape is ever
-    a credential.
+    (optionally suffixed with a `.method` call), a workflow-style relative file
+    path (e.g. `github/workflows/release-npm.yml`), or a Rust target triple
+    (`target/x86_64-pc-windows-msvc/release`). None of these shapes are ever a
+    credential.
 
     The guard keeps the rest of the high-entropy path strict by requiring the
     token to be composed only of `[A-Za-z0-9_./-]`, to be split into at least
-    three segments by `_`/`.`/`/`/`-`, and for every segment to be a simple
-    word-like chunk (single-case alphabetic with optional trailing digits).
-    Real API tokens lack separators, mix case within a segment, or contain
-    base64-only characters such as `+`, so they continue to fail this check
-    and trip the entropy rule as before.
+    three segments by `_`/`.`/`/`/`-`, for at least one segment to contain
+    letters (so a token of pure-digit segments still trips the entropy rule),
+    and for every letter-bearing segment to be uniformly single-case. Real API
+    tokens lack separators, mix case within a segment, or contain base64-only
+    characters such as `+`/`=`, so they continue to fail at least one of these
+    checks and trip the entropy rule as before.
     """
     if not re.fullmatch(r"[A-Za-z0-9_./-]+", token):
         return False
     segments = [seg for seg in re.split(r"[._/-]", token) if seg]
     if len(segments) < 3:
         return False
+    has_letter_segment = False
     for seg in segments:
-        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", seg):
-            return False
-        letters = "".join(ch for ch in seg if ch.isalpha())
-        if not (letters.islower() or letters.isupper()):
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9]*", seg):
             return False
         if len(seg) > 24:
             return False
-    return True
+        letters = "".join(ch for ch in seg if ch.isalpha())
+        if letters:
+            has_letter_segment = True
+            if not (letters.islower() or letters.isupper()):
+                return False
+    return has_letter_segment
 
 
 def scan_text(text: str, path: str) -> list[tuple[str, int, str]]:
@@ -155,6 +175,7 @@ def scan_text(text: str, path: str) -> list[tuple[str, int, str]]:
                 is_local_path_like_token(token)
                 or is_public_repo_url_like_token(token)
                 or is_github_advisory_url_like_token(token)
+                or is_github_action_sha_ref_token(token)
                 or is_programming_identifier_token(token)
             ):
                 continue
