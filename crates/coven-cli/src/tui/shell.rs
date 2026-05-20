@@ -1150,10 +1150,64 @@ fn run_guided_harness_session() -> Result<()> {
     run_session(&harness, &[prompt], None, title.as_deref(), false)
 }
 
+const LAUNCHER_VISIBLE_COMMANDS: usize = 6;
+const LAUNCHER_FIELD_LABEL_WIDTH: usize = 14;
+const LAUNCHER_PROMPT_PLACEHOLDER: &str = "type a task or /run codex";
+const LAUNCHER_FOOTER_HINT: &str = "enter run · ↑↓ select · esc quit · ctrl+u clear";
+
+/// Snapshot of the local context shown in the right-hand lane of the
+/// launcher (`project`, `harness`, `daemon`). Each field is best-effort:
+/// when the environment cannot be read we fall back to quiet placeholders
+/// rather than failing to render the frame.
+pub(crate) struct LauncherSnapshot {
+    pub project: String,
+    pub harness: String,
+    pub daemon: String,
+}
+
+impl LauncherSnapshot {
+    fn placeholder() -> Self {
+        Self {
+            project: "(unset)".to_string(),
+            harness: "(unset)".to_string(),
+            daemon: "unknown".to_string(),
+        }
+    }
+}
+
+fn resolve_launcher_snapshot() -> LauncherSnapshot {
+    let project = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| project::canonical_project_root(&cwd).ok())
+        .and_then(|root| root.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "(no project)".to_string());
+
+    let harness = default_harness_id()
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "(none)".to_string());
+
+    let daemon = coven_home_dir()
+        .ok()
+        .and_then(|home| daemon::background_server_status(&home).ok().flatten())
+        .map(|state| match state {
+            daemon::DaemonStatusState::Running(_) => "running",
+            daemon::DaemonStatusState::Stale(_) => "stale",
+        })
+        .unwrap_or("stopped")
+        .to_string();
+
+    LauncherSnapshot {
+        project,
+        harness,
+        daemon,
+    }
+}
+
 fn render_magical_tui_frame(selection: usize, input: &str) -> String {
     render_magical_tui_frame_with_mode_and_width(
         selection,
         input,
+        &resolve_launcher_snapshot(),
         theme::mode(),
         magical_tui_inner_width(),
     )
@@ -1168,6 +1222,7 @@ pub(crate) fn render_magical_tui_frame_plain(selection: usize) -> String {
     render_magical_tui_frame_with_mode_and_width(
         selection,
         "",
+        &LauncherSnapshot::placeholder(),
         theme::TerminalMode::NoColor,
         MAGICAL_TUI_DEFAULT_INNER_WIDTH,
     )
@@ -1181,6 +1236,7 @@ pub(crate) fn render_magical_tui_frame_plain_with_width(
     render_magical_tui_frame_with_mode_and_width(
         selection,
         "",
+        &LauncherSnapshot::placeholder(),
         theme::TerminalMode::NoColor,
         inner_width,
     )
@@ -1195,6 +1251,7 @@ pub(crate) fn render_magical_tui_frame_plain_with_input(
     render_magical_tui_frame_with_mode_and_width(
         selection,
         input,
+        &LauncherSnapshot::placeholder(),
         theme::TerminalMode::NoColor,
         inner_width,
     )
@@ -1203,214 +1260,225 @@ pub(crate) fn render_magical_tui_frame_plain_with_input(
 fn render_magical_tui_frame_with_mode_and_width(
     selection: usize,
     input: &str,
+    snapshot: &LauncherSnapshot,
     mode: theme::TerminalMode,
     inner_width: usize,
 ) -> String {
     let inner_width = normalized_magical_tui_inner_width(inner_width);
-    let primary = theme::Fg::with_mode(theme::PRIMARY, mode);
-    let primary_strong = theme::Fg::with_mode(theme::PRIMARY_STRONG, mode);
-    let field_label = theme::Fg::with_mode(theme::FIELD_LABEL, mode);
-    let user_label = theme::Fg::with_mode(theme::USER_LABEL, mode);
-    let dim = theme::Fg::with_mode(theme::DIM, mode);
-    let reset = theme::Reset::with_mode(mode);
+    let palette = theme::palette_for(mode);
+    let total_items = magical_tui_items().len();
+    let visible = LAUNCHER_VISIBLE_COMMANDS.min(total_items);
+    let window = launcher_command_window(selection, total_items, visible);
+    let (left_width, right_width) = body_lane_widths(inner_width);
+
     let mut frame = String::new();
-    frame.push_str(&magical_tui_line(
-        "CovenCLI",
-        primary_strong,
-        reset,
-        inner_width,
-    ));
-    frame.push_str(&magical_tui_line(
-        "Welcome back to the Coven.",
-        field_label,
-        reset,
-        inner_width,
-    ));
-    frame.push_str(&magical_tui_line(
-        "OpenCoven terminal home for local agent work.",
-        user_label,
-        reset,
-        inner_width,
-    ));
-    frame.push('\n');
-    for line in magical_tui_graph_lines() {
-        frame.push_str(&magical_tui_line(line, primary, reset, inner_width));
-    }
-    frame.push('\n');
-    frame.push_str(&magical_tui_line(
-        "Status",
-        primary_strong,
-        reset,
-        inner_width,
-    ));
-    for line in magical_tui_status_lines() {
-        frame.push_str(&magical_tui_line(line, field_label, reset, inner_width));
-    }
-    frame.push('\n');
-    frame.push_str(&magical_tui_line(
-        "Task inbox",
-        primary_strong,
-        reset,
-        inner_width,
-    ));
-    for line in magical_tui_task_inbox_lines() {
-        frame.push_str(&magical_tui_line(line, primary, reset, inner_width));
-    }
-    frame.push('\n');
-    for line in magical_tui_input_box_lines(input, inner_width) {
-        frame.push_str(&magical_tui_line(&line, user_label, reset, inner_width));
-    }
-    frame.push('\n');
 
-    frame.push_str(&magical_tui_line(
-        "Slash commands",
-        primary_strong,
-        reset,
+    // 1. Identity
+    push_line(
+        &mut frame,
+        "Cast",
+        palette.primary_strong,
+        palette.reset,
         inner_width,
-    ));
-    for (index, item) in magical_tui_items().iter().enumerate() {
-        let pointer = if index == selection { ">" } else { " " };
-        let content = magical_tui_command_row(pointer, item, inner_width);
-        let color = if index == selection {
-            primary_strong
-        } else {
-            primary
+    );
+    push_line(&mut frame, "", palette.text, palette.reset, inner_width);
+
+    // 2. Prompt area — single thin rule above and below, no inner bezels.
+    let rule: String = "─".repeat(inner_width);
+    push_line(
+        &mut frame,
+        &rule,
+        palette.field_label,
+        palette.reset,
+        inner_width,
+    );
+    let (prompt_text, prompt_color) = if input.is_empty() {
+        (format!("> {LAUNCHER_PROMPT_PLACEHOLDER}"), palette.dim)
+    } else {
+        (format!("> {input}"), palette.text)
+    };
+    push_line(
+        &mut frame,
+        &prompt_text,
+        prompt_color,
+        palette.reset,
+        inner_width,
+    );
+    push_line(
+        &mut frame,
+        &rule,
+        palette.field_label,
+        palette.reset,
+        inner_width,
+    );
+    push_line(&mut frame, "", palette.text, palette.reset, inner_width);
+
+    // 3. Two-lane body: Commands rail (windowed) + Snapshot rows.
+    push_two_lane(
+        &mut frame,
+        ("Commands", palette.primary_strong),
+        ("Snapshot", palette.primary_strong),
+        palette.reset,
+        (left_width, right_width),
+    );
+
+    let snapshot_rows = [
+        ("project", snapshot.project.as_str()),
+        ("harness", snapshot.harness.as_str()),
+        ("daemon", snapshot.daemon.as_str()),
+    ];
+    let body_row_count = visible.max(snapshot_rows.len());
+    for row in 0..body_row_count {
+        let (left_text, left_color) = match window.get(row) {
+            Some(&idx) => {
+                let item = &magical_tui_items()[idx];
+                let row_text = magical_tui_command_row(idx == selection, item);
+                let color = if idx == selection {
+                    palette.primary_strong
+                } else {
+                    palette.text
+                };
+                (row_text, color)
+            }
+            None => (String::new(), palette.text),
         };
-        frame.push_str(&magical_tui_line(&content, color, reset, inner_width));
+        let right_text = snapshot_rows
+            .get(row)
+            .map(|(label, value)| snapshot_row(label, value, right_width))
+            .unwrap_or_default();
+        push_two_lane(
+            &mut frame,
+            (&left_text, left_color),
+            (&right_text, palette.text),
+            palette.reset,
+            (left_width, right_width),
+        );
     }
 
-    let selected = magical_tui_items()[selection.min(magical_tui_items().len() - 1)];
-    frame.push('\n');
-    frame.push_str(&magical_tui_line(
-        "Selected command",
-        primary_strong,
-        reset,
-        inner_width,
-    ));
-    frame.push_str(&magical_tui_line(
+    // Scroll hint when the rail can't display every item.
+    if visible < total_items {
+        let hint = format!("{} of {}", selection.min(total_items - 1) + 1, total_items);
+        push_line(&mut frame, &hint, palette.dim, palette.reset, inner_width);
+    }
+    push_line(&mut frame, "", palette.text, palette.reset, inner_width);
+
+    // 4. Action preview rows for the current selection.
+    let selected = &magical_tui_items()[selection.min(total_items - 1)];
+    push_field_row(&mut frame, "spell", selected.slash, &palette, inner_width);
+    push_field_row(
+        &mut frame,
+        "detail",
         selected.description,
-        user_label,
-        reset,
+        &palette,
         inner_width,
-    ));
-    frame.push_str(&magical_tui_line(
-        &format!("{} => {}", selected.slash, selected.command),
-        primary_strong,
-        reset,
+    );
+    push_line(&mut frame, "", palette.text, palette.reset, inner_width);
+
+    // 5. Footer hint — one dim line, never two.
+    push_line(
+        &mut frame,
+        LAUNCHER_FOOTER_HINT,
+        palette.dim,
+        palette.reset,
         inner_width,
-    ));
-    frame.push_str(&magical_tui_line(
-        "Store: ~/.coven",
-        dim,
-        reset,
-        inner_width,
-    ));
+    );
+
     frame
 }
 
-fn magical_tui_graph_lines() -> &'static [&'static str] {
-    &[
-        "+-------------------------- Workspace map -----------------------------+",
-        "| workspace: current repo            branch: local checkout            |",
-        "| harness shelf: Codex | Claude Code | local adapters                  |",
-        "|                                                                      |",
-        "|       [nova] ------ [coven] ------ [cody]                            |",
-        r"|          |            /   \           |                              |",
-        r"|          |           /     \          |                              |",
-        "| [memory] -- [coven] -- [sessions] -- [review]                        |",
-        r"|          |                              \                            |",
-        "|     [gateway]                     local daemon                       |",
-        "|                                                                      |",
-        "| prompt floor: ask | slash | attach | summon | archive | sacrifice    |",
-        "+----------------------------------------------------------------------+",
-    ]
-}
-
-fn magical_tui_status_lines() -> &'static [&'static str] {
-    &[
-        "System snapshot   local-first session ledger | ~/.coven",
-        "Model lane        Codex ready | Claude Code ready | PTY guarded",
-        "Context           repo, docs, memory, sessions, and slash palette",
-        "Approvals         asks before secrets, deletes, pushes, or public moves",
-        "Release notes     CovenCLI now opens as a rich terminal home",
-        "Tips              type a task, /run <harness>, or choose below",
-    ]
-}
-
-fn magical_tui_task_inbox_lines() -> &'static [&'static str] {
-    &[
-        "[ ] inspect repo      [ ] launch harness      [ ] attach session",
-        "[ ] review diff       [ ] export trace        [ ] archive work",
-        "Claude Code style: welcome, status, context, prompt, command rail",
-    ]
-}
-
-fn magical_tui_prompt_row(input: &str, inner_width: usize) -> String {
-    let value = if input.is_empty() {
-        "fix the failing tests  |  /run codex plan the refactor"
-    } else {
-        input
-    };
-    fit_chars(&format!("> {value}"), inner_width)
-}
-
-fn magical_tui_input_box_lines(input: &str, inner_width: usize) -> Vec<String> {
-    let width = normalized_magical_tui_inner_width(inner_width);
-    let content_width = width.saturating_sub(4).max(1);
-    let prompt = magical_tui_prompt_row(input, content_width);
-    let hint = fit_chars(
-        "Enter sends. Empty Enter runs selected slash. Ctrl+U clears. Esc quits.",
-        content_width,
-    );
-    vec![
-        magical_tui_input_box_top(width),
-        magical_tui_input_box_row(&prompt, width),
-        magical_tui_input_box_row(&hint, width),
-        magical_tui_input_box_bottom(width),
-    ]
-}
-
-fn magical_tui_input_box_top(width: usize) -> String {
-    let label = "+-- Ask anything ";
-    if width <= 2 {
-        return fit_chars(label, width);
+fn launcher_command_window(selection: usize, total: usize, visible: usize) -> Vec<usize> {
+    if total == 0 || visible == 0 {
+        return Vec::new();
     }
-    if width <= label.chars().count() + 1 {
-        return fit_chars(label, width);
-    }
-    let fill = width - label.chars().count() - 1;
-    format!("{label}{}+", "-".repeat(fill))
+    let last = total - 1;
+    let sel = selection.min(last);
+    let start = if sel < visible { 0 } else { sel + 1 - visible };
+    let end = (start + visible).min(total);
+    (start..end).collect()
 }
 
-fn magical_tui_input_box_bottom(width: usize) -> String {
-    if width <= 2 {
-        return "-".repeat(width);
-    }
-    format!("+{}+", "-".repeat(width - 2))
+fn body_lane_widths(inner_width: usize) -> (usize, usize) {
+    // Two columns separated by a 2-space gap; the rail favours the left
+    // lane by one character on odd widths because slash + label text is
+    // typically longer than the snapshot values.
+    let usable = inner_width.saturating_sub(2);
+    let left = usable.div_ceil(2);
+    let right = usable - left;
+    (left, right)
 }
 
-fn magical_tui_input_box_row(content: &str, width: usize) -> String {
-    if width <= 2 {
-        return fit_chars(content, width);
-    }
-    let content_width = width.saturating_sub(4).max(1);
-    let fitted = fit_chars(content, content_width);
-    let padding = content_width.saturating_sub(fitted.chars().count());
-    format!("| {fitted}{} |", " ".repeat(padding))
-}
-
-fn magical_tui_line(
+fn push_line(
+    frame: &mut String,
     content: &str,
-    text_color: impl std::fmt::Display,
+    color: impl std::fmt::Display,
     reset: impl std::fmt::Display,
     inner_width: usize,
-) -> String {
-    format!("{text_color}{}{reset}\n", fit_chars(content, inner_width))
+) {
+    let fitted = fit_chars(content, inner_width);
+    frame.push_str(&format!("{color}{fitted}{reset}\n"));
 }
 
-fn magical_tui_command_row(pointer: &str, item: &MagicalTuiItem, inner_width: usize) -> String {
-    let row = format!("{pointer} {:<10} {}", item.slash, item.label);
-    fit_chars(&row, inner_width)
+fn push_two_lane(
+    frame: &mut String,
+    left: (&str, impl std::fmt::Display),
+    right: (&str, impl std::fmt::Display),
+    reset: impl std::fmt::Display,
+    widths: (usize, usize),
+) {
+    let (left_text, left_color) = left;
+    let (right_text, right_color) = right;
+    let (left_width, right_width) = widths;
+    let left_fitted = fit_chars(left_text, left_width);
+    let right_fitted = fit_chars(right_text, right_width);
+    let pad = left_width.saturating_sub(left_fitted.chars().count());
+    let padding = " ".repeat(pad);
+    frame.push_str(&format!(
+        "{left_color}{left_fitted}{reset}{padding}  {right_color}{right_fitted}{reset}\n",
+    ));
+}
+
+fn snapshot_row(label: &str, value: &str, right_width: usize) -> String {
+    if right_width == 0 {
+        return String::new();
+    }
+    let column = LAUNCHER_FIELD_LABEL_WIDTH.min(right_width);
+    if column + 2 >= right_width {
+        return fit_chars(label, right_width);
+    }
+    let fitted_label = fit_chars(label, column);
+    let pad = column.saturating_sub(fitted_label.chars().count());
+    let value_width = right_width - column - 2;
+    let fitted_value = fit_chars(value, value_width);
+    format!(
+        "{fitted_label}{padding}  {fitted_value}",
+        padding = " ".repeat(pad)
+    )
+}
+
+fn push_field_row(
+    frame: &mut String,
+    label: &str,
+    value: &str,
+    palette: &theme::Palette,
+    inner_width: usize,
+) {
+    let column = LAUNCHER_FIELD_LABEL_WIDTH.min(inner_width.saturating_sub(2).max(1));
+    let fitted_label = fit_chars(label, column);
+    let pad = column.saturating_sub(fitted_label.chars().count());
+    let value_width = inner_width.saturating_sub(column + 2);
+    let fitted_value = fit_chars(value, value_width);
+    let padding = " ".repeat(pad);
+    frame.push_str(&format!(
+        "{field_label}{fitted_label}{reset}{padding}  {text}{fitted_value}{reset}\n",
+        field_label = palette.field_label,
+        text = palette.text,
+        reset = palette.reset,
+    ));
+}
+
+fn magical_tui_command_row(selected: bool, item: &MagicalTuiItem) -> String {
+    let pointer = if selected { "›" } else { " " };
+    format!("{pointer} {:<10} {}", item.slash, item.label)
 }
 
 fn magical_tui_inner_width() -> usize {

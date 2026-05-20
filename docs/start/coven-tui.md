@@ -8,7 +8,9 @@ title: "Coven TUI"
 description: "Use the prompt-first Coven TUI to launch harness sessions, browse running work, attach to sessions, and trigger rituals from one menu."
 ---
 
-`coven` (or the explicit `coven tui`) opens the **prompt-first TUI**: a Ratatui-backed interface where you can type free-form tasks, run slash commands, or navigate ritual menus with arrow keys. It is the recommended starting point for new users and works over SSH or in a local terminal.
+`coven` (or the explicit `coven tui`) opens the **prompt-first TUI** — the launcher surface internally branded **Cast**. You can type free-form tasks, dispatch slash commands, or pick one from the visible **Commands rail**. It is the recommended starting point for new users and works over SSH or in a local terminal.
+
+Typed input flows through Cast's spell parser: every spell is classified, surfaced as a plan card, and run through the safety gate before any side effect. Plain text is treated as a task for the default harness; `/run <harness> "<task>"`, `/codex …`, and `/claude …` route directly to a named harness.
 
 ## When to use it
 
@@ -68,38 +70,45 @@ The prompt bar accepts three input shapes interchangeably:
    /help
    ```
 
-3. **Arrow-key menu navigation** — `↑` / `↓` cycle through ritual cards (Rejoin, View Log, Summon, Archive, Sacrifice) for the currently selected session. `Enter` confirms. `Esc` cancels.
+3. **Arrow-key navigation** — `↑` / `↓` cycle through the **Commands rail** on the launcher (a windowed list of slash commands, 6 visible at a time with a `N of 14` scroll hint). Pressing `Enter` with an **empty** prompt dispatches the selected slash command; pressing `Enter` with text dispatches the typed spell through Cast.
 
 ## Slash command reference
 
+The launcher exposes 14 slash commands in the Commands rail. The Cast parser additionally accepts harness-direct verbs (`/codex`, `/claude`) and natural-language equivalents (e.g. `sessions`, `doctor`, `help`, `quit`).
+
 | Command | What it does |
 |---|---|
-| `/help` | Show the help overlay with all shortcuts and examples. |
+| `/start` | Setup check and a safe first command. Runs `coven doctor` and points at the next step. |
+| `/help` | Show natural-language and slash-command examples. |
+| `/tui` | Re-render this launcher palette explicitly. |
+| `/doctor` | Check store, project, and harness readiness (`coven doctor`). |
+| `/daemon` | Report whether the local Coven daemon is awake (`coven daemon status`). |
 | `/run <harness> "<task>"` | Launch a project-scoped session. Same as `coven run`. |
-| `/sessions` | Open the session browser. Same as `coven sessions`. |
+| `/patch` | Open the guided OpenClaw repair room. |
+| `/sessions` | Open the session browser (active sessions only). |
+| `/all` | Open the session browser including archived sessions. |
 | `/attach <session-id>` | Attach to (or replay) a session. |
+| `/summon <session-id>` | Restore an archived session, then follow it. |
 | `/archive <session-id>` | Hide a non-running session while preserving events. |
-| `/summon <session-id>` | Restore an archived session. |
 | `/sacrifice <session-id>` | Permanently delete a non-running session. Asks you to type `sacrifice` to confirm. |
-| `/doctor` | Run `coven doctor` and render the result inline. |
-| `/clear` | Clear the input bar and any inline output. |
-| `/export` | Copy the current selected session's record as JSON to the clipboard. |
-| `/agent <harness>` | Set the default harness for free-form input in this TUI session. |
-| `/exit` | Close the TUI cleanly. Equivalent to `Ctrl+C` or `Esc` at the root. |
+| `/quit` (alias `/exit`) | Close the TUI cleanly. Equivalent to `Ctrl+C` or `Esc` at the root. |
 
 ## Keyboard shortcuts
 
+The launcher footer renders the same hint inline:
+
+> `enter run · ↑↓ select · esc quit · ctrl+u clear`
+
 | Keys | Action |
 |---|---|
-| `h` (root) | Open `/help` overlay |
-| `↑ / ↓` | Move selection in the session browser or menu |
-| `Enter` | Confirm selection / submit prompt |
-| `Esc` | Back out of a menu, or quit at root |
-| `Ctrl+C` | Quit immediately |
-| `Tab` | Cycle focus between input bar and session browser |
-| `Ctrl+L` | Re-render (useful over flaky SSH) |
+| `↑ / ↓` | Move selection within the Commands rail. |
+| `Enter` | Empty prompt → dispatch the selected slash command. Non-empty → run the typed spell through Cast. |
+| `Backspace` | Delete the last character of the prompt. |
+| `Ctrl+U` | Clear the prompt. |
+| `Esc` | Quit the launcher. |
+| `Ctrl+C` | Quit immediately. |
 
-The TUI resizes safely. Terminals as small as 80×24 remain usable; wider terminals expand the session list, log preview, and help overlay automatically.
+The TUI resizes safely. Terminals as small as 80×24 remain usable; the launcher renders inside a normalized inner width (clamped to 18–96 columns) so single-rule prompts and the two-lane Commands + Snapshot body stay aligned at any size.
 
 ## Session browser actions
 
@@ -117,13 +126,13 @@ The map between actions and CLI verbs is documented in [Session lifecycle](/SESS
 
 ## SSH and remote use
 
-The TUI is Ratatui-based and survives the usual hostile environments:
+The TUI survives the usual hostile environments:
 
 - Terminals over SSH (no local mouse/font dependencies).
 - Resizing during a session (re-renders on `SIGWINCH`).
 - `TERM=xterm-256color` or `screen-256color`.
 
-It does **not** require a graphical terminal, a clipboard backend, or `tmux`. If you are inside `tmux` or `screen`, the TUI behaves like any other Ratatui app — pane splits and detach still work.
+It does **not** require a graphical terminal, a clipboard backend, or `tmux`. Inside `tmux` or `screen`, the launcher and session browser render cleanly — pane splits and detach still work.
 
 ## Plain-text fallback
 
