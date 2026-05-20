@@ -263,15 +263,70 @@ fn push_section_header(frame: &mut String, p: &Palette, title: &str) {
     frame.push_str(&format!("{}{}{}\n", p.primary_strong, title, p.reset));
 }
 
+/// Maximum inner width for Cast rows. This keeps label/value output within
+/// the renderer's wrap contract so terminals never auto-wrap from column 0.
+const CAST_ROW_MAX_INNER_WIDTH: usize = 96;
+
+fn wrap_label_value_lines(value: &str) -> Vec<String> {
+    let value_width = CAST_ROW_MAX_INNER_WIDTH.saturating_sub(LABEL_COLUMN_WIDTH + 2).max(1);
+    let mut lines = Vec::new();
+
+    for raw_line in value.split('\n') {
+        if raw_line.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+
+        let mut chunk = String::new();
+        let mut chunk_len = 0usize;
+        for ch in raw_line.chars() {
+            if chunk_len == value_width {
+                lines.push(chunk);
+                chunk = String::new();
+                chunk_len = 0;
+            }
+            chunk.push(ch);
+            chunk_len += 1;
+        }
+
+        if !chunk.is_empty() {
+            lines.push(chunk);
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+
+    lines
+}
+
 /// `label    value` row with a fixed 14-char label column. Two-space gap
 /// before the value so the eye locks onto a single value column across the
 /// whole frame.
 fn push_label_row(frame: &mut String, p: &Palette, label: &str, value: &str) {
     let label_block = format!("{:<width$}", label, width = LABEL_COLUMN_WIDTH);
-    frame.push_str(&format!(
-        "{}{}{}  {}{}{}\n",
-        p.field_label, label_block, p.reset, p.text, value, p.reset
-    ));
+    let continuation_label_block = " ".repeat(LABEL_COLUMN_WIDTH);
+    let mut wrapped_lines = wrap_label_value_lines(value).into_iter();
+
+    if let Some(first_line) = wrapped_lines.next() {
+        frame.push_str(&format!(
+            "{}{}{}  {}{}{}\n",
+            p.field_label, label_block, p.reset, p.text, first_line, p.reset
+        ));
+    }
+
+    for continuation_line in wrapped_lines {
+        frame.push_str(&format!(
+            "{}{}{}  {}{}{}\n",
+            p.field_label,
+            continuation_label_block,
+            p.reset,
+            p.text,
+            continuation_line,
+            p.reset
+        ));
+    }
 }
 
 /// Risk row: label + 10-char ALL-CAPS chip colored by severity.
