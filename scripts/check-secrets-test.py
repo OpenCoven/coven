@@ -215,6 +215,28 @@ class SecretGuardLockfileTests(unittest.TestCase):
             check_secrets.is_programming_identifier_token("supersecret_payloadblob")
         )
 
+    def test_workflow_relative_path_is_not_a_secret(self) -> None:
+        # The pre-publish script prints `.github/workflows/release-npm.yml`
+        # in its end-of-run hint; the tokenizer reads
+        # `github/workflows/release-npm.yml` as one 33-char run.
+        text = (
+            "  console.log('Next: bump version + tag (vX.Y.Z) to trigger "
+            ".github/workflows/release-npm.yml.');\n"
+        )
+
+        hits = check_secrets.scan_text(text, "scripts/test-cli-prepublish.mjs")
+
+        self.assertEqual(hits, [])
+
+    def test_identifier_heuristic_rejects_base64_with_single_slash(self) -> None:
+        # A real base64 secret with a single `/` separator yields only two
+        # segments and segments mix case — both checks must reject it.
+        self.assertFalse(
+            check_secrets.is_programming_identifier_token(
+                "m9R3tQv7WzK2pL5nX8cF1gJ4sD6hY0aB/EuIqOwPz9RkTlVxCyNmS3HdG7fA"
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
