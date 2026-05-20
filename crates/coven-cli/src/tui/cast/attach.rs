@@ -11,8 +11,9 @@ use crate::store;
 
 use super::intent::CastHarness;
 use super::quest::{
-    advance, quest_from_goal, set_phase_sub_prompt, skip_phase, Quest, QuestPhaseSummary,
-    CAST_QUEST_PHASE_EDITED_KIND, CAST_QUEST_PHASE_SKIPPED_KIND,
+    advance, mark_phase_running, quest_from_goal, set_phase_sub_prompt, skip_phase, Quest,
+    QuestPhaseSummary, CAST_QUEST_PHASE_EDITED_KIND, CAST_QUEST_PHASE_SKIPPED_KIND,
+    CAST_QUEST_PHASE_STARTED_KIND,
 };
 
 /// Event kind Cast writes when a launched session finishes. See
@@ -140,6 +141,26 @@ pub(crate) fn reconstruct_quest(events: &[store::EventRecord]) -> Option<Reconst
 
     for event in events {
         match event.kind.as_str() {
+            kind if kind == CAST_QUEST_PHASE_STARTED_KIND => {
+                // Phase 10 defensive: if Cast crashed between dispatch and
+                // advance, the anchor will hold a `phase_started` event
+                // without a matching `phase_completed`. Mark the phase
+                // Running so resume can show "this phase was already
+                // started". When a `phase_completed` later in the log
+                // exists, `advance` below overwrites the status to
+                // Complete and the Running mark becomes invisible.
+                let payload =
+                    serde_json::from_str::<Value>(&event.payload_json).unwrap_or(Value::Null);
+                let idx = payload.get("index").and_then(Value::as_u64);
+                let session_id = payload
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if let Some(idx) = idx {
+                    let _ = mark_phase_running(&mut quest, idx as usize, session_id);
+                }
+            }
             kind if kind == CAST_QUEST_PHASE_EDITED_KIND => {
                 let payload =
                     serde_json::from_str::<Value>(&event.payload_json).unwrap_or(Value::Null);
@@ -687,6 +708,57 @@ mod tests {
         let recon = reconstruct_quest(&events).expect("should reconstruct");
         assert!(recon.is_complete);
         assert_eq!(recon.quest.cursor, 3, "cursor should be past all phases");
+    }
+
+    fn phase_started_event(seq: i64, idx: usize, session_id: &str) -> store::EventRecord {
+        store::EventRecord {
+            seq,
+            id: format!("event-{seq}"),
+            session_id: "anchor".to_string(),
+            kind: CAST_QUEST_PHASE_STARTED_KIND.to_string(),
+            payload_json: serde_json::json!({
+                "phase": format!("p{idx}"),
+                "index": idx,
+                "session_id": session_id,
+                "harness": "codex",
+            })
+            .to_string(),
+            created_at: "2026-05-20T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn reconstruct_quest_marks_phase_running_when_started_without_completed() {
+        // Cast crashed between dispatch and advance: phase_started landed
+        // on the anchor but phase_completed never did. Reconstruction
+        // must mark the phase Running so resume can surface that.
+        let events = vec![
+            started_event_with("anchor-id", "ship phase 10", "codex"),
+            phase_started_event(2, 0, "session-design-id"),
+        ];
+        let recon = reconstruct_quest(&events).expect("should reconstruct");
+        match &recon.quest.phases[0].status {
+            super::super::quest::QuestPhaseStatus::Running { session_id } => {
+                assert_eq!(session_id, "session-design-id");
+            }
+            other => panic!("expected Running, got {other:?}"),
+        }
+        assert_eq!(recon.quest.cursor, 0);
+    }
+
+    #[test]
+    fn reconstruct_quest_overrides_running_with_complete_when_phase_completed_follows() {
+        let events = vec![
+            started_event_with("anchor-id", "ship phase 10", "codex"),
+            phase_started_event(2, 0, "session-design-id"),
+            phase_completed_event(3, 0, "completed", 0),
+        ];
+        let recon = reconstruct_quest(&events).expect("should reconstruct");
+        assert!(matches!(
+            recon.quest.phases[0].status,
+            super::super::quest::QuestPhaseStatus::Complete(_)
+        ));
+        assert_eq!(recon.quest.cursor, 1);
     }
 
     #[test]
