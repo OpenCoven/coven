@@ -135,7 +135,13 @@ pub(crate) fn quest_from_goal(goal: &str, default_harness: Option<CastHarness>) 
 
 fn default_phase_set(goal: &str, harness: Option<CastHarness>) -> Vec<QuestPhase> {
     vec![
-        new_phase("design", "Scope the work", DESIGN_PHASE_TEMPLATE, goal, harness),
+        new_phase(
+            "design",
+            "Scope the work",
+            DESIGN_PHASE_TEMPLATE,
+            goal,
+            harness,
+        ),
         new_phase(
             "implement",
             "Make the change",
@@ -344,7 +350,9 @@ mod tests {
                 phase.name
             );
             assert!(
-                phase.sub_prompt.contains("rename the legacy `cody` module to `cast`"),
+                phase
+                    .sub_prompt
+                    .contains("rename the legacy `cody` module to `cast`"),
                 "phase `{}` sub_prompt should include the user goal verbatim, got:\n{}",
                 phase.name,
                 phase.sub_prompt
@@ -384,7 +392,11 @@ mod tests {
             },
         );
 
-        assert_eq!(next, Some(1), "cursor should advance to the implement phase");
+        assert_eq!(
+            next,
+            Some(1),
+            "cursor should advance to the implement phase"
+        );
         assert_eq!(q.cursor, 1);
         assert!(matches!(q.phases[0].status, QuestPhaseStatus::Complete(_)));
         assert!(matches!(q.phases[1].status, QuestPhaseStatus::Pending));

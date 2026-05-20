@@ -35,9 +35,9 @@ pub(crate) use quest::{
     advance as advance_quest, compose_sub_prompt, quest_from_goal, set_phase_sub_prompt,
     skip_phase, Quest, QuestHandoff, QuestPhase, QuestPhaseStatus, QuestPhaseSummary,
 };
-pub(crate) use render::{render_cast_frame_for_terminal, render_outcome, render_plan_intro};
 #[allow(unused_imports)]
 pub(crate) use render::render_quest_handoff;
+pub(crate) use render::{render_cast_frame_for_terminal, render_outcome, render_plan_intro};
 pub(crate) use safety::SafetyDecision;
 
 // Re-exports used only by tests in `crate::tests` (main.rs). Bundled here

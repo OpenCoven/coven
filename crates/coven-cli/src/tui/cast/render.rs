@@ -321,9 +321,7 @@ fn quest_phase_position_label(quest: &Quest, next_index: usize) -> String {
 
 fn quest_handoff_footer_hint(next: &QuestPhase) -> &'static str {
     match &next.status {
-        QuestPhaseStatus::Pending => {
-            "enter approves the sub-prompt · type to edit · esc cancels"
-        }
+        QuestPhaseStatus::Pending => "enter approves the sub-prompt · type to edit · esc cancels",
         QuestPhaseStatus::Running { .. } => "phase running · attach to follow",
         QuestPhaseStatus::Complete(_) => "phase already complete · advance again",
         QuestPhaseStatus::Skipped { .. } => "phase skipped · advance to continue",
@@ -346,7 +344,10 @@ fn clip_sub_prompt_lines(sub_prompt: &str) -> Vec<String> {
         .take(SUB_PROMPT_VISIBLE_LINES - 1)
         .map(|l| (*l).to_string())
         .collect();
-    out.push(format!("… {} more lines", lines.len() - (SUB_PROMPT_VISIBLE_LINES - 1)));
+    out.push(format!(
+        "… {} more lines",
+        lines.len() - (SUB_PROMPT_VISIBLE_LINES - 1)
+    ));
     out
 }
 
@@ -431,7 +432,10 @@ fn push_step_row(frame: &mut String, p: &Palette, index: usize, kind: CastStepKi
 
 /// `  · note` row inside the Notes section of the outcome card.
 fn push_note_row(frame: &mut String, p: &Palette, note: &str) {
-    frame.push_str(&format!("  {}·{}  {}{}{}\n", p.primary, p.reset, p.text, note, p.reset));
+    frame.push_str(&format!(
+        "  {}·{}  {}{}{}\n",
+        p.primary, p.reset, p.text, note, p.reset
+    ));
 }
 
 /// Single dim footer hint. Never two lines, never punctuated.
@@ -544,9 +548,15 @@ mod tests {
         assert_label_column(&frame, "risk");
         // The redesigned card drops the trailing-colon labels and the
         // bracketed step-kind chips.
-        assert!(!frame.contains("Spell:"), "old `Spell:` label still present");
+        assert!(
+            !frame.contains("Spell:"),
+            "old `Spell:` label still present"
+        );
         assert!(!frame.contains("Risk:"), "old `Risk:` label still present");
-        assert!(!frame.contains("[launch]"), "old `[launch]` chip still present");
+        assert!(
+            !frame.contains("[launch]"),
+            "old `[launch]` chip still present"
+        );
         assert_no_ansi_leakage(&frame);
     }
 
@@ -619,7 +629,10 @@ mod tests {
         .with_raw_spell("/claude polish the README");
         let frame = render_plan_intro_plain(&plan);
 
-        assert!(frame.contains("Claude Code · user-chosen"), "frame:\n{frame}");
+        assert!(
+            frame.contains("Claude Code · user-chosen"),
+            "frame:\n{frame}"
+        );
         assert!(!frame.contains("Cast default"));
     }
 
@@ -639,7 +652,10 @@ mod tests {
 
         assert_label_column(&frame, "session");
         assert!(frame.contains("abcdef123456"), "frame:\n{frame}");
-        assert!(!frame.contains("harness"), "session actions have no harness row");
+        assert!(
+            !frame.contains("harness"),
+            "session actions have no harness row"
+        );
     }
 
     #[test]
@@ -770,14 +786,9 @@ mod tests {
 
     #[test]
     fn quest_handoff_card_shows_source_phase_status_and_next_sub_prompt() {
-        use crate::tui::cast::quest::{
-            advance, quest_from_goal, QuestPhaseSummary,
-        };
+        use crate::tui::cast::quest::{advance, quest_from_goal, QuestPhaseSummary};
 
-        let mut quest = quest_from_goal(
-            "ship phase 5 sub-prompting",
-            Some(CastHarness::Codex),
-        );
+        let mut quest = quest_from_goal("ship phase 5 sub-prompting", Some(CastHarness::Codex));
         let next = advance(
             &mut quest,
             QuestPhaseSummary {
@@ -794,7 +805,10 @@ mod tests {
 
         let frame = render_quest_handoff_plain(&quest, next);
 
-        assert!(frame.contains("Cast handoff"), "missing header, frame:\n{frame}");
+        assert!(
+            frame.contains("Cast handoff"),
+            "missing header, frame:\n{frame}"
+        );
         assert_label_column(&frame, "quest");
         assert_label_column(&frame, "phase");
         assert_label_column(&frame, "from");
