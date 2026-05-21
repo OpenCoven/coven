@@ -287,9 +287,14 @@ fn append_agent_content_lines<'a>(lines: &mut Vec<Line<'a>>, content: &str, wrap
             continue;
         }
 
-        if let Some((marker, body)) = strip_bullet_prefix(line) {
-            let indent_first = format!("  {marker}");
-            let indent_cont = "    ".to_string();
+        if let Some((indent, marker, body)) = strip_bullet_prefix(line) {
+            // Preserve the source indent so nested bullets stay visually
+            // distinct, but clamp it so very deep nesting still leaves the
+            // body at least two thirds of the row on narrow terminals.
+            let max_indent = wrap_width.saturating_sub(6) / 3;
+            let pad = " ".repeat(indent.min(max_indent));
+            let indent_first = format!("  {pad}{marker}");
+            let indent_cont = format!("  {pad}  ");
             let wrap_target = wrap_width
                 .saturating_sub(indent_first.chars().count())
                 .max(1);
@@ -331,19 +336,14 @@ fn strip_heading_prefix(line: &str) -> Option<&str> {
     None
 }
 
-fn strip_bullet_prefix(line: &str) -> Option<(&'static str, &str)> {
+fn strip_bullet_prefix(line: &str) -> Option<(usize, &'static str, &str)> {
     let trimmed = line.trim_start();
     let indent = line.len() - trimmed.len();
-    // Cap indent passthrough; very deep indentation is rare and would push the
-    // body off-screen on narrow terminals.
-    if indent > 4 {
-        return None;
-    }
     if let Some(rest) = trimmed.strip_prefix("- ") {
-        return Some(("\u{2022} ", rest));
+        return Some((indent, "\u{2022} ", rest));
     }
     if let Some(rest) = trimmed.strip_prefix("* ") {
-        return Some(("\u{2022} ", rest));
+        return Some((indent, "\u{2022} ", rest));
     }
     None
 }
@@ -801,6 +801,83 @@ mod tests {
         assert!(rendered
             .iter()
             .any(|line| line.contains("Second paragraph.")));
+    }
+
+    #[test]
+    fn agent_lines_preserve_bullet_nesting_indent_and_never_leak_raw_markers() {
+        // Six levels of indent, 2 spaces per level. Previously the renderer
+        // capped at indent > 4, which flattened the first three levels onto
+        // one row and dropped levels 4+ through to plain-text rendering that
+        // leaked the raw `- ` markers. After the fix, every level gets its
+        // own visual indent and every bullet renders with the `•` marker.
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        let content = "\
+- L0 root
+  - L1 child
+    - L2 grandchild
+      - L3 deep
+        - L4 deeper
+          - L5 deepest";
+        append_agent_content_lines(&mut lines, content, 80);
+
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+
+        let expected_pairs = [
+            (0usize, "L0 root"),
+            (2, "L1 child"),
+            (4, "L2 grandchild"),
+            (6, "L3 deep"),
+            (8, "L4 deeper"),
+            (10, "L5 deepest"),
+        ];
+        for (indent, body) in expected_pairs {
+            let pad = " ".repeat(indent);
+            let needle = format!("  {pad}\u{2022} {body}");
+            assert!(
+                rendered.iter().any(|line| line == &needle),
+                "missing nested bullet at indent {indent} for {body:?}; got:\n{rendered:#?}"
+            );
+        }
+
+        // Raw markdown markers must never leak into the rendered output —
+        // every list item should have been converted to a `•` bullet.
+        for line in &rendered {
+            assert!(
+                !line.trim_start().starts_with("- "),
+                "raw `- ` marker leaked: {line:?}"
+            );
+            assert!(
+                !line.trim_start().starts_with("* "),
+                "raw `* ` marker leaked: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_lines_clamp_runaway_bullet_indent_on_narrow_terminals() {
+        // At wrap_width=20 the clamp should prevent first-line indent from
+        // ever consuming more than ~two thirds of the row, so the body still
+        // has room. wrap_width=20 → max_indent = (20-6)/3 = 4.
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        let content = "                  - very deeply indented bullet";
+        append_agent_content_lines(&mut lines, content, 20);
+
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+
+        // First-line indent should be "  " + 4 pad spaces + "• " = 8 chars.
+        let first_line = rendered.first().expect("at least one line emitted");
+        assert!(
+            first_line.starts_with("      \u{2022} "),
+            "deep indent did not clamp; line was {first_line:?}"
+        );
+        // No raw `- ` left behind.
+        assert!(!first_line.contains("- "));
     }
 
     #[test]
