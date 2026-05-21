@@ -164,8 +164,7 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
 
 /// Braille dots animate left-to-right; each frame is width-1 so the status-bar
 /// budget stays predictable across NoColor / piped terminals.
-pub(super) const SPINNER_FRAMES: &[&str] =
-    &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+pub(super) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 impl App {
     pub(super) fn new() -> Self {
