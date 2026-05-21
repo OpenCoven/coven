@@ -15,7 +15,8 @@ use ratatui::{
 };
 
 use crate::theme::{
-    self, SYNTAX_ATTRIBUTE, SYNTAX_COMMENT, SYNTAX_KEYWORD, SYNTAX_NUMBER, SYNTAX_STRING,
+    self, SYNTAX_ATTRIBUTE, SYNTAX_COMMENT, SYNTAX_KEYWORD, SYNTAX_NUMBER, SYNTAX_REMOVED,
+    SYNTAX_STRING,
 };
 
 /// Language picked from the opening fence tag (e.g. ```` ```rust ````).
@@ -28,6 +29,10 @@ pub(super) enum Lang {
     Js,
     Python,
     Bash,
+    Json,
+    Yaml,
+    Sql,
+    Diff,
 }
 
 /// Semantic role of a token. Drives both the production `Span` styling and
@@ -41,6 +46,9 @@ pub(super) enum Role {
     Number,
     Comment,
     Attribute,
+    /// Deletion / removed token — currently consumed by the diff tokenizer
+    /// for `-` lines so the red half of `+`/`-` diff convention reads.
+    Removed,
 }
 
 /// One tokenized chunk of a code line. `text` is an owned copy; the
@@ -94,6 +102,10 @@ pub(super) fn tokenizer_for(tag: &str) -> Option<Lang> {
         "javascript" | "js" | "jsx" | "typescript" | "ts" | "tsx" => Some(Lang::Js),
         "python" | "py" => Some(Lang::Python),
         "bash" | "sh" | "shell" | "zsh" => Some(Lang::Bash),
+        "json" | "jsonc" => Some(Lang::Json),
+        "yaml" | "yml" => Some(Lang::Yaml),
+        "sql" | "postgres" | "postgresql" | "mysql" | "sqlite" => Some(Lang::Sql),
+        "diff" | "patch" => Some(Lang::Diff),
         _ => None,
     }
 }
@@ -108,6 +120,10 @@ pub(super) fn tokenize(line: &str, lang: Lang, state: &mut TokenizerState) -> Ve
         Lang::Js => tokenize_js(line, state),
         Lang::Python => tokenize_python(line, state),
         Lang::Bash => tokenize_bash(line, state),
+        Lang::Json => tokenize_json(line, state),
+        Lang::Yaml => tokenize_yaml(line, state),
+        Lang::Sql => tokenize_sql(line, state),
+        Lang::Diff => tokenize_diff(line, state),
     }
 }
 
@@ -133,6 +149,7 @@ pub(super) fn style_for(role: Role, default_style: Style) -> Style {
         Role::Number => num_style(),
         Role::Comment => com_style(),
         Role::Attribute => attr_style(),
+        Role::Removed => removed_style(),
     }
 }
 
@@ -152,6 +169,9 @@ fn com_style() -> Style {
 }
 fn attr_style() -> Style {
     theme::ratatui_style(SYNTAX_ATTRIBUTE)
+}
+fn removed_style() -> Style {
+    theme::ratatui_style(SYNTAX_REMOVED)
 }
 
 // ── Rust ───────────────────────────────────────────────────────────────────
@@ -636,6 +656,361 @@ fn scan_bash_var(line: &str, start: usize) -> usize {
         j += 1;
     }
     j
+}
+
+// ── JSON ───────────────────────────────────────────────────────────────────
+
+fn tokenize_json(line: &str, _state: &mut TokenizerState) -> Vec<Token> {
+    let bytes = line.as_bytes();
+    let mut out: Vec<Token> = Vec::new();
+    let mut buf = String::new();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'"' {
+            flush_buf(&mut buf, &mut out);
+            let end = scan_dq_string(line, i);
+            // A string immediately followed by `:` (modulo whitespace) is a
+            // JSON object key — color it as Attribute so the structure
+            // reads. Otherwise it's a regular string value.
+            let mut k = end;
+            while k < bytes.len() && (bytes[k] == b' ' || bytes[k] == b'\t') {
+                k += 1;
+            }
+            let role = if k < bytes.len() && bytes[k] == b':' {
+                Role::Attribute
+            } else {
+                Role::String
+            };
+            out.push(tok(&line[i..end], role));
+            i = end;
+            continue;
+        }
+        if b.is_ascii_digit() || (b == b'-' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit())
+        {
+            flush_buf(&mut buf, &mut out);
+            // Allow a leading `-` for negative numbers; otherwise re-use the
+            // shared scanner. Anchor the start so the `-` byte is included.
+            let mut start = i;
+            if b == b'-' {
+                start = i; // include the sign
+                i += 1;
+            }
+            let end = scan_number(line, i);
+            out.push(tok(&line[start..end], Role::Number));
+            i = end;
+            continue;
+        }
+        if is_ident_start(b) {
+            flush_buf(&mut buf, &mut out);
+            let mut j = i + 1;
+            while j < bytes.len() && is_ident_continue(bytes[j]) {
+                j += 1;
+            }
+            let ident = &line[i..j];
+            let role = if matches!(ident, "true" | "false" | "null") {
+                Role::Keyword
+            } else {
+                Role::Default
+            };
+            out.push(tok(ident, role));
+            i = j;
+            continue;
+        }
+        push_one_char(line, &mut i, &mut buf);
+    }
+    flush_buf(&mut buf, &mut out);
+    out
+}
+
+// ── YAML ───────────────────────────────────────────────────────────────────
+
+fn tokenize_yaml(line: &str, _state: &mut TokenizerState) -> Vec<Token> {
+    let bytes = line.as_bytes();
+    let mut out: Vec<Token> = Vec::new();
+    let mut buf = String::new();
+    let mut i = 0;
+
+    // Document separator: `---` on its own line — color the whole line as
+    // an Attribute marker. Also handle `...` end-of-doc the same way.
+    let trimmed = line.trim_end();
+    if trimmed == "---" || trimmed == "..." {
+        out.push(tok(line, Role::Attribute));
+        return out;
+    }
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'#' {
+            flush_buf(&mut buf, &mut out);
+            out.push(tok(&line[i..], Role::Comment));
+            return out;
+        }
+        // Quoted scalar — either `'…'` or `"…"`. Treat as String.
+        if b == b'"' {
+            flush_buf(&mut buf, &mut out);
+            let end = scan_dq_string(line, i);
+            out.push(tok(&line[i..end], Role::String));
+            i = end;
+            continue;
+        }
+        if b == b'\'' {
+            flush_buf(&mut buf, &mut out);
+            // YAML single-quoted: `''` is the only escape; otherwise scan
+            // to the next `'`.
+            let mut j = i + 1;
+            while j < bytes.len() {
+                if bytes[j] == b'\'' {
+                    if j + 1 < bytes.len() && bytes[j + 1] == b'\'' {
+                        j += 2;
+                        continue;
+                    }
+                    j += 1;
+                    break;
+                }
+                j += 1;
+            }
+            out.push(tok(&line[i..j], Role::String));
+            i = j;
+            continue;
+        }
+        // YAML anchor (`&name`) / alias (`*name`) / tag (`!Foo`) — Attribute.
+        if (b == b'&' || b == b'*' || b == b'!')
+            && i + 1 < bytes.len()
+            && is_ident_start(bytes[i + 1])
+        {
+            flush_buf(&mut buf, &mut out);
+            let mut j = i + 1;
+            while j < bytes.len() && (is_ident_continue(bytes[j]) || bytes[j] == b'.') {
+                j += 1;
+            }
+            out.push(tok(&line[i..j], Role::Attribute));
+            i = j;
+            continue;
+        }
+        // Number — leading `-` allowed (YAML still distinguishes from list
+        // marker because a list marker is `- ` followed by a value; bare
+        // `-N` typically appears as a value).
+        if b.is_ascii_digit() || (b == b'-' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit())
+        {
+            flush_buf(&mut buf, &mut out);
+            let start = i;
+            if b == b'-' {
+                i += 1;
+            }
+            let end = scan_number(line, i);
+            out.push(tok(&line[start..end], Role::Number));
+            i = end;
+            continue;
+        }
+        if is_ident_start(b) {
+            flush_buf(&mut buf, &mut out);
+            let mut j = i + 1;
+            while j < bytes.len() && (is_ident_continue(bytes[j]) || bytes[j] == b'-') {
+                j += 1;
+            }
+            let ident = &line[i..j];
+            // Mapping key: identifier immediately followed by `:` (and either
+            // whitespace or EOL) is a key. Color it as Attribute so the
+            // structure reads. Otherwise classify as Keyword for the small
+            // set of YAML literals (true/false/null/yes/no) or Default.
+            let mut k = j;
+            while k < bytes.len() && (bytes[k] == b' ' || bytes[k] == b'\t') {
+                k += 1;
+            }
+            let role = if k < bytes.len() && bytes[k] == b':' {
+                Role::Attribute
+            } else if matches!(
+                ident.to_ascii_lowercase().as_str(),
+                "true" | "false" | "null" | "yes" | "no" | "on" | "off" | "~"
+            ) {
+                Role::Keyword
+            } else {
+                Role::Default
+            };
+            out.push(tok(ident, role));
+            i = j;
+            continue;
+        }
+        push_one_char(line, &mut i, &mut buf);
+    }
+    flush_buf(&mut buf, &mut out);
+    out
+}
+
+// ── SQL ────────────────────────────────────────────────────────────────────
+
+const SQL_KEYWORDS: &[&str] = &[
+    "ADD",
+    "ALL",
+    "ALTER",
+    "AND",
+    "AS",
+    "ASC",
+    "BEGIN",
+    "BETWEEN",
+    "BY",
+    "CASCADE",
+    "CASE",
+    "COMMIT",
+    "CONSTRAINT",
+    "CREATE",
+    "CROSS",
+    "DATABASE",
+    "DEFAULT",
+    "DELETE",
+    "DESC",
+    "DISTINCT",
+    "DROP",
+    "ELSE",
+    "END",
+    "EXCEPT",
+    "EXISTS",
+    "FOREIGN",
+    "FROM",
+    "FULL",
+    "GROUP",
+    "HAVING",
+    "IF",
+    "IN",
+    "INDEX",
+    "INNER",
+    "INSERT",
+    "INTO",
+    "IS",
+    "JOIN",
+    "KEY",
+    "LEFT",
+    "LIKE",
+    "LIMIT",
+    "NOT",
+    "NULL",
+    "OFFSET",
+    "ON",
+    "OR",
+    "ORDER",
+    "OUTER",
+    "PRIMARY",
+    "REFERENCES",
+    "RETURNING",
+    "RIGHT",
+    "ROLLBACK",
+    "SELECT",
+    "SET",
+    "TABLE",
+    "THEN",
+    "TO",
+    "TRANSACTION",
+    "TRUNCATE",
+    "UNION",
+    "UNIQUE",
+    "UPDATE",
+    "USING",
+    "VALUES",
+    "VIEW",
+    "WHEN",
+    "WHERE",
+    "WITH",
+];
+
+fn tokenize_sql(line: &str, state: &mut TokenizerState) -> Vec<Token> {
+    let bytes = line.as_bytes();
+    let mut out: Vec<Token> = Vec::new();
+    let mut buf = String::new();
+    let mut i = resume_block_comment(line, state, &mut out);
+
+    while i < bytes.len() {
+        // `--` line comment to EOL.
+        if line[i..].starts_with("--") {
+            flush_buf(&mut buf, &mut out);
+            out.push(tok(&line[i..], Role::Comment));
+            return out;
+        }
+        // `/* … */` block comment, possibly spanning lines.
+        if line[i..].starts_with("/*") {
+            flush_buf(&mut buf, &mut out);
+            i = consume_block_comment(line, i, &mut out, state);
+            continue;
+        }
+        let b = bytes[i];
+        // SQL string literal — `'…'` with `''` as the only escape.
+        if b == b'\'' {
+            flush_buf(&mut buf, &mut out);
+            let mut j = i + 1;
+            while j < bytes.len() {
+                if bytes[j] == b'\'' {
+                    if j + 1 < bytes.len() && bytes[j + 1] == b'\'' {
+                        j += 2;
+                        continue;
+                    }
+                    j += 1;
+                    break;
+                }
+                j += 1;
+            }
+            out.push(tok(&line[i..j], Role::String));
+            i = j;
+            continue;
+        }
+        if b.is_ascii_digit() {
+            flush_buf(&mut buf, &mut out);
+            let end = scan_number(line, i);
+            out.push(tok(&line[i..end], Role::Number));
+            i = end;
+            continue;
+        }
+        if is_ident_start(b) {
+            flush_buf(&mut buf, &mut out);
+            let mut j = i + 1;
+            while j < bytes.len() && is_ident_continue(bytes[j]) {
+                j += 1;
+            }
+            let ident = &line[i..j];
+            // SQL keywords are case-insensitive (SELECT == select == Select).
+            let upper = ident.to_ascii_uppercase();
+            let role = if SQL_KEYWORDS.contains(&upper.as_str()) {
+                Role::Keyword
+            } else {
+                Role::Default
+            };
+            out.push(tok(ident, role));
+            i = j;
+            continue;
+        }
+        push_one_char(line, &mut i, &mut buf);
+    }
+    flush_buf(&mut buf, &mut out);
+    out
+}
+
+// ── Diff / patch ───────────────────────────────────────────────────────────
+
+/// Diff is line-classified rather than tokenized: the first character (or
+/// two-character prefix) of the line determines the role for the entire
+/// line. Lines with no recognized prefix render as default text.
+fn tokenize_diff(line: &str, _state: &mut TokenizerState) -> Vec<Token> {
+    if line.starts_with("+++") || line.starts_with("---") {
+        // File header — pure metadata, treat as Keyword so it gets bold.
+        return vec![tok(line, Role::Keyword)];
+    }
+    if line.starts_with("@@") {
+        // Hunk header — Attribute (lighter purple) so it stands out as
+        // navigation chrome without competing with file headers.
+        return vec![tok(line, Role::Attribute)];
+    }
+    if line.starts_with('+') {
+        return vec![tok(line, Role::String)];
+    }
+    if line.starts_with('-') {
+        return vec![tok(line, Role::Removed)];
+    }
+    if line.starts_with("diff ") || line.starts_with("index ") {
+        // `diff --git …` / `index abc..def 100644` lines — file-level
+        // metadata, faint so they don't dominate.
+        return vec![tok(line, Role::Comment)];
+    }
+    vec![tok(line, Role::Default)]
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -1241,6 +1616,183 @@ mod tests {
         assert!(!fresh.in_block_comment);
     }
 
+    #[test]
+    fn tokenizer_for_recognizes_json_yaml_sql_diff_aliases() {
+        assert_eq!(tokenizer_for("json"), Some(Lang::Json));
+        assert_eq!(tokenizer_for("jsonc"), Some(Lang::Json));
+        assert_eq!(tokenizer_for("yaml"), Some(Lang::Yaml));
+        assert_eq!(tokenizer_for("yml"), Some(Lang::Yaml));
+        assert_eq!(tokenizer_for("sql"), Some(Lang::Sql));
+        assert_eq!(tokenizer_for("postgres"), Some(Lang::Sql));
+        assert_eq!(tokenizer_for("mysql"), Some(Lang::Sql));
+        assert_eq!(tokenizer_for("diff"), Some(Lang::Diff));
+        assert_eq!(tokenizer_for("patch"), Some(Lang::Diff));
+    }
+
+    // ── JSON ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn json_object_keys_are_attribute_and_values_are_string() {
+        // A string immediately followed by `:` is a key. The same lexical
+        // shape after `:` should classify as a regular String.
+        let toks = roles_of("{\"name\": \"coven\"}", Lang::Json);
+        assert_eq!(find_role(&toks, "\"name\"").1, Role::Attribute);
+        assert_eq!(find_role(&toks, "\"coven\"").1, Role::String);
+    }
+
+    #[test]
+    fn json_true_false_null_are_keywords() {
+        let toks = roles_of("{\"a\": true, \"b\": false, \"c\": null}", Lang::Json);
+        assert_eq!(find_role(&toks, "true").1, Role::Keyword);
+        assert_eq!(find_role(&toks, "false").1, Role::Keyword);
+        assert_eq!(find_role(&toks, "null").1, Role::Keyword);
+    }
+
+    #[test]
+    fn json_negative_number_includes_leading_sign() {
+        let toks = roles_of("[1, -42, 3.14, -0.5]", Lang::Json);
+        assert_eq!(find_role(&toks, "-42").1, Role::Number);
+        assert_eq!(find_role(&toks, "-0.5").1, Role::Number);
+    }
+
+    #[test]
+    fn json_whitespace_between_key_and_colon_is_tolerated() {
+        // `"key" : "value"` (extra space before colon) must still detect
+        // the key.
+        let toks = roles_of("\"key\"  : \"value\"", Lang::Json);
+        assert_eq!(find_role(&toks, "\"key\"").1, Role::Attribute);
+    }
+
+    // ── YAML ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn yaml_mapping_keys_are_attribute_and_simple_scalars_default() {
+        // `name: coven` — `name` is the key, `coven` is a plain default-text
+        // scalar.
+        let toks = roles_of("name: coven", Lang::Yaml);
+        assert_eq!(find_role(&toks, "name").1, Role::Attribute);
+        assert_eq!(find_role(&toks, "coven").1, Role::Default);
+    }
+
+    #[test]
+    fn yaml_special_literals_are_keywords() {
+        let toks = roles_of("flag: true", Lang::Yaml);
+        assert_eq!(find_role(&toks, "true").1, Role::Keyword);
+
+        let toks = roles_of("answer: null", Lang::Yaml);
+        assert_eq!(find_role(&toks, "null").1, Role::Keyword);
+    }
+
+    #[test]
+    fn yaml_line_comment_colors_to_end_of_line() {
+        let toks = roles_of("port: 8080  # default", Lang::Yaml);
+        assert_eq!(find_role(&toks, "# default").1, Role::Comment);
+    }
+
+    #[test]
+    fn yaml_anchor_and_alias_render_as_attribute() {
+        let toks = roles_of("base: &b 1", Lang::Yaml);
+        assert_eq!(find_role(&toks, "&b").1, Role::Attribute);
+
+        let toks = roles_of("use: *b", Lang::Yaml);
+        assert_eq!(find_role(&toks, "*b").1, Role::Attribute);
+    }
+
+    #[test]
+    fn yaml_doc_separator_paints_the_whole_line_as_attribute() {
+        let toks = roles_of("---", Lang::Yaml);
+        assert_eq!(toks.len(), 1);
+        assert_eq!(toks[0].1, Role::Attribute);
+    }
+
+    // ── SQL ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn sql_keywords_are_case_insensitive() {
+        // Both `SELECT` and `select` must classify as keywords.
+        let toks = roles_of("SELECT * FROM users WHERE id = 1", Lang::Sql);
+        assert_eq!(find_role(&toks, "SELECT").1, Role::Keyword);
+        assert_eq!(find_role(&toks, "FROM").1, Role::Keyword);
+        assert_eq!(find_role(&toks, "WHERE").1, Role::Keyword);
+
+        let toks = roles_of("select id from users", Lang::Sql);
+        assert_eq!(find_role(&toks, "select").1, Role::Keyword);
+        assert_eq!(find_role(&toks, "from").1, Role::Keyword);
+    }
+
+    #[test]
+    fn sql_string_uses_doubled_quote_for_apostrophe_escape() {
+        // SQL standard: `''` inside a string is an escaped single quote,
+        // not a terminator.
+        let toks = roles_of("SELECT 'O''Reilly' FROM t", Lang::Sql);
+        assert_eq!(find_role(&toks, "'O''Reilly'").1, Role::String);
+    }
+
+    #[test]
+    fn sql_dash_dash_is_a_line_comment() {
+        let toks = roles_of("SELECT 1 -- trailing", Lang::Sql);
+        assert_eq!(find_role(&toks, "-- trailing").1, Role::Comment);
+    }
+
+    #[test]
+    fn sql_block_comment_spans_multiple_lines() {
+        let source = "/* opens\n   still inside\n   closes */ SELECT 1;";
+        let per_line = roles_per_line(source, Lang::Sql);
+        assert_eq!(per_line.len(), 3);
+        assert_eq!(find_role(&per_line[0], "/* opens").1, Role::Comment);
+        assert!(
+            per_line[1].iter().all(|(_, r)| *r == Role::Comment),
+            "mid-block-comment line should be entirely comment, got {:?}",
+            per_line[1]
+        );
+        assert_eq!(find_role(&per_line[2], "   closes */").1, Role::Comment);
+        assert_eq!(find_role(&per_line[2], "SELECT").1, Role::Keyword);
+    }
+
+    // ── Diff ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn diff_plus_line_is_string_role() {
+        let toks = roles_of("+    let new_value = 1;", Lang::Diff);
+        assert_eq!(toks.len(), 1);
+        assert_eq!(toks[0].1, Role::String);
+    }
+
+    #[test]
+    fn diff_minus_line_is_removed_role() {
+        let toks = roles_of("-    let old_value = 0;", Lang::Diff);
+        assert_eq!(toks.len(), 1);
+        assert_eq!(toks[0].1, Role::Removed);
+    }
+
+    #[test]
+    fn diff_hunk_header_is_attribute_role() {
+        let toks = roles_of("@@ -10,5 +10,7 @@ fn main() {", Lang::Diff);
+        assert_eq!(toks.len(), 1);
+        assert_eq!(toks[0].1, Role::Attribute);
+    }
+
+    #[test]
+    fn diff_file_headers_are_keyword_role() {
+        let toks = roles_of("+++ b/src/lib.rs", Lang::Diff);
+        assert_eq!(toks[0].1, Role::Keyword);
+        let toks = roles_of("--- a/src/lib.rs", Lang::Diff);
+        assert_eq!(toks[0].1, Role::Keyword);
+    }
+
+    #[test]
+    fn diff_context_line_is_default() {
+        let toks = roles_of("     unchanged context line", Lang::Diff);
+        assert_eq!(toks.len(), 1);
+        assert_eq!(toks[0].1, Role::Default);
+    }
+
+    #[test]
+    fn diff_index_line_is_comment() {
+        let toks = roles_of("index abc1234..def5678 100644", Lang::Diff);
+        assert_eq!(toks[0].1, Role::Comment);
+    }
+
     /// Visual smoke test. Ignored by default; run with
     /// `cargo test -p coven-cli preview_chat_highlight_to_truecolor_stdout -- --ignored --nocapture`
     /// to dump TrueColor ANSI to stdout. Uses the brand RGB tokens directly
@@ -1311,6 +1863,58 @@ mod tests {
                     "done\n",
                 ),
             ),
+            (
+                "json",
+                concat!(
+                    "{\n",
+                    "  \"name\": \"coven\",\n",
+                    "  \"version\": 3,\n",
+                    "  \"enabled\": true,\n",
+                    "  \"port\": 8080,\n",
+                    "  \"tags\": [\"chat\", \"tui\", null]\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "yaml",
+                concat!(
+                    "# yaml sample with anchor + scalar literals\n",
+                    "---\n",
+                    "name: coven\n",
+                    "version: 3\n",
+                    "enabled: true\n",
+                    "defaults: &base\n",
+                    "  port: 8080\n",
+                    "  retries: 3\n",
+                    "server: *base\n",
+                ),
+            ),
+            (
+                "sql",
+                concat!(
+                    "-- SQL sample with case-insensitive keywords\n",
+                    "/* multi-line\n",
+                    "   block comment */\n",
+                    "SELECT id, name FROM users\n",
+                    "WHERE status = 'active' AND id > 100\n",
+                    "ORDER BY id DESC LIMIT 10;\n",
+                ),
+            ),
+            (
+                "diff",
+                concat!(
+                    "diff --git a/src/lib.rs b/src/lib.rs\n",
+                    "index abc1234..def5678 100644\n",
+                    "--- a/src/lib.rs\n",
+                    "+++ b/src/lib.rs\n",
+                    "@@ -10,5 +10,7 @@ fn main() {\n",
+                    "     let x = 1;\n",
+                    "-    println!(\"old\");\n",
+                    "+    println!(\"new\");\n",
+                    "+    println!(\"plus another line\");\n",
+                    "     Ok(())\n",
+                ),
+            ),
         ];
 
         // Frame matches what append_agent_content_lines emits for code rows:
@@ -1323,6 +1927,7 @@ mod tests {
         let num_fg = fg(brand::ACCENT_BLUE);
         let com_fg = fg(brand::TEXT_FAINT);
         let attr_fg = fg(brand::PURPLE_3);
+        let rem_fg = fg(brand::DANGER);
 
         for (tag, source) in samples {
             let lang = tokenizer_for(tag).expect("known fence tag");
@@ -1341,6 +1946,7 @@ mod tests {
                         Role::Number => (num_fg.clone(), reset.to_string()),
                         Role::Comment => (format!("{com_fg}{italic}"), reset.to_string()),
                         Role::Attribute => (attr_fg.clone(), reset.to_string()),
+                        Role::Removed => (rem_fg.clone(), reset.to_string()),
                     };
                     print!("{open}{}{close}", token.text);
                 }

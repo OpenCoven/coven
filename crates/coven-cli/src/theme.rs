@@ -152,6 +152,10 @@ pub const SYNTAX_COMMENT: Rgb = brand::TEXT_FAINT;
 /// Attribute / decorator / lifetime token. Lighter purple than the keyword
 /// shade so the two purple groups stay distinguishable.
 pub const SYNTAX_ATTRIBUTE: Rgb = brand::PURPLE_3;
+/// Removed / deletion token — diff `-` lines, future "rejected" hunks.
+/// Reuses the brand danger red so the visual matches universal diff
+/// convention (`+` green for additions, `-` red for deletions).
+pub const SYNTAX_REMOVED: Rgb = brand::DANGER;
 
 // ── Status semantics ──
 
@@ -672,6 +676,7 @@ mod tests {
         assert_eq!(SYNTAX_NUMBER, brand::ACCENT_BLUE);
         assert_eq!(SYNTAX_COMMENT, brand::TEXT_FAINT);
         assert_eq!(SYNTAX_ATTRIBUTE, brand::PURPLE_3);
+        assert_eq!(SYNTAX_REMOVED, brand::DANGER);
     }
 
     #[test]
