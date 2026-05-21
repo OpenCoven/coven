@@ -1165,10 +1165,7 @@ mod tests {
             .expect("`const` span present");
         assert!(const_span.style.add_modifier.contains(Modifier::BOLD));
         assert!(
-            code_line
-                .spans
-                .iter()
-                .any(|s| s.content == "`hi ${name}`"),
+            code_line.spans.iter().any(|s| s.content == "`hi ${name}`"),
             "template literal should be one string span; got {:#?}",
             code_line.spans
         );
@@ -1205,9 +1202,7 @@ mod tests {
 
         let mut code_lines: Vec<&Line<'_>> = lines
             .iter()
-            .filter(|line| {
-                line.spans.first().map(|s| s.content.as_ref()) == Some("  \u{2502} ")
-            })
+            .filter(|line| line.spans.first().map(|s| s.content.as_ref()) == Some("  \u{2502} "))
             .collect();
         assert_eq!(code_lines.len(), 2, "expected two code rows");
         let plain = code_lines.pop().unwrap();

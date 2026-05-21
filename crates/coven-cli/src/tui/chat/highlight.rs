@@ -157,10 +157,10 @@ fn attr_style() -> Style {
 // ── Rust ───────────────────────────────────────────────────────────────────
 
 const RUST_KEYWORDS: &[&str] = &[
-    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum",
-    "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move",
-    "mut", "pub", "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true",
-    "type", "unsafe", "use", "where", "while", "yield",
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
+    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
+    "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
+    "unsafe", "use", "where", "while", "yield",
 ];
 
 fn tokenize_rust(line: &str, state: &mut TokenizerState) -> Vec<Token> {
@@ -180,9 +180,7 @@ fn tokenize_rust(line: &str, state: &mut TokenizerState) -> Vec<Token> {
             i = consume_block_comment(line, i, &mut out, state);
             continue;
         }
-        if bytes[i] == b'#'
-            && (line[i + 1..].starts_with('[') || line[i + 1..].starts_with("!["))
-        {
+        if bytes[i] == b'#' && (line[i + 1..].starts_with('[') || line[i + 1..].starts_with("![")) {
             flush_buf(&mut buf, &mut out);
             if let Some(end_off) = line[i..].find(']') {
                 let span_end = i + end_off + 1;
@@ -204,7 +202,11 @@ fn tokenize_rust(line: &str, state: &mut TokenizerState) -> Vec<Token> {
         if bytes[i] == b'\'' {
             flush_buf(&mut buf, &mut out);
             let (end, is_lifetime) = scan_rust_quote(line, i);
-            let role = if is_lifetime { Role::Attribute } else { Role::String };
+            let role = if is_lifetime {
+                Role::Attribute
+            } else {
+                Role::String
+            };
             out.push(tok(&line[i..end], role));
             i = end;
             continue;
@@ -378,9 +380,7 @@ fn tokenize_python(line: &str, state: &mut TokenizerState) -> Vec<Token> {
         // ASCII letters so we don't mis-eat identifiers.
         if let Some(quote_offset) = python_string_prefix_len(bytes, i) {
             let quote_at = i + quote_offset;
-            if quote_at < bytes.len()
-                && (bytes[quote_at] == b'"' || bytes[quote_at] == b'\'')
-            {
+            if quote_at < bytes.len() && (bytes[quote_at] == b'"' || bytes[quote_at] == b'\'') {
                 flush_buf(&mut buf, &mut out);
                 let qb = bytes[quote_at];
                 let (kind, is_triple) = if line[quote_at..].starts_with("\"\"\"") {
@@ -790,10 +790,7 @@ fn scan_number(line: &str, start: usize) -> usize {
 
     if j + 1 < n
         && bytes[j] == b'0'
-        && matches!(
-            bytes[j + 1],
-            b'x' | b'X' | b'o' | b'O' | b'b' | b'B'
-        )
+        && matches!(bytes[j + 1], b'x' | b'X' | b'o' | b'O' | b'b' | b'B')
     {
         j += 2;
         while j < n && (bytes[j].is_ascii_hexdigit() || bytes[j] == b'_') {
@@ -966,10 +963,7 @@ mod tests {
 
         // Line 3: leading text up through `*/` is Comment; after the close
         // we drop back into regular tokenization and pick up `let` again.
-        assert_eq!(
-            find_role(&per_line[2], "   and closes */").1,
-            Role::Comment
-        );
+        assert_eq!(find_role(&per_line[2], "   and closes */").1, Role::Comment);
         assert_eq!(find_role(&per_line[2], "let").1, Role::Keyword);
         assert_eq!(find_role(&per_line[2], "2").1, Role::Number);
     }
@@ -1076,8 +1070,7 @@ mod tests {
     fn default_style_is_applied_to_non_token_runs() {
         let default_style = Style::default().add_modifier(Modifier::REVERSED);
         let mut state = TokenizerState::default();
-        let spans: Vec<_> =
-            highlight_line("foo(bar)", Lang::Rust, default_style, &mut state);
+        let spans: Vec<_> = highlight_line("foo(bar)", Lang::Rust, default_style, &mut state);
         let plain: Vec<_> = spans
             .iter()
             .filter(|s| s.content == "(" || s.content == ")")
@@ -1164,7 +1157,10 @@ mod tests {
             "line 2 should be entirely string, got {:?}",
             per_line[1]
         );
-        assert_eq!(find_role(&per_line[2], "   and closes\"\"\"").1, Role::String);
+        assert_eq!(
+            find_role(&per_line[2], "   and closes\"\"\"").1,
+            Role::String
+        );
         // After the close we drop back into normal tokenization.
         assert_eq!(find_role(&per_line[2], "x").1, Role::Default);
     }
