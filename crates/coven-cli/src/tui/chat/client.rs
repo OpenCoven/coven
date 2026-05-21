@@ -333,7 +333,7 @@ fn daemon_error(status: u16, body: &str) -> anyhow::Error {
     anyhow!("Coven daemon rejected request with HTTP {status}")
 }
 
-fn coven_home_dir() -> PathBuf {
+pub(super) fn coven_home_dir() -> PathBuf {
     std::env::var_os("COVEN_HOME")
         .map(PathBuf::from)
         .or_else(|| dirs_next::home_dir().map(|home| home.join(".coven")))

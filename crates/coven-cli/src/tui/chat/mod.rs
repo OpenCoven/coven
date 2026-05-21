@@ -5,6 +5,7 @@ mod app;
 pub(crate) mod client;
 mod events;
 mod render;
+mod settings;
 
 // Re-export the public types so callers see them at `tui::chat::*` instead of
 // having to reach into `tui::chat::app::*`. Matches the surface of the old

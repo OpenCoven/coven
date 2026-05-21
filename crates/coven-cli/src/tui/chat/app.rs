@@ -1,6 +1,7 @@
 //! Chat application state, behavior, and helpers. Owns `App` and all of its
 //! methods; provides `discover_agents` and the spinner-frame data.
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::{
@@ -13,7 +14,8 @@ use crate::{
     },
 };
 
-use super::client::{ChatClient, ChatEventQuery, DaemonChatClient, LaunchRequest};
+use super::client::{coven_home_dir, ChatClient, ChatEventQuery, DaemonChatClient, LaunchRequest};
+use super::settings::{self, ChatSettings, StreamingMode};
 
 // ── Data types ─────────────────────────────────────────────────────────────
 
@@ -81,6 +83,9 @@ pub(super) struct App {
     pub(super) input_history: Vec<String>,
     pub(super) history_index: Option<usize>,
     pending_cast_confirmation: Option<CastPlan>,
+    streaming_mode: StreamingMode,
+    pending_agent_buffer: Option<(String, String)>,
+    coven_home: Option<PathBuf>,
     client: Box<dyn ChatClient>,
 }
 
@@ -90,14 +95,24 @@ impl App {
     pub(super) fn new() -> Self {
         let agents = discover_agents();
         let active_agent = agents.iter().position(|a| a.available);
-        Self::new_with_state(agents, active_agent, Box::<DaemonChatClient>::default())
+        Self::new_with_state(
+            agents,
+            active_agent,
+            Box::<DaemonChatClient>::default(),
+            Some(coven_home_dir()),
+        )
     }
 
     pub(super) fn new_with_state(
         agents: Vec<AgentInfo>,
         active_agent: Option<usize>,
         client: Box<dyn ChatClient>,
+        coven_home: Option<PathBuf>,
     ) -> Self {
+        let streaming_mode = coven_home
+            .as_deref()
+            .map(|home| settings::load_from(home).streaming)
+            .unwrap_or_default();
         let mut app = App {
             messages: Vec::new(),
             input: String::new(),
@@ -123,6 +138,9 @@ impl App {
             input_history: Vec::new(),
             history_index: None,
             pending_cast_confirmation: None,
+            streaming_mode,
+            pending_agent_buffer: None,
+            coven_home,
             client,
         };
 
@@ -139,7 +157,7 @@ impl App {
     pub(super) fn new_with_client(client: Box<dyn ChatClient>) -> Self {
         let agents = discover_agents();
         let active_agent = agents.iter().position(|a| a.available);
-        Self::new_with_state(agents, active_agent, client)
+        Self::new_with_state(agents, active_agent, client, None)
     }
 
     pub(super) fn push_system_message(&mut self, content: &str) {
@@ -177,6 +195,75 @@ impl App {
             }
         }
         self.push_agent_message(agent_name, content);
+    }
+
+    /// Stash agent output until the session completes (batched mode). Keyed by
+    /// sender so a mid-stream agent switch doesn't merge two voices into one
+    /// bubble.
+    fn buffer_pending_agent_output(&mut self, agent_name: &str, content: &str) {
+        match self.pending_agent_buffer.as_mut() {
+            Some((sender, buffer)) if sender == agent_name => buffer.push_str(content),
+            Some(_) => {
+                self.flush_pending_agent_buffer();
+                self.pending_agent_buffer = Some((agent_name.to_string(), content.to_string()));
+            }
+            None => {
+                self.pending_agent_buffer = Some((agent_name.to_string(), content.to_string()));
+            }
+        }
+    }
+
+    /// Drain the batched-mode buffer into a single agent message. Called on
+    /// session end (exit/kill) and when the user flips streaming back on.
+    fn flush_pending_agent_buffer(&mut self) {
+        let Some((sender, buffer)) = self.pending_agent_buffer.take() else {
+            return;
+        };
+        if buffer.trim().is_empty() {
+            return;
+        }
+        self.push_agent_message(&sender, &buffer);
+    }
+
+    pub(super) fn streaming_mode(&self) -> StreamingMode {
+        self.streaming_mode
+    }
+
+    pub(super) fn has_pending_batched_output(&self) -> bool {
+        self.pending_agent_buffer
+            .as_ref()
+            .is_some_and(|(_, buffer)| !buffer.is_empty())
+    }
+
+    fn set_streaming_mode(&mut self, mode: StreamingMode) {
+        if self.streaming_mode == mode {
+            let already = match mode {
+                StreamingMode::Live => "Streaming is already on.",
+                StreamingMode::Batched => "Streaming is already off.",
+            };
+            self.push_system_message(already);
+            return;
+        }
+        self.streaming_mode = mode;
+        // Flipping back to live should not strand any held-back output.
+        if mode.is_live() {
+            self.flush_pending_agent_buffer();
+        }
+        if let Some(home) = self.coven_home.clone() {
+            let settings = ChatSettings { streaming: mode };
+            if let Err(error) = settings::save_to(&home, &settings) {
+                self.push_system_message(&format!(
+                    "Streaming preference not persisted: {error}. Setting still active for this session."
+                ));
+            }
+        }
+        let note = match mode {
+            StreamingMode::Live => "Streaming on. Agent output will appear as it arrives.",
+            StreamingMode::Batched => {
+                "Streaming off. Agent output will appear once the response completes."
+            }
+        };
+        self.push_system_message(note);
     }
 
     pub(super) fn active_agent_label(&self) -> &str {
@@ -334,6 +421,28 @@ impl App {
             }
             "/debug" => {
                 self.push_system_message("Debug mode coming soon.");
+                SlashCommandResult::Handled
+            }
+            "/stream" | "/streaming" => {
+                let new_mode = match arg.to_ascii_lowercase().as_str() {
+                    "" | "toggle" => self.streaming_mode.toggled(),
+                    "on" | "live" => StreamingMode::Live,
+                    "off" | "batched" | "complete" => StreamingMode::Batched,
+                    "status" => {
+                        self.push_system_message(&format!(
+                            "Streaming is {}.",
+                            self.streaming_mode.status_label()
+                        ));
+                        return SlashCommandResult::Handled;
+                    }
+                    other => {
+                        self.push_system_message(&format!(
+                            "Unknown /stream argument \"{other}\". Usage: /stream [on|off|toggle|status]."
+                        ));
+                        return SlashCommandResult::Handled;
+                    }
+                };
+                self.set_streaming_mode(new_mode);
                 SlashCommandResult::Handled
             }
             _ => SlashCommandResult::Unknown(cmd),
@@ -643,11 +752,16 @@ impl App {
                 if let Some(data) = event_payload_text(event, "data") {
                     let sender = self.active_agent_label().to_string();
                     if let Some(text) = clean_terminal_output(&data) {
-                        self.push_or_append_agent_message(&sender, &text);
+                        if self.streaming_mode.is_live() {
+                            self.push_or_append_agent_message(&sender, &text);
+                        } else {
+                            self.buffer_pending_agent_output(&sender, &text);
+                        }
                     }
                 }
             }
             "exit" => {
+                self.flush_pending_agent_buffer();
                 let status =
                     event_payload_text(event, "status").unwrap_or_else(|| "exited".to_string());
                 self.is_responding = false;
@@ -657,6 +771,7 @@ impl App {
                 self.push_system_message(&format!("Session {status}."));
             }
             "kill" => {
+                self.flush_pending_agent_buffer();
                 if self.active_session_id.as_deref() == Some(event.session_id.as_str()) {
                     self.active_session_id = None;
                     self.is_responding = false;
@@ -951,6 +1066,8 @@ fn is_chat_local_slash(input: &str) -> bool {
             | "/trace"
             | "/mem"
             | "/debug"
+            | "/stream"
+            | "/streaming"
     )
 }
 
@@ -1078,6 +1195,7 @@ mod tests {
             agents,
             active_agent,
             Box::new(RecordingChatClient::default()),
+            None,
         )
     }
 
@@ -1966,5 +2084,167 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn live_streaming_appends_output_chunks_immediately() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        assert!(app.streaming_mode().is_live());
+
+        app.push_event_message(&output_event(1, "session-1", "Hello "));
+        app.push_event_message(&output_event(2, "session-1", "world!\n"));
+
+        let agent_messages: Vec<_> = app
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, MessageRole::Agent))
+            .collect();
+        assert_eq!(agent_messages.len(), 1);
+        assert_eq!(agent_messages[0].content, "Hello world!\n");
+    }
+
+    #[test]
+    fn batched_streaming_holds_output_until_session_exits() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.handle_slash_command("/stream off");
+        app.active_session_id = Some("session-1".to_string());
+        app.is_responding = true;
+
+        app.push_event_message(&output_event(1, "session-1", "first chunk "));
+        app.push_event_message(&output_event(2, "session-1", "second chunk\n"));
+
+        let agent_count_before_exit = app
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, MessageRole::Agent))
+            .count();
+        assert_eq!(agent_count_before_exit, 0);
+        assert!(app.has_pending_batched_output());
+
+        app.push_event_message(&EventRecord {
+            seq: 3,
+            id: "event-3".to_string(),
+            session_id: "session-1".to_string(),
+            kind: "exit".to_string(),
+            payload_json: serde_json::json!({ "status": "completed" }).to_string(),
+            created_at: "2026-05-19T00:00:00Z".to_string(),
+        });
+
+        let agent_messages: Vec<_> = app
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, MessageRole::Agent))
+            .collect();
+        assert_eq!(agent_messages.len(), 1);
+        assert_eq!(agent_messages[0].content, "first chunk second chunk\n");
+        assert!(!app.has_pending_batched_output());
+        assert!(!app.is_responding);
+    }
+
+    #[test]
+    fn batched_streaming_flushes_pending_buffer_on_kill_event() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.handle_slash_command("/stream off");
+        app.active_session_id = Some("session-1".to_string());
+        app.is_responding = true;
+
+        app.push_event_message(&output_event(1, "session-1", "partial work"));
+        assert!(app.has_pending_batched_output());
+
+        app.push_event_message(&EventRecord {
+            seq: 2,
+            id: "event-2".to_string(),
+            session_id: "session-1".to_string(),
+            kind: "kill".to_string(),
+            payload_json: serde_json::json!({ "status": "killed" }).to_string(),
+            created_at: "2026-05-19T00:00:00Z".to_string(),
+        });
+
+        let agent_messages: Vec<_> = app
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, MessageRole::Agent))
+            .collect();
+        assert_eq!(agent_messages.len(), 1);
+        assert_eq!(agent_messages[0].content, "partial work");
+    }
+
+    #[test]
+    fn turning_streaming_back_on_flushes_pending_batched_output() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.handle_slash_command("/stream off");
+        app.active_session_id = Some("session-1".to_string());
+
+        app.push_event_message(&output_event(1, "session-1", "queued reply"));
+        assert!(app.has_pending_batched_output());
+
+        app.handle_slash_command("/stream on");
+
+        let agent_messages: Vec<_> = app
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, MessageRole::Agent))
+            .collect();
+        assert_eq!(agent_messages.len(), 1);
+        assert_eq!(agent_messages[0].content, "queued reply");
+        assert!(!app.has_pending_batched_output());
+        assert!(app.streaming_mode().is_live());
+    }
+
+    #[test]
+    fn stream_slash_command_toggles_and_reports_status() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        assert!(app.streaming_mode().is_live());
+
+        app.handle_slash_command("/stream");
+        assert!(!app.streaming_mode().is_live());
+        assert!(app
+            .messages
+            .iter()
+            .any(|message| message.content.contains("Streaming off")));
+
+        app.handle_slash_command("/stream status");
+        assert!(app
+            .messages
+            .iter()
+            .any(|message| message.content == "Streaming is off."));
+
+        app.handle_slash_command("/stream on");
+        assert!(app.streaming_mode().is_live());
+        assert!(app
+            .messages
+            .iter()
+            .any(|message| message.content.contains("Streaming on")));
+    }
+
+    #[test]
+    fn stream_slash_command_rejects_unknown_argument_without_changing_mode() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        let starting_mode = app.streaming_mode();
+
+        app.handle_slash_command("/stream please");
+
+        assert_eq!(app.streaming_mode(), starting_mode);
+        assert!(app
+            .messages
+            .iter()
+            .any(|message| message.content.contains("Unknown /stream argument")));
+    }
+
+    #[test]
+    fn stream_slash_is_treated_as_local_so_cast_never_intercepts_it() {
+        // Regression guard: /stream must short-circuit through
+        // handle_slash_command, not fall into the Cast parser (which would
+        // emit a "unknown spell" message and never flip the toggle).
+        assert!(is_chat_local_slash("/stream"));
+        assert!(is_chat_local_slash("/stream off"));
+        assert!(is_chat_local_slash("/streaming on"));
     }
 }

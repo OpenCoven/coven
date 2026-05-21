@@ -73,6 +73,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         "ready"
     };
 
+    let stream_label = app.streaming_mode().status_label();
     let status_spans = vec![
         Span::styled(
             format!(" coven {harness} "),
@@ -80,7 +81,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         ),
         Span::styled("\u{00b7} ", theme::ratatui_style(DIM)),
         Span::styled(
-            truncate_for_width(project, area.width.saturating_sub(28) as usize),
+            truncate_for_width(project, area.width.saturating_sub(60) as usize),
             theme::ratatui_style(DIM),
         ),
         Span::styled(" \u{00b7} ", theme::ratatui_style(DIM)),
@@ -89,9 +90,19 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
             theme::ratatui_style(DIM),
         ),
         Span::styled(" \u{00b7} ", theme::ratatui_style(DIM)),
+        Span::styled(format!("stream: {stream_label}"), theme::ratatui_style(DIM)),
+        Span::styled(" \u{00b7} ", theme::ratatui_style(DIM)),
         if app.is_responding {
+            let composing = if app.has_pending_batched_output() {
+                " (composing)"
+            } else {
+                ""
+            };
             Span::styled(
-                format!("{} responding...", SPINNER_FRAMES[app.spinner_frame]),
+                format!(
+                    "{} responding...{composing}",
+                    SPINNER_FRAMES[app.spinner_frame]
+                ),
                 theme::ratatui_style(DIM),
             )
         } else {
@@ -147,21 +158,23 @@ fn render_messages(f: &mut Frame, app: &mut App, area: Rect) {
 
         lines.push(Line::from(Span::styled(sender_text, sender_style)));
 
-        // Message content with simple word wrapping
         let wrap_width = if width > 4 { width - 2 } else { width };
-        for content_line in msg.content.lines() {
-            if content_line.is_empty() {
-                lines.push(Line::from(""));
-                continue;
-            }
-            let wrapped = textwrap::wrap(content_line, wrap_width);
-            for wl in wrapped {
+        match msg.role {
+            MessageRole::Agent => append_agent_content_lines(&mut lines, &msg.content, wrap_width),
+            _ => {
                 let style = match msg.role {
                     MessageRole::User => theme::ratatui_style(TEXT),
-                    MessageRole::Agent => theme::ratatui_style(TEXT_DIM),
-                    MessageRole::System => theme::ratatui_style(PRIMARY),
+                    _ => theme::ratatui_style(PRIMARY),
                 };
-                lines.push(Line::from(Span::styled(format!("  {wl}"), style)));
+                for content_line in msg.content.lines() {
+                    if content_line.is_empty() {
+                        lines.push(Line::from(""));
+                        continue;
+                    }
+                    for wl in textwrap::wrap(content_line, wrap_width) {
+                        lines.push(Line::from(Span::styled(format!("  {wl}"), style)));
+                    }
+                }
             }
         }
     }
@@ -206,6 +219,120 @@ fn render_messages(f: &mut Frame, app: &mut App, area: Rect) {
             &mut scrollbar_state,
         );
     }
+}
+
+/// Render an agent message body with light markdown awareness so harness
+/// output stays human-readable: code fences become a left-bar code block,
+/// `# ` headings stand out, `- `/`* ` bullets keep their marker on the first
+/// wrapped line and indent continuations under the text, and runs of blank
+/// lines collapse to a single separator.
+fn append_agent_content_lines<'a>(lines: &mut Vec<Line<'a>>, content: &str, wrap_width: usize) {
+    let text_style = theme::ratatui_style(TEXT);
+    let dim_style = theme::ratatui_style(TEXT_DIM);
+    let heading_style = theme::ratatui_style(PRIMARY).bold();
+
+    let mut in_code_block = false;
+    let mut last_was_blank = true;
+
+    for raw_line in content.lines() {
+        let line = raw_line.trim_end_matches(['\r']);
+
+        if line.trim_start().starts_with("```") {
+            in_code_block = !in_code_block;
+            // Don't render the fence itself; it carried structure, not text.
+            continue;
+        }
+
+        if in_code_block {
+            let visible = if wrap_width > 4 && line.chars().count() > wrap_width - 4 {
+                line.chars().take(wrap_width - 4).collect::<String>()
+            } else {
+                line.to_string()
+            };
+            lines.push(Line::from(vec![
+                Span::styled("  \u{2502} ", dim_style),
+                Span::styled(visible, text_style),
+            ]));
+            last_was_blank = false;
+            continue;
+        }
+
+        if line.trim().is_empty() {
+            if !last_was_blank {
+                lines.push(Line::from(""));
+                last_was_blank = true;
+            }
+            continue;
+        }
+        last_was_blank = false;
+
+        if let Some(heading) = strip_heading_prefix(line) {
+            let wrap_target = wrap_width.saturating_sub(2).max(1);
+            for wl in textwrap::wrap(heading, wrap_target) {
+                lines.push(Line::from(Span::styled(format!("  {wl}"), heading_style)));
+            }
+            continue;
+        }
+
+        if let Some((marker, body)) = strip_bullet_prefix(line) {
+            let indent_first = format!("  {marker}");
+            let indent_cont = "    ".to_string();
+            let wrap_target = wrap_width
+                .saturating_sub(indent_first.chars().count())
+                .max(1);
+            let mut wrapped = textwrap::wrap(body, wrap_target).into_iter();
+            if let Some(first) = wrapped.next() {
+                lines.push(Line::from(Span::styled(
+                    format!("{indent_first}{first}"),
+                    text_style,
+                )));
+            }
+            for cont in wrapped {
+                lines.push(Line::from(Span::styled(
+                    format!("{indent_cont}{cont}"),
+                    text_style,
+                )));
+            }
+            continue;
+        }
+
+        let wrap_target = wrap_width.saturating_sub(2).max(1);
+        for wl in textwrap::wrap(line, wrap_target) {
+            lines.push(Line::from(Span::styled(format!("  {wl}"), text_style)));
+        }
+    }
+
+    if in_code_block {
+        // A fence opened mid-stream and hasn't closed yet; leave a subtle
+        // marker so the reader knows the code block is still flowing.
+        lines.push(Line::from(Span::styled("  \u{2502} \u{2026}", dim_style)));
+    }
+}
+
+fn strip_heading_prefix(line: &str) -> Option<&str> {
+    for prefix in ["#### ", "### ", "## ", "# "] {
+        if let Some(rest) = line.strip_prefix(prefix) {
+            return Some(rest);
+        }
+    }
+    None
+}
+
+fn strip_bullet_prefix(line: &str) -> Option<(&'static str, &str)> {
+    let trimmed = line.trim_start();
+    let indent = line.len() - trimmed.len();
+    // Cap indent passthrough; very deep indentation is rare and would push the
+    // body off-screen on narrow terminals.
+    if indent > 4 {
+        return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix("- ") {
+        return Some(("\u{2022} ", rest));
+    }
+    if let Some(rest) = trimmed.strip_prefix("* ") {
+        return Some(("\u{2022} ", rest));
+    }
+    None
 }
 
 fn render_input(f: &mut Frame, app: &App, area: Rect) {
@@ -310,6 +437,14 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
                 ("/attach <id>", "Attach to daemon session"),
                 ("/run <harness> <prompt>", "Launch via daemon"),
                 ("/kill [id]", "Ask daemon to kill a live session"),
+            ],
+        ),
+        (
+            "Output",
+            vec![
+                ("/stream", "Toggle live agent streaming (persisted)"),
+                ("/stream on|off", "Force live or batched output"),
+                ("/stream status", "Show current streaming mode"),
             ],
         ),
         (
@@ -540,7 +675,7 @@ pub(crate) fn render_chat_frame_plain_for_test(width: u16, height: u16) -> Strin
         harness: "codex".to_string(),
         available: true,
     }];
-    let mut app = App::new_with_state(agents, Some(0), Box::<DaemonChatClient>::default());
+    let mut app = App::new_with_state(agents, Some(0), Box::<DaemonChatClient>::default(), None);
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("test terminal");
     terminal
@@ -581,6 +716,98 @@ mod tests {
         assert!(!frame.contains("Commands"));
         assert!(!frame.contains("/start"));
         assert!(!frame.contains("Session browser"));
+    }
+
+    #[test]
+    fn status_bar_advertises_current_streaming_mode() {
+        let frame = render_chat_frame_plain_for_test(80, 20);
+        assert!(frame.contains("stream: live"));
+    }
+
+    #[test]
+    fn agent_lines_render_fenced_code_blocks_with_bar_prefix() {
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        let content = "Run this:\n```\ncargo test\n```\nDone.";
+        append_agent_content_lines(&mut lines, content, 40);
+
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        let joined = rendered.join("|");
+
+        assert!(joined.contains("  Run this:"));
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("\u{2502} cargo test")));
+        assert!(!joined.contains("```"));
+        assert!(joined.contains("  Done."));
+    }
+
+    #[test]
+    fn agent_lines_promote_markdown_headings_and_bullets() {
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        let content = "# Title\n\n- first\n- second item that wraps onto another line";
+        append_agent_content_lines(&mut lines, content, 30);
+
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+
+        assert!(rendered.iter().any(|line| line.contains("  Title")));
+        assert!(rendered.iter().any(|line| line.contains("\u{2022} first")));
+        assert!(rendered.iter().any(|line| line.contains("\u{2022} second")));
+        // Wrapped continuation must be indented under the bullet body.
+        let bullet_idx = rendered
+            .iter()
+            .position(|line| line.contains("\u{2022} second"))
+            .expect("bullet line present");
+        let continuation = &rendered[bullet_idx + 1];
+        assert!(continuation.starts_with("    "));
+    }
+
+    #[test]
+    fn agent_lines_collapse_runs_of_blank_lines_to_a_single_separator() {
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        let content = "First paragraph.\n\n\n\nSecond paragraph.";
+        append_agent_content_lines(&mut lines, content, 40);
+
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        let blanks_between = rendered
+            .windows(2)
+            .filter(|pair| pair[0].trim().is_empty() && pair[1].trim().is_empty())
+            .count();
+        assert_eq!(blanks_between, 0);
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("First paragraph.")));
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("Second paragraph.")));
+    }
+
+    #[test]
+    fn agent_lines_emit_unterminated_code_block_marker_during_streaming() {
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        // Mid-stream chunk: fence opened but closing fence hasn't arrived yet.
+        append_agent_content_lines(&mut lines, "```\ncargo run", 40);
+
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("\u{2502} cargo run")));
+        // Last rendered line should hint that more code is still flowing.
+        assert!(rendered
+            .last()
+            .map(|line| line.contains('\u{2026}'))
+            .unwrap_or(false));
     }
 
     #[test]
