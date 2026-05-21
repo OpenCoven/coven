@@ -136,6 +136,7 @@ pub(super) fn run_event_loop(
                             app.scroll_offset = app.scroll_offset.saturating_add(page);
                             // Will be clamped during render
                         }
+                        KeyCode::Esc if app.cancel_pending_cast_confirmation() => {}
                         KeyCode::Esc if !app.input.is_empty() => {
                             app.input.clear();
                             app.cursor_pos = 0;

@@ -64,6 +64,9 @@ pub(crate) enum CastIntent {
     ArchiveSession {
         session_id: String,
     },
+    KillSession {
+        session_id: String,
+    },
     SacrificeSession {
         session_id: String,
     },
@@ -137,6 +140,9 @@ fn parse_slash_command(input: &str) -> Result<Option<CastIntent>> {
         })?,
         "/archive" => session_id_intent(rest, "/archive", |session_id| {
             CastIntent::ArchiveSession { session_id }
+        })?,
+        "/kill" => session_id_intent(rest, "/kill", |session_id| CastIntent::KillSession {
+            session_id,
         })?,
         "/sacrifice" => session_id_intent(rest, "/sacrifice", |session_id| {
             CastIntent::SacrificeSession { session_id }
@@ -478,6 +484,12 @@ mod tests {
         assert_eq!(
             intent("/archive abc"),
             CastIntent::ArchiveSession {
+                session_id: "abc".to_string()
+            }
+        );
+        assert_eq!(
+            intent("/kill abc"),
+            CastIntent::KillSession {
                 session_id: "abc".to_string()
             }
         );

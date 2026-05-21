@@ -3,7 +3,15 @@
 
 use std::time::{Duration, Instant};
 
-use crate::{harness, store};
+use crate::{
+    harness, store,
+    tui::cast::{
+        self, build_plan, parse_spell,
+        plan::{CastHarnessSource, CastPlan},
+        safety::{CastRisk, SafetyDecision},
+        CastHarness, CastIntent,
+    },
+};
 
 use super::client::{ChatClient, ChatEventQuery, DaemonChatClient, LaunchRequest};
 
@@ -66,10 +74,12 @@ pub(super) struct App {
     event_poll_backoff_until: Option<Instant>,
     event_poll_failure_streak: u32,
     last_event_poll_error: Option<String>,
+    event_poll_paused_for_api_mismatch: bool,
     pub(super) sessions: Vec<store::SessionRecord>,
     pub(super) show_session_overlay: bool,
     pub(super) input_history: Vec<String>,
     pub(super) history_index: Option<usize>,
+    pending_cast_confirmation: Option<CastPlan>,
     client: Box<dyn ChatClient>,
 }
 
@@ -82,7 +92,7 @@ impl App {
         Self::new_with_state(agents, active_agent, Box::<DaemonChatClient>::default())
     }
 
-    fn new_with_state(
+    pub(super) fn new_with_state(
         agents: Vec<AgentInfo>,
         active_agent: Option<usize>,
         client: Box<dyn ChatClient>,
@@ -105,24 +115,18 @@ impl App {
             event_poll_backoff_until: None,
             event_poll_failure_streak: 0,
             last_event_poll_error: None,
+            event_poll_paused_for_api_mismatch: false,
             sessions: Vec::new(),
             show_session_overlay: false,
             input_history: Vec::new(),
             history_index: None,
+            pending_cast_confirmation: None,
             client,
         };
 
-        app.push_system_message(
-            "Welcome to the Coven. Type a message to chat, or /help for commands.",
-        );
+        app.push_system_message("Ready. Type a task or /help.");
 
-        if let Some(idx) = app.active_agent {
-            let agent = &app.agents[idx];
-            app.push_system_message(&format!(
-                "Active agent: {} ({})",
-                agent.label, agent.harness
-            ));
-        } else {
+        if app.active_agent.is_none() {
             app.push_system_message("No agents available. Run `coven doctor` to check your setup.");
         }
 
@@ -200,12 +204,34 @@ impl App {
             return Some(SlashCommandResult::Handled);
         }
 
-        if raw.starts_with('/') {
+        self.event_poll_paused_for_api_mismatch = false;
+
+        if self.pending_cast_confirmation.is_some() {
+            let result = self.resolve_pending_cast_confirmation(&raw);
+            self.scroll_to_bottom();
+            return Some(result);
+        }
+
+        if is_confirmation_response(&raw) {
+            self.push_system_message("No Cast confirmation is pending.");
+            self.scroll_to_bottom();
+            return Some(SlashCommandResult::Handled);
+        }
+
+        let raw = self.cast_slash_with_context(&raw);
+
+        if raw.starts_with('/') && is_chat_local_slash(&raw) {
             return Some(self.handle_slash_command(&raw));
         }
 
         self.record_history(&raw);
         self.push_user_message(&raw);
+        if raw.starts_with('/') {
+            let result = self.launch_chat_session(&raw);
+            self.scroll_to_bottom();
+            return Some(result);
+        }
+
         if let Some(session_id) = self.active_session_id.clone() {
             self.forward_input_to_session(&session_id, &raw);
         } else {
@@ -263,7 +289,7 @@ impl App {
                     self.push_system_message("Usage: /run <harness> <prompt>");
                     return SlashCommandResult::Handled;
                 };
-                self.run_harness_prompt(harness, prompt);
+                let _ = self.run_harness_prompt(harness, prompt);
                 SlashCommandResult::Handled
             }
             "/kill" => {
@@ -314,28 +340,140 @@ impl App {
         }
     }
 
-    fn launch_chat_session(&mut self, prompt: &str) {
-        let Some(agent) = self
-            .active_agent
-            .and_then(|idx| self.agents.get(idx))
-            .cloned()
-        else {
-            self.push_system_message(
-                "No active agent. Use /agent to select one, or run `coven doctor`.",
-            );
-            return;
+    fn launch_chat_session(&mut self, prompt: &str) -> SlashCommandResult {
+        let plan = match parse_spell(prompt)
+            .and_then(|intent| build_plan(intent, || self.default_cast_harness()))
+            .map(|plan| plan.with_raw_spell(prompt))
+        {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.push_system_message(&format!("{error}"));
+                return SlashCommandResult::Handled;
+            }
         };
-        if !agent.available {
-            self.push_system_message(&format!(
-                "{} is not available. Run `coven doctor` to troubleshoot.",
-                agent.label
-            ));
-            return;
-        }
-        self.run_harness_prompt(&agent.harness, prompt);
+        self.dispatch_cast_plan(plan)
     }
 
-    fn run_harness_prompt(&mut self, harness: &str, prompt: &str) {
+    fn dispatch_cast_plan(&mut self, plan: CastPlan) -> SlashCommandResult {
+        self.push_system_message(&format_cast_plan_for_chat(&plan));
+
+        match &plan.decision {
+            SafetyDecision::Proceed => self.execute_cast_plan(plan),
+            SafetyDecision::Confirm { suggestion, .. } => {
+                self.push_system_message(&format!(
+                    "Confirmation required before launch. Type accept to proceed or reject to cancel. {suggestion}"
+                ));
+                self.pending_cast_confirmation = Some(plan);
+                SlashCommandResult::Handled
+            }
+            SafetyDecision::Reject { alternative, .. } => {
+                self.push_system_message(&format!("Cast rejected this spell. {alternative}"));
+                SlashCommandResult::Handled
+            }
+        }
+    }
+
+    fn execute_cast_plan(&mut self, plan: CastPlan) -> SlashCommandResult {
+        match plan.intent {
+            CastIntent::NaturalSpell { prompt } | CastIntent::HarnessSpell { prompt, .. } => {
+                let Some(plan_harness) = plan.harness else {
+                    self.push_system_message(
+                        "No harness available. Run `coven doctor` to install Codex or Claude Code.",
+                    );
+                    return SlashCommandResult::Handled;
+                };
+                if let Some(session) = self.run_harness_prompt(plan_harness.harness.id(), &prompt) {
+                    self.push_system_message(&format_cast_outcome_for_chat(
+                        plan_harness.harness.label(),
+                        &session.id,
+                    ));
+                }
+            }
+            CastIntent::OpenSessions | CastIntent::OpenAllSessions => {
+                self.refresh_sessions();
+                self.show_session_overlay = true;
+            }
+            CastIntent::AttachSession { session_id } => self.attach_session(&session_id),
+            CastIntent::SummonSession { session_id } => self.summon_session(&session_id),
+            CastIntent::ArchiveSession { session_id } => self.archive_session(&session_id),
+            CastIntent::KillSession { session_id } => self.kill_session(&session_id),
+            CastIntent::SacrificeSession { session_id } => self.sacrifice_session(&session_id),
+            CastIntent::Doctor => self.push_system_message("Run `coven doctor` for setup checks."),
+            CastIntent::DaemonStatus => {
+                self.push_system_message("Run `coven daemon status` to inspect the local daemon.")
+            }
+            CastIntent::Help => self.show_help = true,
+            CastIntent::StartHere | CastIntent::OpenTui => {
+                self.show_help = true;
+                self.push_system_message(
+                    "Command discovery is open. Type a task, /run <harness> <task>, /sessions, or /help.",
+                );
+            }
+            CastIntent::PatchOpenClaw => {
+                self.push_system_message(
+                    "Patch flow: type `patch openclaw <issue>` as a task, or run `coven patch openclaw` for the guided repair flow.",
+                );
+            }
+            CastIntent::Quest { goal } => {
+                self.push_system_message(&format!(
+                    "Quest planned for: {goal}. Cast will run each phase through this composer; start with the design phase prompt when ready."
+                ));
+            }
+            CastIntent::Quit => return SlashCommandResult::Quit,
+        }
+        SlashCommandResult::Handled
+    }
+
+    fn resolve_pending_cast_confirmation(&mut self, raw: &str) -> SlashCommandResult {
+        let normalized = raw.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "accept" | "approve" | "yes" | "y" => {
+                if let Some(mut plan) = self.pending_cast_confirmation.take() {
+                    plan.decision = SafetyDecision::Proceed;
+                    self.push_system_message("Accepted Cast confirmation.");
+                    return self.execute_cast_plan(plan);
+                }
+            }
+            "reject" | "cancel" | "no" | "n" => {
+                self.pending_cast_confirmation = None;
+                self.push_system_message("Rejected Cast confirmation.");
+            }
+            _ => {
+                self.push_system_message(
+                    "A Cast confirmation is pending. Type accept to proceed or reject to cancel.",
+                );
+            }
+        }
+        SlashCommandResult::Handled
+    }
+
+    pub(super) fn cancel_pending_cast_confirmation(&mut self) -> bool {
+        if self.pending_cast_confirmation.take().is_some() {
+            self.push_system_message("Cancelled Cast confirmation.");
+            true
+        } else {
+            false
+        }
+    }
+
+    fn default_cast_harness(&self) -> Option<CastHarness> {
+        self.active_agent
+            .and_then(|idx| self.agents.get(idx))
+            .filter(|agent| agent.available)
+            .and_then(|agent| CastHarness::from_token(&agent.harness))
+            .or_else(cast::default_harness)
+    }
+
+    fn cast_slash_with_context(&mut self, raw: &str) -> String {
+        if raw.trim().eq_ignore_ascii_case("/kill") {
+            if let Some(session_id) = self.active_session_id.clone() {
+                return format!("/kill {session_id}");
+            }
+        }
+        raw.to_string()
+    }
+
+    fn run_harness_prompt(&mut self, harness: &str, prompt: &str) -> Option<store::SessionRecord> {
         self.is_responding = true;
         let result = LaunchRequest::for_current_dir(harness, prompt)
             .and_then(|request| self.client.launch_session(request));
@@ -349,10 +487,14 @@ impl App {
                     session.id, session.harness
                 ));
                 self.poll_session_events();
+                Some(session)
             }
             Err(error) => {
                 self.is_responding = false;
-                self.push_system_message(&format!("Daemon launch failed: {error}"));
+                self.push_system_message(&format!(
+                    "Daemon launch failed: {error}. Start it with `coven daemon start`, then retry."
+                ));
+                None
             }
         }
     }
@@ -395,6 +537,42 @@ impl App {
         }
     }
 
+    fn archive_session(&mut self, session_id: &str) {
+        match self.client.archive_session(session_id) {
+            Ok(()) => self.push_system_message(&format!("Archived session {session_id}.")),
+            Err(error) => self.push_system_message(&format!("Archive failed: {error}")),
+        }
+    }
+
+    fn summon_session(&mut self, session_id: &str) {
+        match self.client.summon_session(session_id) {
+            Ok(session) => {
+                self.push_system_message(&format!("Summoned session {session_id}."));
+                self.active_session_id = Some(session.id.clone());
+                self.last_event_seq = None;
+                self.reset_event_poll_failures();
+                self.push_system_message(&format!(
+                    "Attached to daemon session {} ({}, {})",
+                    session.id, session.harness, session.status
+                ));
+                self.poll_session_events();
+            }
+            Err(error) => self.push_system_message(&format!("Summon failed: {error}")),
+        }
+    }
+
+    fn sacrifice_session(&mut self, session_id: &str) {
+        match self.client.sacrifice_session(session_id) {
+            Ok(()) => {
+                if self.active_session_id.as_deref() == Some(session_id) {
+                    self.active_session_id = None;
+                }
+                self.push_system_message(&format!("Sacrificed session {session_id}."));
+            }
+            Err(error) => self.push_system_message(&format!("Sacrifice failed: {error}")),
+        }
+    }
+
     pub(super) fn refresh_sessions(&mut self) {
         match self.client.list_sessions() {
             Ok(sessions) => self.sessions = sessions,
@@ -411,6 +589,9 @@ impl App {
             .event_poll_backoff_until
             .is_some_and(|until| until > now)
         {
+            return;
+        }
+        if self.event_poll_paused_for_api_mismatch {
             return;
         }
         match self.client.list_events(ChatEventQuery {
@@ -433,17 +614,26 @@ impl App {
         self.event_poll_backoff_until = None;
         self.event_poll_failure_streak = 0;
         self.last_event_poll_error = None;
+        self.event_poll_paused_for_api_mismatch = false;
     }
 
     fn record_event_poll_failure(&mut self, error: anyhow::Error) {
         let message = error.to_string();
+        if is_api_mismatch_error(&message) {
+            self.event_poll_paused_for_api_mismatch = true;
+        }
         let repeated_error = self.last_event_poll_error.as_deref() == Some(message.as_str());
         self.event_poll_failure_streak = self.event_poll_failure_streak.saturating_add(1);
         self.event_poll_backoff_until =
             Some(Instant::now() + event_poll_backoff(self.event_poll_failure_streak));
         self.last_event_poll_error = Some(message.clone());
         if !repeated_error {
-            self.push_system_message(&format!("Event follow failed: {message}"));
+            let message = if self.event_poll_paused_for_api_mismatch {
+                format!("Event follow failed: {message}. polling paused until next input.")
+            } else {
+                format!("Event follow failed: {message}")
+            };
+            self.push_system_message(&message);
         }
     }
 
@@ -699,6 +889,10 @@ fn event_poll_backoff(streak: u32) -> Duration {
     Duration::from_millis(millis)
 }
 
+fn is_api_mismatch_error(message: &str) -> bool {
+    message.contains("Coven daemon API mismatch")
+}
+
 // ── Discover agents from built-in harnesses ────────────────────────────────
 
 pub(super) fn discover_agents() -> Vec<AgentInfo> {
@@ -725,6 +919,82 @@ fn split_first_arg(input: &str) -> Option<(&str, &str)> {
     let first = &trimmed[..split_idx];
     let rest = trimmed[split_idx..].trim();
     (!first.is_empty() && !rest.is_empty()).then_some((first, rest))
+}
+
+fn is_chat_local_slash(input: &str) -> bool {
+    let command = input
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(
+        command.as_str(),
+        "/help"
+            | "/h"
+            | "/commands"
+            | "/palette"
+            | "/clear"
+            | "/cls"
+            | "/agent"
+            | "/a"
+            | "/export"
+            | "/exit"
+            | "/quit"
+            | "/q"
+            | "/delegate"
+            | "/trace"
+            | "/mem"
+            | "/debug"
+    )
+}
+
+fn is_confirmation_response(input: &str) -> bool {
+    matches!(
+        input.trim().to_ascii_lowercase().as_str(),
+        "accept" | "approve" | "yes" | "y" | "reject" | "cancel" | "no" | "n"
+    )
+}
+
+fn format_cast_plan_for_chat(plan: &CastPlan) -> String {
+    let harness = plan
+        .harness
+        .map(|plan_harness| {
+            let source = match plan_harness.source {
+                CastHarnessSource::UserChose => "user-chosen",
+                CastHarnessSource::SafeDefault => "Cast default",
+            };
+            format!("harness {} · {source}", plan_harness.harness.label())
+        })
+        .unwrap_or_else(|| "harness none".to_string());
+    let risk = match plan.risk() {
+        CastRisk::Safe => "[ SAFE ]",
+        CastRisk::Confirm => "[ CONFIRM ]",
+        CastRisk::Reject => "[ REJECT ]",
+    };
+    let steps = if plan
+        .steps
+        .iter()
+        .any(|step| step.kind == crate::tui::cast::plan::CastStepKind::LaunchSession)
+    {
+        "launch project-scoped session".to_string()
+    } else {
+        plan.steps
+            .first()
+            .map(|step| step.note.clone())
+            .unwrap_or_else(|| "no side effects".to_string())
+    };
+
+    let session = plan
+        .session_id
+        .as_deref()
+        .map(|session_id| format!("\n  session  {session_id}"))
+        .unwrap_or_default();
+
+    format!("Cast plan\n  {harness}  risk {risk}{session}\n  steps  {steps}")
+}
+
+fn format_cast_outcome_for_chat(harness_label: &str, session_id: &str) -> String {
+    format!("Cast outcome\n  launched  {harness_label} daemon session\n  session  {session_id}")
 }
 
 fn event_payload_text(event: &store::EventRecord, field: &str) -> Option<String> {
@@ -828,6 +1098,7 @@ mod tests {
         sessions: Rc<RefCell<Vec<SessionRecord>>>,
         events: Rc<RefCell<Vec<EventRecord>>>,
         event_error: Rc<RefCell<Option<String>>>,
+        launch_error: Rc<RefCell<Option<String>>>,
     }
 
     impl RecordingChatClient {
@@ -842,6 +1113,9 @@ mod tests {
         fn launch_session(&mut self, request: LaunchRequest) -> anyhow::Result<SessionRecord> {
             self.calls.borrow_mut().push("launch".to_string());
             self.launched.borrow_mut().push(request.clone());
+            if let Some(error) = self.launch_error.borrow().clone() {
+                return Err(anyhow::anyhow!(error));
+            }
             let session = test_session(&request.id, &request.harness, &request.prompt, "running");
             self.sessions.borrow_mut().push(session.clone());
             Ok(session)
@@ -890,6 +1164,43 @@ mod tests {
 
         fn kill_session(&mut self, session_id: &str) -> anyhow::Result<()> {
             self.calls.borrow_mut().push(format!("kill:{session_id}"));
+            Ok(())
+        }
+
+        fn archive_session(&mut self, session_id: &str) -> anyhow::Result<()> {
+            self.calls
+                .borrow_mut()
+                .push(format!("archive:{session_id}"));
+            let mut sessions = self.sessions.borrow_mut();
+            let session = sessions
+                .iter_mut()
+                .find(|session| session.id == session_id)
+                .ok_or_else(|| anyhow::anyhow!("session not found"))?;
+            session.archived_at = Some("2026-05-19T01:00:00Z".to_string());
+            Ok(())
+        }
+
+        fn summon_session(&mut self, session_id: &str) -> anyhow::Result<SessionRecord> {
+            self.calls.borrow_mut().push(format!("summon:{session_id}"));
+            let mut sessions = self.sessions.borrow_mut();
+            let session = sessions
+                .iter_mut()
+                .find(|session| session.id == session_id)
+                .ok_or_else(|| anyhow::anyhow!("session not found"))?;
+            session.archived_at = None;
+            Ok(session.clone())
+        }
+
+        fn sacrifice_session(&mut self, session_id: &str) -> anyhow::Result<()> {
+            self.calls
+                .borrow_mut()
+                .push(format!("sacrifice:{session_id}"));
+            let mut sessions = self.sessions.borrow_mut();
+            let index = sessions
+                .iter()
+                .position(|session| session.id == session_id)
+                .ok_or_else(|| anyhow::anyhow!("session not found"))?;
+            sessions.remove(index);
             Ok(())
         }
     }
@@ -946,12 +1257,13 @@ mod tests {
 
         let result = app.handle_input();
 
-        match result {
-            Some(SlashCommandResult::Unknown(command)) => assert_eq!(command, "/missing"),
-            other => panic!("expected unknown command result, got {other:?}"),
-        }
+        assert!(matches!(result, Some(SlashCommandResult::Handled)));
         assert!(app.input.is_empty());
         assert_eq!(app.cursor_pos, 0);
+        assert!(app.messages.iter().any(|message| message
+            .content
+            .contains("unknown Cast slash command `/missing`")
+            && message.content.contains("/help")));
     }
 
     #[test]
@@ -1023,7 +1335,7 @@ mod tests {
         app.push_event_message(&EventRecord {
             seq: 1,
             id: "event-1".to_string(),
-            session_id,
+            session_id: session_id.to_string(),
             kind: "exit".to_string(),
             payload_json: serde_json::json!({ "status": "completed" }).to_string(),
             created_at: "2026-05-19T00:00:00Z".to_string(),
@@ -1031,6 +1343,359 @@ mod tests {
 
         assert_eq!(app.active_session_id(), None);
         assert!(!app.is_responding);
+    }
+
+    #[test]
+    fn daemon_launch_failure_surfaces_start_guidance_inline() {
+        let client = RecordingChatClient::default();
+        *client.launch_error.borrow_mut() = Some("connection refused".to_string());
+        let (mut app, _) = app_with_client(client);
+        app.input = "fix the failing tests".to_string();
+        app.cursor_pos = app.input.len();
+
+        app.handle_input();
+
+        assert!(app.messages.iter().any(|message| message
+            .content
+            .contains("Daemon launch failed: connection refused")
+            && message.content.contains("coven daemon start")));
+    }
+
+    #[test]
+    fn plain_chat_input_appends_cast_plan_before_daemon_launch() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.input = "fix the failing tests".to_string();
+        app.cursor_pos = app.input.len();
+
+        app.handle_input();
+
+        let plan_index = app
+            .messages
+            .iter()
+            .position(|message| message.content.contains("Cast plan"))
+            .expect("chat transcript should include Cast plan");
+        let launch_index = app
+            .messages
+            .iter()
+            .position(|message| message.content.contains("Started daemon session"))
+            .expect("safe plan should launch");
+        assert!(plan_index < launch_index);
+        assert!(app.messages[plan_index].content.contains("risk [ SAFE ]"));
+        assert!(app.messages[plan_index]
+            .content
+            .contains("steps  launch project-scoped session"));
+    }
+
+    #[test]
+    fn safe_chat_launch_appends_cast_outcome_after_daemon_launch() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.input = "fix the failing tests".to_string();
+        app.cursor_pos = app.input.len();
+
+        app.handle_input();
+
+        let launch_index = app
+            .messages
+            .iter()
+            .position(|message| message.content.contains("Started daemon session"))
+            .expect("safe plan should launch");
+        let outcome_index = app
+            .messages
+            .iter()
+            .position(|message| message.content.contains("Cast outcome"))
+            .expect("chat transcript should include Cast outcome");
+        assert!(launch_index < outcome_index);
+        assert!(app.messages[outcome_index]
+            .content
+            .contains("launched  Codex daemon session"));
+    }
+
+    #[test]
+    fn slash_run_input_appends_cast_plan_before_daemon_launch() {
+        let client = RecordingChatClient::default();
+        let (mut app, mirror) = app_with_client(client);
+        app.input = "/run claude review the diff".to_string();
+        app.cursor_pos = app.input.len();
+
+        let result = app.handle_input();
+
+        assert!(matches!(result, Some(SlashCommandResult::Handled)));
+        let launched = mirror.launched.borrow();
+        assert_eq!(launched.len(), 1);
+        assert_eq!(launched[0].harness, "claude");
+        assert_eq!(launched[0].prompt, "review the diff");
+        let plan_index = app
+            .messages
+            .iter()
+            .position(|message| message.content.contains("Cast plan"))
+            .expect("chat transcript should include Cast plan");
+        let launch_index = app
+            .messages
+            .iter()
+            .position(|message| message.content.contains("Started daemon session"))
+            .expect("safe slash plan should launch");
+        assert!(plan_index < launch_index);
+        assert!(app.messages[plan_index]
+            .content
+            .contains("harness Claude Code · user-chosen"));
+    }
+
+    #[test]
+    fn slash_attach_input_appends_cast_plan_before_attaching() {
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "codex",
+            "Existing",
+            "running",
+        ));
+        let (mut app, mirror) = app_with_client(client);
+        app.input = "/attach session-1".to_string();
+        app.cursor_pos = app.input.len();
+
+        let result = app.handle_input();
+
+        assert!(matches!(result, Some(SlashCommandResult::Handled)));
+        assert_eq!(app.active_session_id(), Some("session-1"));
+        assert!(mirror.calls.borrow().contains(&"get:session-1".to_string()));
+        let plan_index = app
+            .messages
+            .iter()
+            .position(|message| message.content.contains("Cast plan"))
+            .expect("chat transcript should include Cast plan");
+        let attach_index = app
+            .messages
+            .iter()
+            .position(|message| message.content.contains("Attached to daemon session"))
+            .expect("attach should still work");
+        assert!(plan_index < attach_index);
+    }
+
+    #[test]
+    fn slash_kill_input_appends_cast_plan_before_killing_session() {
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "codex",
+            "Existing",
+            "running",
+        ));
+        let (mut app, mirror) = app_with_client(client);
+        app.input = "/kill session-1".to_string();
+        app.cursor_pos = app.input.len();
+
+        let result = app.handle_input();
+
+        assert!(matches!(result, Some(SlashCommandResult::Handled)));
+        assert!(mirror
+            .calls
+            .borrow()
+            .contains(&"kill:session-1".to_string()));
+        let plan_index = app
+            .messages
+            .iter()
+            .position(|message| message.content.contains("Cast plan"))
+            .expect("chat transcript should include Cast plan");
+        let kill_index = app
+            .messages
+            .iter()
+            .position(|message| {
+                message
+                    .content
+                    .contains("Kill accepted for session session-1")
+            })
+            .expect("kill should still work");
+        assert!(plan_index < kill_index);
+    }
+
+    #[test]
+    fn slash_kill_without_id_uses_active_session_through_cast_plan() {
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "codex",
+            "Existing",
+            "running",
+        ));
+        let (mut app, mirror) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.input = "/kill".to_string();
+        app.cursor_pos = app.input.len();
+
+        let result = app.handle_input();
+
+        assert!(matches!(result, Some(SlashCommandResult::Handled)));
+        assert!(mirror
+            .calls
+            .borrow()
+            .contains(&"kill:session-1".to_string()));
+        assert!(app
+            .messages
+            .iter()
+            .any(|message| message.content.contains("Cast plan")
+                && message.content.contains("session-1")));
+    }
+
+    #[test]
+    fn slash_archive_input_appends_cast_plan_before_archiving_session() {
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "codex",
+            "Existing",
+            "completed",
+        ));
+        let (mut app, mirror) = app_with_client(client);
+        app.input = "/archive session-1".to_string();
+        app.cursor_pos = app.input.len();
+
+        let result = app.handle_input();
+
+        assert!(matches!(result, Some(SlashCommandResult::Handled)));
+        assert!(mirror
+            .calls
+            .borrow()
+            .contains(&"archive:session-1".to_string()));
+        assert!(app
+            .messages
+            .iter()
+            .any(|message| message.content.contains("Cast plan")
+                && message.content.contains("session-1")));
+        assert!(app
+            .messages
+            .iter()
+            .any(|message| message.content.contains("Archived session session-1")));
+    }
+
+    #[test]
+    fn slash_summon_input_appends_cast_plan_before_summoning_and_attaching() {
+        let mut session = test_session("session-1", "codex", "Existing", "completed");
+        session.archived_at = Some("2026-05-18T00:00:00Z".to_string());
+        let client = RecordingChatClient::with_session(session);
+        let (mut app, mirror) = app_with_client(client);
+        app.input = "/summon session-1".to_string();
+        app.cursor_pos = app.input.len();
+
+        let result = app.handle_input();
+
+        assert!(matches!(result, Some(SlashCommandResult::Handled)));
+        assert!(mirror
+            .calls
+            .borrow()
+            .contains(&"summon:session-1".to_string()));
+        assert_eq!(app.active_session_id(), Some("session-1"));
+        assert!(app
+            .messages
+            .iter()
+            .any(|message| message.content.contains("Cast plan")
+                && message.content.contains("session-1")));
+    }
+
+    #[test]
+    fn slash_sacrifice_waits_for_confirmation_then_deletes_session() {
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "codex",
+            "Existing",
+            "completed",
+        ));
+        let (mut app, mirror) = app_with_client(client);
+        app.input = "/sacrifice session-1".to_string();
+        app.cursor_pos = app.input.len();
+
+        app.handle_input();
+
+        assert!(app.pending_cast_confirmation.is_some());
+        assert!(!mirror
+            .calls
+            .borrow()
+            .contains(&"sacrifice:session-1".to_string()));
+
+        app.input = "accept".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+
+        assert!(app.pending_cast_confirmation.is_none());
+        assert!(mirror
+            .calls
+            .borrow()
+            .contains(&"sacrifice:session-1".to_string()));
+        assert!(app
+            .messages
+            .iter()
+            .any(|message| message.content.contains("Sacrificed session session-1")));
+    }
+
+    #[test]
+    fn informational_cast_slashes_do_not_fall_through_to_unwired_message() {
+        for input in ["/start", "/tui", "/patch", "/quest ship chat mode"] {
+            let client = RecordingChatClient::default();
+            let (mut app, _) = app_with_client(client);
+            app.input = input.to_string();
+            app.cursor_pos = app.input.len();
+
+            let result = app.handle_input();
+
+            assert!(matches!(result, Some(SlashCommandResult::Handled)));
+            assert!(app
+                .messages
+                .iter()
+                .any(|message| message.content.contains("Cast plan")));
+            assert!(!app
+                .messages
+                .iter()
+                .any(|message| message.content.contains("not wired yet")));
+        }
+    }
+
+    #[test]
+    fn risky_chat_input_waits_for_confirmation_and_accept_launches_without_duplicate_plan() {
+        let client = RecordingChatClient::default();
+        let (mut app, mirror) = app_with_client(client);
+        app.input = "publish the package".to_string();
+        app.cursor_pos = app.input.len();
+
+        app.handle_input();
+
+        assert!(app.pending_cast_confirmation.is_some());
+        assert!(mirror.launched.borrow().is_empty());
+        assert!(app
+            .messages
+            .iter()
+            .any(|message| message.content.contains("Confirmation required")));
+
+        app.input = "accept".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+
+        assert!(app.pending_cast_confirmation.is_none());
+        assert_eq!(mirror.launched.borrow().len(), 1);
+        assert_eq!(
+            app.messages
+                .iter()
+                .filter(|message| message.content.contains("Cast plan"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn escape_cancels_pending_confirmation_before_accept_can_launch() {
+        let client = RecordingChatClient::default();
+        let (mut app, mirror) = app_with_client(client);
+        app.input = "publish the package".to_string();
+        app.cursor_pos = app.input.len();
+
+        app.handle_input();
+        app.cancel_pending_cast_confirmation();
+        app.input = "accept".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+
+        assert!(app.pending_cast_confirmation.is_none());
+        assert!(mirror.launched.borrow().is_empty());
+        assert!(app
+            .messages
+            .iter()
+            .any(|message| message.content.contains("Cancelled Cast confirmation")));
     }
 
     #[test]
@@ -1228,6 +1893,48 @@ mod tests {
                 .filter(|message| message.content == "Event follow failed: daemon unavailable")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn api_mismatch_stops_event_polling_until_next_user_input() {
+        let client = RecordingChatClient::default();
+        *client.event_error.borrow_mut() = Some(
+            "Coven daemon API mismatch: expected coven.daemon.v1, got coven.daemon.v0".to_string(),
+        );
+        let (mut app, mirror) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+
+        app.poll_session_events();
+        app.event_poll_backoff_until = Some(Instant::now() - Duration::from_millis(1));
+        app.poll_session_events();
+
+        assert_eq!(
+            mirror
+                .calls
+                .borrow()
+                .iter()
+                .filter(|call| *call == "events:session-1:0")
+                .count(),
+            1
+        );
+        assert!(app.messages.iter().any(|message| {
+            message.content.contains("Coven daemon API mismatch")
+                && message.content.contains("polling paused")
+        }));
+
+        app.input = "continue".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+
+        assert_eq!(
+            mirror
+                .calls
+                .borrow()
+                .iter()
+                .filter(|call| *call == "events:session-1:0")
+                .count(),
+            2
         );
     }
 }

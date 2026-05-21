@@ -65,24 +65,32 @@ pub(super) fn render_ui(f: &mut Frame, app: &mut App) {
 }
 
 fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
-    let agent_name = app.active_agent_label();
     let harness = app.active_agent_harness();
-    let session = app.active_session_id().unwrap_or("no-session");
+    let project = std::env::current_dir()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "unknown project".to_string());
+    let daemon_status = if app.active_session_id().is_some() {
+        "running"
+    } else {
+        "ready"
+    };
 
     let status_spans = vec![
         Span::styled(
-            " \u{2666} coven chat ",
+            format!(" coven {harness} "),
             theme::ratatui_style(PRIMARY).bold(),
         ),
-        Span::styled(" \u{2502} ", theme::ratatui_style(DIM)),
+        Span::styled("\u{00b7} ", theme::ratatui_style(DIM)),
         Span::styled(
-            format!("\u{25C9} {agent_name}"),
-            theme::ratatui_style(AGENT_LABEL).bold(),
+            truncate_for_width(&project, area.width.saturating_sub(28) as usize),
+            theme::ratatui_style(DIM),
         ),
-        Span::styled(format!(" ({harness})"), theme::ratatui_style(DIM)),
-        Span::styled(" \u{2502} ", theme::ratatui_style(DIM)),
-        Span::styled(session.to_string(), theme::ratatui_style(DIM)),
-        Span::styled(" \u{2502} ", theme::ratatui_style(DIM)),
+        Span::styled(" \u{00b7} ", theme::ratatui_style(DIM)),
+        Span::styled(
+            format!("daemon: {daemon_status}"),
+            theme::ratatui_style(DIM),
+        ),
+        Span::styled(" \u{00b7} ", theme::ratatui_style(DIM)),
         if app.is_responding {
             Span::styled(
                 format!("{} responding...", SPINNER_FRAMES[app.spinner_frame]),
@@ -129,8 +137,13 @@ fn render_messages(f: &mut Frame, app: &mut App, area: Rect) {
         };
 
         if matches!(msg.role, MessageRole::System) {
-            // System messages are single-line
-            lines.push(Line::from(Span::styled(sender_text, sender_style)));
+            for (idx, content_line) in msg.content.lines().enumerate() {
+                let prefix = if idx == 0 { "\u{2731} " } else { "  " };
+                lines.push(Line::from(Span::styled(
+                    format!("{prefix}{content_line}"),
+                    sender_style,
+                )));
+            }
             continue;
         }
 
@@ -249,18 +262,11 @@ fn render_hint_bar(f: &mut Frame, app: &App, area: Rect) {
         ]
     } else {
         vec![
-            Span::styled(" /help", theme::ratatui_style(HINT_KEY).bold()),
-            Span::styled(" commands  ", theme::ratatui_style(HINT_LABEL)),
-            Span::styled("/agent", theme::ratatui_style(HINT_KEY).bold()),
-            Span::styled(" switch  ", theme::ratatui_style(HINT_LABEL)),
-            Span::styled("PgUp/PgDn", theme::ratatui_style(HINT_KEY).bold()),
-            Span::styled(" scroll  ", theme::ratatui_style(HINT_LABEL)),
-            Span::styled("Shift+Enter", theme::ratatui_style(HINT_KEY).bold()),
-            Span::styled(" newline  ", theme::ratatui_style(HINT_LABEL)),
-            Span::styled("Ctrl+K", theme::ratatui_style(HINT_KEY).bold()),
-            Span::styled(" palette  ", theme::ratatui_style(HINT_LABEL)),
-            Span::styled("Ctrl+C", theme::ratatui_style(HINT_KEY).bold()),
-            Span::styled(" quit  ", theme::ratatui_style(HINT_LABEL)),
+            Span::styled(" > ", theme::ratatui_style(HINT_KEY).bold()),
+            Span::styled(
+                "Try \"review this branch\" or /help",
+                theme::ratatui_style(HINT_LABEL),
+            ),
         ]
     };
 
@@ -525,8 +531,59 @@ fn truncate_for_width(value: &str, max_width: usize) -> String {
 }
 
 #[cfg(test)]
+pub(crate) fn render_chat_frame_plain_for_test(width: u16, height: u16) -> String {
+    use ratatui::{backend::TestBackend, Terminal};
+
+    use super::{app::AgentInfo, client::DaemonChatClient};
+
+    let agents = vec![AgentInfo {
+        id: "codex".to_string(),
+        label: "codex".to_string(),
+        harness: "codex".to_string(),
+        available: true,
+    }];
+    let mut app = App::new_with_state(agents, Some(0), Box::<DaemonChatClient>::default());
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| render_ui(frame, &mut app))
+        .expect("render chat frame");
+
+    buffer_to_plain_text(terminal.backend().buffer())
+}
+
+#[cfg(test)]
+fn buffer_to_plain_text(buffer: &ratatui::buffer::Buffer) -> String {
+    let width = buffer.area.width as usize;
+    buffer
+        .content()
+        .chunks(width)
+        .map(|row| {
+            row.iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_first_frame_opens_on_transcript_composer_and_status() {
+        let frame = render_chat_frame_plain_for_test(80, 20);
+
+        assert!(frame.contains("coven codex"));
+        assert!(frame.contains("Ready. Type a task or /help."));
+        assert!(frame.contains("> Try \"review this branch\" or /help"));
+        assert!(!frame.contains("Commands"));
+        assert!(!frame.contains("/start"));
+        assert!(!frame.contains("Session browser"));
+    }
 
     #[test]
     fn cursor_position_counts_trailing_newline_as_next_line() {

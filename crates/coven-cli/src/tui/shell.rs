@@ -306,7 +306,7 @@ enum LauncherChoice {
 /// `CastIntent`, builds a plan, renders the intro card the user sees before
 /// any side effect, runs the safety gate, dispatches the matching handler,
 /// then renders the outcome card.
-fn run_cast_spell(raw: &str) -> Result<()> {
+pub(crate) fn run_cast_spell(raw: &str) -> Result<()> {
     let plan = cast::plan_spell(raw)?;
     print_plan_intro(&plan);
     dispatch_cast_plan(plan)
@@ -377,6 +377,17 @@ fn dispatch_cast_plan(plan: CastPlan) -> Result<()> {
                 next_step: Some(
                     "Use `/summon <id>` later to restore it; events are preserved.".to_string(),
                 ),
+                notes: vec![],
+            }
+        }
+        CastIntent::KillSession { session_id } => {
+            let mut client = DaemonChatClient::default();
+            client.kill_session(&session_id)?;
+            CastOutcome {
+                request: request_text,
+                launched: Some(format!("Kill accepted for session {session_id}")),
+                session_id: Some(session_id),
+                next_step: Some("Use `/attach <id>` to inspect the final transcript.".to_string()),
                 notes: vec![],
             }
         }
@@ -2153,6 +2164,18 @@ mod attach_tests {
         }
 
         fn kill_session(&mut self, _session_id: &str) -> Result<()> {
+            unimplemented!("not exercised by replay tests")
+        }
+
+        fn archive_session(&mut self, _session_id: &str) -> Result<()> {
+            unimplemented!("not exercised by replay tests")
+        }
+
+        fn summon_session(&mut self, _session_id: &str) -> Result<store::SessionRecord> {
+            unimplemented!("not exercised by replay tests")
+        }
+
+        fn sacrifice_session(&mut self, _session_id: &str) -> Result<()> {
             unimplemented!("not exercised by replay tests")
         }
     }

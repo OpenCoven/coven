@@ -64,6 +64,7 @@ pub(crate) enum CastStepKind {
     Attach,
     Summon,
     Archive,
+    Kill,
     Sacrifice,
     Diagnose,
     Inform,
@@ -126,6 +127,14 @@ where
             CastStep::new(
                 CastStepKind::Archive,
                 "Hide the session from the active list; keep events",
+            ),
+        ),
+        CastIntent::KillSession { ref session_id } => simple_plan(
+            intent.clone(),
+            &format!("Kill live session {}", short_id(session_id)),
+            CastStep::new(
+                CastStepKind::Kill,
+                "Ask the daemon to stop the live session",
             ),
         ),
         CastIntent::SacrificeSession { ref session_id } => {
@@ -357,7 +366,8 @@ fn simple_plan(intent: CastIntent, headline: &str, step: CastStep) -> CastPlan {
     let session_id = match &intent {
         CastIntent::AttachSession { session_id }
         | CastIntent::SummonSession { session_id }
-        | CastIntent::ArchiveSession { session_id } => Some(session_id.clone()),
+        | CastIntent::ArchiveSession { session_id }
+        | CastIntent::KillSession { session_id } => Some(session_id.clone()),
         _ => None,
     };
     CastPlan {
@@ -556,6 +566,24 @@ mod tests {
             .iter()
             .any(|step| step.kind == CastStepKind::Attach));
         assert!(plan.headline.contains("abcdef123456"));
+    }
+
+    #[test]
+    fn kill_intent_records_session_id_in_plan() {
+        let plan = build_plan(
+            CastIntent::KillSession {
+                session_id: "abcdef123456".to_string(),
+            },
+            codex,
+        )
+        .unwrap();
+
+        assert_eq!(plan.session_id.as_deref(), Some("abcdef123456"));
+        assert!(plan
+            .steps
+            .iter()
+            .any(|step| step.kind == CastStepKind::Kill));
+        assert_eq!(plan.risk(), CastRisk::Safe);
     }
 
     #[test]

@@ -275,6 +275,18 @@ mod tests {
         fn kill_session(&mut self, _session_id: &str) -> Result<()> {
             unimplemented!("not exercised in follower tests")
         }
+
+        fn archive_session(&mut self, _session_id: &str) -> Result<()> {
+            unimplemented!("not exercised in follower tests")
+        }
+
+        fn summon_session(&mut self, _session_id: &str) -> Result<store::SessionRecord> {
+            unimplemented!("not exercised in follower tests")
+        }
+
+        fn sacrifice_session(&mut self, _session_id: &str) -> Result<()> {
+            unimplemented!("not exercised in follower tests")
+        }
     }
 
     fn output_event(seq: i64, data: &str) -> store::EventRecord {

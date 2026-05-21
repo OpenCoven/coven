@@ -461,6 +461,7 @@ fn step_kind_label(kind: CastStepKind) -> &'static str {
         CastStepKind::Attach => "attach",
         CastStepKind::Summon => "summon",
         CastStepKind::Archive => "archive",
+        CastStepKind::Kill => "kill",
         CastStepKind::Sacrifice => "sacrifice",
         CastStepKind::Diagnose => "diagnose",
         CastStepKind::Inform => "inform",

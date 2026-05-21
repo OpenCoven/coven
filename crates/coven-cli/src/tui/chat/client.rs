@@ -57,6 +57,9 @@ pub(crate) trait ChatClient {
     fn list_events(&mut self, query: ChatEventQuery<'_>) -> Result<Vec<store::EventRecord>>;
     fn send_input(&mut self, session_id: &str, data: &str) -> Result<()>;
     fn kill_session(&mut self, session_id: &str) -> Result<()>;
+    fn archive_session(&mut self, session_id: &str) -> Result<()>;
+    fn summon_session(&mut self, session_id: &str) -> Result<store::SessionRecord>;
+    fn sacrifice_session(&mut self, session_id: &str) -> Result<()>;
 }
 
 pub(crate) struct DaemonChatClient {
@@ -86,6 +89,14 @@ impl DaemonChatClient {
 }
 
 impl DaemonChatClient {
+    fn store_path(&self) -> PathBuf {
+        self.coven_home.join("coven.sqlite3")
+    }
+
+    fn open_store(&self) -> Result<rusqlite::Connection> {
+        store::open_store(&self.store_path())
+    }
+
     fn request_json<T: for<'de> Deserialize<'de>>(
         &mut self,
         method: &str,
@@ -193,6 +204,43 @@ impl ChatClient for DaemonChatClient {
             Some(json!({})),
         )
     }
+
+    fn archive_session(&mut self, session_id: &str) -> Result<()> {
+        let conn = self.open_store()?;
+        let Some(session) = store::get_session(&conn, session_id)? else {
+            anyhow::bail!("session `{session_id}` not found");
+        };
+        if session.status == "running" {
+            anyhow::bail!("session `{session_id}` is still running; stop it before archiving");
+        }
+        store::archive_session(&conn, session_id, &timestamp_now())
+    }
+
+    fn summon_session(&mut self, session_id: &str) -> Result<store::SessionRecord> {
+        let conn = self.open_store()?;
+        let Some(session) = store::get_session(&conn, session_id)? else {
+            anyhow::bail!("session `{session_id}` not found");
+        };
+        if session.archived_at.is_some() {
+            store::summon_session(&conn, session_id, &timestamp_now())?;
+            let Some(session) = store::get_session(&conn, session_id)? else {
+                anyhow::bail!("session `{session_id}` not found");
+            };
+            return Ok(session);
+        }
+        Ok(session)
+    }
+
+    fn sacrifice_session(&mut self, session_id: &str) -> Result<()> {
+        let conn = self.open_store()?;
+        let Some(session) = store::get_session(&conn, session_id)? else {
+            anyhow::bail!("session `{session_id}` not found");
+        };
+        if session.status == "running" {
+            anyhow::bail!("session `{session_id}` is still running; do not sacrifice live work");
+        }
+        store::sacrifice_session(&conn, session_id)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -277,6 +325,10 @@ fn daemon_error(status: u16, body: &str) -> anyhow::Error {
         }
     }
     anyhow!("Coven daemon rejected request with HTTP {status}")
+}
+
+fn timestamp_now() -> String {
+    chrono::Utc::now().to_rfc3339()
 }
 
 fn coven_home_dir() -> PathBuf {

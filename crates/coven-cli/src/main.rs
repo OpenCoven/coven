@@ -41,6 +41,14 @@ const DEFAULT_TITLE_CHARS: usize = 48;
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+    #[arg(
+        value_name = "PROMPT",
+        num_args = 0..,
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        help = "Task to run through Cast when no subcommand is provided"
+    )]
+    prompt: Vec<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -135,12 +143,24 @@ enum DaemonCommand {
     Serve,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractiveShellRoute {
+    Chat,
+    PlainCast,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    run_cli(cli)
+}
+
+fn run_cli(cli: Cli) -> Result<()> {
+    if cli.command.is_none() && !cli.prompt.is_empty() {
+        return run_bare_prompt(&cli.prompt);
+    }
+
     match cli.command {
-        None => tui::shell::run(),
-        Some(Command::Chat) => tui::chat::run_chat(),
-        Some(Command::Tui) => tui::shell::run(),
+        None | Some(Command::Chat) | Some(Command::Tui) => run_shared_interactive_shell(),
         Some(Command::Doctor) => run_doctor(),
         Some(Command::Daemon { command }) => run_daemon_command(command),
         Some(Command::Run {
@@ -162,6 +182,30 @@ fn main() -> Result<()> {
         Some(Command::Sacrifice { session_id, yes }) => sacrifice_session_command(&session_id, yes),
         Some(Command::Patch { command }) => run_patch_command(command),
         Some(Command::Pc { command }) => pc::run_pc_command(command),
+    }
+}
+
+fn run_bare_prompt(prompt: &[String]) -> Result<()> {
+    let prompt = joined_prompt(prompt)?;
+    tui::shell::run_cast_spell(&prompt)
+}
+
+fn run_shared_interactive_shell() -> Result<()> {
+    match interactive_shell_route(None, io::stdin().is_terminal(), io::stdout().is_terminal()) {
+        InteractiveShellRoute::Chat => tui::chat::run_chat(),
+        InteractiveShellRoute::PlainCast => tui::shell::run(),
+    }
+}
+
+fn interactive_shell_route(
+    _command: Option<&Command>,
+    stdin_is_terminal: bool,
+    stdout_is_terminal: bool,
+) -> InteractiveShellRoute {
+    if stdin_is_terminal && stdout_is_terminal {
+        InteractiveShellRoute::Chat
+    } else {
+        InteractiveShellRoute::PlainCast
     }
 }
 
@@ -971,6 +1015,15 @@ mod tests {
     }
 
     #[test]
+    fn cli_accepts_bare_prompt_as_cast_spell() {
+        let parsed = Cli::try_parse_from(["coven", "fix tests"])
+            .expect("bare prompt should be accepted for script-friendly Cast input");
+
+        assert!(parsed.command.is_none());
+        assert_eq!(parsed.prompt, vec!["fix tests"]);
+    }
+
+    #[test]
     fn cli_accepts_explicit_tui_command() {
         let cli = Cli::parse_from(["coven", "tui"]);
 
@@ -988,6 +1041,38 @@ mod tests {
             Some(Command::Chat) => {}
             other => panic!("expected chat command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn default_tui_and_chat_use_shared_chat_shell_for_interactive_terminals() {
+        assert_eq!(
+            interactive_shell_route(None, true, true),
+            InteractiveShellRoute::Chat
+        );
+        assert_eq!(
+            interactive_shell_route(Some(&Command::Tui), true, true),
+            InteractiveShellRoute::Chat
+        );
+        assert_eq!(
+            interactive_shell_route(Some(&Command::Chat), true, true),
+            InteractiveShellRoute::Chat
+        );
+    }
+
+    #[test]
+    fn default_tui_and_chat_keep_plain_cast_output_for_pipes() {
+        assert_eq!(
+            interactive_shell_route(None, true, false),
+            InteractiveShellRoute::PlainCast
+        );
+        assert_eq!(
+            interactive_shell_route(Some(&Command::Tui), false, true),
+            InteractiveShellRoute::PlainCast
+        );
+        assert_eq!(
+            interactive_shell_route(Some(&Command::Chat), false, false),
+            InteractiveShellRoute::PlainCast
+        );
     }
 
     #[test]
