@@ -74,40 +74,53 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let stream_label = app.streaming_mode().status_label();
-    let status_spans = vec![
-        Span::styled(
-            format!(" coven {harness} "),
-            theme::ratatui_style(PRIMARY).bold(),
-        ),
-        Span::styled("\u{00b7} ", theme::ratatui_style(DIM)),
-        Span::styled(
-            truncate_for_width(project, area.width.saturating_sub(60) as usize),
-            theme::ratatui_style(DIM),
-        ),
-        Span::styled(" \u{00b7} ", theme::ratatui_style(DIM)),
-        Span::styled(
-            format!("daemon: {daemon_status}"),
-            theme::ratatui_style(DIM),
-        ),
-        Span::styled(" \u{00b7} ", theme::ratatui_style(DIM)),
-        Span::styled(format!("stream: {stream_label}"), theme::ratatui_style(DIM)),
-        Span::styled(" \u{00b7} ", theme::ratatui_style(DIM)),
-        if app.is_responding {
-            let composing = if app.has_pending_batched_output() {
-                " (composing)"
-            } else {
-                ""
-            };
-            Span::styled(
-                format!(
-                    "{} responding...{composing}",
-                    SPINNER_FRAMES[app.spinner_frame]
-                ),
-                theme::ratatui_style(DIM),
-            )
+    let head_text = format!(" coven {harness} ");
+    let separator = "\u{00b7} ";
+    let separator_padded = " \u{00b7} ";
+    let daemon_text = format!("daemon: {daemon_status}");
+    let stream_text = format!("stream: {stream_label}");
+    let state_text = if app.is_responding {
+        let composing = if app.has_pending_batched_output() {
+            " (composing)"
         } else {
-            Span::styled("\u{2713} ready", theme::status_style(Status::Ready))
-        },
+            ""
+        };
+        format!(
+            "{} responding...{composing}",
+            SPINNER_FRAMES[app.spinner_frame]
+        )
+    } else {
+        "\u{2713} ready".to_string()
+    };
+
+    // Compute the project-label budget from what the rest of the row actually
+    // needs, so the rightmost segment never clips when daemon: running and the
+    // batched "(composing)" suffix push the tail wider than usual.
+    let fixed_width = UnicodeWidthStr::width(head_text.as_str())
+        + UnicodeWidthStr::width(separator)
+        + UnicodeWidthStr::width(separator_padded) * 3
+        + UnicodeWidthStr::width(daemon_text.as_str())
+        + UnicodeWidthStr::width(stream_text.as_str())
+        + UnicodeWidthStr::width(state_text.as_str());
+    let project_budget = (area.width as usize).saturating_sub(fixed_width);
+    let project_text = truncate_for_width(project, project_budget);
+
+    let state_style = if app.is_responding {
+        theme::ratatui_style(DIM)
+    } else {
+        theme::status_style(Status::Ready)
+    };
+
+    let status_spans = vec![
+        Span::styled(head_text, theme::ratatui_style(PRIMARY).bold()),
+        Span::styled(separator, theme::ratatui_style(DIM)),
+        Span::styled(project_text, theme::ratatui_style(DIM)),
+        Span::styled(separator_padded, theme::ratatui_style(DIM)),
+        Span::styled(daemon_text, theme::ratatui_style(DIM)),
+        Span::styled(separator_padded, theme::ratatui_style(DIM)),
+        Span::styled(stream_text, theme::ratatui_style(DIM)),
+        Span::styled(separator_padded, theme::ratatui_style(DIM)),
+        Span::styled(state_text, state_style),
     ];
 
     let status_line = Line::from(status_spans);
@@ -686,7 +699,7 @@ pub(crate) fn render_chat_frame_plain_for_test(width: u16, height: u16) -> Strin
 }
 
 #[cfg(test)]
-fn buffer_to_plain_text(buffer: &ratatui::buffer::Buffer) -> String {
+pub(super) fn buffer_to_plain_text(buffer: &ratatui::buffer::Buffer) -> String {
     let width = buffer.area.width as usize;
     buffer
         .content()

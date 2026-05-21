@@ -2106,6 +2106,38 @@ mod tests {
     }
 
     #[test]
+    fn status_bar_keeps_composing_indicator_at_eighty_columns() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.handle_slash_command("/stream off");
+        // A realistic long cwd previously pushed the rightmost segment off the
+        // status bar; the project label must yield first so the spinner +
+        // (composing) tail always survives.
+        app.project_label = "/Users/buns/Documents/GitHub/OpenCoven/coven".to_string();
+        app.active_session_id = Some("demo-session".to_string());
+        app.is_responding = true;
+        app.push_event_message(&output_event(1, "demo-session", "partial reply"));
+        assert!(app.has_pending_batched_output());
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
+        terminal
+            .draw(|frame| crate::tui::chat::render::render_ui(frame, &mut app))
+            .unwrap();
+        let frame = crate::tui::chat::render::buffer_to_plain_text(terminal.backend().buffer());
+
+        assert!(
+            frame.contains("stream: off"),
+            "stream chip missing at 80 cols:\n{frame}"
+        );
+        assert!(
+            frame.contains("(composing)"),
+            "composing suffix clipped at 80 cols:\n{frame}"
+        );
+    }
+
+    #[test]
     fn batched_streaming_holds_output_until_session_exits() {
         let client = RecordingChatClient::default();
         let (mut app, _) = app_with_client(client);
