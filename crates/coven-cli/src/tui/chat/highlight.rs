@@ -1,10 +1,11 @@
 //! Per-language code-block tokenizers. Each `tokenize_*` walks one line of
 //! source and emits typed tokens; `highlight_line` then maps token roles to
 //! brand-tinted styles via `theme::SYNTAX_*`. Block comments (`/* … */`)
-//! are tracked across lines via `TokenizerState`, which the caller threads
-//! through every line of a fenced block. Other multi-line constructs —
-//! Rust raw strings spanning lines, JS template literals with embedded
-//! newlines — aren't tracked: unterminated strings color to EOL and resume
+//! and Python triple-strings (`""" … """`, `''' … '''`) are tracked across
+//! lines via `TokenizerState`, which the caller threads through every line
+//! of a fenced block. Other multi-line constructs — Rust raw strings
+//! spanning lines, JS template literals with embedded newlines, bash
+//! heredocs — aren't tracked: unterminated strings color to EOL and resume
 //! fresh on the next line. Good enough for chat output, with no external
 //! deps.
 
@@ -25,6 +26,8 @@ use crate::theme::{
 pub(super) enum Lang {
     Rust,
     Js,
+    Python,
+    Bash,
 }
 
 /// Semantic role of a token. Drives both the production `Span` styling and
@@ -49,6 +52,23 @@ pub(super) struct Token {
     pub role: Role,
 }
 
+/// Triple-quote flavor for Python multi-line strings — `'''…'''` vs
+/// `"""…"""`. Tracked so the closing delimiter has to match the opener.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum TripleKind {
+    Single,
+    Double,
+}
+
+impl TripleKind {
+    fn marker(self) -> &'static str {
+        match self {
+            TripleKind::Single => "'''",
+            TripleKind::Double => "\"\"\"",
+        }
+    }
+}
+
 /// Cross-line state carried by the caller between successive `tokenize` /
 /// `highlight_line` calls on the lines of one fenced code block. Reset
 /// to `default()` at every opening fence so two adjacent blocks never
@@ -59,6 +79,10 @@ pub(super) struct TokenizerState {
     /// block comment, so the next line should color from byte 0 up
     /// through the closing `*/` (or to EOL again if still unclosed).
     pub in_block_comment: bool,
+    /// Some(kind) when the prior line ended inside an unterminated Python
+    /// triple-quoted string. The next line colors from byte 0 up through
+    /// the matching `'''`/`"""` (or stays in string-mode to EOL).
+    pub in_python_triple: Option<TripleKind>,
 }
 
 /// Map a fence language tag (everything after ```` ``` ```` up to the first
@@ -68,6 +92,8 @@ pub(super) fn tokenizer_for(tag: &str) -> Option<Lang> {
     match tag.trim().to_ascii_lowercase().as_str() {
         "rust" | "rs" => Some(Lang::Rust),
         "javascript" | "js" | "jsx" | "typescript" | "ts" | "tsx" => Some(Lang::Js),
+        "python" | "py" => Some(Lang::Python),
+        "bash" | "sh" | "shell" | "zsh" => Some(Lang::Bash),
         _ => None,
     }
 }
@@ -80,6 +106,8 @@ pub(super) fn tokenize(line: &str, lang: Lang, state: &mut TokenizerState) -> Ve
     match lang {
         Lang::Rust => tokenize_rust(line, state),
         Lang::Js => tokenize_js(line, state),
+        Lang::Python => tokenize_python(line, state),
+        Lang::Bash => tokenize_bash(line, state),
     }
 }
 
@@ -321,6 +349,293 @@ fn tokenize_js(line: &str, state: &mut TokenizerState) -> Vec<Token> {
     }
     flush_buf(&mut buf, &mut out);
     out
+}
+
+// ── Python ─────────────────────────────────────────────────────────────────
+
+const PYTHON_KEYWORDS: &[&str] = &[
+    "False", "None", "True", "and", "as", "assert", "async", "await", "break", "case", "class",
+    "continue", "def", "del", "elif", "else", "except", "finally", "for", "from", "global", "if",
+    "import", "in", "is", "lambda", "match", "nonlocal", "not", "or", "pass", "raise", "return",
+    "try", "while", "with", "yield",
+];
+
+fn tokenize_python(line: &str, state: &mut TokenizerState) -> Vec<Token> {
+    let bytes = line.as_bytes();
+    let mut out: Vec<Token> = Vec::new();
+    let mut buf = String::new();
+    let mut i = resume_triple_string(line, state, &mut out);
+
+    while i < bytes.len() {
+        // `#` line comment — Python has no block comment.
+        if bytes[i] == b'#' {
+            flush_buf(&mut buf, &mut out);
+            out.push(tok(&line[i..], Role::Comment));
+            return out;
+        }
+        // String literal — possibly with a single-char prefix (r/R/b/B/f/F/u/U)
+        // or two-char combo (rb, Rb, fr, …). Always cap the prefix at two
+        // ASCII letters so we don't mis-eat identifiers.
+        if let Some(quote_offset) = python_string_prefix_len(bytes, i) {
+            let quote_at = i + quote_offset;
+            if quote_at < bytes.len()
+                && (bytes[quote_at] == b'"' || bytes[quote_at] == b'\'')
+            {
+                flush_buf(&mut buf, &mut out);
+                let qb = bytes[quote_at];
+                let (kind, is_triple) = if line[quote_at..].starts_with("\"\"\"") {
+                    (Some(TripleKind::Double), true)
+                } else if line[quote_at..].starts_with("'''") {
+                    (Some(TripleKind::Single), true)
+                } else {
+                    (None, false)
+                };
+                if is_triple {
+                    let kind = kind.unwrap();
+                    let after_open = quote_at + 3;
+                    // Look for matching closing triple on this same line.
+                    if let Some(rel) = line[after_open..].find(kind.marker()) {
+                        let close_end = after_open + rel + 3;
+                        out.push(tok(&line[i..close_end], Role::String));
+                        i = close_end;
+                    } else {
+                        out.push(tok(&line[i..], Role::String));
+                        state.in_python_triple = Some(kind);
+                        return out;
+                    }
+                } else {
+                    let end = scan_js_string(line, quote_at, qb);
+                    out.push(tok(&line[i..end], Role::String));
+                    i = end;
+                }
+                continue;
+            }
+        }
+        // Decorator: `@name` (or `@name.method`) — color the whole leading
+        // identifier-and-dots run as attribute. Heuristic: only at start of
+        // line (modulo indent) treat as decorator. Off-leading `@` (rare in
+        // Python pre-3.5) falls through as default.
+        if bytes[i] == b'@' && line[..i].chars().all(char::is_whitespace) {
+            flush_buf(&mut buf, &mut out);
+            let mut j = i + 1;
+            while j < bytes.len() && (is_ident_continue(bytes[j]) || bytes[j] == b'.') {
+                j += 1;
+            }
+            out.push(tok(&line[i..j], Role::Attribute));
+            i = j;
+            continue;
+        }
+        if bytes[i].is_ascii_digit() {
+            flush_buf(&mut buf, &mut out);
+            let end = scan_number(line, i);
+            // Python supports `1j`/`1J` complex literal suffix; scan_number's
+            // generic ident-continue tail already grabs it.
+            out.push(tok(&line[i..end], Role::Number));
+            i = end;
+            continue;
+        }
+        if is_ident_start(bytes[i]) {
+            flush_buf(&mut buf, &mut out);
+            let mut j = i + 1;
+            while j < bytes.len() && is_ident_continue(bytes[j]) {
+                j += 1;
+            }
+            let ident = &line[i..j];
+            let role = if PYTHON_KEYWORDS.contains(&ident) {
+                Role::Keyword
+            } else {
+                Role::Default
+            };
+            out.push(tok(ident, role));
+            i = j;
+            continue;
+        }
+        push_one_char(line, &mut i, &mut buf);
+    }
+    flush_buf(&mut buf, &mut out);
+    out
+}
+
+/// Number of bytes between `i` and the quote character of a Python string
+/// literal, accounting for an optional 1- or 2-char prefix (`r`, `b`, `f`,
+/// `u`, `rb`, `fr`, …). Returns `Some(0)` for an un-prefixed quote and
+/// `None` when there's no string starting here.
+fn python_string_prefix_len(bytes: &[u8], i: usize) -> Option<usize> {
+    if i >= bytes.len() {
+        return None;
+    }
+    let b = bytes[i];
+    if b == b'"' || b == b'\'' {
+        return Some(0);
+    }
+    if !is_python_string_prefix_char(b) {
+        return None;
+    }
+    // Single-char prefix?
+    if i + 1 < bytes.len() && (bytes[i + 1] == b'"' || bytes[i + 1] == b'\'') {
+        // Reject identifiers like `r_squared` — only treat as a prefix when
+        // the byte before is not ident-continue (so it isn't part of a
+        // bigger identifier) AND the quote follows directly.
+        if i == 0 || !is_ident_continue(bytes[i - 1]) {
+            return Some(1);
+        }
+        return None;
+    }
+    // Two-char prefix?
+    if i + 2 < bytes.len()
+        && is_python_string_prefix_char(bytes[i + 1])
+        && (bytes[i + 2] == b'"' || bytes[i + 2] == b'\'')
+        && (i == 0 || !is_ident_continue(bytes[i - 1]))
+    {
+        return Some(2);
+    }
+    None
+}
+
+fn is_python_string_prefix_char(b: u8) -> bool {
+    matches!(b, b'r' | b'R' | b'b' | b'B' | b'f' | b'F' | b'u' | b'U')
+}
+
+/// If we entered this line still inside a Python triple-quoted string,
+/// scan forward for the matching closing triple. Emit one String token for
+/// the swallowed range and clear the state when we close it; otherwise
+/// stay inside and color the whole line. Returns the byte index where
+/// regular tokenization should resume.
+fn resume_triple_string(line: &str, state: &mut TokenizerState, out: &mut Vec<Token>) -> usize {
+    let Some(kind) = state.in_python_triple else {
+        return 0;
+    };
+    let marker = kind.marker();
+    if let Some(rel) = line.find(marker) {
+        let close_end = rel + 3;
+        out.push(tok(&line[..close_end], Role::String));
+        state.in_python_triple = None;
+        close_end
+    } else {
+        out.push(tok(line, Role::String));
+        line.len()
+    }
+}
+
+// ── Bash / shell ───────────────────────────────────────────────────────────
+
+const BASH_KEYWORDS: &[&str] = &[
+    "alias", "break", "case", "continue", "declare", "do", "done", "elif", "else", "esac", "eval",
+    "exec", "exit", "export", "fi", "for", "function", "getopts", "if", "in", "let", "local",
+    "read", "readonly", "return", "select", "set", "shift", "source", "test", "then", "time",
+    "trap", "umask", "unalias", "unset", "until", "while",
+];
+
+fn tokenize_bash(line: &str, _state: &mut TokenizerState) -> Vec<Token> {
+    let bytes = line.as_bytes();
+    let mut out: Vec<Token> = Vec::new();
+    let mut buf = String::new();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        // `#` line comment — covers shebang `#!/...` too.
+        if bytes[i] == b'#' {
+            flush_buf(&mut buf, &mut out);
+            out.push(tok(&line[i..], Role::Comment));
+            return out;
+        }
+        let b = bytes[i];
+        // Strings. Single-quotes are fully literal in bash (no `\` escapes);
+        // double-quotes honor backslash escapes. We don't try to tokenize
+        // `$var` interpolation *inside* a double-quoted string — the whole
+        // span renders as one String token.
+        if b == b'\'' {
+            flush_buf(&mut buf, &mut out);
+            let end = scan_bash_single_string(line, i);
+            out.push(tok(&line[i..end], Role::String));
+            i = end;
+            continue;
+        }
+        if b == b'"' {
+            flush_buf(&mut buf, &mut out);
+            let end = scan_dq_string(line, i);
+            out.push(tok(&line[i..end], Role::String));
+            i = end;
+            continue;
+        }
+        // Variable reference: `$NAME`, `$1`, `${NAME}`, `$?`, `$#`, `$@`.
+        // Color as Attribute so it shares the lifetime/decorator family.
+        if b == b'$' && i + 1 < bytes.len() {
+            flush_buf(&mut buf, &mut out);
+            let end = scan_bash_var(line, i);
+            out.push(tok(&line[i..end], Role::Attribute));
+            i = end;
+            continue;
+        }
+        if b.is_ascii_digit() {
+            flush_buf(&mut buf, &mut out);
+            let end = scan_number(line, i);
+            out.push(tok(&line[i..end], Role::Number));
+            i = end;
+            continue;
+        }
+        if is_ident_start(b) {
+            flush_buf(&mut buf, &mut out);
+            let mut j = i + 1;
+            while j < bytes.len() && is_ident_continue(bytes[j]) {
+                j += 1;
+            }
+            let ident = &line[i..j];
+            let role = if BASH_KEYWORDS.contains(&ident) {
+                Role::Keyword
+            } else {
+                Role::Default
+            };
+            out.push(tok(ident, role));
+            i = j;
+            continue;
+        }
+        push_one_char(line, &mut i, &mut buf);
+    }
+    flush_buf(&mut buf, &mut out);
+    out
+}
+
+/// Scan a bash single-quoted string. Single quotes are literal — `\` does
+/// not escape; the only terminator is another `'`.
+fn scan_bash_single_string(line: &str, start: usize) -> usize {
+    let bytes = line.as_bytes();
+    let mut j = start + 1;
+    while j < bytes.len() {
+        if bytes[j] == b'\'' {
+            return j + 1;
+        }
+        j += 1;
+    }
+    j
+}
+
+/// Scan a bash variable reference starting at `$`. Handles `$NAME`, `$1`,
+/// `${...}`, and special variables `$?`, `$#`, `$@`, `$*`, `$$`, `$!`, `$-`.
+fn scan_bash_var(line: &str, start: usize) -> usize {
+    let bytes = line.as_bytes();
+    let n = bytes.len();
+    let mut j = start + 1;
+    if j >= n {
+        return j;
+    }
+    if bytes[j] == b'{' {
+        j += 1;
+        while j < n && bytes[j] != b'}' {
+            j += 1;
+        }
+        if j < n {
+            j += 1;
+        }
+        return j;
+    }
+    if matches!(bytes[j], b'?' | b'#' | b'@' | b'*' | b'$' | b'!' | b'-') {
+        return j + 1;
+    }
+    while j < n && is_ident_continue(bytes[j]) {
+        j += 1;
+    }
+    j
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -570,7 +885,8 @@ mod tests {
         assert_eq!(tokenizer_for("tsx"), Some(Lang::Js));
         assert_eq!(tokenizer_for("typescript"), Some(Lang::Js));
         assert_eq!(tokenizer_for(""), None);
-        assert_eq!(tokenizer_for("python"), None);
+        // Languages handled by other tokenizers / unknown tags fall through.
+        assert_eq!(tokenizer_for("cobol"), None);
     }
 
     #[test]
@@ -775,6 +1091,160 @@ mod tests {
         }
     }
 
+    #[test]
+    fn tokenizer_for_recognizes_python_and_bash_aliases() {
+        assert_eq!(tokenizer_for("python"), Some(Lang::Python));
+        assert_eq!(tokenizer_for("py"), Some(Lang::Python));
+        assert_eq!(tokenizer_for("PYTHON"), Some(Lang::Python));
+        assert_eq!(tokenizer_for("bash"), Some(Lang::Bash));
+        assert_eq!(tokenizer_for("sh"), Some(Lang::Bash));
+        assert_eq!(tokenizer_for("shell"), Some(Lang::Bash));
+        assert_eq!(tokenizer_for("zsh"), Some(Lang::Bash));
+    }
+
+    // ── Python ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn python_keywords_and_strings_get_distinct_roles() {
+        let toks = roles_of("def greet(name): return \"hi\"", Lang::Python);
+        assert_eq!(find_role(&toks, "def").1, Role::Keyword);
+        assert_eq!(find_role(&toks, "return").1, Role::Keyword);
+        assert_eq!(find_role(&toks, "\"hi\"").1, Role::String);
+    }
+
+    #[test]
+    fn python_line_comment_colors_to_end_of_line() {
+        let toks = roles_of("x = 1  # trailing", Lang::Python);
+        assert_eq!(find_role(&toks, "# trailing").1, Role::Comment);
+    }
+
+    #[test]
+    fn python_decorator_at_start_of_line_is_attribute() {
+        let toks = roles_of("    @functools.cache", Lang::Python);
+        assert_eq!(find_role(&toks, "@functools.cache").1, Role::Attribute);
+    }
+
+    #[test]
+    fn python_string_prefixes_are_part_of_the_string_token() {
+        // `f"…"` and `rb"…"` — the prefix bytes belong to the string span,
+        // not the surrounding default text.
+        let toks = roles_of("x = f\"hi {name}\"", Lang::Python);
+        assert_eq!(find_role(&toks, "f\"hi {name}\"").1, Role::String);
+
+        let toks = roles_of("x = rb\"raw bytes\"", Lang::Python);
+        assert_eq!(find_role(&toks, "rb\"raw bytes\"").1, Role::String);
+    }
+
+    #[test]
+    fn python_identifiers_starting_with_string_prefix_letters_are_not_strings() {
+        // `r_squared` starts with `r` but is just an identifier — the
+        // prefix detector must NOT mis-eat the leading `r`.
+        let toks = roles_of("r_squared = 1", Lang::Python);
+        assert_eq!(find_role(&toks, "r_squared").1, Role::Default);
+        assert_eq!(find_role(&toks, "1").1, Role::Number);
+    }
+
+    #[test]
+    fn python_complex_literal_with_j_suffix_renders_as_one_number() {
+        let toks = roles_of("z = 3.5j", Lang::Python);
+        assert_eq!(find_role(&toks, "3.5j").1, Role::Number);
+    }
+
+    #[test]
+    fn python_triple_double_string_spans_multiple_lines() {
+        // Open on line 1, body on line 2, close on line 3. With state
+        // threaded, every byte after the opening triple-quote and through
+        // the closing one is one continuous String role.
+        let source = "msg = \"\"\"opens\n   still inside\n   and closes\"\"\" + x";
+        let per_line = roles_per_line(source, Lang::Python);
+        assert_eq!(per_line.len(), 3);
+        assert_eq!(find_role(&per_line[0], "\"\"\"opens").1, Role::String);
+        assert!(
+            per_line[1].iter().all(|(_, r)| *r == Role::String),
+            "line 2 should be entirely string, got {:?}",
+            per_line[1]
+        );
+        assert_eq!(find_role(&per_line[2], "   and closes\"\"\"").1, Role::String);
+        // After the close we drop back into normal tokenization.
+        assert_eq!(find_role(&per_line[2], "x").1, Role::Default);
+    }
+
+    #[test]
+    fn python_triple_single_does_not_close_on_triple_double() {
+        // `'''` and `"""` must not cross-close — the closer has to match
+        // the opener's flavor. Here the inner `"""` should stay part of
+        // the single-quoted triple string.
+        let source = "doc = '''first\n   \"\"\" still inside\n   end'''";
+        let per_line = roles_per_line(source, Lang::Python);
+        assert_eq!(per_line.len(), 3);
+        assert!(
+            per_line[1].iter().all(|(_, r)| *r == Role::String),
+            "mid-triple-string line should be entirely string, got {:?}",
+            per_line[1]
+        );
+        assert_eq!(find_role(&per_line[2], "   end'''").1, Role::String);
+    }
+
+    #[test]
+    fn python_triple_string_on_single_line_does_not_set_state() {
+        let mut state = TokenizerState::default();
+        let _ = tokenize("x = \"\"\"all on one line\"\"\"", Lang::Python, &mut state);
+        assert_eq!(
+            state.in_python_triple, None,
+            "single-line triple string should not leave state armed"
+        );
+    }
+
+    // ── Bash ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn bash_keywords_and_strings_get_distinct_roles() {
+        let toks = roles_of("if [ \"$x\" = \"y\" ]; then echo hi; fi", Lang::Bash);
+        assert_eq!(find_role(&toks, "if").1, Role::Keyword);
+        assert_eq!(find_role(&toks, "then").1, Role::Keyword);
+        assert_eq!(find_role(&toks, "fi").1, Role::Keyword);
+        assert_eq!(find_role(&toks, "\"y\"").1, Role::String);
+    }
+
+    #[test]
+    fn bash_line_comment_colors_to_end_of_line() {
+        let toks = roles_of("echo hello  # greet", Lang::Bash);
+        assert_eq!(find_role(&toks, "# greet").1, Role::Comment);
+    }
+
+    #[test]
+    fn bash_single_quoted_string_treats_backslash_as_literal() {
+        // In bash, single quotes are FULLY literal — `\'` does NOT escape.
+        // The first `'` after the opener is always the terminator.
+        let toks = roles_of("echo 'a\\b'c", Lang::Bash);
+        assert_eq!(find_role(&toks, "'a\\b'").1, Role::String);
+        assert_eq!(find_role(&toks, "c").1, Role::Default);
+    }
+
+    #[test]
+    fn bash_variables_are_styled_as_attribute() {
+        let toks = roles_of("path=$HOME; echo ${USER} status=$?", Lang::Bash);
+        assert_eq!(find_role(&toks, "$HOME").1, Role::Attribute);
+        assert_eq!(find_role(&toks, "${USER}").1, Role::Attribute);
+        assert_eq!(find_role(&toks, "$?").1, Role::Attribute);
+    }
+
+    #[test]
+    fn bash_shebang_is_treated_as_a_comment() {
+        let toks = roles_of("#!/usr/bin/env bash", Lang::Bash);
+        assert_eq!(find_role(&toks, "#!/usr/bin/env bash").1, Role::Comment);
+    }
+
+    #[test]
+    fn bash_state_threading_is_a_no_op_block_comment_flag_stays_false() {
+        // Bash has no `/* … */`, so tokenizing it must never set the C-style
+        // block-comment flag — otherwise switching languages mid-fence would
+        // bleed comment styling across blocks.
+        let mut fresh = TokenizerState::default();
+        let _ = tokenize("echo /* not a comment */", Lang::Bash, &mut fresh);
+        assert!(!fresh.in_block_comment);
+    }
+
     /// Visual smoke test. Ignored by default; run with
     /// `cargo test -p coven-cli preview_chat_highlight_to_truecolor_stdout -- --ignored --nocapture`
     /// to dump TrueColor ANSI to stdout. Uses the brand RGB tokens directly
@@ -815,6 +1285,34 @@ mod tests {
                     "let attempts = 1.5e-3; // tiny\n",
                     "/* block\n   comment */\n",
                     "export const PI = 3.14;\n",
+                ),
+            ),
+            (
+                "python",
+                concat!(
+                    "# Python sample with decorator + triple-string\n",
+                    "import functools\n",
+                    "\n",
+                    "@functools.cache\n",
+                    "def greet(name: str) -> str:\n",
+                    "    \"\"\"Return a greeting.\n",
+                    "    Supports multi-line docstring.\n",
+                    "    \"\"\"\n",
+                    "    return f\"hi {name}\"  # interpolated\n",
+                    "\n",
+                    "z = 3.5j\n",
+                ),
+            ),
+            (
+                "bash",
+                concat!(
+                    "#!/usr/bin/env bash\n",
+                    "# bash sample with vars + control flow\n",
+                    "set -euo pipefail\n",
+                    "name=${1:-world}\n",
+                    "for i in 1 2 3; do\n",
+                    "    echo \"hello $name #$i\"\n",
+                    "done\n",
                 ),
             ),
         ];
