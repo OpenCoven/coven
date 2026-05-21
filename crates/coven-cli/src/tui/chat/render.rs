@@ -314,6 +314,18 @@ fn append_agent_content_lines<'a>(lines: &mut Vec<Line<'a>>, content: &str, wrap
             continue;
         }
 
+        if is_table_row(line) {
+            // Tables only survive when cell alignment is preserved; wrapping
+            // a row fragments the pipes and trashes the columns. Truncate
+            // with `\u{2026}` so the row stays on one visual line — losing
+            // the right edge is far easier to read than losing the columns.
+            let body = line.trim_end();
+            let visible_budget = wrap_width.saturating_sub(2).max(1);
+            let visible = truncate_for_width(body, visible_budget);
+            lines.push(Line::from(Span::styled(format!("  {visible}"), text_style)));
+            continue;
+        }
+
         let wrap_target = wrap_width.saturating_sub(2).max(1);
         for wl in textwrap::wrap(line, wrap_target) {
             lines.push(Line::from(Span::styled(format!("  {wl}"), text_style)));
@@ -346,6 +358,13 @@ fn strip_bullet_prefix(line: &str) -> Option<(usize, &'static str, &str)> {
         return Some((indent, "\u{2022} ", rest));
     }
     None
+}
+
+/// Lines beginning with `|` (after any leading indent) look like markdown
+/// table rows. They have to render unwrapped so column boundaries survive;
+/// wrapping at width turns the table into pipe-and-dash spaghetti.
+fn is_table_row(line: &str) -> bool {
+    line.trim_start().starts_with('|')
 }
 
 fn render_input(f: &mut Frame, app: &App, area: Rect) {
@@ -854,6 +873,71 @@ mod tests {
                 "raw `* ` marker leaked: {line:?}"
             );
         }
+    }
+
+    #[test]
+    fn agent_lines_preserve_table_row_alignment_at_wide_widths() {
+        // When the table fits inside the wrap budget, every row should land
+        // on its own line unwrapped so column boundaries stay intact.
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        let content = "\
+| Mode    | Status chip   | Best for                    |
+|---------|---------------|-----------------------------|
+| live    | stream: live  | watching long-running plans |
+| batched | stream: off   | short queries and demos     |";
+        append_agent_content_lines(&mut lines, content, 80);
+
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+
+        assert_eq!(rendered.len(), 4, "every table row should render unwrapped");
+        for row in &rendered {
+            assert!(
+                row.matches('|').count() == 4,
+                "row lost a pipe (should have 4): {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_lines_truncate_table_rows_with_ellipsis_at_narrow_widths() {
+        // When the source row is wider than the wrap budget, truncate with
+        // an ellipsis so the row stays on one line and the column header
+        // remains readable. Losing the right edge beats losing the columns.
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        let row = "| A | B | C | D | E | F | G | H |";
+        append_agent_content_lines(&mut lines, row, 16);
+
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+
+        assert_eq!(rendered.len(), 1, "table row must not wrap");
+        let only = &rendered[0];
+        assert!(
+            only.starts_with("  | A | B"),
+            "left edge preserved: {only:?}"
+        );
+        assert!(only.ends_with('\u{2026}'), "ellipsis applied: {only:?}");
+    }
+
+    #[test]
+    fn agent_lines_render_table_separator_row_without_wrapping() {
+        // The `|---|---|...` separator row is what makes a markdown table
+        // visually a table; if it wraps the table reads as garbage.
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        let content = "| Col A | Col B |\n|-------|-------|\n| value | other |";
+        append_agent_content_lines(&mut lines, content, 80);
+
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        assert_eq!(rendered.len(), 3);
+        assert!(rendered[1].contains("|-------|-------|"));
     }
 
     #[test]

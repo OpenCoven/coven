@@ -1137,7 +1137,12 @@ fn clean_terminal_output(data: &str) -> Option<String> {
         }
     }
 
-    (!output.trim().is_empty()).then_some(output)
+    // Newlines carry paragraph-break structure even when nothing visible
+    // surrounds them, so keep any chunk that has a newline OR any
+    // non-whitespace char. Drop only space/tab-only or fully empty chunks —
+    // those are pure control noise after escape sequences are stripped.
+    let has_structure = output.chars().any(|ch| ch == '\n' || !ch.is_whitespace());
+    has_structure.then_some(output)
 }
 
 fn skip_escape_sequence<I>(chars: &mut std::iter::Peekable<I>)
@@ -2004,6 +2009,25 @@ mod tests {
         assert_eq!(clean_terminal_output("\x1b[?25l\x1b[?25h"), None);
         assert_eq!(clean_terminal_output("\x1b]0;just a title\x07"), None);
         assert_eq!(clean_terminal_output("\r\r\r"), None);
+        // Pure space/tab without any newline is still invisible noise.
+        assert_eq!(clean_terminal_output("   "), None);
+        assert_eq!(clean_terminal_output("\t\t"), None);
+    }
+
+    #[test]
+    fn clean_terminal_output_preserves_newline_only_chunks_for_paragraph_breaks() {
+        // When the daemon streams a markdown reply line-by-line, blank source
+        // lines arrive as `\n`-only payloads. Dropping them collapses the
+        // paragraph structure on the way to the message body, so headings
+        // and tables end up stuck to the next block. Keep any chunk that
+        // carries a newline.
+        assert_eq!(clean_terminal_output("\n"), Some("\n".to_string()));
+        assert_eq!(clean_terminal_output("\n\n"), Some("\n\n".to_string()));
+        // Even mixed with control noise the newline must survive.
+        assert_eq!(
+            clean_terminal_output("\x1b[?25l\n\x1b[?25h"),
+            Some("\n".to_string())
+        );
     }
 
     #[test]
@@ -2103,6 +2127,34 @@ mod tests {
             .collect();
         assert_eq!(agent_messages.len(), 1);
         assert_eq!(agent_messages[0].content, "Hello world!\n");
+    }
+
+    #[test]
+    fn streamed_blank_line_chunks_keep_paragraph_breaks_in_message_body() {
+        // Regression: prior to keeping newline-only chunks, splitting a reply
+        // by lines and streaming each one separately erased the paragraph
+        // boundaries because the blank-line events were silently dropped.
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+
+        for (idx, chunk) in ["First paragraph.\n", "\n", "Second paragraph.\n"]
+            .iter()
+            .enumerate()
+        {
+            app.push_event_message(&output_event((idx as i64) + 1, "session-1", chunk));
+        }
+
+        let agent: Vec<_> = app
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, MessageRole::Agent))
+            .collect();
+        assert_eq!(agent.len(), 1);
+        assert_eq!(
+            agent[0].content, "First paragraph.\n\nSecond paragraph.\n",
+            "the blank-line chunk between paragraphs must survive"
+        );
     }
 
     #[test]
