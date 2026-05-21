@@ -4,6 +4,7 @@
 mod app;
 pub(crate) mod client;
 mod events;
+mod highlight;
 mod render;
 mod settings;
 

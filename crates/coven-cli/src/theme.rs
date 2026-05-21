@@ -30,9 +30,6 @@ pub mod brand {
         g: 0xBD,
         b: 0xED,
     };
-    // Defined for future use; consumed via the `DANGER` / `SUCCESS` semantic tokens
-    // in later phases (destructive prompts, ready-state indicators).
-    #[allow(dead_code)]
     pub const ACCENT_BLUE: Rgb = Rgb {
         r: 0x0A,
         g: 0x84,
@@ -138,6 +135,23 @@ pub const BORDER_SUBTLE: Rgb = brand::BORDER_SUBTLE;
 /// Emphasized divider line (e.g. focused input area, active rule).
 /// Mirrors `--oc-border-strong`.
 pub const BORDER_STRONG: Rgb = brand::BORDER_STRONG;
+
+// ── Syntax highlighting tokens (chat code-block rendering) ──
+
+/// Keyword token in highlighted code blocks. Pairs with `Modifier::BOLD` at
+/// the call site so weight, not saturation, carries the emphasis.
+pub const SYNTAX_KEYWORD: Rgb = brand::PURPLE_2;
+/// String / character literal in highlighted code blocks. Reuses the brand
+/// green — green-for-strings is the most universal terminal convention.
+pub const SYNTAX_STRING: Rgb = brand::SUCCESS;
+/// Numeric literal in highlighted code blocks. Brand accent-blue keeps
+/// numbers distinct from the purple keyword/attribute family.
+pub const SYNTAX_NUMBER: Rgb = brand::ACCENT_BLUE;
+/// Comment in highlighted code blocks. Quiet & italic so comments recede.
+pub const SYNTAX_COMMENT: Rgb = brand::TEXT_FAINT;
+/// Attribute / decorator / lifetime token. Lighter purple than the keyword
+/// shade so the two purple groups stay distinguishable.
+pub const SYNTAX_ATTRIBUTE: Rgb = brand::PURPLE_3;
 
 // ── Status semantics ──
 
@@ -653,6 +667,11 @@ mod tests {
         assert_eq!(BACKDROP, brand::SURFACE_0);
         assert_eq!(BORDER_SUBTLE, brand::BORDER_SUBTLE);
         assert_eq!(BORDER_STRONG, brand::BORDER_STRONG);
+        assert_eq!(SYNTAX_KEYWORD, brand::PURPLE_2);
+        assert_eq!(SYNTAX_STRING, brand::SUCCESS);
+        assert_eq!(SYNTAX_NUMBER, brand::ACCENT_BLUE);
+        assert_eq!(SYNTAX_COMMENT, brand::TEXT_FAINT);
+        assert_eq!(SYNTAX_ATTRIBUTE, brand::PURPLE_3);
     }
 
     #[test]
