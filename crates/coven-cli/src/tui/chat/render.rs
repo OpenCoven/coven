@@ -4,7 +4,7 @@
 
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Margin, Rect},
-    style::Style,
+    style::{Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
         Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
@@ -242,7 +242,6 @@ fn render_messages(f: &mut Frame, app: &mut App, area: Rect) {
 fn append_agent_content_lines<'a>(lines: &mut Vec<Line<'a>>, content: &str, wrap_width: usize) {
     let text_style = theme::ratatui_style(TEXT);
     let dim_style = theme::ratatui_style(TEXT_DIM);
-    let heading_style = theme::ratatui_style(PRIMARY).bold();
 
     let mut in_code_block = false;
     let mut last_was_blank = true;
@@ -262,6 +261,7 @@ fn append_agent_content_lines<'a>(lines: &mut Vec<Line<'a>>, content: &str, wrap
             } else {
                 line.to_string()
             };
+            // Code blocks are verbatim — no inline-markdown parsing inside.
             lines.push(Line::from(vec![
                 Span::styled("  \u{2502} ", dim_style),
                 Span::styled(visible, text_style),
@@ -279,10 +279,13 @@ fn append_agent_content_lines<'a>(lines: &mut Vec<Line<'a>>, content: &str, wrap
         }
         last_was_blank = false;
 
-        if let Some(heading) = strip_heading_prefix(line) {
+        if let Some((level, heading)) = strip_heading_prefix(line) {
+            let style = heading_style_for(level);
             let wrap_target = wrap_width.saturating_sub(2).max(1);
             for wl in textwrap::wrap(heading, wrap_target) {
-                lines.push(Line::from(Span::styled(format!("  {wl}"), heading_style)));
+                let mut spans = vec![Span::styled("  ", style)];
+                spans.extend(parse_inline_markdown(&wl, style));
+                lines.push(Line::from(spans));
             }
             continue;
         }
@@ -300,16 +303,14 @@ fn append_agent_content_lines<'a>(lines: &mut Vec<Line<'a>>, content: &str, wrap
                 .max(1);
             let mut wrapped = textwrap::wrap(body, wrap_target).into_iter();
             if let Some(first) = wrapped.next() {
-                lines.push(Line::from(Span::styled(
-                    format!("{indent_first}{first}"),
-                    text_style,
-                )));
+                let mut spans = vec![Span::styled(indent_first.clone(), text_style)];
+                spans.extend(parse_inline_markdown(&first, text_style));
+                lines.push(Line::from(spans));
             }
             for cont in wrapped {
-                lines.push(Line::from(Span::styled(
-                    format!("{indent_cont}{cont}"),
-                    text_style,
-                )));
+                let mut spans = vec![Span::styled(indent_cont.clone(), text_style)];
+                spans.extend(parse_inline_markdown(&cont, text_style));
+                lines.push(Line::from(spans));
             }
             continue;
         }
@@ -319,6 +320,8 @@ fn append_agent_content_lines<'a>(lines: &mut Vec<Line<'a>>, content: &str, wrap
             // a row fragments the pipes and trashes the columns. Truncate
             // with `\u{2026}` so the row stays on one visual line — losing
             // the right edge is far easier to read than losing the columns.
+            // Table cells render verbatim (no inline parsing) so `|`, `*`,
+            // and `` ` `` inside cells stay literal.
             let body = line.trim_end();
             let visible_budget = wrap_width.saturating_sub(2).max(1);
             let visible = truncate_for_width(body, visible_budget);
@@ -328,7 +331,9 @@ fn append_agent_content_lines<'a>(lines: &mut Vec<Line<'a>>, content: &str, wrap
 
         let wrap_target = wrap_width.saturating_sub(2).max(1);
         for wl in textwrap::wrap(line, wrap_target) {
-            lines.push(Line::from(Span::styled(format!("  {wl}"), text_style)));
+            let mut spans = vec![Span::styled("  ", text_style)];
+            spans.extend(parse_inline_markdown(&wl, text_style));
+            lines.push(Line::from(spans));
         }
     }
 
@@ -339,10 +344,23 @@ fn append_agent_content_lines<'a>(lines: &mut Vec<Line<'a>>, content: &str, wrap
     }
 }
 
-fn strip_heading_prefix(line: &str) -> Option<&str> {
-    for prefix in ["#### ", "### ", "## ", "# "] {
+/// Map a heading level (1..=4) to a distinct style so the visual hierarchy
+/// reads cleanly even when the terminal can't render the brand purple
+/// (NoColor / piped output). Modifier mix carries the hierarchy on its own:
+/// H1 is bold + underlined, H2 is bold, H3 is bold + italic, H4 is italic.
+fn heading_style_for(level: u8) -> Style {
+    match level {
+        1 => theme::ratatui_style(PRIMARY).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        2 => theme::ratatui_style(PRIMARY).add_modifier(Modifier::BOLD),
+        3 => theme::ratatui_style(PRIMARY_STRONG).add_modifier(Modifier::BOLD | Modifier::ITALIC),
+        _ => theme::ratatui_style(TEXT_DIM).add_modifier(Modifier::ITALIC),
+    }
+}
+
+fn strip_heading_prefix(line: &str) -> Option<(u8, &str)> {
+    for (prefix, level) in [("#### ", 4u8), ("### ", 3), ("## ", 2), ("# ", 1)] {
         if let Some(rest) = line.strip_prefix(prefix) {
-            return Some(rest);
+            return Some((level, rest));
         }
     }
     None
@@ -365,6 +383,106 @@ fn strip_bullet_prefix(line: &str) -> Option<(usize, &'static str, &str)> {
 /// wrapping at width turns the table into pipe-and-dash spaghetti.
 fn is_table_row(line: &str) -> bool {
     line.trim_start().starts_with('|')
+}
+
+/// Walk a single line of text and split it into styled spans so common
+/// markdown inline markers — `` `code` ``, `**bold**`, and `*italic*` —
+/// render with the right modifier instead of leaving their literal
+/// punctuation in the chat. The parser is intentionally lite: it never
+/// nests across lines, ignores escapes, and only treats `*`/`**` as
+/// emphasis when the marker is hugging a non-whitespace char (so
+/// arithmetic like `2 * 3 * 4` and casual mentions of asterisks survive
+/// as literal text). Inline `` ` `` always wins over `*` so a paragraph
+/// like `` `*foo*` `` renders as inline code, not as code-then-italic.
+fn parse_inline_markdown<'a>(text: &str, default_style: Style) -> Vec<Span<'a>> {
+    let mut spans: Vec<Span<'a>> = Vec::new();
+    let mut buf = String::new();
+    let mut i = 0;
+
+    while i < text.len() {
+        let rest = &text[i..];
+
+        if let Some(byte) = rest.as_bytes().first() {
+            if *byte == b'`' {
+                if let Some(end) = rest[1..].find('`') {
+                    flush_inline_buf(&mut spans, &mut buf, default_style);
+                    let body = rest[1..1 + end].to_string();
+                    let code_style = theme::ratatui_style(TEXT_DIM).add_modifier(Modifier::ITALIC);
+                    spans.push(Span::styled(body, code_style));
+                    i += 1 + end + 1;
+                    continue;
+                }
+            }
+
+            if let Some(after) = rest.strip_prefix("**") {
+                let opens_on_word = after
+                    .chars()
+                    .next()
+                    .is_some_and(|c| !c.is_whitespace() && c != '*');
+                if opens_on_word {
+                    if let Some(end) = after.find("**") {
+                        let body = &after[..end];
+                        let closes_on_word =
+                            body.chars().last().is_some_and(|c| !c.is_whitespace());
+                        if closes_on_word {
+                            flush_inline_buf(&mut spans, &mut buf, default_style);
+                            let bold = default_style.add_modifier(Modifier::BOLD);
+                            spans.push(Span::styled(body.to_string(), bold));
+                            i += 2 + end + 2;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            if *byte == b'*' && !rest.starts_with("**") {
+                let after = &rest[1..];
+                let opens_on_word = after
+                    .chars()
+                    .next()
+                    .is_some_and(|c| !c.is_whitespace() && c != '*');
+                if opens_on_word {
+                    // Find the next single `*` (not `**`) whose preceding char
+                    // is non-whitespace — that's the closing marker per
+                    // commonmark-ish emphasis rules.
+                    let mut search_at = 0usize;
+                    let mut found: Option<usize> = None;
+                    while let Some(p) = after[search_at..].find('*') {
+                        let abs = search_at + p;
+                        let body = &after[..abs];
+                        let last_ok = body.chars().last().is_some_and(|c| !c.is_whitespace());
+                        let not_double = after.as_bytes().get(abs + 1) != Some(&b'*');
+                        if last_ok && not_double {
+                            found = Some(abs);
+                            break;
+                        }
+                        search_at = abs + 1;
+                    }
+                    if let Some(end) = found {
+                        flush_inline_buf(&mut spans, &mut buf, default_style);
+                        let italic = default_style.add_modifier(Modifier::ITALIC);
+                        spans.push(Span::styled(after[..end].to_string(), italic));
+                        i += 1 + end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Literal character — including any opener that didn't pair off.
+        let ch = rest.chars().next().expect("rest is non-empty here");
+        buf.push(ch);
+        i += ch.len_utf8();
+    }
+
+    flush_inline_buf(&mut spans, &mut buf, default_style);
+    spans
+}
+
+fn flush_inline_buf<'a>(spans: &mut Vec<Span<'a>>, buf: &mut String, style: Style) {
+    if !buf.is_empty() {
+        spans.push(Span::styled(std::mem::take(buf), style));
+    }
 }
 
 fn render_input(f: &mut Frame, app: &App, area: Rect) {
@@ -938,6 +1056,206 @@ mod tests {
             .collect();
         assert_eq!(rendered.len(), 3);
         assert!(rendered[1].contains("|-------|-------|"));
+    }
+
+    #[test]
+    fn heading_styles_form_a_distinct_visual_hierarchy() {
+        // H1 must be visually loudest, H4 the quietest. We don't pin the
+        // exact tokens here — that would be brittle — but we do require the
+        // styles for each level to be pairwise different so the hierarchy
+        // is actually readable in the chat.
+        let styles = [
+            heading_style_for(1),
+            heading_style_for(2),
+            heading_style_for(3),
+            heading_style_for(4),
+        ];
+        for (i, lhs) in styles.iter().enumerate() {
+            for (j, rhs) in styles.iter().enumerate() {
+                if i != j {
+                    assert_ne!(
+                        lhs,
+                        rhs,
+                        "heading level {} and {} share the same style",
+                        i + 1,
+                        j + 1
+                    );
+                }
+            }
+        }
+        // H1 must be bold + underlined so it reads as the top of the page.
+        assert!(styles[0].add_modifier.contains(Modifier::BOLD));
+        assert!(styles[0].add_modifier.contains(Modifier::UNDERLINED));
+        // H4 is italic body text — no bold, no underline.
+        assert!(!styles[3].add_modifier.contains(Modifier::BOLD));
+        assert!(!styles[3].add_modifier.contains(Modifier::UNDERLINED));
+        assert!(styles[3].add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn strip_heading_prefix_reports_level() {
+        assert_eq!(strip_heading_prefix("# Title"), Some((1u8, "Title")));
+        assert_eq!(strip_heading_prefix("## Title"), Some((2, "Title")));
+        assert_eq!(strip_heading_prefix("### Title"), Some((3, "Title")));
+        assert_eq!(strip_heading_prefix("#### Title"), Some((4, "Title")));
+        assert_eq!(strip_heading_prefix("##### Title"), None);
+        assert_eq!(strip_heading_prefix("#no space"), None);
+        assert_eq!(strip_heading_prefix("paragraph"), None);
+    }
+
+    #[test]
+    fn inline_markdown_splits_code_bold_and_italic_into_styled_spans() {
+        let default_style = theme::ratatui_style(TEXT);
+        let spans = parse_inline_markdown("use `cargo` to **build** the *project*", default_style);
+
+        let texts: Vec<String> = spans.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "use ".to_string(),
+                "cargo".to_string(),
+                " to ".to_string(),
+                "build".to_string(),
+                " the ".to_string(),
+                "project".to_string(),
+            ]
+        );
+
+        // Style hops must follow the markers: plain, code, plain, bold,
+        // plain, italic — with the markers themselves stripped.
+        assert_eq!(spans[0].style, default_style);
+        assert!(spans[1].style.add_modifier.contains(Modifier::ITALIC));
+        assert_eq!(spans[2].style, default_style);
+        assert!(spans[3].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(spans[4].style, default_style);
+        assert!(spans[5].style.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn inline_markdown_leaves_unclosed_markers_as_literal_text() {
+        let default_style = theme::ratatui_style(TEXT);
+        let spans = parse_inline_markdown("an *unclosed italic line", default_style);
+        let joined: String = spans.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(joined, "an *unclosed italic line");
+        // Every span should be plain — no modifiers were applied.
+        for span in &spans {
+            assert!(!span.style.add_modifier.contains(Modifier::ITALIC));
+            assert!(!span.style.add_modifier.contains(Modifier::BOLD));
+        }
+    }
+
+    #[test]
+    fn inline_markdown_does_not_match_arithmetic_or_whitespace_padded_stars() {
+        // `2 * 3 * 4` and `* a *` should both stay literal because the
+        // markers are surrounded by whitespace — emphasis requires the
+        // opener to hug a word char and the closer to be preceded by one.
+        let default_style = theme::ratatui_style(TEXT);
+        for input in ["2 * 3 * 4", "leading: * a *", "trailing space *body *"] {
+            let spans = parse_inline_markdown(input, default_style);
+            let joined: String = spans.iter().map(|s| s.content.to_string()).collect();
+            assert_eq!(joined, input, "literal text mangled for {input:?}");
+            for span in &spans {
+                assert!(
+                    !span.style.add_modifier.contains(Modifier::ITALIC),
+                    "false italic match for {input:?}: {:?}",
+                    span.content
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inline_markdown_preserves_backticks_inside_inline_code() {
+        // The first backtick opens, the next closes — nested backticks would
+        // need fence-style triple-tick handling we don't support today.
+        let default_style = theme::ratatui_style(TEXT);
+        let spans = parse_inline_markdown("see `*foo*` for the literal stars", default_style);
+        let texts: Vec<String> = spans.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "see ".to_string(),
+                "*foo*".to_string(),
+                " for the literal stars".to_string(),
+            ]
+        );
+        // The middle span is inline code, not italic.
+        assert!(spans[1].style.add_modifier.contains(Modifier::ITALIC)); // code styled italic
+                                                                         // The outer text remains plain — no italic spilling out of the code span.
+        assert!(!spans[0].style.add_modifier.contains(Modifier::ITALIC));
+        assert!(!spans[2].style.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn agent_lines_skip_inline_markdown_inside_code_blocks_and_tables() {
+        // Inside fenced code: backticks and stars must stay literal so the
+        // user sees the actual code they pasted.
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        append_agent_content_lines(&mut lines, "```\nlet x = `1` * **two**;\n```", 80);
+        let code_line = &lines[0];
+        let body: String = code_line
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(
+            body.contains('`'),
+            "backticks must survive inside code: {body:?}"
+        );
+        assert!(
+            body.contains("**"),
+            "stars must survive inside code: {body:?}"
+        );
+
+        // Inside a table row: same deal — cells render verbatim.
+        let mut lines2: Vec<Line<'_>> = Vec::new();
+        append_agent_content_lines(&mut lines2, "| `code` | *italic* |", 80);
+        let row: String = lines2[0]
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(
+            row.contains('`'),
+            "backticks survive in table cells: {row:?}"
+        );
+        assert!(row.contains('*'), "stars survive in table cells: {row:?}");
+    }
+
+    #[test]
+    fn agent_lines_apply_inline_markdown_inside_headings_and_bullets() {
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        append_agent_content_lines(
+            &mut lines,
+            "## A **bold** heading\n\n- a bullet with `code`",
+            80,
+        );
+
+        // Heading line carries multiple spans now — including a bold body.
+        let heading_line = lines
+            .iter()
+            .find(|line| line.spans.iter().any(|span| span.content.contains("bold")));
+        let heading_line = heading_line.expect("heading line present");
+        let bold_span = heading_line
+            .spans
+            .iter()
+            .find(|span| span.content == "bold")
+            .expect("bold span present in heading");
+        assert!(bold_span.style.add_modifier.contains(Modifier::BOLD));
+
+        // Bullet line carries an inline-code span.
+        let bullet_line = lines.iter().find(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content.contains("\u{2022}"))
+        });
+        let bullet_line = bullet_line.expect("bullet line present");
+        let code_span = bullet_line
+            .spans
+            .iter()
+            .find(|span| span.content == "code")
+            .expect("inline code span present in bullet body");
+        assert!(code_span.style.add_modifier.contains(Modifier::ITALIC));
     }
 
     #[test]
