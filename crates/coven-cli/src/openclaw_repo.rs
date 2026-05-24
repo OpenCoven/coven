@@ -130,6 +130,7 @@ pub fn changed_files(repo_root: &Path) -> Result<Vec<String>> {
 
 fn run_git(repo_root: &Path, args: &[&str]) -> Result<String> {
     let output = std::process::Command::new("git")
+        .args(["-c", "core.fsmonitor="])
         .args(args)
         .current_dir(repo_root)
         .output()
@@ -148,6 +149,8 @@ fn run_git(repo_root: &Path, args: &[&str]) -> Result<String> {
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     fn write_openclaw_fixture(root: &Path) -> Result<()> {
         fs::create_dir_all(root.join(".git"))?;
@@ -270,6 +273,37 @@ mod tests {
 
         assert!(files.contains(&"package.json".to_string()));
         assert!(files.contains(&"untracked.txt".to_string()));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_state_ignores_repo_local_fsmonitor_config() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repo = temp.path().join("openclaw");
+        write_openclaw_fixture(&repo)?;
+        init_test_repo(&repo)?;
+        run_git_for_test(&repo, &["add", "."])?;
+        run_git_for_test(&repo, &["commit", "-m", "initial"])?;
+        let marker = temp.path().join("fsmonitor-ran");
+        let fsmonitor = temp.path().join("fsmonitor-hook.sh");
+        fs::write(
+            &fsmonitor,
+            format!("#!/bin/sh\nprintf ran > '{}'\n", marker.display()),
+        )?;
+        fs::set_permissions(&fsmonitor, fs::Permissions::from_mode(0o755))?;
+        let fsmonitor_path = fsmonitor.to_string_lossy().into_owned();
+        run_git_for_test(&repo, &["config", "core.fsmonitor", &fsmonitor_path])?;
+
+        let state = inspect_git_state(&repo)?;
+        let files = changed_files(&repo)?;
+
+        assert!(!state.head.is_empty());
+        assert!(files.is_empty());
+        assert!(
+            !marker.exists(),
+            "repo-local core.fsmonitor hook was executed"
+        );
         Ok(())
     }
 }
