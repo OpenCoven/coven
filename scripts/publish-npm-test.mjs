@@ -209,13 +209,28 @@ test('release workflow verifies the signed release tag before building or publis
   );
   assert.match(
     workflow,
-    /vars\.NPM_RELEASE_SIGNERS/,
-    'verify-tag must require an explicit signer allowlist via NPM_RELEASE_SIGNERS'
+    /vars\.NPM_RELEASE_ALLOWED_SIGNERS/,
+    'verify-tag must require an explicit SSH allowed-signers allowlist via NPM_RELEASE_ALLOWED_SIGNERS'
   );
   assert.match(
     workflow,
-    /tagger_email=\$\(jq -r '\.tagger\.email/,
-    'verify-tag must authorize the REST-verified annotated tagger email'
+    /git verify-tag "\$TAG_NAME"/,
+    'verify-tag must locally verify the tag against the SSH allowed signers file'
+  );
+  assert.match(
+    workflow,
+    /empty line/,
+    'verify-tag must reject empty allowed signer entries before authorization checks'
+  );
+  assert.match(
+    workflow,
+    /gpg\.ssh\.allowedSignersFile/,
+    'verify-tag must configure git with the release SSH allowed signers file'
+  );
+  assert.doesNotMatch(
+    workflow,
+    /tagger_email_lc|tagger_email=\$\(jq -r '\.tagger\.email|NPM_RELEASE_SIGNERS/,
+    'verify-tag must not authorize releases by mutable tagger email allowlist'
   );
   assert.doesNotMatch(
     workflow,

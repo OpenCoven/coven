@@ -6,7 +6,7 @@ name: Release npm packages
 # Auth: npm trusted publishing via GitHub Actions OIDC — no long-lived NPM_TOKEN required. Configure each
 #       @opencoven/cli* package on npmjs.com -> Settings -> Trusted Publishers before the first OIDC release.
 # Gate: the `verify-tag` job confirms the tag is annotated, that GitHub has cryptographically verified
-#       the maintainer's signature, and that the verified tagger email is release-allowlisted.
+#       the maintainer's signature, and that local git verification trusts the release signing key.
 
 on:
   push:
@@ -54,6 +54,7 @@ jobs:
       - name: Confirm tag is annotated, signer-authorized, and points to main
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_RELEASE_ALLOWED_SIGNERS: ${{ vars.NPM_RELEASE_ALLOWED_SIGNERS }}
         run: |
           set -euo pipefail
           TAG_NAME="${GITHUB_REF#refs/tags/}"
@@ -72,23 +73,34 @@ jobs:
           fi
           tag_object_type=$(jq -r '.object.type // ""' <<<"$payload")
           TAGGED_COMMIT_SHA=$(jq -r '.object.sha // ""' <<<"$payload")
-          tagger_email=$(jq -r '.tagger.email // ""' <<<"$payload")
-          echo "tag=$TAG_NAME verified=$verified reason=$reason tagger=${tagger_email:-unknown} target=$TAGGED_COMMIT_SHA"
+          echo "tag=$TAG_NAME verified=$verified reason=$reason target=$TAGGED_COMMIT_SHA"
           if [ "$tag_object_type" != "commit" ] || [ -z "$TAGGED_COMMIT_SHA" ]; then
             echo "::error::Refusing release: annotated tag $TAG_NAME targets ${tag_object_type:-unknown}, not a commit."
             exit 1
           fi
-          allowed_signers_raw='${{ vars.NPM_RELEASE_SIGNERS }}'
-          if [ -z "$allowed_signers_raw" ]; then
-            echo "::error::Repository variable NPM_RELEASE_SIGNERS must contain a comma-separated allowlist of release tagger emails."
+          allowed_signers_raw="${NPM_RELEASE_ALLOWED_SIGNERS:-}"
+          if [ -z "${allowed_signers_raw//[[:space:]]/}" ]; then
+            echo "::error::Repository variable NPM_RELEASE_ALLOWED_SIGNERS must contain one or more SSH allowed-signers lines."
             exit 1
           fi
-          allowed_signers=",$(echo "$allowed_signers_raw" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]'),"
-          tagger_email_lc=$(echo "$tagger_email" | tr '[:upper:]' '[:lower:]')
-          if [[ "$allowed_signers" != *",$tagger_email_lc,"* ]]; then
-            echo "::error::Tagger email $tagger_email is not in NPM_RELEASE_SIGNERS."
+          allowed_signers_file="$RUNNER_TEMP/coven-release-allowed-signers"
+          printf '%s\n' "$allowed_signers_raw" > "$allowed_signers_file"
+          line_number=0
+          while IFS= read -r signer_line || [ -n "$signer_line" ]; do
+            line_number=$((line_number + 1))
+            if [[ "$signer_line" =~ ^[[:space:]]*$ ]]; then
+              echo "::error::NPM_RELEASE_ALLOWED_SIGNERS contains an empty line at line $line_number."
+              exit 1
+            fi
+          done < "$allowed_signers_file"
+          git config gpg.format ssh
+          git config gpg.ssh.allowedSignersFile "$allowed_signers_file"
+          if ! verify_output=$(git verify-tag "$TAG_NAME" 2>&1); then
+            printf '%s\n' "$verify_output"
+            echo "::error::Release tag $TAG_NAME is not signed by a key in NPM_RELEASE_ALLOWED_SIGNERS."
             exit 1
           fi
+          printf '%s\n' "$verify_output"
           git fetch --no-tags origin main
           if ! git merge-base --is-ancestor "$TAGGED_COMMIT_SHA" origin/main; then
             echo "::error::Refusing release: tagged commit $TAGGED_COMMIT_SHA is not contained in origin/main."
