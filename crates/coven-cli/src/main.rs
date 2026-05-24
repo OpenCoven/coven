@@ -145,7 +145,10 @@ enum DaemonCommand {
         #[arg(
             long,
             value_name = "ADDR",
-            help = "Also bind an HTTP TCP listener at ADDR (e.g. 127.0.0.1:3000)"
+            help = "Also bind an HTTP TCP listener at ADDR (e.g. 127.0.0.1:3000). \
+                    The API is unauthenticated — bind only to loopback for local \
+                    dev (e.g. cockpit via Vite proxy). Do not expose to non-loopback \
+                    interfaces or untrusted networks."
         )]
         tcp: Option<String>,
     },

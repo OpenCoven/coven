@@ -654,9 +654,16 @@ fn daemon_status_from_health_socket(socket: &str) -> Result<Option<DaemonStatus>
 // `bind_tcp_listener` and `serve_next_tcp_connection` expose the TCP transport
 // so it can be unit-tested in isolation; `serve_forever` wires them into the
 // daemon's accept loop alongside the Unix socket listener.
+//
+// TCP gets read/write timeouts and a Content-Length cap because — unlike the
+// Unix socket — a misbehaving network client can otherwise hold the API
+// thread indefinitely (slowloris) or force a huge allocation by claiming a
+// large body.
+pub const TCP_IO_TIMEOUT: Duration = Duration::from_secs(30);
+pub const MAX_TCP_BODY_BYTES: usize = 1024 * 1024;
+
 pub fn bind_tcp_listener<A: std::net::ToSocketAddrs>(addr: A) -> Result<TcpListener> {
-    let listener = TcpListener::bind(&addr)
-        .with_context(|| "failed to bind Coven TCP listener")?;
+    let listener = TcpListener::bind(&addr).with_context(|| "failed to bind Coven TCP listener")?;
     Ok(listener)
 }
 
@@ -670,8 +677,21 @@ pub fn serve_next_tcp_connection(
     let (stream, _) = listener
         .accept()
         .context("failed to accept TCP API connection")?;
+    stream
+        .set_read_timeout(Some(TCP_IO_TIMEOUT))
+        .context("failed to set TCP read timeout")?;
+    stream
+        .set_write_timeout(Some(TCP_IO_TIMEOUT))
+        .context("failed to set TCP write timeout")?;
     let read = stream.try_clone().context("failed to clone TCP stream")?;
-    handle_http_stream(read, stream, coven_home, status, runtime)
+    handle_http_stream(
+        read,
+        stream,
+        coven_home,
+        status,
+        runtime,
+        Some(MAX_TCP_BODY_BYTES),
+    )
 }
 
 #[cfg(unix)]
@@ -696,11 +716,7 @@ pub fn bind_api_socket(coven_home: &Path) -> Result<UnixListener> {
 }
 
 #[cfg(unix)]
-pub fn serve_forever(
-    coven_home: &Path,
-    started_at: String,
-    tcp_addr: Option<&str>,
-) -> Result<()> {
+pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&str>) -> Result<()> {
     use std::sync::Arc;
     let status = DaemonStatus {
         pid: std::process::id(),
@@ -712,7 +728,9 @@ pub fn serve_forever(
     write_status(coven_home, &status)?;
     recover_orphaned_sessions(coven_home, &started_at)?;
     let unix_listener = bind_api_socket(coven_home)?;
-    let runtime = Arc::new(LiveSessionRuntime::with_coven_home(coven_home.to_path_buf()));
+    let runtime = Arc::new(LiveSessionRuntime::with_coven_home(
+        coven_home.to_path_buf(),
+    ));
 
     if let Some(addr) = tcp_addr {
         let tcp_listener = bind_tcp_listener(addr)?;
@@ -756,6 +774,7 @@ fn handle_http_stream<R, W>(
     coven_home: &Path,
     status: Option<DaemonStatus>,
     runtime: &dyn SessionRuntime,
+    max_body_bytes: Option<usize>,
 ) -> Result<()>
 where
     R: Read,
@@ -764,6 +783,11 @@ where
     let mut reader = BufReader::new(read);
     let request_line = read_http_request_line(&mut reader)?;
     let content_length = read_http_headers(&mut reader)?;
+    if let Some(max) = max_body_bytes {
+        if content_length > max {
+            return write_payload_too_large(&mut write, max);
+        }
+    }
     let body = read_http_body(&mut reader, content_length)?;
     let (method, path) = parse_request_line(&request_line)?;
     let response = crate::api::handle_request_with_runtime(
@@ -790,6 +814,22 @@ where
 }
 
 #[cfg(unix)]
+fn write_payload_too_large<W: Write>(write: &mut W, max: usize) -> Result<()> {
+    let body = format!(
+        "{{\"ok\":false,\"error\":{{\"code\":\"payload_too_large\",\"message\":\"Request body exceeds {max}-byte limit.\"}}}}",
+    );
+    let http = format!(
+        "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    write
+        .write_all(http.as_bytes())
+        .context("failed to write 413 response")?;
+    Ok(())
+}
+
+#[cfg(unix)]
 pub fn serve_next_connection(
     listener: &UnixListener,
     coven_home: &Path,
@@ -800,7 +840,9 @@ pub fn serve_next_connection(
         .accept()
         .context("failed to accept API connection")?;
     let read = stream.try_clone().context("failed to clone Unix stream")?;
-    handle_http_stream(read, stream, coven_home, status, runtime)
+    // Unix socket has no body cap — only local processes can reach it and the
+    // socket permission bits already gate access.
+    handle_http_stream(read, stream, coven_home, status, runtime, None)
 }
 
 fn http_reason_phrase(status: u16) -> &'static str {
@@ -970,11 +1012,44 @@ mod tests {
         let mut stream = Cursor::new(Vec::from(&request[..]));
         let mut output: Vec<u8> = Vec::new();
         let runtime = NoopSessionRuntime;
-        handle_http_stream(&mut stream, &mut output, temp.path(), None, &runtime)
+        handle_http_stream(&mut stream, &mut output, temp.path(), None, &runtime, None)
             .expect("handle ok");
         let response = String::from_utf8(output).expect("utf8");
         assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
         assert!(response.contains("\"apiVersion\""), "got: {response}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_http_stream_rejects_oversize_body() {
+        use crate::api::NoopSessionRuntime;
+        use std::io::Cursor;
+        let temp = tempfile::tempdir().expect("tempdir");
+        ensure_private_coven_home(temp.path()).expect("ensure home");
+        // Claim a body larger than the cap; the handler must reject without
+        // reading the body, so the bytes don't need to actually be present.
+        let request = format!(
+            "POST /api/v1/cast HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n",
+            MAX_TCP_BODY_BYTES + 1
+        );
+        let mut stream = Cursor::new(request.into_bytes());
+        let mut output: Vec<u8> = Vec::new();
+        let runtime = NoopSessionRuntime;
+        handle_http_stream(
+            &mut stream,
+            &mut output,
+            temp.path(),
+            None,
+            &runtime,
+            Some(MAX_TCP_BODY_BYTES),
+        )
+        .expect("handle ok");
+        let response = String::from_utf8(output).expect("utf8");
+        assert!(
+            response.starts_with("HTTP/1.1 413 Payload Too Large"),
+            "got: {response}"
+        );
+        assert!(response.contains("payload_too_large"), "got: {response}");
     }
 
     #[cfg(unix)]

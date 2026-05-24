@@ -473,9 +473,8 @@ fn submit_cast(coven_home: &Path, body: Option<&str>) -> Result<ApiResponse> {
 }
 
 fn ensure_cockpit_session(conn: &rusqlite::Connection) -> Result<()> {
-    if store::get_session(conn, "__cockpit__")?.is_some() {
-        return Ok(());
-    }
+    // INSERT OR IGNORE keeps this atomic under concurrent Unix + TCP accept
+    // loops — both transports can race the first cast through this path.
     let now = current_timestamp();
     let record = store::SessionRecord {
         id: "__cockpit__".into(),
@@ -488,7 +487,8 @@ fn ensure_cockpit_session(conn: &rusqlite::Connection) -> Result<()> {
         created_at: now.clone(),
         updated_at: now,
     };
-    store::insert_session(conn, &record)
+    store::insert_session_if_absent(conn, &record)?;
+    Ok(())
 }
 
 fn session_not_live_response(session_id: &str) -> Result<ApiResponse> {
@@ -607,9 +607,13 @@ fn event_to_log_line(event: store::EventRecord) -> LogLineDto {
 
 fn payload_preview(payload: &Value) -> String {
     const MAX: usize = 240;
+    // `data` is what the daemon's input/output events actually carry (see
+    // `LiveSessionRuntime::send_input` and the output observer); `text` and
+    // `message` cover hand-rolled event shapes we may emit later.
     let text = payload
         .get("text")
         .or_else(|| payload.get("message"))
+        .or_else(|| payload.get("data"))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| payload.to_string());
@@ -1698,7 +1702,10 @@ mod tests {
         assert_eq!(response.status, 202);
         let result: serde_json::Value = serde_json::from_str(&response.body)?;
         assert_eq!(result["accepted"], true);
-        assert!(result["cast_id"].as_str().expect("cast_id").starts_with("cast-"));
+        assert!(result["cast_id"]
+            .as_str()
+            .expect("cast_id")
+            .starts_with("cast-"));
         assert_eq!(result["echo"], "/status");
         Ok(())
     }
@@ -1739,13 +1746,8 @@ mod tests {
         drop(conn);
 
         let body = json!({ "code": "/handoff", "target": "sess-target" });
-        let response = handle_request_with_body(
-            "POST",
-            "/api/v1/cast",
-            home,
-            None,
-            Some(&body.to_string()),
-        )?;
+        let response =
+            handle_request_with_body("POST", "/api/v1/cast", home, None, Some(&body.to_string()))?;
         assert_eq!(response.status, 202);
         let result: serde_json::Value = serde_json::from_str(&response.body)?;
         assert_eq!(result["accepted"], true);
@@ -1809,7 +1811,10 @@ mod tests {
         let conn = store::open_store(&store_path(home))?;
         let sessions = store::list_sessions(&conn)?;
         let cockpit_count = sessions.iter().filter(|s| s.id == "__cockpit__").count();
-        assert_eq!(cockpit_count, 1, "expected exactly one __cockpit__ session row");
+        assert_eq!(
+            cockpit_count, 1,
+            "expected exactly one __cockpit__ session row"
+        );
         Ok(())
     }
 
@@ -1821,17 +1826,20 @@ mod tests {
         for id in ["s1", "s2", "s3"] {
             let now = "2026-01-01T00:00:00Z";
             let status = if id == "s3" { "ended" } else { "running" };
-            store::insert_session(&conn, &store::SessionRecord {
-                id: id.into(),
-                project_root: "/tmp".into(),
-                harness: "claude".into(),
-                title: "t".into(),
-                status: status.into(),
-                exit_code: None,
-                archived_at: None,
-                created_at: now.into(),
-                updated_at: now.into(),
-            })?;
+            store::insert_session(
+                &conn,
+                &store::SessionRecord {
+                    id: id.into(),
+                    project_root: "/tmp".into(),
+                    harness: "claude".into(),
+                    title: "t".into(),
+                    status: status.into(),
+                    exit_code: None,
+                    archived_at: None,
+                    created_at: now.into(),
+                    updated_at: now.into(),
+                },
+            )?;
         }
         drop(conn);
 
