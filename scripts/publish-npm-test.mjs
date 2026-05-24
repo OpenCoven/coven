@@ -222,6 +222,16 @@ test('release workflow verifies the signed release tag before building or publis
     /gpg\.format ssh[\s\S]*git tag -s/,
     'release instructions must show SSH signing configuration before the signed tag command'
   );
+  assert.doesNotMatch(
+    workflow,
+    /Trigger: pushing an SSH-signed annotated tag/,
+    'release instructions must not imply the GitHub push trigger itself rejects unsigned tags'
+  );
+  assert.match(
+    workflow,
+    /Trigger:[^\n]*any `v\*` tag push[\s\S]*Gate:[^\n]*requires an SSH-signed annotated tag/,
+    'release instructions must separate the broad tag trigger from the signed-tag gate'
+  );
   assert.match(
     workflow,
     /empty line/,
