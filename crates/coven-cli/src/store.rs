@@ -15,6 +15,15 @@ pub struct SessionRecord {
     pub archived_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// Optional grouping id so chat-style multi-turn conversations show as a
+    /// single thread in `/sessions` instead of one row per turn. Distinct
+    /// from `id` (which is per-session). In practice today this id is the
+    /// same value the chat passes to the harness CLI for resume — claude
+    /// uses a chat-generated UUID for both `--session-id` and grouping;
+    /// codex uses its own captured `session id: <uuid>` for both `exec
+    /// resume` and grouping. See `docs/chat-persistence.md`.
+    #[serde(default)]
+    pub conversation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,7 +75,8 @@ pub fn open_store(path: &Path) -> Result<Connection> {
             exit_code INTEGER,
             archived_at TEXT,
             created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            updated_at TEXT NOT NULL,
+            conversation_id TEXT
         );
 
         CREATE TABLE IF NOT EXISTS events (
@@ -96,6 +106,7 @@ pub fn open_store(path: &Path) -> Result<Connection> {
     .context("failed to initialize Coven store schema")?;
     ensure_exit_code_column(&conn)?;
     ensure_archived_at_column(&conn)?;
+    ensure_conversation_id_column(&conn)?;
 
     Ok(conn)
 }
@@ -146,6 +157,36 @@ fn ensure_archived_at_column(conn: &Connection) -> Result<()> {
         conn.execute("ALTER TABLE sessions ADD COLUMN archived_at TEXT", [])
             .context("failed to add sessions.archived_at column")?;
     }
+
+    Ok(())
+}
+
+fn ensure_conversation_id_column(conn: &Connection) -> Result<()> {
+    let mut statement = conn
+        .prepare("PRAGMA table_info(sessions)")
+        .context("failed to inspect sessions schema")?;
+    let has_conversation_id = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .context("failed to query sessions schema")?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to read sessions schema")?
+        .into_iter()
+        .any(|column| column == "conversation_id");
+
+    if !has_conversation_id {
+        conn.execute("ALTER TABLE sessions ADD COLUMN conversation_id TEXT", [])
+            .context("failed to add sessions.conversation_id column")?;
+    }
+    // Idempotent — covers both the fresh-create path (column came from
+    // the initial CREATE TABLE) and the migration path (column added just
+    // above). Lives outside the if-block so existing stores opened by a
+    // newer binary still get the index.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_conversation_id
+            ON sessions(conversation_id)",
+        [],
+    )
+    .context("failed to create sessions.conversation_id index")?;
 
     Ok(())
 }
@@ -226,8 +267,9 @@ pub fn insert_session(conn: &Connection, record: &SessionRecord) -> Result<()> {
             exit_code,
             archived_at,
             created_at,
-            updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            updated_at,
+            conversation_id
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             &record.id,
             &record.project_root,
@@ -238,6 +280,7 @@ pub fn insert_session(conn: &Connection, record: &SessionRecord) -> Result<()> {
             &record.archived_at,
             &record.created_at,
             &record.updated_at,
+            &record.conversation_id,
         ],
     )
     .with_context(|| format!("failed to insert session {}", record.id))?;
@@ -342,7 +385,8 @@ fn list_sessions_with_archive_filter(
                 exit_code,
                 archived_at,
                 created_at,
-                updated_at
+                updated_at,
+                conversation_id
             FROM sessions
             {archive_filter}
             ORDER BY created_at DESC, id DESC",
@@ -361,6 +405,7 @@ fn list_sessions_with_archive_filter(
                 archived_at: row.get(6)?,
                 created_at: row.get(7)?,
                 updated_at: row.get(8)?,
+                conversation_id: row.get(9)?,
             })
         })
         .context("failed to query sessions")?
@@ -1037,6 +1082,7 @@ mod tests {
             archived_at: None,
             created_at: created_at.to_string(),
             updated_at: created_at.to_string(),
+            conversation_id: None,
         }
     }
 }

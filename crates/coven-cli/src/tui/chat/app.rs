@@ -1,8 +1,11 @@
 //! Chat application state, behavior, and helpers. Owns `App` and all of its
 //! methods; provides `discover_agents` and the spinner-frame data.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+use uuid::Uuid;
 
 use crate::{
     harness, store,
@@ -15,6 +18,7 @@ use crate::{
 };
 
 use super::client::{coven_home_dir, ChatClient, ChatEventQuery, DaemonChatClient, LaunchRequest};
+use super::persistence;
 use super::settings::{self, ChatSettings, StreamingMode};
 
 // ── Data types ─────────────────────────────────────────────────────────────
@@ -100,6 +104,52 @@ pub(super) struct App {
     /// Timestamp of the most recent Ctrl+C press, used to require a double
     /// tap before exiting so a stray ^C doesn't kill the session.
     last_interrupt_at: Option<Instant>,
+    /// Per-harness conversation ids so chat turns reuse the harness CLI's
+    /// own session-resume mechanism. Persisted per-project so a fresh
+    /// `coven chat` invocation resumes the prior conversation. Reset on
+    /// `/clear`. See `docs/chat-persistence.md`.
+    harness_conversation_ids: HashMap<String, String>,
+    /// Canonical project root used to scope persisted conversation ids. If
+    /// missing (e.g. tests, broken cwd), the chat runs without cross-restart
+    /// persistence.
+    project_root: Option<PathBuf>,
+    /// True when `active_session_id` points at a session this chat launched
+    /// as a turn (so the next message should be a fresh launch + resume).
+    /// False when the user `/attach`ed an externally-spawned session, in
+    /// which case typing is forwarded as stdin to that PTY.
+    chat_owns_active_session: bool,
+    /// Harness id of `active_session_id`. Used to decide whether output from
+    /// the active session is worth scanning for a codex session-id banner.
+    active_session_harness: Option<String>,
+    /// Most recent user prompt the chat sent through `run_harness_prompt`,
+    /// stashed so stale-id recovery can auto-resend it with no hint instead
+    /// of asking the user to retype.
+    last_chat_prompt: Option<String>,
+    /// True if we've already auto-retried once during the current user turn.
+    /// Reset by `handle_input` so a fresh user message gets a fresh retry
+    /// budget; prevents an infinite loop if the retry itself somehow hits
+    /// stale-detection too.
+    auto_retry_consumed: bool,
+    /// Session ids whose events should be hidden from the visible
+    /// transcript. Populated when stale-recovery fires so the raw harness
+    /// error chunk, any trailing teardown output, and the orphaned exit
+    /// event don't clutter the chat after we've already kicked off a
+    /// retry. Entries are cleared once their exit (or kill) event arrives.
+    suppressed_session_ids: HashSet<String>,
+    /// Per-harness daemon session ids for long-lived stream-mode processes.
+    /// On the first chat turn for a stream-capable harness we launch with
+    /// `HarnessLaunchMode::Stream` and store the daemon session id here;
+    /// subsequent turns reuse it via `send_input` (no fresh launch, no
+    /// cold-start). Cleared on session exit/kill/`/clear`/`/new`. Today
+    /// only claude is stream-capable. See `docs/chat-persistence.md`.
+    harness_stream_session_ids: HashMap<String, String>,
+    /// Per-stream-session accumulator for partial JSON lines. Daemon
+    /// output events come from 8KiB reads of the child's stdout; a single
+    /// JSON line can be split across two events. We buffer the trailing
+    /// partial line here and prepend it to the next event so
+    /// `dispatch_stream_json_output` only ever tries to parse complete
+    /// newline-terminated lines.
+    stream_json_buffers: HashMap<String, String>,
     client: Box<dyn ChatClient>,
 }
 
@@ -135,7 +185,11 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/clear",
-        summary: "Clear the chat transcript",
+        summary: "Clear the transcript and start a fresh thread",
+    },
+    SlashCommand {
+        name: "/new",
+        summary: "Start a fresh thread; keep the transcript visible",
     },
     SlashCommand {
         name: "/agent",
@@ -193,10 +247,30 @@ impl App {
         client: Box<dyn ChatClient>,
         coven_home: Option<PathBuf>,
     ) -> Self {
+        Self::new_with_state_and_project_root(
+            agents,
+            active_agent,
+            client,
+            coven_home,
+            std::env::current_dir().ok(),
+        )
+    }
+
+    pub(super) fn new_with_state_and_project_root(
+        agents: Vec<AgentInfo>,
+        active_agent: Option<usize>,
+        client: Box<dyn ChatClient>,
+        coven_home: Option<PathBuf>,
+        project_root: Option<PathBuf>,
+    ) -> Self {
         let streaming_mode = coven_home
             .as_deref()
             .map(|home| settings::load_from(home).streaming)
             .unwrap_or_default();
+        let harness_conversation_ids = match (coven_home.as_deref(), project_root.as_deref()) {
+            (Some(home), Some(root)) => persistence::load_for_project(home, root),
+            _ => HashMap::new(),
+        };
         let mut app = App {
             messages: Vec::new(),
             input: String::new(),
@@ -229,6 +303,15 @@ impl App {
             slash_suggestion_index: 0,
             slash_popup_dismissed: false,
             last_interrupt_at: None,
+            harness_conversation_ids,
+            project_root,
+            chat_owns_active_session: false,
+            active_session_harness: None,
+            last_chat_prompt: None,
+            auto_retry_consumed: false,
+            suppressed_session_ids: HashSet::new(),
+            harness_stream_session_ids: HashMap::new(),
+            stream_json_buffers: HashMap::new(),
             client,
         };
 
@@ -386,6 +469,8 @@ impl App {
         }
 
         self.event_poll_paused_for_api_mismatch = false;
+        // Each user message gets a fresh auto-retry budget.
+        self.auto_retry_consumed = false;
 
         if self.pending_cast_confirmation.is_some() {
             let result = self.resolve_pending_cast_confirmation(&raw);
@@ -407,9 +492,30 @@ impl App {
             return Some(result);
         }
 
-        if let Some(session_id) = self.active_session_id.clone() {
+        // If the user is talking to an externally-spawned session they
+        // `/attach`ed to, keep the legacy "type forwards as stdin" flow —
+        // it's how you drive a long-running `coven run` task. Chat-owned
+        // sessions take the resume path instead.
+        if let Some(session_id) = self
+            .active_session_id
+            .clone()
+            .filter(|_| !self.chat_owns_active_session)
+        {
             self.forward_input_to_session(&session_id, &raw);
+        } else if self.is_responding {
+            self.push_system_message(
+                "Previous reply is still streaming. Wait for it to finish or press Ctrl+C to interrupt.",
+            );
         } else {
+            // Route into the chat-launch path. Non-stream harnesses (codex
+            // today) cold-start a fresh daemon session per turn, carrying
+            // conversation state through the harness CLI's own resume
+            // mechanism (--session-id/--resume for claude when not in
+            // stream mode, `exec resume <id>` for codex). Stream-mode
+            // harnesses (claude on unix) take a fast-path inside
+            // `run_harness_prompt` that reuses the existing long-lived
+            // daemon session via `forward_input_to_session` instead.
+            // See docs/chat-persistence.md.
             self.launch_chat_session(&raw);
         }
         self.scroll_to_bottom();
@@ -418,11 +524,81 @@ impl App {
 
     /// Clear the visible transcript and reset scroll, matching what `/clear`
     /// does. Used by Ctrl+L so the keybind doesn't have to fake a slash
-    /// command through the parser.
+    /// command through the parser. Also drops the harness conversation ids
+    /// (both in-memory and on disk) so the next turn starts a fresh thread
+    /// rather than silently resuming after a restart, and tears down any
+    /// long-lived stream sessions so the next claude turn cold-starts a
+    /// fresh process.
     pub(super) fn clear_transcript(&mut self) {
         self.messages.clear();
         self.scroll_offset = 0;
+        self.harness_conversation_ids.clear();
+        self.kill_all_stream_sessions();
+        self.clear_persisted_conversations();
         self.push_system_message("Chat cleared.");
+    }
+
+    /// Drop the in-memory + persisted harness conversation ids without
+    /// touching the visible transcript. Useful when a user wants to start
+    /// a fresh thread (next message will create a new harness session) but
+    /// keep the prior exchange visible for their own reference. Tears down
+    /// any long-lived stream sessions for the same reason as `/clear`.
+    pub(super) fn start_new_conversation(&mut self) {
+        self.harness_conversation_ids.clear();
+        self.kill_all_stream_sessions();
+        self.clear_persisted_conversations();
+        self.push_system_message(
+            "Started a new conversation. Your next message creates a fresh thread; the transcript above stays for reference.",
+        );
+    }
+
+    /// Best-effort shutdown for the chat App: tears down any long-lived
+    /// stream-mode daemon sessions so they don't outlive `coven chat`.
+    /// Called by `run_chat` on every exit path (slash `/exit`, double
+    /// Ctrl+C, Ctrl+D, panic-free unwind of the event loop). Safe to
+    /// call multiple times — `kill_all_stream_sessions` is idempotent on
+    /// an empty map.
+    pub(super) fn shutdown(&mut self) {
+        self.kill_all_stream_sessions();
+    }
+
+    /// Kill every tracked stream-mode daemon session and clear our local
+    /// map (including the per-session JSON buffers — leaving those behind
+    /// would leak across a long chat). Best-effort: kill failures are
+    /// logged but don't block the caller. Used by `/clear`, `/new`, and
+    /// `shutdown` to ensure the next message cold-starts a fresh stream
+    /// process (or no process at all, on exit).
+    ///
+    /// Also clears `active_session_id` if it points at one of the killed
+    /// sessions and adds each killed id to `suppressed_session_ids`, so
+    /// the user's "Chat cleared."/"Started a new conversation." line
+    /// isn't followed by an orphan "Session kill recorded." once the
+    /// daemon's kill event eventually polls in.
+    fn kill_all_stream_sessions(&mut self) {
+        let ids: Vec<String> = self.harness_stream_session_ids.values().cloned().collect();
+        for id in &ids {
+            if let Err(error) = self.client.kill_session(id) {
+                self.push_system_message(&format!(
+                    "Stream session {id} kill failed: {error}. Daemon may still hold it."
+                ));
+            }
+            self.stream_json_buffers.remove(id);
+            // Suppress the impending kill/exit events for this session so
+            // they don't leak back into the transcript after the user
+            // reset state.
+            self.suppressed_session_ids.insert(id.clone());
+            // If the active session is one we're tearing down, clear the
+            // active-session fields now so the event poller stops
+            // chasing it and the next user input is treated as a fresh
+            // turn rather than a "reply still streaming" rejection.
+            if self.active_session_id.as_deref() == Some(id.as_str()) {
+                self.active_session_id = None;
+                self.active_session_harness = None;
+                self.chat_owns_active_session = false;
+                self.is_responding = false;
+            }
+        }
+        self.harness_stream_session_ids.clear();
     }
 
     pub(super) fn handle_slash_command(&mut self, input: &str) -> SlashCommandResult {
@@ -437,6 +613,10 @@ impl App {
             }
             "/clear" | "/cls" => {
                 self.clear_transcript();
+                SlashCommandResult::Handled
+            }
+            "/new" => {
+                self.start_new_conversation();
                 SlashCommandResult::Handled
             }
             "/agent" | "/a" => {
@@ -744,13 +924,62 @@ impl App {
     fn run_harness_prompt(&mut self, harness: &str, prompt: &str) -> Option<store::SessionRecord> {
         self.is_responding = true;
         self.agent_output_mode = AgentOutputMode::Unknown;
-        let result = LaunchRequest::for_current_dir(harness, prompt)
-            .and_then(|request| self.client.launch_session(request));
+        // Stash the prompt so stale-id recovery can auto-resend it without
+        // making the user retype.
+        self.last_chat_prompt = Some(prompt.to_string());
+
+        // Fast path for stream-mode harnesses (today: claude). If we
+        // already have a long-lived stream session for this harness, send
+        // the next user message into it instead of cold-starting a new
+        // daemon session.
+        if harness::harness_supports_stream_mode(harness) {
+            if let Some(stream_id) = self.harness_stream_session_ids.get(harness).cloned() {
+                self.active_session_id = Some(stream_id.clone());
+                self.active_session_harness = Some(harness.to_string());
+                self.chat_owns_active_session = true;
+                self.reset_event_poll_failures();
+                self.forward_input_to_session(&stream_id, prompt);
+                // No SessionRecord to return — the caller's "Started
+                // daemon session" outcome is suppressed for warm sends.
+                return None;
+            }
+        }
+
+        let hint = self.conversation_hint_for_harness(harness);
+        // Same map that holds the harness-CLI session id also serves as the
+        // ledger conversation id, so /sessions can collapse multi-turn
+        // threads. Codex's very first turn has no entry yet (we capture
+        // from output), so it lands as an ungrouped row — see
+        // `docs/chat-persistence.md`.
+        let conversation_id = self.harness_conversation_ids.get(harness).cloned();
+        let launch_mode = if harness::harness_supports_stream_mode(harness) {
+            crate::harness::HarnessLaunchMode::Stream
+        } else {
+            crate::harness::HarnessLaunchMode::NonInteractive
+        };
+        let result = LaunchRequest::for_current_dir(harness, prompt).map(|mut request| {
+            request.launch_mode = launch_mode;
+            let request = match hint {
+                Some(hint) => request.with_conversation(hint),
+                None => request,
+            };
+            match conversation_id {
+                Some(id) => request.with_conversation_id(id),
+                None => request,
+            }
+        });
+        let result = result.and_then(|request| self.client.launch_session(request));
         match result {
             Ok(session) => {
                 self.active_session_id = Some(session.id.clone());
+                self.active_session_harness = Some(session.harness.clone());
+                self.chat_owns_active_session = true;
                 self.last_event_seq = None;
                 self.reset_event_poll_failures();
+                if launch_mode == crate::harness::HarnessLaunchMode::Stream {
+                    self.harness_stream_session_ids
+                        .insert(harness.to_string(), session.id.clone());
+                }
                 self.push_system_message("Connected. Waiting for the reply.");
                 self.poll_session_events();
                 Some(session)
@@ -765,14 +994,116 @@ impl App {
         }
     }
 
+    /// Decide whether a launch for `harness` should ride a resumable chat
+    /// session, and if so produce the right hint. For harnesses where we can
+    /// pre-assign the session id (claude `--session-id`) the first turn sends
+    /// `Init` with a freshly generated UUID. For harnesses that auto-assign
+    /// (codex) the first turn sends no hint and the id is captured from
+    /// output afterwards via `maybe_capture_codex_session_id`.
+    fn conversation_hint_for_harness(
+        &mut self,
+        harness: &str,
+    ) -> Option<harness::ConversationHint> {
+        if !harness_supports_chat_resume(harness) {
+            return None;
+        }
+        if let Some(id) = self.harness_conversation_ids.get(harness) {
+            return Some(harness::ConversationHint::Resume { id: id.clone() });
+        }
+        if harness::harness_supports_preassigned_session_id(harness) {
+            let id = Uuid::new_v4().to_string();
+            self.harness_conversation_ids
+                .insert(harness.to_string(), id.clone());
+            self.persist_conversations();
+            Some(harness::ConversationHint::Init { id })
+        } else {
+            None
+        }
+    }
+
+    /// Best-effort write of `harness_conversation_ids` to the per-project
+    /// persistence file. Logged on failure (as a system message) but never
+    /// fatal — the in-memory map is authoritative for the current session.
+    fn persist_conversations(&mut self) {
+        let (Some(home), Some(root)) = (self.coven_home.as_deref(), self.project_root.as_deref())
+        else {
+            return;
+        };
+        if let Err(error) =
+            persistence::save_for_project(home, root, &self.harness_conversation_ids)
+        {
+            self.push_system_message(&format!(
+                "Could not persist chat conversation ids: {error}. Resume across restarts may not work."
+            ));
+        }
+    }
+
+    /// Best-effort delete of the per-project persistence file. Called from
+    /// `/clear` so a deliberate reset doesn't silently resume on the next
+    /// `coven chat` invocation. Logged on failure but never fatal.
+    fn clear_persisted_conversations(&mut self) {
+        let (Some(home), Some(root)) = (self.coven_home.as_deref(), self.project_root.as_deref())
+        else {
+            return;
+        };
+        if let Err(error) = persistence::clear_for_project(home, root) {
+            self.push_system_message(&format!(
+                "Could not clear persisted chat conversation ids: {error}."
+            ));
+        }
+    }
+
+    /// Send raw text as stdin to a session — either one the user
+    /// `/attach`ed to (PTY-backed) or one of our own long-lived stream
+    /// sessions. PTY sessions need a trailing newline so Enter submits;
+    /// stream sessions don't, because the daemon wraps the payload in a
+    /// JSON envelope verbatim and the inner `\n` would otherwise leak
+    /// into the user message text on every turn after the first.
+    ///
+    /// **Limitation**: this distinguishes stream-vs-PTY by checking our
+    /// own `harness_stream_session_ids` map, which only knows about
+    /// stream sessions this chat instance launched. If a future
+    /// `/attach` connects to a stream session launched by another
+    /// process (or a stream session that survived a restart), the check
+    /// would mis-treat it as PTY and append the spurious `\n`. Today no
+    /// flow produces this state — only chat launches stream sessions
+    /// and `/attach` is documented for `coven run`-spawned PTY tasks —
+    /// but the proper fix is exposing the session kind on
+    /// `SessionRecord` so the daemon is the source of truth.
     fn forward_input_to_session(&mut self, session_id: &str, raw: &str) {
         self.is_responding = true;
-        let result = self.client.send_input(session_id, &format!("{raw}\n"));
+        let is_stream = self
+            .harness_stream_session_ids
+            .values()
+            .any(|id| id == session_id);
+        let payload = if is_stream {
+            raw.to_string()
+        } else {
+            format!("{raw}\n")
+        };
+        let result = self.client.send_input(session_id, &payload);
         match result {
             Ok(()) => self.poll_session_events(),
             Err(error) => {
                 self.is_responding = false;
                 self.push_system_message(&format!("Input rejected: {error}"));
+                // For stream-mode failures, the long-lived child is
+                // almost certainly dead (daemon returns NotLiveError
+                // when the registry entry is gone, which only happens
+                // after the wait thread reaped the process). Drop the
+                // tracking entry and its buffer so the next user
+                // message cold-starts a fresh stream session instead
+                // of looping into the same dead pipe.
+                if is_stream {
+                    self.harness_stream_session_ids
+                        .retain(|_, id| id != session_id);
+                    self.stream_json_buffers.remove(session_id);
+                    if self.active_session_id.as_deref() == Some(session_id) {
+                        self.active_session_id = None;
+                        self.active_session_harness = None;
+                        self.chat_owns_active_session = false;
+                    }
+                }
             }
         }
     }
@@ -781,6 +1112,8 @@ impl App {
         match self.client.get_session(session_id) {
             Ok(session) => {
                 self.active_session_id = Some(session.id.clone());
+                self.active_session_harness = Some(session.harness.clone());
+                self.chat_owns_active_session = false;
                 self.last_event_seq = None;
                 self.agent_output_mode = AgentOutputMode::Unknown;
                 self.reset_event_poll_failures();
@@ -816,7 +1149,14 @@ impl App {
             Ok(session) => {
                 self.push_system_message(&format!("Summoned session {session_id}."));
                 self.active_session_id = Some(session.id.clone());
+                self.active_session_harness = Some(session.harness.clone());
+                // Summon attaches to an externally-spawned (or
+                // previously-archived) session; treat it like /attach so
+                // typing forwards to its PTY stdin instead of cold-
+                // starting a chat turn over it.
+                self.chat_owns_active_session = false;
                 self.last_event_seq = None;
+                self.agent_output_mode = AgentOutputMode::Unknown;
                 self.reset_event_poll_failures();
                 self.push_system_message(&format!(
                     "Attached to daemon session {} ({}, {})",
@@ -833,6 +1173,8 @@ impl App {
             Ok(()) => {
                 if self.active_session_id.as_deref() == Some(session_id) {
                     self.active_session_id = None;
+                    self.active_session_harness = None;
+                    self.chat_owns_active_session = false;
                 }
                 self.push_system_message(&format!("Sacrificed session {session_id}."));
             }
@@ -869,6 +1211,17 @@ impl App {
             Ok(events) => {
                 self.reset_event_poll_failures();
                 for event in events {
+                    // If `push_event_message` swapped the active session
+                    // mid-batch (e.g. stale-id recovery auto-relaunched
+                    // into a new session and reset `last_event_seq` to
+                    // None), stop processing this batch. Continuing
+                    // would advance `last_event_seq` to one of the OLD
+                    // session's seqs, causing the next poll for the NEW
+                    // session to query with a cursor that filters out
+                    // the new session's own events.
+                    if self.active_session_id.as_deref() != Some(session_id.as_str()) {
+                        break;
+                    }
                     self.last_event_seq = Some(event.seq);
                     self.push_event_message(&event);
                 }
@@ -904,10 +1257,260 @@ impl App {
         }
     }
 
+    /// Codex auto-assigns a session id on its first turn and prints it in
+    /// the run header (`session id: <uuid>`). When this chat owns a running
+    /// codex session and we haven't captured its id yet, scan the chunk for
+    /// the banner so the *next* turn can `codex exec resume <id> <prompt>`.
+    fn maybe_capture_codex_session_id(&mut self, data: &str) {
+        if !self.chat_owns_active_session {
+            return;
+        }
+        if self.active_session_harness.as_deref() != Some("codex") {
+            return;
+        }
+        if self.harness_conversation_ids.contains_key("codex") {
+            return;
+        }
+        if let Some(id) = extract_codex_session_id(data) {
+            self.harness_conversation_ids
+                .insert("codex".to_string(), id);
+            self.persist_conversations();
+        }
+    }
+
+    /// If the harness rejected our `Resume` because the prior session no
+    /// longer exists (claude or codex local store wiped, server-side
+    /// expiry, etc.), drop the stale id from memory and disk and either
+    /// auto-resend the original prompt (preferred) or tell the user to
+    /// retype if we've already auto-retried this turn. Only fires for
+    /// chat-owned sessions where we actually had a stored id to send.
+    fn maybe_clear_stale_conversation_id(&mut self, data: &str) {
+        if !self.chat_owns_active_session {
+            return;
+        }
+        let Some(harness) = self.active_session_harness.clone() else {
+            return;
+        };
+        if !self.harness_conversation_ids.contains_key(&harness) {
+            return;
+        }
+        if !detect_stale_session(&harness, data) {
+            return;
+        }
+        self.harness_conversation_ids.remove(&harness);
+        // The dying stream session (if any) can't be reused: claude rejected
+        // its --resume id and is about to exit. Drop it (and its JSON
+        // line buffer) so the auto-retry cold-starts a fresh stream
+        // process instead of forwarding to a half-dead pipe. The
+        // eventual exit event will be ignored thanks to the suppression
+        // entry below.
+        if let Some(stale_stream_id) = self.harness_stream_session_ids.remove(&harness) {
+            self.stream_json_buffers.remove(&stale_stream_id);
+        }
+        self.persist_conversations();
+        // Hide any further output and the eventual exit event for the
+        // failed session so the user only sees the system message + the
+        // retry's reply.
+        if let Some(failed_session_id) = self.active_session_id.clone() {
+            self.suppressed_session_ids.insert(failed_session_id);
+        }
+
+        // Try to auto-resend so the user doesn't have to retype. Skip if
+        // we've already retried this turn (defense against a retry that
+        // itself trips the stale phrase — natural flow won't, since a
+        // post-drop turn sends no Resume, but be defensive anyway).
+        let prompt = self
+            .last_chat_prompt
+            .clone()
+            .filter(|_| !self.auto_retry_consumed);
+        match prompt {
+            Some(prompt) => {
+                self.push_system_message(&format!(
+                    "Prior {harness} conversation no longer exists. Starting a new one and re-sending your message."
+                ));
+                self.auto_retry_consumed = true;
+                self.run_harness_prompt(&harness, &prompt);
+            }
+            None => {
+                // No auto-retry: clear the active-session state now so
+                // the user's next message isn't gated as "still
+                // streaming". Without this, the failed session's
+                // events stay suppressed (so exit/kill won't reach
+                // the normal state-reset arms in push_event_message),
+                // and the chat wedges with `is_responding == true`
+                // forever.
+                self.is_responding = false;
+                self.active_session_id = None;
+                self.active_session_harness = None;
+                self.chat_owns_active_session = false;
+                self.push_system_message(&format!(
+                    "Prior {harness} conversation no longer exists. Send your message again to start a fresh one."
+                ));
+            }
+        }
+    }
+
+    /// Parse a chunk of stream-mode harness output (newline-delimited JSON)
+    /// and turn it into chat-visible messages. Each line is one JSON event:
+    /// `assistant.message.content[].text` becomes an agent message; the
+    /// `result` event marks the turn complete and clears `is_responding`;
+    /// other event types (system init, rate_limit_event, …) are ignored
+    /// for now. Malformed lines are silently dropped — stream-mode is too
+    /// noisy to surface every parse error.
+    fn dispatch_stream_json_output(&mut self, session_id: &str, data: &str) {
+        let sender = self.active_agent_label().to_string();
+        // Daemon output events come from raw 8KiB reads, so a JSON line
+        // can be split across two events. Buffer the trailing partial
+        // line and prepend it to the next chunk so we only try to parse
+        // complete newline-terminated lines.
+        let buffer = self
+            .stream_json_buffers
+            .entry(session_id.to_string())
+            .or_default();
+        buffer.push_str(data);
+        let (complete, remainder) = match buffer.rfind('\n') {
+            Some(idx) => (buffer[..=idx].to_string(), buffer[idx + 1..].to_string()),
+            None => (String::new(), std::mem::take(buffer)),
+        };
+        *buffer = remainder;
+
+        for line in complete.split('\n') {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(value): Result<serde_json::Value, _> = serde_json::from_str(trimmed) else {
+                continue;
+            };
+            let Some(kind) = value.get("type").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            match kind {
+                "assistant" => {
+                    let Some(content) = value
+                        .get("message")
+                        .and_then(|m| m.get("content"))
+                        .and_then(serde_json::Value::as_array)
+                    else {
+                        continue;
+                    };
+                    let mut chunk = String::new();
+                    for block in content {
+                        if block.get("type").and_then(serde_json::Value::as_str) == Some("text") {
+                            if let Some(text) =
+                                block.get("text").and_then(serde_json::Value::as_str)
+                            {
+                                chunk.push_str(text);
+                            }
+                        }
+                    }
+                    if !chunk.is_empty() {
+                        if self.streaming_mode.is_live() {
+                            self.push_or_append_agent_message(&sender, &chunk);
+                        } else {
+                            self.buffer_pending_agent_output(&sender, &chunk);
+                        }
+                    }
+                }
+                "result" => {
+                    self.flush_pending_agent_buffer();
+                    self.is_responding = false;
+                }
+                "system" => {
+                    // Daemon wraps stream-mode child stderr in
+                    // {"type":"system","subtype":"stderr","text":...} so
+                    // chat surfaces auth/setup errors instead of dropping
+                    // them. Other system subtypes (init, etc.) stay silent.
+                    //
+                    // The stderr text comes from a subprocess we don't
+                    // control — it can contain ANSI escapes or other
+                    // control codes that would corrupt the TUI render.
+                    // Run it through `clean_terminal_output` to strip
+                    // those before pushing to the transcript. We also
+                    // pipe stderr text through `maybe_clear_stale_conversation_id`
+                    // here (instead of the broad chunk-level check in
+                    // `push_event_message`) so stale-id auto-retry
+                    // never fires off assistant prose that happens to
+                    // quote the error phrase.
+                    let subtype = value
+                        .get("subtype")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    if subtype == "stderr" {
+                        if let Some(text) = value.get("text").and_then(serde_json::Value::as_str) {
+                            self.maybe_clear_stale_conversation_id(text);
+                            // If the stale handler just suppressed this
+                            // session, skip rendering the raw stderr
+                            // line — the auto-retry's "Prior X
+                            // conversation no longer exists. Starting a
+                            // new one and re-sending your message."
+                            // system message tells the user what they
+                            // need to know, and the raw harness error
+                            // would just be noise after it.
+                            if self.suppressed_session_ids.contains(session_id) {
+                                continue;
+                            }
+                            if let Some(safe) = clean_terminal_output(text) {
+                                let trimmed = safe.trim_end_matches('\n');
+                                if !trimmed.is_empty() {
+                                    self.push_system_message(&format!(
+                                        "[{sender} stderr] {trimmed}"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn push_event_message(&mut self, event: &store::EventRecord) {
+        // Drop events from sessions we've decided to hide (today: failed
+        // sessions whose stale-id we already auto-recovered from). Clear
+        // the entry once the session has reached a terminal event so the
+        // set doesn't grow over the chat lifetime.
+        if self.suppressed_session_ids.contains(&event.session_id) {
+            if matches!(event.kind.as_str(), "exit" | "kill") {
+                self.suppressed_session_ids.remove(&event.session_id);
+            }
+            return;
+        }
         match event.kind.as_str() {
             "output" => {
                 if let Some(data) = event_payload_text(event, "data") {
+                    self.maybe_capture_codex_session_id(&data);
+                    // Stale-id detection is scoped per-mode to avoid
+                    // false-positive auto-retries on assistant text
+                    // that happens to quote the error phrase. Stream
+                    // mode runs stale checks ONLY against the stderr
+                    // text inside `{"type":"system","subtype":"stderr"}`
+                    // envelopes (see `dispatch_stream_json_output`); we
+                    // skip the broad text match here. PTY mode (NonInteractive
+                    // codex / fallback claude) doesn't have a JSON
+                    // structure to lean on, so we still run the broad
+                    // match on the raw chunk.
+                    let is_stream = self
+                        .harness_stream_session_ids
+                        .values()
+                        .any(|id| id == &event.session_id);
+                    if !is_stream {
+                        self.maybe_clear_stale_conversation_id(&data);
+                    }
+                    // The stale handler may have just suppressed this very
+                    // session; if so, skip displaying this chunk too.
+                    if self.suppressed_session_ids.contains(&event.session_id) {
+                        return;
+                    }
+                    if is_stream {
+                        // Stream-mode output is newline-delimited JSON.
+                        // dispatch_stream_json_output extracts assistant
+                        // text from envelopes AND scopes stale detection
+                        // to system/stderr text only.
+                        self.dispatch_stream_json_output(&event.session_id, &data);
+                        return;
+                    }
                     let sender = self.active_agent_label().to_string();
                     if let Some(text) =
                         human_facing_agent_output(&data, &mut self.agent_output_mode)
@@ -927,7 +1530,16 @@ impl App {
                 self.is_responding = false;
                 if self.active_session_id.as_deref() == Some(event.session_id.as_str()) {
                     self.active_session_id = None;
+                    self.active_session_harness = None;
+                    self.chat_owns_active_session = false;
                 }
+                // If a stream session for any harness died, drop its id so
+                // the next turn cold-starts a fresh one instead of
+                // forwarding to a dead pipe. Also drop its JSON buffer
+                // (partial lines from before the exit are stale now).
+                self.harness_stream_session_ids
+                    .retain(|_, id| id != &event.session_id);
+                self.stream_json_buffers.remove(&event.session_id);
                 self.agent_output_mode = AgentOutputMode::Unknown;
                 self.push_system_message(&format!("Session {status}."));
             }
@@ -935,8 +1547,13 @@ impl App {
                 self.flush_pending_agent_buffer();
                 if self.active_session_id.as_deref() == Some(event.session_id.as_str()) {
                     self.active_session_id = None;
+                    self.active_session_harness = None;
+                    self.chat_owns_active_session = false;
                     self.is_responding = false;
                 }
+                self.harness_stream_session_ids
+                    .retain(|_, id| id != &event.session_id);
+                self.stream_json_buffers.remove(&event.session_id);
                 self.agent_output_mode = AgentOutputMode::Unknown;
                 self.push_system_message("Session kill recorded.");
             }
@@ -1301,6 +1918,7 @@ fn is_chat_local_slash(input: &str) -> bool {
             | "/palette"
             | "/clear"
             | "/cls"
+            | "/new"
             | "/agent"
             | "/a"
             | "/export"
@@ -1319,6 +1937,57 @@ fn is_chat_local_slash(input: &str) -> bool {
 fn should_keep_launch_inline(plan: &CastPlan) -> bool {
     !matches!(plan.intent, CastIntent::NaturalSpell { .. })
         || !matches!(plan.risk(), CastRisk::Safe)
+}
+
+/// Whether a chat turn launched against this harness should reuse the prior
+/// turn's conversation via the harness CLI's session-resume mechanism. See
+/// `docs/chat-persistence.md` for the per-harness mechanics.
+fn harness_supports_chat_resume(harness: &str) -> bool {
+    matches!(harness, "claude" | "codex")
+}
+
+/// Whether `data` (a chunk of harness output) indicates the harness rejected
+/// our `Resume` because the session id it carried no longer exists. Both
+/// claude and codex unhelpfully exit with code 0 in this case, so we have to
+/// pattern-match on their distinctive error wording. See
+/// `docs/chat-persistence.md` under "stale-id auto-recovery".
+///
+/// The match is a broad `contains` because callers scope the input
+/// before passing it in. For Stream mode `push_event_message` skips the
+/// broad check and `dispatch_stream_json_output` calls this only with
+/// the unwrapped `text` of `system/stderr` envelopes, so assistant
+/// prose can never trip it. For PTY mode (NonInteractive codex / fallback
+/// claude) we still match the whole stdout chunk because there's no
+/// JSON structure to lean on; the realistic risk there is a turn-1
+/// codex error message that quotes the phrase, which is acceptable
+/// given codex's stale error is also turn-1-only.
+fn detect_stale_session(harness: &str, data: &str) -> bool {
+    match harness {
+        "claude" => data.contains("No conversation found with session ID"),
+        "codex" => {
+            data.contains("no rollout found for thread id") || data.contains("thread/resume failed")
+        }
+        _ => false,
+    }
+}
+
+/// Scan `data` (a chunk of cleaned-but-not-line-filtered harness output) for a
+/// codex session-id banner line and return the uuid if present. Codex prints
+/// `session id: <uuid>` in the header of every `codex exec` run; we capture
+/// it so the next chat turn can `codex exec resume <id> <prompt>`.
+fn extract_codex_session_id(data: &str) -> Option<String> {
+    const PREFIX: &str = "session id:";
+    for line in data.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix(PREFIX) else {
+            continue;
+        };
+        let id = rest.trim();
+        if !id.is_empty() {
+            return Some(id.to_string());
+        }
+    }
+    None
 }
 
 fn format_cast_plan_for_chat(plan: &CastPlan) -> String {
@@ -1496,7 +2165,9 @@ mod tests {
     use super::*;
     use crate::store::{EventRecord, SessionRecord};
     use crate::tui::chat::client::{ChatClient, ChatEventQuery, LaunchRequest};
+    use crate::tui::chat::persistence;
     use std::cell::RefCell;
+    use std::path::Path;
     use std::rc::Rc;
 
     fn app_with_agents(agents: Vec<AgentInfo>) -> App {
@@ -1526,6 +2197,7 @@ mod tests {
         events: Rc<RefCell<Vec<EventRecord>>>,
         event_error: Rc<RefCell<Option<String>>>,
         launch_error: Rc<RefCell<Option<String>>>,
+        send_input_error: Rc<RefCell<Option<String>>>,
     }
 
     impl RecordingChatClient {
@@ -1586,6 +2258,9 @@ mod tests {
             self.calls
                 .borrow_mut()
                 .push(format!("input:{session_id}:{data}"));
+            if let Some(error) = self.send_input_error.borrow().clone() {
+                return Err(anyhow::anyhow!(error));
+            }
             Ok(())
         }
 
@@ -1641,6 +2316,28 @@ mod tests {
         (app, mirror)
     }
 
+    /// Like `app_with_client` but with `coven_home` + `project_root` wired
+    /// so cross-restart persistence is exercised. Returns the mirror plus the
+    /// two paths so tests can simulate a restart by constructing a second
+    /// App that points at the same persisted store.
+    fn app_with_persistence(
+        client: RecordingChatClient,
+        coven_home: &Path,
+        project_root: &Path,
+    ) -> (App, RecordingChatClient) {
+        let mirror = client.clone();
+        let agents = vec![agent("codex", true), agent("claude", true)];
+        let mut app = App::new_with_state_and_project_root(
+            agents,
+            Some(0),
+            Box::new(client),
+            Some(coven_home.to_path_buf()),
+            Some(project_root.to_path_buf()),
+        );
+        app.messages.clear();
+        (app, mirror)
+    }
+
     fn test_session(id: &str, harness: &str, title: &str, status: &str) -> SessionRecord {
         SessionRecord {
             id: id.to_string(),
@@ -1652,6 +2349,7 @@ mod tests {
             archived_at: None,
             created_at: "2026-05-19T00:00:00Z".to_string(),
             updated_at: "2026-05-19T00:00:00Z".to_string(),
+            conversation_id: None,
         }
     }
 
@@ -1664,6 +2362,21 @@ mod tests {
             payload_json: serde_json::json!({ "data": data }).to_string(),
             created_at: "2026-05-19T00:00:00Z".to_string(),
         }
+    }
+
+    /// Build a stream-json `{"type":"system","subtype":"stderr","text":...}\n`
+    /// envelope, the wire format the daemon emits for piped-child stderr
+    /// lines. Stale-id detection in stream-mode runs ONLY against the
+    /// unwrapped `text` of these envelopes (not against assistant
+    /// content), so stale tests must use this helper when simulating a
+    /// stream session.
+    fn stale_stderr_chunk(text: &str) -> String {
+        let envelope = serde_json::json!({
+            "type": "system",
+            "subtype": "stderr",
+            "text": text,
+        });
+        format!("{envelope}\n")
     }
 
     #[test]
@@ -1719,7 +2432,1396 @@ mod tests {
     }
 
     #[test]
-    fn plain_chat_input_launches_interactive_daemon_session_without_mock_response() {
+    fn first_claude_chat_turn_attaches_init_conversation_hint() {
+        let client = RecordingChatClient::default();
+        let (mut app, mirror) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hello".to_string();
+        app.cursor_pos = app.input.len();
+
+        app.handle_input();
+
+        let launched = mirror.launched.borrow();
+        assert_eq!(launched.len(), 1);
+        assert_eq!(launched[0].harness, "claude");
+        match &launched[0].conversation {
+            Some(crate::harness::ConversationHint::Init { id }) => {
+                assert!(!id.is_empty(), "Init id must be a non-empty uuid");
+            }
+            other => panic!("first turn should carry Init hint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn second_claude_chat_turn_reuses_init_id_as_resume() {
+        let client = RecordingChatClient::default();
+        let (mut app, mirror) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "first".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let first_session_id = app
+            .active_session_id()
+            .expect("first launch sets id")
+            .to_string();
+        let init_id = match &mirror.launched.borrow()[0].conversation {
+            Some(crate::harness::ConversationHint::Init { id }) => id.clone(),
+            other => panic!("first turn should be Init, got {other:?}"),
+        };
+
+        // Simulate harness exit so the next turn isn't gated by is_responding.
+        app.push_event_message(&EventRecord {
+            seq: 1,
+            id: "event-1".to_string(),
+            session_id: first_session_id,
+            kind: "exit".to_string(),
+            payload_json: serde_json::json!({ "status": "completed" }).to_string(),
+            created_at: "2026-05-19T00:00:00Z".to_string(),
+        });
+
+        app.input = "second".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+
+        let launched = mirror.launched.borrow();
+        assert_eq!(launched.len(), 2);
+        match &launched[1].conversation {
+            Some(crate::harness::ConversationHint::Resume { id }) => {
+                assert_eq!(id, &init_id, "second turn must resume the first turn's id");
+            }
+            other => panic!("second turn should carry Resume hint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clear_transcript_drops_conversation_ids_so_next_turn_is_init() {
+        let client = RecordingChatClient::default();
+        let (mut app, mirror) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "first".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app
+            .active_session_id()
+            .expect("first launch sets id")
+            .to_string();
+        app.push_event_message(&EventRecord {
+            seq: 1,
+            id: "event-1".to_string(),
+            session_id,
+            kind: "exit".to_string(),
+            payload_json: serde_json::json!({ "status": "completed" }).to_string(),
+            created_at: "2026-05-19T00:00:00Z".to_string(),
+        });
+
+        app.clear_transcript();
+
+        app.input = "fresh".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+
+        let launched = mirror.launched.borrow();
+        assert_eq!(launched.len(), 2);
+        let init_id_1 = match &launched[0].conversation {
+            Some(crate::harness::ConversationHint::Init { id }) => id.clone(),
+            other => panic!("expected first Init, got {other:?}"),
+        };
+        match &launched[1].conversation {
+            Some(crate::harness::ConversationHint::Init { id }) => {
+                assert_ne!(
+                    id, &init_id_1,
+                    "/clear should yield a fresh conversation id"
+                );
+            }
+            other => panic!("expected Init after /clear, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_chat_turn_carries_conversation_id_matching_the_init_uuid() {
+        let client = RecordingChatClient::default();
+        let (mut app, mirror) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hello".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+
+        let launched = mirror.launched.borrow();
+        let init_id = match &launched[0].conversation {
+            Some(crate::harness::ConversationHint::Init { id }) => id.clone(),
+            other => panic!("expected Init, got {other:?}"),
+        };
+        assert_eq!(
+            launched[0].conversation_id.as_deref(),
+            Some(init_id.as_str()),
+            "claude chat turns must carry conversation_id equal to the session uuid"
+        );
+    }
+
+    #[test]
+    fn codex_first_chat_turn_lands_without_conversation_id_then_subsequent_turns_carry_it() {
+        let client = RecordingChatClient::default();
+        let (mut app, mirror) = app_with_client(client);
+        app.active_agent = Some(0); // codex
+        app.input = "first".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        // First codex launch: no captured id yet, no conversation_id either.
+        assert!(mirror.launched.borrow()[0].conversation_id.is_none());
+
+        let session_id = app.active_session_id().expect("first launch").to_string();
+        let captured = "019eaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        app.push_event_message(&output_event(
+            1,
+            &session_id,
+            &format!("session id: {captured}\n"),
+        ));
+        app.push_event_message(&EventRecord {
+            seq: 2,
+            id: "event-2".to_string(),
+            session_id,
+            kind: "exit".to_string(),
+            payload_json: serde_json::json!({ "status": "completed" }).to_string(),
+            created_at: "2026-05-19T00:00:00Z".to_string(),
+        });
+
+        app.input = "follow up".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+
+        let launched = mirror.launched.borrow();
+        assert_eq!(launched.len(), 2);
+        assert_eq!(
+            launched[1].conversation_id.as_deref(),
+            Some(captured),
+            "second codex turn must carry the captured id as conversation_id"
+        );
+    }
+
+    #[test]
+    fn codex_first_chat_turn_carries_no_hint_so_codex_can_assign_its_own_session_id() {
+        let client = RecordingChatClient::default();
+        let (mut app, mirror) = app_with_client(client);
+        app.active_agent = Some(0); // codex
+        app.input = "do a thing".to_string();
+        app.cursor_pos = app.input.len();
+
+        app.handle_input();
+
+        let launched = mirror.launched.borrow();
+        assert_eq!(launched.len(), 1);
+        assert_eq!(launched[0].harness, "codex");
+        assert!(
+            launched[0].conversation.is_none(),
+            "codex auto-assigns ids; first turn must not carry a hint"
+        );
+    }
+
+    #[test]
+    fn second_codex_chat_turn_resumes_using_id_captured_from_first_turn_output() {
+        let client = RecordingChatClient::default();
+        let (mut app, mirror) = app_with_client(client);
+        app.active_agent = Some(0); // codex
+        app.input = "first".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app
+            .active_session_id()
+            .expect("first launch sets id")
+            .to_string();
+
+        // Simulate codex emitting its session-id banner mid-stream.
+        let captured_id = "019e5998-7130-7872-8d96-a6b67c5b6406";
+        app.push_event_message(&output_event(
+            1,
+            &session_id,
+            &format!("OpenAI Codex v0.132.0\n--------\nsession id: {captured_id}\n--------\n"),
+        ));
+        // And then exit so we can fire the next turn without is_responding gating.
+        app.push_event_message(&EventRecord {
+            seq: 2,
+            id: "event-2".to_string(),
+            session_id,
+            kind: "exit".to_string(),
+            payload_json: serde_json::json!({ "status": "completed" }).to_string(),
+            created_at: "2026-05-19T00:00:00Z".to_string(),
+        });
+
+        app.input = "follow up".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+
+        let launched = mirror.launched.borrow();
+        assert_eq!(launched.len(), 2);
+        match &launched[1].conversation {
+            Some(crate::harness::ConversationHint::Resume { id }) => {
+                assert_eq!(id, captured_id);
+            }
+            other => panic!("second codex turn must Resume with captured id, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_session_id_capture_is_not_overridden_by_later_output() {
+        let client = RecordingChatClient::default();
+        let (mut app, _mirror) = app_with_client(client);
+        app.active_agent = Some(0); // codex
+        app.input = "first".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app
+            .active_session_id()
+            .expect("first launch sets id")
+            .to_string();
+
+        let first_id = "019e5998-7130-7872-8d96-a6b67c5b6406";
+        let later_id = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+        app.push_event_message(&output_event(
+            1,
+            &session_id,
+            &format!("session id: {first_id}\n"),
+        ));
+        // Another id later in the same turn must not clobber the captured one.
+        app.push_event_message(&output_event(
+            2,
+            &session_id,
+            &format!("session id: {later_id}\n"),
+        ));
+
+        assert_eq!(
+            app.harness_conversation_ids
+                .get("codex")
+                .map(String::as_str),
+            Some(first_id),
+            "first captured id must stick"
+        );
+    }
+
+    #[test]
+    fn first_claude_turn_persists_conversation_id_to_disk() {
+        let coven_home = tempfile::tempdir().unwrap();
+        let project_root = tempfile::tempdir().unwrap();
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_persistence(client, coven_home.path(), project_root.path());
+        app.active_agent = Some(1); // claude
+        app.input = "hello".to_string();
+        app.cursor_pos = app.input.len();
+
+        app.handle_input();
+
+        let stored = persistence::load_for_project(coven_home.path(), project_root.path());
+        let in_memory = app
+            .harness_conversation_ids
+            .get("claude")
+            .cloned()
+            .expect("first claude turn must record an id");
+        assert_eq!(
+            stored.get("claude").cloned(),
+            Some(in_memory),
+            "claude conversation id must be persisted to disk after Init"
+        );
+    }
+
+    #[test]
+    fn fresh_app_resumes_persisted_claude_conversation_on_first_send() {
+        let coven_home = tempfile::tempdir().unwrap();
+        let project_root = tempfile::tempdir().unwrap();
+        let stored_id = "fab1efac-1234-5678-9abc-def012345678";
+        let mut seed = std::collections::HashMap::new();
+        seed.insert("claude".to_string(), stored_id.to_string());
+        persistence::save_for_project(coven_home.path(), project_root.path(), &seed)
+            .expect("seed persisted state");
+
+        let client = RecordingChatClient::default();
+        let (mut app, mirror) =
+            app_with_persistence(client, coven_home.path(), project_root.path());
+        assert_eq!(
+            app.harness_conversation_ids
+                .get("claude")
+                .map(String::as_str),
+            Some(stored_id),
+            "App must load persisted conversation ids on startup"
+        );
+
+        app.active_agent = Some(1); // claude
+        app.input = "hello again".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+
+        let launched = mirror.launched.borrow();
+        match &launched[0].conversation {
+            Some(crate::harness::ConversationHint::Resume { id }) => {
+                assert_eq!(
+                    id, stored_id,
+                    "first turn after restart must Resume with persisted id"
+                );
+            }
+            other => panic!("expected Resume on first turn after restart, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_session_id_capture_is_persisted_to_disk() {
+        let coven_home = tempfile::tempdir().unwrap();
+        let project_root = tempfile::tempdir().unwrap();
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_persistence(client, coven_home.path(), project_root.path());
+        app.active_agent = Some(0); // codex
+        app.input = "first".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app
+            .active_session_id()
+            .expect("first launch sets id")
+            .to_string();
+
+        let captured_id = "019eaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        app.push_event_message(&output_event(
+            1,
+            &session_id,
+            &format!("session id: {captured_id}\n"),
+        ));
+
+        let stored = persistence::load_for_project(coven_home.path(), project_root.path());
+        assert_eq!(
+            stored.get("codex").map(String::as_str),
+            Some(captured_id),
+            "codex session id must be persisted as soon as it's captured"
+        );
+    }
+
+    #[test]
+    fn first_claude_chat_turn_launches_in_stream_mode_and_tracks_the_daemon_session_id() {
+        let client = RecordingChatClient::default();
+        let (mut app, mirror) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hello".to_string();
+        app.cursor_pos = app.input.len();
+
+        app.handle_input();
+
+        let launched = mirror.launched.borrow();
+        assert_eq!(launched.len(), 1, "first claude turn must launch once");
+        assert_eq!(
+            launched[0].launch_mode,
+            crate::harness::HarnessLaunchMode::Stream,
+            "claude chat turns must take the stream path",
+        );
+        let session_id = app
+            .active_session_id()
+            .expect("first launch sets active session id")
+            .to_string();
+        assert_eq!(
+            app.harness_stream_session_ids.get("claude").cloned(),
+            Some(session_id),
+            "first stream launch must register its daemon session id under claude"
+        );
+    }
+
+    #[test]
+    fn stream_send_failure_drops_tracking_so_next_turn_cold_starts() {
+        let client = RecordingChatClient::default();
+        let (mut app, mirror) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "first".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let stream_session = app.active_session_id().expect("first launch").to_string();
+        assert!(app.harness_stream_session_ids.contains_key("claude"));
+
+        // Complete the first turn so the next message isn't gated by
+        // is_responding, then arm the mock so the next send_input fails
+        // (e.g. daemon NotLiveError).
+        let result_chunk =
+            r#"{"type":"result","subtype":"success","is_error":false}"#.to_string() + "\n";
+        app.push_event_message(&output_event(1, &stream_session, &result_chunk));
+        *mirror.send_input_error.borrow_mut() = Some("simulated NotLive".to_string());
+
+        app.input = "second".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+
+        // The send to the dead stream session failed — chat must drop
+        // the tracking entry so it doesn't loop back to the same dead
+        // pipe on the third message. Both the per-harness id and the
+        // per-session JSON buffer should be gone, and active state
+        // cleared so the user isn't gated by stale is_responding.
+        assert!(
+            !app.harness_stream_session_ids.contains_key("claude"),
+            "send failure on stream session must drop the per-harness id so the next turn cold-starts"
+        );
+        assert!(!app.stream_json_buffers.contains_key(&stream_session));
+        assert!(app.active_session_id().is_none());
+        assert!(!app.is_responding);
+
+        // Now disarm the mock and prove the next message launches fresh.
+        *mirror.send_input_error.borrow_mut() = None;
+        let launches_before_retype = mirror.launched.borrow().len();
+        app.input = "third".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        assert_eq!(
+            mirror.launched.borrow().len(),
+            launches_before_retype + 1,
+            "after the dead-stream cleanup, next message must cold-start a fresh launch"
+        );
+    }
+
+    #[test]
+    fn second_claude_chat_turn_reuses_the_stream_session_via_send_input_not_launch() {
+        let client = RecordingChatClient::default();
+        let (mut app, mirror) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "first".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let stream_session_id = app.active_session_id().expect("first launch").to_string();
+        assert_eq!(mirror.launched.borrow().len(), 1);
+
+        // Stream-mode sessions don't fire an exit between turns; instead
+        // each turn ends with a `result` event that clears is_responding.
+        // Simulate that so the next user message isn't gated.
+        let result_chunk =
+            r#"{"type":"result","subtype":"success","is_error":false}"#.to_string() + "\n";
+        app.push_event_message(&output_event(1, &stream_session_id, &result_chunk));
+        assert!(!app.is_responding);
+
+        app.input = "second".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+
+        assert_eq!(
+            mirror.launched.borrow().len(),
+            1,
+            "second turn must NOT cold-start a new launch when a stream session exists"
+        );
+        assert!(
+            mirror
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call == &format!("input:{stream_session_id}:second")),
+            "second turn must forward via send_input to the existing stream session WITHOUT a trailing newline (the daemon wraps payload verbatim in a JSON envelope; a literal \\n would leak into the user message text)"
+        );
+    }
+
+    #[test]
+    fn codex_chat_turn_does_not_take_the_stream_path() {
+        let client = RecordingChatClient::default();
+        let (mut app, mirror) = app_with_client(client);
+        app.active_agent = Some(0); // codex
+        app.input = "do a thing".to_string();
+        app.cursor_pos = app.input.len();
+
+        app.handle_input();
+
+        let launched = mirror.launched.borrow();
+        assert_eq!(launched.len(), 1);
+        assert_eq!(
+            launched[0].launch_mode,
+            crate::harness::HarnessLaunchMode::NonInteractive,
+            "codex doesn't support stream mode; must fall back to non-interactive"
+        );
+        assert!(
+            app.harness_stream_session_ids.is_empty(),
+            "codex turns must not register a stream session id"
+        );
+    }
+
+    #[test]
+    fn stream_json_assistant_output_renders_as_chat_message() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        let chunk =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello, Val."}]}}"#
+                .to_string()
+                + "\n";
+        app.push_event_message(&output_event(1, &session_id, &chunk));
+
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content.contains("Hello, Val.") && matches!(m.role, MessageRole::Agent)),
+            "stream-json assistant text must be rendered as an agent message"
+        );
+        // is_responding stays true until the result event arrives.
+        assert!(app.is_responding);
+
+        let result_chunk =
+            r#"{"type":"result","subtype":"success","is_error":false}"#.to_string() + "\n";
+        app.push_event_message(&output_event(2, &session_id, &result_chunk));
+        assert!(!app.is_responding, "result event must clear is_responding");
+    }
+
+    #[test]
+    fn stream_json_assistant_split_across_two_output_chunks_still_renders_correctly() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        // Realistic case: the daemon's 8KiB read split a single JSON line
+        // exactly in the middle. Without buffering, both halves are
+        // unparseable and the assistant text would be dropped silently.
+        let full_line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello from split."}]}}"#;
+        let split_at = full_line.len() / 2;
+        let (head, tail) = full_line.split_at(split_at);
+
+        app.push_event_message(&output_event(1, &session_id, head));
+        // After the first chunk there's no newline yet, so nothing renders.
+        assert!(
+            !app.messages
+                .iter()
+                .any(|m| m.content.contains("Hello from split.")),
+            "first chunk alone must not render — line isn't complete"
+        );
+
+        // The second chunk completes the line; render now.
+        app.push_event_message(&output_event(2, &session_id, &format!("{tail}\n")));
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content.contains("Hello from split.")),
+            "rejoined line must parse and render after the trailing newline arrives"
+        );
+    }
+
+    #[test]
+    fn stream_json_stderr_envelope_renders_as_system_message() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        let stderr_chunk =
+            r#"{"type":"system","subtype":"stderr","text":"warning: auth token expiring soon"}"#
+                .to_string()
+                + "\n";
+        app.push_event_message(&output_event(1, &session_id, &stderr_chunk));
+
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content.contains("warning: auth token expiring soon")),
+            "stream-json stderr envelope must surface as a system message in the transcript"
+        );
+    }
+
+    #[test]
+    fn shutdown_kills_tracked_stream_sessions_and_clears_state() {
+        let client = RecordingChatClient::default();
+        let (mut app, mirror) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let stream_id = app.active_session_id().expect("first launch").to_string();
+        assert!(!app.harness_stream_session_ids.is_empty());
+
+        app.shutdown();
+
+        assert!(
+            app.harness_stream_session_ids.is_empty(),
+            "shutdown must clear tracked stream session ids"
+        );
+        assert!(
+            mirror
+                .calls
+                .borrow()
+                .iter()
+                .any(|c| c == &format!("kill:{stream_id}")),
+            "shutdown must issue a kill for each tracked stream session so chat exit doesn't leak a claude process"
+        );
+    }
+
+    #[test]
+    fn stream_session_exit_event_also_drops_the_per_session_json_buffer() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        // Feed a partial JSON line so the buffer has content to leak.
+        app.push_event_message(&output_event(
+            1,
+            &session_id,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"par"#,
+        ));
+        assert!(
+            app.stream_json_buffers.contains_key(&session_id),
+            "partial line must be buffered"
+        );
+
+        app.push_event_message(&EventRecord {
+            seq: 2,
+            id: "event-exit".to_string(),
+            session_id: session_id.clone(),
+            kind: "exit".to_string(),
+            payload_json: serde_json::json!({ "status": "completed" }).to_string(),
+            created_at: "2026-05-19T00:00:00Z".to_string(),
+        });
+        assert!(
+            !app.stream_json_buffers.contains_key(&session_id),
+            "exit must drop the per-session JSON buffer so it doesn't leak across the chat"
+        );
+    }
+
+    #[test]
+    fn clear_transcript_suppresses_the_orphan_kill_event_so_it_doesnt_echo_after_chat_cleared() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let stream_id = app.active_session_id().expect("first launch").to_string();
+
+        app.clear_transcript();
+
+        // The kill request fires synchronously; the daemon's resulting
+        // `kill` event arrives later via polling. /clear must
+        // pre-suppress the failed session so that event doesn't push
+        // "Session kill recorded." back into the just-cleared transcript.
+        assert!(
+            app.suppressed_session_ids.contains(&stream_id),
+            "killed stream session must be suppressed so its kill event doesn't echo after /clear"
+        );
+        // And the active-session state must be cleared so the next
+        // user input isn't gated by stale is_responding.
+        assert!(app.active_session_id().is_none());
+        assert!(!app.is_responding);
+
+        // Simulate the delayed kill event arriving — it must NOT push
+        // "Session kill recorded." into the transcript now.
+        app.push_event_message(&EventRecord {
+            seq: 1,
+            id: "event-kill".to_string(),
+            session_id: stream_id.clone(),
+            kind: "kill".to_string(),
+            payload_json: "{}".to_string(),
+            created_at: "2026-05-19T00:00:00Z".to_string(),
+        });
+        assert!(
+            !app.messages
+                .iter()
+                .any(|m| m.content.contains("Session kill recorded")),
+            "kill event for a suppressed stream session must not surface"
+        );
+    }
+
+    #[test]
+    fn clear_transcript_drops_stream_json_buffers_too() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        app.push_event_message(&output_event(
+            1,
+            &session_id,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"par"#,
+        ));
+        assert!(app.stream_json_buffers.contains_key(&session_id));
+
+        app.clear_transcript();
+        assert!(
+            !app.stream_json_buffers.contains_key(&session_id),
+            "/clear must drop per-session JSON buffers along with the stream session ids"
+        );
+    }
+
+    #[test]
+    fn stream_session_exit_event_drops_the_tracked_id_so_next_turn_cold_starts() {
+        let client = RecordingChatClient::default();
+        let (mut app, mirror) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "first".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        // Simulate the stream process dying (crash, kill, etc.).
+        app.push_event_message(&EventRecord {
+            seq: 1,
+            id: "event-exit".to_string(),
+            session_id: session_id.clone(),
+            kind: "exit".to_string(),
+            payload_json: serde_json::json!({ "status": "failed" }).to_string(),
+            created_at: "2026-05-19T00:00:00Z".to_string(),
+        });
+        assert!(
+            app.harness_stream_session_ids.is_empty(),
+            "exit must drop the dead stream session from the per-harness map"
+        );
+
+        // Next turn cold-starts a fresh stream session instead of forwarding.
+        app.input = "second".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        assert_eq!(mirror.launched.borrow().len(), 2);
+    }
+
+    #[test]
+    fn slash_new_drops_conversation_ids_but_preserves_visible_transcript() {
+        let coven_home = tempfile::tempdir().unwrap();
+        let project_root = tempfile::tempdir().unwrap();
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_persistence(client, coven_home.path(), project_root.path());
+        app.active_agent = Some(1); // claude
+        app.input = "first".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let messages_after_first_turn = app.messages.len();
+        assert!(
+            app.harness_conversation_ids.contains_key("claude"),
+            "first claude turn must seed an id"
+        );
+        assert!(
+            persistence::conversations_file(coven_home.path(), project_root.path()).exists(),
+            "first turn must have persisted the id"
+        );
+
+        app.input = "/new".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+
+        // Conversation ids gone from both memory and disk.
+        assert!(app.harness_conversation_ids.is_empty());
+        assert!(
+            !persistence::conversations_file(coven_home.path(), project_root.path()).exists(),
+            "/new must delete the persistence file too"
+        );
+
+        // Visible transcript preserved (plus the /new system message).
+        assert!(
+            app.messages.len() > messages_after_first_turn,
+            "/new must keep prior messages and add at least its own system message"
+        );
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content == "first" && matches!(m.role, MessageRole::User)),
+            "the user message from the prior turn must still be visible after /new"
+        );
+        assert!(app
+            .messages
+            .iter()
+            .any(|m| m.content.contains("Started a new conversation")));
+    }
+
+    #[test]
+    fn first_chat_turn_after_slash_new_sends_init_not_resume() {
+        let coven_home = tempfile::tempdir().unwrap();
+        let project_root = tempfile::tempdir().unwrap();
+        let client = RecordingChatClient::default();
+        let (mut app, mirror) =
+            app_with_persistence(client, coven_home.path(), project_root.path());
+        app.active_agent = Some(1); // claude
+        app.input = "first".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let first_id = match &mirror.launched.borrow()[0].conversation {
+            Some(crate::harness::ConversationHint::Init { id }) => id.clone(),
+            other => panic!("turn 1 should be Init, got {other:?}"),
+        };
+        // Mark the first turn as completed so the next launch isn't gated.
+        let session_id = app.active_session_id().expect("first launch").to_string();
+        app.push_event_message(&EventRecord {
+            seq: 1,
+            id: "event-1".to_string(),
+            session_id,
+            kind: "exit".to_string(),
+            payload_json: serde_json::json!({ "status": "completed" }).to_string(),
+            created_at: "2026-05-19T00:00:00Z".to_string(),
+        });
+
+        app.input = "/new".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+
+        app.input = "fresh topic".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+
+        let launched = mirror.launched.borrow();
+        assert_eq!(launched.len(), 2);
+        match &launched[1].conversation {
+            Some(crate::harness::ConversationHint::Init { id }) => {
+                assert_ne!(id, &first_id, "/new must yield a fresh conversation id");
+            }
+            other => panic!("first turn after /new should be Init, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_new_is_a_chat_local_command_not_routed_through_cast() {
+        assert!(is_chat_local_slash("/new"));
+        assert!(is_chat_local_slash("/NEW"));
+    }
+
+    #[test]
+    fn clear_transcript_wipes_persisted_conversations_file() {
+        let coven_home = tempfile::tempdir().unwrap();
+        let project_root = tempfile::tempdir().unwrap();
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_persistence(client, coven_home.path(), project_root.path());
+        app.active_agent = Some(1); // claude
+        app.input = "hello".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        assert!(
+            persistence::conversations_file(coven_home.path(), project_root.path()).exists(),
+            "first turn should have created the persistence file"
+        );
+
+        app.clear_transcript();
+
+        assert!(
+            !persistence::conversations_file(coven_home.path(), project_root.path()).exists(),
+            "/clear must delete the persistence file so restart starts fresh"
+        );
+        assert!(app.harness_conversation_ids.is_empty());
+    }
+
+    #[test]
+    fn app_without_coven_home_does_not_attempt_persistence() {
+        // Sanity check: tests that don't pass a coven_home (the default
+        // `app_with_client` path) must keep working without touching disk.
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hello".to_string();
+        app.cursor_pos = app.input.len();
+
+        app.handle_input();
+
+        assert!(app.harness_conversation_ids.contains_key("claude"));
+        assert!(app.coven_home.is_none());
+    }
+
+    #[test]
+    fn detect_stale_session_matches_known_per_harness_phrases() {
+        assert!(detect_stale_session(
+            "claude",
+            "No conversation found with session ID: 00000000-0000-0000-0000-000000000000"
+        ));
+        assert!(detect_stale_session(
+            "codex",
+            "Error: thread/resume: thread/resume failed: no rollout found for thread id 00000000-..."
+        ));
+        assert!(detect_stale_session(
+            "codex",
+            "thread/resume failed: something else"
+        ));
+        // Different harness id doesn't match either phrase.
+        assert!(!detect_stale_session(
+            "hermes",
+            "No conversation found with session ID: x"
+        ));
+        // Plain content with neither phrase.
+        assert!(!detect_stale_session("claude", "Hi Persist."));
+        assert!(!detect_stale_session("codex", "session id: 019e..."));
+    }
+
+    #[test]
+    fn stale_claude_resume_replaces_id_and_auto_resends_original_prompt() {
+        let coven_home = tempfile::tempdir().unwrap();
+        let project_root = tempfile::tempdir().unwrap();
+        let stored_id = "fab1efac-1234-5678-9abc-def012345678";
+        let mut seed = std::collections::HashMap::new();
+        seed.insert("claude".to_string(), stored_id.to_string());
+        persistence::save_for_project(coven_home.path(), project_root.path(), &seed)
+            .expect("seed persisted state");
+
+        let client = RecordingChatClient::default();
+        let (mut app, mirror) =
+            app_with_persistence(client, coven_home.path(), project_root.path());
+        app.active_agent = Some(1); // claude
+        app.input = "hello again".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app
+            .active_session_id()
+            .expect("first launch sets id")
+            .to_string();
+
+        // Simulate claude rejecting our stale --resume.
+        app.push_event_message(&output_event(
+            1,
+            &session_id,
+            &stale_stderr_chunk(&format!(
+                "No conversation found with session ID: {stored_id}"
+            )),
+        ));
+
+        // Stale id must be gone — but auto-retry should have created a
+        // fresh one in its place (claude pre-assigns via --session-id).
+        let new_id = app
+            .harness_conversation_ids
+            .get("claude")
+            .cloned()
+            .expect("auto-retry should have stored a fresh claude id");
+        assert_ne!(new_id, stored_id, "fresh id must not equal the stale one");
+        let stored = persistence::load_for_project(coven_home.path(), project_root.path());
+        assert_eq!(
+            stored.get("claude").cloned(),
+            Some(new_id.clone()),
+            "fresh id must be persisted to disk"
+        );
+
+        // Two launches: the original (Resume with stale id) and the auto-
+        // retry (Init with the fresh id, carrying the same prompt).
+        let launched = mirror.launched.borrow();
+        assert_eq!(launched.len(), 2);
+        assert_eq!(launched[0].prompt, "hello again");
+        assert_eq!(launched[1].prompt, "hello again");
+        match &launched[1].conversation {
+            Some(crate::harness::ConversationHint::Init { id }) => {
+                assert_eq!(id, &new_id);
+            }
+            other => panic!("auto-retry should carry Init with the new id, got {other:?}"),
+        }
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content.contains("re-sending your message")),
+            "user must see a system message about the auto-retry"
+        );
+    }
+
+    #[test]
+    fn stale_recovery_hides_raw_error_chunk_and_failed_session_exit_from_transcript() {
+        let coven_home = tempfile::tempdir().unwrap();
+        let project_root = tempfile::tempdir().unwrap();
+        let stored_id = "fab1efac-1234-5678-9abc-def012345678";
+        let mut seed = std::collections::HashMap::new();
+        seed.insert("claude".to_string(), stored_id.to_string());
+        persistence::save_for_project(coven_home.path(), project_root.path(), &seed)
+            .expect("seed persisted state");
+
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_persistence(client, coven_home.path(), project_root.path());
+        app.active_agent = Some(1); // claude
+        app.input = "hello again".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let failed_session = app.active_session_id().expect("first launch").to_string();
+
+        // The chunk that contains the stale phrase.
+        app.push_event_message(&output_event(
+            1,
+            &failed_session,
+            &stale_stderr_chunk(&format!(
+                "No conversation found with session ID: {stored_id}"
+            )),
+        ));
+        // A trailing chunk from the same failed session (ANSI cleanup, etc.).
+        app.push_event_message(&output_event(
+            2,
+            &failed_session,
+            "trailing teardown noise\n",
+        ));
+        // And finally the failed session's exit event.
+        app.push_event_message(&EventRecord {
+            seq: 3,
+            id: "event-exit".to_string(),
+            session_id: failed_session.clone(),
+            kind: "exit".to_string(),
+            payload_json: serde_json::json!({ "status": "completed" }).to_string(),
+            created_at: "2026-05-19T00:00:00Z".to_string(),
+        });
+
+        // None of the failed session's content (raw error, trailing noise,
+        // "Session completed.") should appear in the transcript.
+        let transcript: Vec<&str> = app.messages.iter().map(|m| m.content.as_str()).collect();
+        for content in &transcript {
+            assert!(
+                !content.contains("No conversation found with session ID"),
+                "raw stale error must be hidden, found: {content}"
+            );
+            assert!(
+                !content.contains("trailing teardown noise"),
+                "trailing output from the failed session must be hidden, found: {content}"
+            );
+            assert!(
+                !content.contains("Session completed"),
+                "orphaned exit message from the failed session must be hidden, found: {content}"
+            );
+        }
+        // The system message and the retry's "Connected" line should be visible.
+        assert!(transcript
+            .iter()
+            .any(|c| c.contains("re-sending your message")));
+        assert!(transcript.iter().any(|c| c.contains("Connected")));
+        // Suppression entry must be cleared once the exit is consumed.
+        assert!(!app.suppressed_session_ids.contains(&failed_session));
+    }
+
+    #[test]
+    fn suppression_only_applies_to_the_failed_session_not_other_sessions() {
+        let coven_home = tempfile::tempdir().unwrap();
+        let project_root = tempfile::tempdir().unwrap();
+        let stored_id = "fab1efac-1234-5678-9abc-def012345678";
+        let mut seed = std::collections::HashMap::new();
+        seed.insert("claude".to_string(), stored_id.to_string());
+        persistence::save_for_project(coven_home.path(), project_root.path(), &seed)
+            .expect("seed persisted state");
+
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_persistence(client, coven_home.path(), project_root.path());
+        app.active_agent = Some(1); // claude
+        app.input = "hello".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let failed_session = app.active_session_id().expect("first launch").to_string();
+
+        app.push_event_message(&output_event(
+            1,
+            &failed_session,
+            &stale_stderr_chunk(&format!(
+                "No conversation found with session ID: {stored_id}"
+            )),
+        ));
+        let retry_session = app.active_session_id().expect("retry session").to_string();
+        assert_ne!(retry_session, failed_session);
+
+        // Output from the retry session must still be rendered. The retry
+        // is a stream-mode claude session, so the chunk is a stream-json
+        // assistant event rather than plain text.
+        let assistant_chunk = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hi from the new conversation."}]}}"#.to_string() + "\n";
+        app.push_event_message(&output_event(2, &retry_session, &assistant_chunk));
+
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content.contains("Hi from the new conversation")),
+            "retry-session output must not be suppressed"
+        );
+    }
+
+    #[test]
+    fn poll_session_events_stops_advancing_cursor_when_active_session_changes_mid_batch() {
+        let coven_home = tempfile::tempdir().unwrap();
+        let project_root = tempfile::tempdir().unwrap();
+        let stored_id = "fab1efac-1234-5678-9abc-def012345678";
+        let mut seed = std::collections::HashMap::new();
+        seed.insert("claude".to_string(), stored_id.to_string());
+        persistence::save_for_project(coven_home.path(), project_root.path(), &seed)
+            .expect("seed persisted state");
+
+        let client = RecordingChatClient::default();
+        let (mut app, mirror) =
+            app_with_persistence(client, coven_home.path(), project_root.path());
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let old_session = app.active_session_id().expect("first launch").to_string();
+
+        // Pre-load three events for the OLD session: a harmless first
+        // one, a stale-error in the middle, and a "trailing noise"
+        // event afterward. Without the active-session-id guard in
+        // poll_session_events, processing the trailing event would
+        // overwrite `last_event_seq` after the stale handler had
+        // reset it to None for the new session, leaving a poisoned
+        // cursor.
+        let stored_id_for_error = stored_id.to_string();
+        let old_session_for_events = old_session.clone();
+        mirror.events.borrow_mut().extend(vec![
+            EventRecord {
+                seq: 10,
+                id: "ev-10".to_string(),
+                session_id: old_session_for_events.clone(),
+                kind: "output".to_string(),
+                payload_json: serde_json::json!({ "data": "" }).to_string(),
+                created_at: "2026-05-19T00:00:00Z".to_string(),
+            },
+            EventRecord {
+                seq: 11,
+                id: "ev-11".to_string(),
+                session_id: old_session_for_events.clone(),
+                kind: "output".to_string(),
+                payload_json: serde_json::json!({
+                    "data": stale_stderr_chunk(&format!(
+                        "No conversation found with session ID: {stored_id_for_error}"
+                    ))
+                })
+                .to_string(),
+                created_at: "2026-05-19T00:00:00Z".to_string(),
+            },
+            EventRecord {
+                seq: 12,
+                id: "ev-12".to_string(),
+                session_id: old_session_for_events,
+                kind: "output".to_string(),
+                payload_json: serde_json::json!({ "data": "trailing noise after stale\n" })
+                    .to_string(),
+                created_at: "2026-05-19T00:00:00Z".to_string(),
+            },
+        ]);
+
+        app.poll_session_events();
+
+        // Active session should have swapped to the retry session.
+        let new_session = app
+            .active_session_id()
+            .expect("auto-retry must have set a new active session");
+        assert_ne!(new_session, old_session);
+
+        // Cursor must be at None (the value the auto-retry reset to),
+        // NOT Some(12) from the trailing OLD-session event. If it were
+        // Some(12), the next poll for the new session would query with
+        // after_seq=12 and skip any new-session events that arrived
+        // with smaller seqs.
+        assert_eq!(
+            app.last_event_seq, None,
+            "active-session swap during a batch must stop the loop from advancing the cursor past the swap"
+        );
+    }
+
+    #[test]
+    fn stale_recovery_only_auto_retries_once_per_user_turn() {
+        let coven_home = tempfile::tempdir().unwrap();
+        let project_root = tempfile::tempdir().unwrap();
+        let stored_id = "fab1efac-1234-5678-9abc-def012345678";
+        let mut seed = std::collections::HashMap::new();
+        seed.insert("claude".to_string(), stored_id.to_string());
+        persistence::save_for_project(coven_home.path(), project_root.path(), &seed)
+            .expect("seed persisted state");
+
+        let client = RecordingChatClient::default();
+        let (mut app, mirror) =
+            app_with_persistence(client, coven_home.path(), project_root.path());
+        app.active_agent = Some(1); // claude
+        app.input = "hello".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let first_session = app.active_session_id().expect("first launch").to_string();
+
+        // First stale event → consumes the auto-retry budget.
+        app.push_event_message(&output_event(
+            1,
+            &first_session,
+            &stale_stderr_chunk(&format!(
+                "No conversation found with session ID: {stored_id}"
+            )),
+        ));
+        let after_first_retry = mirror.launched.borrow().len();
+        assert_eq!(after_first_retry, 2, "first stale event triggers a retry");
+        let retry_session = app.active_session_id().expect("retry sets id").to_string();
+        let retry_id = app.harness_conversation_ids.get("claude").cloned().unwrap();
+
+        // Simulate the retry itself also somehow hitting stale (pathological
+        // — claude wouldn't really say this for an Init session — but we
+        // guard against it to bound the loop).
+        app.push_event_message(&output_event(
+            2,
+            &retry_session,
+            &stale_stderr_chunk(&format!(
+                "No conversation found with session ID: {retry_id}"
+            )),
+        ));
+        assert_eq!(
+            mirror.launched.borrow().len(),
+            after_first_retry,
+            "second stale event in the same turn must not auto-retry again"
+        );
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content.contains("Send your message again")),
+            "second stale event falls back to asking the user to retype"
+        );
+        // The fallback path must also clear the wedged state so the
+        // user's NEXT message can actually be sent — otherwise
+        // is_responding stays true forever (failed session's exit
+        // event is suppressed, normal state-reset arms in
+        // push_event_message never run).
+        assert!(
+            !app.is_responding,
+            "after the retry-exhausted fallback, is_responding must be cleared so the next message isn't gated"
+        );
+        assert!(
+            app.active_session_id().is_none(),
+            "after the retry-exhausted fallback, active_session_id must be cleared so the next message launches fresh"
+        );
+
+        // And prove the chat is actually usable: send a new message, it
+        // should produce a fresh launch instead of being rejected.
+        let launches_before_retype = mirror.launched.borrow().len();
+        app.input = "second attempt".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        assert_eq!(
+            mirror.launched.borrow().len(),
+            launches_before_retype + 1,
+            "user's manual retype after retry-exhausted fallback must produce a fresh launch, not a still-streaming rejection"
+        );
+    }
+
+    #[test]
+    fn stale_codex_resume_drops_codex_id_only() {
+        let coven_home = tempfile::tempdir().unwrap();
+        let project_root = tempfile::tempdir().unwrap();
+        // Seed both claude and codex; only codex should get dropped.
+        let mut seed = std::collections::HashMap::new();
+        seed.insert("claude".to_string(), "claude-uuid".to_string());
+        seed.insert("codex".to_string(), "codex-uuid".to_string());
+        persistence::save_for_project(coven_home.path(), project_root.path(), &seed)
+            .expect("seed persisted state");
+
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_persistence(client, coven_home.path(), project_root.path());
+        app.active_agent = Some(0); // codex
+        app.input = "hello again".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app
+            .active_session_id()
+            .expect("first launch sets id")
+            .to_string();
+
+        app.push_event_message(&output_event(
+            1,
+            &session_id,
+            "Error: thread/resume: thread/resume failed: no rollout found for thread id codex-uuid\n",
+        ));
+
+        assert!(!app.harness_conversation_ids.contains_key("codex"));
+        assert!(
+            app.harness_conversation_ids.contains_key("claude"),
+            "claude id must not be touched by a codex stale event"
+        );
+        let stored = persistence::load_for_project(coven_home.path(), project_root.path());
+        assert!(!stored.contains_key("codex"));
+        assert_eq!(
+            stored.get("claude").map(String::as_str),
+            Some("claude-uuid")
+        );
+    }
+
+    #[test]
+    fn stale_pattern_in_attached_session_output_does_not_drop_chat_ids() {
+        let coven_home = tempfile::tempdir().unwrap();
+        let project_root = tempfile::tempdir().unwrap();
+        let mut seed = std::collections::HashMap::new();
+        seed.insert("claude".to_string(), "claude-uuid".to_string());
+        persistence::save_for_project(coven_home.path(), project_root.path(), &seed)
+            .expect("seed persisted state");
+
+        let attached = test_session("attached-session", "claude", "external", "running");
+        let client = RecordingChatClient::with_session(attached);
+        let (mut app, _) = app_with_persistence(client, coven_home.path(), project_root.path());
+        app.attach_session("attached-session");
+        assert!(!app.chat_owns_active_session);
+
+        // Output from the attached session contains the stale phrase, but
+        // since chat doesn't own this session we must not touch our own
+        // persisted ids.
+        app.push_event_message(&output_event(
+            1,
+            "attached-session",
+            "No conversation found with session ID: irrelevant\n",
+        ));
+
+        assert!(
+            app.harness_conversation_ids.contains_key("claude"),
+            "attached-session output must not clobber chat-owned ids"
+        );
+    }
+
+    #[test]
+    fn stale_pattern_with_no_stored_id_is_a_noop() {
+        let coven_home = tempfile::tempdir().unwrap();
+        let project_root = tempfile::tempdir().unwrap();
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_persistence(client, coven_home.path(), project_root.path());
+        app.active_agent = Some(0); // codex
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app
+            .active_session_id()
+            .expect("first launch sets id")
+            .to_string();
+        assert!(!app.harness_conversation_ids.contains_key("codex"));
+
+        // Stale phrase arrives during a turn that had no stored codex id —
+        // nothing to drop, nothing to warn about.
+        app.push_event_message(&output_event(
+            1,
+            &session_id,
+            "thread/resume failed: bogus\n",
+        ));
+
+        assert!(
+            !app.messages
+                .iter()
+                .any(|m| m.content.contains("no longer exists")),
+            "must not emit a misleading warning when there was no stored id"
+        );
+    }
+
+    #[test]
+    fn extract_codex_session_id_parses_banner_lines_only() {
+        assert_eq!(
+            extract_codex_session_id("session id: 019e5998-7130-7872-8d96-a6b67c5b6406"),
+            Some("019e5998-7130-7872-8d96-a6b67c5b6406".to_string())
+        );
+        assert_eq!(
+            extract_codex_session_id("workdir: /tmp\n--------\nsession id: abc-123\n"),
+            Some("abc-123".to_string())
+        );
+        assert_eq!(extract_codex_session_id("session id:\n"), None);
+        assert_eq!(extract_codex_session_id("hello world"), None);
+    }
+
+    #[test]
+    fn chat_input_while_responding_does_not_launch_a_second_session() {
+        let client = RecordingChatClient::default();
+        let (mut app, mirror) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "first".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        assert!(app.is_responding, "first turn should set is_responding");
+
+        // Second send while previous reply is still streaming.
+        app.input = "too soon".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+
+        assert_eq!(
+            mirror.launched.borrow().len(),
+            1,
+            "second send while is_responding must not launch a fresh session"
+        );
+        assert!(app
+            .messages
+            .iter()
+            .any(|message| message.content.contains("still streaming")));
+    }
+
+    #[test]
+    fn plain_chat_input_launches_non_interactive_daemon_session_without_mock_response() {
         let client = RecordingChatClient::default();
         let (mut app, mirror) = app_with_client(client);
         app.input = "summarize the repo".to_string();
@@ -1734,7 +3836,7 @@ mod tests {
         assert_eq!(launched[0].prompt, "summarize the repo");
         assert_eq!(
             launched[0].launch_mode,
-            crate::harness::HarnessLaunchMode::Interactive
+            crate::harness::HarnessLaunchMode::NonInteractive
         );
         assert!(app.active_session_id().is_some());
         assert!(app.messages.iter().any(|message| message

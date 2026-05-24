@@ -64,17 +64,19 @@ flowchart TD
   Parse -- ok --> Route{Route exists?}
   Route -- no --> ErrNotFound["404 not_found"]
   Route -- yes --> Validate{Field validation}
-  Validate -- cwd outside root --> ErrCwd["400 project_root_violation"]
+  Validate -- cwd outside root --> ErrInvalid
   Validate -- unknown harness/action --> ErrInvalid
   Validate -- ok --> Action{Resource lookup}
   Action -- session missing --> ErrSession["404 session_not_found"]
   Action -- session not live --> ErrLive["409 session_not_live"]
-  Action -- PTY spawn fails --> ErrPty["500 pty_spawn_failed"]
+  Action -- launch (PTY/pipe spawn, init write, harness startup) fails --> ErrLaunch["500 launch_failed"]
+  Action -- send_input fails --> ErrSend["500 send_input_failed"]
+  Action -- kill_session fails --> ErrKill["500 kill_failed"]
   Action -- runtime down --> ErrRuntime["503 runtime_unavailable"]
   Action -- internal panic --> ErrInternal["500 internal_error"]
   Action -- ok --> Success[Documented success shape]
 
-  ErrInvalid & ErrNotFound & ErrCwd & ErrSession & ErrLive & ErrPty & ErrRuntime & ErrInternal -->|"{ error: { code, message, details } }"| Client[Client branches on code]
+  ErrInvalid & ErrNotFound & ErrSession & ErrLive & ErrLaunch & ErrSend & ErrKill & ErrRuntime & ErrInternal -->|"{ error: { code, message, details } }"| Client[Client branches on code]
 ```
 
 All API errors use the following stable envelope. Clients must branch on `error.code`, not `error.message`:
@@ -98,11 +100,14 @@ All API errors use the following stable envelope. Clients must branch on `error.
 | Code                   | HTTP status | Description                                      |
 |------------------------|-------------|--------------------------------------------------|
 | `not_found`            | 404         | Generic route not found.                         |
-| `invalid_request`      | 400 or 404  | Malformed request or unsupported API version.    |
+| `invalid_request`      | 400 or 404  | Malformed request, unknown harness id, missing required field, or unsupported API version. |
 | `session_not_found`    | 404         | Session id does not exist.                       |
 | `session_not_live`     | 409         | Session exists but is not running.               |
-| `project_root_violation`| 400        | cwd is outside the declared project root.        |
-| `pty_spawn_failed`     | 500         | PTY harness could not be launched.               |
+| `project_root_violation`| 400        | Reserved. Cwd-outside-root currently emits `invalid_request` with the violation message in the body; promoting to its own code would let clients branch without parsing prose. |
+| `pty_spawn_failed`     | 500         | Reserved. PTY spawn failures currently emit `launch_failed`; promoting to its own code would let clients distinguish "the PTY couldn't open" (likely a host issue) from "the harness CLI errored at startup" (likely an auth/config issue). |
+| `launch_failed`        | 500         | Daemon accepted the launch payload but the runtime (PTY/pipe spawn, initial-message write, harness CLI startup) failed. `details.sessionId` is the row that was inserted and marked `failed`. |
+| `send_input_failed`    | 500         | Daemon accepted the input payload but the runtime write failed (closed pipe, killed process, IO error). `details.sessionId` is the affected session. |
+| `kill_failed`          | 500         | Daemon accepted the kill request but the runtime signal/kill call failed (permission, missing process, IO error). `details.sessionId` is the affected session. |
 | `runtime_unavailable`  | 503         | The session runtime is unavailable.              |
 | `internal_error`       | 500         | Unexpected internal error.                       |
 

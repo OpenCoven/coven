@@ -5,6 +5,7 @@ mod app;
 pub(crate) mod client;
 mod events;
 mod highlight;
+mod persistence;
 mod render;
 mod settings;
 
@@ -33,6 +34,11 @@ pub fn run_chat() -> Result<()> {
     let mut terminal = TerminalSession::enter()?;
     let mut app = App::new();
     let result = run_event_loop(&mut terminal, &mut app);
+    // Tear down long-lived stream sessions (claude --stream-json) before
+    // we release the terminal. Covers every normal exit path — /exit,
+    // double Ctrl+C, Ctrl+D, plus errors from the event loop — so a
+    // closed chat doesn't leave a claude process running in the daemon.
+    app.shutdown();
     terminal.restore()?;
     result
 }

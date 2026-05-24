@@ -489,6 +489,7 @@ fn launch_patch_session(request: &patch::PatchOpenClawRequest) -> Result<String>
         archived_at: None,
         created_at: now.clone(),
         updated_at: now.clone(),
+        conversation_id: None,
     };
     store::insert_session(&conn, &record)?;
     store::insert_json_event(
@@ -635,6 +636,7 @@ fn run_session(
         archived_at: None,
         created_at: now.clone(),
         updated_at: now,
+        conversation_id: None,
     };
 
     store::insert_session(&conn, &record)?;
@@ -1777,6 +1779,7 @@ mod tests {
             archived_at: None,
             created_at: "2026-04-27T06:00:00Z".to_string(),
             updated_at: "2026-04-27T06:00:00Z".to_string(),
+            conversation_id: None,
         };
 
         assert_eq!(
@@ -1797,6 +1800,7 @@ mod tests {
             archived_at: None,
             created_at: "2026-05-14T07:00:00Z".to_string(),
             updated_at: "2026-05-14T07:00:01Z".to_string(),
+            conversation_id: None,
         };
 
         let rendered = render_sessions_json(&[session])?;
@@ -1908,6 +1912,7 @@ mod tests {
             archived_at: archived_at.map(ToOwned::to_owned),
             created_at: "2026-05-08T07:00:00Z".to_string(),
             updated_at: "2026-05-08T07:05:00Z".to_string(),
+            conversation_id: None,
         }
     }
 }

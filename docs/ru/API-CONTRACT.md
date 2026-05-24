@@ -60,17 +60,19 @@ flowchart TD
   Parse -- ok --> Route{Route exists?}
   Route -- no --> ErrNotFound["404 not_found"]
   Route -- yes --> Validate{Field validation}
-  Validate -- cwd outside root --> ErrCwd["400 project_root_violation"]
+  Validate -- cwd outside root --> ErrInvalid
   Validate -- unknown harness/action --> ErrInvalid
   Validate -- ok --> Action{Resource lookup}
   Action -- session missing --> ErrSession["404 session_not_found"]
   Action -- session not live --> ErrLive["409 session_not_live"]
-  Action -- PTY spawn fails --> ErrPty["500 pty_spawn_failed"]
+  Action -- launch (PTY/pipe spawn, init write, harness startup) fails --> ErrLaunch["500 launch_failed"]
+  Action -- send_input fails --> ErrSend["500 send_input_failed"]
+  Action -- kill_session fails --> ErrKill["500 kill_failed"]
   Action -- runtime down --> ErrRuntime["503 runtime_unavailable"]
   Action -- internal panic --> ErrInternal["500 internal_error"]
   Action -- ok --> Success[Documented success shape]
 
-  ErrInvalid & ErrNotFound & ErrCwd & ErrSession & ErrLive & ErrPty & ErrRuntime & ErrInternal -->|"{ error: { code, message, details } }"| Client[Client branches on code]
+  ErrInvalid & ErrNotFound & ErrSession & ErrLive & ErrLaunch & ErrSend & ErrKill & ErrRuntime & ErrInternal -->|"{ error: { code, message, details } }"| Client[Client branches on code]
 ```
 
 Все ошибки API используют следующий стабильный конверт. Клиенты должны ветвиться по `error.code`, а не по `error.message`:
@@ -94,11 +96,14 @@ flowchart TD
 | Код                    | HTTP-статус | Описание                                         |
 |------------------------|-------------|--------------------------------------------------|
 | `not_found`            | 404         | Общий маршрут не найден.                         |
-| `invalid_request`      | 400 или 404 | Некорректный запрос или неподдерживаемая версия API. |
+| `invalid_request`      | 400 или 404 | Некорректный запрос, неизвестный id harness, отсутствует обязательное поле, или неподдерживаемая версия API. |
 | `session_not_found`    | 404         | Id сессии не существует.                         |
 | `session_not_live`     | 409         | Сессия существует, но не выполняется.            |
-| `project_root_violation`| 400        | cwd находится вне объявленного корня проекта.    |
-| `pty_spawn_failed`     | 500         | PTY harness не удалось запустить.                |
+| `project_root_violation`| 400        | Зарезервировано. Нарушения cwd сейчас возвращают `invalid_request`; продвижение в отдельный код позволит клиентам ветвиться без парсинга текста. |
+| `pty_spawn_failed`     | 500         | Зарезервировано. Сбои spawn PTY сейчас возвращают `launch_failed`; продвижение в отдельный код позволит различать "не удалось открыть PTY" и "CLI harness упал при старте". |
+| `launch_failed`        | 500         | Демон принял payload запуска, но runtime (PTY/pipe spawn, начальная запись, старт CLI harness) дал сбой. `details.sessionId` — строка, помеченная как `failed`. |
+| `send_input_failed`    | 500         | Демон принял payload ввода, но запись в runtime дала сбой (закрытый pipe, мёртвый процесс, ошибка IO). `details.sessionId` — затронутая сессия. |
+| `kill_failed`          | 500         | Демон принял запрос kill, но сигнал/вызов runtime дал сбой (нет прав, отсутствует процесс, ошибка IO). `details.sessionId` — затронутая сессия. |
 | `runtime_unavailable`  | 503         | Runtime сессии недоступен.                       |
 | `internal_error`       | 500         | Неожиданная внутренняя ошибка.                   |
 

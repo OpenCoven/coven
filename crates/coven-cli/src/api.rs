@@ -6,7 +6,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::{control_plane, daemon::DaemonStatus, harness::HarnessLaunchMode, project, store};
+use crate::{
+    control_plane,
+    daemon::DaemonStatus,
+    harness::{ConversationHint, HarnessLaunchMode},
+    project, store,
+};
 
 const MAX_EVENTS_LIMIT: i64 = 1_000;
 pub const COVEN_API_VERSION: &str = "v1";
@@ -63,6 +68,13 @@ pub struct SessionLaunch {
     pub launch_mode: HarnessLaunchMode,
     pub prompt: String,
     pub title: String,
+    pub conversation: Option<ConversationHint>,
+    /// Caller-supplied id used to group this session with other turns of the
+    /// same chat conversation in `/sessions`. Independent of the harness
+    /// CLI's own session-resume mechanism (see `ConversationHint`); the
+    /// chat layer typically passes a chat-generated UUID stable for the
+    /// lifetime of the conversation. `None` = ungrouped (one-off run).
+    pub conversation_id: Option<String>,
 }
 
 pub trait SessionRuntime {
@@ -251,8 +263,23 @@ fn launch_session(
     body: Option<&str>,
     runtime: &dyn SessionRuntime,
 ) -> Result<ApiResponse> {
-    let payload = parse_body(body)?;
-    let launch = session_launch_from_payload(payload)?;
+    // Client-side validation errors (malformed JSON, bad fields,
+    // unsupported launchMode, malformed `conversation` object, …) must
+    // become structured 400 responses. Bubbling them up as Err crashes
+    // the daemon, since the api-server loop `?`-propagates errors out
+    // of the accept loop and terminates the process.
+    let payload = match parse_body(body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return api_error(400, "invalid_request", &error.to_string(), None);
+        }
+    };
+    let launch = match session_launch_from_payload(payload) {
+        Ok(launch) => launch,
+        Err(error) => {
+            return api_error(400, "invalid_request", &error.to_string(), None);
+        }
+    };
     let conn = store::open_store(&store_path(coven_home))?;
     let now = current_timestamp();
     let record = store::SessionRecord {
@@ -265,11 +292,22 @@ fn launch_session(
         archived_at: None,
         created_at: now.clone(),
         updated_at: now,
+        conversation_id: launch.conversation_id.clone(),
     };
     store::insert_session(&conn, &record)?;
     if let Err(error) = runtime.launch_session(&launch) {
+        // Don't propagate to the accept loop — that crashes the daemon.
+        // Runtime launch failures are user-facing (missing harness CLI,
+        // missing auth, child closed stdin during stream-mode init):
+        // mark the session row failed and return a structured response
+        // so the client surfaces the cause and the daemon stays up.
         store::update_session_status(&conn, &record.id, "failed", None, &current_timestamp())?;
-        return Err(error);
+        return api_error(
+            500,
+            "launch_failed",
+            &error.to_string(),
+            Some(json!({ "sessionId": record.id })),
+        );
     }
     json_response(201, &record)
 }
@@ -281,6 +319,19 @@ fn session_launch_from_payload(payload: Value) -> Result<SessionLaunch> {
         .context("failed to resolve projectRoot")?;
     let canonical_cwd = project::resolve_inside_root(&canonical_project_root, cwd.map(Path::new))?;
     let harness = required_string(&payload, "harness")?;
+    // Validate against the supported harness set up-front (client error)
+    // instead of letting the runtime's arg builder surface it later as a
+    // 500. Bonus: rejecting here means we never insert a session row for
+    // a launch that can't possibly succeed.
+    let supported: Vec<&'static str> = crate::harness::built_in_harness_specs()
+        .into_iter()
+        .map(|spec| spec.id)
+        .collect();
+    if !supported.iter().any(|id| *id == harness) {
+        anyhow::bail!(
+            "harness `{harness}` is not a supported harness; expected one of {supported:?}"
+        );
+    }
     let launch_mode = launch_mode_from_payload(&payload)?;
     let prompt = required_string(&payload, "prompt")?;
     let title = payload
@@ -290,6 +341,14 @@ fn session_launch_from_payload(payload: Value) -> Result<SessionLaunch> {
         .unwrap_or(&prompt)
         .to_string();
 
+    let conversation = conversation_from_payload(&payload)?;
+    let conversation_id = payload
+        .get("conversationId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned);
+
     Ok(SessionLaunch {
         id: Uuid::new_v4().to_string(),
         project_root: canonical_project_root.to_string_lossy().into_owned(),
@@ -298,6 +357,8 @@ fn session_launch_from_payload(payload: Value) -> Result<SessionLaunch> {
         launch_mode,
         prompt,
         title,
+        conversation,
+        conversation_id,
     })
 }
 
@@ -305,9 +366,38 @@ fn launch_mode_from_payload(payload: &Value) -> Result<HarnessLaunchMode> {
     match payload.get("launchMode").and_then(Value::as_str) {
         Some("interactive") | None => Ok(HarnessLaunchMode::Interactive),
         Some("nonInteractive") => Ok(HarnessLaunchMode::NonInteractive),
-        Some(other) => {
-            anyhow::bail!("launchMode must be `interactive` or `nonInteractive`, got `{other}`")
-        }
+        Some("stream") => Ok(HarnessLaunchMode::Stream),
+        Some(other) => anyhow::bail!(
+            "launchMode must be `interactive`, `nonInteractive`, or `stream`, got `{other}`"
+        ),
+    }
+}
+
+fn conversation_from_payload(payload: &Value) -> Result<Option<ConversationHint>> {
+    let Some(value) = payload.get("conversation") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let object = value
+        .as_object()
+        .context("conversation must be an object with `mode` and `id` fields")?;
+    let mode = object
+        .get("mode")
+        .and_then(Value::as_str)
+        .context("conversation.mode is required and must be `init` or `resume`")?;
+    let id = object
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .context("conversation.id is required and must be a non-empty string")?
+        .to_string();
+    match mode {
+        "init" => Ok(Some(ConversationHint::Init { id })),
+        "resume" => Ok(Some(ConversationHint::Resume { id })),
+        other => anyhow::bail!("conversation.mode must be `init` or `resume`, got `{other}`"),
     }
 }
 
@@ -340,12 +430,48 @@ fn record_input(
         return session_not_live_response(session_id);
     }
 
-    let payload = parse_body(body)?;
+    // Same structured-error pattern as `launch_session`: malformed JSON
+    // or runtime send failures must NOT propagate to the accept loop
+    // (that crashes the daemon process). Parse errors → 400; runtime
+    // errors → 500 except for "not live" which is the dedicated 409.
+    let payload = match parse_body(body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return api_error(
+                400,
+                "invalid_request",
+                &error.to_string(),
+                Some(json!({ "sessionId": session_id })),
+            );
+        }
+    };
+    // Validate `data` shape here (client error) instead of letting the
+    // runtime surface it as a 500. Required field, must be a string.
+    if !payload.get("data").map(|v| v.is_string()).unwrap_or(false) {
+        return api_error(
+            400,
+            "invalid_request",
+            "input payload requires string field `data`",
+            Some(json!({ "sessionId": session_id })),
+        );
+    }
     if let Err(error) = runtime.send_input(session_id, &payload) {
-        if error.to_string().contains("not live") {
+        // Match the typed sentinel from the daemon runtime instead of
+        // substring-matching the error message — refactoring the prose
+        // later can't accidentally route the not-live case to the
+        // generic 500 path.
+        if error
+            .downcast_ref::<crate::daemon::NotLiveError>()
+            .is_some()
+        {
             return session_not_live_response(session_id);
         }
-        return Err(error);
+        return api_error(
+            500,
+            "send_input_failed",
+            &error.to_string(),
+            Some(json!({ "sessionId": session_id })),
+        );
     }
     insert_event(&conn, session_id, "input", payload)?;
     json_response(202, &json!({ "ok": true, "accepted": true }))
@@ -369,11 +495,22 @@ fn kill_session(
         return session_not_live_response(session_id);
     }
 
+    // Same structured-error pattern as the launch + input handlers: a
+    // runtime kill failure (libc::kill returning EPERM, etc.) must
+    // become a 500 response, not an Err that brings down the daemon.
     if let Err(error) = runtime.kill_session(session_id) {
-        if error.to_string().contains("not live") {
+        if error
+            .downcast_ref::<crate::daemon::NotLiveError>()
+            .is_some()
+        {
             return session_not_live_response(session_id);
         }
-        return Err(error);
+        return api_error(
+            500,
+            "kill_failed",
+            &error.to_string(),
+            Some(json!({ "sessionId": session_id })),
+        );
     }
     let now = current_timestamp();
     store::update_session_status(&conn, session_id, "killed", None, &now)?;
@@ -914,6 +1051,7 @@ mod tests {
             archived_at: None,
             created_at: "2026-04-27T10:00:00Z".to_string(),
             updated_at: "2026-04-27T10:00:00Z".to_string(),
+            conversation_id: None,
         };
         crate::store::insert_session(&conn, &session)?;
 
@@ -1016,7 +1154,183 @@ mod tests {
     }
 
     #[test]
-    fn launch_request_persists_failed_status_when_runtime_launch_fails() -> anyhow::Result<()> {
+    fn launch_request_threads_conversation_hint_through_to_runtime() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "claude",
+            "launchMode": "nonInteractive",
+            "prompt": "hello",
+            "conversation": {"mode": "init", "id": "abc-123"}
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 201);
+        assert_eq!(
+            runtime.launches.borrow()[0].conversation,
+            Some(ConversationHint::Init {
+                id: "abc-123".to_string()
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn launch_request_accepts_resume_conversation_hint() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "claude",
+            "launchMode": "nonInteractive",
+            "prompt": "follow up",
+            "conversation": {"mode": "resume", "id": "abc-123"}
+        })
+        .to_string();
+
+        handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(
+            runtime.launches.borrow()[0].conversation,
+            Some(ConversationHint::Resume {
+                id: "abc-123".to_string()
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn launch_request_persists_conversation_id_on_the_session_row() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "claude",
+            "launchMode": "nonInteractive",
+            "prompt": "hi",
+            "conversation": {"mode": "init", "id": "abc-123"},
+            "conversationId": "abc-123"
+        })
+        .to_string();
+
+        handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(
+            runtime.launches.borrow()[0].conversation_id.as_deref(),
+            Some("abc-123")
+        );
+
+        // And it round-trips through the session list payload too.
+        let list = handle_request("GET", "/sessions", temp_dir.path(), None)?;
+        assert!(
+            list.body.contains(r#""conversation_id":"abc-123""#),
+            "list response should expose conversation_id, got: {}",
+            list.body
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn launch_request_treats_missing_conversation_id_as_null() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "claude",
+            "launchMode": "nonInteractive",
+            "prompt": "hi"
+        })
+        .to_string();
+
+        handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert!(runtime.launches.borrow()[0].conversation_id.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn launch_request_with_malformed_conversation_mode_returns_400_not_daemon_crash(
+    ) -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "claude",
+            "launchMode": "nonInteractive",
+            "prompt": "hi",
+            "conversation": {"mode": "forge", "id": "abc"}
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        // Must be a structured 400 — bubbling the error up to the
+        // daemon's accept loop would take the daemon down.
+        assert_eq!(response.status, 400);
+        assert!(
+            response.body.contains("conversation.mode"),
+            "expected body to mention conversation.mode, got: {}",
+            response.body
+        );
+        assert!(
+            response.body.contains("invalid_request"),
+            "expected structured `invalid_request` code, got: {}",
+            response.body
+        );
+        assert!(runtime.launches.borrow().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn launch_request_runtime_failure_returns_500_and_marks_session_failed() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let project_root = temp_dir.path().join("repo");
         std::fs::create_dir_all(&project_root)?;
@@ -1028,18 +1342,29 @@ mod tests {
         })
         .to_string();
 
-        let error = handle_request_with_runtime(
+        let response = handle_request_with_runtime(
             "POST",
             "/sessions",
             temp_dir.path(),
             None,
             Some(&body),
             &runtime,
-        )
-        .unwrap_err();
+        )?;
         let sessions = handle_request("GET", "/sessions", temp_dir.path(), None)?;
 
-        assert!(error.to_string().contains("launch failed"));
+        // Must be a structured response — propagating Err would crash
+        // the daemon's accept loop.
+        assert_eq!(response.status, 500);
+        assert!(
+            response.body.contains("launch_failed"),
+            "expected structured `launch_failed` code, got: {}",
+            response.body
+        );
+        assert!(
+            response.body.contains("launch failed"),
+            "expected runtime error message in the body, got: {}",
+            response.body
+        );
         assert!(sessions.body.contains(r#""status":"failed""#));
         Ok(())
     }
@@ -1060,19 +1385,20 @@ mod tests {
         })
         .to_string();
 
-        let error = handle_request_with_runtime(
+        let response = handle_request_with_runtime(
             "POST",
             "/sessions",
             temp_dir.path(),
             None,
             Some(&body),
             &runtime,
-        )
-        .unwrap_err();
+        )?;
 
+        assert_eq!(response.status, 400);
         assert!(
-            error.to_string().contains("outside the Coven project root"),
-            "unexpected error: {error:?}"
+            response.body.contains("outside the Coven project root"),
+            "unexpected body: {}",
+            response.body
         );
         assert!(runtime.launches.borrow().is_empty());
         Ok(())
@@ -1083,17 +1409,18 @@ mod tests {
         let temp_dir = tempfile::tempdir()?;
         let runtime = RecordingRuntime::default();
 
-        let error = handle_request_with_runtime(
+        let response = handle_request_with_runtime(
             "POST",
             "/sessions",
             temp_dir.path(),
             None,
             Some(r#"{"harness":"codex"}"#),
             &runtime,
-        )
-        .unwrap_err();
+        )?;
 
-        assert!(error.to_string().contains("projectRoot"));
+        assert_eq!(response.status, 400);
+        assert!(response.body.contains("projectRoot"));
+        assert!(response.body.contains("invalid_request"));
         assert!(runtime.launches.borrow().is_empty());
         Ok(())
     }
@@ -1139,6 +1466,238 @@ mod tests {
         assert_eq!(
             runtime.inputs.borrow().as_slice(),
             &["session-1:hello coven"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn launch_request_with_unknown_harness_returns_400_upfront_no_session_row() -> anyhow::Result<()>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "hermes",
+            "launchMode": "nonInteractive",
+            "prompt": "hello"
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 400);
+        assert!(
+            response.body.contains("not a supported harness"),
+            "expected supported-harness validation message, got: {}",
+            response.body
+        );
+        assert!(
+            runtime.launches.borrow().is_empty(),
+            "runtime must not be invoked for an unsupported harness"
+        );
+        // And no session row should have been inserted.
+        let sessions = handle_request("GET", "/sessions", temp_dir.path(), None)?;
+        assert!(
+            sessions.body.contains("[]"),
+            "no session row should exist after a 400-rejected launch, got: {}",
+            sessions.body
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn input_request_with_missing_data_field_returns_400_not_500() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "session-1")?;
+
+        let response = handle_request_with_body(
+            "POST",
+            "/sessions/session-1/input",
+            temp_dir.path(),
+            None,
+            Some(r#"{"foo":"bar"}"#),
+        )?;
+
+        assert_eq!(response.status, 400);
+        assert!(
+            response.body.contains("invalid_request"),
+            "missing `data` is a client error, expected 400 invalid_request, got: {}",
+            response.body
+        );
+        assert!(
+            response.body.contains("`data`"),
+            "expected the message to name the missing field, got: {}",
+            response.body
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn input_request_with_non_string_data_field_returns_400_not_500() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "session-1")?;
+
+        let response = handle_request_with_body(
+            "POST",
+            "/sessions/session-1/input",
+            temp_dir.path(),
+            None,
+            Some(r#"{"data": 42}"#),
+        )?;
+
+        assert_eq!(response.status, 400);
+        assert!(
+            response.body.contains("invalid_request"),
+            "non-string `data` is a client error, expected 400 invalid_request, got: {}",
+            response.body
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn input_request_with_malformed_body_returns_400_not_daemon_crash() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "session-1")?;
+
+        let response = handle_request_with_body(
+            "POST",
+            "/sessions/session-1/input",
+            temp_dir.path(),
+            None,
+            Some("{ not json"),
+        )?;
+
+        assert_eq!(response.status, 400);
+        assert!(
+            response.body.contains("invalid_request"),
+            "expected structured `invalid_request` code, got: {}",
+            response.body
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn input_request_not_live_runtime_error_routes_to_409_via_typed_downcast() -> anyhow::Result<()>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "session-1")?;
+
+        struct NotLiveRuntime;
+        impl SessionRuntime for NotLiveRuntime {
+            fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+                Ok(())
+            }
+            fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+                Err(anyhow::Error::new(crate::daemon::NotLiveError {
+                    session_id: "session-1".to_string(),
+                }))
+            }
+            fn kill_session(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+        let runtime = NotLiveRuntime;
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions/session-1/input",
+            temp_dir.path(),
+            None,
+            Some(r#"{"data":"hi"}"#),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 409);
+        assert!(
+            response.body.contains("session_not_live"),
+            "typed NotLiveError must route to 409 session_not_live, got: {}",
+            response.body
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn input_request_runtime_failure_returns_500_not_daemon_crash() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "session-1")?;
+
+        // Runtime that fails send_input with a non-"not live" message
+        // — we want the daemon to surface it as a structured 500
+        // instead of bubbling it to serve_next_connection's `?`.
+        struct FailingInput;
+        impl SessionRuntime for FailingInput {
+            fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+                Ok(())
+            }
+            fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+                Err(anyhow::anyhow!("simulated send_input failure"))
+            }
+            fn kill_session(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+        let runtime = FailingInput;
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions/session-1/input",
+            temp_dir.path(),
+            None,
+            Some(r#"{"data":"hello"}"#),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 500);
+        assert!(
+            response.body.contains("send_input_failed"),
+            "expected structured `send_input_failed` code, got: {}",
+            response.body
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn kill_request_runtime_failure_returns_500_not_daemon_crash() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "session-1")?;
+
+        struct FailingKill;
+        impl SessionRuntime for FailingKill {
+            fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+                Ok(())
+            }
+            fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+                Ok(())
+            }
+            fn kill_session(&self, _: &str) -> Result<()> {
+                Err(anyhow::anyhow!("simulated kill_session failure"))
+            }
+        }
+        let runtime = FailingKill;
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions/session-1/kill",
+            temp_dir.path(),
+            None,
+            Some("{}"),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 500);
+        assert!(
+            response.body.contains("kill_failed"),
+            "expected structured `kill_failed` code, got: {}",
+            response.body
         );
         Ok(())
     }
@@ -1324,11 +1883,15 @@ mod tests {
         }
 
         fn send_input(&self, session_id: &str, _payload: &Value) -> Result<()> {
-            anyhow::bail!("session `{session_id}` is not live in this daemon")
+            Err(anyhow::Error::new(crate::daemon::NotLiveError {
+                session_id: session_id.to_string(),
+            }))
         }
 
         fn kill_session(&self, session_id: &str) -> Result<()> {
-            anyhow::bail!("session `{session_id}` is not live in this daemon")
+            Err(anyhow::Error::new(crate::daemon::NotLiveError {
+                session_id: session_id.to_string(),
+            }))
         }
     }
 
@@ -1352,6 +1915,7 @@ mod tests {
             archived_at: None,
             created_at: "2026-04-27T10:00:00Z".to_string(),
             updated_at: "2026-04-27T10:00:00Z".to_string(),
+            conversation_id: None,
         };
         crate::store::insert_session(&conn, &session)?;
         Ok(())
