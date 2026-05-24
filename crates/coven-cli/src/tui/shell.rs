@@ -28,8 +28,8 @@ use super::{is_key_press, sessions};
 use crate::{
     archive_session_command, attach_session, coven_home_dir, coven_store_path, current_timestamp,
     daemon, default_harness_id, project, prompt_for_optional_line, prompt_for_required_line,
-    run_daemon_command, run_doctor, run_patch, run_session, sacrifice_session_command,
-    store, summon_only_command, theme, DaemonCommand, RUNNING_SESSION_STATUS,
+    run_daemon_command, run_doctor, run_patch, run_session, sacrifice_session_command, store,
+    summon_only_command, theme, DaemonCommand, RUNNING_SESSION_STATUS,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -106,10 +106,7 @@ path = "/abs/beta"
         let config = load(temp.path())?;
 
         assert_eq!(config.default_name(), Some("alpha"));
-        assert_eq!(
-            config.resolve("alpha"),
-            Some(PathBuf::from("/abs/alpha"))
-        );
+        assert_eq!(config.resolve("alpha"), Some(PathBuf::from("/abs/alpha")));
         assert_eq!(config.resolve("beta"), Some(PathBuf::from("/abs/beta")));
         assert_eq!(config.resolve("missing"), None);
         Ok(())
@@ -135,7 +132,10 @@ path = "~/projects/example"
             None => std::env::remove_var("HOME"),
         }
 
-        assert_eq!(resolved, Some(PathBuf::from("/tmp/fake-home/projects/example")));
+        assert_eq!(
+            resolved,
+            Some(PathBuf::from("/tmp/fake-home/projects/example"))
+        );
         Ok(())
     }
 

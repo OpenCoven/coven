@@ -103,9 +103,7 @@ enum Command {
     },
     #[command(about = "Guided repair flow for a registered repo")]
     Patch {
-        #[arg(
-            help = "Registered repo name (default: from ~/.coven/repos.toml, else `openclaw`)"
-        )]
+        #[arg(help = "Registered repo name (default: from ~/.coven/repos.toml, else `openclaw`)")]
         name: Option<String>,
         #[arg(num_args = 0.., help = "Issue text describing what is broken")]
         issue: Vec<String>,
@@ -113,7 +111,10 @@ enum Command {
         repo: Option<PathBuf>,
         #[arg(long, help = "Harness to use: codex or claude")]
         harness: Option<String>,
-        #[arg(long, help = "Verification profile: auto, pnpm-check, targeted-test, diff-only")]
+        #[arg(
+            long,
+            help = "Verification profile: auto, pnpm-check, targeted-test, diff-only"
+        )]
         verify: Option<String>,
         #[arg(long)]
         non_interactive: bool,
@@ -314,10 +315,9 @@ fn run_patch(
     let issue = match joined_optional_issue(issue)? {
         Some(issue) => issue,
         None if non_interactive => anyhow::bail!("issue text is required with --non-interactive"),
-        None => prompt_for_required_line(&format!(
-            "What is broken in {}? ",
-            detected_repo.repo_name
-        ))?,
+        None => {
+            prompt_for_required_line(&format!("What is broken in {}? ", detected_repo.repo_name))?
+        }
     };
     let harness_id = match harness {
         Some(harness) => patch::HarnessId::parse(&harness)?,

@@ -440,7 +440,10 @@ mod tests {
         let error = detect_repo("nope", None, None, temp.path(), None).unwrap_err();
         let message = error.to_string();
         assert!(message.contains("\"nope\""), "unexpected error: {message}");
-        assert!(message.contains("repos.toml"), "unexpected error: {message}");
+        assert!(
+            message.contains("repos.toml"),
+            "unexpected error: {message}"
+        );
         Ok(())
     }
 
