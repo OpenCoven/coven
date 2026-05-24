@@ -300,8 +300,9 @@ pub fn insert_session_if_absent(conn: &Connection, record: &SessionRecord) -> Re
                 exit_code,
                 archived_at,
                 created_at,
-                updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                updated_at,
+                conversation_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 &record.id,
                 &record.project_root,
@@ -312,6 +313,7 @@ pub fn insert_session_if_absent(conn: &Connection, record: &SessionRecord) -> Re
                 &record.archived_at,
                 &record.created_at,
                 &record.updated_at,
+                &record.conversation_id,
             ],
         )
         .with_context(|| format!("failed to upsert session {}", record.id))?;

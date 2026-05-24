@@ -623,6 +623,7 @@ fn ensure_cockpit_session(conn: &rusqlite::Connection) -> Result<()> {
         archived_at: None,
         created_at: now.clone(),
         updated_at: now,
+        conversation_id: None,
     };
     store::insert_session_if_absent(conn, &record)?;
     Ok(())
@@ -2217,6 +2218,7 @@ mod tests {
             archived_at: None,
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
+            conversation_id: None,
         };
         store::insert_session(&conn, &session)?;
         insert_event(&conn, "sess-log", "input", json!({"text": "hello"}))?;
@@ -2305,6 +2307,7 @@ mod tests {
             archived_at: None,
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
+            conversation_id: None,
         };
         store::insert_session(&conn, &session)?;
         drop(conn);
@@ -2402,6 +2405,7 @@ mod tests {
                     archived_at: None,
                     created_at: now.into(),
                     updated_at: now.into(),
+                    conversation_id: None,
                 },
             )?;
         }
