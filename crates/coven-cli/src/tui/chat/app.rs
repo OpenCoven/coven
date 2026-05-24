@@ -1,7 +1,7 @@
 //! Chat application state, behavior, and helpers. Owns `App` and all of its
 //! methods; provides `discover_agents` and the spinner-frame data.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -130,6 +130,12 @@ pub(super) struct App {
     /// budget; prevents an infinite loop if the retry itself somehow hits
     /// stale-detection too.
     auto_retry_consumed: bool,
+    /// Session ids whose events should be hidden from the visible
+    /// transcript. Populated when stale-recovery fires so the raw harness
+    /// error chunk, any trailing teardown output, and the orphaned exit
+    /// event don't clutter the chat after we've already kicked off a
+    /// retry. Entries are cleared once their exit (or kill) event arrives.
+    suppressed_session_ids: HashSet<String>,
     client: Box<dyn ChatClient>,
 }
 
@@ -285,6 +291,7 @@ impl App {
             active_session_harness: None,
             last_chat_prompt: None,
             auto_retry_consumed: false,
+            suppressed_session_ids: HashSet::new(),
             client,
         };
 
@@ -1094,6 +1101,12 @@ impl App {
         }
         self.harness_conversation_ids.remove(&harness);
         self.persist_conversations();
+        // Hide any further output and the eventual exit event for the
+        // failed session so the user only sees the system message + the
+        // retry's reply.
+        if let Some(failed_session_id) = self.active_session_id.clone() {
+            self.suppressed_session_ids.insert(failed_session_id);
+        }
 
         // Try to auto-resend so the user doesn't have to retype. Skip if
         // we've already retried this turn (defense against a retry that
@@ -1120,11 +1133,26 @@ impl App {
     }
 
     fn push_event_message(&mut self, event: &store::EventRecord) {
+        // Drop events from sessions we've decided to hide (today: failed
+        // sessions whose stale-id we already auto-recovered from). Clear
+        // the entry once the session has reached a terminal event so the
+        // set doesn't grow over the chat lifetime.
+        if self.suppressed_session_ids.contains(&event.session_id) {
+            if matches!(event.kind.as_str(), "exit" | "kill") {
+                self.suppressed_session_ids.remove(&event.session_id);
+            }
+            return;
+        }
         match event.kind.as_str() {
             "output" => {
                 if let Some(data) = event_payload_text(event, "data") {
                     self.maybe_capture_codex_session_id(&data);
                     self.maybe_clear_stale_conversation_id(&data);
+                    // The stale handler may have just suppressed this very
+                    // session; if so, skip displaying this chunk too.
+                    if self.suppressed_session_ids.contains(&event.session_id) {
+                        return;
+                    }
                     let sender = self.active_agent_label().to_string();
                     if let Some(text) =
                         human_facing_agent_output(&data, &mut self.agent_output_mode)
@@ -2403,6 +2431,115 @@ mod tests {
                 .iter()
                 .any(|m| m.content.contains("re-sending your message")),
             "user must see a system message about the auto-retry"
+        );
+    }
+
+    #[test]
+    fn stale_recovery_hides_raw_error_chunk_and_failed_session_exit_from_transcript() {
+        let coven_home = tempfile::tempdir().unwrap();
+        let project_root = tempfile::tempdir().unwrap();
+        let stored_id = "fab1efac-1234-5678-9abc-def012345678";
+        let mut seed = std::collections::HashMap::new();
+        seed.insert("claude".to_string(), stored_id.to_string());
+        persistence::save_for_project(coven_home.path(), project_root.path(), &seed)
+            .expect("seed persisted state");
+
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_persistence(client, coven_home.path(), project_root.path());
+        app.active_agent = Some(1); // claude
+        app.input = "hello again".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let failed_session = app.active_session_id().expect("first launch").to_string();
+
+        // The chunk that contains the stale phrase.
+        app.push_event_message(&output_event(
+            1,
+            &failed_session,
+            &format!("No conversation found with session ID: {stored_id}\n"),
+        ));
+        // A trailing chunk from the same failed session (ANSI cleanup, etc.).
+        app.push_event_message(&output_event(
+            2,
+            &failed_session,
+            "trailing teardown noise\n",
+        ));
+        // And finally the failed session's exit event.
+        app.push_event_message(&EventRecord {
+            seq: 3,
+            id: "event-exit".to_string(),
+            session_id: failed_session.clone(),
+            kind: "exit".to_string(),
+            payload_json: serde_json::json!({ "status": "completed" }).to_string(),
+            created_at: "2026-05-19T00:00:00Z".to_string(),
+        });
+
+        // None of the failed session's content (raw error, trailing noise,
+        // "Session completed.") should appear in the transcript.
+        let transcript: Vec<&str> = app
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        for content in &transcript {
+            assert!(
+                !content.contains("No conversation found with session ID"),
+                "raw stale error must be hidden, found: {content}"
+            );
+            assert!(
+                !content.contains("trailing teardown noise"),
+                "trailing output from the failed session must be hidden, found: {content}"
+            );
+            assert!(
+                !content.contains("Session completed"),
+                "orphaned exit message from the failed session must be hidden, found: {content}"
+            );
+        }
+        // The system message and the retry's "Connected" line should be visible.
+        assert!(transcript.iter().any(|c| c.contains("re-sending your message")));
+        assert!(transcript.iter().any(|c| c.contains("Connected")));
+        // Suppression entry must be cleared once the exit is consumed.
+        assert!(!app.suppressed_session_ids.contains(&failed_session));
+    }
+
+    #[test]
+    fn suppression_only_applies_to_the_failed_session_not_other_sessions() {
+        let coven_home = tempfile::tempdir().unwrap();
+        let project_root = tempfile::tempdir().unwrap();
+        let stored_id = "fab1efac-1234-5678-9abc-def012345678";
+        let mut seed = std::collections::HashMap::new();
+        seed.insert("claude".to_string(), stored_id.to_string());
+        persistence::save_for_project(coven_home.path(), project_root.path(), &seed)
+            .expect("seed persisted state");
+
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_persistence(client, coven_home.path(), project_root.path());
+        app.active_agent = Some(1); // claude
+        app.input = "hello".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let failed_session = app.active_session_id().expect("first launch").to_string();
+
+        app.push_event_message(&output_event(
+            1,
+            &failed_session,
+            &format!("No conversation found with session ID: {stored_id}\n"),
+        ));
+        let retry_session = app.active_session_id().expect("retry session").to_string();
+        assert_ne!(retry_session, failed_session);
+
+        // Output from the retry session must still be rendered.
+        app.push_event_message(&output_event(
+            2,
+            &retry_session,
+            "Hi from the new conversation.\n",
+        ));
+
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content.contains("Hi from the new conversation")),
+            "retry-session output must not be suppressed"
         );
     }
 

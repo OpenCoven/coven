@@ -98,14 +98,17 @@ CLI's own session API avoids both problems.
   separate entries of `harness_conversation_ids`. There's no cross-harness
   context transfer; switching agents effectively starts (or resumes) a
   parallel thread with the new agent.
-- **Stale ids** — auto-recovered with auto-retry. If the harness CLI rejects
-  our `Resume` because the prior session no longer exists (claude: `No
-  conversation found with session ID:`; codex: `no rollout found for thread
-  id` / `thread/resume failed`), the chat detects the message in the output
-  stream, drops the id from both memory and disk, and immediately re-sends
-  the user's original prompt with no resume hint. The user sees "Prior
-  <harness> conversation no longer exists. Starting a new one and
-  re-sending your message." then the reply from the fresh conversation.
+- **Stale ids** — auto-recovered with auto-retry, raw error hidden. If the
+  harness CLI rejects our `Resume` because the prior session no longer
+  exists (claude: `No conversation found with session ID:`; codex: `no
+  rollout found for thread id` / `thread/resume failed`), the chat detects
+  the message in the output stream, drops the id from both memory and disk,
+  re-sends the user's original prompt with no resume hint, **and**
+  suppresses every remaining event from the failed daemon session (the
+  stale-error chunk itself, any trailing teardown output, and the orphaned
+  exit event). The transcript reads: "Prior <harness> conversation no
+  longer exists. Starting a new one and re-sending your message." → reply
+  from the fresh conversation, with no scary raw error in between.
   Bounded to one auto-retry per user turn — a second stale event in the
   same turn falls back to "Send your message again to start a fresh one."
   so a degenerate loop can't pile up launches. Detection uses output-text
@@ -163,24 +166,6 @@ CLI's own session API avoids both problems.
    the right id.
 
 ## Future work
-
-### Hiding the raw stale-error chunk from the transcript
-
-When stale-recovery fires, the user briefly sees the raw harness error
-(e.g. `No conversation found with session ID: …`) rendered as an agent
-message right before the system message and auto-retry kick in. A polish
-would suppress that one chunk from the transcript so the flow reads:
-system message → new reply, with no scary error in between. Two
-approaches:
-
-- Return early from `push_event_message`'s output branch when stale is
-  detected, skipping the human-facing render for *that* chunk only.
-- Track `suppressed_session_ids: HashSet<String>` and skip all output +
-  exit events from the failed session id (handles the case where the
-  harness emits additional output before exiting).
-
-The second is more robust but adds a sweep of the event handler; the
-first is one-line.
 
 ### `/new` as a separate verb
 
