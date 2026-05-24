@@ -33,7 +33,10 @@ pub fn harness_supports_stream_mode(harness_id: &str) -> bool {
 
 /// Hint passed when a chat turn wants to participate in a multi-turn
 /// conversation by reusing the underlying harness CLI's session-resume
-/// mechanism. Only consulted in `NonInteractive` mode today.
+/// mechanism. Consulted in `NonInteractive` mode (each turn cold-starts
+/// claude/codex with `--resume`/`exec resume`) and in `Stream` mode (the
+/// long-lived claude process is launched with `--session-id`/`--resume`
+/// up front).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConversationHint {
     /// First turn of a conversation. The harness should create a session
@@ -137,10 +140,15 @@ pub fn command_parts_for_harness(
     command_parts_for_harness_with_conversation(harness_id, prompt, mode, None)
 }
 
-/// Build a harness command line, optionally injecting session-continuity flags
-/// so the harness CLI resumes a prior conversation. Only Claude is wired up
-/// today; other harnesses ignore the hint and fall back to one-shot args.
-/// See `docs/chat-persistence.md` for how to extend this for Codex.
+/// Build a harness command line, optionally injecting session-continuity
+/// flags so the harness CLI resumes a prior conversation. Claude uses
+/// `--session-id`/`--resume` (works in both NonInteractive and Stream
+/// modes); codex uses `codex exec … resume <id>` for resume turns and
+/// falls through to a fresh launch for the Init turn (since codex
+/// auto-assigns its own session id, which the chat captures from
+/// output later). Harnesses with no resume support ignore the hint and
+/// fall back to one-shot args. See `docs/chat-persistence.md` for how
+/// to extend this for new harnesses.
 pub fn command_parts_for_harness_with_conversation(
     harness_id: &str,
     prompt: &str,

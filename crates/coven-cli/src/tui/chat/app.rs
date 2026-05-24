@@ -143,6 +143,13 @@ pub(super) struct App {
     /// cold-start). Cleared on session exit/kill/`/clear`/`/new`. Today
     /// only claude is stream-capable. See `docs/chat-persistence.md`.
     harness_stream_session_ids: HashMap<String, String>,
+    /// Per-stream-session accumulator for partial JSON lines. Daemon
+    /// output events come from 8KiB reads of the child's stdout; a single
+    /// JSON line can be split across two events. We buffer the trailing
+    /// partial line here and prepend it to the next event so
+    /// `dispatch_stream_json_output` only ever tries to parse complete
+    /// newline-terminated lines.
+    stream_json_buffers: HashMap<String, String>,
     client: Box<dyn ChatClient>,
 }
 
@@ -304,6 +311,7 @@ impl App {
             auto_retry_consumed: false,
             suppressed_session_ids: HashSet::new(),
             harness_stream_session_ids: HashMap::new(),
+            stream_json_buffers: HashMap::new(),
             client,
         };
 
@@ -1006,12 +1014,24 @@ impl App {
         }
     }
 
-    /// Send raw text as stdin to a session the user `/attach`ed to (i.e. one
-    /// chat did not launch). Chat-owned sessions never take this path; they
-    /// resume via a fresh `--resume` launch instead.
+    /// Send raw text as stdin to a session — either one the user
+    /// `/attach`ed to (PTY-backed) or one of our own long-lived stream
+    /// sessions. PTY sessions need a trailing newline so Enter submits;
+    /// stream sessions don't, because the daemon wraps the payload in a
+    /// JSON envelope verbatim and the inner `\n` would otherwise leak
+    /// into the user message text on every turn after the first.
     fn forward_input_to_session(&mut self, session_id: &str, raw: &str) {
         self.is_responding = true;
-        let result = self.client.send_input(session_id, &format!("{raw}\n"));
+        let is_stream = self
+            .harness_stream_session_ids
+            .values()
+            .any(|id| id == session_id);
+        let payload = if is_stream {
+            raw.to_string()
+        } else {
+            format!("{raw}\n")
+        };
+        let result = self.client.send_input(session_id, &payload);
         match result {
             Ok(()) => self.poll_session_events(),
             Err(error) => {
@@ -1238,9 +1258,24 @@ impl App {
     /// other event types (system init, rate_limit_event, …) are ignored
     /// for now. Malformed lines are silently dropped — stream-mode is too
     /// noisy to surface every parse error.
-    fn dispatch_stream_json_output(&mut self, _session_id: &str, data: &str) {
+    fn dispatch_stream_json_output(&mut self, session_id: &str, data: &str) {
         let sender = self.active_agent_label().to_string();
-        for line in data.split('\n') {
+        // Daemon output events come from raw 8KiB reads, so a JSON line
+        // can be split across two events. Buffer the trailing partial
+        // line and prepend it to the next chunk so we only try to parse
+        // complete newline-terminated lines.
+        let buffer = self
+            .stream_json_buffers
+            .entry(session_id.to_string())
+            .or_default();
+        buffer.push_str(data);
+        let (complete, remainder) = match buffer.rfind('\n') {
+            Some(idx) => (buffer[..=idx].to_string(), buffer[idx + 1..].to_string()),
+            None => (String::new(), std::mem::take(buffer)),
+        };
+        *buffer = remainder;
+
+        for line in complete.split('\n') {
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
@@ -1260,27 +1295,44 @@ impl App {
                     else {
                         continue;
                     };
-                    let mut buffer = String::new();
+                    let mut chunk = String::new();
                     for block in content {
                         if block.get("type").and_then(serde_json::Value::as_str) == Some("text") {
                             if let Some(text) =
                                 block.get("text").and_then(serde_json::Value::as_str)
                             {
-                                buffer.push_str(text);
+                                chunk.push_str(text);
                             }
                         }
                     }
-                    if !buffer.is_empty() {
+                    if !chunk.is_empty() {
                         if self.streaming_mode.is_live() {
-                            self.push_or_append_agent_message(&sender, &buffer);
+                            self.push_or_append_agent_message(&sender, &chunk);
                         } else {
-                            self.buffer_pending_agent_output(&sender, &buffer);
+                            self.buffer_pending_agent_output(&sender, &chunk);
                         }
                     }
                 }
                 "result" => {
                     self.flush_pending_agent_buffer();
                     self.is_responding = false;
+                }
+                "system" => {
+                    // Daemon wraps stream-mode child stderr in
+                    // {"type":"system","subtype":"stderr","text":...} so
+                    // chat surfaces auth/setup errors instead of dropping
+                    // them. Other system subtypes (init, etc.) stay silent.
+                    let subtype = value
+                        .get("subtype")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    if subtype == "stderr" {
+                        if let Some(text) = value.get("text").and_then(serde_json::Value::as_str) {
+                            if !text.is_empty() {
+                                self.push_system_message(&format!("[{sender} stderr] {text}"));
+                            }
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -2628,8 +2680,8 @@ mod tests {
                 .calls
                 .borrow()
                 .iter()
-                .any(|call| call == &format!("input:{stream_session_id}:second\n")),
-            "second turn must forward via send_input to the existing stream session"
+                .any(|call| call == &format!("input:{stream_session_id}:second")),
+            "second turn must forward via send_input to the existing stream session WITHOUT a trailing newline (the daemon wraps payload verbatim in a JSON envelope; a literal \\n would leak into the user message text)"
         );
     }
 
@@ -2685,6 +2737,66 @@ mod tests {
             r#"{"type":"result","subtype":"success","is_error":false}"#.to_string() + "\n";
         app.push_event_message(&output_event(2, &session_id, &result_chunk));
         assert!(!app.is_responding, "result event must clear is_responding");
+    }
+
+    #[test]
+    fn stream_json_assistant_split_across_two_output_chunks_still_renders_correctly() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        // Realistic case: the daemon's 8KiB read split a single JSON line
+        // exactly in the middle. Without buffering, both halves are
+        // unparseable and the assistant text would be dropped silently.
+        let full_line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello from split."}]}}"#;
+        let split_at = full_line.len() / 2;
+        let (head, tail) = full_line.split_at(split_at);
+
+        app.push_event_message(&output_event(1, &session_id, head));
+        // After the first chunk there's no newline yet, so nothing renders.
+        assert!(
+            !app.messages
+                .iter()
+                .any(|m| m.content.contains("Hello from split.")),
+            "first chunk alone must not render — line isn't complete"
+        );
+
+        // The second chunk completes the line; render now.
+        app.push_event_message(&output_event(2, &session_id, &format!("{tail}\n")));
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content.contains("Hello from split.")),
+            "rejoined line must parse and render after the trailing newline arrives"
+        );
+    }
+
+    #[test]
+    fn stream_json_stderr_envelope_renders_as_system_message() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        let stderr_chunk =
+            r#"{"type":"system","subtype":"stderr","text":"warning: auth token expiring soon"}"#
+                .to_string()
+                + "\n";
+        app.push_event_message(&output_event(1, &session_id, &stderr_chunk));
+
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content.contains("warning: auth token expiring soon")),
+            "stream-json stderr envelope must surface as a system message in the transcript"
+        );
     }
 
     #[test]

@@ -93,12 +93,14 @@ pub fn spawn_detached(command: &HarnessCommand) -> Result<DetachedPtySession> {
     spawn_detached_with_observer(command, None)
 }
 
-/// Handle returned by `spawn_piped_with_observer`. The child is wrapped in
-/// an `Arc<Mutex<Option<...>>>` so the drain thread can take it for `wait`
-/// while the daemon's killer holds a separate clone for `kill`.
+/// Handle returned by `spawn_piped_with_observer`. The child handle itself
+/// is owned by the internal wait thread (so `wait()` can block without
+/// blocking the killer); the caller gets a writable stdin and the PID so
+/// it can signal termination via `libc::kill` instead of needing exclusive
+/// access to the `Child`.
 pub struct PipedSession {
     pub input: Box<dyn Write + Send>,
-    pub child: std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>,
+    pub pid: u32,
 }
 
 /// Spawn `command` as a plain piped child process (no PTY) and stream its
@@ -107,7 +109,10 @@ pub struct PipedSession {
 /// newline-delimited JSON to stdout — wrapping in a PTY would add ANSI
 /// escapes the child wouldn't otherwise emit. Lifecycle mirrors
 /// `spawn_detached_with_observer`: a background thread drains stdout and
-/// fires `on_exit` when the child finishes.
+/// fires `on_exit` when the child finishes. Stderr is line-buffered and
+/// forwarded to `observer.on_output` wrapped in a stream-json
+/// `{"type":"system","subtype":"stderr","text":"…"}` envelope so chat
+/// surfaces auth/setup errors instead of swallowing them.
 pub fn spawn_piped_with_observer(
     command: &HarnessCommand,
     observer: Option<DetachedPtyObserver>,
@@ -129,6 +134,7 @@ pub fn spawn_piped_with_observer(
         )
     })?;
 
+    let pid = child.id();
     let stdin = child
         .stdin
         .take()
@@ -142,74 +148,69 @@ pub fn spawn_piped_with_observer(
         .take()
         .context("failed to take child stderr in piped mode")?;
 
-    // Drain stderr to keep the buffer from filling and the child from
-    // blocking. Stream-json harnesses surface auth/setup errors there.
-    // `map_while(Result::ok)` stops at the first read error instead of
-    // looping forever on EBADF (clippy::lines_filter_map_ok).
+    // Share the on_output callback between the stdout and stderr drain
+    // threads — both want to feed the same observer pipeline. `on_exit` is
+    // moved into the stdout thread (it fires exactly once when the child
+    // exits). If no observer was supplied, both callbacks are no-ops.
+    let DetachedPtyObserver { on_output, on_exit } = observer.unwrap_or(DetachedPtyObserver {
+        on_output: Box::new(|_| {}),
+        on_exit: Box::new(|_| {}),
+    });
+    let on_output_shared = Arc::new(StdMutex::new(on_output));
+
+    // Stderr drain: line-buffered, wrapped in a stream-json system
+    // envelope so chat can render auth/setup messages as system lines
+    // rather than dropping them silently.
+    let stderr_callback = Arc::clone(&on_output_shared);
     thread::spawn(move || {
         let reader = BufReader::new(stderr);
         for line in reader.lines().map_while(Result::ok) {
-            eprintln!("[stream-stderr] {line}");
+            let envelope = serde_json::json!({
+                "type": "system",
+                "subtype": "stderr",
+                "text": line,
+            });
+            let mut payload = envelope.to_string();
+            payload.push('\n');
+            if let Ok(mut cb) = stderr_callback.lock() {
+                cb(payload.into_bytes());
+            }
         }
     });
 
-    let shared_child = Arc::new(StdMutex::new(Some(child)));
-    let shared_for_wait = Arc::clone(&shared_child);
+    // Stdout drain + wait. The wait thread OWNS `child`; the killer never
+    // touches the `Child` handle, only the PID. That removes the previous
+    // deadlock risk where `wait()` and `kill()` raced on a shared mutex.
+    let stdout_callback = Arc::clone(&on_output_shared);
     thread::spawn(move || {
         let mut reader = stdout;
-        let mut observer = observer;
-        drain_detached_output(
-            &mut reader,
-            observer.as_mut().map(|observer| &mut observer.on_output),
-        );
-        let result = wait_for_piped_child(&shared_for_wait);
-        if let Some(observer) = observer {
-            (observer.on_exit)(result);
-        }
+        let mut bridge: Box<dyn FnMut(Vec<u8>) + Send + 'static> = Box::new(move |chunk| {
+            if let Ok(mut cb) = stdout_callback.lock() {
+                cb(chunk);
+            }
+        });
+        drain_detached_output(&mut reader, Some(&mut bridge));
+        let result = match child.wait() {
+            Ok(status) => PtyRunResult {
+                status: if status.success() {
+                    "completed"
+                } else {
+                    "failed"
+                },
+                exit_code: status.code(),
+            },
+            Err(_) => PtyRunResult {
+                status: "failed",
+                exit_code: None,
+            },
+        };
+        on_exit(result);
     });
 
     Ok(PipedSession {
         input: Box::new(stdin),
-        child: shared_child,
+        pid,
     })
-}
-
-fn wait_for_piped_child(
-    child: &std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>,
-) -> PtyRunResult {
-    let mut guard = match child.lock() {
-        Ok(guard) => guard,
-        Err(_) => {
-            return PtyRunResult {
-                status: "failed",
-                exit_code: None,
-            };
-        }
-    };
-    let Some(child) = guard.as_mut() else {
-        return PtyRunResult {
-            status: "completed",
-            exit_code: None,
-        };
-    };
-    match child.wait() {
-        Ok(status) => {
-            let exit_code = status.code();
-            let status_label = if status.success() {
-                "completed"
-            } else {
-                "failed"
-            };
-            PtyRunResult {
-                status: status_label,
-                exit_code,
-            }
-        }
-        Err(_) => PtyRunResult {
-            status: "failed",
-            exit_code: None,
-        },
-    }
 }
 
 pub fn spawn_detached_with_observer(

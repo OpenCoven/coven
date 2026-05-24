@@ -132,7 +132,7 @@ impl SessionRuntime for LiveSessionRuntime {
 
         if launch.launch_mode == crate::harness::HarnessLaunchMode::Stream {
             let piped = pty_runner::spawn_piped_with_observer(&command, observer)?;
-            let killer: Box<dyn RuntimeKiller> = Box::new(PipedKiller { child: piped.child });
+            let killer: Box<dyn RuntimeKiller> = Box::new(PipedKiller { pid: piped.pid });
             let mut input = piped.input;
             // Send the launch's prompt as the first stream-json user
             // message so the chat doesn't need a separate send call right
@@ -224,23 +224,42 @@ fn write_stream_message(input: &mut dyn Write, text: &str) -> Result<()> {
 }
 
 /// Killer for a non-PTY piped child (stream-mode harness sessions).
-/// `pty_runner::spawn_piped_with_observer` returns an `Arc<Mutex<Option<Child>>>`
-/// shared with the drain thread; killing tells the kernel to terminate the
-/// child while the drain thread also has access for its eventual `wait`.
+/// `pty_runner::spawn_piped_with_observer` returns just the child's PID
+/// because the `Child` handle itself lives inside the wait/drain thread —
+/// sharing it through a `Mutex` would deadlock when `wait()` blocks while
+/// `kill()` waits for the same lock. Sending SIGTERM via the PID
+/// short-circuits that: the kernel signals the child, `wait()` returns,
+/// and the cleanup observer fires.
 struct PipedKiller {
-    child: std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>,
+    pid: u32,
 }
 
 impl RuntimeKiller for PipedKiller {
+    #[cfg(unix)]
     fn kill(&mut self) -> Result<()> {
-        let mut guard = self
-            .child
-            .lock()
-            .map_err(|_| anyhow::anyhow!("piped child mutex poisoned"))?;
-        if let Some(child) = guard.as_mut() {
-            let _ = child.kill();
+        let pid = self.pid as libc::pid_t;
+        // SIGTERM gives the child a chance to clean up; if it doesn't
+        // respond the OS will reap it when its parent (the daemon) exits.
+        let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
+        if rc != 0 {
+            let error = std::io::Error::last_os_error();
+            // ESRCH means the process is already gone — fine, that's the
+            // post-condition we want.
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error).with_context(|| {
+                    format!("failed to send SIGTERM to stream harness pid {pid}")
+                });
+            }
         }
         Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn kill(&mut self) -> Result<()> {
+        anyhow::bail!(
+            "stream-mode harness kill not implemented on this platform (pid {})",
+            self.pid
+        )
     }
 }
 
