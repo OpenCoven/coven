@@ -1057,11 +1057,37 @@ impl App {
         }
     }
 
+    /// If the harness rejected our `Resume` because the prior session no
+    /// longer exists (claude or codex local store wiped, server-side
+    /// expiry, etc.), drop the stale id from memory and disk and tell the
+    /// user so they can retry with a fresh thread. Only fires for chat-owned
+    /// sessions where we actually had a stored id to send.
+    fn maybe_clear_stale_conversation_id(&mut self, data: &str) {
+        if !self.chat_owns_active_session {
+            return;
+        }
+        let Some(harness) = self.active_session_harness.clone() else {
+            return;
+        };
+        if !self.harness_conversation_ids.contains_key(&harness) {
+            return;
+        }
+        if !detect_stale_session(&harness, data) {
+            return;
+        }
+        self.harness_conversation_ids.remove(&harness);
+        self.persist_conversations();
+        self.push_system_message(&format!(
+            "Prior {harness} conversation no longer exists. Send your message again to start a fresh one."
+        ));
+    }
+
     fn push_event_message(&mut self, event: &store::EventRecord) {
         match event.kind.as_str() {
             "output" => {
                 if let Some(data) = event_payload_text(event, "data") {
                     self.maybe_capture_codex_session_id(&data);
+                    self.maybe_clear_stale_conversation_id(&data);
                     let sender = self.active_agent_label().to_string();
                     if let Some(text) =
                         human_facing_agent_output(&data, &mut self.agent_output_mode)
@@ -1484,6 +1510,22 @@ fn should_keep_launch_inline(plan: &CastPlan) -> bool {
 /// `docs/chat-persistence.md` for the per-harness mechanics.
 fn harness_supports_chat_resume(harness: &str) -> bool {
     matches!(harness, "claude" | "codex")
+}
+
+/// Whether `data` (a chunk of harness output) indicates the harness rejected
+/// our `Resume` because the session id it carried no longer exists. Both
+/// claude and codex unhelpfully exit with code 0 in this case, so we have to
+/// pattern-match on their distinctive error wording. See
+/// `docs/chat-persistence.md` under "stale-id auto-recovery".
+fn detect_stale_session(harness: &str, data: &str) -> bool {
+    match harness {
+        "claude" => data.contains("No conversation found with session ID"),
+        "codex" => {
+            data.contains("no rollout found for thread id")
+                || data.contains("thread/resume failed")
+        }
+        _ => false,
+    }
 }
 
 /// Scan `data` (a chunk of cleaned-but-not-line-filtered harness output) for a
@@ -2240,6 +2282,169 @@ mod tests {
 
         assert!(app.harness_conversation_ids.contains_key("claude"));
         assert!(app.coven_home.is_none());
+    }
+
+    #[test]
+    fn detect_stale_session_matches_known_per_harness_phrases() {
+        assert!(detect_stale_session(
+            "claude",
+            "No conversation found with session ID: 00000000-0000-0000-0000-000000000000"
+        ));
+        assert!(detect_stale_session(
+            "codex",
+            "Error: thread/resume: thread/resume failed: no rollout found for thread id 00000000-..."
+        ));
+        assert!(detect_stale_session(
+            "codex",
+            "thread/resume failed: something else"
+        ));
+        // Different harness id doesn't match either phrase.
+        assert!(!detect_stale_session(
+            "hermes",
+            "No conversation found with session ID: x"
+        ));
+        // Plain content with neither phrase.
+        assert!(!detect_stale_session("claude", "Hi Persist."));
+        assert!(!detect_stale_session("codex", "session id: 019e..."));
+    }
+
+    #[test]
+    fn stale_claude_resume_drops_id_from_memory_and_disk_and_warns_user() {
+        let coven_home = tempfile::tempdir().unwrap();
+        let project_root = tempfile::tempdir().unwrap();
+        let stored_id = "fab1efac-1234-5678-9abc-def012345678";
+        let mut seed = std::collections::HashMap::new();
+        seed.insert("claude".to_string(), stored_id.to_string());
+        persistence::save_for_project(coven_home.path(), project_root.path(), &seed)
+            .expect("seed persisted state");
+
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_persistence(client, coven_home.path(), project_root.path());
+        app.active_agent = Some(1); // claude
+        app.input = "hello again".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch sets id").to_string();
+
+        // Simulate claude rejecting our stale --resume.
+        app.push_event_message(&output_event(
+            1,
+            &session_id,
+            &format!(
+                "No conversation found with session ID: {stored_id}\n",
+            ),
+        ));
+
+        assert!(
+            !app.harness_conversation_ids.contains_key("claude"),
+            "stale id must be dropped from memory"
+        );
+        let stored = persistence::load_for_project(coven_home.path(), project_root.path());
+        assert!(
+            !stored.contains_key("claude"),
+            "stale id must also be removed from disk"
+        );
+        assert!(
+            app.messages.iter().any(|m| m.content.contains("no longer exists")),
+            "user must see a system message explaining the reset"
+        );
+    }
+
+    #[test]
+    fn stale_codex_resume_drops_codex_id_only() {
+        let coven_home = tempfile::tempdir().unwrap();
+        let project_root = tempfile::tempdir().unwrap();
+        // Seed both claude and codex; only codex should get dropped.
+        let mut seed = std::collections::HashMap::new();
+        seed.insert("claude".to_string(), "claude-uuid".to_string());
+        seed.insert("codex".to_string(), "codex-uuid".to_string());
+        persistence::save_for_project(coven_home.path(), project_root.path(), &seed)
+            .expect("seed persisted state");
+
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_persistence(client, coven_home.path(), project_root.path());
+        app.active_agent = Some(0); // codex
+        app.input = "hello again".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch sets id").to_string();
+
+        app.push_event_message(&output_event(
+            1,
+            &session_id,
+            "Error: thread/resume: thread/resume failed: no rollout found for thread id codex-uuid\n",
+        ));
+
+        assert!(!app.harness_conversation_ids.contains_key("codex"));
+        assert!(
+            app.harness_conversation_ids.contains_key("claude"),
+            "claude id must not be touched by a codex stale event"
+        );
+        let stored = persistence::load_for_project(coven_home.path(), project_root.path());
+        assert!(!stored.contains_key("codex"));
+        assert_eq!(stored.get("claude").map(String::as_str), Some("claude-uuid"));
+    }
+
+    #[test]
+    fn stale_pattern_in_attached_session_output_does_not_drop_chat_ids() {
+        let coven_home = tempfile::tempdir().unwrap();
+        let project_root = tempfile::tempdir().unwrap();
+        let mut seed = std::collections::HashMap::new();
+        seed.insert("claude".to_string(), "claude-uuid".to_string());
+        persistence::save_for_project(coven_home.path(), project_root.path(), &seed)
+            .expect("seed persisted state");
+
+        let attached =
+            test_session("attached-session", "claude", "external", "running");
+        let client = RecordingChatClient::with_session(attached);
+        let (mut app, _) =
+            app_with_persistence(client, coven_home.path(), project_root.path());
+        app.attach_session("attached-session");
+        assert!(!app.chat_owns_active_session);
+
+        // Output from the attached session contains the stale phrase, but
+        // since chat doesn't own this session we must not touch our own
+        // persisted ids.
+        app.push_event_message(&output_event(
+            1,
+            "attached-session",
+            "No conversation found with session ID: irrelevant\n",
+        ));
+
+        assert!(
+            app.harness_conversation_ids.contains_key("claude"),
+            "attached-session output must not clobber chat-owned ids"
+        );
+    }
+
+    #[test]
+    fn stale_pattern_with_no_stored_id_is_a_noop() {
+        let coven_home = tempfile::tempdir().unwrap();
+        let project_root = tempfile::tempdir().unwrap();
+        let client = RecordingChatClient::default();
+        let (mut app, _) =
+            app_with_persistence(client, coven_home.path(), project_root.path());
+        app.active_agent = Some(0); // codex
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch sets id").to_string();
+        assert!(!app.harness_conversation_ids.contains_key("codex"));
+
+        // Stale phrase arrives during a turn that had no stored codex id —
+        // nothing to drop, nothing to warn about.
+        app.push_event_message(&output_event(
+            1,
+            &session_id,
+            "thread/resume failed: bogus\n",
+        ));
+
+        assert!(
+            !app.messages
+                .iter()
+                .any(|m| m.content.contains("no longer exists")),
+            "must not emit a misleading warning when there was no stored id"
+        );
     }
 
     #[test]
