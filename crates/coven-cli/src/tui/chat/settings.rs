@@ -81,11 +81,52 @@ pub(super) fn save_to(coven_home: &Path, settings: &ChatSettings) -> std::io::Re
     let path = settings_path(coven_home);
     let temp_path = temporary_settings_path(coven_home);
     std::fs::write(&temp_path, body)?;
-    std::fs::rename(&temp_path, &path)?;
+    replace_settings_file(&temp_path, &path)?;
     if let Ok(dir) = std::fs::File::open(coven_home) {
         let _ = dir.sync_all();
     }
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_settings_file(temp_path: &Path, path: &Path) -> std::io::Result<()> {
+    std::fs::rename(temp_path, path)
+}
+
+#[cfg(windows)]
+fn replace_settings_file(temp_path: &Path, path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+    }
+
+    let existing: Vec<u16> = temp_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let new: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let ok = unsafe {
+        MoveFileExW(
+            existing.as_ptr(),
+            new.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -122,6 +163,20 @@ mod tests {
         save_to(temp.path(), &settings).expect("save settings");
         let reloaded = load_from(temp.path());
         assert_eq!(reloaded, settings);
+    }
+
+    #[test]
+    fn save_overwrites_existing_settings_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = settings_path(temp.path());
+        std::fs::write(&path, r#"{"streaming":"live"}"#).unwrap();
+
+        let settings = ChatSettings {
+            streaming: StreamingMode::Batched,
+        };
+        save_to(temp.path(), &settings).expect("overwrite existing settings");
+
+        assert_eq!(load_from(temp.path()), settings);
     }
 
     #[test]
