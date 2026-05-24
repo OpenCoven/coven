@@ -690,20 +690,21 @@ pub fn serve_forever(coven_home: &Path, started_at: String) -> Result<()> {
 }
 
 #[cfg(unix)]
-pub fn serve_next_connection(
-    listener: &UnixListener,
+fn handle_http_stream<R, W>(
+    read: R,
+    mut write: W,
     coven_home: &Path,
     status: Option<DaemonStatus>,
     runtime: &dyn SessionRuntime,
-) -> Result<()> {
-    let (stream, _) = listener
-        .accept()
-        .context("failed to accept API connection")?;
-    let mut reader = BufReader::new(stream);
+) -> Result<()>
+where
+    R: Read,
+    W: Write,
+{
+    let mut reader = BufReader::new(read);
     let request_line = read_http_request_line(&mut reader)?;
     let content_length = read_http_headers(&mut reader)?;
     let body = read_http_body(&mut reader, content_length)?;
-    let mut stream = reader.into_inner();
     let (method, path) = parse_request_line(&request_line)?;
     let response = crate::api::handle_request_with_runtime(
         method,
@@ -722,10 +723,24 @@ pub fn serve_next_connection(
         response.body.len(),
         response.body
     );
-    stream
+    write
         .write_all(http.as_bytes())
         .context("failed to write API response")?;
     Ok(())
+}
+
+#[cfg(unix)]
+pub fn serve_next_connection(
+    listener: &UnixListener,
+    coven_home: &Path,
+    status: Option<DaemonStatus>,
+    runtime: &dyn SessionRuntime,
+) -> Result<()> {
+    let (stream, _) = listener
+        .accept()
+        .context("failed to accept API connection")?;
+    let read = stream.try_clone().context("failed to clone Unix stream")?;
+    handle_http_stream(read, stream, coven_home, status, runtime)
 }
 
 fn http_reason_phrase(status: u16) -> &'static str {
@@ -882,6 +897,24 @@ mod tests {
     #[test]
     fn http_reason_phrase_names_bad_requests() {
         assert_eq!(http_reason_phrase(400), "Bad Request");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_http_stream_processes_health_request() {
+        use crate::api::NoopSessionRuntime;
+        use std::io::Cursor;
+        let temp = tempfile::tempdir().expect("tempdir");
+        ensure_private_coven_home(temp.path()).expect("ensure home");
+        let request = b"GET /api/v1/health HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n";
+        let mut stream = Cursor::new(Vec::from(&request[..]));
+        let mut output: Vec<u8> = Vec::new();
+        let runtime = NoopSessionRuntime;
+        handle_http_stream(&mut stream, &mut output, temp.path(), None, &runtime)
+            .expect("handle ok");
+        let response = String::from_utf8(output).expect("utf8");
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
+        assert!(response.contains("\"apiVersion\""), "got: {response}");
     }
 
     #[test]
