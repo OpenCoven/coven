@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::Write;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -650,6 +651,31 @@ fn daemon_status_from_health_socket(socket: &str) -> Result<Option<DaemonStatus>
     }
 }
 
+// `bind_tcp_listener` and `serve_next_tcp_connection` are introduced here so
+// the TCP transport can be unit-tested in isolation; `serve_forever` wires
+// them into the daemon's accept loop in a follow-up change.
+#[allow(dead_code)]
+pub fn bind_tcp_listener(addr: &str) -> Result<TcpListener> {
+    let listener = TcpListener::bind(addr)
+        .with_context(|| format!("failed to bind Coven TCP listener at {addr}"))?;
+    Ok(listener)
+}
+
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn serve_next_tcp_connection(
+    listener: &TcpListener,
+    coven_home: &Path,
+    status: Option<DaemonStatus>,
+    runtime: &dyn SessionRuntime,
+) -> Result<()> {
+    let (stream, _) = listener
+        .accept()
+        .context("failed to accept TCP API connection")?;
+    let read = stream.try_clone().context("failed to clone TCP stream")?;
+    handle_http_stream(read, stream, coven_home, status, runtime)
+}
+
 #[cfg(unix)]
 pub fn bind_api_socket(coven_home: &Path) -> Result<UnixListener> {
     ensure_private_coven_home(coven_home)?;
@@ -913,6 +939,35 @@ mod tests {
         handle_http_stream(&mut stream, &mut output, temp.path(), None, &runtime)
             .expect("handle ok");
         let response = String::from_utf8(output).expect("utf8");
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
+        assert!(response.contains("\"apiVersion\""), "got: {response}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bind_tcp_listener_serves_health_over_tcp() {
+        use crate::api::NoopSessionRuntime;
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::thread;
+        let temp = tempfile::tempdir().expect("tempdir");
+        ensure_private_coven_home(temp.path()).expect("ensure home");
+        let listener = bind_tcp_listener("127.0.0.1:0").expect("bind tcp");
+        let addr = listener.local_addr().expect("local addr");
+        let coven_home = temp.path().to_path_buf();
+        let server = thread::spawn(move || {
+            let runtime = NoopSessionRuntime;
+            serve_next_tcp_connection(&listener, &coven_home, None, &runtime).expect("serve tcp");
+        });
+
+        let mut client = TcpStream::connect(addr).expect("connect");
+        client
+            .write_all(b"GET /api/v1/health HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n")
+            .expect("write request");
+        let mut response = String::new();
+        client.read_to_string(&mut response).expect("read response");
+        server.join().expect("server thread");
+
         assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
         assert!(response.contains("\"apiVersion\""), "got: {response}");
     }
