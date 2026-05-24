@@ -166,6 +166,29 @@ describe("CovenAcpRuntime", () => {
     expect(fallback.ensureSession).toHaveBeenCalledOnce();
   });
 
+
+  it("rejects unavailable-Coven fallback sessions whose cwd is outside the workspace", async () => {
+    const fallback = fallbackRuntime();
+    registerAcpRuntimeBackend({ id: "acpx", runtime: fallback });
+    const runtime = new CovenAcpRuntime({
+      config: { ...config, allowFallback: true },
+      client: fakeClient({
+        health: vi.fn(async () => {
+          throw new Error("offline");
+        }),
+      }),
+    });
+
+    await expect(
+      runtime.ensureSession({
+        sessionKey: "agent:codex:test",
+        agent: "codex",
+        mode: "oneshot",
+        cwd: "/tmp/attacker",
+      }),
+    ).rejects.toThrow(/outside workspace/);
+    expect(fallback.ensureSession).not.toHaveBeenCalled();
+  });
   it("falls back when Coven health checks do not settle before the deadline", async () => {
     vi.useFakeTimers();
     const fallback = fallbackRuntime();

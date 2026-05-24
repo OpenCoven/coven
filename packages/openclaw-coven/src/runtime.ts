@@ -615,7 +615,10 @@ export class CovenAcpRuntime implements AcpRuntime {
   private async ensureFallbackSession(
     input: Parameters<AcpRuntime["ensureSession"]>[0],
   ): Promise<AcpRuntimeHandle> {
-    return await this.requireFallbackRuntime().ensureSession(input);
+    return await this.requireFallbackRuntime().ensureSession({
+      ...input,
+      cwd: this.resolveWorkspaceCwd(input.cwd),
+    });
   }
 
   private async *runFallbackTurn(
