@@ -171,6 +171,7 @@ pub fn handle_request_with_runtime(
             let (status, response) = control_plane::route_action(payload);
             json_response(status, &response)
         }
+        ("POST", "/cast") => submit_cast(coven_home, body),
         ("GET", "/sessions") => {
             let conn = store::open_store(&store_path(coven_home))?;
             let sessions = store::list_sessions(&conn)?;
@@ -377,6 +378,84 @@ fn kill_session(
     store::update_session_status(&conn, session_id, "killed", None, &now)?;
     insert_event(&conn, session_id, "kill", json!({ "status": "killed" }))?;
     json_response(202, &json!({ "ok": true, "accepted": true }))
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CastResultDto {
+    accepted: bool,
+    cast_id: String,
+    echo: String,
+}
+
+fn submit_cast(coven_home: &Path, body: Option<&str>) -> Result<ApiResponse> {
+    let payload = match parse_body(body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return api_error(400, "invalid_request", &error.to_string(), None);
+        }
+    };
+    let code = match required_string(&payload, "code") {
+        Ok(code) => code,
+        Err(error) => {
+            return api_error(400, "invalid_request", &error.to_string(), None);
+        }
+    };
+    let target = payload
+        .get("target")
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string);
+    let cast_id = format!("cast-{}", Uuid::new_v4().simple());
+    let echo = match &target {
+        Some(t) => format!("{code} → {t}"),
+        None => code.clone(),
+    };
+
+    let conn = store::open_store(&store_path(coven_home))?;
+    let session_id = target.as_deref().unwrap_or("__cockpit__");
+    if session_id == "__cockpit__" {
+        ensure_cockpit_session(&conn)?;
+    } else if store::get_session(&conn, session_id)?.is_none() {
+        return api_error(
+            404,
+            "session_not_found",
+            "Target session was not found.",
+            Some(json!({ "sessionId": session_id })),
+        );
+    }
+    insert_event(
+        &conn,
+        session_id,
+        "cast",
+        json!({ "cast_id": cast_id, "code": code, "target": target }),
+    )?;
+    json_response(
+        202,
+        &CastResultDto {
+            accepted: true,
+            cast_id,
+            echo,
+        },
+    )
+}
+
+fn ensure_cockpit_session(conn: &rusqlite::Connection) -> Result<()> {
+    if store::get_session(conn, "__cockpit__")?.is_some() {
+        return Ok(());
+    }
+    let now = current_timestamp();
+    let record = store::SessionRecord {
+        id: "__cockpit__".into(),
+        project_root: "(cockpit)".into(),
+        harness: "cockpit".into(),
+        title: "Cockpit Cast Codes".into(),
+        status: "idle".into(),
+        exit_code: None,
+        archived_at: None,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    store::insert_session(conn, &record)
 }
 
 fn session_not_live_response(session_id: &str) -> Result<ApiResponse> {
@@ -1566,6 +1645,43 @@ mod tests {
             "expected sessionId 'missing' (not 'missing/log'); got: {}",
             response.body
         );
+        Ok(())
+    }
+
+    #[test]
+    fn post_cast_records_event_and_returns_result() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let body = json!({
+            "code": "/status",
+            "target": null,
+        });
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/cast",
+            temp.path(),
+            None,
+            Some(&body.to_string()),
+        )?;
+        assert_eq!(response.status, 202);
+        let result: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(result["accepted"], true);
+        assert!(result["cast_id"].as_str().expect("cast_id").starts_with("cast-"));
+        assert_eq!(result["echo"], "/status");
+        Ok(())
+    }
+
+    #[test]
+    fn post_cast_rejects_missing_code() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let body = json!({ "target": "sess-1" });
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/cast",
+            temp.path(),
+            None,
+            Some(&body.to_string()),
+        )?;
+        assert_eq!(response.status, 400);
         Ok(())
     }
 }
