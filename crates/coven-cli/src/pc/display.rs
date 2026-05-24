@@ -18,7 +18,7 @@ fn health_indicator(pct: f32, warn: f32, crit: f32) -> &'static str {
 }
 
 pub fn print_status(snap: &SystemSnapshot, format: &OutputFormat) {
-    print!("{}", format_status(snap, format));
+    println!("{}", format_status(snap, format));
 }
 
 fn format_status(snap: &SystemSnapshot, format: &OutputFormat) -> String {

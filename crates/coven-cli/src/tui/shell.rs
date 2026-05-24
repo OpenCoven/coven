@@ -898,12 +898,15 @@ fn running_phase_outcome(
     phase_session_id: &str,
 ) -> CastOutcome {
     let phase_name = &quest.phases[idx].name;
-    completed_notes.push(format!(
-        "Phase `{phase_name}` is already running in session `{phase_session_id}`."
-    ));
     let next_step = if phase_session_id.is_empty() {
+        completed_notes.push(format!(
+            "Phase `{phase_name}` is already running in its recorded harness."
+        ));
         "Re-attach the quest anchor after checking the running phase's harness output.".to_string()
     } else {
+        completed_notes.push(format!(
+            "Phase `{phase_name}` is already running in session `{phase_session_id}`."
+        ));
         format!(
             "Run `coven attach {phase_session_id}` to follow the running phase, then re-attach the quest anchor."
         )
@@ -1771,6 +1774,35 @@ mod quest_interaction_tests {
                 .iter()
                 .any(|note| note.contains("already running in session `session-design-id`")),
             "running phase note should explain why Cast did not prompt again, outcome: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn running_phase_outcome_without_session_id_avoids_empty_reference() {
+        let mut quest = quest_from_goal("polish the README", Some(CastHarness::Codex));
+        mark_phase_running(&mut quest, 0, String::new()).unwrap();
+
+        let outcome = running_phase_outcome(
+            "/quest polish the README",
+            &quest,
+            Some("anchor-session-id".to_string()),
+            Vec::new(),
+            0,
+            "",
+        );
+
+        assert_eq!(outcome.session_id.as_deref(), Some("anchor-session-id"));
+        assert!(
+            outcome
+                .next_step
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Re-attach the quest anchor"),
+            "running local phase should point back to the quest anchor, outcome: {outcome:?}"
+        );
+        assert!(
+            outcome.notes.iter().all(|note| !note.contains("``")),
+            "running local phase should not render an empty session reference, outcome: {outcome:?}"
         );
     }
 }
