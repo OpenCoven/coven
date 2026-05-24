@@ -219,6 +219,11 @@ test('release workflow verifies the signed release tag before building or publis
   );
   assert.match(
     workflow,
+    /gpg\.format ssh[\s\S]*git tag -s/,
+    'release instructions must show SSH signing configuration before the signed tag command'
+  );
+  assert.match(
+    workflow,
     /empty line/,
     'verify-tag must reject empty allowed signer entries before authorization checks'
   );
