@@ -39,6 +39,14 @@ impl ConversationHint {
     }
 }
 
+/// Whether the harness CLI lets the caller pre-assign a session id at launch
+/// time (e.g. `claude --session-id <uuid>`). Harnesses that auto-generate
+/// session ids (e.g. codex) return `false`; the chat app captures the id from
+/// the first turn's output instead. See `docs/chat-persistence.md`.
+pub fn harness_supports_preassigned_session_id(harness_id: &str) -> bool {
+    harness_id == "claude"
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessCommandSpec {
     pub id: &'static str,
@@ -161,9 +169,21 @@ fn continuity_args(
                 hint.id().to_string(),
             ])
         }
-        // Codex resume support lives in `codex exec resume <id>` and would
-        // need to capture the id from the first run's output. Tracked in
-        // `docs/chat-persistence.md`.
+        "codex" => match hint {
+            // Codex auto-assigns the session id on the first turn; we capture
+            // it from output and feed it back on subsequent turns.
+            ConversationHint::Init { .. } => None,
+            ConversationHint::Resume { id } => {
+                let mut args: Vec<String> = spec
+                    .non_interactive_prompt_prefix_args
+                    .iter()
+                    .map(|arg| (*arg).to_string())
+                    .collect();
+                args.push("resume".to_string());
+                args.push(id.clone());
+                Some(args)
+            }
+        },
         _ => None,
     }
 }
@@ -469,7 +489,8 @@ mod tests {
     }
 
     #[test]
-    fn codex_ignores_conversation_hint_today() -> anyhow::Result<()> {
+    fn codex_init_hint_falls_through_to_default_args_so_codex_can_assign_its_own_id(
+    ) -> anyhow::Result<()> {
         let hint = ConversationHint::Init {
             id: "abc-123".to_string(),
         };
@@ -493,6 +514,42 @@ mod tests {
             )
         );
         Ok(())
+    }
+
+    #[test]
+    fn codex_resume_hint_uses_exec_resume_subcommand_with_id() -> anyhow::Result<()> {
+        let hint = ConversationHint::Resume {
+            id: "019e5998-7130-7872-8d96-a6b67c5b6406".to_string(),
+        };
+        let parts = command_parts_for_harness_with_conversation(
+            "codex",
+            "follow up",
+            HarnessLaunchMode::NonInteractive,
+            Some(&hint),
+        )?;
+        assert_eq!(
+            parts,
+            (
+                "codex",
+                vec![
+                    "exec".to_string(),
+                    "--skip-git-repo-check".to_string(),
+                    "--color".to_string(),
+                    "never".to_string(),
+                    "resume".to_string(),
+                    "019e5998-7130-7872-8d96-a6b67c5b6406".to_string(),
+                    "follow up".to_string(),
+                ]
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn preassigned_session_id_support_is_per_harness() {
+        assert!(harness_supports_preassigned_session_id("claude"));
+        assert!(!harness_supports_preassigned_session_id("codex"));
+        assert!(!harness_supports_preassigned_session_id("unknown"));
     }
 
     #[test]

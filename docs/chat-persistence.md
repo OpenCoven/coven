@@ -8,11 +8,25 @@ extend the mechanism to additional harnesses.
 | Harness | Resume support | Mechanism |
 | --- | --- | --- |
 | `claude` | ✅ | `claude --print --session-id <uuid>` on turn 1; `claude --print --resume <uuid>` on subsequent turns |
-| `codex` | ❌ (not yet) | One-shot per turn; no conversation memory across turns |
+| `codex` | ✅ | Turn 1 runs plain `codex exec …`; chat captures `session id: <uuid>` from output and feeds it back as `codex exec … resume <uuid> <prompt>` on later turns |
 
 Resume support is scoped to a single `coven chat` invocation. Exiting the chat
 ends the conversation; the next invocation starts fresh. See **Future work**
 below for cross-restart persistence.
+
+The two harnesses differ in *who assigns the session id*:
+
+- **Claude** lets us pre-assign one via `--session-id <uuid>`. The chat app
+  generates a UUID upfront, sends `ConversationHint::Init { id }` on turn 1,
+  and `Resume { id }` thereafter. The id is known before any output arrives.
+- **Codex** assigns its own id and prints it in the run banner. The chat app
+  sends *no* hint on turn 1 (so codex assigns), scans the output for
+  `session id: <uuid>`, stores it, and sends `Resume { captured_id }` on
+  subsequent turns. The first captured id sticks for the rest of the chat —
+  later banners (e.g. from `codex exec resume`) don't override it.
+
+`harness::harness_supports_preassigned_session_id` distinguishes the two
+modes.
 
 ## How it works
 
@@ -62,10 +76,11 @@ CLI's own session API avoids both problems.
 ### What does *not* resume
 
 - **Switching agents mid-conversation** (`/agent codex` then `/agent claude`)
-  preserves each harness's own conversation independently. Switching to codex
-  doesn't carry over claude's context — codex has no resume support yet (see
-  below).
-- **Restarts** of `coven chat`. The conversation id is in-memory only.
+  preserves each harness's own conversation independently — they live in
+  separate entries of `harness_conversation_ids`. There's no cross-harness
+  context transfer; switching agents effectively starts (or resumes) a
+  parallel thread with the new agent.
+- **Restarts** of `coven chat`. The conversation ids are in-memory only.
 - **`/attach`ed sessions.** Typing while attached to a session launched by
   `coven run` (not by chat) still forwards to that session's stdin — the
   resume path only applies to sessions chat itself launched.
@@ -73,69 +88,66 @@ CLI's own session API avoids both problems.
 ## Adding support for a new harness
 
 1. **Map the harness CLI's resume flags.** Read the CLI's docs to find:
-   - How to create a session with a chosen id (or accept it auto-generating
-     one and capture from output).
+   - Whether the CLI lets you pre-assign a session id at launch, or whether
+     it auto-generates one (and prints it somewhere parseable).
    - How to resume a session by id in non-interactive mode.
 
-   For claude these are `--session-id <uuid>` and `--resume <uuid>` — both
-   work with `--print`. For codex they're `codex exec resume <id>` and
-   `codex exec resume --last`. Other harnesses will differ.
+   Claude: pre-assign via `--session-id <uuid>`, resume via `--resume <uuid>`
+   — both work with `--print`. Codex: auto-assigns and prints
+   `session id: <uuid>` in the run header; resume via `codex exec … resume
+   <uuid> <prompt>`.
 
 2. **Extend `continuity_args` in `crates/coven-cli/src/harness.rs`.** Add a
-   new arm to the `match spec.id` block that translates `Init` and `Resume`
-   hints into the harness's actual CLI args:
+   new arm to the `match spec.id` block translating `Init` and `Resume` into
+   the harness's actual CLI args. Both existing arms are good templates:
+   `"claude"` for pre-assigned ids, `"codex"` for the auto-assign +
+   capture-from-output flow (`Init` returns `None` so the default args run,
+   `Resume` injects `resume <id>` after the prefix args).
 
-   ```rust
-   "codex" => {
-       let cmd = match hint {
-           ConversationHint::Init { .. } => return None, // codex auto-creates
-           ConversationHint::Resume { id } => vec![
-               "exec".to_string(), "resume".to_string(), id.clone(),
-               // ...any other flags...
-           ],
-       };
-       Some(cmd)
-   }
-   ```
+3. **Tell the chat app the new harness supports resume.** Add the id to
+   `harness_supports_chat_resume` in
+   `crates/coven-cli/src/tui/chat/app.rs`. If the harness pre-assigns ids
+   (claude-style), also add it to
+   `harness::harness_supports_preassigned_session_id` so the chat generates a
+   UUID upfront. Auto-assigning harnesses (codex-style) need *no* entry
+   there.
 
-   Note codex's wrinkle: the `Init` turn doesn't take an id — codex generates
-   one. You'd need to either:
-   - Capture codex's session id from the first turn's output (it prints
-     `session id: <uuid>` in its header), parse it, and stash it as the
-     `Resume` id for follow-up turns. This is fragile to upstream format
-     changes.
-   - Or use `codex exec resume --last`, which avoids parsing but breaks if
-     the user runs another codex session in between (the wrong session
-     becomes "last").
+4. **For auto-assigning harnesses, wire output capture.** Codex uses
+   `extract_codex_session_id` (scans for `session id: <uuid>` lines) called
+   from `maybe_capture_codex_session_id` in the chat app's output event
+   handler. For a new harness with a different banner format, add a sibling
+   extractor and call it from `maybe_capture_codex_session_id` (or refactor
+   into a dispatcher keyed on `active_session_harness`).
 
-3. **Flip `harness_supports_chat_resume` in `crates/coven-cli/src/tui/chat/app.rs`.**
-   It's a simple `harness == "claude"` check today; add your new id.
+5. **Add tests** in `harness::tests` covering Init + Resume → expected args,
+   matching `claude_init_hint_attaches_session_id_flag_in_print_mode` /
+   `codex_resume_hint_uses_exec_resume_subcommand_with_id`.
 
-4. **Add tests** in `harness::tests` covering Init + Resume → expected args,
-   matching the existing `claude_init_hint_attaches_session_id_flag_in_print_mode`
-   and `claude_resume_hint_attaches_resume_flag_in_print_mode`.
-
-5. **Add an end-to-end app test** in `tui::chat::app::tests` similar to
-   `second_claude_chat_turn_reuses_init_id_as_resume`, asserting your harness
-   threads the hint through `LaunchRequest`.
+6. **Add app-level tests** in `tui::chat::app::tests` similar to
+   `second_claude_chat_turn_reuses_init_id_as_resume` (pre-assigned) or
+   `second_codex_chat_turn_resumes_using_id_captured_from_first_turn_output`
+   (capture-from-output), asserting the second turn carries `Resume` with
+   the right id.
 
 ## Future work
 
 ### Cross-restart persistence
 
-Right now a closing `coven chat` loses the conversation. To persist:
+Right now closing `coven chat` loses the conversation. To persist:
 
-1. On `Init`, write the conversation id to a per-project file under
-   `$COVEN_HOME/chat-conversations/<project-hash>.json` (or extend
-   `chat-settings.json`).
-2. On `coven chat` startup, read it back and seed
-   `harness_conversation_ids` with the stored id. Next message will send
-   `Resume`.
+1. Whenever an id is added to `harness_conversation_ids` (claude's `Init` or
+   codex's capture from output), write the `(harness, id)` pair to a
+   per-project file under `$COVEN_HOME/chat-conversations/<project-hash>.json`
+   (or extend `chat-settings.json`).
+2. On `coven chat` startup, read it back and seed `harness_conversation_ids`
+   with the stored ids. The next message will send `Resume` directly without
+   needing turn 1 to capture anything.
 3. Add a `/new` slash command to clear stored ids and start fresh (mirroring
    what `/clear` does in-memory today).
 4. Decide what to do when the stored id no longer exists on the harness side
-   (claude's `--resume` will error). Either surface the error and fall back to
-   `Init`, or detect the missing-session error pattern and silently regenerate.
+   (claude's `--resume` will error; codex's `exec resume <id>` will error).
+   Either surface the error and fall back to no-hint, or detect the
+   missing-session error pattern and silently regenerate.
 
 ### One ledger row per conversation
 

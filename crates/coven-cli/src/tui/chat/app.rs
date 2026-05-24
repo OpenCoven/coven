@@ -112,6 +112,9 @@ pub(super) struct App {
     /// False when the user `/attach`ed an externally-spawned session, in
     /// which case typing is forwarded as stdin to that PTY.
     chat_owns_active_session: bool,
+    /// Harness id of `active_session_id`. Used to decide whether output from
+    /// the active session is worth scanning for a codex session-id banner.
+    active_session_harness: Option<String>,
     client: Box<dyn ChatClient>,
 }
 
@@ -243,6 +246,7 @@ impl App {
             last_interrupt_at: None,
             harness_conversation_ids: HashMap::new(),
             chat_owns_active_session: false,
+            active_session_harness: None,
             client,
         };
 
@@ -784,6 +788,7 @@ impl App {
         match result {
             Ok(session) => {
                 self.active_session_id = Some(session.id.clone());
+                self.active_session_harness = Some(session.harness.clone());
                 self.chat_owns_active_session = true;
                 self.last_event_seq = None;
                 self.reset_event_poll_failures();
@@ -802,9 +807,11 @@ impl App {
     }
 
     /// Decide whether a launch for `harness` should ride a resumable chat
-    /// session, and if so produce the right hint (Init for the first turn,
-    /// Resume for subsequent turns). Records the id on first use so later
-    /// turns route through `--resume`.
+    /// session, and if so produce the right hint. For harnesses where we can
+    /// pre-assign the session id (claude `--session-id`) the first turn sends
+    /// `Init` with a freshly generated UUID. For harnesses that auto-assign
+    /// (codex) the first turn sends no hint and the id is captured from
+    /// output afterwards via `capture_session_id_from_output`.
     fn conversation_hint_for_harness(&mut self, harness: &str) -> Option<harness::ConversationHint> {
         if !harness_supports_chat_resume(harness) {
             return None;
@@ -812,10 +819,14 @@ impl App {
         if let Some(id) = self.harness_conversation_ids.get(harness) {
             return Some(harness::ConversationHint::Resume { id: id.clone() });
         }
-        let id = Uuid::new_v4().to_string();
-        self.harness_conversation_ids
-            .insert(harness.to_string(), id.clone());
-        Some(harness::ConversationHint::Init { id })
+        if harness::harness_supports_preassigned_session_id(harness) {
+            let id = Uuid::new_v4().to_string();
+            self.harness_conversation_ids
+                .insert(harness.to_string(), id.clone());
+            Some(harness::ConversationHint::Init { id })
+        } else {
+            None
+        }
     }
 
     /// Send raw text as stdin to a session the user `/attach`ed to (i.e. one
@@ -837,6 +848,7 @@ impl App {
         match self.client.get_session(session_id) {
             Ok(session) => {
                 self.active_session_id = Some(session.id.clone());
+                self.active_session_harness = Some(session.harness.clone());
                 self.chat_owns_active_session = false;
                 self.last_event_seq = None;
                 self.agent_output_mode = AgentOutputMode::Unknown;
@@ -890,6 +902,7 @@ impl App {
             Ok(()) => {
                 if self.active_session_id.as_deref() == Some(session_id) {
                     self.active_session_id = None;
+                    self.active_session_harness = None;
                     self.chat_owns_active_session = false;
                 }
                 self.push_system_message(&format!("Sacrificed session {session_id}."));
@@ -962,10 +975,30 @@ impl App {
         }
     }
 
+    /// Codex auto-assigns a session id on its first turn and prints it in
+    /// the run header (`session id: <uuid>`). When this chat owns a running
+    /// codex session and we haven't captured its id yet, scan the chunk for
+    /// the banner so the *next* turn can `codex exec resume <id> <prompt>`.
+    fn maybe_capture_codex_session_id(&mut self, data: &str) {
+        if !self.chat_owns_active_session {
+            return;
+        }
+        if self.active_session_harness.as_deref() != Some("codex") {
+            return;
+        }
+        if self.harness_conversation_ids.contains_key("codex") {
+            return;
+        }
+        if let Some(id) = extract_codex_session_id(data) {
+            self.harness_conversation_ids.insert("codex".to_string(), id);
+        }
+    }
+
     fn push_event_message(&mut self, event: &store::EventRecord) {
         match event.kind.as_str() {
             "output" => {
                 if let Some(data) = event_payload_text(event, "data") {
+                    self.maybe_capture_codex_session_id(&data);
                     let sender = self.active_agent_label().to_string();
                     if let Some(text) =
                         human_facing_agent_output(&data, &mut self.agent_output_mode)
@@ -985,6 +1018,7 @@ impl App {
                 self.is_responding = false;
                 if self.active_session_id.as_deref() == Some(event.session_id.as_str()) {
                     self.active_session_id = None;
+                    self.active_session_harness = None;
                     self.chat_owns_active_session = false;
                 }
                 self.agent_output_mode = AgentOutputMode::Unknown;
@@ -994,6 +1028,7 @@ impl App {
                 self.flush_pending_agent_buffer();
                 if self.active_session_id.as_deref() == Some(event.session_id.as_str()) {
                     self.active_session_id = None;
+                    self.active_session_harness = None;
                     self.chat_owns_active_session = false;
                     self.is_responding = false;
                 }
@@ -1382,12 +1417,29 @@ fn should_keep_launch_inline(plan: &CastPlan) -> bool {
 }
 
 /// Whether a chat turn launched against this harness should reuse the prior
-/// turn's conversation via the harness CLI's session-resume mechanism. Today
-/// only Claude supports this through `--session-id` / `--resume`; Codex
-/// support would land in `harness::continuity_args`. See
-/// `docs/chat-persistence.md`.
+/// turn's conversation via the harness CLI's session-resume mechanism. See
+/// `docs/chat-persistence.md` for the per-harness mechanics.
 fn harness_supports_chat_resume(harness: &str) -> bool {
-    harness == "claude"
+    matches!(harness, "claude" | "codex")
+}
+
+/// Scan `data` (a chunk of cleaned-but-not-line-filtered harness output) for a
+/// codex session-id banner line and return the uuid if present. Codex prints
+/// `session id: <uuid>` in the header of every `codex exec` run; we capture
+/// it so the next chat turn can `codex exec resume <id> <prompt>`.
+fn extract_codex_session_id(data: &str) -> Option<String> {
+    const PREFIX: &str = "session id:";
+    for line in data.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix(PREFIX) else {
+            continue;
+        };
+        let id = rest.trim();
+        if !id.is_empty() {
+            return Some(id.to_string());
+        }
+    }
+    None
 }
 
 fn format_cast_plan_for_chat(plan: &CastPlan) -> String {
@@ -1885,7 +1937,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_chat_turn_carries_no_conversation_hint_today() {
+    fn codex_first_chat_turn_carries_no_hint_so_codex_can_assign_its_own_session_id() {
         let client = RecordingChatClient::default();
         let (mut app, mirror) = app_with_client(client);
         app.active_agent = Some(0); // codex
@@ -1899,8 +1951,94 @@ mod tests {
         assert_eq!(launched[0].harness, "codex");
         assert!(
             launched[0].conversation.is_none(),
-            "codex has no resume support yet — see docs/chat-persistence.md"
+            "codex auto-assigns ids; first turn must not carry a hint"
         );
+    }
+
+    #[test]
+    fn second_codex_chat_turn_resumes_using_id_captured_from_first_turn_output() {
+        let client = RecordingChatClient::default();
+        let (mut app, mirror) = app_with_client(client);
+        app.active_agent = Some(0); // codex
+        app.input = "first".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch sets id").to_string();
+
+        // Simulate codex emitting its session-id banner mid-stream.
+        let captured_id = "019e5998-7130-7872-8d96-a6b67c5b6406";
+        app.push_event_message(&output_event(
+            1,
+            &session_id,
+            &format!("OpenAI Codex v0.132.0\n--------\nsession id: {captured_id}\n--------\n"),
+        ));
+        // And then exit so we can fire the next turn without is_responding gating.
+        app.push_event_message(&EventRecord {
+            seq: 2,
+            id: "event-2".to_string(),
+            session_id,
+            kind: "exit".to_string(),
+            payload_json: serde_json::json!({ "status": "completed" }).to_string(),
+            created_at: "2026-05-19T00:00:00Z".to_string(),
+        });
+
+        app.input = "follow up".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+
+        let launched = mirror.launched.borrow();
+        assert_eq!(launched.len(), 2);
+        match &launched[1].conversation {
+            Some(crate::harness::ConversationHint::Resume { id }) => {
+                assert_eq!(id, captured_id);
+            }
+            other => panic!("second codex turn must Resume with captured id, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_session_id_capture_is_not_overridden_by_later_output() {
+        let client = RecordingChatClient::default();
+        let (mut app, _mirror) = app_with_client(client);
+        app.active_agent = Some(0); // codex
+        app.input = "first".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch sets id").to_string();
+
+        let first_id = "019e5998-7130-7872-8d96-a6b67c5b6406";
+        let later_id = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+        app.push_event_message(&output_event(
+            1,
+            &session_id,
+            &format!("session id: {first_id}\n"),
+        ));
+        // Another id later in the same turn must not clobber the captured one.
+        app.push_event_message(&output_event(
+            2,
+            &session_id,
+            &format!("session id: {later_id}\n"),
+        ));
+
+        assert_eq!(
+            app.harness_conversation_ids.get("codex").map(String::as_str),
+            Some(first_id),
+            "first captured id must stick"
+        );
+    }
+
+    #[test]
+    fn extract_codex_session_id_parses_banner_lines_only() {
+        assert_eq!(
+            extract_codex_session_id("session id: 019e5998-7130-7872-8d96-a6b67c5b6406"),
+            Some("019e5998-7130-7872-8d96-a6b67c5b6406".to_string())
+        );
+        assert_eq!(
+            extract_codex_session_id("workdir: /tmp\n--------\nsession id: abc-123\n"),
+            Some("abc-123".to_string())
+        );
+        assert_eq!(extract_codex_session_id("session id:\n"), None);
+        assert_eq!(extract_codex_session_id("hello world"), None);
     }
 
     #[test]
