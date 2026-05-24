@@ -141,7 +141,14 @@ enum DaemonCommand {
     Status,
     Stop,
     #[command(hide = true)]
-    Serve,
+    Serve {
+        #[arg(
+            long,
+            value_name = "ADDR",
+            help = "Also bind an HTTP TCP listener at ADDR (e.g. 127.0.0.1:3000)"
+        )]
+        tcp: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -570,13 +577,14 @@ fn run_daemon_command(command: DaemonCommand) -> Result<()> {
                 println!("coven daemon was not running");
             }
         }
-        DaemonCommand::Serve => {
+        DaemonCommand::Serve { tcp } => {
             #[cfg(unix)]
             {
-                daemon::serve_forever(&home, current_timestamp(), None)?;
+                daemon::serve_forever(&home, current_timestamp(), tcp.as_deref())?;
             }
             #[cfg(not(unix))]
             {
+                let _ = tcp;
                 anyhow::bail!(
                     "coven daemon server is only implemented on Unix-like systems for now"
                 );
