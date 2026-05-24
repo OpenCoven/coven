@@ -1315,6 +1315,17 @@ impl App {
                 self.run_harness_prompt(&harness, &prompt);
             }
             None => {
+                // No auto-retry: clear the active-session state now so
+                // the user's next message isn't gated as "still
+                // streaming". Without this, the failed session's
+                // events stay suppressed (so exit/kill won't reach
+                // the normal state-reset arms in push_event_message),
+                // and the chat wedges with `is_responding == true`
+                // forever.
+                self.is_responding = false;
+                self.active_session_id = None;
+                self.active_session_harness = None;
+                self.chat_owns_active_session = false;
                 self.push_system_message(&format!(
                     "Prior {harness} conversation no longer exists. Send your message again to start a fresh one."
                 ));
@@ -3568,6 +3579,31 @@ mod tests {
                 .iter()
                 .any(|m| m.content.contains("Send your message again")),
             "second stale event falls back to asking the user to retype"
+        );
+        // The fallback path must also clear the wedged state so the
+        // user's NEXT message can actually be sent — otherwise
+        // is_responding stays true forever (failed session's exit
+        // event is suppressed, normal state-reset arms in
+        // push_event_message never run).
+        assert!(
+            !app.is_responding,
+            "after the retry-exhausted fallback, is_responding must be cleared so the next message isn't gated"
+        );
+        assert!(
+            app.active_session_id().is_none(),
+            "after the retry-exhausted fallback, active_session_id must be cleared so the next message launches fresh"
+        );
+
+        // And prove the chat is actually usable: send a new message, it
+        // should produce a fresh launch instead of being rejected.
+        let launches_before_retype = mirror.launched.borrow().len();
+        app.input = "second attempt".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        assert_eq!(
+            mirror.launched.borrow().len(),
+            launches_before_retype + 1,
+            "user's manual retype after retry-exhausted fallback must produce a fresh launch, not a still-streaming rejection"
         );
     }
 
