@@ -651,10 +651,9 @@ fn daemon_status_from_health_socket(socket: &str) -> Result<Option<DaemonStatus>
     }
 }
 
-// `bind_tcp_listener` and `serve_next_tcp_connection` are introduced here so
-// the TCP transport can be unit-tested in isolation; `serve_forever` wires
-// them into the daemon's accept loop in a follow-up change.
-#[allow(dead_code)]
+// `bind_tcp_listener` and `serve_next_tcp_connection` expose the TCP transport
+// so it can be unit-tested in isolation; `serve_forever` wires them into the
+// daemon's accept loop alongside the Unix socket listener.
 pub fn bind_tcp_listener<A: std::net::ToSocketAddrs>(addr: A) -> Result<TcpListener> {
     let listener = TcpListener::bind(&addr)
         .with_context(|| "failed to bind Coven TCP listener")?;
@@ -662,7 +661,6 @@ pub fn bind_tcp_listener<A: std::net::ToSocketAddrs>(addr: A) -> Result<TcpListe
 }
 
 #[cfg(unix)]
-#[allow(dead_code)]
 pub fn serve_next_tcp_connection(
     listener: &TcpListener,
     coven_home: &Path,
@@ -698,7 +696,12 @@ pub fn bind_api_socket(coven_home: &Path) -> Result<UnixListener> {
 }
 
 #[cfg(unix)]
-pub fn serve_forever(coven_home: &Path, started_at: String) -> Result<()> {
+pub fn serve_forever(
+    coven_home: &Path,
+    started_at: String,
+    tcp_addr: Option<&str>,
+) -> Result<()> {
+    use std::sync::Arc;
     let status = DaemonStatus {
         pid: std::process::id(),
         started_at: started_at.clone(),
@@ -708,10 +711,36 @@ pub fn serve_forever(coven_home: &Path, started_at: String) -> Result<()> {
     };
     write_status(coven_home, &status)?;
     recover_orphaned_sessions(coven_home, &started_at)?;
-    let listener = bind_api_socket(coven_home)?;
-    let runtime = LiveSessionRuntime::with_coven_home(coven_home.to_path_buf());
+    let unix_listener = bind_api_socket(coven_home)?;
+    let runtime = Arc::new(LiveSessionRuntime::with_coven_home(coven_home.to_path_buf()));
+
+    if let Some(addr) = tcp_addr {
+        let tcp_listener = bind_tcp_listener(addr)?;
+        let tcp_home = coven_home.to_path_buf();
+        let tcp_status = status.clone();
+        let tcp_runtime = Arc::clone(&runtime);
+        std::thread::Builder::new()
+            .name("coven-tcp-api".into())
+            .spawn(move || loop {
+                if let Err(error) = serve_next_tcp_connection(
+                    &tcp_listener,
+                    &tcp_home,
+                    Some(tcp_status.clone()),
+                    tcp_runtime.as_ref(),
+                ) {
+                    eprintln!("coven daemon: TCP connection error: {error:#}");
+                }
+            })
+            .context("failed to spawn TCP API thread")?;
+    }
+
     loop {
-        serve_next_connection(&listener, coven_home, Some(status.clone()), &runtime)?;
+        serve_next_connection(
+            &unix_listener,
+            coven_home,
+            Some(status.clone()),
+            runtime.as_ref(),
+        )?;
     }
 }
 

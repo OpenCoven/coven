@@ -573,7 +573,7 @@ fn run_daemon_command(command: DaemonCommand) -> Result<()> {
         DaemonCommand::Serve => {
             #[cfg(unix)]
             {
-                daemon::serve_forever(&home, current_timestamp())?;
+                daemon::serve_forever(&home, current_timestamp(), None)?;
             }
             #[cfg(not(unix))]
             {
