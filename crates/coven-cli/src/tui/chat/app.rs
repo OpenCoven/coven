@@ -18,6 +18,7 @@ use crate::{
 };
 
 use super::client::{coven_home_dir, ChatClient, ChatEventQuery, DaemonChatClient, LaunchRequest};
+use super::persistence;
 use super::settings::{self, ChatSettings, StreamingMode};
 
 // ── Data types ─────────────────────────────────────────────────────────────
@@ -104,9 +105,14 @@ pub(super) struct App {
     /// tap before exiting so a stray ^C doesn't kill the session.
     last_interrupt_at: Option<Instant>,
     /// Per-harness conversation ids so chat turns reuse the harness CLI's
-    /// own session-resume mechanism (today only `claude --session-id` /
-    /// `--resume`). Reset on `/clear`. See `docs/chat-persistence.md`.
+    /// own session-resume mechanism. Persisted per-project so a fresh
+    /// `coven chat` invocation resumes the prior conversation. Reset on
+    /// `/clear`. See `docs/chat-persistence.md`.
     harness_conversation_ids: HashMap<String, String>,
+    /// Canonical project root used to scope persisted conversation ids. If
+    /// missing (e.g. tests, broken cwd), the chat runs without cross-restart
+    /// persistence.
+    project_root: Option<PathBuf>,
     /// True when `active_session_id` points at a session this chat launched
     /// as a turn (so the next message should be a fresh launch + resume).
     /// False when the user `/attach`ed an externally-spawned session, in
@@ -208,10 +214,30 @@ impl App {
         client: Box<dyn ChatClient>,
         coven_home: Option<PathBuf>,
     ) -> Self {
+        Self::new_with_state_and_project_root(
+            agents,
+            active_agent,
+            client,
+            coven_home,
+            std::env::current_dir().ok(),
+        )
+    }
+
+    pub(super) fn new_with_state_and_project_root(
+        agents: Vec<AgentInfo>,
+        active_agent: Option<usize>,
+        client: Box<dyn ChatClient>,
+        coven_home: Option<PathBuf>,
+        project_root: Option<PathBuf>,
+    ) -> Self {
         let streaming_mode = coven_home
             .as_deref()
             .map(|home| settings::load_from(home).streaming)
             .unwrap_or_default();
+        let harness_conversation_ids = match (coven_home.as_deref(), project_root.as_deref()) {
+            (Some(home), Some(root)) => persistence::load_for_project(home, root),
+            _ => HashMap::new(),
+        };
         let mut app = App {
             messages: Vec::new(),
             input: String::new(),
@@ -244,7 +270,8 @@ impl App {
             slash_suggestion_index: 0,
             slash_popup_dismissed: false,
             last_interrupt_at: None,
-            harness_conversation_ids: HashMap::new(),
+            harness_conversation_ids,
+            project_root,
             chat_owns_active_session: false,
             active_session_harness: None,
             client,
@@ -451,12 +478,14 @@ impl App {
 
     /// Clear the visible transcript and reset scroll, matching what `/clear`
     /// does. Used by Ctrl+L so the keybind doesn't have to fake a slash
-    /// command through the parser. Also drops the harness conversation ids so
-    /// the next turn starts a fresh `--session-id`-claimed thread.
+    /// command through the parser. Also drops the harness conversation ids
+    /// (both in-memory and on disk) so the next turn starts a fresh thread
+    /// rather than silently resuming after a restart.
     pub(super) fn clear_transcript(&mut self) {
         self.messages.clear();
         self.scroll_offset = 0;
         self.harness_conversation_ids.clear();
+        self.clear_persisted_conversations();
         self.push_system_message("Chat cleared.");
     }
 
@@ -811,7 +840,7 @@ impl App {
     /// pre-assign the session id (claude `--session-id`) the first turn sends
     /// `Init` with a freshly generated UUID. For harnesses that auto-assign
     /// (codex) the first turn sends no hint and the id is captured from
-    /// output afterwards via `capture_session_id_from_output`.
+    /// output afterwards via `maybe_capture_codex_session_id`.
     fn conversation_hint_for_harness(&mut self, harness: &str) -> Option<harness::ConversationHint> {
         if !harness_supports_chat_resume(harness) {
             return None;
@@ -823,9 +852,42 @@ impl App {
             let id = Uuid::new_v4().to_string();
             self.harness_conversation_ids
                 .insert(harness.to_string(), id.clone());
+            self.persist_conversations();
             Some(harness::ConversationHint::Init { id })
         } else {
             None
+        }
+    }
+
+    /// Best-effort write of `harness_conversation_ids` to the per-project
+    /// persistence file. Logged on failure (as a system message) but never
+    /// fatal — the in-memory map is authoritative for the current session.
+    fn persist_conversations(&mut self) {
+        let (Some(home), Some(root)) = (self.coven_home.as_deref(), self.project_root.as_deref())
+        else {
+            return;
+        };
+        if let Err(error) =
+            persistence::save_for_project(home, root, &self.harness_conversation_ids)
+        {
+            self.push_system_message(&format!(
+                "Could not persist chat conversation ids: {error}. Resume across restarts may not work."
+            ));
+        }
+    }
+
+    /// Best-effort delete of the per-project persistence file. Called from
+    /// `/clear` so a deliberate reset doesn't silently resume on the next
+    /// `coven chat` invocation. Logged on failure but never fatal.
+    fn clear_persisted_conversations(&mut self) {
+        let (Some(home), Some(root)) = (self.coven_home.as_deref(), self.project_root.as_deref())
+        else {
+            return;
+        };
+        if let Err(error) = persistence::clear_for_project(home, root) {
+            self.push_system_message(&format!(
+                "Could not clear persisted chat conversation ids: {error}."
+            ));
         }
     }
 
@@ -991,6 +1053,7 @@ impl App {
         }
         if let Some(id) = extract_codex_session_id(data) {
             self.harness_conversation_ids.insert("codex".to_string(), id);
+            self.persist_conversations();
         }
     }
 
@@ -1617,7 +1680,9 @@ mod tests {
     use super::*;
     use crate::store::{EventRecord, SessionRecord};
     use crate::tui::chat::client::{ChatClient, ChatEventQuery, LaunchRequest};
+    use crate::tui::chat::persistence;
     use std::cell::RefCell;
+    use std::path::Path;
     use std::rc::Rc;
 
     fn app_with_agents(agents: Vec<AgentInfo>) -> App {
@@ -1758,6 +1823,28 @@ mod tests {
         let mut app = App::new_with_client(Box::new(client));
         app.agents = vec![agent("codex", true), agent("claude", true)];
         app.active_agent = Some(0);
+        app.messages.clear();
+        (app, mirror)
+    }
+
+    /// Like `app_with_client` but with `coven_home` + `project_root` wired
+    /// so cross-restart persistence is exercised. Returns the mirror plus the
+    /// two paths so tests can simulate a restart by constructing a second
+    /// App that points at the same persisted store.
+    fn app_with_persistence(
+        client: RecordingChatClient,
+        coven_home: &Path,
+        project_root: &Path,
+    ) -> (App, RecordingChatClient) {
+        let mirror = client.clone();
+        let agents = vec![agent("codex", true), agent("claude", true)];
+        let mut app = App::new_with_state_and_project_root(
+            agents,
+            Some(0),
+            Box::new(client),
+            Some(coven_home.to_path_buf()),
+            Some(project_root.to_path_buf()),
+        );
         app.messages.clear();
         (app, mirror)
     }
@@ -2025,6 +2112,134 @@ mod tests {
             Some(first_id),
             "first captured id must stick"
         );
+    }
+
+    #[test]
+    fn first_claude_turn_persists_conversation_id_to_disk() {
+        let coven_home = tempfile::tempdir().unwrap();
+        let project_root = tempfile::tempdir().unwrap();
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_persistence(client, coven_home.path(), project_root.path());
+        app.active_agent = Some(1); // claude
+        app.input = "hello".to_string();
+        app.cursor_pos = app.input.len();
+
+        app.handle_input();
+
+        let stored = persistence::load_for_project(coven_home.path(), project_root.path());
+        let in_memory = app
+            .harness_conversation_ids
+            .get("claude")
+            .cloned()
+            .expect("first claude turn must record an id");
+        assert_eq!(
+            stored.get("claude").cloned(),
+            Some(in_memory),
+            "claude conversation id must be persisted to disk after Init"
+        );
+    }
+
+    #[test]
+    fn fresh_app_resumes_persisted_claude_conversation_on_first_send() {
+        let coven_home = tempfile::tempdir().unwrap();
+        let project_root = tempfile::tempdir().unwrap();
+        let stored_id = "fab1efac-1234-5678-9abc-def012345678";
+        let mut seed = std::collections::HashMap::new();
+        seed.insert("claude".to_string(), stored_id.to_string());
+        persistence::save_for_project(coven_home.path(), project_root.path(), &seed)
+            .expect("seed persisted state");
+
+        let client = RecordingChatClient::default();
+        let (mut app, mirror) =
+            app_with_persistence(client, coven_home.path(), project_root.path());
+        assert_eq!(
+            app.harness_conversation_ids.get("claude").map(String::as_str),
+            Some(stored_id),
+            "App must load persisted conversation ids on startup"
+        );
+
+        app.active_agent = Some(1); // claude
+        app.input = "hello again".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+
+        let launched = mirror.launched.borrow();
+        match &launched[0].conversation {
+            Some(crate::harness::ConversationHint::Resume { id }) => {
+                assert_eq!(
+                    id, stored_id,
+                    "first turn after restart must Resume with persisted id"
+                );
+            }
+            other => panic!("expected Resume on first turn after restart, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_session_id_capture_is_persisted_to_disk() {
+        let coven_home = tempfile::tempdir().unwrap();
+        let project_root = tempfile::tempdir().unwrap();
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_persistence(client, coven_home.path(), project_root.path());
+        app.active_agent = Some(0); // codex
+        app.input = "first".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch sets id").to_string();
+
+        let captured_id = "019eaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        app.push_event_message(&output_event(
+            1,
+            &session_id,
+            &format!("session id: {captured_id}\n"),
+        ));
+
+        let stored = persistence::load_for_project(coven_home.path(), project_root.path());
+        assert_eq!(
+            stored.get("codex").map(String::as_str),
+            Some(captured_id),
+            "codex session id must be persisted as soon as it's captured"
+        );
+    }
+
+    #[test]
+    fn clear_transcript_wipes_persisted_conversations_file() {
+        let coven_home = tempfile::tempdir().unwrap();
+        let project_root = tempfile::tempdir().unwrap();
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_persistence(client, coven_home.path(), project_root.path());
+        app.active_agent = Some(1); // claude
+        app.input = "hello".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        assert!(
+            persistence::conversations_file(coven_home.path(), project_root.path()).exists(),
+            "first turn should have created the persistence file"
+        );
+
+        app.clear_transcript();
+
+        assert!(
+            !persistence::conversations_file(coven_home.path(), project_root.path()).exists(),
+            "/clear must delete the persistence file so restart starts fresh"
+        );
+        assert!(app.harness_conversation_ids.is_empty());
+    }
+
+    #[test]
+    fn app_without_coven_home_does_not_attempt_persistence() {
+        // Sanity check: tests that don't pass a coven_home (the default
+        // `app_with_client` path) must keep working without touching disk.
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hello".to_string();
+        app.cursor_pos = app.input.len();
+
+        app.handle_input();
+
+        assert!(app.harness_conversation_ids.contains_key("claude"));
+        assert!(app.coven_home.is_none());
     }
 
     #[test]

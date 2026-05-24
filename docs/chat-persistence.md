@@ -10,9 +10,12 @@ extend the mechanism to additional harnesses.
 | `claude` | ✅ | `claude --print --session-id <uuid>` on turn 1; `claude --print --resume <uuid>` on subsequent turns |
 | `codex` | ✅ | Turn 1 runs plain `codex exec …`; chat captures `session id: <uuid>` from output and feeds it back as `codex exec … resume <uuid> <prompt>` on later turns |
 
-Resume support is scoped to a single `coven chat` invocation. Exiting the chat
-ends the conversation; the next invocation starts fresh. See **Future work**
-below for cross-restart persistence.
+Conversations persist across `coven chat` invocations on a per-project basis:
+on startup the chat seeds its in-memory map from
+`$COVEN_HOME/chat-conversations/<project-key>.json`, so the next message
+sends `Resume` immediately. `/clear` deletes that file. Different projects
+get different files (the key is a deterministic FNV-1a hash of the canonical
+project root path); changing project directory yields a fresh thread.
 
 The two harnesses differ in *who assigns the session id*:
 
@@ -49,18 +52,33 @@ conversation.
 ### Data flow
 
 ```
-chat App
+chat App startup
+  └─ persistence::load_for_project(coven_home, project_root)  → HashMap<harness, id>
+       └─ seeds harness_conversation_ids
+
+chat App on user message
   └─ run_harness_prompt(harness, prompt)
        └─ conversation_hint_for_harness(harness)  → Option<ConversationHint>
+            └─ (claude pre-assign path) persistence::save_for_project(...)
             └─ LaunchRequest::with_conversation(hint)
                  └─ POST /api/v1/sessions  { ..., "conversation": {"mode": "init"|"resume", "id": "<uuid>"} }
                       └─ daemon: pty_runner::build_harness_command_with_conversation
                            └─ harness::command_parts_for_harness_with_conversation
                                 └─ continuity_args(spec, mode, hint)  → ["--print","--resume","<uuid>"]
+
+chat App on output (codex path)
+  └─ maybe_capture_codex_session_id(data)
+       └─ on hit: insert into map + persistence::save_for_project(...)
+
+chat App on /clear
+  └─ harness_conversation_ids.clear()
+       └─ persistence::clear_for_project(...)  // deletes the file
 ```
 
 `continuity_args` is the per-harness translation point — it's where you wire
 up a new harness's resume flags. It lives in `crates/coven-cli/src/harness.rs`.
+The persistence layer lives in
+`crates/coven-cli/src/tui/chat/persistence.rs`.
 
 ### Why not drive the harness TUI through a PTY?
 
@@ -80,10 +98,18 @@ CLI's own session API avoids both problems.
   separate entries of `harness_conversation_ids`. There's no cross-harness
   context transfer; switching agents effectively starts (or resumes) a
   parallel thread with the new agent.
-- **Restarts** of `coven chat`. The conversation ids are in-memory only.
+- **Stale ids** — if the harness CLI no longer recognizes the persisted id
+  (e.g. you deleted claude's local session store, or codex's), the next turn
+  surfaces the harness's error as a normal exit and stops mid-conversation.
+  Recovery today is manual: `/clear` then retry. Auto-recovery is in the
+  Future work list.
 - **`/attach`ed sessions.** Typing while attached to a session launched by
   `coven run` (not by chat) still forwards to that session's stdin — the
   resume path only applies to sessions chat itself launched.
+- **Concurrent `coven chat` invocations in the same project** race on the
+  persistence file (last write wins). For single-user terminal use this is
+  fine; multi-terminal workflows should expect the second invocation to
+  silently overwrite the first when its turn completes.
 
 ## Adding support for a new harness
 
@@ -131,23 +157,26 @@ CLI's own session API avoids both problems.
 
 ## Future work
 
-### Cross-restart persistence
+### Stale-id auto-recovery
 
-Right now closing `coven chat` loses the conversation. To persist:
+Today a stale persisted id (the harness CLI no longer knows it) surfaces as
+a normal error exit and the user has to `/clear` and retry. A nicer flow:
 
-1. Whenever an id is added to `harness_conversation_ids` (claude's `Init` or
-   codex's capture from output), write the `(harness, id)` pair to a
-   per-project file under `$COVEN_HOME/chat-conversations/<project-hash>.json`
-   (or extend `chat-settings.json`).
-2. On `coven chat` startup, read it back and seed `harness_conversation_ids`
-   with the stored ids. The next message will send `Resume` directly without
-   needing turn 1 to capture anything.
-3. Add a `/new` slash command to clear stored ids and start fresh (mirroring
-   what `/clear` does in-memory today).
-4. Decide what to do when the stored id no longer exists on the harness side
-   (claude's `--resume` will error; codex's `exec resume <id>` will error).
-   Either surface the error and fall back to no-hint, or detect the
-   missing-session error pattern and silently regenerate.
+1. Detect "session not found" in the exit event payload or stderr (each
+   harness has its own wording — claude says e.g. `No conversation found
+   with session ID …`; codex says `session <id> not found`).
+2. On detection: drop the stale id from `harness_conversation_ids`, call
+   `persist_conversations`, and surface a short system message ("Prior
+   conversation expired; starting fresh.").
+3. Optional: auto-relaunch the turn with no hint so the user doesn't have
+   to retype.
+
+### `/new` as a separate verb
+
+`/clear` today does double duty: it clears the visible transcript *and*
+the persisted conversation. A `/new` verb that only resets the conversation
+(keeping the transcript visible for context) would split the two so users
+can scroll back through history while starting a fresh thread.
 
 ### One ledger row per conversation
 
