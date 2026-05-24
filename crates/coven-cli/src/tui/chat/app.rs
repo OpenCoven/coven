@@ -26,6 +26,14 @@ pub enum MessageRole {
     System,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum AgentOutputMode {
+    #[default]
+    Unknown,
+    Assistant,
+    Hidden,
+}
+
 #[derive(Clone, Debug)]
 pub struct ChatMessage {
     pub role: MessageRole,
@@ -85,6 +93,7 @@ pub(super) struct App {
     pending_cast_confirmation: Option<CastPlan>,
     streaming_mode: StreamingMode,
     pending_agent_buffer: Option<(String, String)>,
+    agent_output_mode: AgentOutputMode,
     coven_home: Option<PathBuf>,
     pub(super) slash_suggestion_index: usize,
     pub(super) slash_popup_dismissed: bool,
@@ -215,6 +224,7 @@ impl App {
             pending_cast_confirmation: None,
             streaming_mode,
             pending_agent_buffer: None,
+            agent_output_mode: AgentOutputMode::Unknown,
             coven_home,
             slash_suggestion_index: 0,
             slash_popup_dismissed: false,
@@ -549,7 +559,11 @@ impl App {
     }
 
     fn dispatch_cast_plan(&mut self, plan: CastPlan) -> SlashCommandResult {
-        self.push_system_message(&format_cast_plan_for_chat(&plan));
+        if should_keep_launch_inline(&plan) {
+            self.push_system_message(&format_cast_plan_for_chat(&plan));
+        } else if let Some(plan_harness) = plan.harness {
+            self.push_system_message(&format!("Starting {}...", plan_harness.harness.label()));
+        }
 
         match &plan.decision {
             SafetyDecision::Proceed => self.execute_cast_plan(plan),
@@ -569,7 +583,8 @@ impl App {
 
     fn execute_cast_plan(&mut self, plan: CastPlan) -> SlashCommandResult {
         match plan.intent {
-            CastIntent::NaturalSpell { prompt } | CastIntent::HarnessSpell { prompt, .. } => {
+            CastIntent::NaturalSpell { ref prompt }
+            | CastIntent::HarnessSpell { ref prompt, .. } => {
                 let Some(plan_harness) = plan.harness else {
                     self.push_system_message(
                         "No harness available. Run `coven doctor` to install Codex or Claude Code.",
@@ -577,10 +592,12 @@ impl App {
                     return SlashCommandResult::Handled;
                 };
                 if let Some(session) = self.run_harness_prompt(plan_harness.harness.id(), &prompt) {
-                    self.push_system_message(&format_cast_outcome_for_chat(
-                        plan_harness.harness.label(),
-                        &session.id,
-                    ));
+                    if should_keep_launch_inline(&plan) {
+                        self.push_system_message(&format_cast_outcome_for_chat(
+                            plan_harness.harness.label(),
+                            &session.id,
+                        ));
+                    }
                 }
             }
             CastIntent::OpenSessions | CastIntent::OpenAllSessions => {
@@ -726,6 +743,7 @@ impl App {
 
     fn run_harness_prompt(&mut self, harness: &str, prompt: &str) -> Option<store::SessionRecord> {
         self.is_responding = true;
+        self.agent_output_mode = AgentOutputMode::Unknown;
         let result = LaunchRequest::for_current_dir(harness, prompt)
             .and_then(|request| self.client.launch_session(request));
         match result {
@@ -733,10 +751,7 @@ impl App {
                 self.active_session_id = Some(session.id.clone());
                 self.last_event_seq = None;
                 self.reset_event_poll_failures();
-                self.push_system_message(&format!(
-                    "Started daemon session {} ({})",
-                    session.id, session.harness
-                ));
+                self.push_system_message("Connected. Waiting for the reply.");
                 self.poll_session_events();
                 Some(session)
             }
@@ -767,6 +782,7 @@ impl App {
             Ok(session) => {
                 self.active_session_id = Some(session.id.clone());
                 self.last_event_seq = None;
+                self.agent_output_mode = AgentOutputMode::Unknown;
                 self.reset_event_poll_failures();
                 self.push_system_message(&format!(
                     "Attached to daemon session {} ({}, {})",
@@ -893,7 +909,9 @@ impl App {
             "output" => {
                 if let Some(data) = event_payload_text(event, "data") {
                     let sender = self.active_agent_label().to_string();
-                    if let Some(text) = clean_terminal_output(&data) {
+                    if let Some(text) =
+                        human_facing_agent_output(&data, &mut self.agent_output_mode)
+                    {
                         if self.streaming_mode.is_live() {
                             self.push_or_append_agent_message(&sender, &text);
                         } else {
@@ -910,6 +928,7 @@ impl App {
                 if self.active_session_id.as_deref() == Some(event.session_id.as_str()) {
                     self.active_session_id = None;
                 }
+                self.agent_output_mode = AgentOutputMode::Unknown;
                 self.push_system_message(&format!("Session {status}."));
             }
             "kill" => {
@@ -918,6 +937,7 @@ impl App {
                     self.active_session_id = None;
                     self.is_responding = false;
                 }
+                self.agent_output_mode = AgentOutputMode::Unknown;
                 self.push_system_message("Session kill recorded.");
             }
             _ => {}
@@ -1296,6 +1316,11 @@ fn is_chat_local_slash(input: &str) -> bool {
     )
 }
 
+fn should_keep_launch_inline(plan: &CastPlan) -> bool {
+    !matches!(plan.intent, CastIntent::NaturalSpell { .. })
+        || !matches!(plan.risk(), CastRisk::Safe)
+}
+
 fn format_cast_plan_for_chat(plan: &CastPlan) -> String {
     let harness = plan
         .harness
@@ -1368,6 +1393,61 @@ fn clean_terminal_output(data: &str) -> Option<String> {
     // those are pure control noise after escape sequences are stripped.
     let has_structure = output.chars().any(|ch| ch == '\n' || !ch.is_whitespace());
     has_structure.then_some(output)
+}
+
+fn human_facing_agent_output(data: &str, mode: &mut AgentOutputMode) -> Option<String> {
+    let cleaned = clean_terminal_output(data)?;
+    let mut visible = String::new();
+
+    for raw_line in cleaned.split_inclusive('\n') {
+        let line = raw_line.trim_end_matches('\n');
+        let marker = line.trim();
+
+        if is_assistant_marker(marker) {
+            *mode = AgentOutputMode::Assistant;
+            continue;
+        }
+        if is_hidden_transcript_marker(marker) || is_codex_metadata_line(marker) {
+            *mode = AgentOutputMode::Hidden;
+            continue;
+        }
+
+        match mode {
+            AgentOutputMode::Assistant | AgentOutputMode::Unknown => visible.push_str(raw_line),
+            AgentOutputMode::Hidden => {}
+        }
+    }
+
+    let has_structure = visible.chars().any(|ch| ch == '\n' || !ch.is_whitespace());
+    has_structure.then_some(visible)
+}
+
+fn is_assistant_marker(line: &str) -> bool {
+    matches!(line, "codex" | "assistant")
+}
+
+fn is_hidden_transcript_marker(line: &str) -> bool {
+    if matches!(line, "user" | "exec" | "tool" | "bash" | "shell" | "system") {
+        return true;
+    }
+    line.starts_with("hook:")
+        || line == "tokens used"
+        || line == "Completed"
+        || line.starts_with("succeeded in ")
+        || line.starts_with("failed in ")
+}
+
+fn is_codex_metadata_line(line: &str) -> bool {
+    line.starts_with("OpenAI Codex v")
+        || line == "--------"
+        || line.starts_with("workdir:")
+        || line.starts_with("model:")
+        || line.starts_with("provider:")
+        || line.starts_with("approval:")
+        || line.starts_with("sandbox:")
+        || line.starts_with("reasoning effort:")
+        || line.starts_with("reasoning summaries:")
+        || line.starts_with("session id:")
 }
 
 fn skip_escape_sequence<I>(chars: &mut std::iter::Peekable<I>)
@@ -1657,10 +1737,9 @@ mod tests {
             crate::harness::HarnessLaunchMode::NonInteractive
         );
         assert!(app.active_session_id().is_some());
-        assert!(app
-            .messages
-            .iter()
-            .any(|message| message.content.contains("Started daemon session")));
+        assert!(app.messages.iter().any(|message| message
+            .content
+            .contains("Connected. Waiting for the reply.")));
         assert!(!app
             .messages
             .iter()
@@ -1710,7 +1789,7 @@ mod tests {
     }
 
     #[test]
-    fn plain_chat_input_appends_cast_plan_before_daemon_launch() {
+    fn plain_chat_input_launches_without_operational_cards_in_transcript() {
         let client = RecordingChatClient::default();
         let (mut app, _) = app_with_client(client);
         app.input = "fix the failing tests".to_string();
@@ -1718,46 +1797,20 @@ mod tests {
 
         app.handle_input();
 
-        let plan_index = app
+        let transcript = app
             .messages
             .iter()
-            .position(|message| message.content.contains("Cast plan"))
-            .expect("chat transcript should include Cast plan");
-        let launch_index = app
-            .messages
-            .iter()
-            .position(|message| message.content.contains("Started daemon session"))
-            .expect("safe plan should launch");
-        assert!(plan_index < launch_index);
-        assert!(app.messages[plan_index].content.contains("risk [ SAFE ]"));
-        assert!(app.messages[plan_index]
-            .content
-            .contains("steps  launch project-scoped session"));
-    }
-
-    #[test]
-    fn safe_chat_launch_appends_cast_outcome_after_daemon_launch() {
-        let client = RecordingChatClient::default();
-        let (mut app, _) = app_with_client(client);
-        app.input = "fix the failing tests".to_string();
-        app.cursor_pos = app.input.len();
-
-        app.handle_input();
-
-        let launch_index = app
-            .messages
-            .iter()
-            .position(|message| message.content.contains("Started daemon session"))
-            .expect("safe plan should launch");
-        let outcome_index = app
-            .messages
-            .iter()
-            .position(|message| message.content.contains("Cast outcome"))
-            .expect("chat transcript should include Cast outcome");
-        assert!(launch_index < outcome_index);
-        assert!(app.messages[outcome_index]
-            .content
-            .contains("launched  Codex daemon session"));
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(transcript.contains("Starting Codex"));
+        assert!(!transcript.contains("Cast plan"));
+        assert!(!transcript.contains("Cast outcome"));
+        assert!(!transcript.contains("Started daemon session"));
+        assert!(
+            !transcript.contains("session-"),
+            "safe natural chat should not expose daemon ids inline: {transcript}"
+        );
     }
 
     #[test]
@@ -1782,7 +1835,11 @@ mod tests {
         let launch_index = app
             .messages
             .iter()
-            .position(|message| message.content.contains("Started daemon session"))
+            .position(|message| {
+                message
+                    .content
+                    .contains("Connected. Waiting for the reply.")
+            })
             .expect("safe slash plan should launch");
         assert!(plan_index < launch_index);
         assert!(app.messages[plan_index]
@@ -2191,6 +2248,48 @@ mod tests {
         assert!(!agent_messages[0].content.contains('\x1b'));
         assert!(!agent_messages[0].content.contains("[39;49m"));
         assert!(!agent_messages[0].content.contains("[?2004h"));
+    }
+
+    #[test]
+    fn codex_transcript_output_keeps_assistant_text_and_hides_tool_details() {
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "codex",
+            "Existing",
+            "running",
+        ));
+        client.events.borrow_mut().extend([
+            output_event(
+                1,
+                "session-1",
+                "OpenAI Codex v0.133.0\r\n--------\r\nworkdir: /tmp/project\r\nmodel: gpt-5.5\r\n--------\r\nuser\r\nhi there\r\nhook: SessionStart\r\ncodex\r\nI can help with that.\r\nexec\r\n/bin/zsh -lc \"cat secret\"\r\n  succeeded in 0ms:\r\nprivate tool output\r\n",
+            ),
+            output_event(
+                2,
+                "session-1",
+                "codex\r\nHere is the useful answer.\r\n",
+            ),
+            output_event(3, "session-1", "tokens used\r\n12,345\r\n"),
+        ]);
+        let (mut app, _) = app_with_client(client);
+
+        app.handle_slash_command("/attach session-1");
+
+        let agent_text = app
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, MessageRole::Agent))
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(agent_text.contains("I can help with that."));
+        assert!(agent_text.contains("Here is the useful answer."));
+        assert!(!agent_text.contains("OpenAI Codex"));
+        assert!(!agent_text.contains("workdir:"));
+        assert!(!agent_text.contains("hook:"));
+        assert!(!agent_text.contains("/bin/zsh"));
+        assert!(!agent_text.contains("private tool output"));
+        assert!(!agent_text.contains("tokens used"));
     }
 
     #[test]
