@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,6 +25,15 @@ pub struct EventRecord {
     pub kind: String,
     pub payload_json: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryRecord {
+    pub id: String,
+    pub path: String,
+    pub package_name: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Default)]
@@ -74,6 +83,14 @@ pub fn open_store(path: &Path) -> Result<Connection> {
 
         CREATE INDEX IF NOT EXISTS idx_events_session_created_at
             ON events(session_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS repositories (
+            id TEXT PRIMARY KEY NOT NULL,
+            path TEXT NOT NULL,
+            package_name TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         ",
     )
     .context("failed to initialize Coven store schema")?;
@@ -81,6 +98,16 @@ pub fn open_store(path: &Path) -> Result<Connection> {
     ensure_archived_at_column(&conn)?;
 
     Ok(conn)
+}
+
+pub fn open_existing_store_read_only(path: &Path) -> Result<Option<Connection>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("failed to open Coven store read-only at {}", path.display()))?;
+    Ok(Some(conn))
 }
 
 fn ensure_exit_code_column(conn: &Connection) -> Result<()> {
@@ -121,6 +148,71 @@ fn ensure_archived_at_column(conn: &Connection) -> Result<()> {
     }
 
     Ok(())
+}
+
+pub fn upsert_repository(conn: &Connection, record: &RepositoryRecord) -> Result<()> {
+    conn.execute(
+        "INSERT INTO repositories (
+            id,
+            path,
+            package_name,
+            created_at,
+            updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5)
+        ON CONFLICT(id) DO UPDATE SET
+            path = excluded.path,
+            package_name = excluded.package_name,
+            updated_at = excluded.updated_at",
+        params![
+            &record.id,
+            &record.path,
+            &record.package_name,
+            &record.created_at,
+            &record.updated_at,
+        ],
+    )
+    .with_context(|| format!("failed to upsert repository {}", record.id))?;
+
+    Ok(())
+}
+
+pub fn get_repository(conn: &Connection, id: &str) -> Result<Option<RepositoryRecord>> {
+    use rusqlite::OptionalExtension;
+
+    conn.query_row(
+        "SELECT id, path, package_name, created_at, updated_at
+         FROM repositories
+         WHERE id = ?1
+         LIMIT 1",
+        params![id],
+        |row| {
+            Ok(RepositoryRecord {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                package_name: row.get(2)?,
+                created_at: row.get(3)?,
+                updated_at: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .with_context(|| format!("failed to get repository {id}"))
+}
+
+pub fn repositories_table_exists(conn: &Connection) -> Result<bool> {
+    let exists = conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM sqlite_master
+                WHERE type = 'table' AND name = 'repositories'
+            )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .context("failed to inspect repositories schema")?;
+
+    Ok(exists)
 }
 
 pub fn insert_session(conn: &Connection, record: &SessionRecord) -> Result<()> {
@@ -448,6 +540,94 @@ mod tests {
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "session-1");
+        Ok(())
+    }
+
+    #[test]
+    fn stores_and_retrieves_repository_locations() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+        let repo = RepositoryRecord {
+            id: "openclaw".to_string(),
+            path: "/repo/openclaw".to_string(),
+            package_name: Some("openclaw".to_string()),
+            created_at: "2026-05-24T05:00:00Z".to_string(),
+            updated_at: "2026-05-24T05:00:00Z".to_string(),
+        };
+
+        upsert_repository(&conn, &repo)?;
+
+        assert_eq!(get_repository(&conn, "openclaw")?, Some(repo));
+        Ok(())
+    }
+
+    #[test]
+    fn repository_locations_are_updated_without_changing_created_at() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+        upsert_repository(
+            &conn,
+            &RepositoryRecord {
+                id: "openclaw".to_string(),
+                path: "/old/openclaw".to_string(),
+                package_name: Some("openclaw".to_string()),
+                created_at: "2026-05-24T05:00:00Z".to_string(),
+                updated_at: "2026-05-24T05:00:00Z".to_string(),
+            },
+        )?;
+
+        upsert_repository(
+            &conn,
+            &RepositoryRecord {
+                id: "openclaw".to_string(),
+                path: "/new/openclaw".to_string(),
+                package_name: Some("@openclaw/openclaw".to_string()),
+                created_at: "2026-05-24T06:00:00Z".to_string(),
+                updated_at: "2026-05-24T06:00:00Z".to_string(),
+            },
+        )?;
+
+        assert_eq!(
+            get_repository(&conn, "openclaw")?,
+            Some(RepositoryRecord {
+                id: "openclaw".to_string(),
+                path: "/new/openclaw".to_string(),
+                package_name: Some("@openclaw/openclaw".to_string()),
+                created_at: "2026-05-24T05:00:00Z".to_string(),
+                updated_at: "2026-05-24T06:00:00Z".to_string(),
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn missing_store_does_not_open_read_only() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store_path = temp_dir.path().join("missing.db");
+
+        let conn = open_existing_store_read_only(&store_path)?;
+
+        assert!(conn.is_none());
+        assert!(!store_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn repositories_table_exists_detects_missing_table() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store_path = temp_dir.path().join("legacy.db");
+        let conn = Connection::open(&store_path)?;
+        conn.execute(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY NOT NULL
+            )",
+            [],
+        )?;
+        drop(conn);
+
+        let conn = open_existing_store_read_only(&store_path)?.expect("store should exist");
+
+        assert!(!repositories_table_exists(&conn)?);
         Ok(())
     }
 

@@ -30,6 +30,7 @@ const DEFAULT_SESSION_STATUS: &str = "created";
 const RUNNING_SESSION_STATUS: &str = "running";
 const FAILED_SESSION_STATUS: &str = "failed";
 const DEFAULT_TITLE_CHARS: usize = 48;
+const OPENCLAW_REPOSITORY_ID: &str = "openclaw";
 
 #[derive(Parser, Debug)]
 #[command(name = "coven")]
@@ -280,7 +281,12 @@ fn run_patch_openclaw(
     _keep_session: bool,
 ) -> Result<()> {
     let start_dir = std::env::current_dir().context("failed to read current directory")?;
-    let detected_repo = openclaw_repo::detect_openclaw_repo(repo.as_deref(), &start_dir)?;
+    let stored_repo = stored_repository_path(OPENCLAW_REPOSITORY_ID)?;
+    let detected_repo = openclaw_repo::detect_openclaw_repo_with_stored(
+        repo.as_deref(),
+        &start_dir,
+        stored_repo.as_deref(),
+    )?;
     let git_state = openclaw_repo::inspect_git_state(&detected_repo.root)?;
     let issue = match joined_optional_issue(issue)? {
         Some(issue) => issue,
@@ -323,6 +329,7 @@ fn run_patch_openclaw(
     }
 
     let session_id = launch_patch_session(&request)?;
+    remember_openclaw_repo_location(&request.repo)?;
     let verification_results =
         verification::run_verification(&request.repo.root, &request.verification_profile)?;
     let verification_lines = verification_results
@@ -356,6 +363,38 @@ fn run_patch_openclaw(
         })
     );
     Ok(())
+}
+
+fn stored_repository_path(repository_id: &str) -> Result<Option<PathBuf>> {
+    let Some(store_path) = coven_store_path_if_exists()? else {
+        return Ok(None);
+    };
+    let Some(conn) = store::open_existing_store_read_only(&store_path)? else {
+        return Ok(None);
+    };
+    if !store::repositories_table_exists(&conn)? {
+        return Ok(None);
+    }
+    Ok(store::get_repository(&conn, repository_id)?.map(|repo| PathBuf::from(repo.path)))
+}
+
+fn remember_openclaw_repo_location(repo: &openclaw_repo::OpenClawRepo) -> Result<()> {
+    let store_path = coven_store_path()?;
+    let conn = store::open_store(&store_path)?;
+    let now = current_timestamp();
+    let existing = store::get_repository(&conn, OPENCLAW_REPOSITORY_ID)?;
+    store::upsert_repository(
+        &conn,
+        &store::RepositoryRecord {
+            id: OPENCLAW_REPOSITORY_ID.to_string(),
+            path: repo.root.to_string_lossy().into_owned(),
+            package_name: repo.package_name.clone(),
+            created_at: existing
+                .map(|repo| repo.created_at)
+                .unwrap_or_else(|| now.clone()),
+            updated_at: now,
+        },
+    )
 }
 
 fn joined_optional_issue(issue: Vec<String>) -> Result<Option<String>> {
@@ -897,6 +936,11 @@ fn coven_store_path() -> Result<PathBuf> {
     std::fs::create_dir_all(&home)
         .with_context(|| format!("failed to create Coven home directory {}", home.display()))?;
     Ok(home.join(STORE_FILE_NAME))
+}
+
+fn coven_store_path_if_exists() -> Result<Option<PathBuf>> {
+    let store_path = coven_home_dir()?.join(STORE_FILE_NAME);
+    Ok(store_path.exists().then_some(store_path))
 }
 
 fn coven_home_dir() -> Result<PathBuf> {

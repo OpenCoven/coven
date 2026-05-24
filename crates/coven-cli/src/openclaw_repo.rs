@@ -23,27 +23,45 @@ impl GitState {
     }
 }
 
-pub fn detect_openclaw_repo(
+pub fn detect_openclaw_repo_with_stored(
     explicit_repo: Option<&Path>,
     start_dir: &Path,
+    stored_repo: Option<&Path>,
 ) -> Result<OpenClawRepo> {
     if let Some(repo) = explicit_repo {
         return validate_openclaw_repo(repo);
     }
 
+    if let Some(repo) = detect_openclaw_repo_from_ancestor(start_dir)? {
+        return Ok(repo);
+    }
+
+    if let Some(repo) = stored_repo {
+        return validate_openclaw_repo(repo).with_context(|| {
+            format!(
+                "stored OpenClaw repo path {} is no longer valid; pass --repo <path>",
+                repo.display()
+            )
+        });
+    }
+
+    anyhow::bail!(
+        "could not find an OpenClaw source checkout from {}; pass --repo <path>",
+        start_dir.display()
+    );
+}
+
+fn detect_openclaw_repo_from_ancestor(start_dir: &Path) -> Result<Option<OpenClawRepo>> {
     let mut candidate = start_dir
         .canonicalize()
         .with_context(|| format!("failed to resolve start directory {}", start_dir.display()))?;
 
     loop {
         if looks_like_openclaw_repo(&candidate)? {
-            return validate_openclaw_repo(&candidate);
+            return validate_openclaw_repo(&candidate).map(Some);
         }
         if !candidate.pop() {
-            anyhow::bail!(
-                "could not find an OpenClaw source checkout from {}; pass --repo <path>",
-                start_dir.display()
-            );
+            return Ok(None);
         }
     }
 }
@@ -189,7 +207,7 @@ mod tests {
         let repo = temp.path().join("openclaw");
         write_openclaw_fixture(&repo)?;
 
-        let detected = detect_openclaw_repo(Some(&repo), temp.path())?;
+        let detected = detect_openclaw_repo_with_stored(Some(&repo), temp.path(), None)?;
 
         assert_eq!(detected.root, repo.canonicalize()?);
         assert_eq!(detected.package_name.as_deref(), Some("openclaw"));
@@ -203,7 +221,7 @@ mod tests {
         fs::create_dir_all(repo.join(".git"))?;
         fs::write(repo.join("package.json"), r#"{"name":"other"}"#)?;
 
-        let error = detect_openclaw_repo(Some(&repo), temp.path()).unwrap_err();
+        let error = detect_openclaw_repo_with_stored(Some(&repo), temp.path(), None).unwrap_err();
 
         assert!(
             error
@@ -223,9 +241,54 @@ mod tests {
         // Also create the child dir so ancestry search works
         fs::create_dir_all(&child)?;
 
-        let detected = detect_openclaw_repo(None, &child)?;
+        let detected = detect_openclaw_repo_with_stored(None, &child, None)?;
 
         assert_eq!(detected.root, repo.canonicalize()?);
+        Ok(())
+    }
+
+    #[test]
+    fn detects_stored_openclaw_repo_when_current_directory_is_elsewhere() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repo = temp.path().join("openclaw");
+        let unrelated = temp.path().join("notes");
+        write_openclaw_fixture(&repo)?;
+        fs::create_dir(&unrelated)?;
+
+        let detected = detect_openclaw_repo_with_stored(None, &unrelated, Some(&repo))?;
+
+        assert_eq!(detected.root, repo.canonicalize()?);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_openclaw_repo_beats_stored_repo() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let explicit = temp.path().join("explicit");
+        let stored = temp.path().join("stored");
+        write_openclaw_fixture(&explicit)?;
+        write_openclaw_fixture(&stored)?;
+
+        let detected =
+            detect_openclaw_repo_with_stored(Some(&explicit), temp.path(), Some(&stored))?;
+
+        assert_eq!(detected.root, explicit.canonicalize()?);
+        Ok(())
+    }
+
+    #[test]
+    fn ancestry_openclaw_repo_beats_stored_repo() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let ancestor = temp.path().join("ancestor");
+        let child = ancestor.join("src/gateway");
+        let stored = temp.path().join("stored");
+        write_openclaw_fixture(&ancestor)?;
+        write_openclaw_fixture(&stored)?;
+        fs::create_dir_all(&child)?;
+
+        let detected = detect_openclaw_repo_with_stored(None, &child, Some(&stored))?;
+
+        assert_eq!(detected.root, ancestor.canonicalize()?);
         Ok(())
     }
 

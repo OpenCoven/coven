@@ -412,3 +412,25 @@ New local API endpoints, scoped narrowly:
 - No multi-tenant Supreme. One Supreme per local user, bound to `COVEN_HOME`.
 - No automatic Lead restart or self-healing.
 - No new Supreme-only persistence schema in v0; Leads reuse session/event tables with a `patch_metadata` event marker.
+
+## Amendment: stored OpenClaw repository location (2026-05-24)
+
+Status: accepted for the current CLI rescue loop.
+
+### Motivation
+
+`coven patch openclaw` should not require users to run the command from inside an OpenClaw checkout every time. Once Coven has validated an OpenClaw repo, it can safely remember the canonical path in its local store and reuse it later.
+
+### Behavior
+
+Repository resolution now follows this precedence:
+
+1. Explicit `--repo <path>`.
+2. OpenClaw source checkout found by walking upward from the current directory.
+3. Stored OpenClaw repository path from the local Coven store.
+
+When a real patch session launches, Coven stores the selected canonical repo path under the `openclaw` repository id in `<COVEN_HOME>/coven.sqlite3`. `--dry-run` remains side-effect free and does not update the stored path.
+
+### Scope
+
+This is intentionally a small registry, not a general repo manager. The initial stored target is OpenClaw only; future patch targets can add their own repository ids when they get dedicated patch flows.
