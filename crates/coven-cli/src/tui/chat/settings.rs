@@ -102,7 +102,8 @@ fn replace_settings_file(temp_path: &Path, path: &Path) -> std::io::Result<()> {
 
     #[link(name = "Kernel32")]
     extern "system" {
-        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+        #[link_name = "MoveFileExW"]
+        fn move_file_ex_w(existing: *const u16, new: *const u16, flags: u32) -> i32;
     }
 
     let existing: Vec<u16> = temp_path
@@ -116,7 +117,7 @@ fn replace_settings_file(temp_path: &Path, path: &Path) -> std::io::Result<()> {
         .chain(std::iter::once(0))
         .collect();
     let ok = unsafe {
-        MoveFileExW(
+        move_file_ex_w(
             existing.as_ptr(),
             new.as_ptr(),
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
