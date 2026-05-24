@@ -131,16 +131,37 @@ impl SessionRuntime for LiveSessionRuntime {
             .map(|coven_home| output_observer(coven_home.to_path_buf(), launch.id.clone()));
 
         if launch.launch_mode == crate::harness::HarnessLaunchMode::Stream {
+            // Defense in depth: only allow Stream mode for harnesses that
+            // actually have a stream-json entrypoint. Without this check
+            // the chat's local gating could be bypassed by another client
+            // requesting Stream for, say, codex — the daemon would then
+            // JSON-wrap stdin into a one-shot `codex exec` process that
+            // doesn't understand it.
+            if !crate::harness::harness_supports_stream_mode(&launch.harness) {
+                anyhow::bail!(
+                    "harness `{}` does not support stream-mode launches; use launchMode `nonInteractive` instead",
+                    launch.harness
+                );
+            }
             let piped = pty_runner::spawn_piped_with_observer(&command, observer)?;
-            let killer: Box<dyn RuntimeKiller> = Box::new(PipedKiller { pid: piped.pid });
+            let mut killer: Box<dyn RuntimeKiller> = Box::new(PipedKiller { pid: piped.pid });
             let mut input = piped.input;
             // Send the launch's prompt as the first stream-json user
             // message so the chat doesn't need a separate send call right
-            // after launch. Best-effort: if the write fails the session is
-            // still registered and the caller can retry via send_input.
+            // after launch. A write failure here means the child already
+            // exited (e.g. auth missing) — treat that as a hard launch
+            // error: kill what's left of the child and surface it to the
+            // caller so the session row is marked failed instead of
+            // pretending we delivered the prompt.
             if !launch.prompt.is_empty() {
                 if let Err(error) = write_stream_message(input.as_mut(), &launch.prompt) {
-                    eprintln!("[stream-launch] initial message write failed: {error}");
+                    let _ = killer.kill();
+                    return Err(error).with_context(|| {
+                        format!(
+                            "stream-mode launch of `{}` failed: child closed stdin before the initial message landed (auth/setup error?)",
+                            launch.harness
+                        )
+                    });
                 }
             }
             return self.register_kind(launch.id.clone(), LiveSessionKind::Stream, input, killer);
@@ -927,6 +948,28 @@ fn parse_request_line(line: &str) -> Result<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_runtime_rejects_stream_launch_for_non_stream_capable_harness() {
+        let runtime = LiveSessionRuntime::default();
+        let launch = crate::api::SessionLaunch {
+            id: "session-x".to_string(),
+            project_root: "/tmp/x".to_string(),
+            cwd: "/tmp/x".to_string(),
+            harness: "codex".to_string(),
+            launch_mode: crate::harness::HarnessLaunchMode::Stream,
+            prompt: "hello".to_string(),
+            title: "stream codex (should be rejected)".to_string(),
+            conversation: None,
+            conversation_id: None,
+        };
+
+        let error = SessionRuntime::launch_session(&runtime, &launch).unwrap_err();
+        assert!(
+            error.to_string().contains("does not support stream-mode"),
+            "rejection message should name the constraint, got: {error}"
+        );
+    }
 
     #[test]
     fn live_runtime_writes_input_to_registered_session() -> Result<()> {

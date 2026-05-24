@@ -160,20 +160,39 @@ pub fn spawn_piped_with_observer(
 
     // Stderr drain: line-buffered, wrapped in a stream-json system
     // envelope so chat can render auth/setup messages as system lines
-    // rather than dropping them silently.
+    // rather than dropping them silently. Reads raw bytes with
+    // `read_until(b'\n')` + `from_utf8_lossy` so non-UTF-8 stderr
+    // (rare but seen in some sandboxed environments) doesn't truncate
+    // the stream at the first decode error — which `BufRead::lines()`
+    // would do.
     let stderr_callback = Arc::clone(&on_output_shared);
     thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines().map_while(Result::ok) {
-            let envelope = serde_json::json!({
-                "type": "system",
-                "subtype": "stderr",
-                "text": line,
-            });
-            let mut payload = envelope.to_string();
-            payload.push('\n');
-            if let Ok(mut cb) = stderr_callback.lock() {
-                cb(payload.into_bytes());
+        let mut reader = BufReader::new(stderr);
+        let mut buf: Vec<u8> = Vec::with_capacity(256);
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) => break, // EOF
+                Ok(_) => {
+                    // Strip the trailing newline (if any) for cleaner
+                    // display; the JSON envelope adds its own.
+                    let trimmed = match buf.last() {
+                        Some(b'\n') => &buf[..buf.len() - 1],
+                        _ => &buf[..],
+                    };
+                    let line = String::from_utf8_lossy(trimmed);
+                    let envelope = serde_json::json!({
+                        "type": "system",
+                        "subtype": "stderr",
+                        "text": line,
+                    });
+                    let mut payload = envelope.to_string();
+                    payload.push('\n');
+                    if let Ok(mut cb) = stderr_callback.lock() {
+                        cb(payload.into_bytes());
+                    }
+                }
+                Err(_) => break,
             }
         }
     });

@@ -1028,6 +1028,17 @@ impl App {
     /// stream sessions don't, because the daemon wraps the payload in a
     /// JSON envelope verbatim and the inner `\n` would otherwise leak
     /// into the user message text on every turn after the first.
+    ///
+    /// **Limitation**: this distinguishes stream-vs-PTY by checking our
+    /// own `harness_stream_session_ids` map, which only knows about
+    /// stream sessions this chat instance launched. If a future
+    /// `/attach` connects to a stream session launched by another
+    /// process (or a stream session that survived a restart), the check
+    /// would mis-treat it as PTY and append the spurious `\n`. Today no
+    /// flow produces this state — only chat launches stream sessions
+    /// and `/attach` is documented for `coven run`-spawned PTY tasks —
+    /// but the proper fix is exposing the session kind on
+    /// `SessionRecord` so the daemon is the source of truth.
     fn forward_input_to_session(&mut self, session_id: &str, raw: &str) {
         self.is_responding = true;
         let is_stream = self
