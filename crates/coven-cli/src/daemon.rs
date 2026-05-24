@@ -53,6 +53,28 @@ pub trait RuntimeKiller: Send {
     fn kill(&mut self) -> Result<()>;
 }
 
+/// Sentinel error returned by `LiveSessionRuntime::send_input` and
+/// `kill_session` when the session id isn't in the live registry. The
+/// API layer downcasts to this type instead of substring-matching the
+/// error message — refactoring the prose now can't accidentally route
+/// "not live" cases to the generic 500 path.
+#[derive(Debug)]
+pub struct NotLiveError {
+    pub session_id: String,
+}
+
+impl std::fmt::Display for NotLiveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "session `{}` is not live in this daemon",
+            self.session_id
+        )
+    }
+}
+
+impl std::error::Error for NotLiveError {}
+
 #[derive(Default)]
 pub struct LiveSessionRuntime {
     coven_home: Option<PathBuf>,
@@ -204,9 +226,11 @@ impl SessionRuntime for LiveSessionRuntime {
                 .sessions
                 .lock()
                 .map_err(|_| anyhow::anyhow!("live session registry lock poisoned"))?;
-            let session = sessions
-                .get(session_id)
-                .with_context(|| format!("session `{session_id}` is not live in this daemon"))?;
+            let session = sessions.get(session_id).ok_or_else(|| {
+                anyhow::Error::new(NotLiveError {
+                    session_id: session_id.to_string(),
+                })
+            })?;
             (session.kind, std::sync::Arc::clone(&session.input))
         };
         let mut input = input
@@ -238,9 +262,11 @@ impl SessionRuntime for LiveSessionRuntime {
                 .sessions
                 .lock()
                 .map_err(|_| anyhow::anyhow!("live session registry lock poisoned"))?;
-            sessions
-                .remove(session_id)
-                .with_context(|| format!("session `{session_id}` is not live in this daemon"))?
+            sessions.remove(session_id).ok_or_else(|| {
+                anyhow::Error::new(NotLiveError {
+                    session_id: session_id.to_string(),
+                })
+            })?
         };
         let mut killer = handle
             .killer

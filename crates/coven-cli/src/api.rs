@@ -450,7 +450,14 @@ fn record_input(
         );
     }
     if let Err(error) = runtime.send_input(session_id, &payload) {
-        if error.to_string().contains("not live") {
+        // Match the typed sentinel from the daemon runtime instead of
+        // substring-matching the error message — refactoring the prose
+        // later can't accidentally route the not-live case to the
+        // generic 500 path.
+        if error
+            .downcast_ref::<crate::daemon::NotLiveError>()
+            .is_some()
+        {
             return session_not_live_response(session_id);
         }
         return api_error(
@@ -486,7 +493,10 @@ fn kill_session(
     // runtime kill failure (libc::kill returning EPERM, etc.) must
     // become a 500 response, not an Err that brings down the daemon.
     if let Err(error) = runtime.kill_session(session_id) {
-        if error.to_string().contains("not live") {
+        if error
+            .downcast_ref::<crate::daemon::NotLiveError>()
+            .is_some()
+        {
             return session_not_live_response(session_id);
         }
         return api_error(
@@ -1399,6 +1409,46 @@ mod tests {
     }
 
     #[test]
+    fn input_request_not_live_runtime_error_routes_to_409_via_typed_downcast() -> anyhow::Result<()>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "session-1")?;
+
+        struct NotLiveRuntime;
+        impl SessionRuntime for NotLiveRuntime {
+            fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+                Ok(())
+            }
+            fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+                Err(anyhow::Error::new(crate::daemon::NotLiveError {
+                    session_id: "session-1".to_string(),
+                }))
+            }
+            fn kill_session(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+        let runtime = NotLiveRuntime;
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions/session-1/input",
+            temp_dir.path(),
+            None,
+            Some(r#"{"data":"hi"}"#),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 409);
+        assert!(
+            response.body.contains("session_not_live"),
+            "typed NotLiveError must route to 409 session_not_live, got: {}",
+            response.body
+        );
+        Ok(())
+    }
+
+    #[test]
     fn input_request_runtime_failure_returns_500_not_daemon_crash() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
         insert_test_session(temp_dir.path(), "session-1")?;
@@ -1656,11 +1706,15 @@ mod tests {
         }
 
         fn send_input(&self, session_id: &str, _payload: &Value) -> Result<()> {
-            anyhow::bail!("session `{session_id}` is not live in this daemon")
+            Err(anyhow::Error::new(crate::daemon::NotLiveError {
+                session_id: session_id.to_string(),
+            }))
         }
 
         fn kill_session(&self, session_id: &str) -> Result<()> {
-            anyhow::bail!("session `{session_id}` is not live in this daemon")
+            Err(anyhow::Error::new(crate::daemon::NotLiveError {
+                session_id: session_id.to_string(),
+            }))
         }
     }
 
