@@ -334,59 +334,24 @@ fn output_observer(coven_home: PathBuf, session_id: String) -> pty_runner::Detac
     let output_session_id = session_id.clone();
     let exit_home = coven_home;
     let exit_session_id = session_id;
-    // Per-session byte buffer. `spawn_detached_with_observer` (and the
-    // piped variant) feed us arbitrary 8KiB reads, so a multi-byte
-    // UTF-8 codepoint can straddle two callbacks. Decoding each chunk
-    // independently with `from_utf8_lossy` would insert U+FFFD at the
-    // split, permanently corrupting JSON in stream-mode (and garbling
-    // emoji/non-ASCII text in PTY mode). We append raw bytes, decode
-    // only the longest valid-UTF-8 prefix, and keep the trailing
-    // partial codepoint for the next chunk.
-    let mut buffer: Vec<u8> = Vec::with_capacity(8192);
-
+    // UTF-8 boundary safety is enforced by `drain_detached_output` in
+    // pty_runner per-source (separate buffers for stdout and stderr in
+    // stream mode), so each chunk we receive here is already valid
+    // UTF-8. We just decode and record. Lossy decode is a defensive
+    // fallback that should never trigger.
     pty_runner::DetachedPtyObserver {
         on_output: Box::new(move |chunk| {
             if chunk.is_empty() {
                 return;
             }
-            buffer.extend_from_slice(&chunk);
-            // Take the longest valid-UTF-8 prefix; bytes after that are
-            // either a partial codepoint at a chunk boundary (wait for
-            // more) or genuinely invalid bytes (handled below).
-            let valid_up_to = match std::str::from_utf8(&buffer) {
-                Ok(_) => buffer.len(),
-                Err(error) => error.valid_up_to(),
-            };
-            if valid_up_to > 0 {
-                let safe = std::str::from_utf8(&buffer[..valid_up_to])
-                    .expect("valid_up_to is by definition valid utf-8")
-                    .to_string();
-                buffer.drain(..valid_up_to);
-                let _ = record_session_event(
-                    &output_home,
-                    &output_session_id,
-                    "output",
-                    json!({ "data": safe }),
-                );
-            }
-            // Pathological tail: if the remaining bytes can't be a
-            // partial codepoint (>4 bytes — max UTF-8 codepoint length),
-            // the stream is genuinely malformed. Drop one byte via
-            // lossy decode so we make progress instead of buffering
-            // forever. Re-runs of from_utf8 on subsequent chunks will
-            // either find new valid prefixes or repeat this drain.
-            while buffer.len() > 4
-                && std::str::from_utf8(&buffer).err().map(|e| e.valid_up_to()) == Some(0)
-            {
-                let dropped: Vec<u8> = buffer.drain(..1).collect();
-                let lossy = String::from_utf8_lossy(&dropped).into_owned();
-                let _ = record_session_event(
-                    &output_home,
-                    &output_session_id,
-                    "output",
-                    json!({ "data": lossy }),
-                );
-            }
+            let text = String::from_utf8(chunk)
+                .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned());
+            let _ = record_session_event(
+                &output_home,
+                &output_session_id,
+                "output",
+                json!({ "data": text }),
+            );
         }),
         on_exit: Box::new(move |result| {
             let _ = record_session_exit(&exit_home, &exit_session_id, result);
@@ -1029,26 +994,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn output_observer_buffers_multibyte_codepoints_split_across_chunks() -> Result<()> {
+    fn output_observer_records_each_callback_as_an_event() -> Result<()> {
+        // UTF-8 boundary safety lives in pty_runner::drain_detached_output
+        // now (see its tests). The observer's only job is to take each
+        // chunk it receives and persist it as an `output` event. This
+        // test pins that minimal contract by feeding the observer two
+        // pre-decoded chunks and checking they show up verbatim in the
+        // events table.
         let temp_dir = tempfile::tempdir()?;
-        crate::store::open_store(&temp_dir.path().join("coven.sqlite3"))?;
-        // Seed a session row so record_session_event has a valid FK.
-        let session = session_record("buffered");
         let conn = crate::store::open_store(&temp_dir.path().join("coven.sqlite3"))?;
+        let session = session_record("buffered");
         crate::store::insert_session(&conn, &session)?;
 
         let observer = output_observer(temp_dir.path().to_path_buf(), session.id.clone());
         let pty_runner::DetachedPtyObserver { mut on_output, .. } = observer;
 
-        // 🎉 = 0xF0 0x9F 0x8E 0x89. Split it across two chunks so the
-        // old (non-buffered) implementation would lossy-decode each
-        // half into U+FFFD and corrupt the text.
-        let emoji_bytes = "🎉".as_bytes(); // 4 bytes
-        on_output(emoji_bytes[..2].to_vec());
-        on_output(emoji_bytes[2..].to_vec());
+        // The drain layer would only ever hand us valid-UTF-8 slices,
+        // so simulate that: a complete emoji and then a plain ASCII
+        // chunk, each fully decodable on its own.
+        on_output("🎉".as_bytes().to_vec());
+        on_output(b" done".to_vec());
 
-        // Read back the recorded events and concatenate their decoded
-        // text. The original emoji must round-trip intact.
         let events = crate::store::list_events(&conn, &session.id)?;
         let mut decoded = String::new();
         for event in events.iter().filter(|e| e.kind == "output") {
@@ -1057,10 +1023,7 @@ mod tests {
                 decoded.push_str(text);
             }
         }
-        assert_eq!(
-            decoded, "🎉",
-            "split-codepoint output must reassemble to the original character, not U+FFFD"
-        );
+        assert_eq!(decoded, "🎉 done");
         Ok(())
     }
 

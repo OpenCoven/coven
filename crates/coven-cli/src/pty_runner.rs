@@ -297,12 +297,56 @@ fn drain_detached_output(
     mut on_output: Option<&mut Box<dyn FnMut(Vec<u8>) + Send + 'static>>,
 ) {
     let mut buffer = [0_u8; 8192];
+    // Per-drain UTF-8 reassembly buffer. Each call to this function
+    // owns its own buffer, so concurrent stdout+stderr drains in
+    // `spawn_piped_with_observer` (which share an `on_output` via
+    // Arc<Mutex>) can't corrupt each other's codepoint state. Each
+    // chunk we hand to the callback is guaranteed valid UTF-8.
+    let mut utf8_buf: Vec<u8> = Vec::with_capacity(8192);
     loop {
         match reader.read(&mut buffer) {
-            Ok(0) => break,
+            Ok(0) => {
+                // EOF: flush any trailing bytes (lossy if the stream
+                // ended mid-codepoint — better to surface garbled
+                // glyphs than drop the final message entirely).
+                if !utf8_buf.is_empty() {
+                    if let Some(callback) = on_output.as_deref_mut() {
+                        let text = String::from_utf8_lossy(&utf8_buf).into_owned();
+                        callback(text.into_bytes());
+                    }
+                }
+                break;
+            }
             Ok(bytes_read) => {
-                if let Some(callback) = on_output.as_deref_mut() {
-                    callback(buffer[..bytes_read].to_vec());
+                utf8_buf.extend_from_slice(&buffer[..bytes_read]);
+                // Emit the longest valid-UTF-8 prefix; keep the trailing
+                // partial codepoint in the buffer for the next read.
+                let valid_up_to = match std::str::from_utf8(&utf8_buf) {
+                    Ok(_) => utf8_buf.len(),
+                    Err(error) => error.valid_up_to(),
+                };
+                if valid_up_to > 0 {
+                    let prefix: Vec<u8> = utf8_buf.drain(..valid_up_to).collect();
+                    if let Some(callback) = on_output.as_deref_mut() {
+                        callback(prefix);
+                    }
+                }
+                // Pathological tail: if the remaining bytes can't be a
+                // partial codepoint (>4 bytes — max UTF-8 codepoint
+                // length), the stream is genuinely malformed. Drop one
+                // byte at a time via lossy decode so we make progress
+                // instead of buffering forever.
+                while utf8_buf.len() > 4
+                    && std::str::from_utf8(&utf8_buf)
+                        .err()
+                        .map(|e| e.valid_up_to())
+                        == Some(0)
+                {
+                    let dropped: Vec<u8> = utf8_buf.drain(..1).collect();
+                    if let Some(callback) = on_output.as_deref_mut() {
+                        let lossy = String::from_utf8_lossy(&dropped).into_owned();
+                        callback(lossy.into_bytes());
+                    }
                 }
             }
             Err(_) => break,
@@ -472,6 +516,94 @@ mod tests {
         drain_detached_output(&mut reader, Some(&mut callback));
 
         assert_eq!(captured.lock().unwrap().as_slice(), b"hello coven");
+    }
+
+    /// `Read` adapter that yields a fixed sequence of byte slices, one per
+    /// `read` call, then EOF. Lets us drive `drain_detached_output` with
+    /// the same chunk boundaries the kernel would produce when a
+    /// multi-byte UTF-8 codepoint straddles two reads.
+    struct ChunkedReader<'a> {
+        chunks: std::collections::VecDeque<&'a [u8]>,
+    }
+
+    impl<'a> Read for ChunkedReader<'a> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.chunks.pop_front() {
+                Some(chunk) => {
+                    let n = chunk.len().min(buf.len());
+                    buf[..n].copy_from_slice(&chunk[..n]);
+                    if n < chunk.len() {
+                        self.chunks.push_front(&chunk[n..]);
+                    }
+                    Ok(n)
+                }
+                None => Ok(0),
+            }
+        }
+    }
+
+    #[test]
+    fn drain_detached_output_reassembles_codepoint_split_across_reads() {
+        // 🎉 = F0 9F 8E 89. Split across two reads so the first ends
+        // mid-codepoint. The drainer must hold the trailing bytes back
+        // until the continuation arrives instead of lossy-decoding to
+        // U+FFFD.
+        let emoji = "🎉".as_bytes();
+        let (head, tail) = emoji.split_at(2);
+        let mut reader = ChunkedReader {
+            chunks: vec![head, tail].into(),
+        };
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let captured_for_cb = captured.clone();
+        let mut callback: Box<dyn FnMut(Vec<u8>) + Send + 'static> = Box::new(move |chunk| {
+            captured_for_cb
+                .lock()
+                .unwrap()
+                .push_str(std::str::from_utf8(&chunk).expect(
+                    "drain_detached_output must only emit chunks that are themselves valid UTF-8",
+                ));
+        });
+
+        drain_detached_output(&mut reader, Some(&mut callback));
+
+        assert_eq!(
+            captured.lock().unwrap().as_str(),
+            "🎉",
+            "split codepoint must round-trip; the drain owns per-call buffer state"
+        );
+    }
+
+    #[test]
+    fn drain_detached_output_flushes_trailing_partial_codepoint_on_eof() {
+        // A read that delivers only the first 2 bytes of a 4-byte
+        // codepoint and then closes. The buffered tail can never
+        // complete, but it shouldn't silently disappear either — flush
+        // it through `from_utf8_lossy` so the user sees something.
+        let half = &"🎉".as_bytes()[..2];
+        let mut reader = ChunkedReader {
+            chunks: vec![half].into(),
+        };
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let captured_for_cb = captured.clone();
+        let mut callback: Box<dyn FnMut(Vec<u8>) + Send + 'static> = Box::new(move |chunk| {
+            captured_for_cb
+                .lock()
+                .unwrap()
+                .push_str(&String::from_utf8_lossy(&chunk));
+        });
+
+        drain_detached_output(&mut reader, Some(&mut callback));
+
+        let final_text = captured.lock().unwrap().clone();
+        assert!(
+            !final_text.is_empty(),
+            "EOF with a partial codepoint must flush, not drop the bytes"
+        );
+        assert!(
+            final_text.contains('\u{FFFD}'),
+            "the flushed bytes are unrecoverable; expected U+FFFD replacement, got: {final_text:?}"
+        );
     }
 
     #[test]
