@@ -719,6 +719,10 @@ pub fn serve_forever(
         let tcp_home = coven_home.to_path_buf();
         let tcp_status = status.clone();
         let tcp_runtime = Arc::clone(&runtime);
+        // TCP accept errors are logged and the loop continues — misbehaving
+        // network clients should not bring down the daemon. The Unix loop
+        // below treats accept errors as fatal because they indicate local
+        // system trouble.
         std::thread::Builder::new()
             .name("coven-tcp-api".into())
             .spawn(move || loop {
@@ -729,6 +733,7 @@ pub fn serve_forever(
                     tcp_runtime.as_ref(),
                 ) {
                     eprintln!("coven daemon: TCP connection error: {error:#}");
+                    std::thread::sleep(std::time::Duration::from_millis(100));
                 }
             })
             .context("failed to spawn TCP API thread")?;
