@@ -1398,13 +1398,30 @@ impl App {
                     // control — it can contain ANSI escapes or other
                     // control codes that would corrupt the TUI render.
                     // Run it through `clean_terminal_output` to strip
-                    // those before pushing to the transcript.
+                    // those before pushing to the transcript. We also
+                    // pipe stderr text through `maybe_clear_stale_conversation_id`
+                    // here (instead of the broad chunk-level check in
+                    // `push_event_message`) so stale-id auto-retry
+                    // never fires off assistant prose that happens to
+                    // quote the error phrase.
                     let subtype = value
                         .get("subtype")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("");
                     if subtype == "stderr" {
                         if let Some(text) = value.get("text").and_then(serde_json::Value::as_str) {
+                            self.maybe_clear_stale_conversation_id(text);
+                            // If the stale handler just suppressed this
+                            // session, skip rendering the raw stderr
+                            // line — the auto-retry's "Prior X
+                            // conversation no longer exists. Starting a
+                            // new one and re-sending your message."
+                            // system message tells the user what they
+                            // need to know, and the raw harness error
+                            // would just be noise after it.
+                            if self.suppressed_session_ids.contains(session_id) {
+                                continue;
+                            }
                             if let Some(safe) = clean_terminal_output(text) {
                                 let trimmed = safe.trim_end_matches('\n');
                                 if !trimmed.is_empty() {
@@ -1436,21 +1453,33 @@ impl App {
             "output" => {
                 if let Some(data) = event_payload_text(event, "data") {
                     self.maybe_capture_codex_session_id(&data);
-                    self.maybe_clear_stale_conversation_id(&data);
+                    // Stale-id detection is scoped per-mode to avoid
+                    // false-positive auto-retries on assistant text
+                    // that happens to quote the error phrase. Stream
+                    // mode runs stale checks ONLY against the stderr
+                    // text inside `{"type":"system","subtype":"stderr"}`
+                    // envelopes (see `dispatch_stream_json_output`); we
+                    // skip the broad text match here. PTY mode (NonInteractive
+                    // codex / fallback claude) doesn't have a JSON
+                    // structure to lean on, so we still run the broad
+                    // match on the raw chunk.
+                    let is_stream = self
+                        .harness_stream_session_ids
+                        .values()
+                        .any(|id| id == &event.session_id);
+                    if !is_stream {
+                        self.maybe_clear_stale_conversation_id(&data);
+                    }
                     // The stale handler may have just suppressed this very
                     // session; if so, skip displaying this chunk too.
                     if self.suppressed_session_ids.contains(&event.session_id) {
                         return;
                     }
-                    // Stream-mode output is newline-delimited JSON. Parse
-                    // assistant text directly out of it instead of feeding
-                    // it through the text/ANSI cleaner meant for PTY
-                    // sessions.
-                    let is_stream = self
-                        .harness_stream_session_ids
-                        .values()
-                        .any(|id| id == &event.session_id);
                     if is_stream {
+                        // Stream-mode output is newline-delimited JSON.
+                        // dispatch_stream_json_output extracts assistant
+                        // text from envelopes AND scopes stale detection
+                        // to system/stderr text only.
                         self.dispatch_stream_json_output(&event.session_id, &data);
                         return;
                     }
@@ -1895,20 +1924,15 @@ fn harness_supports_chat_resume(harness: &str) -> bool {
 /// pattern-match on their distinctive error wording. See
 /// `docs/chat-persistence.md` under "stale-id auto-recovery".
 ///
-/// The match is intentionally a broad `contains` rather than a strict
-/// per-line / per-envelope check because the same phrase appears in both
-/// the PTY mode (NonInteractive) plain-text output and the Stream mode
-/// stderr envelope (`{"type":"system","subtype":"stderr","text":"…"}`),
-/// and a single regex needs to handle both. The phrases ("No conversation
-/// found with session ID", "no rollout found for thread id",
-/// "thread/resume failed") are distinctive enough that the realistic
-/// false-positive surface is narrow: a model reply that literally quotes
-/// the phrase — e.g. "The error you saw was 'No conversation found…'" —
-/// would auto-drop the conversation id and trigger an auto-retry. If
-/// that becomes a real annoyance, the right fix is splitting detection
-/// into a per-stream-mode JSON path (look at `system/stderr` text only)
-/// and a per-PTY-mode line path, instead of one regex that's also asked
-/// to match assistant prose.
+/// The match is a broad `contains` because callers scope the input
+/// before passing it in. For Stream mode `push_event_message` skips the
+/// broad check and `dispatch_stream_json_output` calls this only with
+/// the unwrapped `text` of `system/stderr` envelopes, so assistant
+/// prose can never trip it. For PTY mode (NonInteractive codex / fallback
+/// claude) we still match the whole stdout chunk because there's no
+/// JSON structure to lean on; the realistic risk there is a turn-1
+/// codex error message that quotes the phrase, which is acceptable
+/// given codex's stale error is also turn-1-only.
 fn detect_stale_session(harness: &str, data: &str) -> bool {
     match harness {
         "claude" => data.contains("No conversation found with session ID"),
@@ -2306,6 +2330,21 @@ mod tests {
             payload_json: serde_json::json!({ "data": data }).to_string(),
             created_at: "2026-05-19T00:00:00Z".to_string(),
         }
+    }
+
+    /// Build a stream-json `{"type":"system","subtype":"stderr","text":...}\n`
+    /// envelope, the wire format the daemon emits for piped-child stderr
+    /// lines. Stale-id detection in stream-mode runs ONLY against the
+    /// unwrapped `text` of these envelopes (not against assistant
+    /// content), so stale tests must use this helper when simulating a
+    /// stream session.
+    fn stale_stderr_chunk(text: &str) -> String {
+        let envelope = serde_json::json!({
+            "type": "system",
+            "subtype": "stderr",
+            "text": text,
+        });
+        format!("{envelope}\n")
     }
 
     #[test]
@@ -3247,7 +3286,9 @@ mod tests {
         app.push_event_message(&output_event(
             1,
             &session_id,
-            &format!("No conversation found with session ID: {stored_id}\n"),
+            &stale_stderr_chunk(&format!(
+                "No conversation found with session ID: {stored_id}"
+            )),
         ));
 
         // Stale id must be gone — but auto-retry should have created a
@@ -3307,7 +3348,9 @@ mod tests {
         app.push_event_message(&output_event(
             1,
             &failed_session,
-            &format!("No conversation found with session ID: {stored_id}\n"),
+            &stale_stderr_chunk(&format!(
+                "No conversation found with session ID: {stored_id}"
+            )),
         ));
         // A trailing chunk from the same failed session (ANSI cleanup, etc.).
         app.push_event_message(&output_event(
@@ -3372,7 +3415,9 @@ mod tests {
         app.push_event_message(&output_event(
             1,
             &failed_session,
-            &format!("No conversation found with session ID: {stored_id}\n"),
+            &stale_stderr_chunk(&format!(
+                "No conversation found with session ID: {stored_id}"
+            )),
         ));
         let retry_session = app.active_session_id().expect("retry session").to_string();
         assert_ne!(retry_session, failed_session);
@@ -3434,7 +3479,9 @@ mod tests {
                 session_id: old_session_for_events.clone(),
                 kind: "output".to_string(),
                 payload_json: serde_json::json!({
-                    "data": format!("No conversation found with session ID: {stored_id_for_error}\n")
+                    "data": stale_stderr_chunk(&format!(
+                        "No conversation found with session ID: {stored_id_for_error}"
+                    ))
                 })
                 .to_string(),
                 created_at: "2026-05-19T00:00:00Z".to_string(),
@@ -3492,7 +3539,9 @@ mod tests {
         app.push_event_message(&output_event(
             1,
             &first_session,
-            &format!("No conversation found with session ID: {stored_id}\n"),
+            &stale_stderr_chunk(&format!(
+                "No conversation found with session ID: {stored_id}"
+            )),
         ));
         let after_first_retry = mirror.launched.borrow().len();
         assert_eq!(after_first_retry, 2, "first stale event triggers a retry");
@@ -3505,7 +3554,9 @@ mod tests {
         app.push_event_message(&output_event(
             2,
             &retry_session,
-            &format!("No conversation found with session ID: {retry_id}\n"),
+            &stale_stderr_chunk(&format!(
+                "No conversation found with session ID: {retry_id}"
+            )),
         ));
         assert_eq!(
             mirror.launched.borrow().len(),

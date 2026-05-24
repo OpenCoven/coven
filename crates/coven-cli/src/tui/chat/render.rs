@@ -950,6 +950,14 @@ enum SessionOverlayEntry<'a> {
 /// daemon-listed sessions in `created_at DESC` order, so the first per
 /// conversation is the most recent turn). Sessions without a
 /// `conversation_id` pass through as singletons.
+///
+/// Runs in O(N) over `sessions` with two passes (counts + entries). Called
+/// from `render_session_overlay` per frame while the overlay is open, so
+/// the realistic cost ceiling is N×<200 (a few hundred sessions on a
+/// busy user's machine) × ~10 frames/sec — sub-millisecond per render.
+/// If `app.sessions` ever grows past O(thousands), move this behind a
+/// cache that invalidates on `refresh_sessions` instead of recomputing
+/// per frame.
 fn collapse_sessions_by_conversation(
     sessions: &[crate::store::SessionRecord],
 ) -> Vec<SessionOverlayEntry<'_>> {

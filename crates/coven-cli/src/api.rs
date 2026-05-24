@@ -290,8 +290,18 @@ fn launch_session(
     };
     store::insert_session(&conn, &record)?;
     if let Err(error) = runtime.launch_session(&launch) {
+        // Don't propagate to the accept loop — that crashes the daemon.
+        // Runtime launch failures are user-facing (missing harness CLI,
+        // missing auth, child closed stdin during stream-mode init):
+        // mark the session row failed and return a structured response
+        // so the client surfaces the cause and the daemon stays up.
         store::update_session_status(&conn, &record.id, "failed", None, &current_timestamp())?;
-        return Err(error);
+        return api_error(
+            500,
+            "launch_failed",
+            &error.to_string(),
+            Some(json!({ "sessionId": record.id })),
+        );
     }
     json_response(201, &record)
 }
@@ -1083,7 +1093,7 @@ mod tests {
     }
 
     #[test]
-    fn launch_request_persists_failed_status_when_runtime_launch_fails() -> anyhow::Result<()> {
+    fn launch_request_runtime_failure_returns_500_and_marks_session_failed() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let project_root = temp_dir.path().join("repo");
         std::fs::create_dir_all(&project_root)?;
@@ -1095,18 +1105,29 @@ mod tests {
         })
         .to_string();
 
-        let error = handle_request_with_runtime(
+        let response = handle_request_with_runtime(
             "POST",
             "/sessions",
             temp_dir.path(),
             None,
             Some(&body),
             &runtime,
-        )
-        .unwrap_err();
+        )?;
         let sessions = handle_request("GET", "/sessions", temp_dir.path(), None)?;
 
-        assert!(error.to_string().contains("launch failed"));
+        // Must be a structured response — propagating Err would crash
+        // the daemon's accept loop.
+        assert_eq!(response.status, 500);
+        assert!(
+            response.body.contains("launch_failed"),
+            "expected structured `launch_failed` code, got: {}",
+            response.body
+        );
+        assert!(
+            response.body.contains("launch failed"),
+            "expected runtime error message in the body, got: {}",
+            response.body
+        );
         assert!(sessions.body.contains(r#""status":"failed""#));
         Ok(())
     }
