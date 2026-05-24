@@ -75,28 +75,19 @@ pub(super) fn render_ui(f: &mut Frame, app: &mut App) {
 fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let harness = app.active_agent_harness();
     let project = app.project_label();
-    let daemon_status = if app.active_session_id().is_some() {
-        "running"
-    } else {
-        "ready"
-    };
-
     let stream_label = app.streaming_mode().status_label();
     let head_text = format!(" coven {harness} ");
     let separator = "\u{00b7} ";
     let separator_padded = " \u{00b7} ";
-    let daemon_text = format!("daemon: {daemon_status}");
+    let daemon_text = format!("daemon: {}", app.daemon_status_label());
+    let mut session_text = format!("session: {}", app.active_session_label());
     let stream_text = format!("stream: {stream_label}");
     let state_text = if app.is_responding {
-        let composing = if app.has_pending_batched_output() {
-            " (composing)"
+        if app.has_pending_batched_output() {
+            format!("{} (composing)", SPINNER_FRAMES[app.spinner_frame])
         } else {
-            ""
-        };
-        format!(
-            "{} responding...{composing}",
-            SPINNER_FRAMES[app.spinner_frame]
-        )
+            format!("{} responding", SPINNER_FRAMES[app.spinner_frame])
+        }
     } else {
         "\u{2713} ready".to_string()
     };
@@ -104,12 +95,29 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     // Compute the project-label budget from what the rest of the row actually
     // needs, so the rightmost segment never clips when daemon: running and the
     // batched "(composing)" suffix push the tail wider than usual.
-    let fixed_width = UnicodeWidthStr::width(head_text.as_str())
+    let mut fixed_width = UnicodeWidthStr::width(head_text.as_str())
         + UnicodeWidthStr::width(separator)
-        + UnicodeWidthStr::width(separator_padded) * 3
+        + UnicodeWidthStr::width(separator_padded) * 4
         + UnicodeWidthStr::width(daemon_text.as_str())
+        + UnicodeWidthStr::width(session_text.as_str())
         + UnicodeWidthStr::width(stream_text.as_str())
         + UnicodeWidthStr::width(state_text.as_str());
+    if fixed_width > area.width as usize && app.active_session_id().is_some() {
+        session_text = format!(
+            "session: {}",
+            app.active_session_label()
+                .chars()
+                .take(4)
+                .collect::<String>()
+        );
+        fixed_width = UnicodeWidthStr::width(head_text.as_str())
+            + UnicodeWidthStr::width(separator)
+            + UnicodeWidthStr::width(separator_padded) * 4
+            + UnicodeWidthStr::width(daemon_text.as_str())
+            + UnicodeWidthStr::width(session_text.as_str())
+            + UnicodeWidthStr::width(stream_text.as_str())
+            + UnicodeWidthStr::width(state_text.as_str());
+    }
     let project_budget = (area.width as usize).saturating_sub(fixed_width);
     let project_text = truncate_for_width(project, project_budget);
 
@@ -125,6 +133,8 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(project_text, theme::ratatui_style(DIM)),
         Span::styled(separator_padded, theme::ratatui_style(DIM)),
         Span::styled(daemon_text, theme::ratatui_style(DIM)),
+        Span::styled(separator_padded, theme::ratatui_style(DIM)),
+        Span::styled(session_text, theme::ratatui_style(DIM)),
         Span::styled(separator_padded, theme::ratatui_style(DIM)),
         Span::styled(stream_text, theme::ratatui_style(DIM)),
         Span::styled(separator_padded, theme::ratatui_style(DIM)),
@@ -678,8 +688,8 @@ fn hint_bar_spans<'a>(app: &App) -> Vec<Span<'a>> {
 
 fn render_help_overlay(f: &mut Frame, area: Rect) {
     let overlay_width = 60u16.min(area.width.saturating_sub(4));
-    // Fits Basics(5) + Agents(2) + Sessions(4) + Output(3) + Keys(6) +
-    // Advanced(4) plus section headers and separators. Clamps to the
+    // Fits Basics(5) + Agents(2) + System(2) + Sessions(4) + Output(3) +
+    // Keys(6) plus section headers and separators. Clamps to the
     // terminal so very short windows still render something useful even if
     // the bottom rows clip.
     let overlay_height = 34u16.min(area.height.saturating_sub(4));
@@ -708,6 +718,13 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
             ],
         ),
         (
+            "System",
+            vec![
+                ("/doctor", "Show setup checks inline"),
+                ("/daemon", "Show daemon status inline"),
+            ],
+        ),
+        (
             "Sessions",
             vec![
                 ("/sessions", "Open daemon session overlay"),
@@ -733,15 +750,6 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
                 ("Ctrl+C", "Cancel; press twice within 2s to exit"),
                 ("Ctrl+L", "Clear the visible transcript"),
                 ("Ctrl+D", "Exit Coven chat"),
-            ],
-        ),
-        (
-            "Advanced",
-            vec![
-                ("/delegate <a> <t>", "Queue task for agent (coming soon)"),
-                ("/trace", "Show execution trace (coming soon)"),
-                ("/mem <query>", "Search agent memory (coming soon)"),
-                ("/debug", "Toggle debug mode (coming soon)"),
             ],
         ),
     ];

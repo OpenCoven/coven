@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::{
-    harness, store,
+    harness, project, store,
     tui::cast::{
         self, build_plan, parse_spell,
         plan::{CastHarnessSource, CastPlan},
@@ -14,7 +14,9 @@ use crate::{
     },
 };
 
-use super::client::{coven_home_dir, ChatClient, ChatEventQuery, DaemonChatClient, LaunchRequest};
+use super::client::{
+    coven_home_dir, ChatClient, ChatDaemonStatus, ChatEventQuery, DaemonChatClient, LaunchRequest,
+};
 use super::settings::{self, ChatSettings, StreamingMode};
 
 // ── Data types ─────────────────────────────────────────────────────────────
@@ -86,6 +88,7 @@ pub(super) struct App {
     event_poll_failure_streak: u32,
     last_event_poll_error: Option<String>,
     event_poll_paused_for_api_mismatch: bool,
+    daemon_status: ChatDaemonStatus,
     pub(super) sessions: Vec<store::SessionRecord>,
     pub(super) show_session_overlay: bool,
     pub(super) input_history: Vec<String>,
@@ -142,6 +145,14 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
         summary: "Switch agent (no arg = picker)",
     },
     SlashCommand {
+        name: "/doctor",
+        summary: "Show setup checks inline",
+    },
+    SlashCommand {
+        name: "/daemon",
+        summary: "Show daemon status inline",
+    },
+    SlashCommand {
         name: "/sessions",
         summary: "Open the daemon session overlay",
     },
@@ -190,13 +201,19 @@ impl App {
     pub(super) fn new_with_state(
         agents: Vec<AgentInfo>,
         active_agent: Option<usize>,
-        client: Box<dyn ChatClient>,
+        mut client: Box<dyn ChatClient>,
         coven_home: Option<PathBuf>,
     ) -> Self {
         let streaming_mode = coven_home
             .as_deref()
             .map(|home| settings::load_from(home).streaming)
             .unwrap_or_default();
+        let daemon_status =
+            client
+                .daemon_status()
+                .unwrap_or_else(|error| ChatDaemonStatus::Unavailable {
+                    message: error.to_string(),
+                });
         let mut app = App {
             messages: Vec::new(),
             input: String::new(),
@@ -217,6 +234,7 @@ impl App {
             event_poll_failure_streak: 0,
             last_event_poll_error: None,
             event_poll_paused_for_api_mismatch: false,
+            daemon_status,
             sessions: Vec::new(),
             show_session_overlay: false,
             input_history: Vec::new(),
@@ -376,6 +394,33 @@ impl App {
         self.active_session_id.as_deref()
     }
 
+    pub(super) fn daemon_status_label(&self) -> &'static str {
+        match self.daemon_status {
+            ChatDaemonStatus::Running { .. } => "running",
+            ChatDaemonStatus::Stale { .. } => "stale",
+            ChatDaemonStatus::Stopped => "stopped",
+            ChatDaemonStatus::ApiMismatch { .. } => "mismatch",
+            ChatDaemonStatus::Unavailable { .. } => "unavailable",
+        }
+    }
+
+    pub(super) fn active_session_label(&self) -> String {
+        self.active_session_id
+            .as_deref()
+            .map(short_session_id)
+            .unwrap_or_else(|| "none".to_string())
+    }
+
+    fn refresh_daemon_status(&mut self) -> ChatDaemonStatus {
+        self.daemon_status =
+            self.client
+                .daemon_status()
+                .unwrap_or_else(|error| ChatDaemonStatus::Unavailable {
+                    message: error.to_string(),
+                });
+        self.daemon_status.clone()
+    }
+
     pub(super) fn handle_input(&mut self) -> Option<SlashCommandResult> {
         let raw = self.input.trim().to_string();
         self.input.clear();
@@ -492,32 +537,6 @@ impl App {
                 self.show_help = !self.show_help;
                 SlashCommandResult::Handled
             }
-            "/delegate" => {
-                if arg.is_empty() {
-                    self.push_system_message("Usage: /delegate <agent> <task>");
-                } else {
-                    self.push_system_message(&format!("Delegating: {arg} (coming soon)"));
-                }
-                SlashCommandResult::Handled
-            }
-            "/trace" => {
-                self.push_system_message("Trace display coming soon.");
-                SlashCommandResult::Handled
-            }
-            "/mem" => {
-                if arg.is_empty() {
-                    self.push_system_message("Usage: /mem <query>");
-                } else {
-                    self.push_system_message(&format!(
-                        "Searching agent memory for \"{arg}\"... (coming soon)"
-                    ));
-                }
-                SlashCommandResult::Handled
-            }
-            "/debug" => {
-                self.push_system_message("Debug mode coming soon.");
-                SlashCommandResult::Handled
-            }
             "/stream" | "/streaming" => {
                 let new_mode = match arg.to_ascii_lowercase().as_str() {
                     "" | "toggle" => self.streaming_mode.toggled(),
@@ -609,10 +628,8 @@ impl App {
             CastIntent::ArchiveSession { session_id } => self.archive_session(&session_id),
             CastIntent::KillSession { session_id } => self.kill_session(&session_id),
             CastIntent::SacrificeSession { session_id } => self.sacrifice_session(&session_id),
-            CastIntent::Doctor => self.push_system_message("Run `coven doctor` for setup checks."),
-            CastIntent::DaemonStatus => {
-                self.push_system_message("Run `coven daemon status` to inspect the local daemon.")
-            }
+            CastIntent::Doctor => self.push_doctor_summary(),
+            CastIntent::DaemonStatus => self.push_daemon_status_summary(),
             CastIntent::Help => self.show_help = true,
             CastIntent::StartHere | CastIntent::OpenTui => {
                 self.show_help = true;
@@ -845,6 +862,52 @@ impl App {
             Ok(sessions) => self.sessions = sessions,
             Err(error) => self.push_system_message(&format!("Failed to load sessions: {error}")),
         }
+    }
+
+    fn push_doctor_summary(&mut self) {
+        let project = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| project::canonical_project_root(&cwd).ok())
+            .map(|root| root.display().to_string())
+            .unwrap_or_else(|| "not inside a git/project root yet".to_string());
+        let harnesses = harness::built_in_harnesses();
+        let mut lines = vec![
+            "Doctor".to_string(),
+            format!("  Store    {}", coven_home_dir().display()),
+            format!("  Project  {project}"),
+            "  Harnesses".to_string(),
+        ];
+        for harness in &harnesses {
+            let status = if harness.available {
+                "ready"
+            } else {
+                "missing"
+            };
+            lines.push(format!(
+                "    {:<11} `{}` is {status}",
+                harness.label, harness.executable
+            ));
+        }
+        let next = harnesses
+            .iter()
+            .find(|harness| harness.id == "codex" && harness.available)
+            .or_else(|| harnesses.iter().find(|harness| harness.available))
+            .map(|harness| {
+                format!(
+                    "  Next     coven run {} \"explain this repo in 5 bullets\"",
+                    harness.id
+                )
+            })
+            .unwrap_or_else(|| {
+                "  Next     install or authenticate a supported harness".to_string()
+            });
+        lines.push(next);
+        self.push_system_message(&lines.join("\n"));
+    }
+
+    fn push_daemon_status_summary(&mut self) {
+        let status = self.refresh_daemon_status();
+        self.push_system_message(&format_daemon_status_for_chat(&status));
     }
 
     pub(super) fn poll_session_events(&mut self) {
@@ -1307,13 +1370,14 @@ fn is_chat_local_slash(input: &str) -> bool {
             | "/exit"
             | "/quit"
             | "/q"
-            | "/delegate"
-            | "/trace"
-            | "/mem"
-            | "/debug"
             | "/stream"
             | "/streaming"
     )
+}
+
+fn short_session_id(session_id: &str) -> String {
+    const SHORT_ID_LEN: usize = 8;
+    session_id.chars().take(SHORT_ID_LEN).collect()
 }
 
 fn should_keep_launch_inline(plan: &CastPlan) -> bool {
@@ -1361,6 +1425,26 @@ fn format_cast_plan_for_chat(plan: &CastPlan) -> String {
 
 fn format_cast_outcome_for_chat(harness_label: &str, session_id: &str) -> String {
     format!("Cast outcome\n  launched  {harness_label} daemon session\n  session  {session_id}")
+}
+
+fn format_daemon_status_for_chat(status: &ChatDaemonStatus) -> String {
+    match status {
+        ChatDaemonStatus::Running { pid } => {
+            format!("Daemon status\n  status  running\n  pid     {pid}")
+        }
+        ChatDaemonStatus::Stale { pid } => {
+            format!("Daemon status\n  status  stale\n  pid     {pid}\n  next    coven daemon restart")
+        }
+        ChatDaemonStatus::Stopped => {
+            "Daemon status\n  status  stopped\n  next    coven daemon start".to_string()
+        }
+        ChatDaemonStatus::ApiMismatch { expected, actual } => format!(
+            "Daemon status\n  status  mismatch\n  expect  {expected}\n  actual  {actual}\n  next    coven daemon restart"
+        ),
+        ChatDaemonStatus::Unavailable { message } => format!(
+            "Daemon status\n  status  unavailable\n  error   {message}\n  next    coven daemon restart"
+        ),
+    }
 }
 
 fn event_payload_text(event: &store::EventRecord, field: &str) -> Option<String> {
@@ -1495,7 +1579,7 @@ where
 mod tests {
     use super::*;
     use crate::store::{EventRecord, SessionRecord};
-    use crate::tui::chat::client::{ChatClient, ChatEventQuery, LaunchRequest};
+    use crate::tui::chat::client::{ChatClient, ChatDaemonStatus, ChatEventQuery, LaunchRequest};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -1524,6 +1608,7 @@ mod tests {
         launched: Rc<RefCell<Vec<LaunchRequest>>>,
         sessions: Rc<RefCell<Vec<SessionRecord>>>,
         events: Rc<RefCell<Vec<EventRecord>>>,
+        daemon_status: Rc<RefCell<ChatDaemonStatus>>,
         event_error: Rc<RefCell<Option<String>>>,
         launch_error: Rc<RefCell<Option<String>>>,
     }
@@ -1537,6 +1622,11 @@ mod tests {
     }
 
     impl ChatClient for RecordingChatClient {
+        fn daemon_status(&mut self) -> anyhow::Result<ChatDaemonStatus> {
+            self.calls.borrow_mut().push("daemon-status".to_string());
+            Ok(self.daemon_status.borrow().clone())
+        }
+
         fn launch_session(&mut self, request: LaunchRequest) -> anyhow::Result<SessionRecord> {
             self.calls.borrow_mut().push("launch".to_string());
             self.launched.borrow_mut().push(request.clone());
@@ -1641,6 +1731,16 @@ mod tests {
         (app, mirror)
     }
 
+    fn render_app_plain(app: &mut App, width: u16, height: u16) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| crate::tui::chat::render::render_ui(frame, app))
+            .unwrap();
+        crate::tui::chat::render::buffer_to_plain_text(terminal.backend().buffer())
+    }
+
     fn test_session(id: &str, harness: &str, title: &str, status: &str) -> SessionRecord {
         SessionRecord {
             id: id.to_string(),
@@ -1674,6 +1774,105 @@ mod tests {
             SlashCommandResult::Unknown(command) => assert_eq!(command, "/unknown"),
             other => panic!("expected unknown command result, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn status_bar_uses_daemon_health_and_session_state() {
+        let client = RecordingChatClient::default();
+        *client.daemon_status.borrow_mut() = ChatDaemonStatus::Running { pid: 4242 };
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("1234567890abcdef".to_string());
+
+        let frame = render_app_plain(&mut app, 100, 10);
+
+        assert!(
+            frame.contains("daemon: running"),
+            "status row should use daemon health, not active-session inference:\n{frame}"
+        );
+        assert!(
+            frame.contains("session: 12345678"),
+            "status row should show compact active session id:\n{frame}"
+        );
+    }
+
+    #[test]
+    fn help_and_slash_palette_hide_unimplemented_commands() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.input = "/".to_string();
+        app.cursor_pos = app.input.len();
+
+        let suggestions = app
+            .slash_suggestions()
+            .into_iter()
+            .map(|command| command.name)
+            .collect::<Vec<_>>();
+        for command in ["/delegate", "/trace", "/mem", "/debug"] {
+            assert!(
+                !suggestions.contains(&command),
+                "{command} should stay hidden until it performs real work"
+            );
+        }
+
+        app.show_help = true;
+        let frame = render_app_plain(&mut app, 90, 36);
+        assert!(
+            !frame.contains("coming soon"),
+            "dead commands leaked:\n{frame}"
+        );
+        assert!(
+            !frame.contains("/delegate"),
+            "dead command leaked:\n{frame}"
+        );
+        assert!(!frame.contains("/trace"), "dead command leaked:\n{frame}");
+        assert!(!frame.contains("/mem"), "dead command leaked:\n{frame}");
+        assert!(!frame.contains("/debug"), "dead command leaked:\n{frame}");
+    }
+
+    #[test]
+    fn doctor_command_appends_inline_harness_summary() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.input = "/doctor".to_string();
+
+        app.handle_input();
+
+        let transcript = app
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(transcript.contains("Doctor"));
+        assert!(transcript.contains("Harnesses"));
+        assert!(
+            !transcript.contains("Run `coven doctor`"),
+            "doctor should run inline, not hand the user back to the shell:\n{transcript}"
+        );
+    }
+
+    #[test]
+    fn daemon_command_appends_inline_status_summary() {
+        let client = RecordingChatClient::default();
+        *client.daemon_status.borrow_mut() = ChatDaemonStatus::Stale { pid: 99 };
+        let (mut app, mirror) = app_with_client(client);
+        app.input = "/daemon".to_string();
+
+        app.handle_input();
+
+        let transcript = app
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(mirror.calls.borrow().contains(&"daemon-status".to_string()));
+        assert!(transcript.contains("Daemon status"));
+        assert!(transcript.contains("stale"));
+        assert!(
+            !transcript.contains("Run `coven daemon status`"),
+            "daemon status should render inline, not hand the user back to the shell:\n{transcript}"
+        );
     }
 
     #[test]

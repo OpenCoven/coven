@@ -222,7 +222,7 @@ fn parse_payload(payload_json: &str) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::chat::client::LaunchRequest;
+    use crate::tui::chat::client::{ChatDaemonStatus, LaunchRequest};
     use std::cell::RefCell;
 
     /// Stub client that returns canned event batches in order. The first
@@ -244,6 +244,10 @@ mod tests {
     }
 
     impl ChatClient for StubClient {
+        fn daemon_status(&mut self) -> Result<ChatDaemonStatus> {
+            unimplemented!("not exercised in follower tests")
+        }
+
         fn launch_session(&mut self, _request: LaunchRequest) -> Result<store::SessionRecord> {
             unimplemented!("not exercised in follower tests")
         }

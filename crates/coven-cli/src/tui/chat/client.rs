@@ -18,6 +18,25 @@ use crate::{
     current_timestamp, daemon, harness, store, STORE_FILE_NAME,
 };
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ChatDaemonStatus {
+    Running {
+        pid: u32,
+    },
+    Stale {
+        pid: u32,
+    },
+    #[default]
+    Stopped,
+    ApiMismatch {
+        expected: String,
+        actual: String,
+    },
+    Unavailable {
+        message: String,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LaunchRequest {
     pub(crate) id: String,
@@ -53,6 +72,7 @@ pub(crate) struct ChatEventQuery<'a> {
 }
 
 pub(crate) trait ChatClient {
+    fn daemon_status(&mut self) -> Result<ChatDaemonStatus>;
     fn launch_session(&mut self, request: LaunchRequest) -> Result<store::SessionRecord>;
     fn get_session(&mut self, session_id: &str) -> Result<store::SessionRecord>;
     fn list_sessions(&mut self) -> Result<Vec<store::SessionRecord>>;
@@ -157,6 +177,39 @@ impl DaemonChatClient {
 }
 
 impl ChatClient for DaemonChatClient {
+    fn daemon_status(&mut self) -> Result<ChatDaemonStatus> {
+        match daemon::background_server_status(&self.coven_home)? {
+            Some(daemon::DaemonStatusState::Running(status)) => {
+                let response = match self.raw_request("GET", "/api/v1/health", None) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        return Ok(ChatDaemonStatus::Unavailable {
+                            message: error.to_string(),
+                        })
+                    }
+                };
+                let health: HealthResponse =
+                    serde_json::from_str(&response.body).with_context(|| {
+                        format!(
+                            "failed to parse Coven daemon response for GET /api/v1/health: {}",
+                            response.body
+                        )
+                    })?;
+                if health.api_version != COVEN_API_NAMED_VERSION {
+                    return Ok(ChatDaemonStatus::ApiMismatch {
+                        expected: COVEN_API_NAMED_VERSION.to_string(),
+                        actual: health.api_version,
+                    });
+                }
+                Ok(ChatDaemonStatus::Running { pid: status.pid })
+            }
+            Some(daemon::DaemonStatusState::Stale(status)) => {
+                Ok(ChatDaemonStatus::Stale { pid: status.pid })
+            }
+            None => Ok(ChatDaemonStatus::Stopped),
+        }
+    }
+
     fn launch_session(&mut self, request: LaunchRequest) -> Result<store::SessionRecord> {
         self.request_json(
             "POST",
