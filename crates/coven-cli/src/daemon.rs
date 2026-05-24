@@ -655,9 +655,9 @@ fn daemon_status_from_health_socket(socket: &str) -> Result<Option<DaemonStatus>
 // the TCP transport can be unit-tested in isolation; `serve_forever` wires
 // them into the daemon's accept loop in a follow-up change.
 #[allow(dead_code)]
-pub fn bind_tcp_listener(addr: &str) -> Result<TcpListener> {
-    let listener = TcpListener::bind(addr)
-        .with_context(|| format!("failed to bind Coven TCP listener at {addr}"))?;
+pub fn bind_tcp_listener<A: std::net::ToSocketAddrs>(addr: A) -> Result<TcpListener> {
+    let listener = TcpListener::bind(&addr)
+        .with_context(|| "failed to bind Coven TCP listener")?;
     Ok(listener)
 }
 
@@ -961,6 +961,9 @@ mod tests {
         });
 
         let mut client = TcpStream::connect(addr).expect("connect");
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("read timeout");
         client
             .write_all(b"GET /api/v1/health HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n")
             .expect("write request");
