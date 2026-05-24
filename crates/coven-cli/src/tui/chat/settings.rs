@@ -48,6 +48,18 @@ pub(super) fn settings_path(coven_home: &Path) -> PathBuf {
     coven_home.join("chat-settings.json")
 }
 
+fn temporary_settings_path(coven_home: &Path) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    coven_home.join(format!(
+        ".chat-settings.json.{}.{}.tmp",
+        std::process::id(),
+        nanos
+    ))
+}
+
 /// Load settings from disk, falling back to defaults on any error. The TUI
 /// uses this on startup, so an unreadable or partially-written file must not
 /// stop the chat from coming up — it just resets to defaults silently.
@@ -66,7 +78,14 @@ pub(super) fn save_to(coven_home: &Path, settings: &ChatSettings) -> std::io::Re
     std::fs::create_dir_all(coven_home)?;
     let body = serde_json::to_vec_pretty(settings)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-    std::fs::write(settings_path(coven_home), body)
+    let path = settings_path(coven_home);
+    let temp_path = temporary_settings_path(coven_home);
+    std::fs::write(&temp_path, body)?;
+    std::fs::rename(&temp_path, &path)?;
+    if let Ok(dir) = std::fs::File::open(coven_home) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -110,5 +129,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(settings_path(temp.path()), b"not json").unwrap();
         assert_eq!(load_from(temp.path()), ChatSettings::default());
+    }
+
+    #[test]
+    fn temporary_settings_path_stays_in_coven_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp_path = temporary_settings_path(temp.path());
+
+        assert_eq!(temp_path.parent(), Some(temp.path()));
+        assert_ne!(temp_path, settings_path(temp.path()));
     }
 }

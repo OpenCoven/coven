@@ -25,6 +25,9 @@
 //                         the repo has known pre-existing high-entropy hits
 //                         in committed test fixtures; CI still runs it.
 //   --keep-tempdir        Leave the temp install dir on disk for inspection.
+//   COVEN_NPM_DRY_RUN_VERSION=vX.Y.Z
+//                         Override the synthesized dry-run version when the
+//                         public npm registry cannot be reached.
 //
 // Exit code is non-zero on the first failing step.
 
@@ -211,25 +214,40 @@ step(`install wrapper + native package in a temp project (${targetName})`, () =>
 })();
 
 function synthesizeDryRunVersion(packageName) {
+  const override = process.env.COVEN_NPM_DRY_RUN_VERSION?.trim();
+  if (override) {
+    const normalized = override.replace(/^v/, '');
+    if (!/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(normalized)) {
+      fail(`COVEN_NPM_DRY_RUN_VERSION must be a semver version, got ${override}`);
+    }
+    return normalized;
+  }
+
   const view = spawnSync('npm', ['view', packageName, 'version', '--silent'], {
     stdio: ['ignore', 'pipe', 'pipe'],
     encoding: 'utf8'
   });
-  let baseMajor = 0;
-  let baseMinor = 0;
-  let basePatch = 0;
-  if (view.status === 0) {
-    const reported = view.stdout.trim();
-    const match = reported.match(/^(\d+)\.(\d+)\.(\d+)/);
-    if (match) {
-      baseMajor = Number(match[1]);
-      baseMinor = Number(match[2]);
-      basePatch = Number(match[3]);
-    }
+  if (view.status !== 0) {
+    const stderr = view.stderr.trim();
+    fail(
+      `Could not read current ${packageName} version from npm. ` +
+        'Set COVEN_NPM_DRY_RUN_VERSION to an unpublished higher semver and rerun.' +
+        (stderr ? `\nnpm stderr:\n${stderr}` : '')
+    );
+  }
+  const reported = view.stdout.trim();
+  const match = reported.match(/^(\d+)\.(\d+)\.(\d+)/);
+  if (!match) {
+    fail(
+      `Could not read current ${packageName} version from npm output: ${reported || '(empty)'}`
+    );
   }
   // Bump patch (no prerelease suffix) so `npm publish --dry-run` accepts it
   // under the implicit "latest" tag. The version is never published, but it
   // must compare higher than what's already on the registry.
+  const baseMajor = Number(match[1]);
+  const baseMinor = Number(match[2]);
+  const basePatch = Number(match[3]);
   return `${baseMajor}.${baseMinor}.${basePatch + 1}`;
 }
 

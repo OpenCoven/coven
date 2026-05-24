@@ -21,6 +21,7 @@ use super::cast::{
     QuestPhase, QuestPhaseStatus, QuestPhaseSummary, SafetyDecision, CAST_QUEST_ADVANCED_KIND,
     CAST_QUEST_COMPLETED_KIND, CAST_QUEST_PHASE_COMPLETED_KIND, CAST_QUEST_PHASE_EDITED_KIND,
     CAST_QUEST_PHASE_SKIPPED_KIND, CAST_QUEST_PHASE_STARTED_KIND, CAST_QUEST_STARTED_KIND,
+    PHASE_PROMPT_HINT,
 };
 use super::chat::client::{ChatClient, ChatEventQuery, DaemonChatClient, LaunchRequest};
 use super::{is_key_press, sessions};
@@ -584,8 +585,8 @@ fn create_local_quest_anchor(
         &id,
         CAST_QUEST_STARTED_KIND,
         &serde_json::json!({
-            "title": quest.title,
-            "goal": quest.goal,
+            "title": quest.title.clone(),
+            "goal": quest.goal.clone(),
             "harness": harness_label,
             "phases": quest.phases.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
             "synthetic": true,
@@ -648,6 +649,17 @@ fn run_quest_loop(
         print!("{}", render_quest_handoff(&quest, idx));
         println!();
 
+        if let QuestPhaseStatus::Running { session_id } = &quest.phases[idx].status {
+            return Ok(running_phase_outcome(
+                &request_text,
+                &quest,
+                anchor_session_id.clone(),
+                completed_notes,
+                idx,
+                session_id,
+            ));
+        }
+
         let mut reader = stdin_line_reader;
         match run_phase_interaction(&mut quest, idx, anchor_session_id.as_deref(), &mut reader)? {
             PhaseInteraction::Cancel { reason } => {
@@ -668,6 +680,7 @@ fn run_quest_loop(
                 let phase_name = quest.phases[idx].name.clone();
                 skip_phase(&mut quest, idx, reason.clone())?;
                 completed_notes.push(format!("Phase `{phase_name}`: skipped — {reason}"));
+                let next = quest.current_index();
                 if let Some(anchor) = anchor_session_id.as_deref() {
                     write_quest_event(
                         anchor,
@@ -676,6 +689,14 @@ fn run_quest_loop(
                             "phase": phase_name,
                             "index": idx,
                             "reason": reason,
+                        }),
+                    );
+                    write_quest_event(
+                        anchor,
+                        CAST_QUEST_ADVANCED_KIND,
+                        serde_json::json!({
+                            "from_index": idx,
+                            "next_index": next,
                         }),
                     );
                 }
@@ -727,6 +748,23 @@ fn run_quest_loop(
             GateOutcome::Proceed => {}
         }
 
+        let pre_dispatch_phase_started_written = if let Some(anchor) = anchor_session_id.as_deref()
+        {
+            write_quest_event(
+                anchor,
+                CAST_QUEST_PHASE_STARTED_KIND,
+                serde_json::json!({
+                    "phase": quest.phases[idx].name,
+                    "index": idx,
+                    "session_id": serde_json::Value::Null,
+                    "harness": phase_harness.id(),
+                }),
+            );
+            true
+        } else {
+            false
+        };
+
         let phase_outcome = dispatch_cast_launch(
             &phase_plan,
             phase_harness.id(),
@@ -746,8 +784,8 @@ fn run_quest_loop(
                     sid,
                     CAST_QUEST_STARTED_KIND,
                     serde_json::json!({
-                        "title": quest.title,
-                        "goal": quest.goal,
+                        "title": quest.title.clone(),
+                        "goal": quest.goal.clone(),
                         "harness": phase_harness.id(),
                         "phases": quest
                             .phases
@@ -760,16 +798,18 @@ fn run_quest_loop(
         }
 
         if let Some(anchor) = anchor_session_id.as_deref() {
-            write_quest_event(
-                anchor,
-                CAST_QUEST_PHASE_STARTED_KIND,
-                serde_json::json!({
-                    "phase": quest.phases[idx].name,
-                    "index": idx,
-                    "session_id": phase_session_id,
-                    "harness": phase_harness.id(),
-                }),
-            );
+            if !pre_dispatch_phase_started_written {
+                write_quest_event(
+                    anchor,
+                    CAST_QUEST_PHASE_STARTED_KIND,
+                    serde_json::json!({
+                        "phase": quest.phases[idx].name,
+                        "index": idx,
+                        "session_id": phase_session_id.clone(),
+                        "harness": phase_harness.id(),
+                    }),
+                );
+            }
         }
 
         // Phase 10: explicit Pending → Running transition. The shell loop
@@ -820,7 +860,7 @@ fn run_quest_loop(
             anchor,
             CAST_QUEST_COMPLETED_KIND,
             serde_json::json!({
-                "title": quest.title,
+                "title": quest.title.clone(),
                 "phase_count": quest.phases.len(),
             }),
         );
@@ -849,11 +889,34 @@ fn resolve_phase_harness(
     phase.harness.or(default_harness)
 }
 
-/// One line of phase-prompt help, matching the handoff card's footer hint.
-/// The wording is duplicated here (the card is rendered separately) but
-/// kept short and contract-aligned per §2.6 of `cast-tui-contract.md`.
-const PHASE_PROMPT_HINT: &str =
-    "enter approve · type to replace · /skip [reason] · /cancel [reason]";
+fn running_phase_outcome(
+    request_text: &str,
+    quest: &Quest,
+    anchor_session_id: Option<String>,
+    mut completed_notes: Vec<String>,
+    idx: usize,
+    phase_session_id: &str,
+) -> CastOutcome {
+    let phase_name = &quest.phases[idx].name;
+    completed_notes.push(format!(
+        "Phase `{phase_name}` is already running in session `{phase_session_id}`."
+    ));
+    let next_step = if phase_session_id.is_empty() {
+        "Re-attach the quest anchor after checking the running phase's harness output.".to_string()
+    } else {
+        format!(
+            "Run `coven attach {phase_session_id}` to follow the running phase, then re-attach the quest anchor."
+        )
+    };
+    quest_outcome(
+        request_text,
+        quest,
+        anchor_session_id,
+        completed_notes,
+        Some(next_step),
+        Some(format!("Quest paused at running phase `{phase_name}`.")),
+    )
+}
 
 /// Drive the per-phase interaction described in
 /// `docs/design/cast-quest-flow.md` §5: render → prompt → loop on edits →
@@ -1327,6 +1390,16 @@ fn attach_via_daemon(
         maybe_spawn_cast_input_forwarder(coven_home_dir()?, session.id.clone());
     }
 
+    let replay_history = if is_live {
+        Vec::new()
+    } else {
+        client.list_events(ChatEventQuery {
+            session_id: &session.id,
+            after_seq: None,
+            limit: None,
+        })?
+    };
+
     let mut observer = TranscriptObserver::new(io::stdout());
     let exit = if is_live {
         let mut pacer = SleepPacer::new(Duration::from_millis(250));
@@ -1340,7 +1413,7 @@ fn attach_via_daemon(
         // For completed sessions, drain the historical event log once. The
         // follower observer renders the transcript exactly as it did on the
         // original run and reports the exit when it lands in the replay.
-        replay_completed_session(&mut client, &session.id, &mut observer)?
+        replay_completed_session(&replay_history, &mut observer)
     };
 
     if is_live {
@@ -1361,18 +1434,12 @@ fn attach_via_daemon(
     // a quest anchor and (Phase 9) to *resume* the quest loop at the next
     // pending phase when the user attaches mid-quest.
     if !is_live {
-        let history = client.list_events(ChatEventQuery {
-            session_id: &session.id,
-            after_seq: None,
-            limit: None,
-        })?;
-
         // Phase 9: if this session is a quest anchor with work left, hand
         // off to the resume loop. The returned outcome replaces the
         // standard attach outcome — the quest is the user's foreground
         // activity now. Completed quests fall through to the
         // detect-and-inform note that Phase 7 introduced.
-        if let Some(reconstructed) = cast::reconstruct_quest(&history) {
+        if let Some(reconstructed) = cast::reconstruct_quest(&replay_history) {
             if !reconstructed.is_complete && reconstructed.quest.current_index().is_some() {
                 println!();
                 println!(
@@ -1389,11 +1456,12 @@ fn attach_via_daemon(
             }
         }
 
-        if let Some(note) = cast::find_cast_summary(&history).and_then(|s| format_summary_note(&s))
+        if let Some(note) =
+            cast::find_cast_summary(&replay_history).and_then(|s| format_summary_note(&s))
         {
             notes.push(note);
         }
-        if let Some(note) = cast::find_cast_quest_info(&history)
+        if let Some(note) = cast::find_cast_quest_info(&replay_history)
             .and_then(|info| cast::format_quest_attach_note(&info))
         {
             notes.push(note);
@@ -1439,19 +1507,12 @@ fn attach_via_daemon(
 /// observer the live follower uses. Returns the decoded exit if the replay
 /// contains an `exit` event so the outcome card can show the original status.
 fn replay_completed_session(
-    client: &mut dyn ChatClient,
-    session_id: &str,
+    records: &[store::EventRecord],
     observer: &mut dyn FollowerObserver,
-) -> Result<Option<CastSessionExit>> {
-    let records = client.list_events(ChatEventQuery {
-        session_id,
-        after_seq: None,
-        limit: None,
-    })?;
-
+) -> Option<CastSessionExit> {
     let mut exit = None;
     for record in records {
-        let decoded = cast::follow::decode_event(&record);
+        let decoded = cast::follow::decode_event(record);
         match &decoded {
             cast::follow::CastFollowEvent::Output(chunk) => observer.on_output(chunk),
             cast::follow::CastFollowEvent::Exit { status, exit_code } => {
@@ -1464,7 +1525,7 @@ fn replay_completed_session(
             cast::follow::CastFollowEvent::Other { kind } => observer.on_other(kind),
         }
     }
-    Ok(exit)
+    exit
 }
 
 fn format_exit_summary(exit: &CastSessionExit) -> String {
@@ -1679,6 +1740,38 @@ mod quest_interaction_tests {
             }
             other => panic!("expected Cancel, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn running_phase_outcome_points_to_existing_session_instead_of_reprompting() {
+        let mut quest = quest_from_goal("polish the README", Some(CastHarness::Codex));
+        mark_phase_running(&mut quest, 0, "session-design-id".to_string()).unwrap();
+
+        let outcome = running_phase_outcome(
+            "/quest polish the README",
+            &quest,
+            Some("anchor-session-id".to_string()),
+            Vec::new(),
+            0,
+            "session-design-id",
+        );
+
+        assert_eq!(outcome.session_id.as_deref(), Some("anchor-session-id"));
+        assert!(
+            outcome
+                .next_step
+                .as_deref()
+                .unwrap_or_default()
+                .contains("coven attach session-design-id"),
+            "running phase should direct the user to the already-started session, outcome: {outcome:?}"
+        );
+        assert!(
+            outcome
+                .notes
+                .iter()
+                .any(|note| note.contains("already running in session `session-design-id`")),
+            "running phase note should explain why Cast did not prompt again, outcome: {outcome:?}"
+        );
     }
 }
 
@@ -2112,68 +2205,9 @@ pub(crate) fn render_frame_plain_for_test(selection: usize) -> String {
 
 #[cfg(test)]
 mod attach_tests {
-    use std::cell::RefCell;
     use std::io::Cursor;
 
     use super::*;
-    use crate::tui::chat::client::LaunchRequest;
-
-    /// Stub client that returns a canned event log on every `list_events` call
-    /// and records which session id was queried. Mirrors the stub in
-    /// `cast::follow` tests but kept local to shell.rs so the wiring (not the
-    /// already-tested decode pipeline) is what's under test here.
-    struct ReplayClient {
-        events: Vec<store::EventRecord>,
-        queries: RefCell<Vec<String>>,
-    }
-
-    impl ReplayClient {
-        fn new(events: Vec<store::EventRecord>) -> Self {
-            Self {
-                events,
-                queries: RefCell::new(Vec::new()),
-            }
-        }
-    }
-
-    impl ChatClient for ReplayClient {
-        fn launch_session(&mut self, _request: LaunchRequest) -> Result<store::SessionRecord> {
-            unimplemented!("not exercised by replay tests")
-        }
-
-        fn get_session(&mut self, _session_id: &str) -> Result<store::SessionRecord> {
-            unimplemented!("not exercised by replay tests")
-        }
-
-        fn list_sessions(&mut self) -> Result<Vec<store::SessionRecord>> {
-            unimplemented!("not exercised by replay tests")
-        }
-
-        fn list_events(&mut self, query: ChatEventQuery<'_>) -> Result<Vec<store::EventRecord>> {
-            self.queries.borrow_mut().push(query.session_id.to_string());
-            Ok(self.events.clone())
-        }
-
-        fn send_input(&mut self, _session_id: &str, _data: &str) -> Result<()> {
-            unimplemented!("not exercised by replay tests")
-        }
-
-        fn kill_session(&mut self, _session_id: &str) -> Result<()> {
-            unimplemented!("not exercised by replay tests")
-        }
-
-        fn archive_session(&mut self, _session_id: &str) -> Result<()> {
-            unimplemented!("not exercised by replay tests")
-        }
-
-        fn summon_session(&mut self, _session_id: &str) -> Result<store::SessionRecord> {
-            unimplemented!("not exercised by replay tests")
-        }
-
-        fn sacrifice_session(&mut self, _session_id: &str) -> Result<()> {
-            unimplemented!("not exercised by replay tests")
-        }
-    }
 
     fn output_event(seq: i64, data: &str) -> store::EventRecord {
         store::EventRecord {
@@ -2209,16 +2243,15 @@ mod attach_tests {
 
     #[test]
     fn replay_completed_session_streams_full_transcript_into_observer() {
-        let mut client = ReplayClient::new(vec![
+        let records = vec![
             output_event(1, "hello\n"),
             output_event(2, "world\n"),
             exit_event(3, "completed", Some(0)),
-        ]);
+        ];
         let mut buffer: Cursor<Vec<u8>> = Cursor::new(Vec::new());
         let mut observer = TranscriptObserver::new(&mut buffer);
 
-        let exit =
-            replay_completed_session(&mut client, "session-1", &mut observer).expect("replay");
+        let exit = replay_completed_session(&records, &mut observer);
 
         let rendered = String::from_utf8(buffer.into_inner()).unwrap();
         assert!(
@@ -2237,23 +2270,18 @@ mod attach_tests {
         let exit = exit.expect("replay should surface the recorded exit");
         assert_eq!(exit.status, "completed");
         assert_eq!(exit.exit_code, Some(0));
-
-        let queries = client.queries.borrow();
-        assert_eq!(queries.len(), 1, "one full-history fetch is enough");
-        assert_eq!(queries[0], "session-1");
     }
 
     #[test]
     fn replay_completed_session_returns_none_when_no_exit_event_in_log() {
-        let mut client = ReplayClient::new(vec![
+        let records = vec![
             output_event(1, "still going\n"),
             output_event(2, "no exit yet\n"),
-        ]);
+        ];
         let mut buffer: Cursor<Vec<u8>> = Cursor::new(Vec::new());
         let mut observer = TranscriptObserver::new(&mut buffer);
 
-        let exit =
-            replay_completed_session(&mut client, "session-1", &mut observer).expect("replay");
+        let exit = replay_completed_session(&records, &mut observer);
 
         assert!(
             exit.is_none(),

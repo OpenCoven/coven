@@ -13,7 +13,7 @@ A system where agents, tools, and workflows converge under intentional orchestra
 
 OpenCoven is an open ecosystem for persistent AI familiars: named agents with memory, tools, identity, roles, and continuity. It moves AI beyond disposable chat sessions and toward durable, personal, intelligible systems that people can own, customize, and collaborate with over time.
 
-The value should be instantly clear: OpenCoven turns AI from a blank chatbox into a living workspace of agents that remember, coordinate, and belong to the user.
+The value should be instantly clear: OpenCoven turns AI from a blank chatbox into a living workspace of agents that remember, coordinate, and belong to you.
 
 ### Vision
 Most AI today feels temporary: a user opens a chat, explains context, gets a response, and starts over. OpenCoven is built around a different future: AI that can stay.

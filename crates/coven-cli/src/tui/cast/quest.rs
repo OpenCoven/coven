@@ -16,11 +16,9 @@
 //!
 //! Integration boundary: this module is pure. The Cast shell wires the
 //! quest into its existing gate / follow / outcome surfaces; `quest.rs`
-//! does no IO and never reaches the daemon directly. Phase 7 lands the
-//! shell wiring, so the module is no longer dead — but `skip_phase`,
-//! `set_phase_sub_prompt`, and `compose_sub_prompt` remain reachable only
-//! through future UX (edit / skip prompts deferred per the Phase 7 scope
-//! decision). Their `#[allow(dead_code)]` annotations document that.
+//! does no IO and never reaches the daemon directly. The approve / edit /
+//! skip / cancel UX lives in the shell; this module owns the deterministic
+//! state transitions and parser that keep the event ledger replayable.
 
 use anyhow::{anyhow, Result};
 
@@ -37,6 +35,11 @@ pub(crate) const CAST_QUEST_PHASE_SKIPPED_KIND: &str = "cast.quest.phase_skipped
 pub(crate) const CAST_QUEST_PHASE_EDITED_KIND: &str = "cast.quest.phase_edited";
 pub(crate) const CAST_QUEST_ADVANCED_KIND: &str = "cast.quest.advanced";
 pub(crate) const CAST_QUEST_COMPLETED_KIND: &str = "cast.quest.completed";
+
+/// One line of phase-prompt help, shared by the handoff card and shell
+/// prompt so the rendered contract and accepted commands cannot drift.
+pub(crate) const PHASE_PROMPT_HINT: &str =
+    "enter approve · type to replace · /skip [reason] · /cancel [reason]";
 
 /// A sequential goal Cast is guiding the user through. Owns the original
 /// user request and an ordered list of [`QuestPhase`]s. `cursor` points at
@@ -68,16 +71,13 @@ pub(crate) struct QuestPhase {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum QuestPhaseStatus {
     Pending,
-    /// Reserved for a future "live attach to a running quest phase" UX —
-    /// the shell loop in Phase 7 transitions Pending → Complete directly.
-    #[allow(dead_code)]
+    /// The phase launched and has not recorded a completion event yet.
+    /// Replay uses this to pause instead of re-prompting or re-launching.
     Running {
         session_id: String,
     },
     Complete(QuestPhaseSummary),
-    /// Set by `skip_phase` (currently only exercised by tests; the
-    /// auto-advance loop never skips on its own).
-    #[allow(dead_code)]
+    /// Set by `skip_phase` when the user explicitly skips a phase.
     Skipped {
         reason: String,
     },
@@ -271,9 +271,6 @@ pub(crate) fn advance(quest: &mut Quest, summary: QuestPhaseSummary) -> Option<u
 /// text. Errors out if the phase is not pending — Cast does not rewrite
 /// already-running or completed phases.
 ///
-/// Reserved for the edit-sub-prompt UX deferred per Phase 7's scope
-/// decision; currently only the in-module test suite calls it.
-#[allow(dead_code)]
 pub(crate) fn set_phase_sub_prompt(
     quest: &mut Quest,
     index: usize,
@@ -326,9 +323,6 @@ pub(crate) fn mark_phase_running(
 /// phase already satisfied this phase's goal (e.g. tests passed during
 /// implement, so verify becomes a no-op).
 ///
-/// Reserved for the skip-phase UX deferred per Phase 7's scope decision;
-/// currently only the in-module test suite calls it.
-#[allow(dead_code)]
 pub(crate) fn skip_phase(quest: &mut Quest, index: usize, reason: String) -> Result<()> {
     let phase = quest
         .phases

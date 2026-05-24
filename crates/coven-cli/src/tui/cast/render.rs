@@ -11,7 +11,7 @@ use crate::theme::{self, fit_chars, palette_for, Fg, Palette, TerminalMode};
 
 use super::outcome::CastOutcome;
 use super::plan::{CastHarnessSource, CastPlan, CastStepKind};
-use super::quest::{Quest, QuestPhase, QuestPhaseStatus};
+use super::quest::{Quest, QuestPhase, QuestPhaseStatus, PHASE_PROMPT_HINT};
 use super::safety::{CastRisk, SafetyDecision};
 
 const CAST_INTRO_INNER_WIDTH: usize = 76;
@@ -314,9 +314,7 @@ fn quest_phase_position_label(quest: &Quest, next_index: usize) -> String {
 
 fn quest_handoff_footer_hint(next: &QuestPhase) -> &'static str {
     match &next.status {
-        QuestPhaseStatus::Pending => {
-            "enter approve · type to replace · /skip [reason] · /cancel [reason]"
-        }
+        QuestPhaseStatus::Pending => PHASE_PROMPT_HINT,
         QuestPhaseStatus::Running { .. } => "phase running · attach to follow",
         QuestPhaseStatus::Complete(_) => "phase already complete · advance again",
         QuestPhaseStatus::Skipped { .. } => "phase skipped · advance to continue",
@@ -388,6 +386,8 @@ fn push_section_header(frame: &mut String, p: &Palette, title: &str) {
 /// whole frame.
 fn push_label_row(frame: &mut String, p: &Palette, label: &str, value: &str) {
     let label_block = format!("{:<width$}", label, width = LABEL_COLUMN_WIDTH);
+    let value_width = CAST_INTRO_INNER_WIDTH.saturating_sub(LABEL_COLUMN_WIDTH + 2);
+    let value = fit_chars(value, value_width);
     frame.push_str(&format!(
         "{}{}{}  {}{}{}\n",
         p.field_label, label_block, p.reset, p.text, value, p.reset
@@ -499,6 +499,31 @@ mod tests {
         let frame = render_cast_frame_plain(None, None);
         assert!(frame.contains("not inside a project root"));
         assert!(frame.contains("coven doctor"));
+    }
+
+    #[test]
+    fn label_rows_truncate_long_values_to_card_width() {
+        let long_project = PathBuf::from(format!("/tmp/{}", "very-long-segment/".repeat(16)));
+        let frame = render_cast_frame_plain(Some(&long_project), Some("codex"));
+        let full_project = long_project.display().to_string();
+        let value_width = CAST_INTRO_INNER_WIDTH - LABEL_COLUMN_WIDTH - 2;
+        let truncated_project = fit_chars(&full_project, value_width);
+
+        assert!(
+            frame.contains(&truncated_project),
+            "long project path should be truncated into the value column, frame:\n{frame}"
+        );
+        assert!(
+            !frame.contains(&full_project),
+            "long project path overflowed the card instead of being truncated, frame:\n{frame}"
+        );
+        for line in frame.lines() {
+            assert!(
+                line.chars().count() <= CAST_INTRO_INNER_WIDTH,
+                "line exceeded Cast card width ({} > {CAST_INTRO_INNER_WIDTH}): {line}",
+                line.chars().count()
+            );
+        }
     }
 
     fn natural_plan(prompt: &str) -> CastPlan {

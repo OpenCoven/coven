@@ -7,6 +7,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
 };
+use serde::Serialize;
 
 use super::is_key_press;
 use crate::theme::fit_chars;
@@ -626,7 +627,12 @@ pub(crate) fn format_session_line(session: &store::SessionRecord) -> String {
 }
 
 pub(crate) fn render_sessions_json(sessions: &[store::SessionRecord]) -> Result<String> {
-    serde_json::to_string_pretty(&serde_json::json!({ "sessions": sessions }))
+    #[derive(Serialize)]
+    struct SessionsJson<'a> {
+        sessions: &'a [store::SessionRecord],
+    }
+
+    serde_json::to_string_pretty(&SessionsJson { sessions })
         .context("failed to serialize sessions as JSON")
 }
 

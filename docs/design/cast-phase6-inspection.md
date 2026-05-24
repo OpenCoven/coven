@@ -124,7 +124,7 @@ Cast — your Coven familiar
 Cast, your Coven familiar, is ready. Type a spell, or use a slash command.
 
 Context
-Project        /Users/buns/Documents/GitHub/OpenCoven/coven
+Project        /path/to/opencoven/coven
 Default harness codex
 
 Example spells

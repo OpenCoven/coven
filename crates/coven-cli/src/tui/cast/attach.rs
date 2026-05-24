@@ -137,6 +137,18 @@ pub(crate) fn reconstruct_quest(events: &[store::EventRecord]) -> Option<Reconst
         .and_then(CastHarness::from_token);
 
     let mut quest = quest_from_goal(&goal, default_harness);
+    if let Some(title) = payload.get("title").and_then(Value::as_str) {
+        quest.title = title.to_string();
+    }
+    if let Some(phase_names) = payload.get("phases").and_then(Value::as_array) {
+        if phase_names.len() == quest.phases.len() {
+            for (phase, name) in quest.phases.iter_mut().zip(phase_names) {
+                if let Some(name) = name.as_str().filter(|name| !name.trim().is_empty()) {
+                    phase.name = name.to_string();
+                }
+            }
+        }
+    }
     let mut is_complete = false;
 
     for event in events {
@@ -171,8 +183,19 @@ pub(crate) fn reconstruct_quest(events: &[store::EventRecord]) -> Option<Reconst
                 }
             }
             kind if kind == CAST_QUEST_PHASE_COMPLETED_KIND => {
-                let payload =
-                    serde_json::from_str::<Value>(&event.payload_json).unwrap_or(Value::Null);
+                let Ok(payload) = serde_json::from_str::<Value>(&event.payload_json) else {
+                    continue;
+                };
+                let Some(idx) = payload
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as usize)
+                else {
+                    continue;
+                };
+                if quest.current_index() != Some(idx) {
+                    continue;
+                }
                 let summary = QuestPhaseSummary {
                     session_id: payload
                         .get("session_id")
@@ -220,6 +243,7 @@ pub(crate) fn reconstruct_quest(events: &[store::EventRecord]) -> Option<Reconst
 pub(crate) fn format_quest_attach_note(info: &CastQuestAttachInfo) -> Option<String> {
     let title = info.title.as_deref().unwrap_or("(untitled quest)");
     let progress = match info.total_phases {
+        Some(total) if total > 0 && info.completed_phases == 0 => format!("0/{total} complete"),
         Some(total) if total > 0 => format!("phase {}/{total}", info.completed_phases.min(total)),
         _ => format!("{} phases run", info.completed_phases),
     };
@@ -546,6 +570,19 @@ mod tests {
     }
 
     #[test]
+    fn format_quest_attach_note_avoids_phase_zero() {
+        let info = CastQuestAttachInfo {
+            title: Some("Ship phase 7".to_string()),
+            total_phases: Some(3),
+            completed_phases: 0,
+            ..Default::default()
+        };
+        let note = format_quest_attach_note(&info).expect("note should be produced");
+        assert!(note.contains("0/3 complete"));
+        assert!(!note.contains("phase 0/3"));
+    }
+
+    #[test]
     fn format_quest_attach_note_describes_complete_quest() {
         let info = CastQuestAttachInfo {
             title: Some("Ship phase 7".to_string()),
@@ -644,6 +681,7 @@ mod tests {
         assert_eq!(recon.anchor_session_id, "anchor-id");
         assert!(!recon.is_complete);
         assert_eq!(recon.quest.cursor, 0);
+        assert_eq!(recon.quest.title, "Test quest");
         assert_eq!(recon.quest.goal, "ship phase 9");
     }
 
@@ -771,10 +809,22 @@ mod tests {
             phase_completed_event(3, 0, "completed", 0),
         ];
         let recon = reconstruct_quest(&events).expect("should reconstruct");
-        // The first (malformed) event still triggers an advance because
-        // `unwrap_or(Value::Null)` yields a default summary; both advances
-        // run, so cursor lands at 2.
-        assert_eq!(recon.quest.cursor, 2);
+        assert_eq!(recon.quest.cursor, 1);
+    }
+
+    #[test]
+    fn reconstruct_quest_ignores_phase_completed_events_with_wrong_index() {
+        let events = vec![
+            started_event_with("anchor-id", "ship phase 9", "codex"),
+            phase_completed_event(2, 2, "completed", 0),
+            phase_completed_event(3, 0, "completed", 0),
+        ];
+        let recon = reconstruct_quest(&events).expect("should reconstruct");
+        assert_eq!(recon.quest.cursor, 1);
+        assert!(matches!(
+            recon.quest.phases[2].status,
+            super::super::quest::QuestPhaseStatus::Pending
+        ));
     }
 
     #[test]

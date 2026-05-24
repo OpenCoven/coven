@@ -127,10 +127,11 @@ def is_programming_identifier_token(token: str) -> bool:
     token to be composed only of `[A-Za-z0-9_./-]`, to be split into at least
     three segments by `_`/`.`/`/`/`-`, for at least one segment to contain
     letters (so a token of pure-digit segments still trips the entropy rule),
-    and for every letter-bearing segment to be uniformly single-case. Real API
-    tokens lack separators, mix case within a segment, or contain base64-only
-    characters such as `+`/`=`, so they continue to fail at least one of these
-    checks and trip the entropy rule as before.
+    and for every letter-bearing segment to be uniformly single-case while
+    allowing digits inside those identifier/path/triple segments. Real API tokens
+    lack separators, mix case within a segment, or contain base64-only characters
+    such as `+`/`=`, so they continue to fail at least one of these checks and
+    trip the entropy rule as before.
     """
     if not re.fullmatch(r"[A-Za-z0-9_./-]+", token):
         return False

@@ -2,6 +2,9 @@
 summary: "Phase 5 design contract for Cast's sequential goal flow: deterministic sub-prompts, visible handoffs, and a structured advance step between phases."
 title: "Cast — Sequential Goal Flow (Phase 5)"
 description: "How Cast turns a high-level user goal into an ordered Quest of phases, each producing a concrete sub-prompt and a visible handoff to the harness."
+read_when:
+  - Understanding Cast quest handoffs
+  - Reviewing `/quest <goal>` behavior
 ---
 
 # Cast — Sequential Goal Flow (Phase 5)
@@ -110,7 +113,7 @@ Sub-prompt
   - added `cast::quest` module
   - drafted handoff card
 
-enter approves the sub-prompt · type to edit · esc cancels
+enter approve · type to replace · /skip [reason] · /cancel [reason]
 ```
 
 - Sub-prompts longer than 8 lines are clipped with a `… N more lines` indicator; the full text still goes to the harness, but the card stays under one screen.

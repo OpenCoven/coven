@@ -1,10 +1,33 @@
 use anyhow::{bail, Result};
 use std::path::PathBuf;
-use sysinfo::{Pid, Signal, System};
+use sysinfo::{Pid, Process, Signal, System};
 
 /// Hardcoded cache directories eligible for clearing. Never uses glob expansion.
 const USER_CACHE_DIRS: &[&str] = &["Library/Caches"];
 const SYSTEM_CACHE_DIR: &str = "/Library/Caches";
+
+#[derive(Debug, PartialEq, Eq)]
+struct ProcessIdentity {
+    name: String,
+    start_time: u64,
+    exe: Option<PathBuf>,
+    cmd: Vec<String>,
+}
+
+impl ProcessIdentity {
+    fn from_process(process: &Process) -> Self {
+        Self {
+            name: process.name().to_string(),
+            start_time: process.start_time(),
+            exe: process.exe().map(PathBuf::from),
+            cmd: process.cmd().to_vec(),
+        }
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        self == other
+    }
+}
 
 /// Kill a process by PID. Requires --confirm flag at the CLI layer.
 /// Uses SIGTERM only (no SIGKILL in v1). Re-checks PID identity before signaling.
@@ -17,12 +40,12 @@ pub fn kill_by_pid(pid: u32, confirm: bool) -> Result<()> {
     sys.refresh_all();
 
     let pid_key = Pid::from_u32(pid);
-    let name = sys
+    let identity = sys
         .process(pid_key)
-        .map(|p| p.name().to_string())
+        .map(ProcessIdentity::from_process)
         .ok_or_else(|| anyhow::anyhow!("No process found with PID {pid}"))?;
 
-    eprintln!("Sending SIGTERM to PID {pid} ({name})...");
+    eprintln!("Sending SIGTERM to PID {pid} ({})...", identity.name);
 
     // Re-check identity immediately before signaling to avoid PID reuse mistakes
     sys.refresh_process(pid_key);
@@ -30,22 +53,26 @@ pub fn kill_by_pid(pid: u32, confirm: bool) -> Result<()> {
         .process(pid_key)
         .ok_or_else(|| anyhow::anyhow!("Process {pid} disappeared before signal could be sent"))?;
 
-    // Verify name still matches
-    let current_name = proc.name().to_string();
-    if current_name != name {
+    let current_identity = ProcessIdentity::from_process(proc);
+    if !identity.matches(&current_identity) {
         bail!(
-            "PID {pid} identity changed ({name} → {current_name}). Refusing to signal to avoid PID reuse mistake."
+            "PID {pid} identity changed ({} → {}). Refusing to signal to avoid PID reuse mistake.",
+            identity.name,
+            current_identity.name,
         );
     }
 
     let sent = proc.kill_with(Signal::Term);
     match sent {
         Some(true) => {
-            println!("SIGTERM sent to PID {pid} ({name}).");
+            println!("SIGTERM sent to PID {pid} ({}).", identity.name);
             Ok(())
         }
         Some(false) | None => {
-            bail!("Failed to send SIGTERM to PID {pid} ({name}). Check permissions.");
+            bail!(
+                "Failed to send SIGTERM to PID {pid} ({}). Check permissions.",
+                identity.name
+            );
         }
     }
 }
@@ -96,7 +123,14 @@ fn clear_directory_contents(path: &PathBuf, cleared: &mut usize, errors: &mut us
     };
     for entry in entries.flatten() {
         let entry_path = entry.path();
-        let result = if entry_path.is_dir() {
+        let metadata = match std::fs::symlink_metadata(&entry_path) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                *errors += 1;
+                continue;
+            }
+        };
+        let result = if metadata.file_type().is_dir() {
             std::fs::remove_dir_all(&entry_path)
         } else {
             std::fs::remove_file(&entry_path)
@@ -105,5 +139,51 @@ fn clear_directory_contents(path: &PathBuf, cleared: &mut usize, errors: &mut us
             Ok(()) => *cleared += 1,
             Err(_) => *errors += 1,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_identity_requires_more_than_name_to_match() {
+        let first = ProcessIdentity {
+            name: "worker".to_string(),
+            start_time: 100,
+            exe: Some(PathBuf::from("/bin/worker")),
+            cmd: vec!["worker".to_string()],
+        };
+        let reused_pid = ProcessIdentity {
+            name: "worker".to_string(),
+            start_time: 200,
+            exe: Some(PathBuf::from("/bin/worker")),
+            cmd: vec!["worker".to_string()],
+        };
+
+        assert!(!first.matches(&reused_pid));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clear_directory_contents_removes_symlink_without_traversing_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep.txt"), "do not delete").unwrap();
+        symlink(&outside, cache.join("outside-link")).unwrap();
+
+        let mut cleared = 0;
+        let mut errors = 0;
+        clear_directory_contents(&cache, &mut cleared, &mut errors);
+
+        assert_eq!(errors, 0);
+        assert_eq!(cleared, 1);
+        assert!(outside.join("keep.txt").exists());
+        assert!(!cache.join("outside-link").exists());
     }
 }

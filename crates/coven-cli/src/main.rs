@@ -82,11 +82,11 @@ enum Command {
     Sessions {
         #[arg(long, help = "Include archived sessions")]
         all: bool,
-        #[arg(long, help = "Open the interactive session action browser")]
+        #[arg(long, conflicts_with_all = ["plain", "json"], help = "Open the interactive session action browser")]
         manage: bool,
-        #[arg(long, help = "Print a plain table instead of the session browser")]
+        #[arg(long, conflicts_with_all = ["manage", "json"], help = "Print a plain table instead of the session browser")]
         plain: bool,
-        #[arg(long, help = "Print sessions as JSON for clients such as comux")]
+        #[arg(long, conflicts_with_all = ["manage", "plain"], help = "Print sessions as JSON for clients such as comux")]
         json: bool,
     },
     #[command(about = "Replay/follow a session and forward input to live daemon sessions")]
@@ -1542,11 +1542,11 @@ mod tests {
             other => panic!("expected sessions command, got {other:?}"),
         }
 
-        let managed = Cli::parse_from(["coven", "sessions", "--manage", "--plain"]);
+        let managed = Cli::parse_from(["coven", "sessions", "--manage"]);
         match managed.command {
             Some(Command::Sessions { manage, plain, .. }) => {
                 assert!(manage);
-                assert!(plain);
+                assert!(!plain);
             }
             other => panic!("expected sessions command, got {other:?}"),
         }
@@ -1722,6 +1722,20 @@ mod tests {
                 assert!(keep_session);
             }
             other => panic!("expected patch openclaw command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_conflicting_sessions_output_modes() {
+        for args in [
+            ["coven", "sessions", "--json", "--plain"],
+            ["coven", "sessions", "--json", "--manage"],
+            ["coven", "sessions", "--plain", "--manage"],
+        ] {
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "sessions output modes should be mutually exclusive: {args:?}"
+            );
         }
     }
 

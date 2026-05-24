@@ -12,7 +12,7 @@ use ratatui::{
     },
     Frame,
 };
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::theme::{
     self, Status, AGENT_LABEL, BACKDROP, BORDER_DIM, DIM, HINT_KEY, HINT_LABEL, PRIMARY,
@@ -281,11 +281,7 @@ fn append_agent_content_lines<'a>(lines: &mut Vec<Line<'a>>, content: &str, wrap
         }
 
         if in_code_block {
-            let visible = if wrap_width > 4 && line.chars().count() > wrap_width - 4 {
-                line.chars().take(wrap_width - 4).collect::<String>()
-            } else {
-                line.to_string()
-            };
+            let visible = truncate_for_width(line, wrap_width.saturating_sub(4));
             // Code blocks are verbatim — no inline-markdown parsing inside.
             // With a known language tag, hand the visible line to the syntax
             // tokenizer so keywords/strings/numbers/comments pick up brand
@@ -404,7 +400,7 @@ fn strip_heading_prefix(line: &str) -> Option<(u8, &str)> {
 
 fn strip_bullet_prefix(line: &str) -> Option<(usize, &'static str, &str)> {
     let trimmed = line.trim_start();
-    let indent = line.len() - trimmed.len();
+    let indent = leading_whitespace_columns(line, line.len() - trimmed.len());
     if let Some(rest) = trimmed.strip_prefix("- ") {
         return Some((indent, "\u{2022} ", rest));
     }
@@ -412,6 +408,17 @@ fn strip_bullet_prefix(line: &str) -> Option<(usize, &'static str, &str)> {
         return Some((indent, "\u{2022} ", rest));
     }
     None
+}
+
+fn leading_whitespace_columns(line: &str, byte_len: usize) -> usize {
+    line[..byte_len]
+        .chars()
+        .map(|ch| match ch {
+            '\t' => 4,
+            ' ' => 1,
+            _ => ch.width().unwrap_or(1),
+        })
+        .sum()
 }
 
 /// Lines beginning with `|` (after any leading indent) look like markdown
@@ -459,7 +466,7 @@ fn parse_inline_markdown<'a>(text: &str, default_style: Style) -> Vec<Span<'a>> 
                     if let Some(end) = after.find("**") {
                         let body = &after[..end];
                         let closes_on_word =
-                            body.chars().last().is_some_and(|c| !c.is_whitespace());
+                            body.chars().next_back().is_some_and(|c| !c.is_whitespace());
                         if closes_on_word {
                             flush_inline_buf(&mut spans, &mut buf, default_style);
                             let bold = default_style.add_modifier(Modifier::BOLD);
@@ -486,7 +493,7 @@ fn parse_inline_markdown<'a>(text: &str, default_style: Style) -> Vec<Span<'a>> 
                     while let Some(p) = after[search_at..].find('*') {
                         let abs = search_at + p;
                         let body = &after[..abs];
-                        let last_ok = body.chars().last().is_some_and(|c| !c.is_whitespace());
+                        let last_ok = body.chars().next_back().is_some_and(|c| !c.is_whitespace());
                         let not_double = after.as_bytes().get(abs + 1) != Some(&b'*');
                         if last_ok && not_double {
                             found = Some(abs);
@@ -1008,16 +1015,24 @@ fn input_line_count(input: &str) -> usize {
 }
 
 fn truncate_for_width(value: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
     if UnicodeWidthStr::width(value) <= max_width {
         return value.to_string();
     }
+    if max_width == 1 {
+        return "\u{2026}".to_string();
+    }
     let mut output = String::new();
+    let mut output_width = 0usize;
+    let content_budget = max_width - 1;
     for ch in value.chars() {
-        let next_width = UnicodeWidthStr::width(output.as_str())
-            + UnicodeWidthStr::width(ch.to_string().as_str());
-        if next_width >= max_width.saturating_sub(1) {
+        let ch_width = ch.width().unwrap_or(0);
+        if output_width + ch_width > content_budget {
             break;
         }
+        output_width += ch_width;
         output.push(ch);
     }
     output.push('…');
@@ -1360,6 +1375,52 @@ mod tests {
     }
 
     #[test]
+    fn truncate_for_width_never_exceeds_requested_budget() {
+        assert_eq!(truncate_for_width("abcdef", 0), "");
+        assert_eq!(truncate_for_width("abcdef", 1), "\u{2026}");
+        assert_eq!(truncate_for_width("abcdef", 2), "a\u{2026}");
+        assert_eq!(truncate_for_width("abcdef", 4), "abc\u{2026}");
+
+        let wide = truncate_for_width("表表abc", 4);
+        assert!(UnicodeWidthStr::width(wide.as_str()) <= 4);
+        assert!(wide.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn agent_lines_truncate_code_blocks_by_display_width() {
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        append_agent_content_lines(&mut lines, "```\n表表abc\n```", 6);
+
+        let code_line = find_code_line(&lines, "").expect("code line emitted");
+        let visible: String = code_line
+            .spans
+            .iter()
+            .skip(1)
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            UnicodeWidthStr::width(visible.as_str()) <= 2,
+            "visible code text should fit the post-prefix budget: {visible:?}"
+        );
+    }
+
+    #[test]
+    fn agent_lines_treat_tab_bullet_indent_as_columns() {
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        append_agent_content_lines(&mut lines, "\t- nested", 40);
+
+        let rendered: String = lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            rendered.starts_with("      \u{2022} nested"),
+            "tab indent should expand to four columns after the message margin: {rendered:?}"
+        );
+    }
+
+    #[test]
     fn agent_lines_render_table_separator_row_without_wrapping() {
         // The `|---|---|...` separator row is what makes a markdown table
         // visually a table; if it wraps the table reads as garbage.
@@ -1482,9 +1543,9 @@ mod tests {
     }
 
     #[test]
-    fn inline_markdown_preserves_backticks_inside_inline_code() {
-        // The first backtick opens, the next closes — nested backticks would
-        // need fence-style triple-tick handling we don't support today.
+    fn inline_markdown_preserves_stars_inside_inline_code() {
+        // Stars inside an inline-code span should stay literal rather than
+        // becoming italic markers.
         let default_style = theme::ratatui_style(TEXT);
         let spans = parse_inline_markdown("see `*foo*` for the literal stars", default_style);
         let texts: Vec<String> = spans.iter().map(|s| s.content.to_string()).collect();

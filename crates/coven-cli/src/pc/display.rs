@@ -1,4 +1,5 @@
 use crate::pc::diagnostics::{DiskInfo, ProcessInfo, SystemSnapshot};
+use serde_json::json;
 
 pub enum OutputFormat {
     Compact,
@@ -8,15 +9,23 @@ pub enum OutputFormat {
 
 fn health_indicator(pct: f32, warn: f32, crit: f32) -> &'static str {
     if pct >= crit {
-        "🔴"
+        "[crit]"
     } else if pct >= warn {
-        "🟡"
+        "[warn]"
     } else {
-        "🟢"
+        "[ok]"
     }
 }
 
-pub fn print_status(snap: &SystemSnapshot, _format: &OutputFormat) {
+pub fn print_status(snap: &SystemSnapshot, format: &OutputFormat) {
+    print!("{}", format_status(snap, format));
+}
+
+fn format_status(snap: &SystemSnapshot, format: &OutputFormat) -> String {
+    if matches!(format, OutputFormat::Json) {
+        return format_json(snap);
+    }
+
     let cpu_ind = health_indicator(snap.cpu_usage_pct, 70.0, 90.0);
     let mem_pct = if snap.memory_total_mb > 0 {
         snap.memory_used_mb as f32 / snap.memory_total_mb as f32 * 100.0
@@ -24,18 +33,18 @@ pub fn print_status(snap: &SystemSnapshot, _format: &OutputFormat) {
         0.0
     };
     let mem_ind = health_indicator(mem_pct, 70.0, 90.0);
-    println!(
+    format!(
         "{cpu_ind} CPU {:.1}%  {mem_ind} RAM {}/{} MB  uptime {}",
         snap.cpu_usage_pct,
         snap.memory_used_mb,
         snap.memory_total_mb,
         format_uptime(snap.uptime_secs),
-    );
+    )
 }
 
 pub fn print_full(snap: &SystemSnapshot, format: &OutputFormat) {
     match format {
-        OutputFormat::Json => print_json(snap),
+        OutputFormat::Json => println!("{}", format_json(snap)),
         OutputFormat::Compact | OutputFormat::Verbose => print_human(snap, format),
     }
 }
@@ -114,36 +123,34 @@ pub fn print_disk_usage(snap: &SystemSnapshot) {
     }
 }
 
-fn print_json(snap: &SystemSnapshot) {
-    // Minimal JSON output — no external serde dependency needed for this simple shape
-    println!("{{");
-    println!("  \"cpu_usage_pct\": {:.2},", snap.cpu_usage_pct);
-    println!("  \"memory_used_mb\": {},", snap.memory_used_mb);
-    println!("  \"memory_total_mb\": {},", snap.memory_total_mb);
-    println!("  \"swap_used_mb\": {},", snap.swap_used_mb);
-    println!("  \"swap_total_mb\": {},", snap.swap_total_mb);
-    println!("  \"uptime_secs\": {},", snap.uptime_secs);
-    println!("  \"processes\": [");
+fn format_json(snap: &SystemSnapshot) -> String {
     let procs: Vec<_> = snap.processes.iter().take(20).collect();
-    for (i, p) in procs.iter().enumerate() {
-        let comma = if i + 1 < procs.len() { "," } else { "" };
-        // Redact argv in JSON output too (verbose-only)
-        println!(
-            "    {{\"pid\": {}, \"name\": {:?}, \"cpu_pct\": {:.2}, \"memory_mb\": {}}}{}",
-            p.pid, p.name, p.cpu_pct, p.memory_mb, comma
-        );
-    }
-    println!("  ],");
-    println!("  \"disks\": [");
-    for (i, d) in snap.disks.iter().enumerate() {
-        let comma = if i + 1 < snap.disks.len() { "," } else { "" };
-        println!(
-            "    {{\"mount\": {:?}, \"total_gb\": {:.2}, \"available_gb\": {:.2}, \"used_pct\": {:.1}}}{}",
-            d.mount, d.total_gb, d.available_gb, d.used_pct, comma
-        );
-    }
-    println!("  ]");
-    println!("}}");
+    let value = json!({
+        "cpu_usage_pct": snap.cpu_usage_pct,
+        "memory_used_mb": snap.memory_used_mb,
+        "memory_total_mb": snap.memory_total_mb,
+        "swap_used_mb": snap.swap_used_mb,
+        "swap_total_mb": snap.swap_total_mb,
+        "uptime_secs": snap.uptime_secs,
+        "processes": procs.iter().map(|p| {
+            json!({
+                "pid": p.pid,
+                "name": p.name,
+                "cpu_pct": p.cpu_pct,
+                "memory_mb": p.memory_mb,
+            })
+        }).collect::<Vec<_>>(),
+        "disks": snap.disks.iter().map(|d| {
+            json!({
+                "mount": d.mount,
+                "total_gb": d.total_gb,
+                "available_gb": d.available_gb,
+                "used_pct": d.used_pct,
+            })
+        }).collect::<Vec<_>>(),
+    });
+
+    serde_json::to_string_pretty(&value).expect("system snapshot JSON serialization cannot fail")
 }
 
 fn format_uptime(secs: u64) -> String {
@@ -156,5 +163,54 @@ fn format_uptime(secs: u64) -> String {
         format!("{hours}h {mins}m")
     } else {
         format!("{mins}m")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_snapshot() -> SystemSnapshot {
+        SystemSnapshot {
+            cpu_usage_pct: 12.5,
+            memory_used_mb: 1024,
+            memory_total_mb: 4096,
+            swap_used_mb: 0,
+            swap_total_mb: 0,
+            uptime_secs: 3661,
+            processes: vec![ProcessInfo {
+                pid: 42,
+                name: "proc \"quoted\"\u{7}".to_string(),
+                cpu_pct: 3.5,
+                memory_mb: 64,
+                argv: None,
+            }],
+            disks: vec![DiskInfo {
+                mount: "/Volumes/name \"quoted\"\u{7}".to_string(),
+                total_gb: 100.0,
+                available_gb: 40.0,
+                used_pct: 60.0,
+            }],
+        }
+    }
+
+    #[test]
+    fn status_json_serializes_valid_json_with_expected_keys() {
+        let body = format_status(&sample_snapshot(), &OutputFormat::Json);
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+
+        assert_eq!(value["cpu_usage_pct"], 12.5);
+        assert_eq!(value["processes"][0]["name"], "proc \"quoted\"\u{7}");
+        assert_eq!(value["disks"][0]["mount"], "/Volumes/name \"quoted\"\u{7}");
+    }
+
+    #[test]
+    fn human_status_uses_non_emoji_indicators() {
+        let body = format_status(&sample_snapshot(), &OutputFormat::Compact);
+
+        assert!(body.contains("[ok] CPU"));
+        assert!(!body.contains('🟢'));
+        assert!(!body.contains('🟡'));
+        assert!(!body.contains('🔴'));
     }
 }

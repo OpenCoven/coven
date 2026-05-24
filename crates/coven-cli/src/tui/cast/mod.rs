@@ -38,7 +38,7 @@ pub(crate) use quest::{
     set_phase_sub_prompt, skip_phase, PhaseInteraction, Quest, QuestPhase, QuestPhaseStatus,
     QuestPhaseSummary, CAST_QUEST_ADVANCED_KIND, CAST_QUEST_COMPLETED_KIND,
     CAST_QUEST_PHASE_COMPLETED_KIND, CAST_QUEST_PHASE_EDITED_KIND, CAST_QUEST_PHASE_SKIPPED_KIND,
-    CAST_QUEST_PHASE_STARTED_KIND, CAST_QUEST_STARTED_KIND,
+    CAST_QUEST_PHASE_STARTED_KIND, CAST_QUEST_STARTED_KIND, PHASE_PROMPT_HINT,
 };
 // `compose_sub_prompt` and `QuestHandoff` are exercised by the in-module
 // test suite; they remain in the public crate surface so a future async /

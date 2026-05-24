@@ -272,3 +272,11 @@ test('release workflow concurrency keeps overlapping releases from interleaving'
   assert.match(workflow, /^concurrency:\s*\n\s*group:\s*release-npm/m);
   assert.match(workflow, /cancel-in-progress:\s*false/);
 });
+
+test('prepublish smoke has explicit dry-run version override and registry failure message', () => {
+  const scriptPath = new URL('test-cli-prepublish.mjs', import.meta.url);
+  const script = readFileSync(scriptPath, 'utf8');
+
+  assert.match(script, /COVEN_NPM_DRY_RUN_VERSION/);
+  assert.match(script, /Could not read current \$\{packageName\} version/);
+});
