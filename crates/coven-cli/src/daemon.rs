@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::Write;
-use std::net::TcpListener;
+use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -878,8 +878,26 @@ fn daemon_status_from_health_socket(socket: &str) -> Result<Option<DaemonStatus>
 pub const TCP_IO_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_TCP_BODY_BYTES: usize = 1024 * 1024;
 
-pub fn bind_tcp_listener<A: std::net::ToSocketAddrs>(addr: A) -> Result<TcpListener> {
-    let listener = TcpListener::bind(&addr).with_context(|| "failed to bind Coven TCP listener")?;
+fn ensure_loopback_addrs(addrs: &[SocketAddr]) -> Result<()> {
+    if addrs.is_empty() {
+        anyhow::bail!("TCP listener address did not resolve to any sockets");
+    }
+    if addrs.iter().any(|addr| !addr.ip().is_loopback()) {
+        anyhow::bail!(
+            "refusing to bind Coven TCP API to non-loopback address; use 127.0.0.1 or ::1"
+        );
+    }
+    Ok(())
+}
+
+pub fn bind_tcp_listener<A: ToSocketAddrs>(addr: A) -> Result<TcpListener> {
+    let addrs: Vec<SocketAddr> = addr
+        .to_socket_addrs()
+        .context("failed to resolve Coven TCP listener address")?
+        .collect();
+    ensure_loopback_addrs(&addrs)?;
+    let listener =
+        TcpListener::bind(&addrs[..]).with_context(|| "failed to bind Coven TCP listener")?;
     Ok(listener)
 }
 
@@ -1427,6 +1445,16 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
         assert!(response.contains("\"apiVersion\""), "got: {response}");
+    }
+
+    #[test]
+    fn bind_tcp_listener_rejects_non_loopback() {
+        let error = bind_tcp_listener("0.0.0.0:0").expect_err("should reject wildcard bind");
+        let msg = format!("{error:#}");
+        assert!(
+            msg.contains("non-loopback"),
+            "unexpected error message: {msg}"
+        );
     }
 
     #[test]
