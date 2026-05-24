@@ -6,7 +6,7 @@ name: Release npm packages
 # Auth: npm trusted publishing via GitHub Actions OIDC — no long-lived NPM_TOKEN required. Configure each
 #       @opencoven/cli* package on npmjs.com -> Settings -> Trusted Publishers before the first OIDC release.
 # Gate: the `verify-tag` job confirms the tag is annotated, that GitHub has cryptographically verified
-#       the maintainer's signature, and that the verified signer login is release-allowlisted.
+#       the maintainer's signature, and that the verified tagger email is release-allowlisted.
 
 on:
   push:
@@ -57,7 +57,6 @@ jobs:
         run: |
           set -euo pipefail
           TAG_NAME="${GITHUB_REF#refs/tags/}"
-          REPO_NAME="${GITHUB_REPOSITORY#*/}"
           TAG_OBJECT_SHA=$(git rev-parse "$TAG_NAME")
           OBJECT_TYPE=$(git cat-file -t "$TAG_OBJECT_SHA")
           if [ "$OBJECT_TYPE" != "tag" ]; then
@@ -71,51 +70,23 @@ jobs:
             echo "::error::Tag $TAG_NAME does not have a GitHub-verified signature (reason=$reason). Re-tag with a signing key registered to your GitHub account."
             exit 1
           fi
-          signature_payload=$(gh api graphql \
-            -f owner="$GITHUB_REPOSITORY_OWNER" \
-            -f name="$REPO_NAME" \
-            -f expression="refs/tags/$TAG_NAME" \
-            -f query='
-              query($owner: String!, $name: String!, $expression: String!) {
-                repository(owner: $owner, name: $name) {
-                  object(expression: $expression) {
-                    __typename
-                    ... on Tag {
-                      oid
-                      target { __typename oid }
-                      signature {
-                        isValid
-                        state
-                        signer { login }
-                      }
-                    }
-                  }
-                }
-              }
-            ')
-          signature_valid=$(jq -r '.data.repository.object.signature.isValid // false' <<<"$signature_payload")
-          signature_state=$(jq -r '.data.repository.object.signature.state // "UNKNOWN"' <<<"$signature_payload")
-          signer_login=$(jq -r '.data.repository.object.signature.signer.login // ""' <<<"$signature_payload")
-          target_type=$(jq -r '.data.repository.object.target.__typename // ""' <<<"$signature_payload")
-          TAGGED_COMMIT_SHA=$(jq -r '.data.repository.object.target.oid // ""' <<<"$signature_payload")
-          echo "tag=$TAG_NAME verified=$verified reason=$reason signer=${signer_login:-unknown} target=$TAGGED_COMMIT_SHA"
-          if [ "$signature_valid" != "true" ] || [ -z "$signer_login" ]; then
-            echo "::error::Tag $TAG_NAME does not have a GitHub-verified signer identity (state=$signature_state)."
-            exit 1
-          fi
-          if [ "$target_type" != "Commit" ] || [ -z "$TAGGED_COMMIT_SHA" ]; then
-            echo "::error::Refusing release: annotated tag $TAG_NAME targets ${target_type:-unknown}, not a commit."
+          tag_object_type=$(jq -r '.object.type // ""' <<<"$payload")
+          TAGGED_COMMIT_SHA=$(jq -r '.object.sha // ""' <<<"$payload")
+          tagger_email=$(jq -r '.tagger.email // ""' <<<"$payload")
+          echo "tag=$TAG_NAME verified=$verified reason=$reason tagger=${tagger_email:-unknown} target=$TAGGED_COMMIT_SHA"
+          if [ "$tag_object_type" != "commit" ] || [ -z "$TAGGED_COMMIT_SHA" ]; then
+            echo "::error::Refusing release: annotated tag $TAG_NAME targets ${tag_object_type:-unknown}, not a commit."
             exit 1
           fi
           allowed_signers_raw='${{ vars.NPM_RELEASE_SIGNERS }}'
           if [ -z "$allowed_signers_raw" ]; then
-            echo "::error::Repository variable NPM_RELEASE_SIGNERS must contain a comma-separated allowlist of release signer GitHub logins."
+            echo "::error::Repository variable NPM_RELEASE_SIGNERS must contain a comma-separated allowlist of release tagger emails."
             exit 1
           fi
           allowed_signers=",$(echo "$allowed_signers_raw" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]'),"
-          signer_lc=$(echo "$signer_login" | tr '[:upper:]' '[:lower:]')
-          if [[ "$allowed_signers" != *",$signer_lc,"* ]]; then
-            echo "::error::Tag signer GitHub login $signer_login is not in NPM_RELEASE_SIGNERS."
+          tagger_email_lc=$(echo "$tagger_email" | tr '[:upper:]' '[:lower:]')
+          if [[ "$allowed_signers" != *",$tagger_email_lc,"* ]]; then
+            echo "::error::Tagger email $tagger_email is not in NPM_RELEASE_SIGNERS."
             exit 1
           fi
           git fetch --no-tags origin main

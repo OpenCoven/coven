@@ -214,17 +214,22 @@ test('release workflow verifies the signed release tag before building or publis
   );
   assert.match(
     workflow,
-    /signature\s*\{\s*[\s\S]*signer\s*\{\s*login\s*\}/,
-    'verify-tag must authorize the GitHub user bound to the verified tag signature'
+    /tagger_email=\$\(jq -r '\.tagger\.email/,
+    'verify-tag must authorize the REST-verified annotated tagger email'
+  );
+  assert.doesNotMatch(
+    workflow,
+    /\.signature\s*\{/,
+    'verify-tag must not query the removed GitHub GraphQL Tag.signature field'
   );
   assert.match(
     workflow,
-    /target\s*\{\s*__typename\s+oid\s*\}/,
+    /tag_object_type=\$\(jq -r '\.object\.type/,
     'verify-tag must inspect the annotated tag target type and SHA'
   );
   assert.match(
     workflow,
-    /target_type.*Commit/s,
+    /tag_object_type.*commit/s,
     'verify-tag must reject annotated tags that do not target commits'
   );
 });
