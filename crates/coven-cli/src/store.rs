@@ -17,9 +17,11 @@ pub struct SessionRecord {
     pub updated_at: String,
     /// Optional grouping id so chat-style multi-turn conversations show as a
     /// single thread in `/sessions` instead of one row per turn. Distinct
-    /// from `id` (which is per-session) and from the harness CLI's own
-    /// session-resume id (which is the same for claude, different for
-    /// codex). See `docs/chat-persistence.md`.
+    /// from `id` (which is per-session). In practice today this id is the
+    /// same value the chat passes to the harness CLI for resume — claude
+    /// uses a chat-generated UUID for both `--session-id` and grouping;
+    /// codex uses its own captured `session id: <uuid>` for both `exec
+    /// resume` and grouping. See `docs/chat-persistence.md`.
     #[serde(default)]
     pub conversation_id: Option<String>,
 }

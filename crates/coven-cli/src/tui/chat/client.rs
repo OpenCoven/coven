@@ -29,10 +29,12 @@ pub(crate) struct LaunchRequest {
     pub(crate) title: String,
     pub(crate) conversation: Option<harness::ConversationHint>,
     /// Stable per-conversation id used to group multiple chat turns under
-    /// one row in `/sessions`. Distinct from `conversation` (which drives
-    /// the harness CLI's own resume args). Today chat uses the same uuid
-    /// for both fields on claude turns and a chat-generated uuid on codex
-    /// turns (since codex auto-assigns its own session id). See
+    /// one row in `/sessions`. Conceptually distinct from `conversation`
+    /// (which drives the harness CLI's own resume args), though in
+    /// practice both fields carry the same value for both harnesses:
+    /// claude's chat-generated UUID is also the `conversation_id`, and
+    /// codex's captured `session id: <uuid>` is reused as the
+    /// `conversation_id` once we learn it. See
     /// `docs/chat-persistence.md`.
     pub(crate) conversation_id: Option<String>,
 }

@@ -552,11 +552,22 @@ impl App {
         );
     }
 
+    /// Best-effort shutdown for the chat App: tears down any long-lived
+    /// stream-mode daemon sessions so they don't outlive `coven chat`.
+    /// Called by `run_chat` on every exit path (slash `/exit`, double
+    /// Ctrl+C, Ctrl+D, panic-free unwind of the event loop). Safe to
+    /// call multiple times — `kill_all_stream_sessions` is idempotent on
+    /// an empty map.
+    pub(super) fn shutdown(&mut self) {
+        self.kill_all_stream_sessions();
+    }
+
     /// Kill every tracked stream-mode daemon session and clear our local
     /// map (including the per-session JSON buffers — leaving those behind
     /// would leak across a long chat). Best-effort: kill failures are
-    /// logged but don't block the caller. Used by `/clear` and `/new` to
-    /// ensure the next message cold-starts a fresh stream process.
+    /// logged but don't block the caller. Used by `/clear`, `/new`, and
+    /// `shutdown` to ensure the next message cold-starts a fresh stream
+    /// process (or no process at all, on exit).
     fn kill_all_stream_sessions(&mut self) {
         let ids: Vec<String> = self.harness_stream_session_ids.values().cloned().collect();
         for id in ids {
@@ -1101,7 +1112,14 @@ impl App {
             Ok(session) => {
                 self.push_system_message(&format!("Summoned session {session_id}."));
                 self.active_session_id = Some(session.id.clone());
+                self.active_session_harness = Some(session.harness.clone());
+                // Summon attaches to an externally-spawned (or
+                // previously-archived) session; treat it like /attach so
+                // typing forwards to its PTY stdin instead of cold-
+                // starting a chat turn over it.
+                self.chat_owns_active_session = false;
                 self.last_event_seq = None;
+                self.agent_output_mode = AgentOutputMode::Unknown;
                 self.reset_event_poll_failures();
                 self.push_system_message(&format!(
                     "Attached to daemon session {} ({}, {})",
@@ -2821,6 +2839,33 @@ mod tests {
                 .iter()
                 .any(|m| m.content.contains("warning: auth token expiring soon")),
             "stream-json stderr envelope must surface as a system message in the transcript"
+        );
+    }
+
+    #[test]
+    fn shutdown_kills_tracked_stream_sessions_and_clears_state() {
+        let client = RecordingChatClient::default();
+        let (mut app, mirror) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let stream_id = app.active_session_id().expect("first launch").to_string();
+        assert!(!app.harness_stream_session_ids.is_empty());
+
+        app.shutdown();
+
+        assert!(
+            app.harness_stream_session_ids.is_empty(),
+            "shutdown must clear tracked stream session ids"
+        );
+        assert!(
+            mirror
+                .calls
+                .borrow()
+                .iter()
+                .any(|c| c == &format!("kill:{stream_id}")),
+            "shutdown must issue a kill for each tracked stream session so chat exit doesn't leak a claude process"
         );
     }
 
