@@ -248,9 +248,16 @@ fn write_stream_message(input: &mut dyn Write, text: &str) -> Result<()> {
 /// `pty_runner::spawn_piped_with_observer` returns just the child's PID
 /// because the `Child` handle itself lives inside the wait/drain thread —
 /// sharing it through a `Mutex` would deadlock when `wait()` blocks while
-/// `kill()` waits for the same lock. Sending SIGTERM via the PID
-/// short-circuits that: the kernel signals the child, `wait()` returns,
-/// and the cleanup observer fires.
+/// `kill()` waits for the same lock.
+///
+/// The spawn path puts the child in its own session/process group via
+/// `setsid()` (pre_exec), so we can signal the entire group with one
+/// syscall — that picks up subprocesses the harness may have spawned
+/// (skills, MCP servers, shells, …) which would otherwise survive as
+/// orphans. We send SIGKILL (not SIGTERM) because the daemon kill path
+/// is reached from explicit user intent (`/kill`, `/clear`, chat exit)
+/// where the right behavior is "stop immediately"; SIGTERM would let a
+/// harness that ignores it linger past the user's request.
 struct PipedKiller {
     pid: u32,
 }
@@ -259,16 +266,16 @@ impl RuntimeKiller for PipedKiller {
     #[cfg(unix)]
     fn kill(&mut self) -> Result<()> {
         let pid = self.pid as libc::pid_t;
-        // SIGTERM gives the child a chance to clean up; if it doesn't
-        // respond the OS will reap it when its parent (the daemon) exits.
-        let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
+        // Negative argument signals the process group (pgid == pid
+        // since the child called setsid). SIGKILL can't be ignored.
+        let rc = unsafe { libc::kill(-pid, libc::SIGKILL) };
         if rc != 0 {
             let error = std::io::Error::last_os_error();
-            // ESRCH means the process is already gone — fine, that's the
-            // post-condition we want.
+            // ESRCH means the group is already gone — fine, that's
+            // the post-condition we want.
             if error.raw_os_error() != Some(libc::ESRCH) {
                 return Err(error).with_context(|| {
-                    format!("failed to send SIGTERM to stream harness pid {pid}")
+                    format!("failed to SIGKILL stream harness process group {pid}")
                 });
             }
         }

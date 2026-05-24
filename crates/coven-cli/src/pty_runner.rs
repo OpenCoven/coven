@@ -126,6 +126,27 @@ pub fn spawn_piped_with_observer(
     std_command.stdin(Stdio::piped());
     std_command.stdout(Stdio::piped());
     std_command.stderr(Stdio::piped());
+    // Put the child in its own session/process group so the daemon can
+    // signal it (and any subprocesses it spawns — skills, MCP servers,
+    // shells) as a single unit via `kill(-pid, …)` from `PipedKiller`.
+    // Without this, signals to the pid only reach the immediate child
+    // and leave grandchildren as orphans.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            std_command.pre_exec(|| {
+                // setsid() makes the calling process the session leader
+                // of a new session AND the leader of a new process
+                // group with no controlling terminal. Returns -1 on
+                // failure (we propagate as io::Error to abort the spawn).
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
 
     let mut child = std_command.spawn().with_context(|| {
         format!(

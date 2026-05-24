@@ -257,8 +257,23 @@ fn launch_session(
     body: Option<&str>,
     runtime: &dyn SessionRuntime,
 ) -> Result<ApiResponse> {
-    let payload = parse_body(body)?;
-    let launch = session_launch_from_payload(payload)?;
+    // Client-side validation errors (malformed JSON, bad fields,
+    // unsupported launchMode, malformed `conversation` object, …) must
+    // become structured 400 responses. Bubbling them up as Err crashes
+    // the daemon, since the api-server loop `?`-propagates errors out
+    // of the accept loop and terminates the process.
+    let payload = match parse_body(body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return api_error(400, "invalid_request", &error.to_string(), None);
+        }
+    };
+    let launch = match session_launch_from_payload(payload) {
+        Ok(launch) => launch,
+        Err(error) => {
+            return api_error(400, "invalid_request", &error.to_string(), None);
+        }
+    };
     let conn = store::open_store(&store_path(coven_home))?;
     let now = current_timestamp();
     let record = store::SessionRecord {
@@ -1026,7 +1041,8 @@ mod tests {
     }
 
     #[test]
-    fn launch_request_rejects_malformed_conversation_mode() -> anyhow::Result<()> {
+    fn launch_request_with_malformed_conversation_mode_returns_400_not_daemon_crash(
+    ) -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let project_root = temp_dir.path().join("repo");
         std::fs::create_dir_all(&project_root)?;
@@ -1040,19 +1056,27 @@ mod tests {
         })
         .to_string();
 
-        let result = handle_request_with_runtime(
+        let response = handle_request_with_runtime(
             "POST",
             "/sessions",
             temp_dir.path(),
             None,
             Some(&body),
             &runtime,
-        );
+        )?;
 
-        let error = result.unwrap_err();
+        // Must be a structured 400 — bubbling the error up to the
+        // daemon's accept loop would take the daemon down.
+        assert_eq!(response.status, 400);
         assert!(
-            error.to_string().contains("conversation.mode"),
-            "expected error to mention conversation.mode, got: {error}"
+            response.body.contains("conversation.mode"),
+            "expected body to mention conversation.mode, got: {}",
+            response.body
+        );
+        assert!(
+            response.body.contains("invalid_request"),
+            "expected structured `invalid_request` code, got: {}",
+            response.body
         );
         assert!(runtime.launches.borrow().is_empty());
         Ok(())
@@ -1103,19 +1127,20 @@ mod tests {
         })
         .to_string();
 
-        let error = handle_request_with_runtime(
+        let response = handle_request_with_runtime(
             "POST",
             "/sessions",
             temp_dir.path(),
             None,
             Some(&body),
             &runtime,
-        )
-        .unwrap_err();
+        )?;
 
+        assert_eq!(response.status, 400);
         assert!(
-            error.to_string().contains("outside the Coven project root"),
-            "unexpected error: {error:?}"
+            response.body.contains("outside the Coven project root"),
+            "unexpected body: {}",
+            response.body
         );
         assert!(runtime.launches.borrow().is_empty());
         Ok(())
@@ -1126,17 +1151,18 @@ mod tests {
         let temp_dir = tempfile::tempdir()?;
         let runtime = RecordingRuntime::default();
 
-        let error = handle_request_with_runtime(
+        let response = handle_request_with_runtime(
             "POST",
             "/sessions",
             temp_dir.path(),
             None,
             Some(r#"{"harness":"codex"}"#),
             &runtime,
-        )
-        .unwrap_err();
+        )?;
 
-        assert!(error.to_string().contains("projectRoot"));
+        assert_eq!(response.status, 400);
+        assert!(response.body.contains("projectRoot"));
+        assert!(response.body.contains("invalid_request"));
         assert!(runtime.launches.borrow().is_empty());
         Ok(())
     }
