@@ -2751,7 +2751,7 @@ mod tests {
 
         // Visible transcript preserved (plus the /new system message).
         assert!(
-            app.messages.len() >= messages_after_first_turn + 1,
+            app.messages.len() > messages_after_first_turn,
             "/new must keep prior messages and add at least its own system message"
         );
         assert!(
