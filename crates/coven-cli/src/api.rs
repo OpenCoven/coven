@@ -186,14 +186,15 @@ pub fn handle_request_with_runtime(
         }
         ("POST", "/cast") => submit_cast(coven_home, body),
         ("GET", "/cast-codes") => cast_codes_response(),
-        // Empty-array stubs: the cockpit polls these surfaces but the daemon
-        // does not track them yet. Returning [] lets pages render their empty
-        // state instead of 404 errors. Replace with real implementations as
-        // the daemon learns about each concept.
-        ("GET", "/familiars") => json_response(200, &json!([])),
-        ("GET", "/skills") => json_response(200, &json!([])),
-        ("GET", "/memory") => json_response(200, &json!([])),
-        ("GET", "/research") => json_response(200, &json!([])),
+        // Filesystem-backed reads under ~/.coven/. Missing files return [].
+        ("GET", "/familiars") => {
+            json_response(200, &crate::cockpit_sources::read_familiars(coven_home)?)
+        }
+        ("GET", "/skills") => json_response(200, &crate::cockpit_sources::scan_skills(coven_home)?),
+        ("GET", "/memory") => json_response(200, &crate::cockpit_sources::scan_memory(coven_home)?),
+        ("GET", "/research") => {
+            json_response(200, &crate::cockpit_sources::read_research(coven_home)?)
+        }
         ("GET", "/sessions") => {
             let conn = store::open_store(&store_path(coven_home))?;
             let sessions = store::list_sessions(&conn)?;
