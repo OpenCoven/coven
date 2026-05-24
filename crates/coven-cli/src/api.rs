@@ -158,6 +158,7 @@ pub fn handle_request_with_runtime(
         ),
         ("GET", "/health") => json_response(200, &health_response(daemon)),
         ("GET", "/capabilities") => json_response(200, &control_plane::capabilities()),
+        ("GET", "/overview") => overview_response(coven_home),
         ("POST", "/actions") => {
             let payload = match parse_body(body) {
                 Ok(payload) => payload,
@@ -385,6 +386,38 @@ struct CastResultDto {
     accepted: bool,
     cast_id: String,
     echo: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OverviewDto {
+    active_familiars: u32,
+    total_familiars: u32,
+    open_sessions: u32,
+    skills_count: u32,
+    average_skill_score: u32,
+    research_iterations: u32,
+    last_research_delta: i32,
+}
+
+fn overview_response(coven_home: &Path) -> Result<ApiResponse> {
+    let conn = store::open_store(&store_path(coven_home))?;
+    let sessions = store::list_sessions(&conn)?;
+    let open_sessions = sessions
+        .iter()
+        .filter(|s| s.status == "running" || s.status == "active")
+        .count() as u32;
+    json_response(
+        200,
+        &OverviewDto {
+            active_familiars: 0,
+            total_familiars: 0,
+            open_sessions,
+            skills_count: 0,
+            average_skill_score: 0,
+            research_iterations: 0,
+            last_research_delta: 0,
+        },
+    )
 }
 
 fn submit_cast(coven_home: &Path, body: Option<&str>) -> Result<ApiResponse> {
@@ -1777,6 +1810,37 @@ mod tests {
         let sessions = store::list_sessions(&conn)?;
         let cockpit_count = sessions.iter().filter(|s| s.id == "__cockpit__").count();
         assert_eq!(cockpit_count, 1, "expected exactly one __cockpit__ session row");
+        Ok(())
+    }
+
+    #[test]
+    fn get_overview_returns_session_count_and_zeroed_unknowns() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let conn = store::open_store(&store_path(home))?;
+        for id in ["s1", "s2", "s3"] {
+            let now = "2026-01-01T00:00:00Z";
+            let status = if id == "s3" { "ended" } else { "running" };
+            store::insert_session(&conn, &store::SessionRecord {
+                id: id.into(),
+                project_root: "/tmp".into(),
+                harness: "claude".into(),
+                title: "t".into(),
+                status: status.into(),
+                exit_code: None,
+                archived_at: None,
+                created_at: now.into(),
+                updated_at: now.into(),
+            })?;
+        }
+        drop(conn);
+
+        let response = handle_request("GET", "/api/v1/overview", home, None)?;
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["open_sessions"], 2);
+        assert_eq!(body["active_familiars"], 0);
+        assert_eq!(body["skills_count"], 0);
         Ok(())
     }
 }
