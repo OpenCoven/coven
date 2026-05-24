@@ -1684,4 +1684,99 @@ mod tests {
         assert_eq!(response.status, 400);
         Ok(())
     }
+
+    #[test]
+    fn post_cast_with_target_logs_event_to_session() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+
+        let conn = store::open_store(&store_path(home))?;
+        let session = store::SessionRecord {
+            id: "sess-target".into(),
+            project_root: "/tmp/proj".into(),
+            harness: "claude".into(),
+            title: "demo".into(),
+            status: "running".into(),
+            exit_code: None,
+            archived_at: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        };
+        store::insert_session(&conn, &session)?;
+        drop(conn);
+
+        let body = json!({ "code": "/handoff", "target": "sess-target" });
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/cast",
+            home,
+            None,
+            Some(&body.to_string()),
+        )?;
+        assert_eq!(response.status, 202);
+        let result: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(result["accepted"], true);
+        assert_eq!(result["echo"], "/handoff → sess-target");
+
+        // Verify the cast landed as an event on the target session, not __cockpit__.
+        let log_response = handle_request("GET", "/api/v1/sessions/sess-target/log", home, None)?;
+        assert_eq!(log_response.status, 200);
+        let lines: serde_json::Value = serde_json::from_str(&log_response.body)?;
+        let arr = lines.as_array().expect("array body");
+        assert_eq!(arr.len(), 1);
+        assert!(
+            arr[0]["message"].as_str().unwrap().contains("/handoff"),
+            "expected log message to contain code; got: {}",
+            arr[0]["message"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn post_cast_with_unknown_target_returns_404() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let body = json!({ "code": "/status", "target": "no-such-session" });
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/cast",
+            temp.path(),
+            None,
+            Some(&body.to_string()),
+        )?;
+        assert_eq!(response.status, 404);
+        assert!(
+            response.body.contains(r#""code":"session_not_found""#),
+            "expected session_not_found body; got: {}",
+            response.body
+        );
+        assert!(
+            response.body.contains(r#""sessionId":"no-such-session""#),
+            "expected sessionId in error details; got: {}",
+            response.body
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn post_cast_without_target_idempotently_uses_cockpit_session() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let body = json!({ "code": "/status" });
+        for _ in 0..3 {
+            let response = handle_request_with_body(
+                "POST",
+                "/api/v1/cast",
+                home,
+                None,
+                Some(&body.to_string()),
+            )?;
+            assert_eq!(response.status, 202);
+        }
+        // Only one __cockpit__ row should exist; all three casts land as events on it.
+        let conn = store::open_store(&store_path(home))?;
+        let sessions = store::list_sessions(&conn)?;
+        let cockpit_count = sessions.iter().filter(|s| s.id == "__cockpit__").count();
+        assert_eq!(cockpit_count, 1, "expected exactly one __cockpit__ session row");
+        Ok(())
+    }
 }
