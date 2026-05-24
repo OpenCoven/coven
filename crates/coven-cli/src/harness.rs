@@ -19,8 +19,20 @@ pub enum HarnessLaunchMode {
     /// Long-lived stream-json process: stdin reads newline-delimited JSON
     /// messages, stdout writes newline-delimited JSON events. Only
     /// `claude` supports this today (`-p --input-format stream-json
-    /// --output-format stream-json --verbose`). Codex falls back to
-    /// `NonInteractive` if asked for `Stream`.
+    /// --output-format stream-json --verbose`).
+    ///
+    /// Capability is enforced at two layers:
+    /// - `command_parts_for_harness_with_conversation` (the offline arg
+    ///   builder): codex's `stream_args` returns `None`, so the builder
+    ///   falls back to non-interactive args. This makes the function
+    ///   safe to call standalone.
+    /// - `daemon::LiveSessionRuntime::launch_session` (the live runtime):
+    ///   explicitly rejects stream-mode launches when
+    ///   `harness_supports_stream_mode(harness)` is false, returning a
+    ///   structured `500 launch_failed` so the client sees the actual
+    ///   constraint instead of a silently-downgraded behavior. The
+    ///   chat layer is the only caller that requests Stream today and
+    ///   already gates on `harness_supports_stream_mode` before doing so.
     Stream,
 }
 
