@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::Write;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -53,15 +54,55 @@ pub trait RuntimeKiller: Send {
     fn kill(&mut self) -> Result<()>;
 }
 
+/// Sentinel error returned by `LiveSessionRuntime::send_input` and
+/// `kill_session` when the session id isn't in the live registry. The
+/// API layer downcasts to this type instead of substring-matching the
+/// error message — refactoring the prose now can't accidentally route
+/// "not live" cases to the generic 500 path.
+#[derive(Debug)]
+pub struct NotLiveError {
+    pub session_id: String,
+}
+
+impl std::fmt::Display for NotLiveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "session `{}` is not live in this daemon",
+            self.session_id
+        )
+    }
+}
+
+impl std::error::Error for NotLiveError {}
+
 #[derive(Default)]
 pub struct LiveSessionRuntime {
     coven_home: Option<PathBuf>,
     sessions: Mutex<HashMap<String, LiveSessionHandle>>,
 }
 
+/// What kind of underlying process is bound to a registered live session.
+/// PTY sessions take raw text on stdin (we forward `payload.data` as bytes).
+/// Stream sessions take newline-delimited JSON; `payload.data` gets wrapped
+/// in a `{"type":"user","message":{"role":"user","content":[{...}]}}` envelope
+/// before being written to the child. See `docs/chat-persistence.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveSessionKind {
+    Pty,
+    Stream,
+}
+
+/// Registered live session. `input` and `killer` each sit behind their own
+/// `Arc<Mutex<…>>` so `send_input` and `kill_session` can drop the global
+/// `sessions` map lock before doing any potentially-blocking I/O (a
+/// stream-mode harness whose child has stopped reading stdin will block
+/// the write; we don't want that to wedge every other session op,
+/// including a concurrent `/kill` to recover).
 struct LiveSessionHandle {
-    input: Box<dyn Write + Send>,
-    killer: Box<dyn RuntimeKiller>,
+    kind: LiveSessionKind,
+    input: std::sync::Arc<Mutex<Box<dyn Write + Send>>>,
+    killer: std::sync::Arc<Mutex<Box<dyn RuntimeKiller>>>,
 }
 
 impl LiveSessionRuntime {
@@ -79,28 +120,95 @@ impl LiveSessionRuntime {
         input: Box<dyn Write + Send>,
         killer: Box<dyn RuntimeKiller>,
     ) -> Result<()> {
+        self.register_kind(session_id, LiveSessionKind::Pty, input, killer)
+    }
+
+    fn register_kind(
+        &self,
+        session_id: String,
+        kind: LiveSessionKind,
+        input: Box<dyn Write + Send>,
+        killer: Box<dyn RuntimeKiller>,
+    ) -> Result<()> {
+        use std::sync::Arc;
         self.sessions
             .lock()
             .map_err(|_| anyhow::anyhow!("live session registry lock poisoned"))?
-            .insert(session_id, LiveSessionHandle { input, killer });
+            .insert(
+                session_id,
+                LiveSessionHandle {
+                    kind,
+                    input: Arc::new(Mutex::new(input)),
+                    killer: Arc::new(Mutex::new(killer)),
+                },
+            );
         Ok(())
     }
 }
 
 impl SessionRuntime for LiveSessionRuntime {
     fn launch_session(&self, launch: &SessionLaunch) -> Result<()> {
-        let command = pty_runner::build_harness_command(
+        let command = pty_runner::build_harness_command_with_conversation(
             &launch.harness,
             &launch.prompt,
             Path::new(&launch.cwd),
             launch.launch_mode,
+            launch.conversation.as_ref(),
         )?;
         let observer = self
             .coven_home
             .as_ref()
             .map(|coven_home| output_observer(coven_home.to_path_buf(), launch.id.clone()));
+
+        if launch.launch_mode == crate::harness::HarnessLaunchMode::Stream {
+            // Defense in depth: only allow Stream mode for harnesses that
+            // actually have a stream-json entrypoint. Without this check
+            // the chat's local gating could be bypassed by another client
+            // requesting Stream for, say, codex — the daemon would then
+            // JSON-wrap stdin into a one-shot `codex exec` process that
+            // doesn't understand it.
+            if !crate::harness::harness_supports_stream_mode(&launch.harness) {
+                anyhow::bail!(
+                    "harness `{}` does not support stream-mode launches; use launchMode `nonInteractive` instead",
+                    launch.harness
+                );
+            }
+            let piped = pty_runner::spawn_piped_with_observer(&command, observer)?;
+            let mut killer_box: Box<dyn RuntimeKiller> = Box::new(PipedKiller { pid: piped.pid });
+            let mut input = piped.input;
+            // Send the launch's prompt as the first stream-json user
+            // message so the chat doesn't need a separate send call right
+            // after launch. A write failure here means the child already
+            // exited (e.g. auth missing) — treat that as a hard launch
+            // error: kill what's left of the child and surface it to the
+            // caller so the session row is marked failed instead of
+            // pretending we delivered the prompt.
+            if !launch.prompt.is_empty() {
+                if let Err(error) = write_stream_message(input.as_mut(), &launch.prompt) {
+                    let _ = killer_box.kill();
+                    return Err(error).with_context(|| {
+                        format!(
+                            "stream-mode launch of `{}` failed: child closed stdin before the initial message landed (auth/setup error?)",
+                            launch.harness
+                        )
+                    });
+                }
+            }
+            return self.register_kind(
+                launch.id.clone(),
+                LiveSessionKind::Stream,
+                input,
+                killer_box,
+            );
+        }
+
         let detached = pty_runner::spawn_detached_with_observer(&command, observer)?;
-        self.register(launch.id.clone(), detached.input, Box::new(detached.killer))
+        self.register_kind(
+            launch.id.clone(),
+            LiveSessionKind::Pty,
+            detached.input,
+            Box::new(detached.killer),
+        )
     }
 
     fn send_input(&self, session_id: &str, payload: &Value) -> Result<()> {
@@ -108,33 +216,137 @@ impl SessionRuntime for LiveSessionRuntime {
             .get("data")
             .and_then(Value::as_str)
             .context("input payload requires string field `data`")?;
-        let mut sessions = self
-            .sessions
+        // Look up the per-session input writer under the map lock, then
+        // drop the map lock BEFORE blocking on the actual write. A
+        // stream-mode child that's stopped reading stdin can stall the
+        // write indefinitely; holding the global map lock during that
+        // would wedge every other session op (including a concurrent
+        // /kill that wants to recover from exactly this state).
+        let (kind, input) = {
+            let sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| anyhow::anyhow!("live session registry lock poisoned"))?;
+            let session = sessions.get(session_id).ok_or_else(|| {
+                anyhow::Error::new(NotLiveError {
+                    session_id: session_id.to_string(),
+                })
+            })?;
+            (session.kind, std::sync::Arc::clone(&session.input))
+        };
+        let mut input = input
             .lock()
-            .map_err(|_| anyhow::anyhow!("live session registry lock poisoned"))?;
-        let session = sessions
-            .get_mut(session_id)
-            .with_context(|| format!("session `{session_id}` is not live in this daemon"))?;
-        session
-            .input
-            .write_all(data.as_bytes())
-            .context("failed to write input to live session")?;
-        session
-            .input
-            .flush()
-            .context("failed to flush live session input")?;
+            .map_err(|_| anyhow::anyhow!("live session input lock poisoned"))?;
+        match kind {
+            LiveSessionKind::Pty => {
+                input
+                    .write_all(data.as_bytes())
+                    .context("failed to write input to live session")?;
+                input
+                    .flush()
+                    .context("failed to flush live session input")?;
+            }
+            LiveSessionKind::Stream => {
+                write_stream_message(input.as_mut(), data)?;
+            }
+        }
         Ok(())
     }
 
     fn kill_session(&self, session_id: &str) -> Result<()> {
-        let mut sessions = self
-            .sessions
+        // Remove the handle under the map lock, then drop the map lock
+        // before doing the actual kill. The killer is in its own
+        // `Arc<Mutex>` so a concurrent `send_input` that's blocked on a
+        // hung write can't prevent us from issuing the kill.
+        let handle = {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| anyhow::anyhow!("live session registry lock poisoned"))?;
+            sessions.remove(session_id).ok_or_else(|| {
+                anyhow::Error::new(NotLiveError {
+                    session_id: session_id.to_string(),
+                })
+            })?
+        };
+        let mut killer = handle
+            .killer
             .lock()
-            .map_err(|_| anyhow::anyhow!("live session registry lock poisoned"))?;
-        let mut session = sessions
-            .remove(session_id)
-            .with_context(|| format!("session `{session_id}` is not live in this daemon"))?;
-        session.killer.kill()
+            .map_err(|_| anyhow::anyhow!("live session killer lock poisoned"))?;
+        killer.kill()
+    }
+}
+
+/// Wrap raw user text in claude's stream-json user-message envelope and
+/// write it to `input`, followed by a newline so the child reads it
+/// immediately. Used by both the launch-time initial message and by the
+/// per-turn `send_input` path.
+fn write_stream_message(input: &mut dyn Write, text: &str) -> Result<()> {
+    let envelope = json!({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": text}
+            ]
+        }
+    });
+    let mut line =
+        serde_json::to_string(&envelope).context("failed to encode stream-json user envelope")?;
+    line.push('\n');
+    input
+        .write_all(line.as_bytes())
+        .context("failed to write stream-json message to live session")?;
+    input
+        .flush()
+        .context("failed to flush stream-json message to live session")?;
+    Ok(())
+}
+
+/// Killer for a non-PTY piped child (stream-mode harness sessions).
+/// `pty_runner::spawn_piped_with_observer` returns just the child's PID
+/// because the `Child` handle itself lives inside the wait/drain thread —
+/// sharing it through a `Mutex` would deadlock when `wait()` blocks while
+/// `kill()` waits for the same lock.
+///
+/// The spawn path puts the child in its own session/process group via
+/// `setsid()` (pre_exec), so we can signal the entire group with one
+/// syscall — that picks up subprocesses the harness may have spawned
+/// (skills, MCP servers, shells, …) which would otherwise survive as
+/// orphans. We send SIGKILL (not SIGTERM) because the daemon kill path
+/// is reached from explicit user intent (`/kill`, `/clear`, chat exit)
+/// where the right behavior is "stop immediately"; SIGTERM would let a
+/// harness that ignores it linger past the user's request.
+struct PipedKiller {
+    pid: u32,
+}
+
+impl RuntimeKiller for PipedKiller {
+    #[cfg(unix)]
+    fn kill(&mut self) -> Result<()> {
+        let pid = self.pid as libc::pid_t;
+        // Negative argument signals the process group (pgid == pid
+        // since the child called setsid). SIGKILL can't be ignored.
+        let rc = unsafe { libc::kill(-pid, libc::SIGKILL) };
+        if rc != 0 {
+            let error = std::io::Error::last_os_error();
+            // ESRCH means the group is already gone — fine, that's
+            // the post-condition we want.
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error).with_context(|| {
+                    format!("failed to SIGKILL stream harness process group {pid}")
+                });
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn kill(&mut self) -> Result<()> {
+        anyhow::bail!(
+            "stream-mode harness kill not implemented on this platform (pid {})",
+            self.pid
+        )
     }
 }
 
@@ -149,13 +361,18 @@ fn output_observer(coven_home: PathBuf, session_id: String) -> pty_runner::Detac
     let output_session_id = session_id.clone();
     let exit_home = coven_home;
     let exit_session_id = session_id;
-
+    // UTF-8 boundary safety is enforced by `drain_detached_output` in
+    // pty_runner per-source (separate buffers for stdout and stderr in
+    // stream mode), so each chunk we receive here is already valid
+    // UTF-8. We just decode and record. Lossy decode is a defensive
+    // fallback that should never trigger.
     pty_runner::DetachedPtyObserver {
         on_output: Box::new(move |chunk| {
             if chunk.is_empty() {
                 return;
             }
-            let text = String::from_utf8_lossy(&chunk).into_owned();
+            let text = String::from_utf8(chunk)
+                .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned());
             let _ = record_session_event(
                 &output_home,
                 &output_session_id,
@@ -650,6 +867,49 @@ fn daemon_status_from_health_socket(socket: &str) -> Result<Option<DaemonStatus>
     }
 }
 
+// `bind_tcp_listener` and `serve_next_tcp_connection` expose the TCP transport
+// so it can be unit-tested in isolation; `serve_forever` wires them into the
+// daemon's accept loop alongside the Unix socket listener.
+//
+// TCP gets read/write timeouts and a Content-Length cap because — unlike the
+// Unix socket — a misbehaving network client can otherwise hold the API
+// thread indefinitely (slowloris) or force a huge allocation by claiming a
+// large body.
+pub const TCP_IO_TIMEOUT: Duration = Duration::from_secs(30);
+pub const MAX_TCP_BODY_BYTES: usize = 1024 * 1024;
+
+pub fn bind_tcp_listener<A: std::net::ToSocketAddrs>(addr: A) -> Result<TcpListener> {
+    let listener = TcpListener::bind(&addr).with_context(|| "failed to bind Coven TCP listener")?;
+    Ok(listener)
+}
+
+#[cfg(unix)]
+pub fn serve_next_tcp_connection(
+    listener: &TcpListener,
+    coven_home: &Path,
+    status: Option<DaemonStatus>,
+    runtime: &dyn SessionRuntime,
+) -> Result<()> {
+    let (stream, _) = listener
+        .accept()
+        .context("failed to accept TCP API connection")?;
+    stream
+        .set_read_timeout(Some(TCP_IO_TIMEOUT))
+        .context("failed to set TCP read timeout")?;
+    stream
+        .set_write_timeout(Some(TCP_IO_TIMEOUT))
+        .context("failed to set TCP write timeout")?;
+    let read = stream.try_clone().context("failed to clone TCP stream")?;
+    handle_http_stream(
+        read,
+        stream,
+        coven_home,
+        status,
+        runtime,
+        Some(MAX_TCP_BODY_BYTES),
+    )
+}
+
 #[cfg(unix)]
 pub fn bind_api_socket(coven_home: &Path) -> Result<UnixListener> {
     ensure_private_coven_home(coven_home)?;
@@ -672,7 +932,8 @@ pub fn bind_api_socket(coven_home: &Path) -> Result<UnixListener> {
 }
 
 #[cfg(unix)]
-pub fn serve_forever(coven_home: &Path, started_at: String) -> Result<()> {
+pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&str>) -> Result<()> {
+    use std::sync::Arc;
     let status = DaemonStatus {
         pid: std::process::id(),
         started_at: started_at.clone(),
@@ -682,28 +943,68 @@ pub fn serve_forever(coven_home: &Path, started_at: String) -> Result<()> {
     };
     write_status(coven_home, &status)?;
     recover_orphaned_sessions(coven_home, &started_at)?;
-    let listener = bind_api_socket(coven_home)?;
-    let runtime = LiveSessionRuntime::with_coven_home(coven_home.to_path_buf());
+    let unix_listener = bind_api_socket(coven_home)?;
+    let runtime = Arc::new(LiveSessionRuntime::with_coven_home(
+        coven_home.to_path_buf(),
+    ));
+
+    if let Some(addr) = tcp_addr {
+        let tcp_listener = bind_tcp_listener(addr)?;
+        let tcp_home = coven_home.to_path_buf();
+        let tcp_status = status.clone();
+        let tcp_runtime = Arc::clone(&runtime);
+        // TCP accept errors are logged and the loop continues — misbehaving
+        // network clients should not bring down the daemon. The Unix loop
+        // below treats accept errors as fatal because they indicate local
+        // system trouble.
+        std::thread::Builder::new()
+            .name("coven-tcp-api".into())
+            .spawn(move || loop {
+                if let Err(error) = serve_next_tcp_connection(
+                    &tcp_listener,
+                    &tcp_home,
+                    Some(tcp_status.clone()),
+                    tcp_runtime.as_ref(),
+                ) {
+                    eprintln!("coven daemon: TCP connection error: {error:#}");
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            })
+            .context("failed to spawn TCP API thread")?;
+    }
+
     loop {
-        serve_next_connection(&listener, coven_home, Some(status.clone()), &runtime)?;
+        serve_next_connection(
+            &unix_listener,
+            coven_home,
+            Some(status.clone()),
+            runtime.as_ref(),
+        )?;
     }
 }
 
 #[cfg(unix)]
-pub fn serve_next_connection(
-    listener: &UnixListener,
+fn handle_http_stream<R, W>(
+    read: R,
+    mut write: W,
     coven_home: &Path,
     status: Option<DaemonStatus>,
     runtime: &dyn SessionRuntime,
-) -> Result<()> {
-    let (stream, _) = listener
-        .accept()
-        .context("failed to accept API connection")?;
-    let mut reader = BufReader::new(stream);
+    max_body_bytes: Option<usize>,
+) -> Result<()>
+where
+    R: Read,
+    W: Write,
+{
+    let mut reader = BufReader::new(read);
     let request_line = read_http_request_line(&mut reader)?;
     let content_length = read_http_headers(&mut reader)?;
+    if let Some(max) = max_body_bytes {
+        if content_length > max {
+            return write_payload_too_large(&mut write, max);
+        }
+    }
     let body = read_http_body(&mut reader, content_length)?;
-    let mut stream = reader.into_inner();
     let (method, path) = parse_request_line(&request_line)?;
     let response = crate::api::handle_request_with_runtime(
         method,
@@ -722,10 +1023,42 @@ pub fn serve_next_connection(
         response.body.len(),
         response.body
     );
-    stream
+    write
         .write_all(http.as_bytes())
         .context("failed to write API response")?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn write_payload_too_large<W: Write>(write: &mut W, max: usize) -> Result<()> {
+    let body = format!(
+        "{{\"ok\":false,\"error\":{{\"code\":\"payload_too_large\",\"message\":\"Request body exceeds {max}-byte limit.\"}}}}",
+    );
+    let http = format!(
+        "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    write
+        .write_all(http.as_bytes())
+        .context("failed to write 413 response")?;
+    Ok(())
+}
+
+#[cfg(unix)]
+pub fn serve_next_connection(
+    listener: &UnixListener,
+    coven_home: &Path,
+    status: Option<DaemonStatus>,
+    runtime: &dyn SessionRuntime,
+) -> Result<()> {
+    let (stream, _) = listener
+        .accept()
+        .context("failed to accept API connection")?;
+    let read = stream.try_clone().context("failed to clone Unix stream")?;
+    // Unix socket has no body cap — only local processes can reach it and the
+    // socket permission bits already gate access.
+    handle_http_stream(read, stream, coven_home, status, runtime, None)
 }
 
 fn http_reason_phrase(status: u16) -> &'static str {
@@ -804,6 +1137,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn output_observer_records_each_callback_as_an_event() -> Result<()> {
+        // UTF-8 boundary safety lives in pty_runner::drain_detached_output
+        // now (see its tests). The observer's only job is to take each
+        // chunk it receives and persist it as an `output` event. This
+        // test pins that minimal contract by feeding the observer two
+        // pre-decoded chunks and checking they show up verbatim in the
+        // events table.
+        let temp_dir = tempfile::tempdir()?;
+        let conn = crate::store::open_store(&temp_dir.path().join("coven.sqlite3"))?;
+        let session = session_record("buffered");
+        crate::store::insert_session(&conn, &session)?;
+
+        let observer = output_observer(temp_dir.path().to_path_buf(), session.id.clone());
+        let pty_runner::DetachedPtyObserver { mut on_output, .. } = observer;
+
+        // The drain layer would only ever hand us valid-UTF-8 slices,
+        // so simulate that: a complete emoji and then a plain ASCII
+        // chunk, each fully decodable on its own.
+        on_output("🎉".as_bytes().to_vec());
+        on_output(b" done".to_vec());
+
+        let events = crate::store::list_events(&conn, &session.id)?;
+        let mut decoded = String::new();
+        for event in events.iter().filter(|e| e.kind == "output") {
+            let payload: serde_json::Value = serde_json::from_str(&event.payload_json)?;
+            if let Some(text) = payload.get("data").and_then(|v| v.as_str()) {
+                decoded.push_str(text);
+            }
+        }
+        assert_eq!(decoded, "🎉 done");
+        Ok(())
+    }
+
+    #[test]
+    fn live_runtime_rejects_stream_launch_for_non_stream_capable_harness() {
+        let runtime = LiveSessionRuntime::default();
+        let launch = crate::api::SessionLaunch {
+            id: "session-x".to_string(),
+            project_root: "/tmp/x".to_string(),
+            cwd: "/tmp/x".to_string(),
+            harness: "codex".to_string(),
+            launch_mode: crate::harness::HarnessLaunchMode::Stream,
+            prompt: "hello".to_string(),
+            title: "stream codex (should be rejected)".to_string(),
+            conversation: None,
+            conversation_id: None,
+        };
+
+        let error = SessionRuntime::launch_session(&runtime, &launch).unwrap_err();
+        assert!(
+            error.to_string().contains("does not support stream-mode"),
+            "rejection message should name the constraint, got: {error}"
+        );
+    }
+
+    #[test]
     fn live_runtime_writes_input_to_registered_session() -> Result<()> {
         let runtime = LiveSessionRuntime::default();
         let output = SharedBuffer::default();
@@ -879,9 +1268,165 @@ mod tests {
         }
     }
 
+    /// `Write` impl whose `write` blocks until a kill signal is set.
+    /// Used to simulate a stream-mode child that has stopped reading
+    /// stdin — we want `kill_session` to succeed even while
+    /// `send_input` is mid-write to that exact session.
+    #[derive(Clone)]
+    struct BlockingWriter {
+        unblock: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl Write for BlockingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let (lock, cvar) = &*self.unblock;
+            let mut guard = lock.lock().unwrap();
+            while !*guard {
+                guard = cvar.wait(guard).unwrap();
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn kill_session_succeeds_even_while_send_input_is_blocked_on_a_hung_child() {
+        use std::sync::{Arc, Condvar, Mutex as StdMutex};
+        use std::thread;
+
+        let runtime = Arc::new(LiveSessionRuntime::default());
+        let unblock = Arc::new((StdMutex::new(false), Condvar::new()));
+        let writer = BlockingWriter {
+            unblock: Arc::clone(&unblock),
+        };
+        let killed = Arc::new(StdMutex::new(false));
+        runtime
+            .register(
+                "wedged-session".to_string(),
+                Box::new(writer),
+                Box::new(RecordingKiller {
+                    killed: killed.clone(),
+                }),
+            )
+            .unwrap();
+
+        // Kick off a send that will block on the writer.
+        let sender_runtime = Arc::clone(&runtime);
+        let sender = thread::spawn(move || {
+            SessionRuntime::send_input(
+                &*sender_runtime,
+                "wedged-session",
+                &serde_json::json!({ "data": "wedge" }),
+            )
+        });
+
+        // Give the sender a moment to take the input lock + block.
+        thread::sleep(std::time::Duration::from_millis(50));
+
+        // Kill must succeed regardless of the wedged send.
+        SessionRuntime::kill_session(&*runtime, "wedged-session")
+            .expect("kill_session must not be blocked by a hung send_input on the same session");
+        assert!(*killed.lock().unwrap());
+
+        // Let the writer unblock so the sender thread can finish (its
+        // post-kill state isn't what we're testing).
+        {
+            let (lock, cvar) = &*unblock;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+        let _ = sender.join();
+    }
+
     #[test]
     fn http_reason_phrase_names_bad_requests() {
         assert_eq!(http_reason_phrase(400), "Bad Request");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_http_stream_processes_health_request() {
+        use crate::api::NoopSessionRuntime;
+        use std::io::Cursor;
+        let temp = tempfile::tempdir().expect("tempdir");
+        ensure_private_coven_home(temp.path()).expect("ensure home");
+        let request = b"GET /api/v1/health HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n";
+        let mut stream = Cursor::new(Vec::from(&request[..]));
+        let mut output: Vec<u8> = Vec::new();
+        let runtime = NoopSessionRuntime;
+        handle_http_stream(&mut stream, &mut output, temp.path(), None, &runtime, None)
+            .expect("handle ok");
+        let response = String::from_utf8(output).expect("utf8");
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
+        assert!(response.contains("\"apiVersion\""), "got: {response}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_http_stream_rejects_oversize_body() {
+        use crate::api::NoopSessionRuntime;
+        use std::io::Cursor;
+        let temp = tempfile::tempdir().expect("tempdir");
+        ensure_private_coven_home(temp.path()).expect("ensure home");
+        // Claim a body larger than the cap; the handler must reject without
+        // reading the body, so the bytes don't need to actually be present.
+        let request = format!(
+            "POST /api/v1/cast HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n",
+            MAX_TCP_BODY_BYTES + 1
+        );
+        let mut stream = Cursor::new(request.into_bytes());
+        let mut output: Vec<u8> = Vec::new();
+        let runtime = NoopSessionRuntime;
+        handle_http_stream(
+            &mut stream,
+            &mut output,
+            temp.path(),
+            None,
+            &runtime,
+            Some(MAX_TCP_BODY_BYTES),
+        )
+        .expect("handle ok");
+        let response = String::from_utf8(output).expect("utf8");
+        assert!(
+            response.starts_with("HTTP/1.1 413 Payload Too Large"),
+            "got: {response}"
+        );
+        assert!(response.contains("payload_too_large"), "got: {response}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bind_tcp_listener_serves_health_over_tcp() {
+        use crate::api::NoopSessionRuntime;
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::thread;
+        let temp = tempfile::tempdir().expect("tempdir");
+        ensure_private_coven_home(temp.path()).expect("ensure home");
+        let listener = bind_tcp_listener("127.0.0.1:0").expect("bind tcp");
+        let addr = listener.local_addr().expect("local addr");
+        let coven_home = temp.path().to_path_buf();
+        let server = thread::spawn(move || {
+            let runtime = NoopSessionRuntime;
+            serve_next_tcp_connection(&listener, &coven_home, None, &runtime).expect("serve tcp");
+        });
+
+        let mut client = TcpStream::connect(addr).expect("connect");
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("read timeout");
+        client
+            .write_all(b"GET /api/v1/health HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n")
+            .expect("write request");
+        let mut response = String::new();
+        client.read_to_string(&mut response).expect("read response");
+        server.join().expect("server thread");
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
+        assert!(response.contains("\"apiVersion\""), "got: {response}");
     }
 
     #[test]
@@ -1349,6 +1894,7 @@ mod tests {
                 archived_at: None,
                 created_at: "2026-04-27T10:00:00Z".to_string(),
                 updated_at: "2026-04-27T10:00:00Z".to_string(),
+                conversation_id: None,
             },
         )?;
         let listener = bind_api_socket(temp_dir.path())?;
@@ -1453,6 +1999,7 @@ mod tests {
             archived_at: None,
             created_at: "2026-04-27T07:00:00Z".to_string(),
             updated_at: "2026-04-27T07:00:00Z".to_string(),
+            conversation_id: None,
         }
     }
 

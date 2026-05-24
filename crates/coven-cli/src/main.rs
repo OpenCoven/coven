@@ -141,7 +141,17 @@ enum DaemonCommand {
     Status,
     Stop,
     #[command(hide = true)]
-    Serve,
+    Serve {
+        #[arg(
+            long,
+            value_name = "ADDR",
+            help = "Also bind an HTTP TCP listener at ADDR (e.g. 127.0.0.1:3000). \
+                    The API is unauthenticated — bind only to loopback for local \
+                    dev (e.g. cockpit via Vite proxy). Do not expose to non-loopback \
+                    interfaces or untrusted networks."
+        )]
+        tcp: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -479,6 +489,7 @@ fn launch_patch_session(request: &patch::PatchOpenClawRequest) -> Result<String>
         archived_at: None,
         created_at: now.clone(),
         updated_at: now.clone(),
+        conversation_id: None,
     };
     store::insert_session(&conn, &record)?;
     store::insert_json_event(
@@ -570,13 +581,14 @@ fn run_daemon_command(command: DaemonCommand) -> Result<()> {
                 println!("coven daemon was not running");
             }
         }
-        DaemonCommand::Serve => {
+        DaemonCommand::Serve { tcp } => {
             #[cfg(unix)]
             {
-                daemon::serve_forever(&home, current_timestamp())?;
+                daemon::serve_forever(&home, current_timestamp(), tcp.as_deref())?;
             }
             #[cfg(not(unix))]
             {
+                let _ = tcp;
                 anyhow::bail!(
                     "coven daemon server is only implemented on Unix-like systems for now"
                 );
@@ -624,6 +636,7 @@ fn run_session(
         archived_at: None,
         created_at: now.clone(),
         updated_at: now,
+        conversation_id: None,
     };
 
     store::insert_session(&conn, &record)?;
@@ -1766,6 +1779,7 @@ mod tests {
             archived_at: None,
             created_at: "2026-04-27T06:00:00Z".to_string(),
             updated_at: "2026-04-27T06:00:00Z".to_string(),
+            conversation_id: None,
         };
 
         assert_eq!(
@@ -1786,6 +1800,7 @@ mod tests {
             archived_at: None,
             created_at: "2026-05-14T07:00:00Z".to_string(),
             updated_at: "2026-05-14T07:00:01Z".to_string(),
+            conversation_id: None,
         };
 
         let rendered = render_sessions_json(&[session])?;
@@ -1897,6 +1912,7 @@ mod tests {
             archived_at: archived_at.map(ToOwned::to_owned),
             created_at: "2026-05-08T07:00:00Z".to_string(),
             updated_at: "2026-05-08T07:05:00Z".to_string(),
+            conversation_id: None,
         }
     }
 }

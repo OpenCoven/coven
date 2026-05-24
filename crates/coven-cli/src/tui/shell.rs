@@ -575,6 +575,7 @@ fn create_local_quest_anchor(
         archived_at: None,
         created_at: timestamp.clone(),
         updated_at: timestamp.clone(),
+        conversation_id: None,
     };
     store::insert_session(&conn, &record)?;
     let harness_label = default_harness
@@ -1131,6 +1132,8 @@ fn dispatch_via_daemon(
         launch_mode: crate::harness::HarnessLaunchMode::Interactive,
         prompt: prompt.to_string(),
         title,
+        conversation: None,
+        conversation_id: None,
     };
 
     let mut client = DaemonChatClient::default();

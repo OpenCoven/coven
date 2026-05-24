@@ -74,7 +74,7 @@ sequenceDiagram
   end
   Daemon->>Daemon: canonicalize cwd inside projectRoot
   alt cwd outside root
-    Daemon-->>Client: 400 project_root_violation
+    Daemon-->>Client: 400 invalid_request (cwd вне корня проекта)
   end
   Daemon->>Daemon: lookup harness in adapter table
   alt harness unknown
@@ -82,9 +82,9 @@ sequenceDiagram
   end
   Daemon->>Store: insert session (status=created)
   Daemon->>PTY: spawn argv (prefix args + prompt)
-  alt PTY spawn fails
+  alt spawn / initial-write fails
     Daemon->>Store: update status=failed
-    Daemon-->>Client: 500 pty_spawn_failed
+    Daemon-->>Client: 500 launch_failed (details.sessionId)
   else PTY spawn ok
     Daemon->>Store: update status=running
     Daemon-->>Client: 200 SessionRecord

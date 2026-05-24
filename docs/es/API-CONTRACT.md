@@ -60,17 +60,19 @@ flowchart TD
   Parse -- ok --> Route{Route exists?}
   Route -- no --> ErrNotFound["404 not_found"]
   Route -- yes --> Validate{Field validation}
-  Validate -- cwd outside root --> ErrCwd["400 project_root_violation"]
+  Validate -- cwd outside root --> ErrInvalid
   Validate -- unknown harness/action --> ErrInvalid
   Validate -- ok --> Action{Resource lookup}
   Action -- session missing --> ErrSession["404 session_not_found"]
   Action -- session not live --> ErrLive["409 session_not_live"]
-  Action -- PTY spawn fails --> ErrPty["500 pty_spawn_failed"]
+  Action -- launch (PTY/pipe spawn, init write, harness startup) fails --> ErrLaunch["500 launch_failed"]
+  Action -- send_input fails --> ErrSend["500 send_input_failed"]
+  Action -- kill_session fails --> ErrKill["500 kill_failed"]
   Action -- runtime down --> ErrRuntime["503 runtime_unavailable"]
   Action -- internal panic --> ErrInternal["500 internal_error"]
   Action -- ok --> Success[Documented success shape]
 
-  ErrInvalid & ErrNotFound & ErrCwd & ErrSession & ErrLive & ErrPty & ErrRuntime & ErrInternal -->|"{ error: { code, message, details } }"| Client[Client branches on code]
+  ErrInvalid & ErrNotFound & ErrSession & ErrLive & ErrLaunch & ErrSend & ErrKill & ErrRuntime & ErrInternal -->|"{ error: { code, message, details } }"| Client[Client branches on code]
 ```
 
 Todos los errores de la API usan el siguiente sobre estable. Los clientes deben ramificar en `error.code`, no en `error.message`:
@@ -94,11 +96,14 @@ Todos los errores de la API usan el siguiente sobre estable. Los clientes deben 
 | Código                 | Estado HTTP | Descripción                                      |
 |------------------------|-------------|--------------------------------------------------|
 | `not_found`            | 404         | Ruta genérica no encontrada.                     |
-| `invalid_request`      | 400 o 404   | Petición mal formada o versión de API no compatible. |
+| `invalid_request`      | 400 o 404   | Petición mal formada, id de harness desconocido, campo obligatorio ausente, o versión de API no compatible. |
 | `session_not_found`    | 404         | El id de sesión no existe.                       |
 | `session_not_live`     | 409         | La sesión existe pero no está en ejecución.      |
-| `project_root_violation`| 400        | El cwd está fuera de la raíz de proyecto declarada. |
-| `pty_spawn_failed`     | 500         | El harness PTY no pudo lanzarse.                 |
+| `project_root_violation`| 400        | Reservado. Las violaciones de cwd actualmente emiten `invalid_request`; promover a un código propio permitiría a los clientes ramificar sin parsear el mensaje. |
+| `pty_spawn_failed`     | 500         | Reservado. Los fallos de spawn de PTY actualmente emiten `launch_failed`; promover a un código propio distinguiría "no se pudo abrir el PTY" de "el CLI del harness falló al iniciar". |
+| `launch_failed`        | 500         | El daemon aceptó la petición pero el runtime (PTY/pipe spawn, escritura inicial, arranque del CLI) falló. `details.sessionId` es la fila insertada y marcada como `failed`. |
+| `send_input_failed`    | 500         | El daemon aceptó el payload de input pero la escritura del runtime falló (pipe cerrado, proceso muerto, error de IO). `details.sessionId` es la sesión afectada. |
+| `kill_failed`          | 500         | El daemon aceptó la petición de kill pero la señal/llamada del runtime falló (permisos, proceso ausente, error de IO). `details.sessionId` es la sesión afectada. |
 | `runtime_unavailable`  | 503         | El runtime de la sesión no está disponible.      |
 | `internal_error`       | 500         | Error interno inesperado.                        |
 

@@ -245,7 +245,10 @@ mod tests {
 
     impl ChatClient for StubClient {
         fn daemon_status(&mut self) -> Result<ChatDaemonStatus> {
-            unimplemented!("not exercised in follower tests")
+            // Return a harmless default rather than panic — follower polling
+            // could legitimately check daemon status in the future, and tests
+            // that don't care about it shouldn't have to override.
+            Ok(ChatDaemonStatus::default())
         }
 
         fn launch_session(&mut self, _request: LaunchRequest) -> Result<store::SessionRecord> {

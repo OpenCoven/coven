@@ -27,5 +27,8 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm",
 unicode-width = "0.2"
 textwrap = "0.16"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
