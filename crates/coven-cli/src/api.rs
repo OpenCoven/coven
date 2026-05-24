@@ -186,9 +186,7 @@ pub fn handle_request_with_runtime(
             kill_session(coven_home, session_id, runtime)
         }
         ("GET", path) if path.starts_with("/sessions/") && path.ends_with("/log") => {
-            let session_id = path
-                .trim_start_matches("/sessions/")
-                .trim_end_matches("/log");
+            let session_id = session_action_id(path, "/log");
             list_session_log(coven_home, session_id)
         }
         ("GET", path) if path.starts_with("/sessions/") => {
@@ -1563,6 +1561,11 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let response = handle_request("GET", "/api/v1/sessions/missing/log", temp.path(), None)?;
         assert_eq!(response.status, 404);
+        assert!(
+            response.body.contains(r#""sessionId":"missing""#),
+            "expected sessionId 'missing' (not 'missing/log'); got: {}",
+            response.body
+        );
         Ok(())
     }
 }
