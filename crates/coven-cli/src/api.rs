@@ -185,6 +185,12 @@ pub fn handle_request_with_runtime(
             let session_id = session_action_id(path, "/kill");
             kill_session(coven_home, session_id, runtime)
         }
+        ("GET", path) if path.starts_with("/sessions/") && path.ends_with("/log") => {
+            let session_id = path
+                .trim_start_matches("/sessions/")
+                .trim_end_matches("/log");
+            list_session_log(coven_home, session_id)
+        }
         ("GET", path) if path.starts_with("/sessions/") => {
             let session_id = path.trim_start_matches("/sessions/");
             let conn = store::open_store(&store_path(coven_home))?;
@@ -447,6 +453,63 @@ fn list_session_events(coven_home: &Path, session_id: &str, query: &str) -> Resu
             has_more,
         },
     )
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LogLineDto {
+    ts: String,
+    level: &'static str,
+    message: String,
+}
+
+fn list_session_log(coven_home: &Path, session_id: &str) -> Result<ApiResponse> {
+    let conn = store::open_store(&store_path(coven_home))?;
+    if store::get_session(&conn, session_id)?.is_none() {
+        return api_error(
+            404,
+            "session_not_found",
+            "Session was not found.",
+            Some(json!({ "sessionId": session_id })),
+        );
+    }
+    let opts = store::EventsQueryOptions::default();
+    let events = store::list_events_with_options(&conn, session_id, &opts)?;
+    let lines: Vec<LogLineDto> = events.into_iter().map(event_to_log_line).collect();
+    json_response(200, &lines)
+}
+
+fn event_to_log_line(event: store::EventRecord) -> LogLineDto {
+    let payload: Value = serde_json::from_str(&event.payload_json).unwrap_or(Value::Null);
+    let preview = payload_preview(&payload);
+    let (level, message) = match event.kind.as_str() {
+        "input" => ("info", format!("> {preview}")),
+        "output" => ("info", preview),
+        "tool_call" => ("tool", preview),
+        "error" => ("error", preview),
+        other => ("info", format!("{other}: {preview}")),
+    };
+    LogLineDto {
+        ts: event.created_at,
+        level,
+        message,
+    }
+}
+
+fn payload_preview(payload: &Value) -> String {
+    const MAX: usize = 240;
+    let text = payload
+        .get("text")
+        .or_else(|| payload.get("message"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| payload.to_string());
+    if text.chars().count() > MAX {
+        let mut truncated: String = text.chars().take(MAX).collect();
+        truncated.push('…');
+        truncated
+    } else {
+        text
+    }
 }
 
 fn insert_event(
@@ -1458,6 +1521,48 @@ mod tests {
 
         assert_eq!(response.status, 404);
         assert!(response.body.contains(r#""code":"session_not_found""#));
+        Ok(())
+    }
+
+    #[test]
+    fn get_session_log_returns_log_lines_from_events() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let conn = store::open_store(&store_path(home))?;
+        let session = store::SessionRecord {
+            id: "sess-log".into(),
+            project_root: "/tmp/proj".into(),
+            harness: "claude".into(),
+            title: "demo".into(),
+            status: "running".into(),
+            exit_code: None,
+            archived_at: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        };
+        store::insert_session(&conn, &session)?;
+        insert_event(&conn, "sess-log", "input", json!({"text": "hello"}))?;
+        insert_event(&conn, "sess-log", "output", json!({"text": "world"}))?;
+        insert_event(&conn, "sess-log", "error", json!({"message": "boom"}))?;
+        drop(conn);
+
+        let response = handle_request("GET", "/api/v1/sessions/sess-log/log", home, None)?;
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        let lines = body.as_array().expect("array body");
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0]["level"], "info");
+        assert!(lines[0]["message"].as_str().unwrap().contains("hello"));
+        assert_eq!(lines[2]["level"], "error");
+        assert!(lines[2]["message"].as_str().unwrap().contains("boom"));
+        Ok(())
+    }
+
+    #[test]
+    fn get_session_log_returns_404_for_unknown_session() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let response = handle_request("GET", "/api/v1/sessions/missing/log", temp.path(), None)?;
+        assert_eq!(response.status, 404);
         Ok(())
     }
 }
