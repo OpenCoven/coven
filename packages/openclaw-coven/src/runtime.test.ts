@@ -178,16 +178,23 @@ describe("CovenAcpRuntime", () => {
         }),
       }),
     });
+    const outsideWorkspaceDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), "openclaw-coven-outside-workspace-"),
+    );
 
-    await expect(
-      runtime.ensureSession({
-        sessionKey: "agent:codex:test",
-        agent: "codex",
-        mode: "oneshot",
-        cwd: "/tmp/attacker",
-      }),
-    ).rejects.toThrow(/outside workspace/);
-    expect(fallback.ensureSession).not.toHaveBeenCalled();
+    try {
+      await expect(
+        runtime.ensureSession({
+          sessionKey: "agent:codex:test",
+          agent: "codex",
+          mode: "oneshot",
+          cwd: outsideWorkspaceDir,
+        }),
+      ).rejects.toThrow(/outside workspace/);
+      expect(fallback.ensureSession).not.toHaveBeenCalled();
+    } finally {
+      await fs.rm(outsideWorkspaceDir, { recursive: true, force: true });
+    }
   });
   it("falls back when Coven health checks do not settle before the deadline", async () => {
     vi.useFakeTimers();
