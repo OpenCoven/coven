@@ -882,9 +882,19 @@ fn ensure_loopback_addrs(addrs: &[SocketAddr]) -> Result<()> {
     if addrs.is_empty() {
         anyhow::bail!("TCP listener address did not resolve to any sockets");
     }
-    if addrs.iter().any(|addr| !addr.ip().is_loopback()) {
+    let non_loopback_addrs: Vec<SocketAddr> = addrs
+        .iter()
+        .copied()
+        .filter(|addr| !addr.ip().is_loopback())
+        .collect();
+    if !non_loopback_addrs.is_empty() {
+        let non_loopback_addrs = non_loopback_addrs
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
         anyhow::bail!(
-            "refusing to bind Coven TCP API to non-loopback address; use 127.0.0.1 or ::1"
+            "refusing to bind Coven TCP API to non-loopback address(es): {non_loopback_addrs}; use 127.0.0.1 or ::1"
         );
     }
     Ok(())
