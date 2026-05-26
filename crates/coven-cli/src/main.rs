@@ -23,6 +23,7 @@ mod privacy;
 mod project;
 mod pty_runner;
 mod repos_config;
+mod settings;
 mod store;
 mod theme;
 mod tui;
