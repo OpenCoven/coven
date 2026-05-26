@@ -3,16 +3,18 @@ summary: "How the daemon, harnesses, store, and clients fit together."
 read_when:
   - Understanding which Coven component owns which responsibility
 title: "Runtime topology"
-description: "Runtime topology of Coven: how the developer, the coven CLI, TUI, comux, and OpenClaw connect to a single Rust daemon over a local Unix socket."
+description: "Runtime topology of Coven: how CastCodes, the Coven CLI/TUI, and advanced clients connect to a single Rust daemon over a local Unix socket."
 ---
 
 ```mermaid
 flowchart LR
-  User[Developer] --> CLI[coven CLI / TUI]
-  CLI --> Daemon[Coven daemon]
-  Comux[comux] --> Daemon
-  OpenMeow[OpenMeow] --> Daemon
-  Plugin["@opencoven/coven plugin"] --> Daemon
+  User[Developer] --> CastCodes[CastCodes workspace]
+  CastCodes --> Daemon[Coven daemon]
+  User --> CLI[coven CLI / TUI]
+  CLI --> Daemon
+  Comux[comux legacy/reference] -.-> Daemon
+  OpenMeow[OpenMeow advanced intake] -.-> Daemon
+  Plugin["@opencoven/coven plugin"] -.-> Daemon
   Daemon --> Adapter[Adapter router]
   Adapter --> Codex[Codex PTY]
   Adapter --> Claude[Claude Code PTY]

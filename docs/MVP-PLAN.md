@@ -5,6 +5,8 @@ description: "End-to-end product and engineering plan for the Coven MVP: a Rust-
 
 # Coven MVP Product + Implementation Plan
 
+> **Historical framing note:** This plan captured the first Coven MVP path when comux was the proving cockpit. Current public product direction is CastCodes as the primary proof surface and Coven as the runtime that powers it. See [CastCodes and Coven integration](/CASTCODES-INTEGRATION) and [Roadmap](/ROADMAP) for current positioning.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build Coven as a public, standalone, Rust-first harness substrate that runs Codex and Claude Code as project-scoped, attachable PTY sessions, then exposes enough API surface for comux and external clients such as the `@opencoven/coven` OpenClaw plugin to manage those sessions through Coven.

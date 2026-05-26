@@ -9,7 +9,7 @@ description: "The versioned coven.daemon.v1 contract under /api/v1: health negot
 
 # Coven local API contract
 
-The Coven daemon socket API is a public compatibility boundary for comux and external clients such as `@opencoven/coven`.
+The Coven daemon socket API is the compatibility boundary for CastCodes and advanced local clients such as comux or `@opencoven/coven`.
 
 ## Current stable version
 
@@ -113,7 +113,7 @@ All API errors use the following stable envelope. Clients must branch on `error.
 
 ## Capability catalog shape (`v1`)
 
-`GET /api/v1/capabilities` returns the daemon/control-plane capability catalog. This is the intended OpenMeow handshake for deciding which actions to show or route through Coven.
+`GET /api/v1/capabilities` returns the daemon/control-plane capability catalog. This is the intended handshake for CastCodes and advanced clients deciding which actions to show or route through Coven.
 
 ```json
 {
@@ -315,9 +315,10 @@ Shared non-success responses use the structured error envelope:
 }
 ```
 
-## comux and OpenClaw bridge compatibility
+## CastCodes and advanced client compatibility
 
-- comux reads the `capabilities` object from `/health` to decide which features to use.
+- CastCodes should read the `capabilities` object from `/health` to decide which Coven-backed workspace features to show.
+- comux may continue to read the same capability shape as a legacy/reference client.
 - The `@opencoven/coven` OpenClaw bridge (`packages/openclaw-coven`) is updated in this repo alongside the daemon and uses `apiVersion === "coven.daemon.v1"` as its contract guard.
 - Client updates to use `afterSeq` cursors and paginated event envelopes may happen independently of the daemon update; the daemon-enforced shape is the source of truth.
 - The `supportedApiVersions` field has been removed from the health response in `coven.daemon.v1`; clients should check `apiVersion` directly.

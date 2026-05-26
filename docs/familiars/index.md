@@ -1,5 +1,5 @@
 ---
-summary: "Familiars are OpenCoven's persistent named agents. Coven runs them. Comux and OpenMeow show them. They remember."
+summary: "Familiars are OpenCoven's persistent named agents. Coven runs them. CastCodes is the primary workspace where users should feel them."
 read_when:
   - Introducing OpenCoven's product layer to a stakeholder
   - Deciding whether to design a familiar or just run a harness

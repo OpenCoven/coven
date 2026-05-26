@@ -23,6 +23,6 @@ description: "Feature reference for the Coven runtime: project-rooted launches, 
     Versioned HTTP-over-Unix-socket contract under `/api/v1`.
   </Card>
   <Card title="Control plane" icon="compass">
-    Capability discovery + action routing for clients like comux and OpenMeow.
+    Capability discovery + action routing for CastCodes and advanced clients.
   </Card>
 </Columns>

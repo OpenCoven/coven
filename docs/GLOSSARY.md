@@ -1,10 +1,10 @@
 ---
 title: "Coven glossary"
-summary: "Definitions for Coven terms: ACP, API version, archive, capability, client, comux, harness, project root, ritual, sacrifice, session, and summon."
+summary: "Definitions for Coven terms: CastCodes, ACP, API version, archive, capability, client, comux, harness, project root, ritual, sacrifice, session, and summon."
 read_when:
   - Looking up Coven terminology
   - Aligning docs, CLI copy, and client labels
-description: "Definitions for Coven terms: ACP, API version, archive, capability, client, comux, harness, project root, ritual, sacrifice, session, and summon."
+description: "Definitions for Coven terms: CastCodes, ACP, API version, archive, capability, client, comux, harness, project root, ritual, sacrifice, session, and summon."
 ---
 
 # Glossary
@@ -13,7 +13,8 @@ How the terms fit together at a glance:
 
 ```mermaid
 flowchart LR
-  OpenCoven[OpenCoven] --> Coven[Coven]
+  OpenCoven[OpenCoven] --> CastCodes[CastCodes]
+  CastCodes --> Coven[Coven]
   Coven --> CLI[coven CLI / TUI]
   Coven --> Daemon[Daemon]
   Daemon --> Store[Store / SQLite]
@@ -26,7 +27,7 @@ flowchart LR
   Daemon --> Session[Session]
   Session --> Event[Event]
   Session --> Ritual[Rituals: archive / summon / sacrifice]
-  Client[Client] --> SocketAPI
+  Client[Advanced clients] --> SocketAPI
   Client --> Comux[comux]
   Client --> Plugin["@opencoven/coven (OpenClaw plugin)"]
 ```
@@ -50,13 +51,17 @@ Hide a non-running session from the active list while preserving its record and 
 
 A discoverable daemon or adapter feature returned by `GET /api/v1/capabilities`.
 
+## CastCodes
+
+The local-first AI coding workspace powered by Coven. CastCodes is the primary public proof surface: the product users open to run visible lanes, inspect work, review diffs, verify changes, and decide what lands.
+
 ## Client
 
-Any process or UI that talks to the Coven daemon, including the CLI, comux, OpenMeow, or the OpenClaw plugin.
+Any process or UI that talks to the Coven daemon. CastCodes is the primary public client; the CLI/TUI, comux, OpenMeow, and the OpenClaw plugin are operator, legacy, or advanced client shapes.
 
 ## comux
 
-The cockpit layer for visible agent work, panes, worktrees, review, and merge flow. comux can consume Coven sessions but is not the Coven runtime.
+The legacy/reference cockpit layer for visible agent work, panes, worktrees, review, and merge flow. comux proved primitives that are being folded into CastCodes; it is not the Coven runtime or the future-facing flagship surface.
 
 ## Control plane
 
@@ -92,7 +97,7 @@ A supported coding-agent CLI that Coven can launch and supervise.
 
 ## OpenCoven
 
-The broader ecosystem and organization around Coven, comux, and related integrations.
+The broader organization and lab around CastCodes, Coven, and related integrations.
 
 ## OpenClaw plugin
 

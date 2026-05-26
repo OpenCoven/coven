@@ -13,14 +13,15 @@ description: "How the Coven Rust daemon stays the authority boundary for project
 
 Coven's Rust layer is the local authority boundary. It owns process launch, project-root validation, PTY lifecycle, daemon state, session/event persistence, and the local socket API.
 
-TypeScript clients are integration layers. They may validate inputs for better UX, but Rust must revalidate every launch, input, kill, and path-sensitive request before acting.
+CastCodes and other clients are integration layers. They may validate inputs for better UX, but Rust must revalidate every launch, input, kill, and path-sensitive request before acting.
 
 ```mermaid
 flowchart LR
+  CastCodes[CastCodes workspace] --> Socket[HTTP over Unix socket]
   CLI[coven CLI / TUI] --> Rust[local Rust CLI/daemon]
-  Comux[comux cockpit] --> Socket[HTTP over Unix socket]
+  Comux[comux legacy/reference] -.-> Socket
   OpenClaw[OpenClaw] --> Plugin[external @opencoven/coven plugin]
-  Plugin --> Socket
+  Plugin -.-> Socket
   Socket --> Rust
   Rust --> Guard[project-root + cwd guard]
   Guard --> Router[harness adapter router]
@@ -45,7 +46,7 @@ The current auth posture is documented in [Authentication and local access](/AUT
 - Build harness commands with argv APIs. Do not use `sh -c` for prompt execution.
 - Keep provider credentials in the harness/provider's normal local auth flow.
 - Do not store repository secrets, environment dumps, private URLs, or tokens in event logs intentionally.
-- Do not let OpenClaw, comux, or npm package configuration widen Rust launch authority.
+- Do not let CastCodes, OpenClaw, comux, or npm package configuration widen Rust launch authority.
 
 ## Rust responsibilities
 
@@ -75,9 +76,13 @@ Legacy unversioned routes remain as early-MVP aliases, but external clients shou
 
 ## Client responsibilities
 
+### CastCodes
+
+CastCodes is the primary public workspace for Coven. It may present visible lanes, workspace context, diffs, verification status, and approval flows, but it should not become the runtime authority.
+
 ### comux
 
-comux is a cockpit client. It may list, launch, open, and attach to Coven sessions through the local API, but it should not become the harness runtime.
+comux is a legacy/reference cockpit client. It may list, launch, open, and attach to Coven sessions through the local API, but it should not become the harness runtime or the future-facing public surface.
 
 ### OpenClaw
 

@@ -15,7 +15,7 @@ Current public tabs:
 
 - `Start` - overview, install path, TUI, troubleshooting, concepts, roadmap.
 - `Runtime` - architecture, operational model, safety/auth posture, sessions, harness adapters.
-- `Integrate` - local API contract, client integration, and comux demo-loop contract.
+- `Integrate` - local API contract, CastCodes integration, advanced clients, and the comux migration reference.
 - `Reference` - current CLI/API lookup, glossary, and product spec.
 
 Excluded from the public app:
@@ -56,6 +56,7 @@ Use stable, verified product language. Do not document future commands or endpoi
 ## Canonical Language
 
 - Ecosystem/org: **OpenCoven**
+- Primary public workspace: **CastCodes**
 - Product/daemon/CLI: **Coven**
 - Command: `coven`
 - CLI package: `@opencoven/cli`

@@ -4,7 +4,7 @@ read_when:
   - Looking up a Coven term
   - Onboarding a contributor or stakeholder
 title: "Glossary"
-description: "Glossary of Coven and OpenCoven terms: ACP, coven.daemon.v1, harness, adapter, familiar, ritual, project root, archive, sacrifice, and capability."
+description: "Glossary of Coven and OpenCoven terms: CastCodes, ACP, coven.daemon.v1, harness, adapter, familiar, ritual, project root, archive, sacrifice, and capability."
 ---
 
 ## ACP
@@ -31,13 +31,17 @@ Hide a non-running session from the active list while preserving its record and 
 
 A discoverable daemon or adapter feature returned by `GET /api/v1/capabilities`.
 
+## CastCodes
+
+The local-first AI coding workspace powered by Coven. CastCodes is the primary public proof surface.
+
 ## Client
 
-Any process or UI that talks to the Coven daemon, including the CLI, comux, OpenMeow, or the OpenClaw plugin.
+Any process or UI that talks to the Coven daemon. CastCodes is the primary public client; the CLI, comux, OpenMeow, and the OpenClaw plugin are operator, legacy, or advanced client shapes.
 
 ## comux
 
-The cockpit layer for visible agent work, panes, worktrees, review, and merge flow. comux can consume Coven sessions but is not the Coven runtime.
+The legacy/reference cockpit layer for visible agent work, panes, worktrees, review, and merge flow. comux proved primitives that are being folded into CastCodes; it is not the Coven runtime or the future-facing flagship surface.
 
 ## Control plane
 
@@ -89,7 +93,7 @@ The external package `@opencoven/coven`, which lets OpenClaw use Coven through t
 
 ## OpenCoven
 
-The broader ecosystem and organization around Coven, comux, and related integrations.
+The broader organization and lab around CastCodes, Coven, and related integrations.
 
 ## Project root
 

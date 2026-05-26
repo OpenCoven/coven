@@ -33,7 +33,7 @@ Current public sections:
 | --- | --- |
 | Start | Install, first run, TUI, troubleshooting, concepts, roadmap |
 | Runtime | Architecture, operational model, safety/auth, session lifecycle, harness adapter docs |
-| Integrate | Local API, API contract, client integration, comux demo loop |
+| Integrate | Local API, API contract, CastCodes integration, advanced clients, comux migration reference |
 | Reference | CLI/API lookup, glossary, product spec |
 
 ## Excluded Content

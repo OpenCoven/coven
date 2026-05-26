@@ -37,7 +37,7 @@ Coven is **not** a model gateway. It does not store API keys, OAuth tokens, or s
 
 ## What this means for clients
 
-A client (comux, OpenMeow, the OpenClaw plugin) cannot pass an API key into Coven. It must launch a harness whose own provider auth is already complete. `coven doctor` will report any harness whose auth is missing.
+A client (CastCodes, comux, OpenMeow, or the OpenClaw plugin) cannot pass an API key into Coven. It must launch a harness whose own provider auth is already complete. `coven doctor` will report any harness whose auth is missing.
 
 ## Related
 

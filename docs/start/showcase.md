@@ -21,8 +21,8 @@ description: "Showcase landing for Coven: a local-first runtime that supervises 
   <Card title="Codex and Claude Code today" icon="layers" href="/harnesses">
     Two supported harnesses, more on the way through the adapter spec.
   </Card>
-  <Card title="comux JSON sessions" icon="braces" href="/sessions/comux-json">
-    Session shape that comux, OpenMeow, and external clients can replay.
+  <Card title="Session JSON records" icon="braces" href="/sessions/comux-json">
+    Session shape that CastCodes and advanced clients can replay.
   </Card>
   <Card title="Rituals over flags" icon="moon" href="/rituals">
     Archive, summon, sacrifice — explicit verbs around destructive operations.

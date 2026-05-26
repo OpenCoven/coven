@@ -1,13 +1,13 @@
 ---
-summary: "The on-disk session JSON format that comux and external clients can consume."
+summary: "The on-disk session JSON format that CastCodes and advanced clients can consume."
 read_when:
   - Building a client that replays Coven sessions
-  - Designing the comux demo loop
-title: "comux JSON sessions"
-description: "Coven exposes finished sessions as stable comux JSON records so comux, OpenMeow, and external clients can replay history without the live PTY."
+  - Designing session replay in CastCodes
+title: "Session JSON records"
+description: "Coven exposes finished sessions as stable JSON records so CastCodes and advanced clients can replay history without the live PTY."
 ---
 
-Coven exposes finished sessions as **comux JSON** — a stable record shape that comux, OpenMeow, and external clients can replay without depending on the live PTY.
+Coven exposes finished sessions as stable JSON records that CastCodes and advanced clients can replay without depending on the live PTY. The original comux integration proved this replay shape; CastCodes is now the primary workspace target.
 
 ## Shape
 
@@ -56,7 +56,7 @@ Coven exposes finished sessions as **comux JSON** — a stable record shape that
 
 ## What this format is for
 
-- **Replay** — comux and OpenMeow can render a finished session without touching the live PTY.
+- **Replay** — CastCodes and advanced clients can render a finished session without touching the live PTY.
 - **Audit** — the event log is enough to reconstruct what the harness saw and emitted.
 - **Handoff (future)** — Phase 1 orchestration will include this shape in the handoff payload.
 

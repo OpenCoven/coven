@@ -1,15 +1,19 @@
 ---
-title: "comux and Coven demo loop"
-summary: "The Coven-side contract for making Codex and Claude Code sessions discoverable as visible comux panes through the local socket API."
+title: "comux to CastCodes migration reference"
+summary: "Legacy reference for the comux + Coven demo loop and the primitives being folded into CastCodes."
 read_when:
-  - Demonstrating Coven sessions in comux
-  - Validating the session discovery contract
-description: "The Coven-side contract for making Codex and Claude Code sessions discoverable as visible comux panes through the local socket API."
+  - Understanding what comux proved
+  - Migrating the public demo loop to CastCodes
+description: "Legacy reference for the comux + Coven demo loop. The future-facing public demo is CastCodes + Coven."
 ---
 
-# comux + Coven demo loop
+# comux to CastCodes migration reference
 
-This is the Coven-side contract for making Coven-managed Codex and Claude Code sessions visible in comux.
+The future-facing public demo loop is **CastCodes + Coven**. See [CastCodes and Coven integration](/CASTCODES-INTEGRATION) for the current product direction.
+
+This page remains as a migration reference for the legacy comux + Coven demo loop and for the durable primitives CastCodes should absorb.
+
+comux proved the terminal cockpit model. Its durable primitives are being folded into CastCodes so Coven has one primary product surface.
 
 ```mermaid
 flowchart LR
@@ -18,7 +22,7 @@ flowchart LR
   end
 
   subgraph Local["Local machine"]
-    Comux[comux cockpit]
+    Comux[legacy comux cockpit]
     CLI[coven CLI]
     Daemon[Coven daemon]
     PTY1[Codex PTY]
@@ -41,7 +45,7 @@ flowchart LR
 
 The demo loop is end-to-end: comux never bypasses the daemon, and the daemon never trusts comux for project-root, harness, or destructive-deletion enforcement.
 
-## Loop
+## Legacy loop
 
 1. Open the target repository in comux.
 2. Start Coven if needed:
@@ -68,6 +72,20 @@ The demo loop is end-to-end: comux never bypasses the daemon, and the daemon nev
 
 6. Inspect files, diffs, and session output from comux.
 7. Merge, create a PR, archive, summon, sacrifice, or clean up explicitly after verification.
+
+## CastCodes targets
+
+| comux primitive | CastCodes target |
+| --- | --- |
+| Pane | Agent lane / terminal tab / workspace lane |
+| Worktree isolation | CastCodes/Coven isolated task lane |
+| Agent launcher registry | CastCodes harness picker backed by Coven/Cast Agent |
+| Multi-select launch | Multi-harness CastCodes lane creation |
+| Ritual | CastCodes command palette ritual/template |
+| File browser/diff | Native editor diff/review surface |
+| Merge/PR flow | CastCodes review, verification, PR, cleanup workflow |
+| Lifecycle hooks | Coven/Cast Agent events and hooks |
+| Coven bridge | Direct CastCodes/Coven integration |
 
 ## CLI discovery
 
@@ -115,4 +133,4 @@ Clients should keep their core UI usable when Coven is missing or stopped:
 
 ## Roadmap
 
-The broader OpenCoven roadmap remains the public tracking point for the end-to-end demo: [ROADMAP.md](/ROADMAP).
+The broader OpenCoven roadmap now tracks CastCodes as the primary public proof surface: [ROADMAP.md](/ROADMAP).

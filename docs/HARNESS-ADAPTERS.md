@@ -102,7 +102,7 @@ If upstream ids become useful, store them as metadata rather than replacing Cove
 3. **Doctor detection** - add install/auth hints.
 4. **Launch smoke** - prove a session can run in a temporary project.
 5. **Attach/replay smoke** - prove events can be replayed.
-6. **Client compatibility** - update docs and integration tests.
+6. **Client compatibility** - update CastCodes-facing docs and advanced-client integration tests.
 
 Do not skip from research directly to public support.
 
@@ -113,7 +113,7 @@ flowchart LR
   S3["3. coven doctor detection\n(install + auth hints)"] --> S4
   S4["4. Launch smoke\n(temp project, fake creds)"] --> S5
   S5["5. Attach / replay smoke\n(events round-trip)"] --> S6
-  S6["6. Client compatibility\n(comux + plugin tests)"] --> Done(["Public support"])
+  S6["6. Client compatibility\n(CastCodes + advanced clients)"] --> Done(["Public support"])
 
   style S1 fill:#3D3547,stroke:#9A8ECD,color:#fff
   style S2 fill:#3D3547,stroke:#9A8ECD,color:#fff

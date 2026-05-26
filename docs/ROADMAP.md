@@ -1,27 +1,29 @@
 ---
 title: "OpenCoven public roadmap"
-summary: "The OpenCoven public roadmap for Coven, comux, and OpenClaw integrations, with shipped, now, next, and later slices for the local agent runtime."
+summary: "The OpenCoven public roadmap for CastCodes as the primary Coven proof surface, with Coven runtime, migration, and harness slices."
 read_when:
   - Checking public project direction
   - Separating shipped work from planned work
-description: "The OpenCoven public roadmap for Coven, comux, and OpenClaw integrations, with shipped, now, next, and later slices for the local agent runtime."
+description: "The OpenCoven public roadmap for CastCodes as the primary public workspace powered by Coven, with shipped, now, next, and later slices."
 ---
 
 # OpenCoven public roadmap
 
-_Last updated: 2026-05-19_
+_Last updated: 2026-05-26_
 
-This roadmap is the public progress ledger for **OpenCoven**, **Coven**, and **comux**.
+This roadmap is the public progress ledger for **OpenCoven**, **CastCodes**, and **Coven**.
 
 It is intentionally written as a community-facing map, not an internal promise sheet. Items move when they are designed, implemented, tested, released, or deliberately cut. Dates are avoided unless a release is already scheduled.
 
 ## North star
 
-OpenCoven is building a local-first agent workspace where autonomous coding harnesses can work inside explicit rooms:
+OpenCoven is building a local-first agent workspace where autonomous coding harnesses can work inside explicit project rooms:
 
-- **Coven** is the runtime substrate: project-scoped harness sessions, PTYs, logs, and local APIs.
-- **comux** is the cockpit: visible panes, worktrees, agent lanes, rituals, review, and merge flow.
-- **OpenMeow / OpenClaw integrations** are intake and orchestration surfaces that can hand work into the same local runtime without hiding what happened.
+- **CastCodes** is the product users open: the local-first AI coding workspace and primary public proof surface.
+- **Coven** is the runtime substrate: project-scoped harness sessions, PTYs, logs, artifacts, handoffs, policy, and local APIs.
+- **OpenCoven** is the umbrella and lab behind the direction.
+
+comux proved the terminal cockpit model. Its durable primitives are being folded into CastCodes so Coven has one primary product surface.
 
 The simple promise:
 
@@ -37,9 +39,45 @@ The simple promise:
 
 ## Current snapshot
 
+### CastCodes
+
+**Status:** staged public workspace and primary Coven proof surface.
+
+Shipped:
+
+- Public `OpenCoven/cast-codes` repo.
+- Public app identity: `CastCodes`, `cast-codes`, `dev.castcodes.CastCodes`, and `castcodes://`.
+- Local-first public build boundary: no sign-in, hosted telemetry, hosted crash reporting, billing, shared sessions, upstream release feeds, or upstream feedback flows by default.
+- Terminal and code workspace substrate.
+- Cast Agent / Coven integration direction documented in the repo.
+- Rebrand and attribution guards for public-surface changes.
+
+Now:
+
+- Make CastCodes the first-contact public story for Coven.
+- Treat Cast Agent and Coven integration as the core direction, not a side feature.
+- Define the parity milestones for absorbing the useful terminal-cockpit primitives comux proved.
+
+Next:
+
+- Launch isolated agent lanes from repository context.
+- Choose harnesses through a CastCodes picker backed by Coven/Cast Agent.
+- Create or attach a worktree/branch per lane.
+- Show live terminal/output and structured Coven session status.
+- Preserve and render logs/artifacts safely.
+- Show changed files and inline diffs.
+- Run verification gates and display results.
+- Keep PR, merge, archive, and cleanup actions behind explicit approval.
+
+Later:
+
+- Command-palette rituals/templates: Start Coding, Review Stack, Release Check, Fix OpenClaw, Coven Dogfood Quest, and Multi-Harness Review.
+- Handoff packets between harnesses.
+- End-of-task retrospectives that capture what worked, what was missing, and what should become a CastCodes/Coven issue.
+
 ### Coven
 
-**Status:** early public MVP, usable by adventurous local-first developers.
+**Status:** early public runtime MVP, usable by adventurous local-first developers and positioned as the runtime that powers CastCodes.
 
 Shipped:
 
@@ -54,7 +92,7 @@ Shipped:
 - SQLite-backed session metadata and event log.
 - Session browser and rituals: **Rejoin**, **View Log**, **Summon**, **Archive**, **Sacrifice**.
 - Scriptable and human session output: `coven sessions`, `--plain`, and `--all`.
-- Local HTTP-over-Unix-socket API for clients.
+- Local HTTP-over-Unix-socket API for CastCodes and advanced local clients.
 - Versioned `coven.daemon.v1` API contract with named apiVersion, machine-readable capabilities, structured errors, and monotonic event cursors. See [`docs/API-CONTRACT.md`](/API-CONTRACT).
 - Compatibility tests for the external OpenClaw bridge against versioned daemon responses.
 - First-run recovery hints for missing Codex or Claude Code CLIs.
@@ -64,13 +102,13 @@ Shipped:
   - `@opencoven/cli`
   - `@opencoven/cli-macos`
   - `@opencoven/cli-linux-x64`
-- External OpenClaw bridge package kept outside OpenClaw core.
+- External OpenClaw bridge package kept outside OpenClaw core as an advanced compatibility path.
 - Architecture, operational model, product spec, brand docs, and MVP plan.
 
 Now:
 
 - **Cast launcher redesign** (Phases 1–6 on `cast/*` branches): collapses the Coven launcher chrome into a single-prompt surface with a two-lane Commands + Snapshot body, plan/outcome cards for every spell, and a sequential quest flow that hands off between phases with deterministic sub-prompts. The repo-local design notes live under `docs/design/`. PR #99 is the current review slice (Phase 6 verification + readiness).
-- Keep the versioned daemon API contract and external-client compatibility work aligned. See [`docs/API-CONTRACT.md`](/API-CONTRACT).
+- Keep the versioned daemon API contract and CastCodes integration work aligned. See [`docs/API-CONTRACT.md`](/API-CONTRACT).
 - Keep the public docs aligned with the actual CLI/API surface.
 
 Next:
@@ -90,11 +128,11 @@ Later:
   - Phase 4: Audit dashboard and compliance tooling
 - Optional cloud/team collaboration only after the local runtime is boringly reliable.
 
-### comux
+### comux migration reference
 
-**Status:** early public product, useful as a standalone terminal cockpit and becoming the first visual Coven client.
+**Status:** reference/prototype evidence. comux remains useful as a standalone terminal cockpit, but it is no longer the future-facing public product surface for Coven.
 
-Shipped:
+What it proved:
 
 - Public `comux` npm package and CLI command.
 - tmux cockpit for visible parallel work.
@@ -112,32 +150,30 @@ Shipped:
 
 Now:
 
-- Stabilize the Coven session UX in comux: list, open, launch, attach/rejoin, and unavailable states.
-- Keep comux useful without Coven installed.
-- Continue dogfooding comux-on-comux for branch/worktree hygiene.
-- Tighten review/merge flows so agent output stays explicit and inspectable.
+- Preserve comux as legacy/reference context.
+- Fold the useful primitives into CastCodes-native concepts.
+- Avoid positioning comux as a second flagship cockpit in beginner/product docs.
 
 Next:
 
-- Promote a crisp `comux + Coven` demo loop:
-  1. Open project in comux.
-  2. Launch a Coven-backed Codex or Claude session.
-  3. Watch it as a visible pane/session.
-  4. Inspect files and diffs.
-  5. Merge, PR, archive, or clean up explicitly.
+- Use the CastCodes + Coven demo loop:
+  1. Open a project in CastCodes.
+  2. Launch a Coven-backed Codex or Claude Code lane.
+  3. Watch live terminal output and structured session status.
+  4. Inspect files, diffs, logs, and artifacts.
+  5. Verify, merge, PR, archive, or clean up explicitly.
 - Add public issues for rough edges discovered during dogfooding.
-- Improve onboarding for tmux, agent CLI detection, and Coven availability.
+- Improve onboarding for CastCodes, agent CLI detection, and Coven availability.
 - Make Discord updates easy to generate from shipped commits and roadmap issues.
 
 Lab:
 
-- Native macOS cockpit exploration.
 - Desktop shortcuts and faster project/session switching.
-- OpenMeow intake handoff into comux/Coven sessions.
+- OpenMeow intake handoff into CastCodes/Coven sessions.
 
-### OpenClaw / OpenMeow integration path
+### Advanced integration paths
 
-**Status:** opt-in bridge direction, not bundled into OpenClaw core.
+**Status:** compatibility and advanced architecture, not the beginner public story.
 
 Shipped:
 
@@ -149,22 +185,22 @@ Now:
 
 - Treat the Coven API as the compatibility boundary.
 - Add compatibility tests before encouraging broad plugin usage.
-- Keep OpenMeow/OpenClaw copy honest: intake and orchestration sit above Coven; they do not replace the runtime substrate.
+- Keep OpenMeow/OpenClaw copy honest: advanced intake and orchestration sit above Coven; they do not replace CastCodes as the public workspace or Coven as the runtime substrate.
 
 Next:
 
 - Publicly document the supported plugin path once API versioning lands.
-- Add a demo showing a task moving from intake to Coven runtime to comux review.
+- Keep advanced demos secondary to the CastCodes + Coven product demo.
 
 ## Milestone map
 
 ```mermaid
 flowchart LR
-  A["A. Local runtime foundation\n(mostly shipped)"] --> B["B. Visible cockpit foundation\n(shipped, stabilizing)"]
+  A["A. Local runtime foundation\n(mostly shipped)"] --> B["B. CastCodes workspace foundation\n(now)"]
   A --> C["C. Transparent community loop\n(now)"]
   B --> D["D. Harness expansion\n(next/later)"]
   C --> D
-  B --> E["E. Intake → runtime → review\n(next/lab)"]
+  B --> E["E. Visible lane → verify → review\n(next/lab)"]
   A --> E
   D --> F["F. Multi-harness orchestration\n(planned, phased)"]
   E --> F
@@ -197,20 +233,21 @@ Status: **mostly shipped**
 - [x] Versioned API contract
 - [x] Compatibility tests for external clients
 
-### Milestone B — Visible cockpit foundation
+### Milestone B — CastCodes workspace foundation
 
-Status: **shipped, stabilizing**
+Status: **now / migration target**
 
-- [x] Public `comux` package
-- [x] tmux panes
-- [x] git worktrees
-- [x] agent launcher registry
-- [x] file browser / diff review
-- [x] rituals
-- [x] merge and PR-oriented pane menu
-- [x] Coven session visibility
-- [ ] Coven attach/rejoin UX polish
-- [ ] documented end-to-end comux + Coven demo
+- [x] Public CastCodes repo and app identity
+- [x] Local terminal and code workspace substrate
+- [x] Cast Agent / Coven integration direction documented
+- [ ] CastCodes direction doc linked from public surfaces
+- [ ] isolated agent lane from repo context
+- [ ] Coven-backed harness picker
+- [ ] worktree/branch isolation per lane
+- [ ] changed-file and inline diff review surface for lanes
+- [ ] verification result display
+- [ ] explicit PR/merge/archive/cleanup workflow
+- [ ] documented end-to-end CastCodes + Coven demo
 
 ### Milestone C — Transparent community loop
 
@@ -232,13 +269,14 @@ Status: **next/later**
 - [ ] Third harness proof
 - [ ] Harness compatibility docs
 
-### Milestone E — Intake to runtime to review
+### Milestone E — Visible lane to verification to review
 
 Status: **next/lab**
 
-- [ ] OpenMeow/OpenClaw intake creates or requests a Coven task
+- [ ] CastCodes creates or attaches a Coven-backed lane
 - [ ] Coven owns the session and event log
-- [ ] comux shows the session for review
+- [ ] CastCodes shows the session for review
+- [ ] verification gates run and display results
 - [ ] user explicitly merges, PRs, archives, or deletes work
 
 ### Milestone F — Multi-harness orchestration (Phase 1-4)
@@ -303,7 +341,7 @@ We should keep Discord updates lightweight and repeatable.
 ### Links
 - Roadmap: https://github.com/OpenCoven/coven/blob/main/docs/ROADMAP.md
 - Coven issues: https://github.com/OpenCoven/coven/issues
-- comux issues: https://github.com/BunsDev/comux/issues
+- CastCodes issues: https://github.com/OpenCoven/cast-codes/issues
 ```
 
 ### Rules for honest updates
@@ -311,23 +349,25 @@ We should keep Discord updates lightweight and repeatable.
 - Do not promise dates unless we are already in release mode.
 - Link shipped work to commits, releases, issues, or docs.
 - Mark experiments as **Lab** instead of pretending they are committed roadmap items.
-- Separate **Coven runtime**, **comux cockpit**, and **OpenMeow/OpenClaw intake** so people understand the architecture.
+- Lead beginner/product updates with **CastCodes as the workspace** and **Coven as the runtime**.
+- Mention comux, OpenMeow, or OpenClaw only when the update is explicitly about migration, legacy/reference context, or advanced compatibility.
 - Prefer small public issues over giant vague tasks.
 - Ask for help only when the task has a clear acceptance condition.
 
 ## First public Discord post
 
 ```md
-We opened a public roadmap for OpenCoven/Coven/comux so progress is easier to follow.
+We updated the public roadmap around the CastCodes + Coven story so progress is easier to follow.
 
 The short version:
-- Coven is the local runtime substrate: project-scoped Codex/Claude sessions, PTYs, logs, daemon API.
-- comux is the visible cockpit: tmux panes, worktrees, rituals, review, merge/PR flows.
-- The next serious focus is hardening the Coven API contract and polishing the comux + Coven demo loop.
+- CastCodes is the local-first AI coding workspace and primary public proof surface.
+- Coven is the runtime substrate: project-scoped Codex/Claude sessions, PTYs, logs, daemon API.
+- comux proved useful terminal-cockpit primitives that are being folded into CastCodes-native workflows.
+- The next serious focus is hardening the Coven API contract and polishing the CastCodes + Coven demo loop.
 
 Roadmap: https://github.com/OpenCoven/coven/blob/main/docs/ROADMAP.md
 Coven: https://github.com/OpenCoven/coven
-comux: https://github.com/BunsDev/comux
+CastCodes: https://github.com/OpenCoven/cast-codes
 
 We’ll start posting lightweight shipped / building / next updates here so the work is easier to follow and easier to help with.
 ```

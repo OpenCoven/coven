@@ -81,7 +81,7 @@ When no daemon metadata is available, `daemon` is `null`.
 
 ## Control-plane capabilities
 
-`GET /api/v1/capabilities` is the discovery point for first-party clients such as OpenMeow. It returns capability ids, adapter ownership, availability, policy hints, and action ids. This keeps clients from hard-coding what the daemon can do.
+`GET /api/v1/capabilities` is the discovery point for CastCodes and advanced local clients. It returns capability ids, adapter ownership, availability, policy hints, and action ids. This keeps clients from hard-coding what the daemon can do.
 
 ```json
 {
@@ -108,12 +108,12 @@ When no daemon metadata is available, `daemon` is `null`.
 
 ## Control-plane actions
 
-`POST /api/v1/actions` accepts an OpenMeow-style intent envelope. The daemon routes only known actions; unknown actions fail closed before any adapter can run.
+`POST /api/v1/actions` accepts a client intent envelope. The daemon routes only known actions; unknown actions fail closed before any adapter can run.
 
 ```json
 {
   "action": "coven.capabilities.refresh",
-  "origin": "open-meow",
+  "origin": "castcodes",
   "intentId": "intent-1",
   "args": {}
 }
@@ -130,7 +130,7 @@ Immediately completed safe actions return `200` with an event-shaped payload tha
   "event": {
     "kind": "capabilities.refreshed",
     "action": "coven.capabilities.refresh",
-    "origin": "open-meow",
+    "origin": "castcodes",
     "intentId": "intent-1",
     "payload": { "capabilities": 3 }
   }

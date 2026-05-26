@@ -1,13 +1,13 @@
 ---
 summary: "Runtime topology, session lifecycle, and authority boundary diagrams for Coven."
 read_when:
-  - Understanding how Coven, comux, and clients fit together
+  - Understanding how CastCodes, Coven, and advanced clients fit together
   - Auditing trust boundaries before adding a new client
 title: "Architecture"
-description: "Conceptual map of Coven: the Rust daemon as authority, the CLI, TUI, comux, and OpenClaw clients, and the versioned local socket API contract that joins them."
+description: "Conceptual map of Coven: CastCodes as the primary workspace, the Rust daemon as authority, the CLI/TUI, advanced clients, and the versioned local socket API contract that joins them."
 ---
 
-Coven is a local-first harness substrate. The Rust CLI/daemon is the authority layer; clients such as the CLI TUI, comux, and the optional OpenClaw plugin are presentation/integration layers.
+Coven is a local-first harness substrate. CastCodes is the primary workspace and proof surface; the Rust CLI/daemon is the authority layer. The CLI/TUI, comux, and the optional OpenClaw plugin are operator, legacy, or advanced integration layers.
 
 The versioned local socket API contract lives in [API contract](/reference/api-contract). Clients should handshake with [`GET /api/v1/health`](/daemon/health) and negotiate against `apiVersion: "coven.daemon.v1"` plus the `capabilities` object before depending on session or event response shapes. All error responses use the structured `{ error: { code, message, details } }` envelope documented in [Error envelope](/daemon/error-envelope).
 
@@ -15,14 +15,17 @@ The versioned local socket API contract lives in [API contract](/reference/api-c
 
 ```mermaid
 flowchart LR
-  User[Developer] --> CLI[coven CLI / TUI]
-  CLI -->|direct commands| Rust[Coven Rust CLI]
-  Rust --> Daemon[Coven daemon]
+  User[Developer] --> CastCodes[CastCodes workspace]
+  CastCodes -->|HTTP over Unix socket| Daemon[Coven daemon]
 
-  Comux[comux cockpit] -->|HTTP over Unix socket| Daemon
+  User --> CLI[coven CLI / TUI]
+  CLI -->|direct commands| Rust[Coven Rust CLI]
+  Rust --> Daemon
+
+  Comux[comux legacy/reference] -.->|HTTP over Unix socket| Daemon
   OpenClaw[OpenClaw] --> Plugin[external @opencoven/coven plugin]
-  Plugin -->|HTTP over Unix socket| Daemon
-  OpenMeow[OpenMeow chat/intent client] -->|capabilities + actions| Daemon
+  Plugin -.->|HTTP over Unix socket| Daemon
+  OpenMeow[OpenMeow advanced intake] -.->|capabilities + actions| Daemon
 
   Daemon --> Control[Control plane: capability discovery + action routing]
   Control --> Policy[Policy + permission hints]
@@ -73,7 +76,7 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-  Client[CLI, TUI, comux, OpenClaw plugin] --> Request[Launch / input / kill / list request]
+  Client[CastCodes, CLI, TUI, advanced clients] --> Request[Launch / input / kill / list request]
   Request --> Rust[Rank 0 authority: Rust daemon]
   Rust --> RootCheck{projectRoot explicit?}
   RootCheck -- no --> RejectRoot[Reject]

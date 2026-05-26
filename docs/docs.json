@@ -1,7 +1,7 @@
 {
   "$schema": "https://mintlify.com/docs.json",
   "name": "Coven",
-  "description": "Coven is a local-first runtime for project-scoped coding-agent harness sessions, append-only events, and a versioned local socket API.",
+  "description": "Coven is the local-first runtime that powers CastCodes with project-scoped coding-agent harness sessions, append-only events, and a versioned local socket API.",
   "image": "/assets/opencoven-icon.svg",
   "theme": "mint",
   "modeToggle": {
@@ -153,8 +153,9 @@
                 ]
               },
               {
-                "group": "Clients",
+                "group": "Workspace",
                 "pages": [
+                  "CASTCODES-INTEGRATION",
                   "COMUX-DEMO-LOOP",
                   "sessions/comux-json"
                 ]

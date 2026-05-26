@@ -17,6 +17,7 @@ The Rust daemon is the authority boundary.
 
 Every client is untrusted for enforcement purposes, including:
 
+- CastCodes;
 - the CLI/TUI;
 - comux;
 - OpenMeow;
@@ -30,6 +31,7 @@ Clients may improve UX, but they must not be the only place where a sensitive de
 flowchart TB
   subgraph UntrustedZone["Untrusted for enforcement (UX layer only)"]
     direction LR
+    CastCodes[CastCodes]
     CLI[coven CLI / TUI]
     Comux[comux]
     Meow[OpenMeow]

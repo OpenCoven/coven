@@ -1,10 +1,10 @@
 ---
-summary: "Coven is a local-first runtime substrate for persistent AI familiars. One daemon supervises every coding-agent harness with project-scoped sessions, append-only events, and a typed local socket API."
+summary: "Coven is the local runtime that powers CastCodes with project-scoped harness sessions, append-only events, and a typed local socket API."
 read_when:
   - Introducing OpenCoven and Coven to newcomers
   - Choosing whether to install Coven for local agent work
-title: "Coven: local-first runtime for coding-agent sessions"
-description: "Coven is a local-first runtime that supervises coding-agent CLIs in project-scoped sessions with append-only events and a local socket API."
+title: "Coven: the runtime that powers CastCodes"
+description: "Coven powers CastCodes with local-first project-scoped harness sessions, append-only events, and a local socket API."
 ---
 
 
@@ -17,9 +17,9 @@ description: "Coven is a local-first runtime that supervises coding-agent CLIs i
     height="88"
   />
   <div>
-    <p class="home-intro-kicker"><strong>Bring any familiar into the circle.</strong></p>
-    <p><strong>OpenCoven is an open ecosystem for persistent AI familiars. Coven is the local runtime substrate that supervises every harness — Codex, Claude Code, and future Hermes, Aider, and Gemini CLIs — inside explicit project boundaries.</strong></p>
-    <p>Launch a session, watch the PTY, attach later, archive when done. One daemon, one socket, every familiar on equal footing.</p>
+    <p class="home-intro-kicker"><strong>Coven powers CastCodes.</strong></p>
+    <p><strong>CastCodes is the local-first AI coding workspace users open. Coven is the local runtime underneath: project-scoped harness sessions, append-only events, logs, artifacts, and authority boundaries.</strong></p>
+    <p>Run Codex, Claude Code, and future harnesses as visible CastCodes lanes. Inspect the work, preserve context, verify changes, and merge with confidence.</p>
   </div>
 </div>
 
@@ -37,9 +37,9 @@ description: "Coven is a local-first runtime that supervises coding-agent CLIs i
 
 ## What is Coven?
 
-Coven is a **local-first runtime substrate**: a single Rust daemon that owns harness PTYs, session state, and an append-only event ledger on your own machine. Clients like the `coven` CLI/TUI, the comux cockpit, OpenMeow, and the external OpenClaw plugin all coordinate through one versioned HTTP-over-Unix-socket contract.
+Coven is a **local-first runtime substrate**: a single Rust daemon that owns harness PTYs, session state, and an append-only event ledger on your own machine. CastCodes is the primary workspace and public proof surface for that runtime. The `coven` CLI/TUI remains the operator surface for installing, checking, and managing the daemon directly.
 
-**Who is it for?** Developers and operators who want their AI familiars to keep running locally, remember what they did, and stay inside project boundaries you can audit.
+**Who is it for?** Developers and operators who want AI coding work to keep running locally, remember what it did, and stay inside project boundaries they can audit.
 
 **What makes it different today?**
 
@@ -55,10 +55,9 @@ Coven is a **local-first runtime substrate**: a single Rust daemon that owns har
 
 ```mermaid
 flowchart LR
-  A["coven CLI / TUI"] --> B["Coven daemon"]
-  C["comux cockpit"] --> B
-  D["OpenMeow"] --> B
-  E["@opencoven/coven plugin"] --> B
+  A["CastCodes workspace"] --> B["Coven daemon"]
+  K["coven CLI / TUI"] --> B
+  C["Advanced / legacy clients"] -.-> B
   B --> F["Codex PTY"]
   B --> G["Claude Code PTY"]
   B --> H["Future harness PTYs"]
@@ -86,8 +85,8 @@ The daemon is the single source of truth for sessions, PTY lifecycle, and capabi
   <Card title="Local socket API" icon="plug" href="/API">
     `GET /api/v1/health` first; then sessions, events, capabilities, and actions over Unix socket.
   </Card>
-  <Card title="Client integration" icon="plug-zap" href="/CLIENT-INTEGRATION">
-    comux, OpenMeow, and the OpenClaw bridge integrate as socket clients, not launch authorities.
+  <Card title="CastCodes integration" icon="plug-zap" href="/CASTCODES-INTEGRATION">
+    CastCodes is the public workspace; Coven remains the runtime authority underneath.
   </Card>
 </Columns>
 
@@ -163,7 +162,7 @@ coven daemon restart
     Per-harness setup, provider auth boundary, and adapter expectations.
   </Card>
   <Card title="Local API" href="/API" icon="plug">
-    Versioned socket API for comux, OpenMeow, OpenClaw plugin, and your own clients.
+    Versioned socket API for CastCodes and advanced local clients.
   </Card>
   <Card title="Sessions" href="/SESSION-LIFECYCLE" icon="moon">
     Archive, summon, and sacrifice — the beginner-safe verbs around session state.

@@ -1,15 +1,17 @@
 ---
-title: "Client integration guide"
-summary: "How comux, OpenMeow, OpenClaw, and other clients should talk to the Coven daemon socket API without duplicating runtime policy or authority."
+title: "CastCodes integration and advanced clients"
+summary: "How CastCodes and advanced local clients should talk to the Coven daemon socket API without duplicating runtime policy or authority."
 read_when:
   - Integrating a UI or bridge with Coven
   - Avoiding client-side policy drift
-description: "How comux, OpenMeow, OpenClaw, and other clients should talk to the Coven daemon socket API without duplicating runtime policy or authority."
+description: "How CastCodes and advanced local clients should talk to the Coven daemon socket API without duplicating runtime policy or authority."
 ---
 
-# Client integration guide
+# CastCodes integration and advanced clients
 
-Coven is a runtime substrate. Clients should present, route, and observe work without taking over the authority boundary.
+Coven is a runtime substrate. CastCodes is the primary public workspace that presents, routes, and observes Coven-managed work without taking over the authority boundary.
+
+Other clients are advanced, legacy, or compatibility surfaces. They should follow the same socket rules, but beginner/product docs should not lead with them.
 
 ## Integration rule
 
@@ -45,7 +47,23 @@ sequenceDiagram
 
 Clients should treat the handshake as **mandatory before any other request**. Skipping it means depending on undefined response shapes from a future daemon version.
 
-## Client responsibilities
+## CastCodes responsibilities
+
+CastCodes should own:
+
+- workspace navigation;
+- terminal tabs and visible agent lanes;
+- editor/file context;
+- harness selection UI;
+- diff/review surfaces;
+- verification result display;
+- session selection and status rendering;
+- PR, merge, archive, and cleanup approval UX; and
+- handoff and retrospective views.
+
+CastCodes must still treat the daemon as the authority for project roots, cwd, harness ids, live-session checks, destructive deletion rules, socket trust, and external action approvals.
+
+## Advanced client responsibilities
 
 Clients may own:
 
@@ -69,11 +87,11 @@ Clients must not be the only enforcement point for:
 - socket trust;
 - external action approvals.
 
-## comux
+## comux migration reference
 
-comux is the cockpit layer.
+comux is a legacy/reference cockpit layer. It proved useful primitives that are being folded into CastCodes-native workflows.
 
-Good comux responsibilities:
+Useful comux primitives:
 
 - list Coven sessions;
 - launch sessions from visible project/worktree context;
@@ -110,7 +128,7 @@ The plugin should not:
 
 ## OpenMeow and intake surfaces
 
-OpenMeow-like clients are best treated as intake and presentation layers.
+OpenMeow-like clients are advanced intake and presentation layers. They should not become the first-contact public story for Coven.
 
 Useful responsibilities:
 
@@ -140,7 +158,7 @@ A native control room can make Coven easier to operate by showing:
 
 Use `coven sessions --json` for active sessions and `coven sessions --json --all` when the client needs archived records too. The CLI returns a top-level object with a `sessions` array, and each record uses the same `SessionRecord` field names exposed by the daemon API, including `project_root`, `status`, `created_at`, `updated_at`, and nullable `archived_at`.
 
-The control room should still use the same socket API and capability handshake as other clients.
+The control room should still use the same socket API and capability handshake as CastCodes and other clients.
 
 ## Desktop automation adapters
 

@@ -1,15 +1,15 @@
 ---
 title: "Coven runtime architecture"
-summary: "How the Coven Rust daemon, CLI, TUI, comux cockpit, and OpenClaw plugin compose around the local socket API, PTY adapters, and event store."
+summary: "How CastCodes, the Coven Rust daemon, CLI/TUI, and advanced clients compose around the local socket API, PTY adapters, and event store."
 read_when:
   - Understanding the Coven runtime topology
   - Designing a client around the local socket API
-description: "How the Coven Rust daemon, CLI, TUI, comux cockpit, and OpenClaw plugin compose around the local socket API, PTY adapters, and event store."
+description: "How CastCodes, the Coven Rust daemon, CLI/TUI, and advanced clients compose around the local socket API, PTY adapters, and event store."
 ---
 
 # Coven Architecture
 
-Coven is a local-first harness substrate. The Rust CLI/daemon is the authority layer; clients such as the CLI TUI, comux, and the optional OpenClaw plugin are presentation/integration layers.
+Coven is a local-first harness substrate. The Rust CLI/daemon is the authority layer; CastCodes is the primary public workspace and proof surface. The CLI/TUI remains an operator surface, while comux, OpenMeow, and the optional OpenClaw plugin are advanced or legacy integration layers.
 
 The versioned local socket API contract lives in [`docs/API-CONTRACT.md`](/API-CONTRACT). Clients should use `GET /api/v1/health` and negotiate against `apiVersion: "coven.daemon.v1"` and the `capabilities` object before depending on session or event response shapes. All error responses use the structured `{ error: { code, message, details } }` envelope documented there.
 
@@ -17,14 +17,17 @@ The versioned local socket API contract lives in [`docs/API-CONTRACT.md`](/API-C
 
 ```mermaid
 flowchart LR
-  User[Developer] --> CLI[coven CLI / TUI]
-  CLI -->|direct commands| Rust[Coven Rust CLI]
-  Rust --> Daemon[Coven daemon]
+  User[Developer] --> CastCodes[CastCodes workspace]
+  CastCodes -->|HTTP over Unix socket| Daemon[Coven daemon]
 
-  Comux[comux cockpit] -->|HTTP over Unix socket| Daemon
+  User --> CLI[coven CLI / TUI]
+  CLI -->|direct commands| Rust[Coven Rust CLI]
+  Rust --> Daemon
+
+  Comux[comux legacy/reference] -.->|HTTP over Unix socket| Daemon
   OpenClaw[OpenClaw] --> Plugin[external @opencoven/coven plugin]
-  Plugin -->|HTTP over Unix socket| Daemon
-  OpenMeow[OpenMeow chat/intent client] -->|capabilities + actions| Daemon
+  Plugin -.->|HTTP over Unix socket| Daemon
+  OpenMeow[OpenMeow advanced intake] -.->|capabilities + actions| Daemon
 
   Daemon --> Control[Control plane: capability discovery + action routing]
   Control --> Policy[Policy + permission hints]
@@ -75,7 +78,7 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-  Client[CLI, TUI, comux, OpenClaw plugin] --> Request[Launch / input / kill / list request]
+  Client[CastCodes, CLI, TUI, advanced clients] --> Request[Launch / input / kill / list request]
   Request --> Rust[Rank 0 authority: Rust daemon]
   Rust --> RootCheck{projectRoot explicit?}
   RootCheck -- no --> RejectRoot[Reject]
@@ -87,9 +90,9 @@ flowchart TD
   Spawn --> Ledger[Persist session + events]
 ```
 
-## OpenMeow / automation boundary
+## Advanced intake / automation boundary
 
-OpenMeow should remain a chat UI, local echo/optimistic rendering surface, intent-capture layer, and tiny fast-path host for ultra-simple local actions. It should not become the automation engine.
+OpenMeow-like surfaces should remain chat UI, local echo/optimistic rendering, intent-capture, or tiny fast-path hosts for ultra-simple local actions. They should not become the automation engine or the primary public Coven story.
 
 Coven is the canonical shared local runtime for reusable automation because it centralizes:
 
@@ -107,7 +110,7 @@ user -> OpenMeow -> Coven -> adapters -> desktop/apps
 desktop/apps -> Coven -> OpenMeow UI updates
 ```
 
-`GET /api/v1/capabilities` lets OpenMeow and other clients discover what Coven can route. `POST /api/v1/actions` gives clients a stable intent envelope without coupling them directly to brittle OS automation APIs.
+`GET /api/v1/capabilities` lets CastCodes and advanced clients discover what Coven can route. `POST /api/v1/actions` gives clients a stable intent envelope without coupling them directly to brittle OS automation APIs.
 
 ## Future adapter boundary
 

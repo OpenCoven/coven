@@ -1,19 +1,20 @@
 ---
 title: "Coven concepts and terminology"
-summary: "Definitions for the nouns Coven uses across the CLI, daemon, API, and clients: harnesses, sessions, projects, rituals, summon, and sacrifice."
+summary: "Definitions for the nouns Coven uses across CastCodes, the CLI, daemon, API, and advanced clients: harnesses, sessions, projects, rituals, summon, and sacrifice."
 read_when:
   - Learning the Coven vocabulary
   - Mapping product terms to daemon and CLI behavior
-description: "Definitions for the nouns Coven uses across the CLI, daemon, API, and clients: harnesses, sessions, projects, rituals, summon, and sacrifice."
+description: "Definitions for the nouns Coven uses across CastCodes, the CLI, daemon, API, and advanced clients: harnesses, sessions, projects, rituals, summon, and sacrifice."
 ---
 
 # Coven Concepts
 
-This page defines the nouns used across the Coven CLI, daemon, API, docs, and client integrations.
+This page defines the nouns used across CastCodes, the Coven CLI, daemon, API, docs, and advanced client integrations.
 
 ```mermaid
 flowchart TB
-  OpenCoven[OpenCoven ecosystem] --> Coven[Coven runtime]
+  OpenCoven[OpenCoven] --> CastCodes[CastCodes workspace]
+  CastCodes --> Coven[Coven runtime]
   Coven --> Daemon[Daemon]
   Daemon --> Project[Project root]
   Daemon --> Cwd[Working directory]
@@ -32,9 +33,15 @@ Every term below is one node in the graph above.
 
 ## OpenCoven
 
-OpenCoven is the ecosystem and organization around the runtime, cockpit, and integrations.
+OpenCoven is the umbrella and organization behind CastCodes, Coven, and related labs.
 
 Use **OpenCoven** when talking about the broader project family.
+
+## CastCodes
+
+CastCodes is the local-first AI coding workspace and primary public proof surface for Coven.
+
+Use **CastCodes** for the product users open: terminal/editor substrate, visible lanes, workspace context, review flows, and approval UX.
 
 ## Coven
 
@@ -127,8 +134,9 @@ A client is anything that talks to Coven rather than launching harnesses directl
 
 Known client shapes:
 
+- CastCodes workspace.
 - `coven` CLI/TUI.
-- comux cockpit.
+- comux legacy/reference cockpit.
 - external OpenClaw plugin package `@opencoven/coven`.
 - future OpenMeow or desktop intake surfaces.
 

@@ -27,7 +27,7 @@ This keeps the runtime generic enough for CLIs that are not shaped exactly like 
 
 ## Hermes observations
 
-Hermes should stay a phase-2 validation target until Coven has more direct Codex/Claude/comux usage.
+Hermes should stay a phase-2 validation target until CastCodes and Coven have more direct Codex/Claude usage.
 
 Observed public CLI surface:
 
@@ -66,7 +66,7 @@ Do not add Hermes to `coven doctor` or `coven run` yet.
 For now, keep the adapter seam able to express prefix-arg CLIs (`chat -q <prompt>`) and revisit the actual Hermes adapter after:
 
 - direct Coven Codex/Claude sessions have been used more;
-- comux attach/open has had real usage;
+- CastCodes-facing attach/open or lane replay has had real usage;
 - we know whether Hermes should be one-shot, interactive, or resume-aware inside Coven; and
 - we can test against a real Hermes install.
 

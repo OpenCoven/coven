@@ -9,7 +9,7 @@ description: "Coven uses a same-user local Unix socket access model rather than 
 
 # Authentication and local access
 
-_Last updated: 2026-05-14_
+_Last updated: 2026-05-26_
 
 Coven does not currently have daemon-level user authentication in the OAuth, JWT, bearer-token, API-key, browser-cookie, or hosted-account sense.
 
@@ -21,18 +21,20 @@ The current solution is a **same-user local access model**:
 - Harness provider credentials stay in the harness provider's normal local auth flow.
 - Coven should not read, proxy, persist, or mint Codex, Claude Code, OpenAI, Anthropic, GitHub, or OpenClaw credentials.
 
-This is intentionally a local-first MVP posture. It is suitable for same-user local clients such as the Coven CLI/TUI, comux, OpenMeow, and the external OpenClaw plugin. It is not a remote API auth scheme.
+This is intentionally a local-first MVP posture. It is suitable for same-user local clients such as CastCodes, the Coven CLI/TUI, comux, OpenMeow, and the external OpenClaw plugin. It is not a remote API auth scheme.
 
 ```mermaid
 flowchart LR
   subgraph User["Same-user trust zone"]
     direction LR
+    CastCodes[CastCodes]
     CLI[coven CLI / TUI]
     Comux[comux]
     Plugin["@opencoven/coven\nOpenClaw plugin"]
     Other[Other same-user clients]
   end
 
+  CastCodes -->|Unix socket| Socket
   CLI -->|Unix socket| Socket["<covenHome>/coven.sock"]
   Comux -->|Unix socket| Socket
   Plugin -->|Unix socket + trust-anchor checks| Socket

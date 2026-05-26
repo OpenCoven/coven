@@ -1,9 +1,9 @@
 ---
-summary: "The Coven-side CLI/API contract for the visible comux cockpit flow."
+summary: "Legacy pointer for the comux + Coven demo loop; CastCodes is now the primary public proof surface."
 read_when:
-  - Building or auditing the comux demo loop
-title: "comux + Coven demo loop"
-description: "Summary of the comux + Coven demo loop for new contributors, with pointers to the canonical demo-loop contract and the moving pieces it covers."
+  - Migrating comux demo-loop language to CastCodes
+title: "comux to CastCodes migration note"
+description: "Legacy pointer for the comux + Coven demo loop; the future-facing public demo is CastCodes + Coven."
 ---
 
-See `docs/COMUX-DEMO-LOOP.md` for the canonical demo-loop contract. This page summarises the moving parts for new contributors.
+See `docs/CASTCODES-INTEGRATION.md` for the current CastCodes + Coven product direction. `docs/COMUX-DEMO-LOOP.md` remains as a legacy migration reference for the comux primitives being folded into CastCodes.

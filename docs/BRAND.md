@@ -17,7 +17,9 @@ OpenCoven should feel like **collective intelligence + controlled power**: arcan
 
 ## Positioning
 
-OpenCoven is an open ecosystem for persistent AI familiars: named agents with memory, tools, identity, roles, and continuity.
+OpenCoven is the umbrella behind CastCodes and Coven. CastCodes is the local-first workspace users open; Coven is the local runtime that gives agent work project boundaries, durable session records, and explicit authority.
+
+The broader OpenCoven brand still points toward persistent AI familiars: named agents with memory, tools, identity, roles, and continuity. CastCodes is the primary place that story should become visible.
 
 Most AI today feels temporary. You open a chat, explain your context, get a response, and start over. OpenCoven is built around a different future: AI that can **stay**.
 
@@ -25,9 +27,13 @@ OpenCoven gives builders a way to create durable AI systems that remember what m
 
 The philosophy is simple: AI should be powerful without becoming opaque, personal without pretending to be human, and extensible without collapsing into chaos. OpenCoven brings structure to the magic through memory, identity, orchestration, local execution, tool access, and multi-agent collaboration.
 
-Use this as the high-level brand promise:
+Use this as the high-level umbrella promise:
 
 > OpenCoven turns AI from a blank chatbox into a living workspace of agents that remember, coordinate, and belong to you.
+
+Use this as the product/runtime framing:
+
+> CastCodes is the product users open. Coven is the runtime that powers it.
 
 ## Approved logo
 

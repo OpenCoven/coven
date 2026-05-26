@@ -1,10 +1,10 @@
 ---
 title: "Coven product spec"
-summary: "The Coven product thesis, MVP scope, harness direction, CLI/TUI surface, daemon API, and OpenClaw integration plan for the local agent runtime."
+summary: "The Coven product thesis, MVP scope, CastCodes proof surface, harness direction, CLI/TUI surface, daemon API, and advanced integration plan for the local agent runtime."
 read_when:
   - Reviewing product scope and MVP boundaries
   - Checking whether a docs claim matches current product intent
-description: "The Coven product thesis, MVP scope, harness direction, CLI/TUI surface, daemon API, and OpenClaw integration plan for the local agent runtime."
+description: "The Coven product thesis, MVP scope, CastCodes proof surface, harness direction, CLI/TUI surface, daemon API, and advanced integration plan for the local agent runtime."
 ---
 
 # Coven product spec
@@ -12,6 +12,8 @@ description: "The Coven product thesis, MVP scope, harness direction, CLI/TUI su
 ## Product thesis
 
 Coven is a Rust-first harness substrate for running coding agents as project-scoped, observable, attachable sessions. It lets developers bring the harnesses they already trust into a controlled local runtime instead of forcing one agent provider or UI.
+
+CastCodes is the primary public proof surface for that runtime: the local-first AI coding workspace where users open visible lanes, inspect work, review diffs, verify changes, and decide what lands.
 
 North star: **One project. Any harness. Visible work.**
 
@@ -25,8 +27,9 @@ The MVP proves the core runtime loop:
 - Interactive PTY session execution
 - Session metadata and event persistence
 - Commands and TUI flows for running, browsing, rejoining, viewing, archiving, summoning, sacrificing, and killing live sessions through the daemon API
-- A minimal local API for first-party clients
-- An external OpenClaw plugin package that consumes that API without entering OpenClaw core
+- A minimal local API for CastCodes and advanced local clients
+- CastCodes-facing runtime contracts that keep the daemon authoritative while the workspace owns presentation and review UX
+- An external OpenClaw plugin package as an advanced compatibility path that consumes that API without entering OpenClaw core
 - Public distribution and documentation for early adopters
 
 Out of scope for MVP: marketplace plugins, cloud sync, multi-user collaboration, a full comux rewrite, bundled OpenClaw core integration, or replacing OpenClaw.
@@ -56,11 +59,13 @@ Hermes and other harnesses should arrive through a small adapter contract after 
 
 ```mermaid
 flowchart LR
-  User[Developer] --> CLI[coven CLI / TUI]
-  CLI --> Daemon[Coven Rust daemon]
-  Comux[comux] --> Daemon
+  User[Developer] --> CastCodes[CastCodes workspace]
+  CastCodes --> Daemon[Coven Rust daemon]
+  User --> CLI[coven CLI / TUI]
+  CLI --> Daemon
+  Comux[comux legacy/reference] -.-> Daemon
   OpenClaw[OpenClaw] --> Plugin[external @opencoven/coven plugin]
-  Plugin --> Daemon
+  Plugin -.-> Daemon
   Daemon --> Store[(SQLite session ledger)]
   Daemon --> Router[Codex / Claude adapter router]
   Router --> PTY[Harness PTYs]
@@ -68,11 +73,15 @@ flowchart LR
 
 For fuller diagrams, see [Architecture diagrams](/ARCHITECTURE).
 
-## Relationship to comux, OpenClaw, and OpenMeow
+## Relationship to CastCodes and advanced clients
 
-Coven is the local runtime substrate. comux can become the visual cockpit for Coven-managed panes and session history. OpenClaw can delegate project-scoped harness launches to Coven only through the external `@opencoven/coven` plugin, not through bundled OpenClaw core code. OpenMeow can consume Coven session status, intake, or notifications where useful.
+Coven is the local runtime substrate. CastCodes is the primary workspace and public proof surface for Coven-managed lanes, session history, logs, artifacts, verification, and review.
 
-Coven should integrate with these projects without being owned by any one of them: it is the shared room where harnesses run, not the entire UI or orchestrator.
+comux proved visible terminal-cockpit primitives such as panes, worktree isolation, agent launchers, rituals, diff review, merge/PR cleanup, lifecycle hooks, and Coven session visibility. Those primitives should fold into CastCodes-native concepts instead of positioning comux as a second flagship cockpit.
+
+OpenClaw can delegate project-scoped harness launches to Coven only through the external `@opencoven/coven` plugin, not through bundled OpenClaw core code. OpenMeow-like surfaces may consume Coven session status, intake, or notifications where useful, but they are advanced integration paths rather than the beginner product story.
+
+Coven should integrate with these projects without being owned by any one of them: it is the room where harnesses run, while CastCodes is the product where most users should feel that runtime.
 
 ## External OpenClaw plugin boundary
 

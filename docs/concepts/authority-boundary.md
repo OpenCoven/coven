@@ -8,7 +8,7 @@ description: "Where the authority boundary sits in Coven: clients ask, but only 
 
 ```mermaid
 flowchart TD
-  Client[CLI, TUI, comux, OpenClaw plugin] --> Request[Launch / input / kill / list request]
+  Client[CastCodes, CLI, TUI, advanced clients] --> Request[Launch / input / kill / list request]
   Request --> Rust[Rank 0 authority: Rust daemon]
   Rust --> RootCheck{projectRoot explicit?}
   RootCheck -- no --> RejectRoot[Reject]
