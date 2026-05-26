@@ -9,7 +9,6 @@ pub const SETTINGS_FILE_NAME: &str = "settings.json";
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
-    #[serde(rename = "covenCli")]
     pub coven_cli: CovenCliSettings,
 }
 
@@ -18,9 +17,7 @@ pub struct Settings {
 pub struct CovenCliSettings {
     pub privacy: Option<PrivacySettings>,
     pub repos: BTreeMap<String, RepoSettings>,
-    #[serde(default)]
     pub default_repo: Option<String>,
-    #[serde(default)]
     pub fuzzy: FuzzySettings,
 }
 
@@ -46,8 +43,13 @@ pub struct FuzzySettings {
 
 pub fn user_settings_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|v| !v.is_empty())
+                .map(|h| PathBuf::from(h).join(".config"))
+        })?;
     Some(base.join("coven").join(SETTINGS_FILE_NAME))
 }
 
@@ -96,5 +98,13 @@ mod tests {
             loaded.coven_cli.repos.get("alpha").unwrap().path,
             PathBuf::from("/abs/alpha")
         );
+    }
+
+    #[test]
+    fn empty_object_returns_default_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        std::fs::write(&path, "{}").unwrap();
+        assert_eq!(load_from(&path).unwrap().unwrap(), Settings::default());
     }
 }
