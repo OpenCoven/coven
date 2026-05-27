@@ -826,6 +826,15 @@ fn run_session(
     let conn = store::open_store(&store_path)?;
     let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
 
+    // Expand @path / @T-<id> / @@search refs before dispatching to the harness.
+    // Keep the original `prompt` for session title and human-facing output so titles
+    // aren't blown out by inlined file content.
+    let expanded_prompt = if prompt.is_empty() {
+        String::new()
+    } else {
+        prompt_refs::expand_all(&cwd, &conn, &prompt)?
+    };
+
     // Resolve --continue: explicit id, "" (latest), or None (new session).
     let resumed_id: Option<String> = match continue_session {
         None => None,
@@ -914,7 +923,7 @@ fn run_session(
     };
     let command = pty_runner::build_harness_command_with_conversation(
         selected_harness.id,
-        &prompt,
+        &expanded_prompt,
         &cwd,
         harness_launch_mode_for_stdio(),
         conversation_hint.as_ref(),

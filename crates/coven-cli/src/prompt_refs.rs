@@ -1,12 +1,9 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
-#[allow(dead_code)]
 pub const MAX_TEXT_LINES: usize = 500;
-#[allow(dead_code)]
 pub const MAX_LINE_CHARS: usize = 2048;
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ref {
     /// `@path/to/file` or `@glob/*.md`
@@ -17,14 +14,12 @@ pub enum Ref {
     Search(String),
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedPrompt {
     pub raw: String,
     pub refs: Vec<Ref>,
 }
 
-#[allow(dead_code)]
 pub fn parse(prompt: &str) -> ParsedPrompt {
     let mut refs = Vec::new();
     let bytes = prompt.as_bytes();
@@ -63,7 +58,6 @@ pub fn parse(prompt: &str) -> ParsedPrompt {
     }
 }
 
-#[allow(dead_code)]
 pub fn expand_path(cwd: &Path, raw: &str) -> Result<String> {
     if raw.contains('*') || raw.contains('?') || raw.contains('[') {
         return expand_glob(cwd, raw);
@@ -83,8 +77,7 @@ pub fn expand_path(cwd: &Path, raw: &str) -> Result<String> {
     let raw_text = std::fs::read_to_string(&full)?;
     let mut out = String::new();
     out.push_str(&format!("--- @{raw} ---\n"));
-    let mut written = 0usize;
-    for line in raw_text.lines() {
+    for (written, line) in raw_text.lines().enumerate() {
         if written >= MAX_TEXT_LINES {
             out.push_str(&format!("[…truncated at {MAX_TEXT_LINES} lines]\n"));
             break;
@@ -92,13 +85,11 @@ pub fn expand_path(cwd: &Path, raw: &str) -> Result<String> {
         let truncated: String = line.chars().take(MAX_LINE_CHARS).collect();
         out.push_str(&truncated);
         out.push('\n');
-        written += 1;
     }
     out.push_str("--- end ---\n");
     Ok(out)
 }
 
-#[allow(dead_code)]
 fn guess_mime(path: &Path) -> String {
     match path.extension().and_then(|e| e.to_str()) {
         Some("png") => "image/png".into(),
@@ -109,7 +100,6 @@ fn guess_mime(path: &Path) -> String {
     }
 }
 
-#[allow(dead_code)]
 pub fn expand_thread(conn: &rusqlite::Connection, id: &str) -> Result<String> {
     use anyhow::Context;
     let mut stmt = conn
@@ -141,7 +131,6 @@ pub fn expand_thread(conn: &rusqlite::Connection, id: &str) -> Result<String> {
     Ok(out)
 }
 
-#[allow(dead_code)]
 fn expand_glob(cwd: &Path, pattern: &str) -> Result<String> {
     use globset::{Glob, GlobSetBuilder};
     let mut builder = GlobSetBuilder::new();
@@ -169,7 +158,6 @@ fn expand_glob(cwd: &Path, pattern: &str) -> Result<String> {
     Ok(out)
 }
 
-#[allow(dead_code)]
 fn walkdir(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -188,6 +176,50 @@ fn walkdir(root: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// Expand every `@path`, `@T-<id>`, and `@@search` ref found in `prompt`.
+/// Inlined content is prepended to the prompt with delimited blocks; the
+/// original prompt text follows unchanged. Returns `prompt` unmodified when
+/// it contains no refs.
+pub fn expand_all(
+    cwd: &Path,
+    conn: &rusqlite::Connection,
+    prompt: &str,
+) -> Result<String> {
+    let parsed = parse(prompt);
+    if parsed.refs.is_empty() {
+        return Ok(prompt.to_string());
+    }
+    let mut prefix = String::new();
+    for r in &parsed.refs {
+        let block = match r {
+            Ref::Path(p) => expand_path(cwd, p)?,
+            Ref::Thread(id) => expand_thread(conn, id)?,
+            Ref::Search(q) => expand_search(conn, q)?,
+        };
+        prefix.push_str(&block);
+        if !prefix.ends_with('\n') {
+            prefix.push('\n');
+        }
+    }
+    Ok(format!("{prefix}\n{prompt}"))
+}
+
+fn expand_search(conn: &rusqlite::Connection, query: &str) -> Result<String> {
+    let hits = crate::store::search_events(conn, query)?;
+    if hits.is_empty() {
+        return Ok(format!("[no search hits for @@{query}]"));
+    }
+    let mut s = format!("--- @@{query} ---\n");
+    for hit in hits.into_iter().take(5) {
+        s.push_str(&format!(
+            "[{}] {} {} {}\n",
+            hit.created_at, hit.session_id, hit.kind, hit.snippet
+        ));
+    }
+    s.push_str("--- end ---\n");
+    Ok(s)
 }
 
 #[cfg(test)]
@@ -337,6 +369,80 @@ mod tests {
         let conn = crate::store::open_store(&temp.path().join("test.sqlite3"))?;
         let out = expand_thread(&conn, "T-nope")?;
         assert_eq!(out, "[no events for @T-nope]");
+        Ok(())
+    }
+
+    #[test]
+    fn expand_all_passes_through_when_no_refs() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = crate::store::open_store(&temp.path().join("test.sqlite3"))?;
+        let out = expand_all(temp.path(), &conn, "just a plain prompt with no refs")?;
+        assert_eq!(out, "just a plain prompt with no refs");
+        Ok(())
+    }
+
+    #[test]
+    fn expand_all_inlines_path_ref_before_prompt() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        std::fs::write(temp.path().join("notes.md"), "alpha beta gamma\n")?;
+        let conn = crate::store::open_store(&temp.path().join("test.sqlite3"))?;
+        let out = expand_all(temp.path(), &conn, "summarise @notes.md please")?;
+        assert!(out.contains("alpha beta gamma"), "got: {out}");
+        let body_idx = out.find("summarise @notes.md please").expect("original prompt should appear");
+        let content_idx = out.find("alpha beta gamma").expect("file content should appear");
+        assert!(content_idx < body_idx, "inlined content should precede the original prompt; got: {out}");
+        Ok(())
+    }
+
+    #[test]
+    fn expand_all_search_no_hits_inlines_placeholder() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = crate::store::open_store(&temp.path().join("test.sqlite3"))?;
+        let out = expand_all(temp.path(), &conn, "context:\n@@phoenix rising\nthen answer")?;
+        assert!(out.contains("[no search hits for @@phoenix rising]"), "got: {out}");
+        assert!(out.contains("then answer"), "original prompt preserved; got: {out}");
+        Ok(())
+    }
+
+    #[test]
+    fn expand_all_search_inlines_hits() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = crate::store::open_store(&temp.path().join("test.sqlite3"))?;
+        conn.execute(
+            "INSERT INTO sessions(id, project_root, harness, title, status, created_at, updated_at)
+             VALUES('s-1', '/tmp', 'codex', 't', 'created', '2026-01-01', '2026-01-01')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO events(id, session_id, kind, payload_json, created_at)
+             VALUES('e1', 's-1', 'user', '{\"text\":\"phoenix rising over the city\"}', '2026-01-01')",
+            [],
+        )?;
+        let out = expand_all(temp.path(), &conn, "context:\n@@phoenix\ngo")?;
+        assert!(out.contains("phoenix"), "search snippet should appear; got: {out}");
+        assert!(out.contains("--- @@phoenix ---"), "search delimiter; got: {out}");
+        Ok(())
+    }
+
+    #[test]
+    fn expand_all_combines_path_and_thread_refs() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        std::fs::write(temp.path().join("intro.md"), "INTRO_BODY\n")?;
+        let conn = crate::store::open_store(&temp.path().join("test.sqlite3"))?;
+        conn.execute(
+            "INSERT INTO sessions(id, project_root, harness, title, status, created_at, updated_at)
+             VALUES('T-prev', '/tmp', 'codex', 't', 'created', '2026-01-01', '2026-01-01')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO events(id, session_id, kind, payload_json, created_at)
+             VALUES('e1', 'T-prev', 'user', '{\"text\":\"PREV_PAYLOAD\"}', '2026-01-01')",
+            [],
+        )?;
+        let out = expand_all(temp.path(), &conn, "read @intro.md and continue @T-prev")?;
+        assert!(out.contains("INTRO_BODY"), "got: {out}");
+        assert!(out.contains("PREV_PAYLOAD"), "got: {out}");
+        assert!(out.contains("read @intro.md and continue @T-prev"), "original prompt preserved; got: {out}");
         Ok(())
     }
 }
