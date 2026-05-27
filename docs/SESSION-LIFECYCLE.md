@@ -165,3 +165,20 @@ An orphaned session means Coven no longer owns a live process for that record. T
 Events are append-only records in SQLite. This gives clients a stable replay source even when the original PTY process has exited.
 
 Do not intentionally write secrets, environment dumps, private URLs, or token-bearing command output into events. Coven cannot guarantee that harness output is secret-free, so users should avoid running untrusted prompts in sensitive repositories.
+
+## Search and continuation (added 2026-05)
+
+- `coven sessions search <query>` runs a SQLite FTS5 query over `events.payload_json`.
+  Supports the full FTS5 query syntax (`phoenix OR rises`, `"exact phrase"`, `phoe*`).
+  Output is a flat list of hits ordered most-recent-first; pass `--json` to get the raw
+  SearchHit array for client tools.
+- `coven run <harness> --continue` resumes the most recently created, non-archived
+  session whose `project_root` matches the current directory. The harness is launched
+  with `ConversationHint::Resume` so codex/claude pick up the prior turn's context.
+- `coven run <harness> --continue <ID>` resumes by explicit session id.
+- `coven run <harness> --labels foo,bar --visibility workspace --archive "task"` tags
+  and archives a one-shot run in a single command. `--labels` and `--visibility` are
+  creation-time only (ignored when resuming). Valid visibility values: `private`
+  (default), `workspace`, `shared`.
+- `--detach` and `--continue` are mutually exclusive — resuming-but-not-running is
+  incoherent.
