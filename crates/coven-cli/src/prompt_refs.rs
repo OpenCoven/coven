@@ -1,4 +1,4 @@
-#[allow(unused_imports)]
+use anyhow::Result;
 use std::path::{Path, PathBuf};
 
 #[allow(dead_code)]
@@ -63,6 +63,49 @@ pub fn parse(prompt: &str) -> ParsedPrompt {
     }
 }
 
+#[allow(dead_code)]
+pub fn expand_path(cwd: &Path, raw: &str) -> Result<String> {
+    let full = cwd.join(raw);
+    if !full.exists() {
+        return Ok(format!("[missing @{raw}]"));
+    }
+    let mime = guess_mime(&full);
+    if mime.starts_with("image/") {
+        let bytes = std::fs::metadata(&full)?.len();
+        return Ok(format!(
+            "[image @ {}: {mime}, {bytes} bytes]",
+            full.display()
+        ));
+    }
+    let raw_text = std::fs::read_to_string(&full)?;
+    let mut out = String::new();
+    out.push_str(&format!("--- @{raw} ---\n"));
+    let mut written = 0usize;
+    for line in raw_text.lines() {
+        if written >= MAX_TEXT_LINES {
+            out.push_str(&format!("[…truncated at {MAX_TEXT_LINES} lines]\n"));
+            break;
+        }
+        let truncated: String = line.chars().take(MAX_LINE_CHARS).collect();
+        out.push_str(&truncated);
+        out.push('\n');
+        written += 1;
+    }
+    out.push_str("--- end ---\n");
+    Ok(out)
+}
+
+#[allow(dead_code)]
+fn guess_mime(path: &Path) -> String {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("png") => "image/png".into(),
+        Some("jpg") | Some("jpeg") => "image/jpeg".into(),
+        Some("gif") => "image/gif".into(),
+        Some("webp") => "image/webp".into(),
+        _ => "text/plain".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,5 +151,46 @@ mod tests {
                 Ref::Search("phoenix".into()),
             ]
         );
+    }
+
+    #[test]
+    fn expand_path_inlines_text_file_capped() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("hello.md");
+        std::fs::write(&path, "line1\nline2\nline3\n").unwrap();
+        let expanded = expand_path(temp.path(), "hello.md").unwrap();
+        assert!(expanded.contains("line1"), "got: {expanded}");
+        assert!(expanded.contains("line3"), "got: {expanded}");
+        assert!(expanded.contains("hello.md"), "got: {expanded}");
+    }
+
+    #[test]
+    fn expand_path_image_becomes_placeholder() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("pic.png");
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\nfake").unwrap();
+        let expanded = expand_path(temp.path(), "pic.png").unwrap();
+        assert!(expanded.contains("[image @ "), "got: {expanded}");
+        assert!(expanded.contains("image/png"), "got: {expanded}");
+    }
+
+    #[test]
+    fn expand_path_missing_returns_placeholder() {
+        let temp = tempfile::tempdir().unwrap();
+        let expanded = expand_path(temp.path(), "nope.md").unwrap();
+        assert_eq!(expanded, "[missing @nope.md]");
+    }
+
+    #[test]
+    fn expand_path_truncates_at_max_lines() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("big.md");
+        let body: String = (0..(MAX_TEXT_LINES + 50))
+            .map(|i| format!("line-{i}\n"))
+            .collect();
+        std::fs::write(&path, body).unwrap();
+        let expanded = expand_path(temp.path(), "big.md").unwrap();
+        assert!(expanded.contains(&format!("…truncated at {MAX_TEXT_LINES} lines")));
+        assert!(!expanded.contains(&format!("line-{}", MAX_TEXT_LINES + 49)));
     }
 }
