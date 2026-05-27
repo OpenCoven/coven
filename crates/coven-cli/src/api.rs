@@ -2395,6 +2395,8 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             conversation_id: None,
+            labels: Vec::new(),
+            visibility: "private".to_string(),
         };
         store::insert_session(&conn, &session)?;
         let fake = fake_openai_key();
@@ -2435,6 +2437,8 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             conversation_id: None,
+            labels: Vec::new(),
+            visibility: "private".to_string(),
         };
         store::insert_session(&conn, &session)?;
         drop(conn);
@@ -2469,6 +2473,8 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             conversation_id: None,
+            labels: Vec::new(),
+            visibility: "private".to_string(),
         };
         store::insert_session(&conn, &session)?;
         insert_event(

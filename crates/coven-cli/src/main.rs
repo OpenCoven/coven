@@ -705,7 +705,7 @@ fn run_logs_command(command: LogsCommand) -> Result<()> {
 
 fn prune_logs_command(dry_run: bool, raw_days: Option<u64>, event_days: Option<u64>) -> Result<()> {
     let home = coven_home_dir()?;
-    let config = privacy::load_config(&home).unwrap_or_default();
+    let config = privacy::load_with_settings(&home, settings::cached()).unwrap_or_default();
     let raw_days = raw_days
         .unwrap_or(config.raw_artifact_retention_days)
         .max(1);
