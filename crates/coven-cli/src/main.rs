@@ -101,6 +101,17 @@ enum Command {
         visibility: Option<String>,
         #[arg(long, help = "Archive the session after the run completes")]
         archive: bool,
+        #[arg(
+            long,
+            help = "Emit JSONL events on stdout (system.init / user / assistant / tool_result / result)"
+        )]
+        stream_json: bool,
+        #[arg(
+            long,
+            requires = "stream_json",
+            help = "Read JSONL user messages from stdin (claude harness only; requires --stream-json)"
+        )]
+        stream_json_input: bool,
     },
     #[command(about = "List or search recent Coven sessions")]
     Sessions {
@@ -254,6 +265,8 @@ fn run_cli(cli: Cli) -> Result<()> {
             labels,
             visibility,
             archive,
+            stream_json,
+            stream_json_input,
         }) => run_session(
             &harness,
             &prompt,
@@ -264,6 +277,8 @@ fn run_cli(cli: Cli) -> Result<()> {
             labels,
             visibility.as_deref(),
             archive,
+            stream_json,
+            stream_json_input,
         ),
         Some(Command::Sessions {
             command,
@@ -803,7 +818,12 @@ fn run_session(
     labels: Vec<String>,
     visibility: Option<&str>,
     archive: bool,
+    stream_json: bool,
+    stream_json_input: bool,
 ) -> Result<()> {
+    // 4.3/4.4 will consume these; for now they only need to exist on the
+    // signature so the flags compile cleanly end-to-end.
+    let _ = (stream_json, stream_json_input);
     let prompt = if prompt_args.is_empty() {
         String::new()
     } else {

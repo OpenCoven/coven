@@ -1189,7 +1189,19 @@ fn dispatch_via_local_pty(
     daemon_reason: &str,
 ) -> Result<CastOutcome> {
     let title = plan.title.as_deref();
-    run_session(harness_id, &[prompt.to_string()], None, title, false, None, Vec::new(), None, false)?;
+    run_session(
+        harness_id,
+        &[prompt.to_string()],
+        None,
+        title,
+        false,
+        None,
+        Vec::new(),
+        None,
+        false,
+        false,
+        false,
+    )?;
     let mut notes = plan_outcome_notes(plan);
     notes.push(format!("Cast event follower skipped: {daemon_reason}."));
     Ok(CastOutcome {
@@ -1864,7 +1876,19 @@ fn run_guided_harness_session() -> Result<()> {
         prompt_for_optional_line(&harness_prompt)?.unwrap_or_else(|| default_harness.to_string());
     let prompt = prompt_for_required_line("Task for the agent: ")?;
     let title = prompt_for_optional_line("Optional session title [enter to skip]: ")?;
-    run_session(&harness, &[prompt], None, title.as_deref(), false, None, Vec::new(), None, false)
+    run_session(
+        &harness,
+        &[prompt],
+        None,
+        title.as_deref(),
+        false,
+        None,
+        Vec::new(),
+        None,
+        false,
+        false,
+        false,
+    )
 }
 
 const LAUNCHER_VISIBLE_COMMANDS: usize = 6;
