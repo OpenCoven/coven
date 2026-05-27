@@ -71,6 +71,15 @@ pub struct SensitiveArtifactRecord {
     pub expires_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SearchHit {
+    pub event_id: String,
+    pub session_id: String,
+    pub kind: String,
+    pub snippet: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Default)]
 pub struct EventsQueryOptions {
     pub after_seq: Option<i64>,
@@ -150,6 +159,25 @@ pub fn open_store(path: &Path) -> Result<Connection> {
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
+            payload_json,
+            content='events',
+            content_rowid='rowid'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS events_fts_insert AFTER INSERT ON events BEGIN
+            INSERT INTO events_fts(rowid, payload_json) VALUES (new.rowid, new.payload_json);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS events_fts_delete AFTER DELETE ON events BEGIN
+            INSERT INTO events_fts(events_fts, rowid, payload_json) VALUES('delete', old.rowid, old.payload_json);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS events_fts_update AFTER UPDATE ON events BEGIN
+            INSERT INTO events_fts(events_fts, rowid, payload_json) VALUES('delete', old.rowid, old.payload_json);
+            INSERT INTO events_fts(rowid, payload_json) VALUES (new.rowid, new.payload_json);
+        END;
         ",
     )
     .context("failed to initialize Coven store schema")?;
@@ -160,6 +188,17 @@ pub fn open_store(path: &Path) -> Result<Connection> {
     ensure_sensitive_artifacts_table(&conn)?;
     ensure_labels_column(&conn)?;
     ensure_visibility_column(&conn)?;
+
+    // Backfill: copy any existing events into the FTS index. Safe on fresh dbs.
+    conn.execute(
+        "INSERT INTO events_fts(rowid, payload_json)
+         SELECT e.rowid, e.payload_json
+         FROM events e
+         LEFT JOIN events_fts f ON f.rowid = e.rowid
+         WHERE f.rowid IS NULL",
+        [],
+    )
+    .context("failed to backfill events_fts")?;
 
     Ok(conn)
 }
@@ -621,6 +660,35 @@ pub fn sacrifice_session(conn: &Connection, session_id: &str) -> Result<()> {
         .with_context(|| format!("failed to sacrifice session {session_id}"))?;
 
     Ok(())
+}
+
+pub fn search_events(conn: &Connection, query: &str) -> Result<Vec<SearchHit>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT e.id, e.session_id, e.kind, snippet(events_fts, 0, '[', ']', '…', 16), e.created_at
+             FROM events_fts
+             JOIN events e ON e.rowid = events_fts.rowid
+             WHERE events_fts MATCH ?1
+             ORDER BY e.created_at DESC
+             LIMIT 100",
+        )
+        .context("failed to prepare events_fts search")?;
+    let rows = stmt
+        .query_map([query], |row| {
+            Ok(SearchHit {
+                event_id: row.get(0)?,
+                session_id: row.get(1)?,
+                kind: row.get(2)?,
+                snippet: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })
+        .context("failed to run events_fts search")?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.context("failed to read events_fts row")?);
+    }
+    Ok(out)
 }
 
 pub fn insert_event(conn: &Connection, record: &EventRecord) -> Result<()> {
@@ -1759,6 +1827,27 @@ mod tests {
             labels: Vec::new(),
             visibility: "private".to_string(),
         }
+    }
+
+    #[test]
+    fn search_events_finds_match_in_payload() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("test.sqlite3"))?;
+        conn.execute(
+            "INSERT INTO sessions(id, project_root, harness, title, status, created_at, updated_at)
+             VALUES('s1', '/tmp', 'codex', 't', 'created', '2026-01-01', '2026-01-01')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO events(id, session_id, kind, payload_json, created_at)
+             VALUES('e1', 's1', 'stdout', '{\"text\":\"phoenix rises\"}', '2026-01-01')",
+            [],
+        )?;
+        let hits = search_events(&conn, "phoenix")?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].event_id, "e1");
+        assert_eq!(hits[0].session_id, "s1");
+        Ok(())
     }
 
     #[test]
