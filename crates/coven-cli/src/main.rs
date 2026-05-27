@@ -817,6 +817,15 @@ fn emit_stream_event(event: &stream_json::Event) -> Result<()> {
     Ok(())
 }
 
+fn should_synthesize_stream_user_event(
+    stream_json: bool,
+    expanded_prompt: &str,
+    detach: bool,
+    harness_id: &str,
+) -> bool {
+    stream_json && !expanded_prompt.is_empty() && (detach || harness_id != "claude")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_session(
     harness_id: &str,
@@ -833,7 +842,6 @@ fn run_session(
 ) -> Result<()> {
     // `stream_json_input` is consumed by the claude pass-through in 4.4; for
     // non-stream harnesses it has no effect on this path.
-    let _ = stream_json_input;
     let prompt = if prompt_args.is_empty() {
         String::new()
     } else {
@@ -941,19 +949,18 @@ fn run_session(
             tools: Vec::new(),
             agent_mode: None,
         }))?;
-        if !expanded_prompt.is_empty() {
-            emit_stream_event(&stream_json::Event::User(stream_json::UserMessage {
-                message: stream_json::MessageBody {
-                    role: "user".into(),
-                    content: vec![stream_json::ContentBlock::Text {
-                        text: expanded_prompt.clone(),
-                    }],
-                },
-                session_id: record.id.clone(),
-                parent_tool_use_id: None,
-            }))?;
-        }
     }
+
+    // We synthesize the `user` event only on paths where the harness will
+    // *not* emit it itself: detach (no harness runs) and codex / generic
+    // non-stream harnesses. The claude pass-through skips this so we don't
+    // duplicate the user message claude echoes through its native protocol.
+    let synthesize_user_event = should_synthesize_stream_user_event(
+        stream_json,
+        &expanded_prompt,
+        detach,
+        selected_harness.id,
+    );
 
     if detach {
         if archive {
@@ -963,6 +970,18 @@ fn run_session(
             println!("\nDetached mode: session was recorded but the harness was not spawned.");
             println!("View it later with `coven sessions`.");
         } else {
+            if synthesize_user_event {
+                emit_stream_event(&stream_json::Event::User(stream_json::UserMessage {
+                    message: stream_json::MessageBody {
+                        role: "user".into(),
+                        content: vec![stream_json::ContentBlock::Text {
+                            text: expanded_prompt.clone(),
+                        }],
+                    },
+                    session_id: record.id.clone(),
+                    parent_tool_use_id: None,
+                }))?;
+            }
             emit_stream_event(&stream_json::Event::Result(stream_json::RunResult {
                 subtype: "success".into(),
                 duration_ms: stream_started.elapsed().as_millis() as u64,
@@ -982,6 +1001,83 @@ fn run_session(
         None,
         &current_timestamp(),
     )?;
+
+    // Claude's native stream-json: pipe its JSONL events through ours
+    // between the init/result frames we already emit. The codex / generic
+    // path below cannot do this because codex doesn't speak stream-json, so we
+    // branch here after resolving the harness to claude.
+    if stream_json && selected_harness.id == "claude" {
+        let stdout = io::stdout();
+        let mut handle = stdout.lock();
+        let exit_code = pty_runner::stream_claude(
+            &cwd,
+            &record.id,
+            &expanded_prompt,
+            stream_json_input,
+            &mut handle,
+        );
+        drop(handle);
+        let exit_code = match exit_code {
+            Ok(code) => code,
+            Err(error) => {
+                store::update_session_status(
+                    &conn,
+                    &record.id,
+                    FAILED_SESSION_STATUS,
+                    None,
+                    &current_timestamp(),
+                )?;
+                emit_stream_event(&stream_json::Event::Result(stream_json::RunResult {
+                    subtype: "error_during_execution".into(),
+                    duration_ms: stream_started.elapsed().as_millis() as u64,
+                    is_error: true,
+                    num_turns: 1,
+                    session_id: record.id.clone(),
+                    error: Some(format!("{error:#}")),
+                }))?;
+                return Err(error);
+            }
+        };
+        let is_error = exit_code != 0;
+        let status = if is_error { "failed" } else { "completed" };
+        store::update_session_status(
+            &conn,
+            &record.id,
+            status,
+            Some(exit_code),
+            &current_timestamp(),
+        )?;
+        emit_stream_event(&stream_json::Event::Result(stream_json::RunResult {
+            subtype: if is_error {
+                "error_during_execution".into()
+            } else {
+                "success".into()
+            },
+            duration_ms: stream_started.elapsed().as_millis() as u64,
+            is_error,
+            num_turns: 1,
+            session_id: record.id.clone(),
+            error: None,
+        }))?;
+        if archive {
+            let archived_at = current_timestamp();
+            store::archive_session(&conn, &record.id, &archived_at)?;
+        }
+        return Ok(());
+    }
+
+    if synthesize_user_event {
+        emit_stream_event(&stream_json::Event::User(stream_json::UserMessage {
+            message: stream_json::MessageBody {
+                role: "user".into(),
+                content: vec![stream_json::ContentBlock::Text {
+                    text: expanded_prompt.clone(),
+                }],
+            },
+            session_id: record.id.clone(),
+            parent_tool_use_id: None,
+        }))?;
+    }
 
     let conversation_hint = if is_resume {
         Some(harness::ConversationHint::Resume { id: record.id.clone() })
@@ -1385,6 +1481,25 @@ mod tests {
             "hello from coven"
         );
         Ok(())
+    }
+
+    #[test]
+    fn stream_json_user_event_synthesis_skips_live_claude_passthrough() {
+        assert!(should_synthesize_stream_user_event(
+            true, "hello", true, "claude"
+        ));
+        assert!(should_synthesize_stream_user_event(
+            true, "hello", false, "codex"
+        ));
+        assert!(!should_synthesize_stream_user_event(
+            true, "hello", false, "claude"
+        ));
+        assert!(!should_synthesize_stream_user_event(
+            false, "hello", false, "codex"
+        ));
+        assert!(!should_synthesize_stream_user_event(
+            true, "", true, "codex"
+        ));
     }
 
     #[test]

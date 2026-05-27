@@ -1,4 +1,4 @@
-//! End-to-end tests for `coven run … --stream-json`.
+//! End-to-end tests for `coven run ... --stream-json`.
 //!
 //! These tests are `#[ignore]` by default because they shell out to the
 //! built `coven` binary. Run them explicitly with:
