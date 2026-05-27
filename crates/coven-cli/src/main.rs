@@ -187,6 +187,17 @@ enum InteractiveShellRoute {
 }
 
 fn main() -> Result<()> {
+    let loaded = settings::user_settings_path()
+        .as_deref()
+        .and_then(|path| match settings::load_from(path) {
+            Ok(s) => s,
+            Err(err) => {
+                eprintln!("coven: ignoring settings ({}): {err:#}", path.display());
+                None
+            }
+        });
+    settings::init_cached(loaded);
+
     let cli = Cli::parse();
     run_cli(cli)
 }
@@ -277,7 +288,7 @@ fn run_doctor() -> Result<()> {
         None => println!("Project: not inside a git/project root yet"),
     }
 
-    let repos_config = repos_config::load(&home)?;
+    let repos_config = repos_config::load_with_settings(&home, settings::cached())?;
     if !repos_config.is_empty() {
         println!("\nRepos ({}):", repos_config::config_path(&home).display());
         for (name, path) in repos_config.entries() {
@@ -327,7 +338,7 @@ fn run_patch(
     keep_session: bool,
 ) -> Result<()> {
     let coven_home = coven_home_dir()?;
-    let repos_config = repos_config::load(&coven_home)?;
+    let repos_config = repos_config::load_with_settings(&coven_home, settings::cached())?;
     let resolved_name = name
         .or_else(|| repos_config.default_name().map(str::to_string))
         .unwrap_or_else(|| openclaw_repo::OPENCLAW_REPO_NAME.to_string());

@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -79,6 +80,22 @@ pub fn warn_if_shadowed(shadowed: &[String], toml_path: &Path, jsonc_path: &Path
     }
 }
 
+static CACHED: OnceLock<Option<Settings>> = OnceLock::new();
+
+/// Initialize the process-wide cached Settings. Call exactly once at startup.
+/// Subsequent calls are no-ops (the first init wins). Returns the cached value
+/// so the caller can also use it directly if convenient.
+pub fn init_cached(value: Option<Settings>) -> Option<&'static Settings> {
+    let _ = CACHED.set(value);
+    CACHED.get().and_then(|opt| opt.as_ref())
+}
+
+/// Get the cached Settings, if any. Returns `None` if init has not run or if
+/// the loader returned None at startup.
+pub fn cached() -> Option<&'static Settings> {
+    CACHED.get().and_then(|opt| opt.as_ref())
+}
+
 pub fn load_from(path: &Path) -> Result<Option<Settings>> {
     let raw = match std::fs::read_to_string(path) {
         Ok(r) => r,
@@ -140,5 +157,16 @@ mod tests {
         let jsonc_keys = ["repos.alpha".to_string()];
         let shadowed = shadowed_keys(&toml_keys, &jsonc_keys);
         assert_eq!(shadowed, vec!["repos.alpha".to_string()]);
+    }
+
+    #[test]
+    fn cached_returns_the_initialized_value() {
+        // Note: OnceLock is process-wide; this test relies on being the ONLY test
+        // in the suite that calls init_cached. If another test also calls it, the
+        // ordering will determine which value wins, which would make this test
+        // flaky. As of this commit no other test touches init_cached.
+        let settings = Settings::default();
+        init_cached(Some(settings.clone()));
+        assert_eq!(cached(), Some(&settings));
     }
 }
