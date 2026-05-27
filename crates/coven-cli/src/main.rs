@@ -22,11 +22,11 @@ mod pc;
 mod privacy;
 mod project;
 mod prompt_refs;
-mod stream_json;
 mod pty_runner;
 mod repos_config;
 mod settings;
 mod store;
+mod stream_json;
 mod theme;
 mod tui;
 mod verification;
@@ -91,7 +91,11 @@ enum Command {
             help = "Resume session by id; omit value to resume the latest active session for this project"
         )]
         continue_session: Option<String>,
-        #[arg(long, value_delimiter = ',', help = "Comma-separated labels for the new session (ignored when resuming)")]
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Comma-separated labels for the new session (ignored when resuming)"
+        )]
         labels: Vec<String>,
         #[arg(
             long,
@@ -231,13 +235,14 @@ enum InteractiveShellRoute {
 }
 
 fn main() -> Result<()> {
-    let loaded = settings::user_settings_path()
-        .as_deref()
-        .and_then(|path| match settings::load_from(path) {
-            Ok(s) => s,
-            Err(err) => {
-                eprintln!("coven: ignoring settings ({}): {err:#}", path.display());
-                None
+    let loaded =
+        settings::user_settings_path().as_deref().and_then(|path| {
+            match settings::load_from(path) {
+                Ok(s) => s,
+                Err(err) => {
+                    eprintln!("coven: ignoring settings ({}): {err:#}", path.display());
+                    None
+                }
             }
         });
     settings::init_cached(loaded);
@@ -287,9 +292,10 @@ fn run_cli(cli: Cli) -> Result<()> {
             plain,
             json,
         }) => match command {
-            Some(SessionsCommand::Search { query, json: search_json }) => {
-                run_sessions_search(&query, search_json)
-            }
+            Some(SessionsCommand::Search {
+                query,
+                json: search_json,
+            }) => run_sessions_search(&query, search_json),
             None => tui::sessions::run_command(all, manage, plain, json),
         },
         Some(Command::Logs { command }) => run_logs_command(command),
@@ -332,8 +338,7 @@ fn run_sessions_search(query: &str, json: bool) -> Result<()> {
 
     if json {
         // Serialize the Vec<SearchHit> directly — SearchHit derives Serialize.
-        let serialized = serde_json::to_string(&hits)
-            .context("failed to serialize search hits")?;
+        let serialized = serde_json::to_string(&hits).context("failed to serialize search hits")?;
         println!("{serialized}");
         return Ok(());
     }
@@ -878,10 +883,8 @@ fn run_session(
     let resumed_id: Option<String> = match continue_session {
         None => None,
         Some("") => {
-            let latest = store::latest_active_for_project(
-                &conn,
-                project_root.to_str().unwrap_or(""),
-            )?;
+            let latest =
+                store::latest_active_for_project(&conn, project_root.to_str().unwrap_or(""))?;
             if latest.is_none() {
                 anyhow::bail!(
                     "no active session to continue in {}; pass an explicit --continue <ID> or omit the flag",
@@ -929,7 +932,10 @@ fn run_session(
     }
 
     if !stream_json {
-        println!("Coven session {}", if is_resume { "resumed" } else { "created" });
+        println!(
+            "Coven session {}",
+            if is_resume { "resumed" } else { "created" }
+        );
         println!("  id:      {}", record.id);
         println!("  harness: {}", record.harness);
         println!("  cwd:     {}", cwd.display());
@@ -1080,7 +1086,9 @@ fn run_session(
     }
 
     let conversation_hint = if is_resume {
-        Some(harness::ConversationHint::Resume { id: record.id.clone() })
+        Some(harness::ConversationHint::Resume {
+            id: record.id.clone(),
+        })
     } else {
         None
     };

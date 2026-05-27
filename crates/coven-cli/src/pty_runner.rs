@@ -163,10 +163,7 @@ fn stream_claude_with_program<W: Write>(
         });
     }
 
-    let child_stdout = child
-        .stdout
-        .take()
-        .expect("stdout was requested as piped");
+    let child_stdout = child.stdout.take().expect("stdout was requested as piped");
     let reader = BufReader::new(child_stdout);
     for line in reader.lines() {
         let line = line.context("reading claude stdout")?;

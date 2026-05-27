@@ -31,7 +31,10 @@ pub fn parse(prompt: &str) -> ParsedPrompt {
         }
         // double-@ for search comes first so single-@ doesn't swallow it
         if i + 1 < bytes.len() && bytes[i + 1] == b'@' {
-            let end = prompt[i..].find('\n').map(|n| i + n).unwrap_or(prompt.len());
+            let end = prompt[i..]
+                .find('\n')
+                .map(|n| i + n)
+                .unwrap_or(prompt.len());
             let body = &prompt[i + 2..end];
             if !body.trim().is_empty() {
                 refs.push(Ref::Search(body.trim().to_string()));
@@ -162,7 +165,9 @@ fn walkdir(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
@@ -182,11 +187,7 @@ fn walkdir(root: &Path) -> Vec<PathBuf> {
 /// Inlined content is prepended to the prompt with delimited blocks; the
 /// original prompt text follows unchanged. Returns `prompt` unmodified when
 /// it contains no refs.
-pub fn expand_all(
-    cwd: &Path,
-    conn: &rusqlite::Connection,
-    prompt: &str,
-) -> Result<String> {
+pub fn expand_all(cwd: &Path, conn: &rusqlite::Connection, prompt: &str) -> Result<String> {
     let parsed = parse(prompt);
     if parsed.refs.is_empty() {
         return Ok(prompt.to_string());
@@ -231,10 +232,7 @@ mod tests {
         let p = parse("look at @README.md and @docs/*.md please");
         assert_eq!(
             p.refs,
-            vec![
-                Ref::Path("README.md".into()),
-                Ref::Path("docs/*.md".into()),
-            ]
+            vec![Ref::Path("README.md".into()), Ref::Path("docs/*.md".into()),]
         );
     }
 
@@ -253,7 +251,11 @@ mod tests {
     #[test]
     fn bare_at_sign_followed_by_whitespace_is_ignored() {
         let p = parse("email me at @ work");
-        assert!(p.refs.is_empty(), "bare @ should produce no ref, got: {:?}", p.refs);
+        assert!(
+            p.refs.is_empty(),
+            "bare @ should produce no ref, got: {:?}",
+            p.refs
+        );
     }
 
     #[test]
@@ -333,11 +335,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join("many")).unwrap();
         for i in 0..25 {
-            std::fs::write(
-                temp.path().join(format!("many/f{i}.txt")),
-                format!("F{i}"),
-            )
-            .unwrap();
+            std::fs::write(temp.path().join(format!("many/f{i}.txt")), format!("F{i}")).unwrap();
         }
         let expanded = expand_path(temp.path(), "many/*.txt").unwrap();
         assert!(expanded.contains("glob match cap reached at 20 files"));
@@ -388,9 +386,16 @@ mod tests {
         let conn = crate::store::open_store(&temp.path().join("test.sqlite3"))?;
         let out = expand_all(temp.path(), &conn, "summarise @notes.md please")?;
         assert!(out.contains("alpha beta gamma"), "got: {out}");
-        let body_idx = out.find("summarise @notes.md please").expect("original prompt should appear");
-        let content_idx = out.find("alpha beta gamma").expect("file content should appear");
-        assert!(content_idx < body_idx, "inlined content should precede the original prompt; got: {out}");
+        let body_idx = out
+            .find("summarise @notes.md please")
+            .expect("original prompt should appear");
+        let content_idx = out
+            .find("alpha beta gamma")
+            .expect("file content should appear");
+        assert!(
+            content_idx < body_idx,
+            "inlined content should precede the original prompt; got: {out}"
+        );
         Ok(())
     }
 
@@ -398,9 +403,19 @@ mod tests {
     fn expand_all_search_no_hits_inlines_placeholder() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let conn = crate::store::open_store(&temp.path().join("test.sqlite3"))?;
-        let out = expand_all(temp.path(), &conn, "context:\n@@phoenix rising\nthen answer")?;
-        assert!(out.contains("[no search hits for @@phoenix rising]"), "got: {out}");
-        assert!(out.contains("then answer"), "original prompt preserved; got: {out}");
+        let out = expand_all(
+            temp.path(),
+            &conn,
+            "context:\n@@phoenix rising\nthen answer",
+        )?;
+        assert!(
+            out.contains("[no search hits for @@phoenix rising]"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains("then answer"),
+            "original prompt preserved; got: {out}"
+        );
         Ok(())
     }
 
@@ -419,8 +434,14 @@ mod tests {
             [],
         )?;
         let out = expand_all(temp.path(), &conn, "context:\n@@phoenix\ngo")?;
-        assert!(out.contains("phoenix"), "search snippet should appear; got: {out}");
-        assert!(out.contains("--- @@phoenix ---"), "search delimiter; got: {out}");
+        assert!(
+            out.contains("phoenix"),
+            "search snippet should appear; got: {out}"
+        );
+        assert!(
+            out.contains("--- @@phoenix ---"),
+            "search delimiter; got: {out}"
+        );
         Ok(())
     }
 
@@ -442,7 +463,10 @@ mod tests {
         let out = expand_all(temp.path(), &conn, "read @intro.md and continue @T-prev")?;
         assert!(out.contains("INTRO_BODY"), "got: {out}");
         assert!(out.contains("PREV_PAYLOAD"), "got: {out}");
-        assert!(out.contains("read @intro.md and continue @T-prev"), "original prompt preserved; got: {out}");
+        assert!(
+            out.contains("read @intro.md and continue @T-prev"),
+            "original prompt preserved; got: {out}"
+        );
         Ok(())
     }
 }

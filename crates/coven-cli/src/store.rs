@@ -450,10 +450,7 @@ pub fn insert_session(conn: &Connection, record: &SessionRecord) -> Result<()> {
     let labels_json: Option<String> = if record.labels.is_empty() {
         None
     } else {
-        Some(
-            serde_json::to_string(&record.labels)
-                .context("failed to serialize session labels")?,
-        )
+        Some(serde_json::to_string(&record.labels).context("failed to serialize session labels")?)
     };
     conn.execute(
         "INSERT INTO sessions (
@@ -484,10 +481,7 @@ pub fn insert_session_if_absent(conn: &Connection, record: &SessionRecord) -> Re
     let labels_json: Option<String> = if record.labels.is_empty() {
         None
     } else {
-        Some(
-            serde_json::to_string(&record.labels)
-                .context("failed to serialize session labels")?,
-        )
+        Some(serde_json::to_string(&record.labels).context("failed to serialize session labels")?)
     };
     let affected = conn
         .execute(
@@ -1889,16 +1883,14 @@ mod tests {
              VALUES('s1', '/tmp', 'codex', 't', 'created', '2026-01-01', '2026-01-01')",
             [],
         )?;
-        let labels: Option<String> = conn.query_row(
-            "SELECT labels FROM sessions WHERE id='s1'",
-            [],
-            |row| row.get(0),
-        )?;
-        let visibility: String = conn.query_row(
-            "SELECT visibility FROM sessions WHERE id='s1'",
-            [],
-            |row| row.get(0),
-        )?;
+        let labels: Option<String> =
+            conn.query_row("SELECT labels FROM sessions WHERE id='s1'", [], |row| {
+                row.get(0)
+            })?;
+        let visibility: String =
+            conn.query_row("SELECT visibility FROM sessions WHERE id='s1'", [], |row| {
+                row.get(0)
+            })?;
         assert_eq!(labels, None);
         assert_eq!(visibility, "private");
         Ok(())

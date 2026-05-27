@@ -111,8 +111,8 @@ pub fn load_from(path: &Path) -> Result<Option<Settings>> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
     };
-    let parsed: Settings = json5::from_str(&raw)
-        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let parsed: Settings =
+        json5::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))?;
     Ok(Some(parsed))
 }
 

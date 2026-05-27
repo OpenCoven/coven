@@ -72,14 +72,8 @@ pub enum ContentBlock {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ImageSource {
-    Base64 {
-        media_type: String,
-        data: String,
-    },
-    Path {
-        path: String,
-        media_type: String,
-    },
+    Base64 { media_type: String, data: String },
+    Path { path: String, media_type: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
