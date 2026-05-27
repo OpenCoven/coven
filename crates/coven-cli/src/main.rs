@@ -21,6 +21,7 @@ mod patch;
 mod pc;
 mod privacy;
 mod project;
+mod prompt_refs;
 mod pty_runner;
 mod repos_config;
 mod settings;
