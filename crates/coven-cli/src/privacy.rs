@@ -246,6 +246,32 @@ fn built_in_patterns() -> &'static [Regex] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        name: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
 
     #[test]
     fn redact_text_removes_common_secret_shapes() {
@@ -336,13 +362,9 @@ extra_patterns = ["custom-sensitive-[0-9]+"]
 "#,
         )?;
 
-        let previous = std::env::var_os("COVEN_PERSIST_RAW_ARTIFACTS");
-        std::env::set_var("COVEN_PERSIST_RAW_ARTIFACTS", "1");
+        let _env_lock = ENV_LOCK.lock().expect("privacy env lock poisoned");
+        let _env_guard = EnvVarGuard::set("COVEN_PERSIST_RAW_ARTIFACTS", "1");
         let config = load_config(temp.path())?;
-        match previous {
-            Some(value) => std::env::set_var("COVEN_PERSIST_RAW_ARTIFACTS", value),
-            None => std::env::remove_var("COVEN_PERSIST_RAW_ARTIFACTS"),
-        }
 
         assert!(config.persist_raw_artifacts);
         assert_eq!(config.raw_artifact_retention_days, 9);
@@ -379,13 +401,9 @@ extra_patterns = ["toml-secret"]
             },
         };
 
-        let previous = std::env::var_os("COVEN_PERSIST_RAW_ARTIFACTS");
-        std::env::set_var("COVEN_PERSIST_RAW_ARTIFACTS", "1");
+        let _env_lock = ENV_LOCK.lock().expect("privacy env lock poisoned");
+        let _env_guard = EnvVarGuard::set("COVEN_PERSIST_RAW_ARTIFACTS", "1");
         let loaded = load_with_settings(temp.path(), Some(&settings))?;
-        match previous {
-            Some(value) => std::env::set_var("COVEN_PERSIST_RAW_ARTIFACTS", value),
-            None => std::env::remove_var("COVEN_PERSIST_RAW_ARTIFACTS"),
-        }
 
         assert!(loaded.persist_raw_artifacts);
         assert_eq!(loaded.raw_artifact_retention_days, 3);
