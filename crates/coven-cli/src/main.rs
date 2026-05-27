@@ -807,6 +807,16 @@ fn harness_launch_mode_for_stdio() -> harness::HarnessLaunchMode {
     }
 }
 
+/// Lock stdout, emit one stream-JSON frame, release. Per-frame locking keeps
+/// us from holding the lock across `pty_runner::run_attached`, which writes
+/// the harness's own stdout through the same handle.
+fn emit_stream_event(event: &stream_json::Event) -> Result<()> {
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    stream_json::emit_event(&mut handle, event)?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_session(
     harness_id: &str,
@@ -821,9 +831,9 @@ fn run_session(
     stream_json: bool,
     stream_json_input: bool,
 ) -> Result<()> {
-    // 4.3/4.4 will consume these; for now they only need to exist on the
-    // signature so the flags compile cleanly end-to-end.
-    let _ = (stream_json, stream_json_input);
+    // `stream_json_input` is consumed by the claude pass-through in 4.4; for
+    // non-stream harnesses it has no effect on this path.
+    let _ = stream_json_input;
     let prompt = if prompt_args.is_empty() {
         String::new()
     } else {
@@ -910,22 +920,58 @@ fn run_session(
         store::insert_session(&conn, &record)?;
     }
 
-    println!("Coven session {}", if is_resume { "resumed" } else { "created" });
-    println!("  id:      {}", record.id);
-    println!("  harness: {}", record.harness);
-    println!("  cwd:     {}", cwd.display());
-    println!("  title:   {}", record.title);
+    if !stream_json {
+        println!("Coven session {}", if is_resume { "resumed" } else { "created" });
+        println!("  id:      {}", record.id);
+        println!("  harness: {}", record.harness);
+        println!("  cwd:     {}", cwd.display());
+        println!("  title:   {}", record.title);
+    }
 
     if detach && is_resume {
         anyhow::bail!("--detach and --continue are mutually exclusive");
+    }
+
+    let stream_started = std::time::Instant::now();
+    if stream_json {
+        emit_stream_event(&stream_json::Event::System(stream_json::System {
+            subtype: "init".into(),
+            cwd: cwd.to_string_lossy().into_owned(),
+            session_id: record.id.clone(),
+            tools: Vec::new(),
+            agent_mode: None,
+        }))?;
+        if !expanded_prompt.is_empty() {
+            emit_stream_event(&stream_json::Event::User(stream_json::UserMessage {
+                message: stream_json::MessageBody {
+                    role: "user".into(),
+                    content: vec![stream_json::ContentBlock::Text {
+                        text: expanded_prompt.clone(),
+                    }],
+                },
+                session_id: record.id.clone(),
+                parent_tool_use_id: None,
+            }))?;
+        }
     }
 
     if detach {
         if archive {
             eprintln!("warning: --archive ignored in --detach mode (session was never launched)");
         }
-        println!("\nDetached mode: session was recorded but the harness was not spawned.");
-        println!("View it later with `coven sessions`.");
+        if !stream_json {
+            println!("\nDetached mode: session was recorded but the harness was not spawned.");
+            println!("View it later with `coven sessions`.");
+        } else {
+            emit_stream_event(&stream_json::Event::Result(stream_json::RunResult {
+                subtype: "success".into(),
+                duration_ms: stream_started.elapsed().as_millis() as u64,
+                is_error: false,
+                num_turns: 1,
+                session_id: record.id.clone(),
+                error: None,
+            }))?;
+        }
         return Ok(());
     }
 
@@ -958,10 +1004,27 @@ fn run_session(
                 result.exit_code,
                 &current_timestamp(),
             )?;
+            if stream_json {
+                let is_error = result.exit_code.map_or(false, |c| c != 0);
+                emit_stream_event(&stream_json::Event::Result(stream_json::RunResult {
+                    subtype: if is_error {
+                        "error_during_execution".into()
+                    } else {
+                        "success".into()
+                    },
+                    duration_ms: stream_started.elapsed().as_millis() as u64,
+                    is_error,
+                    num_turns: 1,
+                    session_id: record.id.clone(),
+                    error: None,
+                }))?;
+            }
             if archive {
                 let archived_at = current_timestamp();
                 store::archive_session(&conn, &record.id, &archived_at)?;
-                println!("\nArchived session {} at {archived_at}", record.id);
+                if !stream_json {
+                    println!("\nArchived session {} at {archived_at}", record.id);
+                }
             }
             Ok(())
         }
@@ -973,6 +1036,16 @@ fn run_session(
                 None,
                 &current_timestamp(),
             )?;
+            if stream_json {
+                emit_stream_event(&stream_json::Event::Result(stream_json::RunResult {
+                    subtype: "error_during_execution".into(),
+                    duration_ms: stream_started.elapsed().as_millis() as u64,
+                    is_error: true,
+                    num_turns: 1,
+                    session_id: record.id.clone(),
+                    error: Some(format!("{error:#}")),
+                }))?;
+            }
             Err(error)
         }
     }
