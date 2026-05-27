@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
 use std::path::PathBuf;
-use sysinfo::{Pid, Process, Signal, System};
+use sysinfo::{Pid, Process, ProcessesToUpdate, Signal, System};
 
 /// Hardcoded cache directories eligible for clearing. Never uses glob expansion.
 const USER_CACHE_DIRS: &[&str] = &["Library/Caches"];
@@ -17,10 +17,14 @@ struct ProcessIdentity {
 impl ProcessIdentity {
     fn from_process(process: &Process) -> Self {
         Self {
-            name: process.name().to_string(),
+            name: process.name().to_string_lossy().into_owned(),
             start_time: process.start_time(),
             exe: process.exe().map(PathBuf::from),
-            cmd: process.cmd().to_vec(),
+            cmd: process
+                .cmd()
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect(),
         }
     }
 
@@ -48,7 +52,7 @@ pub fn kill_by_pid(pid: u32, confirm: bool) -> Result<()> {
     eprintln!("Sending SIGTERM to PID {pid} ({})...", identity.name);
 
     // Re-check identity immediately before signaling to avoid PID reuse mistakes
-    sys.refresh_process(pid_key);
+    sys.refresh_processes(ProcessesToUpdate::Some(&[pid_key]), true);
     let proc = sys
         .process(pid_key)
         .ok_or_else(|| anyhow::anyhow!("Process {pid} disappeared before signal could be sent"))?;

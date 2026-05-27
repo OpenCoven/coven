@@ -23,6 +23,8 @@ toml = "1.1"
 uuid = { version = "1", features = ["v4"] }
 sysinfo = "0.39"
 dirs-next = "2"
+regex = "1"
+chacha20poly1305 = { version = "0.10", features = ["std", "rand_core"] }
 # Chat TUI
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "underline-color"] }
 unicode-width = "0.2"

@@ -21,7 +21,7 @@ flowchart LR
   Router --> Capabilities["/capabilities"]
   Router --> Actions["/actions"]
   Router --> Sessions["/sessions[/:id[/input|/kill]]"]
-  Router --> Events["/events"]
+  Router --> Events["/events + /sessions/:id/events"]
   Router --> Version["/api-version"]
 
   Health & Capabilities & Actions & Sessions & Events & Version -->|"{ ... } or { error: { code, message, details } }"| Client
@@ -46,13 +46,19 @@ Versioned clients should use the `/api/v1` prefix:
 | `GET /api/v1/sessions` | List active sessions |
 | `POST /api/v1/sessions` | Launch a session |
 | `GET /api/v1/sessions/:id` | Fetch one session |
-| `GET /api/v1/events?sessionId=...` | Read session events |
+| `GET /api/v1/events?sessionId=...` | Read redacted session events |
+| `GET /api/v1/sessions/:id/events` | Read redacted session events |
+| `GET /api/v1/sessions/:id/log` | Read bounded redacted log previews |
 | `POST /api/v1/sessions/:id/input` | Forward input to a live session |
 | `POST /api/v1/sessions/:id/kill` | Kill a live session |
 
 Unversioned routes currently remain as legacy aliases during the early MVP window, but new clients should not rely on them.
 
 Unknown `/api/<version>/...` prefixes fail closed with an `unsupported API version` JSON response.
+
+## Log privacy
+
+Event payloads returned by `/events`, `/sessions/:id/events`, and `/sessions/:id/log` are redacted by default. Raw sensitive artifacts are not included in broad responses. The narrow raw artifact route requires explicit local raw artifact persistence and `raw=1`; otherwise it returns a structured `raw_artifacts_disabled` error.
 
 ## Health response
 
@@ -81,7 +87,7 @@ When no daemon metadata is available, `daemon` is `null`.
 
 ## Control-plane capabilities
 
-`GET /api/v1/capabilities` is the discovery point for CastCodes and advanced local clients. It returns capability ids, adapter ownership, availability, policy hints, and action ids. This keeps clients from hard-coding what the daemon can do.
+`GET /api/v1/capabilities` is the discovery point for first-party clients such as OpenMeow. It returns capability ids, adapter ownership, availability, policy hints, and action ids. This keeps clients from hard-coding what the daemon can do.
 
 ```json
 {
@@ -108,12 +114,12 @@ When no daemon metadata is available, `daemon` is `null`.
 
 ## Control-plane actions
 
-`POST /api/v1/actions` accepts a client intent envelope. The daemon routes only known actions; unknown actions fail closed before any adapter can run.
+`POST /api/v1/actions` accepts an OpenMeow-style intent envelope. The daemon routes only known actions; unknown actions fail closed before any adapter can run.
 
 ```json
 {
   "action": "coven.capabilities.refresh",
-  "origin": "castcodes",
+  "origin": "open-meow",
   "intentId": "intent-1",
   "args": {}
 }
@@ -130,7 +136,7 @@ Immediately completed safe actions return `200` with an event-shaped payload tha
   "event": {
     "kind": "capabilities.refreshed",
     "action": "coven.capabilities.refresh",
-    "origin": "castcodes",
+    "origin": "open-meow",
     "intentId": "intent-1",
     "payload": { "capabilities": 3 }
   }
@@ -143,4 +149,4 @@ Immediately completed safe actions return `200` with an event-shaped payload tha
 - Existing required fields should not be removed or renamed inside `v1`.
 - Breaking response-shape or behavior changes require a new API version prefix.
 - External clients should call `/api/v1/health` before assuming compatibility.
-- Daemon changes that affect `/api/v1/health`, `/api/v1/sessions`, `/api/v1/events`, input, or kill behavior should update client compatibility tests in the same repo.
+- Daemon changes that affect `/api/v1/health`, `/api/v1/sessions`, `/api/v1/events`, `/api/v1/sessions/:id/events`, input, or kill behavior should update client compatibility tests in the same repo.

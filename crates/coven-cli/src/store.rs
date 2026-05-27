@@ -1,8 +1,14 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use chrono::{Duration, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
+
+use crate::{
+    encrypted_artifacts::{EncryptedPayload, SensitiveArtifactStore},
+    privacy::{self, PrivacyConfig},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRecord {
@@ -45,6 +51,18 @@ pub struct RepositoryRecord {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SensitiveArtifactRecord {
+    pub id: String,
+    pub session_id: String,
+    pub event_id: String,
+    pub kind: String,
+    pub nonce: Vec<u8>,
+    pub ciphertext: Vec<u8>,
+    pub created_at: String,
+    pub expires_at: String,
+}
+
 #[derive(Debug, Default)]
 pub struct EventsQueryOptions {
     pub after_seq: Option<i64>,
@@ -85,6 +103,8 @@ pub fn open_store(path: &Path) -> Result<Connection> {
             kind TEXT NOT NULL,
             payload_json TEXT NOT NULL,
             created_at TEXT NOT NULL,
+            redaction_status TEXT NOT NULL DEFAULT 'redacted',
+            sensitive INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
         );
 
@@ -93,6 +113,25 @@ pub fn open_store(path: &Path) -> Result<Connection> {
 
         CREATE INDEX IF NOT EXISTS idx_events_session_created_at
             ON events(session_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS sensitive_artifacts (
+            id TEXT PRIMARY KEY NOT NULL,
+            session_id TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            nonce BLOB NOT NULL,
+            ciphertext BLOB NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+            FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_sensitive_artifacts_session
+            ON sensitive_artifacts(session_id, created_at);
+
+        CREATE INDEX IF NOT EXISTS idx_sensitive_artifacts_expires_at
+            ON sensitive_artifacts(expires_at);
 
         CREATE TABLE IF NOT EXISTS repositories (
             id TEXT PRIMARY KEY NOT NULL,
@@ -107,8 +146,69 @@ pub fn open_store(path: &Path) -> Result<Connection> {
     ensure_exit_code_column(&conn)?;
     ensure_archived_at_column(&conn)?;
     ensure_conversation_id_column(&conn)?;
+    ensure_event_privacy_columns(&conn)?;
+    ensure_sensitive_artifacts_table(&conn)?;
 
     Ok(conn)
+}
+
+fn ensure_event_privacy_columns(conn: &Connection) -> Result<()> {
+    ensure_column(
+        conn,
+        "events",
+        "redaction_status",
+        "ALTER TABLE events ADD COLUMN redaction_status TEXT NOT NULL DEFAULT 'legacy'",
+    )?;
+    ensure_column(
+        conn,
+        "events",
+        "sensitive",
+        "ALTER TABLE events ADD COLUMN sensitive INTEGER NOT NULL DEFAULT 0",
+    )?;
+    Ok(())
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, sql: &str) -> Result<()> {
+    let mut statement = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .with_context(|| format!("failed to inspect {table} schema"))?;
+    let has_column = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .with_context(|| format!("failed to query {table} schema"))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("failed to read {table} schema"))?
+        .into_iter()
+        .any(|candidate| candidate == column);
+
+    if !has_column {
+        conn.execute(sql, [])
+            .with_context(|| format!("failed to add {table}.{column} column"))?;
+    }
+    Ok(())
+}
+
+fn ensure_sensitive_artifacts_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sensitive_artifacts (
+            id TEXT PRIMARY KEY NOT NULL,
+            session_id TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            nonce BLOB NOT NULL,
+            ciphertext BLOB NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+            FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_sensitive_artifacts_session
+            ON sensitive_artifacts(session_id, created_at);
+
+        CREATE INDEX IF NOT EXISTS idx_sensitive_artifacts_expires_at
+            ON sensitive_artifacts(expires_at);",
+    )
+    .context("failed to initialize sensitive artifact schema")
 }
 
 pub fn open_existing_store_read_only(path: &Path) -> Result<Option<Connection>> {
@@ -451,24 +551,101 @@ pub fn sacrifice_session(conn: &Connection, session_id: &str) -> Result<()> {
 }
 
 pub fn insert_event(conn: &Connection, record: &EventRecord) -> Result<()> {
+    let config = PrivacyConfig::default();
+    let redacted_payload = privacy::redact_payload_json_with_config(&record.payload_json, &config);
+    let sensitive = redacted_payload != record.payload_json;
+    let redaction_status = if sensitive { "redacted" } else { "clean" };
+    insert_event_raw(conn, record, &redacted_payload, redaction_status, sensitive)
+}
+
+pub fn insert_event_with_privacy(
+    conn: &Connection,
+    coven_home: &Path,
+    record: &EventRecord,
+) -> Result<()> {
+    let config = privacy::load_config(coven_home).unwrap_or_default();
+    let redacted_payload = privacy::redact_payload_json_with_config(&record.payload_json, &config);
+    let sensitive = redacted_payload != record.payload_json;
+    let mut redaction_status = if sensitive { "redacted" } else { "clean" };
+    insert_event_raw(conn, record, &redacted_payload, redaction_status, sensitive)?;
+
+    if config.persist_raw_artifacts && sensitive {
+        let artifact_result = SensitiveArtifactStore::load(coven_home)
+            .and_then(|store| {
+                store.encrypt(
+                    &record.session_id,
+                    &record.id,
+                    &record.kind,
+                    record.payload_json.as_bytes(),
+                )
+            })
+            .and_then(|encrypted| {
+                insert_sensitive_artifact(
+                    conn,
+                    &SensitiveArtifactRecord {
+                        id: record.id.clone(),
+                        session_id: record.session_id.clone(),
+                        event_id: record.id.clone(),
+                        kind: record.kind.clone(),
+                        nonce: encrypted.nonce,
+                        ciphertext: encrypted.ciphertext,
+                        created_at: record.created_at.clone(),
+                        expires_at: retention_expires_at(
+                            &record.created_at,
+                            config.raw_artifact_retention_days,
+                        ),
+                    },
+                )
+            });
+        redaction_status = if artifact_result.is_ok() {
+            "redacted_raw_encrypted"
+        } else {
+            "redacted_raw_unavailable"
+        };
+        set_event_redaction_status(conn, &record.id, redaction_status)?;
+    }
+
+    Ok(())
+}
+
+fn insert_event_raw(
+    conn: &Connection,
+    record: &EventRecord,
+    payload_json: &str,
+    redaction_status: &str,
+    sensitive: bool,
+) -> Result<()> {
     conn.execute(
         "INSERT INTO events (
             id,
             session_id,
             kind,
             payload_json,
-            created_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            created_at,
+            redaction_status,
+            sensitive
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             &record.id,
             &record.session_id,
             &record.kind,
-            &record.payload_json,
+            payload_json,
             &record.created_at,
+            redaction_status,
+            if sensitive { 1 } else { 0 },
         ],
     )
     .with_context(|| format!("failed to insert event {}", record.id))?;
 
+    Ok(())
+}
+
+fn set_event_redaction_status(conn: &Connection, event_id: &str, status: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE events SET redaction_status = ?2 WHERE id = ?1",
+        params![event_id, status],
+    )
+    .with_context(|| format!("failed to update redaction status for event {event_id}"))?;
     Ok(())
 }
 
@@ -537,7 +714,7 @@ pub fn list_events_with_options(
     // present.  All user-provided values are bound via parameterized placeholders
     // (?1, ?2, ?3), so there is no SQL injection risk.
     let mut sql = String::from(
-        "SELECT rowid AS seq, id, session_id, kind, payload_json, created_at
+        "SELECT rowid AS seq, id, session_id, kind, payload_json, created_at, redaction_status
          FROM events WHERE session_id = ?1",
     );
     let has_cursor = after_rowid.is_some();
@@ -555,14 +732,19 @@ pub fn list_events_with_options(
         .context("failed to prepare event list query")?;
 
     let map_row = |row: &rusqlite::Row<'_>| {
-        Ok(EventRecord {
+        let mut record = EventRecord {
             seq: row.get(0)?,
             id: row.get(1)?,
             session_id: row.get(2)?,
             kind: row.get(3)?,
             payload_json: row.get(4)?,
             created_at: row.get(5)?,
-        })
+        };
+        let redaction_status: String = row.get(6)?;
+        if redaction_status == "legacy" {
+            record.payload_json = privacy::redact_payload_json(&record.payload_json);
+        }
+        Ok(record)
     };
 
     let events = match (after_rowid, opts.limit) {
@@ -583,6 +765,127 @@ pub fn list_events_with_options(
     .context("failed to read events")?;
 
     Ok(events)
+}
+
+pub fn insert_sensitive_artifact(
+    conn: &Connection,
+    record: &SensitiveArtifactRecord,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO sensitive_artifacts (
+            id, session_id, event_id, kind, nonce, ciphertext, created_at, expires_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            &record.id,
+            &record.session_id,
+            &record.event_id,
+            &record.kind,
+            &record.nonce,
+            &record.ciphertext,
+            &record.created_at,
+            &record.expires_at,
+        ],
+    )
+    .with_context(|| format!("failed to insert sensitive artifact {}", record.id))?;
+    Ok(())
+}
+
+pub fn get_sensitive_artifact(
+    conn: &Connection,
+    session_id: &str,
+    artifact_id: &str,
+) -> Result<Option<SensitiveArtifactRecord>> {
+    use rusqlite::OptionalExtension;
+
+    conn.query_row(
+        "SELECT id, session_id, event_id, kind, nonce, ciphertext, created_at, expires_at
+         FROM sensitive_artifacts
+         WHERE id = ?1 AND session_id = ?2
+         LIMIT 1",
+        params![artifact_id, session_id],
+        |row| {
+            Ok(SensitiveArtifactRecord {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                event_id: row.get(2)?,
+                kind: row.get(3)?,
+                nonce: row.get(4)?,
+                ciphertext: row.get(5)?,
+                created_at: row.get(6)?,
+                expires_at: row.get(7)?,
+            })
+        },
+    )
+    .optional()
+    .with_context(|| format!("failed to get sensitive artifact {artifact_id}"))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn count_sensitive_artifacts(conn: &Connection) -> Result<i64> {
+    conn.query_row("SELECT COUNT(*) FROM sensitive_artifacts", [], |row| {
+        row.get(0)
+    })
+    .context("failed to count sensitive artifacts")
+}
+
+pub fn count_prunable_sensitive_artifacts(
+    conn: &Connection,
+    now: &str,
+    retention_cutoff: &str,
+) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sensitive_artifacts WHERE expires_at < ?1 OR created_at < ?2",
+        params![now, retention_cutoff],
+        |row| row.get(0),
+    )
+    .context("failed to count prunable sensitive artifacts")
+}
+
+pub fn count_events_older_than(conn: &Connection, cutoff: &str) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE created_at < ?1",
+        params![cutoff],
+        |row| row.get(0),
+    )
+    .context("failed to count old events")
+}
+
+pub fn prune_sensitive_artifacts(
+    conn: &Connection,
+    now: &str,
+    retention_cutoff: &str,
+) -> Result<usize> {
+    conn.execute(
+        "DELETE FROM sensitive_artifacts WHERE expires_at < ?1 OR created_at < ?2",
+        params![now, retention_cutoff],
+    )
+    .context("failed to prune sensitive artifacts")
+}
+
+pub fn prune_events_older_than(conn: &Connection, cutoff: &str) -> Result<usize> {
+    conn.execute("DELETE FROM events WHERE created_at < ?1", params![cutoff])
+        .context("failed to prune events")
+}
+
+pub fn retention_cutoff(now: &str, days: u64) -> String {
+    let parsed = chrono::DateTime::parse_from_rfc3339(now)
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now());
+    (parsed - Duration::days(days as i64)).to_rfc3339_opts(SecondsFormat::Nanos, true)
+}
+
+fn retention_expires_at(created_at: &str, days: u64) -> String {
+    let parsed = chrono::DateTime::parse_from_rfc3339(created_at)
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now());
+    (parsed + Duration::days(days as i64)).to_rfc3339_opts(SecondsFormat::Nanos, true)
+}
+
+pub fn artifact_payload(record: &SensitiveArtifactRecord) -> EncryptedPayload {
+    EncryptedPayload {
+        nonce: record.nonce.clone(),
+        ciphertext: record.ciphertext.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -909,6 +1212,301 @@ mod tests {
     }
 
     #[test]
+    fn event_schema_adds_privacy_columns_to_existing_store() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let path = temp_dir.path().join("legacy.db");
+        {
+            let conn = Connection::open(&path)?;
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    project_root TEXT NOT NULL,
+                    harness TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE events (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    session_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );",
+            )?;
+        }
+
+        let conn = open_store(&path)?;
+        let event_columns = table_columns(&conn, "events")?;
+        let artifact_columns = table_columns(&conn, "sensitive_artifacts")?;
+
+        assert!(event_columns.contains(&"redaction_status".to_string()));
+        assert!(event_columns.contains(&"sensitive".to_string()));
+        assert!(artifact_columns.contains(&"ciphertext".to_string()));
+        assert!(artifact_columns.contains(&"nonce".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn event_insert_stores_redacted_payload_by_default() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+        insert_session(&conn, &session_record("session-1", "2026-04-27T06:00:00Z"))?;
+        let fake = fake_openai_key();
+
+        insert_json_event(
+            &conn,
+            "session-1",
+            "input",
+            &serde_json::json!({ "data": format!("token={fake}") }),
+            "2026-04-27T06:01:00Z",
+        )?;
+
+        let (payload, status, sensitive): (String, String, i64) = conn.query_row(
+            "SELECT payload_json, redaction_status, sensitive FROM events WHERE id IS NOT NULL",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert!(!payload.contains(&fake));
+        assert!(payload.contains("[REDACTED]"));
+        assert_eq!(status, "redacted");
+        assert_eq!(sensitive, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_plaintext_rows_are_redacted_when_listed() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let path = temp_dir.path().join("legacy.db");
+        let fake = fake_github_token();
+        {
+            let conn = Connection::open(&path)?;
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    project_root TEXT NOT NULL,
+                    harness TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE events (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    session_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );",
+            )?;
+            conn.execute(
+                "INSERT INTO sessions (id, project_root, harness, title, status, created_at, updated_at)
+                 VALUES ('session-1', '/repo', 'codex', 'Legacy', 'completed', '2026-04-27T06:00:00Z', '2026-04-27T06:00:00Z')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO events (id, session_id, kind, payload_json, created_at)
+                 VALUES ('event-1', 'session-1', 'output', ?1, '2026-04-27T06:01:00Z')",
+                params![
+                    serde_json::json!({ "data": format!("Authorization: Bearer {fake}") })
+                        .to_string()
+                ],
+            )?;
+        }
+        let conn = open_store(&path)?;
+
+        let events = list_events(&conn, "session-1")?;
+
+        assert_eq!(events.len(), 1);
+        assert!(!events[0].payload_json.contains(&fake));
+        assert!(events[0].payload_json.contains("[REDACTED]"));
+        Ok(())
+    }
+
+    #[test]
+    fn raw_artifacts_are_encrypted_when_explicitly_enabled() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        std::fs::write(
+            temp_dir.path().join("privacy.toml"),
+            "persist_raw_artifacts = true\nraw_artifact_retention_days = 7\n",
+        )?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+        insert_session(&conn, &session_record("session-1", "2026-04-27T06:00:00Z"))?;
+        let fake = fake_openai_key();
+        let raw_payload = serde_json::json!({ "data": format!("secret {fake}") }).to_string();
+        let record = EventRecord {
+            seq: 0,
+            id: "event-raw".to_string(),
+            session_id: "session-1".to_string(),
+            kind: "output".to_string(),
+            payload_json: raw_payload.clone(),
+            created_at: "2026-04-27T06:01:00Z".to_string(),
+        };
+
+        insert_event_with_privacy(&conn, temp_dir.path(), &record)?;
+
+        let stored_payload: String = conn.query_row(
+            "SELECT payload_json FROM events WHERE id = 'event-raw'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(!stored_payload.contains(&fake));
+        let artifact = get_sensitive_artifact(&conn, "session-1", "event-raw")?
+            .expect("artifact should exist");
+        assert_ne!(artifact.ciphertext, raw_payload.as_bytes());
+        let decrypted = crate::encrypted_artifacts::SensitiveArtifactStore::load(temp_dir.path())?
+            .decrypt(
+                "session-1",
+                "event-raw",
+                "output",
+                &artifact_payload(&artifact),
+            )?;
+        assert_eq!(String::from_utf8(decrypted)?, raw_payload);
+        Ok(())
+    }
+
+    #[test]
+    fn raw_artifact_key_failure_keeps_redacted_event_only() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        std::fs::write(
+            temp_dir.path().join("privacy.toml"),
+            "persist_raw_artifacts = true\n",
+        )?;
+        let keys = temp_dir.path().join("keys");
+        std::fs::create_dir_all(&keys)?;
+        std::fs::write(keys.join("session-artifacts.key"), "invalid-key-material")?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+        insert_session(&conn, &session_record("session-1", "2026-04-27T06:00:00Z"))?;
+        let fake = fake_openai_key();
+        let record = EventRecord {
+            seq: 0,
+            id: "event-fail".to_string(),
+            session_id: "session-1".to_string(),
+            kind: "input".to_string(),
+            payload_json: serde_json::json!({ "data": format!("secret {fake}") }).to_string(),
+            created_at: "2026-04-27T06:01:00Z".to_string(),
+        };
+
+        insert_event_with_privacy(&conn, temp_dir.path(), &record)?;
+
+        let (payload, status): (String, String) = conn.query_row(
+            "SELECT payload_json, redaction_status FROM events WHERE id = 'event-fail'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert!(!payload.contains(&fake));
+        assert_eq!(status, "redacted_raw_unavailable");
+        assert_eq!(count_sensitive_artifacts(&conn)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn pruning_removes_expired_artifacts_and_old_events() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+        insert_session(&conn, &session_record("session-1", "2026-04-27T06:00:00Z"))?;
+        for (id, created_at) in [
+            ("old-event", "2026-04-01T00:00:00Z"),
+            ("fresh-event", "2026-04-26T00:00:00Z"),
+        ] {
+            insert_event(
+                &conn,
+                &EventRecord {
+                    seq: 0,
+                    id: id.to_string(),
+                    session_id: "session-1".to_string(),
+                    kind: "output".to_string(),
+                    payload_json: serde_json::json!({ "data": id }).to_string(),
+                    created_at: created_at.to_string(),
+                },
+            )?;
+        }
+        insert_sensitive_artifact(
+            &conn,
+            &SensitiveArtifactRecord {
+                id: "expired".to_string(),
+                session_id: "session-1".to_string(),
+                event_id: "old-event".to_string(),
+                kind: "output".to_string(),
+                nonce: vec![0; 24],
+                ciphertext: vec![1, 2, 3],
+                created_at: "2026-04-01T00:00:00Z".to_string(),
+                expires_at: "2026-04-08T00:00:00Z".to_string(),
+            },
+        )?;
+
+        let pruned_artifacts =
+            prune_sensitive_artifacts(&conn, "2026-05-01T00:00:00Z", "2026-04-24T00:00:00Z")?;
+        let cutoff = retention_cutoff("2026-05-01T00:00:00Z", 7);
+        let pruned_events = prune_events_older_than(&conn, &cutoff)?;
+
+        assert_eq!(pruned_artifacts, 1);
+        assert_eq!(pruned_events, 1);
+        let events = list_events(&conn, "session-1")?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload_json, r#"{"data":"fresh-event"}"#);
+        Ok(())
+    }
+
+    #[test]
+    fn pruning_sensitive_artifacts_honors_expires_at_and_created_at_cutoff() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+        insert_session(&conn, &session_record("session-1", "2026-04-27T06:00:00Z"))?;
+        insert_event(
+            &conn,
+            &EventRecord {
+                seq: 0,
+                id: "event-1".to_string(),
+                session_id: "session-1".to_string(),
+                kind: "output".to_string(),
+                payload_json: serde_json::json!({ "data": "old raw payload" }).to_string(),
+                created_at: "2026-04-20T00:00:00Z".to_string(),
+            },
+        )?;
+        insert_sensitive_artifact(
+            &conn,
+            &SensitiveArtifactRecord {
+                id: "older-than-override".to_string(),
+                session_id: "session-1".to_string(),
+                event_id: "event-1".to_string(),
+                kind: "output".to_string(),
+                nonce: vec![0; 24],
+                ciphertext: vec![1, 2, 3],
+                created_at: "2026-04-20T00:00:00Z".to_string(),
+                expires_at: "2026-05-04T00:00:00Z".to_string(),
+            },
+        )?;
+        insert_sensitive_artifact(
+            &conn,
+            &SensitiveArtifactRecord {
+                id: "expired-by-record".to_string(),
+                session_id: "session-1".to_string(),
+                event_id: "event-1".to_string(),
+                kind: "output".to_string(),
+                nonce: vec![0; 24],
+                ciphertext: vec![4, 5, 6],
+                created_at: "2026-04-26T00:00:00Z".to_string(),
+                expires_at: "2026-04-26T12:00:00Z".to_string(),
+            },
+        )?;
+
+        let cutoff = retention_cutoff("2026-04-27T00:00:00Z", 1);
+
+        assert_eq!(
+            count_prunable_sensitive_artifacts(&conn, "2026-04-27T00:00:00Z", &cutoff)?,
+            2
+        );
+        assert_eq!(
+            prune_sensitive_artifacts(&conn, "2026-04-27T00:00:00Z", &cutoff)?,
+            2
+        );
+        assert_eq!(count_sensitive_artifacts(&conn)?, 0);
+        Ok(())
+    }
+
+    #[test]
     fn events_have_monotonic_seq_fields() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let conn = open_store(&temp_dir.path().join("coven.db"))?;
@@ -1086,5 +1684,22 @@ mod tests {
             updated_at: created_at.to_string(),
             conversation_id: None,
         }
+    }
+
+    fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+        let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::from)?;
+        Ok(columns)
+    }
+
+    fn fake_openai_key() -> String {
+        format!("sk-{}", "a".repeat(40))
+    }
+
+    fn fake_github_token() -> String {
+        format!("ghp_{}", "b".repeat(40))
     }
 }

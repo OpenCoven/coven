@@ -9,8 +9,9 @@ use uuid::Uuid;
 use crate::{
     control_plane,
     daemon::DaemonStatus,
+    encrypted_artifacts::SensitiveArtifactStore,
     harness::{ConversationHint, HarnessLaunchMode},
-    project, store,
+    privacy, project, store,
 };
 
 const MAX_EVENTS_LIMIT: i64 = 1_000;
@@ -212,6 +213,15 @@ pub fn handle_request_with_runtime(
         ("GET", path) if path.starts_with("/sessions/") && path.ends_with("/log") => {
             let session_id = session_action_id(path, "/log");
             list_session_log(coven_home, session_id)
+        }
+        ("GET", path) if path.starts_with("/sessions/") && path.ends_with("/events") => {
+            let session_id = session_action_id(path, "/events");
+            let q = query.unwrap_or_default();
+            list_session_events(coven_home, session_id, q)
+        }
+        ("GET", path) if path.starts_with("/sessions/") && path.contains("/artifacts/") => {
+            let q = query.unwrap_or_default();
+            get_session_artifact(coven_home, path, q)
         }
         ("GET", path) if path.starts_with("/sessions/") => {
             let session_id = path.trim_start_matches("/sessions/");
@@ -483,7 +493,7 @@ fn record_input(
             Some(json!({ "sessionId": session_id })),
         );
     }
-    insert_event(&conn, session_id, "input", payload)?;
+    insert_event(&conn, coven_home, session_id, "input", payload)?;
     json_response(202, &json!({ "ok": true, "accepted": true }))
 }
 
@@ -524,7 +534,13 @@ fn kill_session(
     }
     let now = current_timestamp();
     store::update_session_status(&conn, session_id, "killed", None, &now)?;
-    insert_event(&conn, session_id, "kill", json!({ "status": "killed" }))?;
+    insert_event(
+        &conn,
+        coven_home,
+        session_id,
+        "kill",
+        json!({ "status": "killed" }),
+    )?;
     json_response(202, &json!({ "ok": true, "accepted": true }))
 }
 
@@ -654,6 +670,7 @@ fn submit_cast(coven_home: &Path, body: Option<&str>) -> Result<ApiResponse> {
     }
     insert_event(
         &conn,
+        coven_home,
         session_id,
         "cast",
         json!({ "cast_id": cast_id, "code": code, "target": target }),
@@ -785,6 +802,76 @@ fn list_session_log(coven_home: &Path, session_id: &str) -> Result<ApiResponse> 
     json_response(200, &lines)
 }
 
+fn get_session_artifact(coven_home: &Path, path: &str, query: &str) -> Result<ApiResponse> {
+    let Some(rest) = path.strip_prefix("/sessions/") else {
+        return api_error(404, "not_found", "Route not found.", None);
+    };
+    let Some((session_id, artifact_id)) = rest.split_once("/artifacts/") else {
+        return api_error(404, "not_found", "Route not found.", None);
+    };
+    if query_param(query, "raw") != Some("1") {
+        return api_error(
+            400,
+            "raw_artifact_requires_raw_flag",
+            "Raw artifact retrieval requires raw=1.",
+            Some(json!({ "sessionId": session_id, "artifactId": artifact_id })),
+        );
+    }
+    let config = privacy::load_config(coven_home).unwrap_or_default();
+    if !config.persist_raw_artifacts {
+        return api_error(
+            403,
+            "raw_artifacts_disabled",
+            "Raw artifact persistence is not enabled.",
+            Some(json!({ "sessionId": session_id, "artifactId": artifact_id })),
+        );
+    }
+
+    let conn = store::open_store(&store_path(coven_home))?;
+    if store::get_session(&conn, session_id)?.is_none() {
+        return api_error(
+            404,
+            "session_not_found",
+            "Session was not found.",
+            Some(json!({ "sessionId": session_id })),
+        );
+    }
+    let Some(artifact) = store::get_sensitive_artifact(&conn, session_id, artifact_id)? else {
+        return api_error(
+            404,
+            "artifact_not_found",
+            "Sensitive artifact was not found.",
+            Some(json!({ "sessionId": session_id, "artifactId": artifact_id })),
+        );
+    };
+    if artifact.expires_at <= current_timestamp() {
+        return api_error(
+            404,
+            "artifact_expired",
+            "Sensitive artifact has expired.",
+            Some(json!({ "sessionId": session_id, "artifactId": artifact_id })),
+        );
+    }
+    let plaintext = SensitiveArtifactStore::load(coven_home)?.decrypt(
+        session_id,
+        &artifact.event_id,
+        &artifact.kind,
+        &store::artifact_payload(&artifact),
+    )?;
+    let payload = serde_json::from_slice::<Value>(&plaintext)
+        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&plaintext).into_owned()));
+    json_response(
+        200,
+        &json!({
+            "sessionId": session_id,
+            "artifactId": artifact.id,
+            "eventId": artifact.event_id,
+            "kind": artifact.kind,
+            "payload": payload,
+        }),
+    )
+}
+
 fn event_to_log_line(event: store::EventRecord) -> LogLineDto {
     let payload: Value = serde_json::from_str(&event.payload_json).unwrap_or(Value::Null);
     let preview = payload_preview(&payload);
@@ -803,34 +890,19 @@ fn event_to_log_line(event: store::EventRecord) -> LogLineDto {
 }
 
 fn payload_preview(payload: &Value) -> String {
-    const MAX: usize = 240;
-    // `data` is what the daemon's input/output events actually carry (see
-    // `LiveSessionRuntime::send_input` and the output observer); `text` and
-    // `message` cover hand-rolled event shapes we may emit later.
-    let text = payload
-        .get("text")
-        .or_else(|| payload.get("message"))
-        .or_else(|| payload.get("data"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| payload.to_string());
-    if text.chars().count() > MAX {
-        let mut truncated: String = text.chars().take(MAX).collect();
-        truncated.push('…');
-        truncated
-    } else {
-        text
-    }
+    privacy::payload_preview(payload, 240)
 }
 
 fn insert_event(
     conn: &rusqlite::Connection,
+    coven_home: &Path,
     session_id: &str,
     kind: &str,
     payload: Value,
 ) -> Result<()> {
-    store::insert_event(
+    store::insert_event_with_privacy(
         conn,
+        coven_home,
         &store::EventRecord {
             // seq is populated by SQLite's rowid on insertion; the 0 here is a
             // placeholder that the INSERT statement ignores.
@@ -2280,9 +2352,9 @@ mod tests {
             conversation_id: None,
         };
         store::insert_session(&conn, &session)?;
-        insert_event(&conn, "sess-log", "input", json!({"text": "hello"}))?;
-        insert_event(&conn, "sess-log", "output", json!({"text": "world"}))?;
-        insert_event(&conn, "sess-log", "error", json!({"message": "boom"}))?;
+        insert_event(&conn, home, "sess-log", "input", json!({"text": "hello"}))?;
+        insert_event(&conn, home, "sess-log", "output", json!({"text": "world"}))?;
+        insert_event(&conn, home, "sess-log", "error", json!({"message": "boom"}))?;
         drop(conn);
 
         let response = handle_request("GET", "/api/v1/sessions/sess-log/log", home, None)?;
@@ -2294,6 +2366,137 @@ mod tests {
         assert!(lines[0]["message"].as_str().unwrap().contains("hello"));
         assert_eq!(lines[2]["level"], "error");
         assert!(lines[2]["message"].as_str().unwrap().contains("boom"));
+        Ok(())
+    }
+
+    #[test]
+    fn logs_and_events_return_redacted_payloads_by_default() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let conn = store::open_store(&store_path(home))?;
+        let session = store::SessionRecord {
+            id: "sess-secret".into(),
+            project_root: "/tmp/proj".into(),
+            harness: "codex".into(),
+            title: "demo".into(),
+            status: "running".into(),
+            exit_code: None,
+            archived_at: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            conversation_id: None,
+        };
+        store::insert_session(&conn, &session)?;
+        let fake = fake_openai_key();
+        insert_event(
+            &conn,
+            home,
+            "sess-secret",
+            "input",
+            json!({"data": format!("Authorization: Bearer {fake}")}),
+        )?;
+        drop(conn);
+
+        let log = handle_request("GET", "/api/v1/sessions/sess-secret/log", home, None)?;
+        let events = handle_request("GET", "/api/v1/events?sessionId=sess-secret", home, None)?;
+        let alias = handle_request("GET", "/api/v1/sessions/sess-secret/events", home, None)?;
+
+        for response in [log, events, alias] {
+            assert_eq!(response.status, 200);
+            assert!(!response.body.contains(&fake));
+            assert!(response.body.contains("[REDACTED]"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn raw_artifact_endpoint_is_disabled_by_default() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let conn = store::open_store(&store_path(home))?;
+        let session = store::SessionRecord {
+            id: "sess-secret".into(),
+            project_root: "/tmp/proj".into(),
+            harness: "codex".into(),
+            title: "demo".into(),
+            status: "running".into(),
+            exit_code: None,
+            archived_at: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            conversation_id: None,
+        };
+        store::insert_session(&conn, &session)?;
+        drop(conn);
+
+        let response = handle_request(
+            "GET",
+            "/api/v1/sessions/sess-secret/artifacts/event-1?raw=1",
+            home,
+            None,
+        )?;
+
+        assert_eq!(response.status, 403);
+        assert!(response.body.contains(r#""code":"raw_artifacts_disabled""#));
+        assert!(!response.body.contains("payload"));
+        Ok(())
+    }
+
+    #[test]
+    fn raw_artifact_endpoint_returns_404_for_expired_artifact() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        std::fs::write(home.join("privacy.toml"), "persist_raw_artifacts = true\n")?;
+        let conn = store::open_store(&store_path(home))?;
+        let session = store::SessionRecord {
+            id: "sess-secret".into(),
+            project_root: "/tmp/proj".into(),
+            harness: "codex".into(),
+            title: "demo".into(),
+            status: "running".into(),
+            exit_code: None,
+            archived_at: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            conversation_id: None,
+        };
+        store::insert_session(&conn, &session)?;
+        insert_event(
+            &conn,
+            home,
+            "sess-secret",
+            "input",
+            json!({"data": "secret"}),
+        )?;
+        let event_id = store::list_events(&conn, "sess-secret")?
+            .pop()
+            .expect("event")
+            .id;
+        store::insert_sensitive_artifact(
+            &conn,
+            &store::SensitiveArtifactRecord {
+                id: "artifact-1".into(),
+                session_id: "sess-secret".into(),
+                event_id,
+                kind: "input".into(),
+                nonce: vec![0; 24],
+                ciphertext: vec![1, 2, 3],
+                created_at: "2026-01-01T00:00:00Z".into(),
+                expires_at: "2026-01-02T00:00:00Z".into(),
+            },
+        )?;
+        drop(conn);
+
+        let response = handle_request(
+            "GET",
+            "/api/v1/sessions/sess-secret/artifacts/artifact-1?raw=1",
+            home,
+            None,
+        )?;
+
+        assert_eq!(response.status, 404);
+        assert!(response.body.contains(r#""code":"artifact_expired""#));
+        assert!(!response.body.contains("payload"));
         Ok(())
     }
 
@@ -2524,5 +2727,9 @@ mod tests {
         let first = &codes[0];
         assert_eq!(first["type"], "status");
         Ok(())
+    }
+
+    fn fake_openai_key() -> String {
+        format!("sk-{}", "c".repeat(40))
     }
 }

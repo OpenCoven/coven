@@ -22,6 +22,7 @@ flowchart TB
   Root --> Archive["archive"]
   Root --> Sacrifice["sacrifice"]
   Root --> Patch["patch"]
+  Root --> Logs["logs"]
   Root --> Pc["pc (macOS-first)"]
 
   Daemon --> DStart["start"]
@@ -38,6 +39,8 @@ flowchart TB
   Sessions --> SManage["--manage"]
 
   Patch --> POpenclaw["openclaw &lt;prompt&gt;"]
+
+  Logs --> LPrune["prune [--dry-run]"]
 
   Pc --> PcStatus["status [--json]"]
   Pc --> PcTop["top --n N"]
@@ -61,6 +64,7 @@ flowchart TB
 | `coven archive <session-id>` | Hide a non-running session while preserving events. |
 | `coven sacrifice <session-id> --yes` | Permanently delete a non-running session. |
 | `coven patch openclaw <prompt>` | Local OpenClaw rescue loop. Does not commit or push. |
+| `coven logs prune` | Prune expired encrypted raw artifacts and old redacted event logs. |
 | `coven pc` | macOS-first diagnostics and explicit `--confirm` relief operations. |
 
 ## Common flags by command
@@ -70,6 +74,7 @@ flowchart TB
 | `coven run` | `--cwd <path>`, `--title <text>`, `--detach` |
 | `coven sessions` | `--plain`, `--json`, `--all`, `--manage` |
 | `coven sacrifice` | `--yes` (required) |
+| `coven logs prune` | `--dry-run`, `--raw-days <N>`, `--event-days <N>` |
 | `coven pc kill` | `--confirm` (required) |
 | `coven pc cache clear` | `--confirm` (required) |
 | `coven pc top` | `--n <N>`, `--verbose` |
@@ -81,6 +86,15 @@ flowchart TB
 - **Pipe-friendly commands** accept `--plain` for tables and `--json` for machine output.
 - **Destructive commands** require `--yes` (or `--confirm` for `coven pc` relief).
 - **Daemon-touching commands** print install/repair hints when the socket is missing.
+
+## Log retention
+
+`coven logs prune` applies the local privacy retention policy:
+
+- Raw encrypted artifacts default to 7 days.
+- Redacted operational event logs default to 30 days.
+- `--dry-run` prints counts only.
+- `--raw-days <N>` and `--event-days <N>` override the configured retention for one run.
 
 ## Exit codes
 

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use sysinfo::{Disks, Pid, System};
+use sysinfo::{Disks, Pid, ProcessesToUpdate, System};
 
 #[derive(Debug)]
 pub struct SystemSnapshot {
@@ -37,7 +37,7 @@ pub fn snapshot(verbose: bool) -> Result<SystemSnapshot> {
     std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
     sys.refresh_all();
 
-    let cpu_usage_pct = sys.global_cpu_info().cpu_usage();
+    let cpu_usage_pct = sys.global_cpu_usage();
     let memory_used_mb = sys.used_memory() / 1024 / 1024;
     let memory_total_mb = sys.total_memory() / 1024 / 1024;
     let swap_used_mb = sys.used_swap() / 1024 / 1024;
@@ -49,11 +49,16 @@ pub fn snapshot(verbose: bool) -> Result<SystemSnapshot> {
         .iter()
         .map(|(pid, p)| ProcessInfo {
             pid: pid.as_u32(),
-            name: p.name().to_string(),
+            name: p.name().to_string_lossy().into_owned(),
             cpu_pct: p.cpu_usage(),
             memory_mb: p.memory() / 1024 / 1024,
             argv: if verbose {
-                Some(p.cmd().to_vec())
+                Some(
+                    p.cmd()
+                        .iter()
+                        .map(|arg| arg.to_string_lossy().into_owned())
+                        .collect(),
+                )
             } else {
                 None
             },
@@ -104,6 +109,7 @@ pub fn snapshot(verbose: bool) -> Result<SystemSnapshot> {
 pub fn process_name_for_pid(pid: u32) -> Option<String> {
     let mut sys = System::new();
     let pid_key = Pid::from_u32(pid);
-    sys.refresh_process(pid_key);
-    sys.process(pid_key).map(|p| p.name().to_string())
+    sys.refresh_processes(ProcessesToUpdate::Some(&[pid_key]), true);
+    sys.process(pid_key)
+        .map(|p| p.name().to_string_lossy().into_owned())
 }

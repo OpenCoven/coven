@@ -9,7 +9,7 @@ description: "The versioned coven.daemon.v1 contract under /api/v1: health negot
 
 # Coven local API contract
 
-The Coven daemon socket API is the compatibility boundary for CastCodes and advanced local clients such as comux or `@opencoven/coven`.
+The Coven daemon socket API is a public compatibility boundary for comux and external clients such as `@opencoven/coven`.
 
 ## Current stable version
 
@@ -19,6 +19,7 @@ The Coven daemon socket API is the compatibility boundary for CastCodes and adva
 - Control-plane clients should discover capabilities before sending action ids.
 - All API failures are returned as structured `{ "error": { "code", "message", "details" } }` envelopes.
 - Events include a monotonic `seq` cursor for incremental reads.
+- Event payloads are redacted by default before API display.
 
 ## `GET /api/v1/health`
 
@@ -110,10 +111,13 @@ All API errors use the following stable envelope. Clients must branch on `error.
 | `kill_failed`          | 500         | Daemon accepted the kill request but the runtime signal/kill call failed (permission, missing process, IO error). `details.sessionId` is the affected session. |
 | `runtime_unavailable`  | 503         | The session runtime is unavailable.              |
 | `internal_error`       | 500         | Unexpected internal error.                       |
+| `raw_artifacts_disabled` | 403       | Raw artifact retrieval was requested without explicit raw artifact persistence enabled. |
+| `raw_artifact_requires_raw_flag` | 400 | Raw artifact retrieval omitted the required `raw=1` query flag. |
+| `artifact_not_found`   | 404         | Sensitive artifact id does not exist for the session. |
 
 ## Capability catalog shape (`v1`)
 
-`GET /api/v1/capabilities` returns the daemon/control-plane capability catalog. This is the intended handshake for CastCodes and advanced clients deciding which actions to show or route through Coven.
+`GET /api/v1/capabilities` returns the daemon/control-plane capability catalog. This is the intended OpenMeow handshake for deciding which actions to show or route through Coven.
 
 ```json
 {
@@ -214,7 +218,7 @@ Endpoints that return this shape:
 
 ## Event record shape and cursor pagination (`v1`)
 
-`GET /api/v1/events` returns a paginated envelope with monotonic `seq` cursors.
+`GET /api/v1/events` returns a paginated envelope with monotonic `seq` cursors. `GET /api/v1/sessions/:id/events` is the session-scoped alias with the same response shape and cursor query parameters except that `sessionId` comes from the path.
 
 ### Query parameters
 
@@ -247,6 +251,39 @@ Endpoints that return this shape:
 ```
 
 `nextCursor` is `null` when there are no events. `hasMore` is `true` when a `limit` was applied and more events may exist.
+
+`payload_json` is the redacted preview payload used by clients. Raw sensitive artifacts are never included in this envelope.
+
+## Log preview shape (`v1`)
+
+`GET /api/v1/sessions/:id/log` currently returns the full redacted log preview for the session as an unbounded array:
+
+```json
+[
+  {
+    "ts": "2026-05-09T06:43:10Z",
+    "level": "info",
+    "message": "> hello"
+  }
+]
+```
+
+## Raw artifact access (`v1`)
+
+`GET /api/v1/sessions/:id/artifacts/:artifactId?raw=1` is intentionally narrow. It is unavailable unless raw artifact persistence is explicitly enabled in local privacy settings. Disabled installs return:
+
+```json
+{
+  "error": {
+    "code": "raw_artifacts_disabled",
+    "message": "Raw artifact persistence is not enabled.",
+    "details": {
+      "sessionId": "session-1",
+      "artifactId": "event-1"
+    }
+  }
+}
+```
 
 ### Incremental read pattern
 
@@ -315,10 +352,9 @@ Shared non-success responses use the structured error envelope:
 }
 ```
 
-## CastCodes and advanced client compatibility
+## comux and OpenClaw bridge compatibility
 
-- CastCodes should read the `capabilities` object from `/health` to decide which Coven-backed workspace features to show.
-- comux may continue to read the same capability shape as a legacy/reference client.
+- comux reads the `capabilities` object from `/health` to decide which features to use.
 - The `@opencoven/coven` OpenClaw bridge (`packages/openclaw-coven`) is updated in this repo alongside the daemon and uses `apiVersion === "coven.daemon.v1"` as its contract guard.
 - Client updates to use `afterSeq` cursors and paginated event envelopes may happen independently of the daemon update; the daemon-enforced shape is the source of truth.
 - The `supportedApiVersions` field has been removed from the health response in `coven.daemon.v1`; clients should check `apiVersion` directly.

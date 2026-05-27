@@ -417,8 +417,9 @@ fn record_session_exit(
             )?;
         }
     }
-    crate::store::insert_event(
+    crate::store::insert_event_with_privacy(
         &conn,
+        coven_home,
         &crate::store::EventRecord {
             seq: 0,
             id: uuid::Uuid::new_v4().to_string(),
@@ -441,8 +442,9 @@ fn record_session_event(
     payload: Value,
 ) -> Result<()> {
     let conn = crate::store::open_store(&coven_home.join("coven.sqlite3"))?;
-    crate::store::insert_event(
+    crate::store::insert_event_with_privacy(
         &conn,
+        coven_home,
         &crate::store::EventRecord {
             seq: 0,
             id: uuid::Uuid::new_v4().to_string(),

@@ -23,6 +23,8 @@ flowchart LR
   Sessions --> SCreate["POST /"]
   Sessions --> SById["/:id"]
   SById --> SGet["GET /"]
+  SById --> SEvents["GET /events"]
+  SById --> SLog["GET /log"]
   SById --> SInput["POST /input"]
   SById --> SKill["POST /kill"]
 ```
@@ -38,9 +40,11 @@ flowchart LR
 | GET | `/api/v1/sessions` | List active sessions. | — | `SessionRecord[]` | — |
 | POST | `/api/v1/sessions` | Launch a project-scoped harness session. | `{ projectRoot, cwd?, harness, prompt, title?, launchMode?, conversation?, conversationId? }` | `SessionRecord` | `400 invalid_request` (includes cwd-outside-project-root, unknown harness id, malformed body, etc.), `500 launch_failed` (runtime spawn / initial-message-write / harness startup failed; row marked `failed`) |
 | GET | `/api/v1/sessions/:id` | Fetch one session. | — | `SessionRecord` | `404 session_not_found` |
+| GET | `/api/v1/sessions/:id/events` | Read redacted session events. | — (`?afterSeq`, `?afterEventId`, `?limit`) | `{ events, nextCursor, hasMore }` | `404 session_not_found` |
+| GET | `/api/v1/sessions/:id/log` | Read bounded redacted log previews. | — | `[{ ts, level, message }]` | `404 session_not_found` |
 | POST | `/api/v1/sessions/:id/input` | Forward input to a live session. | `{ data }` | `{ ok, accepted }` | `400 invalid_request` (malformed body / missing or non-string `data`), `404 session_not_found`, `409 session_not_live`, `500 send_input_failed` |
 | POST | `/api/v1/sessions/:id/kill` | Kill a live session. | — | `{ ok, accepted }` | `404 session_not_found`, `409 session_not_live`, `500 kill_failed` |
-| GET | `/api/v1/events` | Read paginated session events. | — (`?sessionId`, `?afterSeq`, `?afterEventId`, `?limit`) | `{ events, nextCursor, hasMore }` | `400 invalid_request` |
+| GET | `/api/v1/events` | Read paginated redacted session events. | — (`?sessionId`, `?afterSeq`, `?afterEventId`, `?limit`) | `{ events, nextCursor, hasMore }` | `400 invalid_request` |
 
 All error responses use the structured envelope documented in [API contract](/API-CONTRACT#structured-error-envelope).
 
