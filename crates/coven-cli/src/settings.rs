@@ -53,6 +53,32 @@ pub fn user_settings_path() -> Option<PathBuf> {
     Some(base.join("coven").join(SETTINGS_FILE_NAME))
 }
 
+pub fn shadowed_keys(toml_keys: &[String], jsonc_keys: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = toml_keys
+        .iter()
+        .filter(|k| jsonc_keys.iter().any(|j| j == *k))
+        .cloned()
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+pub fn warn_if_shadowed(shadowed: &[String], toml_path: &Path, jsonc_path: &Path) {
+    if shadowed.is_empty() {
+        return;
+    }
+    eprintln!(
+        "coven: {} keys in {} are shadowed by {}. Consider removing them from the TOML file.",
+        shadowed.len(),
+        toml_path.display(),
+        jsonc_path.display()
+    );
+    for key in shadowed {
+        eprintln!("  - {key}");
+    }
+}
+
 pub fn load_from(path: &Path) -> Result<Option<Settings>> {
     let raw = match std::fs::read_to_string(path) {
         Ok(r) => r,
@@ -106,5 +132,13 @@ mod tests {
         let path = temp.path().join("settings.json");
         std::fs::write(&path, "{}").unwrap();
         assert_eq!(load_from(&path).unwrap().unwrap(), Settings::default());
+    }
+
+    #[test]
+    fn detect_shadowed_keys_lists_overrides() {
+        let toml_keys = ["repos.alpha".to_string(), "defaultRepo".to_string()];
+        let jsonc_keys = ["repos.alpha".to_string()];
+        let shadowed = shadowed_keys(&toml_keys, &jsonc_keys);
+        assert_eq!(shadowed, vec!["repos.alpha".to_string()]);
     }
 }
