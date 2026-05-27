@@ -65,6 +65,9 @@ pub fn parse(prompt: &str) -> ParsedPrompt {
 
 #[allow(dead_code)]
 pub fn expand_path(cwd: &Path, raw: &str) -> Result<String> {
+    if raw.contains('*') || raw.contains('?') || raw.contains('[') {
+        return expand_glob(cwd, raw);
+    }
     let full = cwd.join(raw);
     if !full.exists() {
         return Ok(format!("[missing @{raw}]"));
@@ -104,6 +107,55 @@ fn guess_mime(path: &Path) -> String {
         Some("webp") => "image/webp".into(),
         _ => "text/plain".into(),
     }
+}
+
+#[allow(dead_code)]
+fn expand_glob(cwd: &Path, pattern: &str) -> Result<String> {
+    use globset::{Glob, GlobSetBuilder};
+    let mut builder = GlobSetBuilder::new();
+    builder.add(Glob::new(pattern)?);
+    let set = builder.build()?;
+    let mut out = String::new();
+    let mut count = 0usize;
+    for entry in walkdir(cwd) {
+        let rel = entry.strip_prefix(cwd).unwrap_or(&entry);
+        if !set.is_match(rel) {
+            continue;
+        }
+        let part = expand_path(cwd, &rel.to_string_lossy())?;
+        out.push_str(&part);
+        out.push('\n');
+        count += 1;
+        if count >= 20 {
+            out.push_str("[…glob match cap reached at 20 files]\n");
+            break;
+        }
+    }
+    if count == 0 {
+        return Ok(format!("[no matches for @{pattern}]"));
+    }
+    Ok(out)
+}
+
+#[allow(dead_code)]
+fn walkdir(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().and_then(|s| s.to_str()) == Some(".git") {
+                    continue;
+                }
+                stack.push(path);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -192,5 +244,38 @@ mod tests {
         let expanded = expand_path(temp.path(), "big.md").unwrap();
         assert!(expanded.contains(&format!("…truncated at {MAX_TEXT_LINES} lines")));
         assert!(!expanded.contains(&format!("line-{}", MAX_TEXT_LINES + 49)));
+    }
+
+    #[test]
+    fn expand_glob_includes_all_matches() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("docs")).unwrap();
+        std::fs::write(temp.path().join("docs/a.md"), "AAA").unwrap();
+        std::fs::write(temp.path().join("docs/b.md"), "BBB").unwrap();
+        let expanded = expand_path(temp.path(), "docs/*.md").unwrap();
+        assert!(expanded.contains("AAA"), "got: {expanded}");
+        assert!(expanded.contains("BBB"), "got: {expanded}");
+    }
+
+    #[test]
+    fn expand_glob_no_matches_returns_placeholder() {
+        let temp = tempfile::tempdir().unwrap();
+        let expanded = expand_path(temp.path(), "docs/*.md").unwrap();
+        assert_eq!(expanded, "[no matches for @docs/*.md]");
+    }
+
+    #[test]
+    fn expand_glob_caps_at_twenty() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("many")).unwrap();
+        for i in 0..25 {
+            std::fs::write(
+                temp.path().join(format!("many/f{i}.txt")),
+                format!("F{i}"),
+            )
+            .unwrap();
+        }
+        let expanded = expand_path(temp.path(), "many/*.txt").unwrap();
+        assert!(expanded.contains("glob match cap reached at 20 files"));
     }
 }
