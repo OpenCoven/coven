@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use chrono::{Duration, SecondsFormat, Utc};
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -660,6 +660,19 @@ pub fn sacrifice_session(conn: &Connection, session_id: &str) -> Result<()> {
         .with_context(|| format!("failed to sacrifice session {session_id}"))?;
 
     Ok(())
+}
+
+pub fn latest_active_for_project(conn: &Connection, project_root: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT id FROM sessions
+         WHERE project_root = ?1 AND archived_at IS NULL
+         ORDER BY created_at DESC
+         LIMIT 1",
+        params![project_root],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .context("failed to query latest active session for project")
 }
 
 pub fn search_events(conn: &Connection, query: &str) -> Result<Vec<SearchHit>> {
@@ -1827,6 +1840,23 @@ mod tests {
             labels: Vec::new(),
             visibility: "private".to_string(),
         }
+    }
+
+    #[test]
+    fn latest_active_returns_newest_non_archived_for_project() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("test.sqlite3"))?;
+        conn.execute_batch(
+            "INSERT INTO sessions(id, project_root, harness, title, status, created_at, updated_at)
+               VALUES ('older', '/p', 'codex', 't', 'created', '2026-01-01', '2026-01-01'),
+                      ('newer', '/p', 'claude', 't', 'created', '2026-01-02', '2026-01-02'),
+                      ('archived', '/p', 'claude', 't', 'created', '2026-01-03', '2026-01-03'),
+                      ('other_proj', '/other', 'claude', 't', 'created', '2026-01-04', '2026-01-04');
+             UPDATE sessions SET archived_at='2026-01-03' WHERE id='archived';",
+        )?;
+        let hit = latest_active_for_project(&conn, "/p")?;
+        assert_eq!(hit.as_deref(), Some("newer"));
+        Ok(())
     }
 
     #[test]
