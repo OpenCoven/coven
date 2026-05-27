@@ -549,6 +549,8 @@ fn launch_patch_session(request: &patch::PatchRequest) -> Result<String> {
         created_at: now.clone(),
         updated_at: now.clone(),
         conversation_id: None,
+        labels: Vec::new(),
+        visibility: "private".to_string(),
     };
     store::insert_session(&conn, &record)?;
     let metadata = serde_json::json!({
@@ -741,6 +743,8 @@ fn run_session(
         created_at: now.clone(),
         updated_at: now,
         conversation_id: None,
+        labels: Vec::new(),
+        visibility: "private".to_string(),
     };
 
     store::insert_session(&conn, &record)?;
@@ -1925,6 +1929,8 @@ mod tests {
             created_at: "2026-04-27T06:00:00Z".to_string(),
             updated_at: "2026-04-27T06:00:00Z".to_string(),
             conversation_id: None,
+            labels: Vec::new(),
+            visibility: "private".to_string(),
         };
 
         assert_eq!(
@@ -1946,6 +1952,8 @@ mod tests {
             created_at: "2026-05-14T07:00:00Z".to_string(),
             updated_at: "2026-05-14T07:00:01Z".to_string(),
             conversation_id: None,
+            labels: Vec::new(),
+            visibility: "private".to_string(),
         };
 
         let rendered = render_sessions_json(&[session])?;
@@ -2058,6 +2066,8 @@ mod tests {
             created_at: "2026-05-08T07:00:00Z".to_string(),
             updated_at: "2026-05-08T07:05:00Z".to_string(),
             conversation_id: None,
+            labels: Vec::new(),
+            visibility: "private".to_string(),
         }
     }
 }

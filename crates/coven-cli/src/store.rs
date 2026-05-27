@@ -30,6 +30,14 @@ pub struct SessionRecord {
     /// resume` and grouping. See `docs/chat-persistence.md`.
     #[serde(default)]
     pub conversation_id: Option<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default = "default_visibility")]
+    pub visibility: String,
+}
+
+fn default_visibility() -> String {
+    "private".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,7 +102,9 @@ pub fn open_store(path: &Path) -> Result<Connection> {
             archived_at TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
-            conversation_id TEXT
+            conversation_id TEXT,
+            labels TEXT,
+            visibility TEXT NOT NULL DEFAULT 'private'
         );
 
         CREATE TABLE IF NOT EXISTS events (
@@ -148,6 +158,8 @@ pub fn open_store(path: &Path) -> Result<Connection> {
     ensure_conversation_id_column(&conn)?;
     ensure_event_privacy_columns(&conn)?;
     ensure_sensitive_artifacts_table(&conn)?;
+    ensure_labels_column(&conn)?;
+    ensure_visibility_column(&conn)?;
 
     Ok(conn)
 }
@@ -291,6 +303,45 @@ fn ensure_conversation_id_column(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_labels_column(conn: &Connection) -> Result<()> {
+    let mut statement = conn
+        .prepare("PRAGMA table_info(sessions)")
+        .context("failed to inspect sessions schema")?;
+    let has_labels = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .context("failed to query sessions schema")?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to read sessions schema")?
+        .into_iter()
+        .any(|column| column == "labels");
+    if !has_labels {
+        conn.execute("ALTER TABLE sessions ADD COLUMN labels TEXT", [])
+            .context("failed to add sessions.labels column")?;
+    }
+    Ok(())
+}
+
+fn ensure_visibility_column(conn: &Connection) -> Result<()> {
+    let mut statement = conn
+        .prepare("PRAGMA table_info(sessions)")
+        .context("failed to inspect sessions schema")?;
+    let has_visibility = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .context("failed to query sessions schema")?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to read sessions schema")?
+        .into_iter()
+        .any(|column| column == "visibility");
+    if !has_visibility {
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN visibility TEXT NOT NULL DEFAULT 'private'",
+            [],
+        )
+        .context("failed to add sessions.visibility column")?;
+    }
+    Ok(())
+}
+
 pub fn upsert_repository(conn: &Connection, record: &RepositoryRecord) -> Result<()> {
     conn.execute(
         "INSERT INTO repositories (
@@ -357,19 +408,19 @@ pub fn repositories_table_exists(conn: &Connection) -> Result<bool> {
 }
 
 pub fn insert_session(conn: &Connection, record: &SessionRecord) -> Result<()> {
+    let labels_json: Option<String> = if record.labels.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::to_string(&record.labels)
+                .context("failed to serialize session labels")?,
+        )
+    };
     conn.execute(
         "INSERT INTO sessions (
-            id,
-            project_root,
-            harness,
-            title,
-            status,
-            exit_code,
-            archived_at,
-            created_at,
-            updated_at,
-            conversation_id
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            id, project_root, harness, title, status, exit_code, archived_at,
+            created_at, updated_at, conversation_id, labels, visibility
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             &record.id,
             &record.project_root,
@@ -381,6 +432,8 @@ pub fn insert_session(conn: &Connection, record: &SessionRecord) -> Result<()> {
             &record.created_at,
             &record.updated_at,
             &record.conversation_id,
+            labels_json,
+            &record.visibility,
         ],
     )
     .with_context(|| format!("failed to insert session {}", record.id))?;
@@ -389,20 +442,20 @@ pub fn insert_session(conn: &Connection, record: &SessionRecord) -> Result<()> {
 }
 
 pub fn insert_session_if_absent(conn: &Connection, record: &SessionRecord) -> Result<bool> {
+    let labels_json: Option<String> = if record.labels.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::to_string(&record.labels)
+                .context("failed to serialize session labels")?,
+        )
+    };
     let affected = conn
         .execute(
             "INSERT OR IGNORE INTO sessions (
-                id,
-                project_root,
-                harness,
-                title,
-                status,
-                exit_code,
-                archived_at,
-                created_at,
-                updated_at,
-                conversation_id
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                id, project_root, harness, title, status, exit_code, archived_at,
+                created_at, updated_at, conversation_id, labels, visibility
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 &record.id,
                 &record.project_root,
@@ -414,6 +467,8 @@ pub fn insert_session_if_absent(conn: &Connection, record: &SessionRecord) -> Re
                 &record.created_at,
                 &record.updated_at,
                 &record.conversation_id,
+                labels_json,
+                &record.visibility,
             ],
         )
         .with_context(|| format!("failed to upsert session {}", record.id))?;
@@ -488,7 +543,9 @@ fn list_sessions_with_archive_filter(
                 archived_at,
                 created_at,
                 updated_at,
-                conversation_id
+                conversation_id,
+                labels,
+                visibility
             FROM sessions
             {archive_filter}
             ORDER BY created_at DESC, id DESC",
@@ -497,6 +554,20 @@ fn list_sessions_with_archive_filter(
 
     let sessions = statement
         .query_map([], |row| {
+            let labels_str: Option<String> = row.get(10)?;
+            let labels: Vec<String> = labels_str
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|err| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        10,
+                        rusqlite::types::Type::Text,
+                        Box::new(err),
+                    )
+                })?
+                .unwrap_or_default();
+            let visibility: String = row.get(11)?;
             Ok(SessionRecord {
                 id: row.get(0)?,
                 project_root: row.get(1)?,
@@ -508,6 +579,8 @@ fn list_sessions_with_archive_filter(
                 created_at: row.get(7)?,
                 updated_at: row.get(8)?,
                 conversation_id: row.get(9)?,
+                labels,
+                visibility,
             })
         })
         .context("failed to query sessions")?
@@ -1683,7 +1756,33 @@ mod tests {
             created_at: created_at.to_string(),
             updated_at: created_at.to_string(),
             conversation_id: None,
+            labels: Vec::new(),
+            visibility: "private".to_string(),
         }
+    }
+
+    #[test]
+    fn new_columns_default_correctly() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("test.sqlite3"))?;
+        conn.execute(
+            "INSERT INTO sessions(id, project_root, harness, title, status, created_at, updated_at)
+             VALUES('s1', '/tmp', 'codex', 't', 'created', '2026-01-01', '2026-01-01')",
+            [],
+        )?;
+        let labels: Option<String> = conn.query_row(
+            "SELECT labels FROM sessions WHERE id='s1'",
+            [],
+            |row| row.get(0),
+        )?;
+        let visibility: String = conn.query_row(
+            "SELECT visibility FROM sessions WHERE id='s1'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(labels, None);
+        assert_eq!(visibility, "private");
+        Ok(())
     }
 
     fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {

@@ -313,6 +313,8 @@ fn launch_session(
         created_at: now.clone(),
         updated_at: now,
         conversation_id: launch.conversation_id.clone(),
+        labels: Vec::new(),
+        visibility: "private".to_string(),
     };
     store::insert_session(&conn, &record)?;
     if let Err(error) = runtime.launch_session(&launch) {
@@ -700,6 +702,8 @@ fn ensure_cockpit_session(conn: &rusqlite::Connection) -> Result<()> {
         created_at: now.clone(),
         updated_at: now,
         conversation_id: None,
+        labels: Vec::new(),
+        visibility: "private".to_string(),
     };
     store::insert_session_if_absent(conn, &record)?;
     Ok(())
@@ -1184,6 +1188,8 @@ mod tests {
             created_at: "2026-04-27T10:00:00Z".to_string(),
             updated_at: "2026-04-27T10:00:00Z".to_string(),
             conversation_id: None,
+            labels: Vec::new(),
+            visibility: "private".to_string(),
         };
         crate::store::insert_session(&conn, &session)?;
 
@@ -2048,6 +2054,8 @@ mod tests {
             created_at: "2026-04-27T10:00:00Z".to_string(),
             updated_at: "2026-04-27T10:00:00Z".to_string(),
             conversation_id: None,
+            labels: Vec::new(),
+            visibility: "private".to_string(),
         };
         crate::store::insert_session(&conn, &session)?;
         Ok(())
@@ -2350,6 +2358,8 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             conversation_id: None,
+            labels: Vec::new(),
+            visibility: "private".to_string(),
         };
         store::insert_session(&conn, &session)?;
         insert_event(&conn, home, "sess-log", "input", json!({"text": "hello"}))?;
@@ -2570,6 +2580,8 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             conversation_id: None,
+            labels: Vec::new(),
+            visibility: "private".to_string(),
         };
         store::insert_session(&conn, &session)?;
         drop(conn);
@@ -2668,6 +2680,8 @@ mod tests {
                     created_at: now.into(),
                     updated_at: now.into(),
                     conversation_id: None,
+                    labels: Vec::new(),
+                    visibility: "private".to_string(),
                 },
             )?;
         }
