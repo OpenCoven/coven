@@ -27,9 +27,9 @@ impl Default for PrivacyConfig {
     }
 }
 
-pub fn load_config(_coven_home: &Path) -> Result<PrivacyConfig> {
+pub fn load_config(coven_home: &Path) -> Result<PrivacyConfig> {
     let mut config = PrivacyConfig::default();
-    let path = _coven_home.join("privacy.toml");
+    let path = coven_home.join("privacy.toml");
     match std::fs::read_to_string(&path) {
         Ok(raw) => {
             let file_config: PrivacyConfigFile = toml::from_str(&raw)
@@ -66,16 +66,16 @@ pub fn load_config(_coven_home: &Path) -> Result<PrivacyConfig> {
     Ok(config)
 }
 
-pub fn redact_text(_text: &str) -> String {
-    redact_text_with_config(_text, &PrivacyConfig::default())
+pub fn redact_text(text: &str) -> String {
+    redact_text_with_config(text, &PrivacyConfig::default())
 }
 
-pub fn redact_text_with_config(_text: &str, _config: &PrivacyConfig) -> String {
-    let mut out = _text.to_string();
+pub fn redact_text_with_config(text: &str, config: &PrivacyConfig) -> String {
+    let mut out = text.to_string();
     for regex in built_in_patterns() {
         out = regex.replace_all(&out, REDACTED).into_owned();
     }
-    for pattern in &_config.extra_patterns {
+    for pattern in &config.extra_patterns {
         if let Ok(regex) = Regex::new(pattern) {
             out = regex.replace_all(&out, REDACTED).into_owned();
         }
@@ -84,30 +84,30 @@ pub fn redact_text_with_config(_text: &str, _config: &PrivacyConfig) -> String {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-pub fn redact_value(_value: &Value) -> Value {
-    redact_value_with_config(_value, &PrivacyConfig::default())
+pub fn redact_value(value: &Value) -> Value {
+    redact_value_with_config(value, &PrivacyConfig::default())
 }
 
-pub fn redact_payload_json(_payload_json: &str) -> String {
-    redact_payload_json_with_config(_payload_json, &PrivacyConfig::default())
+pub fn redact_payload_json(payload_json: &str) -> String {
+    redact_payload_json_with_config(payload_json, &PrivacyConfig::default())
 }
 
-pub fn redact_payload_json_with_config(_payload_json: &str, config: &PrivacyConfig) -> String {
-    match serde_json::from_str::<Value>(_payload_json) {
+pub fn redact_payload_json_with_config(payload_json: &str, config: &PrivacyConfig) -> String {
+    match serde_json::from_str::<Value>(payload_json) {
         Ok(value) => redact_value_with_config(&value, config).to_string(),
-        Err(_) => redact_text_with_config(_payload_json, config),
+        Err(_) => redact_text_with_config(payload_json, config),
     }
 }
 
-pub fn payload_preview(_payload: &Value, _max_chars: usize) -> String {
-    let text = _payload
+pub fn payload_preview(payload: &Value, max_chars: usize) -> String {
+    let text = payload
         .get("text")
-        .or_else(|| _payload.get("message"))
-        .or_else(|| _payload.get("data"))
+        .or_else(|| payload.get("message"))
+        .or_else(|| payload.get("data"))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
-        .unwrap_or_else(|| _payload.to_string());
-    truncate_chars(&redact_text(&text), _max_chars)
+        .unwrap_or_else(|| payload.to_string());
+    truncate_chars(&redact_text(&text), max_chars)
 }
 
 #[derive(Debug, Deserialize)]

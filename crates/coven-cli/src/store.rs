@@ -570,7 +570,7 @@ pub fn insert_event_with_privacy(
     insert_event_raw(conn, record, &redacted_payload, redaction_status, sensitive)?;
 
     if config.persist_raw_artifacts && sensitive {
-        let artifact_result = SensitiveArtifactStore::load(coven_home)
+        let artifact_result = SensitiveArtifactStore::load_or_create(coven_home)
             .and_then(|store| {
                 store.encrypt(
                     &record.session_id,
@@ -1355,13 +1355,14 @@ mod tests {
         let artifact = get_sensitive_artifact(&conn, "session-1", "event-raw")?
             .expect("artifact should exist");
         assert_ne!(artifact.ciphertext, raw_payload.as_bytes());
-        let decrypted = crate::encrypted_artifacts::SensitiveArtifactStore::load(temp_dir.path())?
-            .decrypt(
-                "session-1",
-                "event-raw",
-                "output",
-                &artifact_payload(&artifact),
-            )?;
+        let decrypted =
+            crate::encrypted_artifacts::SensitiveArtifactStore::load_existing(temp_dir.path())?
+                .decrypt(
+                    "session-1",
+                    "event-raw",
+                    "output",
+                    &artifact_payload(&artifact),
+                )?;
         assert_eq!(String::from_utf8(decrypted)?, raw_payload);
         Ok(())
     }

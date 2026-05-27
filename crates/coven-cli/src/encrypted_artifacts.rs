@@ -22,24 +22,37 @@ pub struct SensitiveArtifactStore {
 }
 
 impl SensitiveArtifactStore {
-    pub fn load(coven_home: &Path) -> Result<Self> {
+    pub fn load_or_create(coven_home: &Path) -> Result<Self> {
         let key_path = coven_home.join(KEY_DIR_NAME).join(KEY_FILE_NAME);
-        let key = match std::fs::read_to_string(&key_path) {
-            Ok(raw) => decode_key(raw.trim())
-                .with_context(|| "failed to load artifact encryption key".to_string())?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let key = XChaCha20Poly1305::generate_key(&mut OsRng);
-                let bytes: [u8; KEY_LEN] = key
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| anyhow!("failed to generate artifact encryption key material"))?;
-                write_key_file(&key_path, &bytes)?;
-                bytes
-            }
-            Err(error) => {
-                return Err(error).with_context(|| "failed to load artifact encryption key");
-            }
-        };
+        let key =
+            match std::fs::read_to_string(&key_path) {
+                Ok(raw) => decode_key(raw.trim())
+                    .with_context(|| "failed to load artifact encryption key")?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let key = XChaCha20Poly1305::generate_key(&mut OsRng);
+                    let bytes: [u8; KEY_LEN] = key.as_slice().try_into().map_err(|_| {
+                        anyhow!("failed to generate artifact encryption key material")
+                    })?;
+                    write_key_file(&key_path, &bytes)?;
+                    bytes
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| "failed to load artifact encryption key");
+                }
+            };
+        Ok(Self { key })
+    }
+
+    pub fn load_existing(coven_home: &Path) -> Result<Self> {
+        let key_path = coven_home.join(KEY_DIR_NAME).join(KEY_FILE_NAME);
+        let raw = std::fs::read_to_string(&key_path).with_context(|| {
+            format!(
+                "failed to load existing artifact encryption key at {}",
+                key_path.display()
+            )
+        })?;
+        let key =
+            decode_key(raw.trim()).with_context(|| "failed to load artifact encryption key")?;
         Ok(Self { key })
     }
 
@@ -157,7 +170,7 @@ mod tests {
     #[test]
     fn encrypt_decrypt_round_trip_uses_nonce_and_aad() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let store = SensitiveArtifactStore::load(temp.path())?;
+        let store = SensitiveArtifactStore::load_or_create(temp.path())?;
         let plaintext = fake_payload();
 
         let encrypted = store.encrypt("session-1", "event-1", "output", &plaintext)?;
@@ -179,11 +192,21 @@ mod tests {
         std::fs::create_dir_all(&keys)?;
         std::fs::write(keys.join("session-artifacts.key"), "not-a-valid-key")?;
 
-        let error = SensitiveArtifactStore::load(temp.path()).unwrap_err();
+        let error = SensitiveArtifactStore::load_or_create(temp.path()).unwrap_err();
         let message = error.to_string();
 
         assert!(message.contains("artifact encryption key"));
         assert!(!message.contains("not-a-valid-key"));
+        Ok(())
+    }
+
+    #[test]
+    fn load_existing_fails_when_key_is_missing() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let error = SensitiveArtifactStore::load_existing(temp.path()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("failed to load existing artifact encryption key"));
         Ok(())
     }
 }

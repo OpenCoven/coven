@@ -1,7 +1,7 @@
 use std::{borrow::Cow, path::Path};
 
 use anyhow::{Context, Result};
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -844,7 +844,10 @@ fn get_session_artifact(coven_home: &Path, path: &str, query: &str) -> Result<Ap
             Some(json!({ "sessionId": session_id, "artifactId": artifact_id })),
         );
     };
-    if artifact.expires_at <= current_timestamp() {
+    let expires_at = parse_rfc3339_utc(&artifact.expires_at)
+        .with_context(|| format!("failed to parse artifact expiry for {}", artifact.id))?;
+    let now = Utc::now();
+    if expires_at <= now {
         return api_error(
             404,
             "artifact_expired",
@@ -852,7 +855,7 @@ fn get_session_artifact(coven_home: &Path, path: &str, query: &str) -> Result<Ap
             Some(json!({ "sessionId": session_id, "artifactId": artifact_id })),
         );
     }
-    let plaintext = SensitiveArtifactStore::load(coven_home)?.decrypt(
+    let plaintext = SensitiveArtifactStore::load_existing(coven_home)?.decrypt(
         session_id,
         &artifact.event_id,
         &artifact.kind,
@@ -942,6 +945,12 @@ fn session_action_id<'a>(path: &'a str, suffix: &str) -> &'a str {
     path.trim_start_matches("/sessions/")
         .strip_suffix(suffix)
         .unwrap_or_default()
+}
+
+fn parse_rfc3339_utc(timestamp: &str) -> Result<DateTime<Utc>> {
+    Ok(DateTime::parse_from_rfc3339(timestamp)
+        .with_context(|| format!("invalid RFC3339 timestamp: {timestamp}"))?
+        .with_timezone(&Utc))
 }
 
 pub(crate) fn current_timestamp() -> String {
