@@ -22,6 +22,7 @@ mod pc;
 mod privacy;
 mod project;
 mod prompt_refs;
+mod stream_json;
 mod pty_runner;
 mod repos_config;
 mod settings;
