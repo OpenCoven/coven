@@ -1109,7 +1109,7 @@ fn run_session(
                 &current_timestamp(),
             )?;
             if stream_json {
-                let is_error = result.exit_code.map_or(false, |c| c != 0);
+                let is_error = result.exit_code.is_some_and(|c| c != 0);
                 emit_stream_event(&stream_json::Event::Result(stream_json::RunResult {
                     subtype: if is_error {
                         "error_during_execution".into()
