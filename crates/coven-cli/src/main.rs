@@ -14,10 +14,12 @@ mod api;
 mod cockpit_sources;
 mod control_plane;
 mod daemon;
+mod encrypted_artifacts;
 mod harness;
 mod openclaw_repo;
 mod patch;
 mod pc;
+mod privacy;
 mod project;
 mod pty_runner;
 mod repos_config;
@@ -90,6 +92,11 @@ enum Command {
         #[arg(long, conflicts_with_all = ["manage", "plain"], help = "Print sessions as JSON for clients such as comux")]
         json: bool,
     },
+    #[command(about = "Manage local log retention")]
+    Logs {
+        #[command(subcommand)]
+        command: LogsCommand,
+    },
     #[command(about = "Replay/follow a session and forward input to live daemon sessions")]
     Attach { session_id: String },
     #[command(about = "Summon an archived session back, then replay/follow it")]
@@ -151,6 +158,27 @@ enum DaemonCommand {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum LogsCommand {
+    #[command(about = "Prune expired raw artifacts and old redacted event logs")]
+    Prune {
+        #[arg(long, help = "Report what would be pruned without deleting rows")]
+        dry_run: bool,
+        #[arg(
+            long,
+            value_name = "DAYS",
+            help = "Override raw artifact retention days"
+        )]
+        raw_days: Option<u64>,
+        #[arg(
+            long,
+            value_name = "DAYS",
+            help = "Override redacted event retention days"
+        )]
+        event_days: Option<u64>,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InteractiveShellRoute {
     Chat,
@@ -184,6 +212,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             plain,
             json,
         }) => tui::sessions::run_command(all, manage, plain, json),
+        Some(Command::Logs { command }) => run_logs_command(command),
         Some(Command::Attach { session_id }) => attach_session(&session_id),
         Some(Command::Summon { session_id }) => summon_session_command(&session_id),
         Some(Command::Archive { session_id }) => archive_session_command(&session_id),
@@ -492,7 +521,8 @@ fn default_harness_id() -> Option<&'static str> {
 
 fn launch_patch_session(request: &patch::PatchRequest) -> Result<String> {
     let selected_harness = selected_available_harness(request.harness_id.as_str())?;
-    let store_path = coven_store_path()?;
+    let coven_home = coven_home_dir()?;
+    let store_path = coven_home.join(STORE_FILE_NAME);
     let conn = store::open_store(&store_path)?;
     let now = current_timestamp();
     let brief = patch::build_repair_brief(request);
@@ -509,19 +539,25 @@ fn launch_patch_session(request: &patch::PatchRequest) -> Result<String> {
         conversation_id: None,
     };
     store::insert_session(&conn, &record)?;
-    store::insert_json_event(
+    let metadata = serde_json::json!({
+        "patchTarget": request.repo.repo_name,
+        "repoRoot": request.repo.root,
+        "issue": request.issue,
+        "harnessId": request.harness_id.as_str(),
+        "verificationProfile": request.verification_profile.as_str(),
+        "status": "running"
+    });
+    store::insert_event_with_privacy(
         &conn,
-        &record.id,
-        "patch_metadata",
-        &serde_json::json!({
-            "patchTarget": request.repo.repo_name,
-            "repoRoot": request.repo.root,
-            "issue": request.issue,
-            "harnessId": request.harness_id.as_str(),
-            "verificationProfile": request.verification_profile.as_str(),
-            "status": "running"
-        }),
-        &now,
+        &coven_home,
+        &store::EventRecord {
+            seq: 0,
+            id: Uuid::new_v4().to_string(),
+            session_id: record.id.clone(),
+            kind: "patch_metadata".to_string(),
+            payload_json: metadata.to_string(),
+            created_at: now,
+        },
     )?;
 
     store::update_session_status(
@@ -546,6 +582,45 @@ fn launch_patch_session(request: &patch::PatchRequest) -> Result<String> {
         &current_timestamp(),
     )?;
     Ok(record.id)
+}
+
+fn run_logs_command(command: LogsCommand) -> Result<()> {
+    match command {
+        LogsCommand::Prune {
+            dry_run,
+            raw_days,
+            event_days,
+        } => prune_logs_command(dry_run, raw_days, event_days),
+    }
+}
+
+fn prune_logs_command(dry_run: bool, raw_days: Option<u64>, event_days: Option<u64>) -> Result<()> {
+    let home = coven_home_dir()?;
+    let config = privacy::load_config(&home).unwrap_or_default();
+    let raw_days = raw_days
+        .unwrap_or(config.raw_artifact_retention_days)
+        .max(1);
+    let event_days = event_days.unwrap_or(config.log_retention_days).max(1);
+    let conn = store::open_store(&home.join(STORE_FILE_NAME))?;
+    let now = current_timestamp();
+    let raw_cutoff = store::retention_cutoff(&now, raw_days);
+    let event_cutoff = store::retention_cutoff(&now, event_days);
+    let raw_count = store::count_prunable_sensitive_artifacts(&conn, &now, &raw_cutoff)?;
+    let event_count = store::count_events_older_than(&conn, &event_cutoff)?;
+
+    if dry_run {
+        println!(
+            "logs prune dryRun=true rawArtifacts={raw_count} events={event_count} rawDays={raw_days} eventDays={event_days}"
+        );
+        return Ok(());
+    }
+
+    let raw_pruned = store::prune_sensitive_artifacts(&conn, &now, &raw_cutoff)?;
+    let events_pruned = store::prune_events_older_than(&conn, &event_cutoff)?;
+    println!(
+        "logs pruned rawArtifacts={raw_pruned} events={events_pruned} rawCutoff={raw_cutoff} eventCutoff={event_cutoff}"
+    );
+    Ok(())
 }
 
 fn run_daemon_command(command: DaemonCommand) -> Result<()> {
@@ -1606,6 +1681,36 @@ mod tests {
                 assert!(yes);
             }
             other => panic!("expected sacrifice command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_logs_prune_options() {
+        let cli = Cli::parse_from([
+            "coven",
+            "logs",
+            "prune",
+            "--dry-run",
+            "--raw-days",
+            "3",
+            "--event-days",
+            "14",
+        ]);
+
+        match cli.command {
+            Some(Command::Logs {
+                command:
+                    LogsCommand::Prune {
+                        dry_run,
+                        raw_days,
+                        event_days,
+                    },
+            }) => {
+                assert!(dry_run);
+                assert_eq!(raw_days, Some(3));
+                assert_eq!(event_days, Some(14));
+            }
+            other => panic!("expected logs prune command, got {other:?}"),
         }
     }
 

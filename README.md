@@ -4,11 +4,11 @@
 
 <h1 align="center">OpenCoven / Coven</h1>
 
-<h3 align="center">The local runtime that powers CastCodes</h3>
+<h3 align="center">Project-scoped harness sessions for the OpenCoven ecosystem</h3>
 
 <p align="center">
-  Coven powers CastCodes with project-scoped harness sessions, local logs, artifacts, handoffs, policy, and orchestration.<br/>
-  CastCodes is where users inspect the work. Coven is the runtime authority underneath.
+  Run Codex, Claude Code, and future harnesses inside explicit local project boundaries.<br/>
+  Launch, observe, attach, and coordinate agent work through one neutral runtime substrate.
 </p>
 
 <p align="center">
@@ -76,20 +76,29 @@ coven sessions --json
 
 `coven doctor` checks whether supported local harness CLIs are available. `coven run` creates a project-scoped session record, validates the working directory, and launches the selected harness through Coven-managed PTY execution. In a terminal, `coven sessions` opens a human session browser where you can select work and choose visible actions like **Rejoin**, **View Log**, **Summon**, **Archive**, and **Sacrifice** without copying IDs; use `--plain` for scripts or `--json` for client discovery.
 
+Coven also provides a rescue loop for OpenClaw contributors and users:
+
+```sh
+coven patch openclaw
+```
+
+If OpenClaw breaks, Coven gives you a predictable repair room: choose a repo, choose a harness, get a verified patch.
+
 ## What it does
 
-Coven is the local harness substrate for CastCodes. It does not replace the workspace UI; it gives CastCodes a trusted room where project work can happen visibly and safely.
+Coven is the local harness substrate for OpenCoven. It does not replace your coding agent, your UI, or OpenClaw. It gives them a shared room where project work can happen visibly and safely.
 
-OpenCoven is the umbrella behind that product direction. CastCodes is the public workspace; Coven is the local runtime layer: project-scoped sessions, harness-neutral execution, inspectable history, and explicit authority boundaries.
+OpenCoven is an open ecosystem for persistent AI familiars: named agents with memory, tools, identity, roles, and continuity. Coven provides the local runtime layer for that vision: project-scoped sessions, harness-neutral execution, inspectable history, and explicit authority boundaries.
 
 - **Project-root boundaries** — every launch is tied to an explicit repository/project root.
 - **Harness-neutral runtime** — v0 focuses on Codex and Claude Code, with a clean adapter path for future harnesses.
 - **Human session browser** — live and completed work can be selected, rejoined, viewed, archived, restored, or sacrificed without memorizing ids.
 - **Attachable PTY sessions** — live work can still be replayed/followed from explicit CLI verbs.
-- **CastCodes runtime API** — CastCodes and advanced local integrations coordinate through the same socket contract.
+- **Local daemon API** — comux, OpenMeow, and the external OpenClaw plugin can coordinate through the same socket contract.
 - **SQLite-backed history** — session metadata and event logs survive daemon restarts.
+- **Redacted logs by default** — event payloads are redacted before normal storage and API display; raw artifacts are opt-in, encrypted locally, and short-lived.
 - **Rust authority layer** — launch, cwd, input, kill, and path-sensitive requests are revalidated in Rust.
-- **Advanced compatibility** — legacy and external clients stay outside the trust root and talk to Coven as socket clients.
+- **External OpenClaw bridge** — `@opencoven/coven` is an opt-in plugin; OpenClaw core does not include Coven code.
 - **OpenCoven package shape** — CLI wrapper packages live under the `@opencoven/*` namespace while the command stays `coven`.
 
 ## Commands
@@ -110,11 +119,12 @@ OpenCoven is the umbrella behind that product direction. CastCodes is the public
 | `coven sessions --all` | Browse active and archived sessions in a terminal; print all when piped |
 | `coven sessions --manage` | Force the interactive session browser |
 | `coven sessions --plain` | Force plain table output for scripts/copying |
-| `coven sessions --json` | Print a JSON `sessions` array for CastCodes and other local clients |
+| `coven sessions --json` | Print a JSON `sessions` array for clients such as comux |
 | `coven attach <session-id>` | Replay/follow session output and forward input |
 | `coven summon <session-id>` | Restore an archived session, then replay/follow it |
 | `coven archive <session-id>` | Hide a non-running session from the active list while preserving events |
 | `coven sacrifice <session-id> --yes` | Permanently delete a non-running session and its events |
+| `coven logs prune` | Prune expired encrypted raw artifacts and old redacted event logs |
 
 Session rituals are intentionally explicit. **Archive** is reversible and keeps the ledger. **Summon** brings an archived session back into the active list. **Sacrifice** is destructive, refuses live sessions, and requires `--yes` so beginners do not delete work by accident.
 
@@ -132,10 +142,14 @@ Coven's current auth posture is same-user local access over `<covenHome>/coven.s
 | `POST /api/v1/sessions` | Launch a session |
 | `GET /api/v1/sessions/:id` | Fetch one session |
 | `GET /api/v1/events?sessionId=...` | Read session events |
+| `GET /api/v1/sessions/:id/events` | Read redacted session events |
+| `GET /api/v1/sessions/:id/log` | Read bounded redacted log previews |
 | `POST /api/v1/sessions/:id/input` | Forward input to a live session |
 | `POST /api/v1/sessions/:id/kill` | Kill a live session |
 
 Treat the socket API as the product contract. Clients may validate for UX, but the Rust daemon remains the authority boundary. See [`docs/API.md`](docs/API.md) for compatibility rules.
+
+Default API log and event responses are redacted. Raw sensitive artifacts are not returned by broad endpoints and remain unavailable unless explicit local debug persistence is enabled.
 
 Current stable contract: [`docs/API-CONTRACT.md`](docs/API-CONTRACT.md). `GET /api/v1/health` exposes the named contract `apiVersion: "coven.daemon.v1"` and machine-readable capabilities for client handshakes.
 
@@ -160,13 +174,13 @@ npm install -g @anthropic-ai/claude-code
 claude doctor
 ```
 
-## CastCodes integration
+## OpenCoven integrations
 
-CastCodes is the primary public workspace and proof surface for Coven. It should present visible project-scoped lanes, terminal/output status, local workspace context, changed files, diffs, verification results, and explicit review/merge/cleanup actions while Coven remains the daemon/runtime/API/session authority.
+- **comux** is the visual cockpit for agent panes and can consume Coven-managed sessions through the local API.
+- **OpenClaw** integrates only through the external `@opencoven/coven` plugin package.
+- **OpenMeow** can consume Coven session status, intake, or notifications as the desktop companion surface matures.
 
-comux proved useful terminal-cockpit primitives: panes, worktree isolation, agent launchers, rituals, file/diff inspection, review, merge, PR, cleanup, lifecycle hooks, and Coven session visibility. Those primitives are being folded into CastCodes-native concepts so Coven has one primary product surface.
-
-Advanced compatibility paths such as comux, OpenMeow, and the external `@opencoven/coven` OpenClaw plugin may remain documented where technically necessary, but beginner/product docs should not lead with them.
+Coven is the room where harnesses run. The clients decide how to present and route that work.
 
 ## Documentation
 
@@ -180,8 +194,7 @@ Advanced compatibility paths such as comux, OpenMeow, and the external `@opencov
 - [Glossary](docs/GLOSSARY.md) — future orchestration terms without current CLI/API promises.
 
 ### Architecture & Reference
-- [CastCodes integration](docs/CASTCODES-INTEGRATION.md)
-- [comux migration reference](docs/COMUX-DEMO-LOOP.md)
+- [comux + Coven demo loop](docs/COMUX-DEMO-LOOP.md)
 - [Architecture diagrams](docs/ARCHITECTURE.md)
 - [Session lifecycle](docs/SESSION-LIFECYCLE.md)
 - [Operational model](docs/OPERATIONAL-MODEL.md)
