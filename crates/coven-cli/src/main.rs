@@ -100,9 +100,11 @@ enum Command {
         #[arg(long, help = "Archive the session after the run completes")]
         archive: bool,
     },
-    #[command(about = "List recent Coven sessions")]
+    #[command(about = "List or search recent Coven sessions")]
     Sessions {
-        #[arg(long, help = "Include archived sessions")]
+        #[command(subcommand)]
+        command: Option<SessionsCommand>,
+        #[arg(long, help = "Include archived sessions (list mode only)")]
         all: bool,
         #[arg(long, conflicts_with_all = ["plain", "json"], help = "Open the interactive session action browser")]
         manage: bool,
@@ -154,6 +156,17 @@ enum Command {
     Pc {
         #[command(subcommand)]
         command: Option<pc::PcCommand>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SessionsCommand {
+    #[command(about = "Full-text search session event payloads")]
+    Search {
+        #[arg(help = "FTS5 query (e.g. `phoenix OR rises`)")]
+        query: String,
+        #[arg(long, help = "Print SearchHit JSON for clients")]
+        json: bool,
     },
 }
 
@@ -251,11 +264,17 @@ fn run_cli(cli: Cli) -> Result<()> {
             archive,
         ),
         Some(Command::Sessions {
+            command,
             all,
             manage,
             plain,
             json,
-        }) => tui::sessions::run_command(all, manage, plain, json),
+        }) => match command {
+            Some(SessionsCommand::Search { query, json: search_json }) => {
+                run_sessions_search(&query, search_json)
+            }
+            None => tui::sessions::run_command(all, manage, plain, json),
+        },
         Some(Command::Logs { command }) => run_logs_command(command),
         Some(Command::Attach { session_id }) => attach_session(&session_id),
         Some(Command::Summon { session_id }) => summon_session_command(&session_id),
@@ -287,6 +306,33 @@ fn run_cli(cli: Cli) -> Result<()> {
 fn run_bare_prompt(prompt: &[String]) -> Result<()> {
     let prompt = joined_prompt(prompt)?;
     tui::shell::run_cast_spell(&prompt)
+}
+
+fn run_sessions_search(query: &str, json: bool) -> Result<()> {
+    let store_path = coven_store_path()?;
+    let conn = store::open_store(&store_path)?;
+    let hits = store::search_events(&conn, query)?;
+
+    if json {
+        // Serialize the Vec<SearchHit> directly — SearchHit derives Serialize.
+        let serialized = serde_json::to_string(&hits)
+            .context("failed to serialize search hits")?;
+        println!("{serialized}");
+        return Ok(());
+    }
+
+    if hits.is_empty() {
+        println!("No matches for `{query}`.");
+        return Ok(());
+    }
+
+    for hit in &hits {
+        println!(
+            "{}  {}  [{}]  {}",
+            hit.created_at, hit.session_id, hit.kind, hit.snippet
+        );
+    }
+    Ok(())
 }
 
 fn run_shared_interactive_shell() -> Result<()> {
@@ -1756,6 +1802,7 @@ mod tests {
                 manage,
                 plain,
                 json,
+                ..
             }) => {
                 assert!(all);
                 assert!(!manage);
