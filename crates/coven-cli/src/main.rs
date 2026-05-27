@@ -73,7 +73,7 @@ enum Command {
     Run {
         #[arg(help = "Harness to run: codex or claude")]
         harness: String,
-        #[arg(help = "Task for the harness", required = true, num_args = 1..)]
+        #[arg(help = "Task for the harness", required = false, num_args = 0..)]
         prompt: Vec<String>,
         #[arg(long, help = "Working directory inside the current project")]
         cwd: Option<PathBuf>,
@@ -81,6 +81,24 @@ enum Command {
         title: Option<String>,
         #[arg(long, help = "Create the session record without launching the harness")]
         detach: bool,
+        #[arg(
+            long = "continue",
+            value_name = "ID",
+            num_args = 0..=1,
+            default_missing_value = "",
+            help = "Resume session by id; omit value to resume the latest active session for this project"
+        )]
+        continue_session: Option<String>,
+        #[arg(long, value_delimiter = ',', help = "Comma-separated labels for the new session (ignored when resuming)")]
+        labels: Vec<String>,
+        #[arg(
+            long,
+            value_parser = ["private", "workspace", "shared"],
+            help = "Visibility for the new session: private (default), workspace, shared (ignored when resuming)"
+        )]
+        visibility: Option<String>,
+        #[arg(long, help = "Archive the session after the run completes")]
+        archive: bool,
     },
     #[command(about = "List recent Coven sessions")]
     Sessions {
@@ -217,7 +235,21 @@ fn run_cli(cli: Cli) -> Result<()> {
             cwd,
             title,
             detach,
-        }) => run_session(&harness, &prompt, cwd.as_deref(), title.as_deref(), detach),
+            continue_session,
+            labels,
+            visibility,
+            archive,
+        }) => run_session(
+            &harness,
+            &prompt,
+            cwd.as_deref(),
+            title.as_deref(),
+            detach,
+            continue_session.as_deref(),
+            labels,
+            visibility.as_deref(),
+            archive,
+        ),
         Some(Command::Sessions {
             all,
             manage,
@@ -712,14 +744,28 @@ fn harness_launch_mode_for_stdio() -> harness::HarnessLaunchMode {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_session(
     harness_id: &str,
     prompt_args: &[String],
     cwd: Option<&Path>,
     title: Option<&str>,
     detach: bool,
+    continue_session: Option<&str>,
+    labels: Vec<String>,
+    visibility: Option<&str>,
+    archive: bool,
 ) -> Result<()> {
-    let prompt = joined_prompt(prompt_args)?;
+    let prompt = if prompt_args.is_empty() {
+        String::new()
+    } else {
+        joined_prompt(prompt_args)?
+    };
+
+    if prompt_args.is_empty() && continue_session.is_none() {
+        anyhow::bail!("nothing to do: pass a prompt, or use --continue [ID] to resume a session");
+    }
+
     let selected_harness = selected_available_harness(harness_id)?;
     let current_dir = std::env::current_dir().context("failed to read current directory")?;
     let project_root = project::canonical_project_root(&current_dir).with_context(|| {
@@ -732,30 +778,75 @@ fn run_session(
     let store_path = coven_store_path()?;
     let conn = store::open_store(&store_path)?;
     let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
-    let record = store::SessionRecord {
-        id: Uuid::new_v4().to_string(),
-        project_root: project_root.to_string_lossy().into_owned(),
-        harness: selected_harness.id.to_string(),
-        title: session_title(title, &prompt),
-        status: DEFAULT_SESSION_STATUS.to_string(),
-        exit_code: None,
-        archived_at: None,
-        created_at: now.clone(),
-        updated_at: now,
-        conversation_id: None,
-        labels: Vec::new(),
-        visibility: "private".to_string(),
+
+    // Resolve --continue: explicit id, "" (latest), or None (new session).
+    let resumed_id: Option<String> = match continue_session {
+        None => None,
+        Some("") => {
+            let latest = store::latest_active_for_project(
+                &conn,
+                project_root.to_str().unwrap_or(""),
+            )?;
+            if latest.is_none() {
+                anyhow::bail!(
+                    "no active session to continue in {}; pass an explicit --continue <ID> or omit the flag",
+                    project_root.display(),
+                );
+            }
+            latest
+        }
+        Some(id) => Some(id.to_string()),
     };
 
-    store::insert_session(&conn, &record)?;
+    let (record, is_resume) = if let Some(ref id) = resumed_id {
+        // Verify the session exists; reuse its row.
+        let existing = store::list_sessions_including_archived(&conn)?
+            .into_iter()
+            .find(|s| &s.id == id);
+        match existing {
+            Some(mut r) => {
+                // Mutate updated_at to now; keep labels/visibility/title from the original.
+                r.updated_at = now.clone();
+                (r, true)
+            }
+            None => anyhow::bail!("session {} not found in local store", id),
+        }
+    } else {
+        let r = store::SessionRecord {
+            id: Uuid::new_v4().to_string(),
+            project_root: project_root.to_string_lossy().into_owned(),
+            harness: selected_harness.id.to_string(),
+            title: session_title(title, &prompt),
+            status: DEFAULT_SESSION_STATUS.to_string(),
+            exit_code: None,
+            archived_at: None,
+            created_at: now.clone(),
+            updated_at: now,
+            conversation_id: None,
+            labels,
+            visibility: visibility.unwrap_or("private").to_string(),
+        };
+        (r, false)
+    };
 
-    println!("Coven session created");
+    if !is_resume {
+        store::insert_session(&conn, &record)?;
+    }
+
+    println!("Coven session {}", if is_resume { "resumed" } else { "created" });
     println!("  id:      {}", record.id);
     println!("  harness: {}", record.harness);
     println!("  cwd:     {}", cwd.display());
     println!("  title:   {}", record.title);
 
+    if detach && is_resume {
+        anyhow::bail!("--detach and --continue are mutually exclusive");
+    }
+
     if detach {
+        if archive {
+            eprintln!("warning: --archive ignored in --detach mode (session was never launched)");
+        }
         println!("\nDetached mode: session was recorded but the harness was not spawned.");
         println!("View it later with `coven sessions`.");
         return Ok(());
@@ -769,11 +860,17 @@ fn run_session(
         &current_timestamp(),
     )?;
 
-    let command = pty_runner::build_harness_command(
+    let conversation_hint = if is_resume {
+        Some(harness::ConversationHint::Resume { id: record.id.clone() })
+    } else {
+        None
+    };
+    let command = pty_runner::build_harness_command_with_conversation(
         selected_harness.id,
         &prompt,
         &cwd,
         harness_launch_mode_for_stdio(),
+        conversation_hint.as_ref(),
     )?;
     match pty_runner::run_attached(&command) {
         Ok(result) => {
@@ -784,6 +881,11 @@ fn run_session(
                 result.exit_code,
                 &current_timestamp(),
             )?;
+            if archive {
+                let archived_at = current_timestamp();
+                store::archive_session(&conn, &record.id, &archived_at)?;
+                println!("\nArchived session {} at {archived_at}", record.id);
+            }
             Ok(())
         }
         Err(error) => {
