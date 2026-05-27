@@ -1948,6 +1948,8 @@ mod tests {
                 created_at: "2026-04-27T10:00:00Z".to_string(),
                 updated_at: "2026-04-27T10:00:00Z".to_string(),
                 conversation_id: None,
+                labels: Vec::new(),
+                visibility: "private".to_string(),
             },
         )?;
         let listener = bind_api_socket(temp_dir.path())?;
@@ -2110,6 +2112,8 @@ mod tests {
             created_at: "2026-04-27T07:00:00Z".to_string(),
             updated_at: "2026-04-27T07:00:00Z".to_string(),
             conversation_id: None,
+            labels: Vec::new(),
+            visibility: "private".to_string(),
         }
     }
 

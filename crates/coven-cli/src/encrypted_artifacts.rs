@@ -22,30 +22,7 @@ pub struct SensitiveArtifactStore {
 }
 
 impl SensitiveArtifactStore {
-    /// Load an existing key file. Returns an error if the key file is missing — callers
-    /// that want to create a new store should use `load_or_create`.
     pub fn load(coven_home: &Path) -> Result<Self> {
-        let key_path = coven_home.join(KEY_DIR_NAME).join(KEY_FILE_NAME);
-        let key = match std::fs::read_to_string(&key_path) {
-            Ok(raw) => decode_key(raw.trim())
-                .with_context(|| "failed to load artifact encryption key".to_string())?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                anyhow::bail!(
-                    "artifact encryption key not found at {}; \
-                     call load_or_create() to initialise a new store",
-                    key_path.display()
-                );
-            }
-            Err(error) => {
-                return Err(error).with_context(|| "failed to load artifact encryption key");
-            }
-        };
-        Ok(Self { key })
-    }
-
-    /// Load an existing key file, or create and persist a fresh one when none exists.
-    /// Use this only when setting up a new store for the first time (encryption path).
-    pub fn load_or_create(coven_home: &Path) -> Result<Self> {
         let key_path = coven_home.join(KEY_DIR_NAME).join(KEY_FILE_NAME);
         let key = match std::fs::read_to_string(&key_path) {
             Ok(raw) => decode_key(raw.trim())
@@ -180,7 +157,7 @@ mod tests {
     #[test]
     fn encrypt_decrypt_round_trip_uses_nonce_and_aad() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let store = SensitiveArtifactStore::load_or_create(temp.path())?;
+        let store = SensitiveArtifactStore::load(temp.path())?;
         let plaintext = fake_payload();
 
         let encrypted = store.encrypt("session-1", "event-1", "output", &plaintext)?;

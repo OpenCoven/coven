@@ -21,9 +21,12 @@ mod patch;
 mod pc;
 mod privacy;
 mod project;
+mod prompt_refs;
 mod pty_runner;
 mod repos_config;
+mod settings;
 mod store;
+mod stream_json;
 mod theme;
 mod tui;
 mod verification;
@@ -72,7 +75,7 @@ enum Command {
     Run {
         #[arg(help = "Harness to run: codex or claude")]
         harness: String,
-        #[arg(help = "Task for the harness", required = true, num_args = 1..)]
+        #[arg(help = "Task for the harness", required = false, num_args = 0..)]
         prompt: Vec<String>,
         #[arg(long, help = "Working directory inside the current project")]
         cwd: Option<PathBuf>,
@@ -80,10 +83,45 @@ enum Command {
         title: Option<String>,
         #[arg(long, help = "Create the session record without launching the harness")]
         detach: bool,
+        #[arg(
+            long = "continue",
+            value_name = "ID",
+            num_args = 0..=1,
+            default_missing_value = "",
+            help = "Resume session by id; omit value to resume the latest active session for this project"
+        )]
+        continue_session: Option<String>,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Comma-separated labels for the new session (ignored when resuming)"
+        )]
+        labels: Vec<String>,
+        #[arg(
+            long,
+            value_parser = ["private", "workspace", "shared"],
+            help = "Visibility for the new session: private (default), workspace, shared (ignored when resuming)"
+        )]
+        visibility: Option<String>,
+        #[arg(long, help = "Archive the session after the run completes")]
+        archive: bool,
+        #[arg(
+            long,
+            help = "Emit JSONL events on stdout (system.init / user / assistant / tool_result / result)"
+        )]
+        stream_json: bool,
+        #[arg(
+            long,
+            requires = "stream_json",
+            help = "Read JSONL user messages from stdin (claude harness only; requires --stream-json)"
+        )]
+        stream_json_input: bool,
     },
-    #[command(about = "List recent Coven sessions")]
+    #[command(about = "List or search recent Coven sessions")]
     Sessions {
-        #[arg(long, help = "Include archived sessions")]
+        #[command(subcommand)]
+        command: Option<SessionsCommand>,
+        #[arg(long, help = "Include archived sessions (list mode only)")]
         all: bool,
         #[arg(long, conflicts_with_all = ["plain", "json"], help = "Open the interactive session action browser")]
         manage: bool,
@@ -139,6 +177,17 @@ enum Command {
 }
 
 #[derive(Subcommand, Debug)]
+enum SessionsCommand {
+    #[command(about = "Full-text search session event payloads")]
+    Search {
+        #[arg(help = "FTS5 query (e.g. `phoenix OR rises`)")]
+        query: String,
+        #[arg(long, help = "Print SearchHit JSON for clients")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum DaemonCommand {
     Start,
     Restart,
@@ -186,6 +235,18 @@ enum InteractiveShellRoute {
 }
 
 fn main() -> Result<()> {
+    let loaded =
+        settings::user_settings_path().as_deref().and_then(|path| {
+            match settings::load_from(path) {
+                Ok(s) => s,
+                Err(err) => {
+                    eprintln!("coven: ignoring settings ({}): {err:#}", path.display());
+                    None
+                }
+            }
+        });
+    settings::init_cached(loaded);
+
     let cli = Cli::parse();
     run_cli(cli)
 }
@@ -205,13 +266,38 @@ fn run_cli(cli: Cli) -> Result<()> {
             cwd,
             title,
             detach,
-        }) => run_session(&harness, &prompt, cwd.as_deref(), title.as_deref(), detach),
+            continue_session,
+            labels,
+            visibility,
+            archive,
+            stream_json,
+            stream_json_input,
+        }) => run_session(
+            &harness,
+            &prompt,
+            cwd.as_deref(),
+            title.as_deref(),
+            detach,
+            continue_session.as_deref(),
+            labels,
+            visibility.as_deref(),
+            archive,
+            stream_json,
+            stream_json_input,
+        ),
         Some(Command::Sessions {
+            command,
             all,
             manage,
             plain,
             json,
-        }) => tui::sessions::run_command(all, manage, plain, json),
+        }) => match command {
+            Some(SessionsCommand::Search {
+                query,
+                json: search_json,
+            }) => run_sessions_search(&query, search_json),
+            None => tui::sessions::run_command(all, manage, plain, json),
+        },
         Some(Command::Logs { command }) => run_logs_command(command),
         Some(Command::Attach { session_id }) => attach_session(&session_id),
         Some(Command::Summon { session_id }) => summon_session_command(&session_id),
@@ -245,6 +331,32 @@ fn run_bare_prompt(prompt: &[String]) -> Result<()> {
     tui::shell::run_cast_spell(&prompt)
 }
 
+fn run_sessions_search(query: &str, json: bool) -> Result<()> {
+    let store_path = coven_store_path()?;
+    let conn = store::open_store(&store_path)?;
+    let hits = store::search_events(&conn, query)?;
+
+    if json {
+        // Serialize the Vec<SearchHit> directly — SearchHit derives Serialize.
+        let serialized = serde_json::to_string(&hits).context("failed to serialize search hits")?;
+        println!("{serialized}");
+        return Ok(());
+    }
+
+    if hits.is_empty() {
+        println!("No matches for `{query}`.");
+        return Ok(());
+    }
+
+    for hit in &hits {
+        println!(
+            "{}  {}  [{}]  {}",
+            hit.created_at, hit.session_id, hit.kind, hit.snippet
+        );
+    }
+    Ok(())
+}
+
 fn run_shared_interactive_shell() -> Result<()> {
     match interactive_shell_route(None, io::stdin().is_terminal(), io::stdout().is_terminal()) {
         InteractiveShellRoute::Chat => tui::chat::run_chat(),
@@ -276,7 +388,7 @@ fn run_doctor() -> Result<()> {
         None => println!("Project: not inside a git/project root yet"),
     }
 
-    let repos_config = repos_config::load(&home)?;
+    let repos_config = repos_config::load_with_settings(&home, settings::cached())?;
     if !repos_config.is_empty() {
         println!("\nRepos ({}):", repos_config::config_path(&home).display());
         for (name, path) in repos_config.entries() {
@@ -326,7 +438,7 @@ fn run_patch(
     keep_session: bool,
 ) -> Result<()> {
     let coven_home = coven_home_dir()?;
-    let repos_config = repos_config::load(&coven_home)?;
+    let repos_config = repos_config::load_with_settings(&coven_home, settings::cached())?;
     let resolved_name = name
         .or_else(|| repos_config.default_name().map(str::to_string))
         .unwrap_or_else(|| openclaw_repo::OPENCLAW_REPO_NAME.to_string());
@@ -537,6 +649,8 @@ fn launch_patch_session(request: &patch::PatchRequest) -> Result<String> {
         created_at: now.clone(),
         updated_at: now.clone(),
         conversation_id: None,
+        labels: Vec::new(),
+        visibility: "private".to_string(),
     };
     store::insert_session(&conn, &record)?;
     let metadata = serde_json::json!({
@@ -596,7 +710,7 @@ fn run_logs_command(command: LogsCommand) -> Result<()> {
 
 fn prune_logs_command(dry_run: bool, raw_days: Option<u64>, event_days: Option<u64>) -> Result<()> {
     let home = coven_home_dir()?;
-    let config = privacy::load_config(&home).unwrap_or_default();
+    let config = privacy::load_with_settings(&home, settings::cached()).unwrap_or_default();
     let raw_days = raw_days
         .unwrap_or(config.raw_artifact_retention_days)
         .max(1);
@@ -698,14 +812,51 @@ fn harness_launch_mode_for_stdio() -> harness::HarnessLaunchMode {
     }
 }
 
+/// Lock stdout, emit one stream-JSON frame, release. Per-frame locking keeps
+/// us from holding the lock across `pty_runner::run_attached`, which writes
+/// the harness's own stdout through the same handle.
+fn emit_stream_event(event: &stream_json::Event) -> Result<()> {
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    stream_json::emit_event(&mut handle, event)?;
+    Ok(())
+}
+
+fn should_synthesize_stream_user_event(
+    stream_json: bool,
+    expanded_prompt: &str,
+    detach: bool,
+    harness_id: &str,
+) -> bool {
+    stream_json && !expanded_prompt.is_empty() && (detach || harness_id != "claude")
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_session(
     harness_id: &str,
     prompt_args: &[String],
     cwd: Option<&Path>,
     title: Option<&str>,
     detach: bool,
+    continue_session: Option<&str>,
+    labels: Vec<String>,
+    visibility: Option<&str>,
+    archive: bool,
+    stream_json: bool,
+    stream_json_input: bool,
 ) -> Result<()> {
-    let prompt = joined_prompt(prompt_args)?;
+    // `stream_json_input` is consumed by the claude pass-through in 4.4; for
+    // non-stream harnesses it has no effect on this path.
+    let prompt = if prompt_args.is_empty() {
+        String::new()
+    } else {
+        joined_prompt(prompt_args)?
+    };
+
+    if prompt_args.is_empty() && continue_session.is_none() {
+        anyhow::bail!("nothing to do: pass a prompt, or use --continue [ID] to resume a session");
+    }
+
     let selected_harness = selected_available_harness(harness_id)?;
     let current_dir = std::env::current_dir().context("failed to read current directory")?;
     let project_root = project::canonical_project_root(&current_dir).with_context(|| {
@@ -718,30 +869,134 @@ fn run_session(
     let store_path = coven_store_path()?;
     let conn = store::open_store(&store_path)?;
     let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
-    let record = store::SessionRecord {
-        id: Uuid::new_v4().to_string(),
-        project_root: project_root.to_string_lossy().into_owned(),
-        harness: selected_harness.id.to_string(),
-        title: session_title(title, &prompt),
-        status: DEFAULT_SESSION_STATUS.to_string(),
-        exit_code: None,
-        archived_at: None,
-        created_at: now.clone(),
-        updated_at: now,
-        conversation_id: None,
+
+    // Expand @path / @T-<id> / @@search refs before dispatching to the harness.
+    // Keep the original `prompt` for session title and human-facing output so titles
+    // aren't blown out by inlined file content.
+    let expanded_prompt = if prompt.is_empty() {
+        String::new()
+    } else {
+        prompt_refs::expand_all(&cwd, &conn, &prompt)?
     };
 
-    store::insert_session(&conn, &record)?;
+    // Resolve --continue: explicit id, "" (latest), or None (new session).
+    let resumed_id: Option<String> = match continue_session {
+        None => None,
+        Some("") => {
+            let latest =
+                store::latest_active_for_project(&conn, project_root.to_str().unwrap_or(""))?;
+            if latest.is_none() {
+                anyhow::bail!(
+                    "no active session to continue in {}; pass an explicit --continue <ID> or omit the flag",
+                    project_root.display(),
+                );
+            }
+            latest
+        }
+        Some(id) => Some(id.to_string()),
+    };
 
-    println!("Coven session created");
-    println!("  id:      {}", record.id);
-    println!("  harness: {}", record.harness);
-    println!("  cwd:     {}", cwd.display());
-    println!("  title:   {}", record.title);
+    let (record, is_resume) = if let Some(ref id) = resumed_id {
+        // Verify the session exists; reuse its row.
+        let existing = store::list_sessions_including_archived(&conn)?
+            .into_iter()
+            .find(|s| &s.id == id);
+        match existing {
+            Some(mut r) => {
+                // Mutate updated_at to now; keep labels/visibility/title from the original.
+                r.updated_at = now.clone();
+                (r, true)
+            }
+            None => anyhow::bail!("session {} not found in local store", id),
+        }
+    } else {
+        let r = store::SessionRecord {
+            id: Uuid::new_v4().to_string(),
+            project_root: project_root.to_string_lossy().into_owned(),
+            harness: selected_harness.id.to_string(),
+            title: session_title(title, &prompt),
+            status: DEFAULT_SESSION_STATUS.to_string(),
+            exit_code: None,
+            archived_at: None,
+            created_at: now.clone(),
+            updated_at: now,
+            conversation_id: None,
+            labels,
+            visibility: visibility.unwrap_or("private").to_string(),
+        };
+        (r, false)
+    };
+
+    if !is_resume {
+        store::insert_session(&conn, &record)?;
+    }
+
+    if !stream_json {
+        println!(
+            "Coven session {}",
+            if is_resume { "resumed" } else { "created" }
+        );
+        println!("  id:      {}", record.id);
+        println!("  harness: {}", record.harness);
+        println!("  cwd:     {}", cwd.display());
+        println!("  title:   {}", record.title);
+    }
+
+    if detach && is_resume {
+        anyhow::bail!("--detach and --continue are mutually exclusive");
+    }
+
+    let stream_started = std::time::Instant::now();
+    if stream_json {
+        emit_stream_event(&stream_json::Event::System(stream_json::System {
+            subtype: "init".into(),
+            cwd: cwd.to_string_lossy().into_owned(),
+            session_id: record.id.clone(),
+            tools: Vec::new(),
+            agent_mode: None,
+        }))?;
+    }
+
+    // We synthesize the `user` event only on paths where the harness will
+    // *not* emit it itself: detach (no harness runs) and codex / generic
+    // non-stream harnesses. The claude pass-through skips this so we don't
+    // duplicate the user message claude echoes through its native protocol.
+    let synthesize_user_event = should_synthesize_stream_user_event(
+        stream_json,
+        &expanded_prompt,
+        detach,
+        selected_harness.id,
+    );
 
     if detach {
-        println!("\nDetached mode: session was recorded but the harness was not spawned.");
-        println!("View it later with `coven sessions`.");
+        if archive {
+            eprintln!("warning: --archive ignored in --detach mode (session was never launched)");
+        }
+        if !stream_json {
+            println!("\nDetached mode: session was recorded but the harness was not spawned.");
+            println!("View it later with `coven sessions`.");
+        } else {
+            if synthesize_user_event {
+                emit_stream_event(&stream_json::Event::User(stream_json::UserMessage {
+                    message: stream_json::MessageBody {
+                        role: "user".into(),
+                        content: vec![stream_json::ContentBlock::Text {
+                            text: expanded_prompt.clone(),
+                        }],
+                    },
+                    session_id: record.id.clone(),
+                    parent_tool_use_id: None,
+                }))?;
+            }
+            emit_stream_event(&stream_json::Event::Result(stream_json::RunResult {
+                subtype: "success".into(),
+                duration_ms: stream_started.elapsed().as_millis() as u64,
+                is_error: false,
+                num_turns: 1,
+                session_id: record.id.clone(),
+                error: None,
+            }))?;
+        }
         return Ok(());
     }
 
@@ -753,11 +1008,96 @@ fn run_session(
         &current_timestamp(),
     )?;
 
-    let command = pty_runner::build_harness_command(
+    // Claude's native stream-json: pipe its JSONL events through ours
+    // between the init/result frames we already emit. The codex / generic
+    // path below cannot do this because codex doesn't speak stream-json, so we
+    // branch here after resolving the harness to claude.
+    if stream_json && selected_harness.id == "claude" {
+        let stdout = io::stdout();
+        let mut handle = stdout.lock();
+        let exit_code = pty_runner::stream_claude(
+            &cwd,
+            &record.id,
+            &expanded_prompt,
+            stream_json_input,
+            &mut handle,
+        );
+        drop(handle);
+        let exit_code = match exit_code {
+            Ok(code) => code,
+            Err(error) => {
+                store::update_session_status(
+                    &conn,
+                    &record.id,
+                    FAILED_SESSION_STATUS,
+                    None,
+                    &current_timestamp(),
+                )?;
+                emit_stream_event(&stream_json::Event::Result(stream_json::RunResult {
+                    subtype: "error_during_execution".into(),
+                    duration_ms: stream_started.elapsed().as_millis() as u64,
+                    is_error: true,
+                    num_turns: 1,
+                    session_id: record.id.clone(),
+                    error: Some(format!("{error:#}")),
+                }))?;
+                return Err(error);
+            }
+        };
+        let is_error = exit_code != 0;
+        let status = if is_error { "failed" } else { "completed" };
+        store::update_session_status(
+            &conn,
+            &record.id,
+            status,
+            Some(exit_code),
+            &current_timestamp(),
+        )?;
+        emit_stream_event(&stream_json::Event::Result(stream_json::RunResult {
+            subtype: if is_error {
+                "error_during_execution".into()
+            } else {
+                "success".into()
+            },
+            duration_ms: stream_started.elapsed().as_millis() as u64,
+            is_error,
+            num_turns: 1,
+            session_id: record.id.clone(),
+            error: None,
+        }))?;
+        if archive {
+            let archived_at = current_timestamp();
+            store::archive_session(&conn, &record.id, &archived_at)?;
+        }
+        return Ok(());
+    }
+
+    if synthesize_user_event {
+        emit_stream_event(&stream_json::Event::User(stream_json::UserMessage {
+            message: stream_json::MessageBody {
+                role: "user".into(),
+                content: vec![stream_json::ContentBlock::Text {
+                    text: expanded_prompt.clone(),
+                }],
+            },
+            session_id: record.id.clone(),
+            parent_tool_use_id: None,
+        }))?;
+    }
+
+    let conversation_hint = if is_resume {
+        Some(harness::ConversationHint::Resume {
+            id: record.id.clone(),
+        })
+    } else {
+        None
+    };
+    let command = pty_runner::build_harness_command_with_conversation(
         selected_harness.id,
-        &prompt,
+        &expanded_prompt,
         &cwd,
         harness_launch_mode_for_stdio(),
+        conversation_hint.as_ref(),
     )?;
     match pty_runner::run_attached(&command) {
         Ok(result) => {
@@ -768,6 +1108,28 @@ fn run_session(
                 result.exit_code,
                 &current_timestamp(),
             )?;
+            if stream_json {
+                let is_error = result.exit_code.is_some_and(|c| c != 0);
+                emit_stream_event(&stream_json::Event::Result(stream_json::RunResult {
+                    subtype: if is_error {
+                        "error_during_execution".into()
+                    } else {
+                        "success".into()
+                    },
+                    duration_ms: stream_started.elapsed().as_millis() as u64,
+                    is_error,
+                    num_turns: 1,
+                    session_id: record.id.clone(),
+                    error: None,
+                }))?;
+            }
+            if archive {
+                let archived_at = current_timestamp();
+                store::archive_session(&conn, &record.id, &archived_at)?;
+                if !stream_json {
+                    println!("\nArchived session {} at {archived_at}", record.id);
+                }
+            }
             Ok(())
         }
         Err(error) => {
@@ -778,6 +1140,16 @@ fn run_session(
                 None,
                 &current_timestamp(),
             )?;
+            if stream_json {
+                emit_stream_event(&stream_json::Event::Result(stream_json::RunResult {
+                    subtype: "error_during_execution".into(),
+                    duration_ms: stream_started.elapsed().as_millis() as u64,
+                    is_error: true,
+                    num_turns: 1,
+                    session_id: record.id.clone(),
+                    error: Some(format!("{error:#}")),
+                }))?;
+            }
             Err(error)
         }
     }
@@ -1117,6 +1489,25 @@ mod tests {
             "hello from coven"
         );
         Ok(())
+    }
+
+    #[test]
+    fn stream_json_user_event_synthesis_skips_live_claude_passthrough() {
+        assert!(should_synthesize_stream_user_event(
+            true, "hello", true, "claude"
+        ));
+        assert!(should_synthesize_stream_user_event(
+            true, "hello", false, "codex"
+        ));
+        assert!(!should_synthesize_stream_user_event(
+            true, "hello", false, "claude"
+        ));
+        assert!(!should_synthesize_stream_user_event(
+            false, "hello", false, "codex"
+        ));
+        assert!(!should_synthesize_stream_user_event(
+            true, "", true, "codex"
+        ));
     }
 
     #[test]
@@ -1638,6 +2029,7 @@ mod tests {
                 manage,
                 plain,
                 json,
+                ..
             }) => {
                 assert!(all);
                 assert!(!manage);
@@ -1913,6 +2305,8 @@ mod tests {
             created_at: "2026-04-27T06:00:00Z".to_string(),
             updated_at: "2026-04-27T06:00:00Z".to_string(),
             conversation_id: None,
+            labels: Vec::new(),
+            visibility: "private".to_string(),
         };
 
         assert_eq!(
@@ -1934,6 +2328,8 @@ mod tests {
             created_at: "2026-05-14T07:00:00Z".to_string(),
             updated_at: "2026-05-14T07:00:01Z".to_string(),
             conversation_id: None,
+            labels: Vec::new(),
+            visibility: "private".to_string(),
         };
 
         let rendered = render_sessions_json(&[session])?;
@@ -2046,6 +2442,8 @@ mod tests {
             created_at: "2026-05-08T07:00:00Z".to_string(),
             updated_at: "2026-05-08T07:05:00Z".to_string(),
             conversation_id: None,
+            labels: Vec::new(),
+            visibility: "private".to_string(),
         }
     }
 }

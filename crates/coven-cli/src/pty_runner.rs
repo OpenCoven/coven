@@ -88,6 +88,96 @@ pub fn run_attached(command: &HarnessCommand) -> Result<PtyRunResult> {
     run_attached_with_pty_system(command, pty_system.as_ref())
 }
 
+/// Run `claude` in its native stream-JSON mode, framed by the caller (which
+/// emits Coven's own `system.init` / `result` around the call).
+///
+/// `claude -p --input-format stream-json --output-format stream-json --verbose
+/// --session-id <id> <prompt>` already emits the Coven-compatible JSONL
+/// schema; we just forward each line untouched to `out`.
+///
+/// When `forward_stdin` is true, lines on our stdin are piped to claude's
+/// stdin so callers can feed additional user messages mid-run. Stderr is
+/// inherited so claude's own diagnostics land on the terminal.
+pub fn stream_claude<W: Write>(
+    cwd: &Path,
+    session_id: &str,
+    prompt: &str,
+    forward_stdin: bool,
+    out: &mut W,
+) -> Result<i32> {
+    stream_claude_with_program("claude", cwd, session_id, prompt, forward_stdin, out)
+}
+
+fn stream_claude_with_program<W: Write>(
+    program: &str,
+    cwd: &Path,
+    session_id: &str,
+    prompt: &str,
+    forward_stdin: bool,
+    out: &mut W,
+) -> Result<i32> {
+    let mut child = std::process::Command::new(program)
+        .args([
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--session-id",
+            session_id,
+        ])
+        .arg(prompt)
+        .current_dir(cwd)
+        .stdin(if forward_stdin {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("failed to spawn claude in stream-json mode")?;
+
+    if forward_stdin {
+        let mut child_stdin = child
+            .stdin
+            .take()
+            .expect("stdin requested but child has no piped stdin");
+        thread::spawn(move || {
+            let stdin = io::stdin();
+            let mut handle = stdin.lock();
+            let mut buf = String::new();
+            loop {
+                buf.clear();
+                match handle.read_line(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if child_stdin.write_all(buf.as_bytes()).is_err() {
+                            break;
+                        }
+                        let _ = child_stdin.flush();
+                    }
+                }
+            }
+        });
+    }
+
+    let child_stdout = child.stdout.take().expect("stdout was requested as piped");
+    let reader = BufReader::new(child_stdout);
+    for line in reader.lines() {
+        let line = line.context("reading claude stdout")?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        writeln!(out, "{line}").context("forwarding claude stdout")?;
+        out.flush().context("flushing claude stdout")?;
+    }
+
+    let status = child.wait().context("waiting on claude")?;
+    Ok(status.code().unwrap_or(1))
+}
+
 #[allow(dead_code)]
 pub fn spawn_detached(command: &HarnessCommand) -> Result<DetachedPtySession> {
     spawn_detached_with_observer(command, None)
@@ -498,6 +588,48 @@ mod tests {
         session.input.write_all(b"hello detached pty\n")?;
         session.input.flush()?;
         session.killer.kill()?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stream_claude_forwards_jsonl_and_returns_exit_code() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir()?;
+        let fake_claude = temp_dir.path().join("fake-claude");
+        std::fs::write(
+            &fake_claude,
+            r#"#!/bin/sh
+printf '%s\n' "$@" > args.txt
+printf '\n'
+printf '%s\n' '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]},"session_id":"session-123","stop_reason":"end_turn"}'
+exit 7
+"#,
+        )?;
+        let mut permissions = std::fs::metadata(&fake_claude)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_claude, permissions)?;
+
+        let mut out = Vec::new();
+        let code = stream_claude_with_program(
+            fake_claude.to_str().unwrap(),
+            temp_dir.path(),
+            "session-123",
+            "hello prompt",
+            false,
+            &mut out,
+        )?;
+
+        assert_eq!(code, 7);
+        assert_eq!(
+            std::fs::read_to_string(temp_dir.path().join("args.txt"))?,
+            "-p\n--input-format\nstream-json\n--output-format\nstream-json\n--verbose\n--session-id\nsession-123\nhello prompt\n"
+        );
+        assert_eq!(
+            String::from_utf8(out)?,
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"hello\"}]},\"session_id\":\"session-123\",\"stop_reason\":\"end_turn\"}\n"
+        );
         Ok(())
     }
 

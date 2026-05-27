@@ -66,6 +66,39 @@ pub fn load_config(coven_home: &Path) -> Result<PrivacyConfig> {
     Ok(config)
 }
 
+pub fn load_with_settings(
+    coven_home: &Path,
+    settings: Option<&crate::settings::Settings>,
+) -> Result<PrivacyConfig> {
+    let mut config = load_config(coven_home)?;
+    if let Some(settings) = settings.and_then(|settings| settings.coven_cli.privacy.as_ref()) {
+        if let Some(value) = settings.persist_raw_artifacts {
+            config.persist_raw_artifacts = value;
+        }
+        if let Some(value) = settings.raw_artifact_retention_days {
+            config.raw_artifact_retention_days = value;
+        }
+        if let Some(value) = settings.log_retention_days {
+            config.log_retention_days = value;
+        }
+        if let Some(value) = &settings.extra_patterns {
+            config.extra_patterns = value.clone();
+        }
+    }
+
+    if let Some(value) = std::env::var_os("COVEN_PERSIST_RAW_ARTIFACTS") {
+        config.persist_raw_artifacts = env_truthy(&value.to_string_lossy());
+    }
+    if let Some(value) = env_u64("COVEN_RAW_ARTIFACT_RETENTION_DAYS") {
+        config.raw_artifact_retention_days = value;
+    }
+    if let Some(value) = env_u64("COVEN_LOG_RETENTION_DAYS") {
+        config.log_retention_days = value;
+    }
+
+    Ok(config)
+}
+
 pub fn redact_text(text: &str) -> String {
     redact_text_with_config(text, &PrivacyConfig::default())
 }
@@ -213,6 +246,32 @@ fn built_in_patterns() -> &'static [Regex] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        name: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
 
     #[test]
     fn redact_text_removes_common_secret_shapes() {
@@ -303,13 +362,9 @@ extra_patterns = ["custom-sensitive-[0-9]+"]
 "#,
         )?;
 
-        let previous = std::env::var_os("COVEN_PERSIST_RAW_ARTIFACTS");
-        std::env::set_var("COVEN_PERSIST_RAW_ARTIFACTS", "1");
+        let _env_lock = ENV_LOCK.lock().expect("privacy env lock poisoned");
+        let _env_guard = EnvVarGuard::set("COVEN_PERSIST_RAW_ARTIFACTS", "1");
         let config = load_config(temp.path())?;
-        match previous {
-            Some(value) => std::env::set_var("COVEN_PERSIST_RAW_ARTIFACTS", value),
-            None => std::env::remove_var("COVEN_PERSIST_RAW_ARTIFACTS"),
-        }
 
         assert!(config.persist_raw_artifacts);
         assert_eq!(config.raw_artifact_retention_days, 9);
@@ -319,6 +374,41 @@ extra_patterns = ["custom-sensitive-[0-9]+"]
             redact_text_with_config("custom-sensitive-1234", &config),
             "[REDACTED]"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn settings_override_toml_but_env_still_wins() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        std::fs::write(
+            temp.path().join("privacy.toml"),
+            r#"
+persist_raw_artifacts = false
+raw_artifact_retention_days = 9
+log_retention_days = 41
+extra_patterns = ["toml-secret"]
+"#,
+        )?;
+        let settings = crate::settings::Settings {
+            coven_cli: crate::settings::CovenCliSettings {
+                privacy: Some(crate::settings::PrivacySettings {
+                    persist_raw_artifacts: Some(false),
+                    raw_artifact_retention_days: Some(3),
+                    log_retention_days: Some(4),
+                    extra_patterns: Some(vec!["jsonc-secret".to_string()]),
+                }),
+                ..Default::default()
+            },
+        };
+
+        let _env_lock = ENV_LOCK.lock().expect("privacy env lock poisoned");
+        let _env_guard = EnvVarGuard::set("COVEN_PERSIST_RAW_ARTIFACTS", "1");
+        let loaded = load_with_settings(temp.path(), Some(&settings))?;
+
+        assert!(loaded.persist_raw_artifacts);
+        assert_eq!(loaded.raw_artifact_retention_days, 3);
+        assert_eq!(loaded.log_retention_days, 4);
+        assert_eq!(loaded.extra_patterns, vec!["jsonc-secret"]);
         Ok(())
     }
 

@@ -10,6 +10,17 @@
 
 ---
 
+## Execution note (added 2026-05-26 mid-flight)
+
+The plan was originally drafted assuming the state of `security/private-session-logs`, where `crates/coven-cli/src/privacy.rs`, `encrypted_artifacts.rs`, and the `redaction_status`/`sensitive`/`sensitive_artifacts` schema additions exist. **On `origin/main` (this PR's base) none of those exist yet.** Concrete adjustments applied during execution:
+
+- **Task 1.4 (privacy wiring) is deferred** to a follow-up plan that runs once `security/private-session-logs` lands on main. The `PrivacySettings` type still lives in `settings.rs` so the schema is forward-compatible.
+- **Phase 2 thread search** runs over `events.payload_json` as-is on main; the "redacted" qualifier in the plan was a security-branch artifact. Behavior is unchanged because main currently stores plain payloads.
+- **Phase 3 `@T-<id>` expansion** reads `events.payload_json` directly; no decryption path needed on main.
+- **Phase 4 stream-JSON** is unaffected.
+
+---
+
 ## Design decisions (locked in — challenge before execution if you disagree)
 
 1. **Stream-JSON event schema = Coven Code's exact JSONL shape**, which mirrors Anthropic's tool-use shape (`type`, `message`, `tool_use_id`, `session_id`, etc.). External SDKs written against `@opencoven/coven-code` should switch CLIs without modifying their parser. See `docs/STREAM-JSON.md` introduced in Phase 4.

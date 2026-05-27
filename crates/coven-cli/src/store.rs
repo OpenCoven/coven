@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use chrono::{Duration, SecondsFormat, Utc};
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -30,6 +30,14 @@ pub struct SessionRecord {
     /// resume` and grouping. See `docs/chat-persistence.md`.
     #[serde(default)]
     pub conversation_id: Option<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default = "default_visibility")]
+    pub visibility: String,
+}
+
+fn default_visibility() -> String {
+    "private".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +71,15 @@ pub struct SensitiveArtifactRecord {
     pub expires_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SearchHit {
+    pub event_id: String,
+    pub session_id: String,
+    pub kind: String,
+    pub snippet: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Default)]
 pub struct EventsQueryOptions {
     pub after_seq: Option<i64>,
@@ -94,7 +111,9 @@ pub fn open_store(path: &Path) -> Result<Connection> {
             archived_at TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
-            conversation_id TEXT
+            conversation_id TEXT,
+            labels TEXT,
+            visibility TEXT NOT NULL DEFAULT 'private'
         );
 
         CREATE TABLE IF NOT EXISTS events (
@@ -140,6 +159,25 @@ pub fn open_store(path: &Path) -> Result<Connection> {
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
+            payload_json,
+            content='events',
+            content_rowid='rowid'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS events_fts_insert AFTER INSERT ON events BEGIN
+            INSERT INTO events_fts(rowid, payload_json) VALUES (new.rowid, new.payload_json);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS events_fts_delete AFTER DELETE ON events BEGIN
+            INSERT INTO events_fts(events_fts, rowid, payload_json) VALUES('delete', old.rowid, old.payload_json);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS events_fts_update AFTER UPDATE ON events BEGIN
+            INSERT INTO events_fts(events_fts, rowid, payload_json) VALUES('delete', old.rowid, old.payload_json);
+            INSERT INTO events_fts(rowid, payload_json) VALUES (new.rowid, new.payload_json);
+        END;
         ",
     )
     .context("failed to initialize Coven store schema")?;
@@ -148,6 +186,19 @@ pub fn open_store(path: &Path) -> Result<Connection> {
     ensure_conversation_id_column(&conn)?;
     ensure_event_privacy_columns(&conn)?;
     ensure_sensitive_artifacts_table(&conn)?;
+    ensure_labels_column(&conn)?;
+    ensure_visibility_column(&conn)?;
+
+    // Backfill: copy any existing events into the FTS index. Safe on fresh dbs.
+    conn.execute(
+        "INSERT INTO events_fts(rowid, payload_json)
+         SELECT e.rowid, e.payload_json
+         FROM events e
+         LEFT JOIN events_fts f ON f.rowid = e.rowid
+         WHERE f.rowid IS NULL",
+        [],
+    )
+    .context("failed to backfill events_fts")?;
 
     Ok(conn)
 }
@@ -291,6 +342,45 @@ fn ensure_conversation_id_column(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_labels_column(conn: &Connection) -> Result<()> {
+    let mut statement = conn
+        .prepare("PRAGMA table_info(sessions)")
+        .context("failed to inspect sessions schema")?;
+    let has_labels = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .context("failed to query sessions schema")?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to read sessions schema")?
+        .into_iter()
+        .any(|column| column == "labels");
+    if !has_labels {
+        conn.execute("ALTER TABLE sessions ADD COLUMN labels TEXT", [])
+            .context("failed to add sessions.labels column")?;
+    }
+    Ok(())
+}
+
+fn ensure_visibility_column(conn: &Connection) -> Result<()> {
+    let mut statement = conn
+        .prepare("PRAGMA table_info(sessions)")
+        .context("failed to inspect sessions schema")?;
+    let has_visibility = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .context("failed to query sessions schema")?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to read sessions schema")?
+        .into_iter()
+        .any(|column| column == "visibility");
+    if !has_visibility {
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN visibility TEXT NOT NULL DEFAULT 'private'",
+            [],
+        )
+        .context("failed to add sessions.visibility column")?;
+    }
+    Ok(())
+}
+
 pub fn upsert_repository(conn: &Connection, record: &RepositoryRecord) -> Result<()> {
     conn.execute(
         "INSERT INTO repositories (
@@ -357,19 +447,16 @@ pub fn repositories_table_exists(conn: &Connection) -> Result<bool> {
 }
 
 pub fn insert_session(conn: &Connection, record: &SessionRecord) -> Result<()> {
+    let labels_json: Option<String> = if record.labels.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&record.labels).context("failed to serialize session labels")?)
+    };
     conn.execute(
         "INSERT INTO sessions (
-            id,
-            project_root,
-            harness,
-            title,
-            status,
-            exit_code,
-            archived_at,
-            created_at,
-            updated_at,
-            conversation_id
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            id, project_root, harness, title, status, exit_code, archived_at,
+            created_at, updated_at, conversation_id, labels, visibility
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             &record.id,
             &record.project_root,
@@ -381,6 +468,8 @@ pub fn insert_session(conn: &Connection, record: &SessionRecord) -> Result<()> {
             &record.created_at,
             &record.updated_at,
             &record.conversation_id,
+            labels_json,
+            &record.visibility,
         ],
     )
     .with_context(|| format!("failed to insert session {}", record.id))?;
@@ -389,20 +478,17 @@ pub fn insert_session(conn: &Connection, record: &SessionRecord) -> Result<()> {
 }
 
 pub fn insert_session_if_absent(conn: &Connection, record: &SessionRecord) -> Result<bool> {
+    let labels_json: Option<String> = if record.labels.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&record.labels).context("failed to serialize session labels")?)
+    };
     let affected = conn
         .execute(
             "INSERT OR IGNORE INTO sessions (
-                id,
-                project_root,
-                harness,
-                title,
-                status,
-                exit_code,
-                archived_at,
-                created_at,
-                updated_at,
-                conversation_id
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                id, project_root, harness, title, status, exit_code, archived_at,
+                created_at, updated_at, conversation_id, labels, visibility
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 &record.id,
                 &record.project_root,
@@ -414,6 +500,8 @@ pub fn insert_session_if_absent(conn: &Connection, record: &SessionRecord) -> Re
                 &record.created_at,
                 &record.updated_at,
                 &record.conversation_id,
+                labels_json,
+                &record.visibility,
             ],
         )
         .with_context(|| format!("failed to upsert session {}", record.id))?;
@@ -488,7 +576,9 @@ fn list_sessions_with_archive_filter(
                 archived_at,
                 created_at,
                 updated_at,
-                conversation_id
+                conversation_id,
+                labels,
+                visibility
             FROM sessions
             {archive_filter}
             ORDER BY created_at DESC, id DESC",
@@ -497,6 +587,20 @@ fn list_sessions_with_archive_filter(
 
     let sessions = statement
         .query_map([], |row| {
+            let labels_str: Option<String> = row.get(10)?;
+            let labels: Vec<String> = labels_str
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|err| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        10,
+                        rusqlite::types::Type::Text,
+                        Box::new(err),
+                    )
+                })?
+                .unwrap_or_default();
+            let visibility: String = row.get(11)?;
             Ok(SessionRecord {
                 id: row.get(0)?,
                 project_root: row.get(1)?,
@@ -508,6 +612,8 @@ fn list_sessions_with_archive_filter(
                 created_at: row.get(7)?,
                 updated_at: row.get(8)?,
                 conversation_id: row.get(9)?,
+                labels,
+                visibility,
             })
         })
         .context("failed to query sessions")?
@@ -550,6 +656,48 @@ pub fn sacrifice_session(conn: &Connection, session_id: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn latest_active_for_project(conn: &Connection, project_root: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT id FROM sessions
+         WHERE project_root = ?1 AND archived_at IS NULL
+         ORDER BY created_at DESC
+         LIMIT 1",
+        params![project_root],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .context("failed to query latest active session for project")
+}
+
+pub fn search_events(conn: &Connection, query: &str) -> Result<Vec<SearchHit>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT e.id, e.session_id, e.kind, snippet(events_fts, 0, '[', ']', '…', 16), e.created_at
+             FROM events_fts
+             JOIN events e ON e.rowid = events_fts.rowid
+             WHERE events_fts MATCH ?1
+             ORDER BY e.created_at DESC
+             LIMIT 100",
+        )
+        .context("failed to prepare events_fts search")?;
+    let rows = stmt
+        .query_map([query], |row| {
+            Ok(SearchHit {
+                event_id: row.get(0)?,
+                session_id: row.get(1)?,
+                kind: row.get(2)?,
+                snippet: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })
+        .context("failed to run events_fts search")?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.context("failed to read events_fts row")?);
+    }
+    Ok(out)
+}
+
 pub fn insert_event(conn: &Connection, record: &EventRecord) -> Result<()> {
     let config = PrivacyConfig::default();
     let redacted_payload = privacy::redact_payload_json_with_config(&record.payload_json, &config);
@@ -570,7 +718,7 @@ pub fn insert_event_with_privacy(
     insert_event_raw(conn, record, &redacted_payload, redaction_status, sensitive)?;
 
     if config.persist_raw_artifacts && sensitive {
-        let artifact_result = SensitiveArtifactStore::load_or_create(coven_home)
+        let artifact_result = SensitiveArtifactStore::load(coven_home)
             .and_then(|store| {
                 store.encrypt(
                     &record.session_id,
@@ -1355,14 +1503,13 @@ mod tests {
         let artifact = get_sensitive_artifact(&conn, "session-1", "event-raw")?
             .expect("artifact should exist");
         assert_ne!(artifact.ciphertext, raw_payload.as_bytes());
-        let decrypted =
-            crate::encrypted_artifacts::SensitiveArtifactStore::load_existing(temp_dir.path())?
-                .decrypt(
-                    "session-1",
-                    "event-raw",
-                    "output",
-                    &artifact_payload(&artifact),
-                )?;
+        let decrypted = crate::encrypted_artifacts::SensitiveArtifactStore::load(temp_dir.path())?
+            .decrypt(
+                "session-1",
+                "event-raw",
+                "output",
+                &artifact_payload(&artifact),
+            )?;
         assert_eq!(String::from_utf8(decrypted)?, raw_payload);
         Ok(())
     }
@@ -1684,7 +1831,69 @@ mod tests {
             created_at: created_at.to_string(),
             updated_at: created_at.to_string(),
             conversation_id: None,
+            labels: Vec::new(),
+            visibility: "private".to_string(),
         }
+    }
+
+    #[test]
+    fn latest_active_returns_newest_non_archived_for_project() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("test.sqlite3"))?;
+        conn.execute_batch(
+            "INSERT INTO sessions(id, project_root, harness, title, status, created_at, updated_at)
+               VALUES ('older', '/p', 'codex', 't', 'created', '2026-01-01', '2026-01-01'),
+                      ('newer', '/p', 'claude', 't', 'created', '2026-01-02', '2026-01-02'),
+                      ('archived', '/p', 'claude', 't', 'created', '2026-01-03', '2026-01-03'),
+                      ('other_proj', '/other', 'claude', 't', 'created', '2026-01-04', '2026-01-04');
+             UPDATE sessions SET archived_at='2026-01-03' WHERE id='archived';",
+        )?;
+        let hit = latest_active_for_project(&conn, "/p")?;
+        assert_eq!(hit.as_deref(), Some("newer"));
+        Ok(())
+    }
+
+    #[test]
+    fn search_events_finds_match_in_payload() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("test.sqlite3"))?;
+        conn.execute(
+            "INSERT INTO sessions(id, project_root, harness, title, status, created_at, updated_at)
+             VALUES('s1', '/tmp', 'codex', 't', 'created', '2026-01-01', '2026-01-01')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO events(id, session_id, kind, payload_json, created_at)
+             VALUES('e1', 's1', 'stdout', '{\"text\":\"phoenix rises\"}', '2026-01-01')",
+            [],
+        )?;
+        let hits = search_events(&conn, "phoenix")?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].event_id, "e1");
+        assert_eq!(hits[0].session_id, "s1");
+        Ok(())
+    }
+
+    #[test]
+    fn new_columns_default_correctly() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("test.sqlite3"))?;
+        conn.execute(
+            "INSERT INTO sessions(id, project_root, harness, title, status, created_at, updated_at)
+             VALUES('s1', '/tmp', 'codex', 't', 'created', '2026-01-01', '2026-01-01')",
+            [],
+        )?;
+        let labels: Option<String> =
+            conn.query_row("SELECT labels FROM sessions WHERE id='s1'", [], |row| {
+                row.get(0)
+            })?;
+        let visibility: String =
+            conn.query_row("SELECT visibility FROM sessions WHERE id='s1'", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(labels, None);
+        assert_eq!(visibility, "private");
+        Ok(())
     }
 
     fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {

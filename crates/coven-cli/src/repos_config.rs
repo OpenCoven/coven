@@ -26,6 +26,28 @@ pub fn load(coven_home: &Path) -> Result<ReposConfig> {
     load_from(&config_path(coven_home))
 }
 
+pub fn load_with_settings(
+    coven_home: &Path,
+    settings: Option<&crate::settings::Settings>,
+) -> Result<ReposConfig> {
+    let mut config = load(coven_home)?;
+    let Some(settings) = settings else {
+        return Ok(config);
+    };
+    for (name, repo) in &settings.coven_cli.repos {
+        config.repos.insert(
+            name.clone(),
+            RepoEntry {
+                path: repo.path.clone(),
+            },
+        );
+    }
+    if let Some(name) = &settings.coven_cli.default_repo {
+        config.default = Some(name.clone());
+    }
+    Ok(config)
+}
+
 fn load_from(path: &Path) -> Result<ReposConfig> {
     match std::fs::read_to_string(path) {
         Ok(raw) => {
@@ -165,6 +187,45 @@ path = "/abs/alpha"
         assert!(
             err.to_string().contains("failed to parse"),
             "unexpected error: {err:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn settings_override_toml_when_both_present() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        // legacy TOML
+        std::fs::write(
+            config_path(temp.path()),
+            r#"
+default = "from_toml"
+[repos.from_toml]
+path = "/abs/toml"
+"#,
+        )?;
+        // new JSONC settings (constructed in-memory; this test does not exercise the json5 loader)
+        let settings = crate::settings::Settings {
+            coven_cli: crate::settings::CovenCliSettings {
+                default_repo: Some("from_jsonc".to_string()),
+                repos: std::collections::BTreeMap::from([(
+                    "from_jsonc".to_string(),
+                    crate::settings::RepoSettings {
+                        path: std::path::PathBuf::from("/abs/jsonc"),
+                    },
+                )]),
+                ..Default::default()
+            },
+        };
+        let merged = load_with_settings(temp.path(), Some(&settings))?;
+        assert_eq!(merged.default_name(), Some("from_jsonc"));
+        assert_eq!(
+            merged.resolve("from_jsonc"),
+            Some(std::path::PathBuf::from("/abs/jsonc"))
+        );
+        // legacy entry still resolvable as a fallback
+        assert_eq!(
+            merged.resolve("from_toml"),
+            Some(std::path::PathBuf::from("/abs/toml"))
         );
         Ok(())
     }
