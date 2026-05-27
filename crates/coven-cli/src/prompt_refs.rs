@@ -110,6 +110,38 @@ fn guess_mime(path: &Path) -> String {
 }
 
 #[allow(dead_code)]
+pub fn expand_thread(conn: &rusqlite::Connection, id: &str) -> Result<String> {
+    use anyhow::Context;
+    let mut stmt = conn
+        .prepare(
+            "SELECT kind, payload_json, created_at FROM events
+             WHERE session_id = ?1 ORDER BY created_at ASC LIMIT 200",
+        )
+        .context("failed to prepare expand_thread query")?;
+    let rows = stmt
+        .query_map([id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .context("failed to execute expand_thread query")?;
+    let mut out = format!("--- @{id} ---\n");
+    let mut found = false;
+    for r in rows {
+        let (kind, payload, ts) = r.context("failed to read expand_thread row")?;
+        found = true;
+        out.push_str(&format!("[{ts}] {kind}: {payload}\n"));
+    }
+    if !found {
+        return Ok(format!("[no events for @{id}]"));
+    }
+    out.push_str("--- end ---\n");
+    Ok(out)
+}
+
+#[allow(dead_code)]
 fn expand_glob(cwd: &Path, pattern: &str) -> Result<String> {
     use globset::{Glob, GlobSetBuilder};
     let mut builder = GlobSetBuilder::new();
@@ -277,5 +309,34 @@ mod tests {
         }
         let expanded = expand_path(temp.path(), "many/*.txt").unwrap();
         assert!(expanded.contains("glob match cap reached at 20 files"));
+    }
+
+    #[test]
+    fn expand_thread_inlines_payloads() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = crate::store::open_store(&temp.path().join("test.sqlite3"))?;
+        conn.execute(
+            "INSERT INTO sessions(id, project_root, harness, title, status, created_at, updated_at)
+             VALUES('T-abc', '/tmp', 'codex', 't', 'created', '2026-01-01', '2026-01-01')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO events(id, session_id, kind, payload_json, created_at)
+             VALUES('e1', 'T-abc', 'user', '{\"text\":\"hello world\"}', '2026-01-01')",
+            [],
+        )?;
+        let out = expand_thread(&conn, "T-abc")?;
+        assert!(out.contains("hello world"), "got: {out}");
+        assert!(out.contains("T-abc"), "got: {out}");
+        Ok(())
+    }
+
+    #[test]
+    fn expand_thread_missing_returns_placeholder() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = crate::store::open_store(&temp.path().join("test.sqlite3"))?;
+        let out = expand_thread(&conn, "T-nope")?;
+        assert_eq!(out, "[no events for @T-nope]");
+        Ok(())
     }
 }
