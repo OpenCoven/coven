@@ -54,6 +54,16 @@ pub fn user_settings_path() -> Option<PathBuf> {
     Some(base.join("coven").join(SETTINGS_FILE_NAME))
 }
 
+/// Returns the set of dotted-path keys that appear in both inputs.
+///
+/// Both inputs are expected to be **dotted JSONC paths** (e.g. `"repos.alpha"`,
+/// `"defaultRepo"`, `"privacy.logRetentionDays"`), not raw TOML field names or
+/// bare repo names. Callers building these lists from a TOML loader must prefix
+/// nested fields with their parent (e.g. `"repos.{name}"` for entries inside the
+/// `[repos.*]` table).
+#[allow(dead_code)] // Wired into run_doctor in a follow-up; see plan
+                    // docs/superpowers/plans/2026-05-26-coven-cli-p0-coven-code-parity.md
+                    // Task 1.5 (deferred wire-up after PrivacySettings lands).
 pub fn shadowed_keys(toml_keys: &[String], jsonc_keys: &[String]) -> Vec<String> {
     let mut out: Vec<String> = toml_keys
         .iter()
@@ -65,6 +75,7 @@ pub fn shadowed_keys(toml_keys: &[String], jsonc_keys: &[String]) -> Vec<String>
     out
 }
 
+#[allow(dead_code)] // See shadowed_keys above.
 pub fn warn_if_shadowed(shadowed: &[String], toml_path: &Path, jsonc_path: &Path) {
     if shadowed.is_empty() {
         return;
@@ -83,11 +94,9 @@ pub fn warn_if_shadowed(shadowed: &[String], toml_path: &Path, jsonc_path: &Path
 static CACHED: OnceLock<Option<Settings>> = OnceLock::new();
 
 /// Initialize the process-wide cached Settings. Call exactly once at startup.
-/// Subsequent calls are no-ops (the first init wins). Returns the cached value
-/// so the caller can also use it directly if convenient.
-pub fn init_cached(value: Option<Settings>) -> Option<&'static Settings> {
+/// Subsequent calls are no-ops (the first init wins).
+pub fn init_cached(value: Option<Settings>) {
     let _ = CACHED.set(value);
-    CACHED.get().and_then(|opt| opt.as_ref())
 }
 
 /// Get the cached Settings, if any. Returns `None` if init has not run or if
@@ -161,10 +170,10 @@ mod tests {
 
     #[test]
     fn cached_returns_the_initialized_value() {
-        // Note: OnceLock is process-wide; this test relies on being the ONLY test
-        // in the suite that calls init_cached. If another test also calls it, the
-        // ordering will determine which value wins, which would make this test
-        // flaky. As of this commit no other test touches init_cached.
+        // Note: OnceLock is process-wide and cannot be reset between tests. This
+        // test is the only one that should ever call init_cached. If you are adding
+        // another test that also calls init_cached, replace this assertion with a
+        // helper that asserts the OnceLock state without re-initializing it.
         let settings = Settings::default();
         init_cached(Some(settings.clone()));
         assert_eq!(cached(), Some(&settings));

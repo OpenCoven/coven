@@ -7,14 +7,24 @@ All keys live under `covenCli.*`.
 
 ## Precedence
 
-1. Environment variables (highest, see `crates/coven-cli/src/privacy.rs` once privacy lands; today: `COVEN_HOME` only).
-2. `~/.config/coven/settings.json`
-3. `~/.coven/repos.toml`, `~/.coven/privacy.toml` (legacy)
+Today, for keys in the `covenCli.*` namespace:
 
-When a key is set in both the JSONC file and a legacy TOML file, the JSONC value
-wins and `coven` can print a one-time stderr warning naming the shadowed keys
-(via `settings::warn_if_shadowed`; the doctor and shell entry points will start
-emitting this warning in a follow-up commit).
+1. `~/.config/coven/settings.json` (highest)
+2. `~/.coven/repos.toml` (legacy)
+
+The only environment variable that affects settings discovery today is
+`COVEN_HOME`, which controls the local data dir (`~/.coven/...`) — it does not
+override any `covenCli.*` value.
+
+Forward-looking: once the security branch lands and privacy gains
+`load_with_settings`, env vars (`COVEN_PERSIST_RAW_ARTIFACTS`,
+`COVEN_RAW_ARTIFACT_RETENTION_DAYS`, `COVEN_LOG_RETENTION_DAYS`) will trump
+both files for the `covenCli.privacy.*` keys only.
+
+When a key is set in both the JSONC file and a legacy TOML file, the JSONC
+value wins and `coven` can print a one-time stderr warning naming the
+shadowed keys (via `settings::warn_if_shadowed`; the doctor and shell entry
+points will start emitting this warning in a follow-up commit).
 
 ## Schema
 
