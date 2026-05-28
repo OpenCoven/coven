@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use std::io::{BufRead, BufReader, Read};
 #[cfg(unix)]
 use std::os::unix::{
-    fs::PermissionsExt,
+    fs::{FileTypeExt, PermissionsExt},
     net::{UnixListener, UnixStream},
 };
 
@@ -467,6 +467,18 @@ pub fn daemon_socket_path(coven_home: &Path) -> PathBuf {
 
 #[cfg(unix)]
 fn ensure_private_coven_home(coven_home: &Path) -> Result<()> {
+    // Fail closed if the home already exists as a symlink: following it would
+    // let anyone able to plant the link redirect daemon state (socket, status,
+    // SQLite ledger) outside the trusted directory. See docs/AUTH.md
+    // "Current hardening gap".
+    if let Ok(metadata) = std::fs::symlink_metadata(coven_home) {
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!(
+                "refusing to use Coven home {}: path is a symlink",
+                coven_home.display()
+            );
+        }
+    }
     std::fs::create_dir_all(coven_home)
         .with_context(|| format!("failed to create Coven home {}", coven_home.display()))?;
     std::fs::set_permissions(coven_home, std::fs::Permissions::from_mode(0o700)).with_context(
@@ -957,9 +969,34 @@ pub fn serve_next_tcp_connection(
 pub fn bind_api_socket(coven_home: &Path) -> Result<UnixListener> {
     ensure_private_coven_home(coven_home)?;
     let socket_path = daemon_socket_path(coven_home);
-    if socket_path.exists() {
-        std::fs::remove_file(&socket_path)
-            .with_context(|| format!("failed to remove stale socket {}", socket_path.display()))?;
+    // Only ever replace a genuine, non-symlink socket. Blindly removing
+    // whatever sits at the path would follow an attacker-planted symlink or
+    // delete an unrelated file. See docs/AUTH.md "Current hardening gap".
+    match std::fs::symlink_metadata(&socket_path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                anyhow::bail!(
+                    "refusing to bind Coven API socket {}: path is a symlink",
+                    socket_path.display()
+                );
+            }
+            if !file_type.is_socket() {
+                anyhow::bail!(
+                    "refusing to bind Coven API socket {}: path exists and is not a socket",
+                    socket_path.display()
+                );
+            }
+            std::fs::remove_file(&socket_path).with_context(|| {
+                format!("failed to remove stale socket {}", socket_path.display())
+            })?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to inspect socket path {}", socket_path.display())
+            });
+        }
     }
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("failed to bind Coven API socket {}", socket_path.display()))?;
@@ -1571,6 +1608,65 @@ mod tests {
 
         let home_mode = std::fs::metadata(temp_dir.path())?.permissions().mode() & 0o777;
         assert_eq!(home_mode, 0o700);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_coven_home_rejects_symlinked_home() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let temp_dir = tempfile::tempdir()?;
+        let target = temp_dir.path().join("real-home");
+        std::fs::create_dir(&target)?;
+        let link = temp_dir.path().join("link-home");
+        symlink(&target, &link)?;
+
+        let error = ensure_private_coven_home(&link)
+            .expect_err("a symlinked Coven home must be refused (AUTH.md fail-closed)");
+        assert!(
+            error.to_string().contains("symlink"),
+            "error should name the symlink cause, got: {error}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bind_api_socket_refuses_symlinked_socket_path() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let temp_dir = tempfile::tempdir()?;
+        // Plant a symlink (to a real file) where the socket should be created.
+        let decoy = temp_dir.path().join("decoy");
+        std::fs::write(&decoy, b"x")?;
+        symlink(&decoy, daemon_socket_path(temp_dir.path()))?;
+
+        let error = bind_api_socket(temp_dir.path())
+            .expect_err("a symlinked socket path must be refused (AUTH.md fail-closed)");
+        assert!(
+            error.to_string().contains("symlink"),
+            "error should name the symlink cause, got: {error}"
+        );
+        // The guard must refuse before touching the link, so its target survives.
+        assert!(
+            decoy.exists(),
+            "the symlink target must not be removed by the bind guard"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bind_api_socket_refuses_non_socket_at_socket_path() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        std::fs::write(daemon_socket_path(temp_dir.path()), b"not a socket")?;
+
+        let error = bind_api_socket(temp_dir.path()).expect_err(
+            "a non-socket file at the socket path must be refused (AUTH.md fail-closed)",
+        );
+        assert!(
+            error.to_string().contains("not a socket"),
+            "error should name the non-socket cause, got: {error}"
+        );
         Ok(())
     }
 
