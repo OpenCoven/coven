@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::io::Write;
+#[cfg(unix)]
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
 use std::io::{BufRead, BufReader, Read};
 #[cfg(unix)]
 use std::os::unix::{
@@ -37,6 +37,7 @@ pub enum DaemonStatusState {
     Stale(DaemonStatus),
 }
 
+#[cfg(unix)]
 #[derive(Debug, Deserialize)]
 struct DaemonHealthStatus {
     ok: bool,
@@ -902,9 +903,12 @@ fn daemon_status_from_health_socket(socket: &str) -> Result<Option<DaemonStatus>
 // Unix socket — a misbehaving network client can otherwise hold the API
 // thread indefinitely (slowloris) or force a huge allocation by claiming a
 // large body.
+#[cfg(unix)]
 pub const TCP_IO_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(unix)]
 pub const MAX_TCP_BODY_BYTES: usize = 1024 * 1024;
 
+#[cfg(unix)]
 fn ensure_loopback_addrs(addrs: &[SocketAddr]) -> Result<()> {
     if addrs.is_empty() {
         anyhow::bail!("TCP listener address did not resolve to any sockets");
@@ -927,6 +931,7 @@ fn ensure_loopback_addrs(addrs: &[SocketAddr]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 pub fn bind_tcp_listener<A: ToSocketAddrs>(addr: A) -> Result<TcpListener> {
     let addrs: Vec<SocketAddr> = addr
         .to_socket_addrs()
@@ -1064,7 +1069,6 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
     }
 }
 
-#[cfg(unix)]
 fn handle_http_stream<R, W>(
     read: R,
     mut write: W,
@@ -1125,7 +1129,6 @@ where
     Ok(())
 }
 
-#[cfg(unix)]
 fn write_payload_too_large<W: Write>(write: &mut W, max: usize) -> Result<()> {
     let body = format!(
         "{{\"ok\":false,\"error\":{{\"code\":\"payload_too_large\",\"message\":\"Request body exceeds {max}-byte limit.\"}}}}",
@@ -1141,7 +1144,6 @@ fn write_payload_too_large<W: Write>(write: &mut W, max: usize) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 fn host_is_loopback(host: Option<&str>) -> bool {
     match host {
         Some(h) => is_loopback_host(strip_port(h.trim())),
@@ -1149,7 +1151,6 @@ fn host_is_loopback(host: Option<&str>) -> bool {
     }
 }
 
-#[cfg(unix)]
 fn origin_is_loopback(origin: &str) -> bool {
     match origin.trim().split_once("://") {
         Some((_scheme, rest)) => is_loopback_host(strip_port(rest)),
@@ -1157,7 +1158,6 @@ fn origin_is_loopback(origin: &str) -> bool {
     }
 }
 
-#[cfg(unix)]
 fn strip_port(authority: &str) -> &str {
     if let Some(rest) = authority.strip_prefix('[') {
         // IPv6 literal like [::1]:8080 -> ::1
@@ -1166,7 +1166,6 @@ fn strip_port(authority: &str) -> &str {
     authority.split(':').next().unwrap_or(authority)
 }
 
-#[cfg(unix)]
 fn is_loopback_host(host: &str) -> bool {
     // Parse as an IP and ask the address itself — never a string prefix. A prefix
     // test like `starts_with("127.")` would also accept attacker hostnames such as
@@ -1179,7 +1178,6 @@ fn is_loopback_host(host: &str) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(unix)]
 fn write_forbidden<W: Write>(write: &mut W, reason: &str) -> Result<()> {
     let body =
         format!("{{\"ok\":false,\"error\":{{\"code\":\"forbidden\",\"message\":\"{reason}\"}}}}");
@@ -1223,7 +1221,6 @@ fn http_reason_phrase(status: u16) -> &'static str {
     }
 }
 
-#[cfg(unix)]
 fn read_http_request_line<R: BufRead>(reader: &mut R) -> Result<String> {
     let mut line = String::new();
     reader
@@ -1235,14 +1232,12 @@ fn read_http_request_line<R: BufRead>(reader: &mut R) -> Result<String> {
     Ok(line)
 }
 
-#[cfg(unix)]
 struct ParsedHeaders {
     content_length: usize,
     host: Option<String>,
     origin: Option<String>,
 }
 
-#[cfg(unix)]
 fn read_http_headers<R: BufRead>(reader: &mut R) -> Result<ParsedHeaders> {
     let mut headers = ParsedHeaders {
         content_length: 0,
@@ -1273,7 +1268,6 @@ fn read_http_headers<R: BufRead>(reader: &mut R) -> Result<ParsedHeaders> {
     Ok(headers)
 }
 
-#[cfg(unix)]
 fn read_http_body<R: Read>(reader: &mut R, content_length: usize) -> Result<Option<String>> {
     if content_length == 0 {
         return Ok(None);
@@ -1287,12 +1281,69 @@ fn read_http_body<R: Read>(reader: &mut R, content_length: usize) -> Result<Opti
         .context("API request body was not valid UTF-8")
 }
 
-#[cfg(unix)]
 fn parse_request_line(line: &str) -> Result<(&str, &str)> {
     let mut parts = line.split_whitespace();
     let method = parts.next().context("missing HTTP method")?;
     let path = parts.next().context("missing HTTP path")?;
     Ok((method, path))
+}
+
+#[cfg(windows)]
+fn windows_pipe_name(coven_home: &Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    coven_home.to_string_lossy().hash(&mut h);
+    format!("coven-daemon-{:016x}.sock", h.finish())
+}
+
+#[cfg(windows)]
+pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&str>) -> Result<()> {
+    use interprocess::local_socket::{prelude::*, GenericNamespaced, ListenerOptions};
+    use std::sync::Arc;
+
+    let _ = tcp_addr; // TCP not wired on Windows in this prototype
+
+    let status = DaemonStatus {
+        pid: std::process::id(),
+        started_at: started_at.clone(),
+        socket: windows_pipe_name(coven_home),
+    };
+    write_status(coven_home, &status)?;
+    recover_orphaned_sessions(coven_home, &started_at)?;
+
+    let name = windows_pipe_name(coven_home)
+        .to_ns_name::<GenericNamespaced>()
+        .context("failed to create named pipe name")?;
+    let listener = ListenerOptions::new()
+        .name(name)
+        .create_sync()
+        .context("failed to bind Windows named pipe")?;
+
+    let runtime = Arc::new(LiveSessionRuntime::with_coven_home(coven_home.to_path_buf()));
+
+    for conn in listener.incoming() {
+        let stream = match conn {
+            Ok(s) => s,
+            Err(error) => {
+                eprintln!("coven daemon: pipe accept error: {error:#}");
+                continue;
+            }
+        };
+        // Stream implements Read + Write via shared reference on Windows.
+        // The handler reads the full request before writing, so sharing &stream is safe.
+        if let Err(error) = handle_http_stream(
+            &stream,
+            &stream,
+            coven_home,
+            Some(status.clone()),
+            runtime.as_ref(),
+            None,
+            false,
+        ) {
+            eprintln!("coven daemon: pipe connection error: {error:#}");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1722,6 +1773,7 @@ mod tests {
         assert!(response.contains("\"apiVersion\""), "got: {response}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn bind_tcp_listener_rejects_non_loopback() {
         let error = bind_tcp_listener("0.0.0.0:0").expect_err("should reject wildcard bind");
@@ -2432,5 +2484,60 @@ mod tests {
             .find(|session| session.id == id)
             .map(|session| session.status.clone())
             .unwrap_or_default()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn serves_health_over_windows_named_pipe() -> Result<()> {
+        use interprocess::local_socket::{prelude::*, GenericNamespaced, ListenerOptions, Stream};
+        use std::io::{Read, Write};
+        use std::thread;
+
+        let temp_dir = tempfile::tempdir()?;
+        let pipe_name = windows_pipe_name(temp_dir.path());
+
+        let name = pipe_name
+            .clone()
+            .to_ns_name::<GenericNamespaced>()
+            .expect("pipe name");
+        let listener = ListenerOptions::new()
+            .name(name)
+            .create_sync()
+            .expect("bind pipe");
+
+        let status = DaemonStatus {
+            pid: 12345,
+            started_at: "2026-04-27T10:00:00Z".to_string(),
+            socket: pipe_name.clone(),
+        };
+        let home = temp_dir.path().to_path_buf();
+        let runtime = LiveSessionRuntime::default();
+        let server = thread::spawn(move || {
+            let conn = listener.incoming().next().expect("accept").expect("stream");
+            handle_http_stream(&conn, &conn, &home, Some(status), &runtime, None, false)
+        });
+
+        let client_name = pipe_name
+            .to_ns_name::<GenericNamespaced>()
+            .expect("client pipe name");
+        let mut client = Stream::connect(client_name).expect("connect");
+        client
+            .write_all(b"GET /api/v1/health HTTP/1.1\r\nHost: coven\r\n\r\n")
+            .expect("write request");
+        // Flush to ensure the server receives the full request before we start reading.
+        client.flush().expect("flush");
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("read response");
+
+        server.join().expect("server thread")?;
+
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "got: {response}"
+        );
+        assert!(response.contains("\"apiVersion\""), "got: {response}");
+        Ok(())
     }
 }

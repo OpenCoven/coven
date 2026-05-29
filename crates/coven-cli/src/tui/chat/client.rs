@@ -5,10 +5,13 @@
 //! ritual verbs use the shared store path/timestamp helpers because they are
 //! ledger-only mutations.
 
+#[cfg(unix)]
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+#[cfg(unix)]
+use anyhow::anyhow;
+use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -387,6 +390,7 @@ fn request_daemon(
     anyhow::bail!("Coven daemon chat is only implemented on Unix-like systems for now")
 }
 
+#[cfg(unix)]
 fn parse_http_response(response: &str) -> Result<HttpResponse> {
     let (head, body) = response
         .split_once("\r\n\r\n")
@@ -407,6 +411,7 @@ fn parse_http_response(response: &str) -> Result<HttpResponse> {
     })
 }
 
+#[cfg(unix)]
 fn daemon_error(status: u16, body: &str) -> anyhow::Error {
     if let Ok(value) = serde_json::from_str::<Value>(body) {
         if let Some(message) = value
@@ -444,6 +449,7 @@ fn session_title(prompt: &str) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn parses_successful_http_response_body() -> Result<()> {
         let response =
@@ -454,6 +460,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn turns_structured_daemon_errors_into_readable_errors() {
         let error = parse_http_response(
