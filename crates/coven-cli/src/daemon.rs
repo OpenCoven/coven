@@ -1131,7 +1131,15 @@ fn strip_port(authority: &str) -> &str {
 
 #[cfg(unix)]
 fn is_loopback_host(host: &str) -> bool {
-    host == "localhost" || host == "::1" || host.starts_with("127.")
+    // Parse as an IP and ask the address itself — never a string prefix. A prefix
+    // test like `starts_with("127.")` would also accept attacker hostnames such as
+    // `127.evil.com`, defeating the DNS-rebinding guard this function backs.
+    if host == "localhost" {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
 }
 
 #[cfg(unix)]
@@ -1576,6 +1584,23 @@ mod tests {
             response.starts_with("HTTP/1.1 403 Forbidden"),
             "got: {response}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_loopback_host_accepts_only_real_loopback_addresses() {
+        // Real loopback: the whole 127.0.0.0/8, ::1, and the localhost name.
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("127.0.0.2"));
+        assert!(is_loopback_host("::1"));
+        assert!(is_loopback_host("localhost"));
+        // Hostnames that merely *start with* "127." must NOT pass: a DNS-rebinding
+        // attacker can register 127.evil.com -> 127.0.0.1 and would otherwise slip
+        // through a string-prefix check and defeat the loopback guard.
+        assert!(!is_loopback_host("127.evil.com"));
+        assert!(!is_loopback_host("127001.example.com"));
+        assert!(!is_loopback_host("evil.example"));
+        assert!(!is_loopback_host(""));
     }
 
     #[cfg(unix)]
