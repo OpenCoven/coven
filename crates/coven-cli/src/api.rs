@@ -416,6 +416,18 @@ fn conversation_from_payload(payload: &Value) -> Result<Option<ConversationHint>
         .filter(|id| !id.is_empty())
         .context("conversation.id is required and must be a non-empty string")?
         .to_string();
+    // The id is forwarded verbatim as the value of the harness CLI's
+    // `--session-id`/`--resume`/`resume` argument. Restrict it to an unambiguous,
+    // shell-safe charset so untrusted text can never inject extra arguments or —
+    // on Windows, where a `.cmd` shim re-parses the command line through cmd.exe —
+    // shell metacharacters. UUIDs and opaque slugs pass; whitespace and
+    // metacharacters (& | < > ^ % " $ etc.) do not.
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        anyhow::bail!("conversation.id must contain only letters, digits, '-', '_', or '.'");
+    }
     match mode {
         "init" => Ok(Some(ConversationHint::Init { id })),
         "resume" => Ok(Some(ConversationHint::Resume { id })),
@@ -1423,6 +1435,41 @@ mod tests {
 
         assert!(runtime.launches.borrow()[0].conversation_id.is_none());
         Ok(())
+    }
+
+    #[test]
+    fn conversation_id_rejects_shell_metacharacters() {
+        // Ids carrying whitespace or shell metacharacters must be rejected so they
+        // can never reach the harness CLI's `--session-id`/`--resume`/`resume` argv,
+        // where on Windows a `.cmd` shim would re-parse cmd.exe metacharacters.
+        for bad in [
+            "not-a-uuid & calc.exe",
+            "a|b",
+            "a b",
+            "$(whoami)",
+            "a\"b",
+            "a^b",
+        ] {
+            let payload = json!({"conversation": {"mode": "resume", "id": bad}});
+            assert!(
+                conversation_from_payload(&payload).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+        // UUIDs and opaque slugs are accepted.
+        for good in [
+            "11111111-2222-3333-4444-555555555555",
+            "abc-123",
+            "sess_1.2",
+        ] {
+            let payload = json!({"conversation": {"mode": "init", "id": good}});
+            assert!(
+                conversation_from_payload(&payload)
+                    .expect("shell-safe id should parse")
+                    .is_some(),
+                "expected {good:?} to be accepted"
+            );
+        }
     }
 
     #[test]
