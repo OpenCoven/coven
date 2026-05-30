@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
-use std::io::{self, BufRead, IsTerminal, Write};
 #[cfg(unix)]
 use std::io::Read;
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;

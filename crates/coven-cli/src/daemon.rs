@@ -1319,7 +1319,9 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
         .create_sync()
         .context("failed to bind Windows named pipe")?;
 
-    let runtime = Arc::new(LiveSessionRuntime::with_coven_home(coven_home.to_path_buf()));
+    let runtime = Arc::new(LiveSessionRuntime::with_coven_home(
+        coven_home.to_path_buf(),
+    ));
 
     for conn in listener.incoming() {
         let stream = match conn {
@@ -2527,16 +2529,11 @@ mod tests {
         // Flush to ensure the server receives the full request before we start reading.
         client.flush().expect("flush");
         let mut response = String::new();
-        client
-            .read_to_string(&mut response)
-            .expect("read response");
+        client.read_to_string(&mut response).expect("read response");
 
         server.join().expect("server thread")?;
 
-        assert!(
-            response.starts_with("HTTP/1.1 200 OK"),
-            "got: {response}"
-        );
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
         assert!(response.contains("\"apiVersion\""), "got: {response}");
         Ok(())
     }
