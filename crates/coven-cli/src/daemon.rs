@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use std::io::{BufRead, BufReader, Read};
 #[cfg(unix)]
 use std::os::unix::{
-    fs::{FileTypeExt, PermissionsExt},
+    fs::{FileTypeExt, MetadataExt, PermissionsExt},
     net::{UnixListener, UnixStream},
 };
 
@@ -465,6 +465,23 @@ pub fn daemon_socket_path(coven_home: &Path) -> PathBuf {
     coven_home.join("coven.sock")
 }
 
+// Fail closed when daemon state already exists but is owned by a different
+// user: a path we do not own could have been planted by another local user to
+// capture the socket, status, or SQLite ledger. See docs/AUTH.md
+// "Current hardening gap" — COVEN_HOME and the socket must be owned by the
+// current user. Kept pure (uid passed in) so the refusal is unit-testable
+// without a root-owned fixture.
+#[cfg(unix)]
+fn check_owned_by_current_user(path: &Path, owner_uid: u32, euid: u32) -> Result<()> {
+    if owner_uid != euid {
+        anyhow::bail!(
+            "refusing to use {}: it is owned by uid {owner_uid}, not the current user (uid {euid})",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn ensure_private_coven_home(coven_home: &Path) -> Result<()> {
     // Fail closed if the home already exists as a symlink: following it would
@@ -478,6 +495,9 @@ fn ensure_private_coven_home(coven_home: &Path) -> Result<()> {
                 coven_home.display()
             );
         }
+        // SAFETY: geteuid() only reads the calling process's effective uid and
+        // cannot fail.
+        check_owned_by_current_user(coven_home, metadata.uid(), unsafe { libc::geteuid() })?;
     }
     std::fs::create_dir_all(coven_home)
         .with_context(|| format!("failed to create Coven home {}", coven_home.display()))?;
@@ -988,6 +1008,8 @@ pub fn bind_api_socket(coven_home: &Path) -> Result<UnixListener> {
                     socket_path.display()
                 );
             }
+            // SAFETY: geteuid() only reads the effective uid and cannot fail.
+            check_owned_by_current_user(&socket_path, metadata.uid(), unsafe { libc::geteuid() })?;
             std::fs::remove_file(&socket_path).with_context(|| {
                 format!("failed to remove stale socket {}", socket_path.display())
             })?;
@@ -1774,6 +1796,22 @@ mod tests {
         assert_eq!(read_status(temp_dir.path())?, None);
         assert!(!clear_status(temp_dir.path())?);
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_owned_by_current_user_refuses_foreign_ownership() {
+        let path = std::path::Path::new("/tmp/coven-example");
+        // Owned by the current effective uid: accepted.
+        assert!(check_owned_by_current_user(path, 1000, 1000).is_ok());
+        // Owned by another uid (e.g. a root-planted dir while we run as a normal
+        // user): refused before we ever touch it.
+        let err = check_owned_by_current_user(path, 0, 1000)
+            .expect_err("a foreign-owned path must be refused");
+        assert!(
+            err.to_string().contains("owned by uid 0"),
+            "error should name the foreign owner, got: {err}"
+        );
     }
 
     #[cfg(unix)]
