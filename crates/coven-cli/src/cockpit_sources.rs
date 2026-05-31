@@ -17,6 +17,12 @@ pub struct FamiliarDto {
     pub name: String,
     pub display_name: String,
     pub emoji: String,
+    /// Optional glyph hint. Either a literal emoji char (`"🐈"`) or a
+    /// Phosphor icon name (`"ph:cat-fill"`). Clients use this in preference
+    /// to `emoji` when they have a richer icon system — see CovenCave's
+    /// glyph picker. Omitted from the wire when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
     pub role: String,
     pub description: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -41,6 +47,10 @@ struct FamiliarEntry {
     name: Option<String>,
     display_name: String,
     emoji: Option<String>,
+    /// See [`FamiliarDto::icon`]. Free-form string at this layer — the
+    /// renderer decides whether to treat a `ph:` prefix as an icon vs.
+    /// treat anything else as an emoji literal.
+    icon: Option<String>,
     role: String,
     description: String,
     pronouns: Option<String>,
@@ -67,6 +77,14 @@ pub fn read_familiars(coven_home: &Path) -> Result<Vec<FamiliarDto>> {
             name: entry.name.unwrap_or_else(|| entry.id.clone()),
             display_name: entry.display_name,
             emoji: entry.emoji.unwrap_or_default(),
+            icon: entry.icon.and_then(|s| {
+                let trimmed = s.trim().to_string();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                }
+            }),
             role: entry.role,
             description: entry.description,
             pronouns: entry.pronouns,
@@ -79,6 +97,104 @@ pub fn read_familiars(coven_home: &Path) -> Result<Vec<FamiliarDto>> {
         });
     }
     Ok(out)
+}
+
+/// Outcome of a [`write_familiar_icon`] call.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WriteFamiliarIconOutcome {
+    /// The named familiar's `icon` field was updated (or inserted) in-place.
+    Updated,
+    /// The named familiar's `icon` field was removed because the new value
+    /// was `None` or whitespace-only.
+    Cleared,
+    /// No `[[familiar]]` block in `familiars.toml` has a matching `id`.
+    NotFound,
+}
+
+/// Update (or clear) a familiar's `icon` field in `~/.coven/familiars.toml`,
+/// preserving the rest of the file's formatting + comments.
+///
+/// `icon = None` (or a whitespace-only `Some`) removes the field entirely.
+/// `icon = Some("ph:cat-fill")` or `Some("🐈‍⬛")` either inserts or replaces
+/// the value. Returns the [`WriteFamiliarIconOutcome`] so callers can map
+/// `NotFound` → 404 without re-reading the file.
+///
+/// Writes are atomic via `tempfile + rename` inside the same directory so a
+/// crash mid-write can never leave a half-written `familiars.toml`.
+pub fn write_familiar_icon(
+    coven_home: &Path,
+    familiar_id: &str,
+    icon: Option<&str>,
+) -> Result<WriteFamiliarIconOutcome> {
+    use toml_edit::{value, DocumentMut};
+
+    let path = coven_home.join(FAMILIARS_CONFIG_FILE);
+    let raw =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut doc: DocumentMut = raw
+        .parse()
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+
+    // Normalize whitespace-only icons to None at the boundary so the file
+    // never carries an empty glyph.
+    let normalized: Option<&str> = icon.and_then(|s| {
+        let t = s.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t)
+        }
+    });
+
+    // `[[familiar]]` arrays of tables live under the top-level `familiar`
+    // key as an `ArrayOfTables`. Scan for the table whose `id` matches.
+    let array = match doc
+        .get_mut("familiar")
+        .and_then(|item| item.as_array_of_tables_mut())
+    {
+        Some(arr) => arr,
+        None => return Ok(WriteFamiliarIconOutcome::NotFound),
+    };
+
+    let target = array.iter_mut().find(|tbl| {
+        tbl.get("id")
+            .and_then(|item| item.as_str())
+            .map(|s| s == familiar_id)
+            .unwrap_or(false)
+    });
+
+    let table = match target {
+        Some(t) => t,
+        None => return Ok(WriteFamiliarIconOutcome::NotFound),
+    };
+
+    let outcome = match normalized {
+        Some(s) => {
+            table["icon"] = value(s);
+            WriteFamiliarIconOutcome::Updated
+        }
+        None => {
+            if table.remove("icon").is_some() {
+                WriteFamiliarIconOutcome::Cleared
+            } else {
+                // Nothing to clear, but still a successful no-op write.
+                WriteFamiliarIconOutcome::Cleared
+            }
+        }
+    };
+
+    // Atomic write: write to a sibling tempfile in the same directory so the
+    // subsequent `rename` is on the same filesystem and POSIX-atomic. A crash
+    // mid-write can leave `.familiars.toml.tmp` behind but never a half-
+    // written `familiars.toml`.
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp_path = dir.join(".familiars.toml.tmp");
+    fs::write(&tmp_path, doc.to_string())
+        .with_context(|| format!("failed to write {}", tmp_path.display()))?;
+    fs::rename(&tmp_path, &path)
+        .with_context(|| format!("failed to rename tempfile over {}", path.display()))?;
+
+    Ok(outcome)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -400,6 +516,219 @@ description = "Builds and debugs."
         assert_eq!(out[1].id, "cody");
         assert!(out[1].pronouns.is_none());
         assert!(out[1].active_channel.is_none());
+        // No `icon` field set in this fixture — must round-trip as None.
+        assert!(out[0].icon.is_none());
+        assert!(out[1].icon.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn read_familiars_carries_icon_field_for_both_shapes() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        fs::write(
+            temp.path().join(FAMILIARS_CONFIG_FILE),
+            r#"
+[[familiar]]
+id = "cody"
+display_name = "Cody"
+role = "Code"
+description = "..."
+icon = "ph:lightning-fill"
+
+[[familiar]]
+id = "kitten"
+display_name = "Kitten"
+role = "General"
+description = "..."
+icon = "🐈‍⬛"
+
+[[familiar]]
+id = "whitespace"
+display_name = "Whitespace"
+role = "Edge case"
+description = "..."
+icon = "   "
+
+[[familiar]]
+id = "no-icon"
+display_name = "No icon"
+role = "Edge case"
+description = "..."
+"#,
+        )?;
+        let out = read_familiars(temp.path())?;
+        assert_eq!(out[0].icon.as_deref(), Some("ph:lightning-fill"));
+        assert_eq!(out[1].icon.as_deref(), Some("🐈‍⬛"));
+        // Whitespace-only icon must normalize to None so clients don't try to
+        // render an empty glyph.
+        assert!(
+            out[2].icon.is_none(),
+            "whitespace icon should normalize to None"
+        );
+        assert!(out[3].icon.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn familiar_dto_skips_serializing_absent_icon() -> Result<()> {
+        let dto_without = FamiliarDto {
+            id: "sage".to_string(),
+            name: "sage".to_string(),
+            display_name: "Sage".to_string(),
+            emoji: "🌿".to_string(),
+            icon: None,
+            role: "Research".to_string(),
+            description: "...".to_string(),
+            pronouns: None,
+            status: "offline".to_string(),
+            active_channel: None,
+            last_seen: "—".to_string(),
+            active_sessions: 0,
+            memory_freshness: "—".to_string(),
+        };
+        let json = serde_json::to_string(&dto_without)?;
+        assert!(
+            !json.contains("\"icon\""),
+            "absent icon must not appear on the wire: {json}"
+        );
+        let dto_with = FamiliarDto {
+            icon: Some("ph:cat-fill".to_string()),
+            ..dto_without
+        };
+        let json = serde_json::to_string(&dto_with)?;
+        assert!(json.contains("\"icon\":\"ph:cat-fill\""), "got {json}");
+        Ok(())
+    }
+
+    #[test]
+    fn write_familiar_icon_inserts_when_absent_and_preserves_other_fields() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        fs::write(
+            temp.path().join(FAMILIARS_CONFIG_FILE),
+            r#"# top of file
+[[familiar]]
+id = "cody"
+display_name = "Cody"
+role = "Code"
+description = "Builds and debugs."
+# trailing comment
+"#,
+        )?;
+        let outcome = write_familiar_icon(temp.path(), "cody", Some("ph:lightning-fill"))?;
+        assert_eq!(outcome, WriteFamiliarIconOutcome::Updated);
+        let raw = fs::read_to_string(temp.path().join(FAMILIARS_CONFIG_FILE))?;
+        assert!(raw.contains("icon = \"ph:lightning-fill\""), "got {raw}");
+        // Existing fields + comments must be preserved.
+        assert!(raw.contains("display_name = \"Cody\""));
+        assert!(raw.contains("# top of file"));
+        assert!(raw.contains("# trailing comment"));
+        // Round-trip through the reader.
+        let read = read_familiars(temp.path())?;
+        assert_eq!(read[0].icon.as_deref(), Some("ph:lightning-fill"));
+        Ok(())
+    }
+
+    #[test]
+    fn write_familiar_icon_replaces_existing_value() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        fs::write(
+            temp.path().join(FAMILIARS_CONFIG_FILE),
+            r#"[[familiar]]
+id = "cody"
+display_name = "Cody"
+role = "Code"
+description = "..."
+icon = "ph:lightning-fill"
+"#,
+        )?;
+        let outcome = write_familiar_icon(temp.path(), "cody", Some("🐈"))?;
+        assert_eq!(outcome, WriteFamiliarIconOutcome::Updated);
+        let raw = fs::read_to_string(temp.path().join(FAMILIARS_CONFIG_FILE))?;
+        assert!(raw.contains("icon = \"🐈\""), "got {raw}");
+        assert!(
+            !raw.contains("ph:lightning-fill"),
+            "old icon should be gone"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn write_familiar_icon_clears_field_when_value_is_none() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        fs::write(
+            temp.path().join(FAMILIARS_CONFIG_FILE),
+            r#"[[familiar]]
+id = "cody"
+display_name = "Cody"
+role = "Code"
+description = "..."
+icon = "ph:lightning-fill"
+"#,
+        )?;
+        let outcome = write_familiar_icon(temp.path(), "cody", None)?;
+        assert_eq!(outcome, WriteFamiliarIconOutcome::Cleared);
+        let raw = fs::read_to_string(temp.path().join(FAMILIARS_CONFIG_FILE))?;
+        assert!(!raw.contains("icon ="), "icon line must be removed: {raw}");
+        let read = read_familiars(temp.path())?;
+        assert!(read[0].icon.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn write_familiar_icon_treats_whitespace_as_clear() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        fs::write(
+            temp.path().join(FAMILIARS_CONFIG_FILE),
+            r#"[[familiar]]
+id = "cody"
+display_name = "Cody"
+role = "Code"
+description = "..."
+icon = "ph:lightning-fill"
+"#,
+        )?;
+        let outcome = write_familiar_icon(temp.path(), "cody", Some("   "))?;
+        assert_eq!(outcome, WriteFamiliarIconOutcome::Cleared);
+        let raw = fs::read_to_string(temp.path().join(FAMILIARS_CONFIG_FILE))?;
+        assert!(!raw.contains("icon ="), "icon line must be removed: {raw}");
+        Ok(())
+    }
+
+    #[test]
+    fn write_familiar_icon_returns_not_found_for_unknown_id() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        fs::write(
+            temp.path().join(FAMILIARS_CONFIG_FILE),
+            r#"[[familiar]]
+id = "cody"
+display_name = "Cody"
+role = "Code"
+description = "..."
+"#,
+        )?;
+        let outcome = write_familiar_icon(temp.path(), "ghost", Some("ph:ghost-fill"))?;
+        assert_eq!(outcome, WriteFamiliarIconOutcome::NotFound);
+        // File must be unchanged when not found.
+        let raw = fs::read_to_string(temp.path().join(FAMILIARS_CONFIG_FILE))?;
+        assert!(!raw.contains("ph:ghost-fill"));
+        Ok(())
+    }
+
+    #[test]
+    fn write_familiar_icon_leaves_no_tempfile_on_success() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        fs::write(
+            temp.path().join(FAMILIARS_CONFIG_FILE),
+            r#"[[familiar]]
+id = "cody"
+display_name = "Cody"
+role = "Code"
+description = "..."
+"#,
+        )?;
+        write_familiar_icon(temp.path(), "cody", Some("ph:cat-fill"))?;
+        let tmp_path = temp.path().join(".familiars.toml.tmp");
+        assert!(!tmp_path.exists(), "atomic write left a tempfile behind");
         Ok(())
     }
 

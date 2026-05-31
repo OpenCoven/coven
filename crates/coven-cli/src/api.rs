@@ -191,6 +191,12 @@ pub fn handle_request_with_runtime(
         ("GET", "/familiars") => {
             json_response(200, &crate::cockpit_sources::read_familiars(coven_home)?)
         }
+        ("PUT", path) if path.starts_with("/familiars/") && path.ends_with("/icon") => {
+            let id = path
+                .trim_start_matches("/familiars/")
+                .trim_end_matches("/icon");
+            update_familiar_icon(coven_home, id, body)
+        }
         ("GET", "/skills") => json_response(200, &crate::cockpit_sources::scan_skills(coven_home)?),
         ("GET", "/memory") => json_response(200, &crate::cockpit_sources::scan_memory(coven_home)?),
         ("GET", "/research") => {
@@ -919,6 +925,61 @@ fn insert_event(
             created_at: current_timestamp(),
         },
     )
+}
+
+fn update_familiar_icon(
+    coven_home: &Path,
+    familiar_id: &str,
+    body: Option<&str>,
+) -> Result<ApiResponse> {
+    if familiar_id.is_empty() || familiar_id.contains('/') {
+        return api_error(
+            400,
+            "invalid_request",
+            "Familiar id is required and must not contain '/'.",
+            None,
+        );
+    }
+    let payload = match parse_body(body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return api_error(400, "invalid_request", &error.to_string(), None);
+        }
+    };
+    // Accept `{ "icon": "ph:cat-fill" }`, `{ "icon": "🐈" }`, `{ "icon": null }`,
+    // or an empty body `{}` (treated as null → clear). Reject any non-string,
+    // non-null `icon` value so a typo doesn't silently write `[1,2,3]`.
+    let icon: Option<String> = match payload.get("icon") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => {
+            return api_error(
+                400,
+                "invalid_request",
+                "Field `icon` must be a string or null.",
+                None,
+            );
+        }
+    };
+    let outcome =
+        crate::cockpit_sources::write_familiar_icon(coven_home, familiar_id, icon.as_deref())?;
+    use crate::cockpit_sources::WriteFamiliarIconOutcome;
+    match outcome {
+        WriteFamiliarIconOutcome::Updated => json_response(
+            200,
+            &json!({ "ok": true, "action": "updated", "id": familiar_id }),
+        ),
+        WriteFamiliarIconOutcome::Cleared => json_response(
+            200,
+            &json!({ "ok": true, "action": "cleared", "id": familiar_id }),
+        ),
+        WriteFamiliarIconOutcome::NotFound => api_error(
+            404,
+            "familiar_not_found",
+            "No familiar with that id is declared in familiars.toml.",
+            Some(json!({ "id": familiar_id })),
+        ),
+    }
 }
 
 fn parse_body(body: Option<&str>) -> Result<Value> {
@@ -2751,5 +2812,143 @@ mod tests {
 
     fn fake_openai_key() -> String {
         format!("sk-{}", "c".repeat(40))
+    }
+
+    // ---- PUT /api/v1/familiars/{id}/icon ---------------------------------
+
+    fn seed_familiars_toml(home: &Path) -> Result<()> {
+        std::fs::write(
+            home.join("familiars.toml"),
+            r#"[[familiar]]
+id = "cody"
+display_name = "Cody"
+role = "Code"
+description = "Builds and debugs."
+
+[[familiar]]
+id = "sage"
+display_name = "Sage"
+role = "Research"
+description = "Reads and synthesizes."
+icon = "ph:leaf-fill"
+"#,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn put_familiar_icon_updates_existing_value() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_familiars_toml(home)?;
+        let response = handle_request_with_body(
+            "PUT",
+            "/api/v1/familiars/sage/icon",
+            home,
+            None,
+            Some(r#"{"icon":"🌿"}"#),
+        )?;
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["action"], "updated");
+        assert_eq!(body["id"], "sage");
+        let raw = std::fs::read_to_string(home.join("familiars.toml"))?;
+        assert!(raw.contains("icon = \"🌿\""), "got {raw}");
+        Ok(())
+    }
+
+    #[test]
+    fn put_familiar_icon_inserts_when_absent() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_familiars_toml(home)?;
+        let response = handle_request_with_body(
+            "PUT",
+            "/api/v1/familiars/cody/icon",
+            home,
+            None,
+            Some(r#"{"icon":"ph:lightning-fill"}"#),
+        )?;
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["action"], "updated");
+        let raw = std::fs::read_to_string(home.join("familiars.toml"))?;
+        assert!(raw.contains("icon = \"ph:lightning-fill\""), "got {raw}");
+        // Other familiar's icon must be untouched.
+        assert!(raw.contains("icon = \"ph:leaf-fill\""));
+        Ok(())
+    }
+
+    #[test]
+    fn put_familiar_icon_clears_when_null() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_familiars_toml(home)?;
+        let response = handle_request_with_body(
+            "PUT",
+            "/api/v1/familiars/sage/icon",
+            home,
+            None,
+            Some(r#"{"icon":null}"#),
+        )?;
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["action"], "cleared");
+        let raw = std::fs::read_to_string(home.join("familiars.toml"))?;
+        assert!(!raw.contains("ph:leaf-fill"));
+        Ok(())
+    }
+
+    #[test]
+    fn put_familiar_icon_returns_404_for_unknown_id() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_familiars_toml(home)?;
+        let response = handle_request_with_body(
+            "PUT",
+            "/api/v1/familiars/ghost/icon",
+            home,
+            None,
+            Some(r#"{"icon":"ph:ghost-fill"}"#),
+        )?;
+        assert_eq!(response.status, 404);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "familiar_not_found");
+        Ok(())
+    }
+
+    #[test]
+    fn put_familiar_icon_rejects_non_string_icon() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_familiars_toml(home)?;
+        let response = handle_request_with_body(
+            "PUT",
+            "/api/v1/familiars/sage/icon",
+            home,
+            None,
+            Some(r#"{"icon":[1,2,3]}"#),
+        )?;
+        assert_eq!(response.status, 400);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "invalid_request");
+        // File must be untouched.
+        let raw = std::fs::read_to_string(home.join("familiars.toml"))?;
+        assert!(raw.contains("ph:leaf-fill"));
+        Ok(())
+    }
+
+    #[test]
+    fn put_familiar_icon_with_empty_body_clears() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_familiars_toml(home)?;
+        let response =
+            handle_request_with_body("PUT", "/api/v1/familiars/sage/icon", home, None, None)?;
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["action"], "cleared");
+        Ok(())
     }
 }
