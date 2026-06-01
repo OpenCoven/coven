@@ -632,13 +632,55 @@ exit 7
         )?;
 
         assert_eq!(code, 7);
+        // One-shot mode (forward_stdin=false): `--input-format stream-json`
+        // is omitted so the positional prompt is honored. Including it
+        // makes claude wait for JSONL on stdin and ignore the positional —
+        // which is the bug this commit fixes.
         assert_eq!(
             std::fs::read_to_string(temp_dir.path().join("args.txt"))?,
-            "-p\n--input-format\nstream-json\n--output-format\nstream-json\n--verbose\n--session-id\nsession-123\nhello prompt\n"
+            "-p\n--output-format\nstream-json\n--verbose\n--session-id\nsession-123\nhello prompt\n"
         );
         assert_eq!(
             String::from_utf8(out)?,
             "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"hello\"}]},\"session_id\":\"session-123\",\"stop_reason\":\"end_turn\"}\n"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stream_claude_includes_input_format_when_forwarding_stdin() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir()?;
+        let fake_claude = temp_dir.path().join("fake-claude");
+        std::fs::write(
+            &fake_claude,
+            r#"#!/bin/sh
+printf '%s\n' "$@" > args.txt
+exit 0
+"#,
+        )?;
+        let mut permissions = std::fs::metadata(&fake_claude)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_claude, permissions)?;
+
+        let mut out = Vec::new();
+        let _code = stream_claude_with_program(
+            fake_claude.to_str().unwrap(),
+            temp_dir.path(),
+            "session-456",
+            "hello prompt",
+            // forward_stdin=true → long-lived chat mode where claude reads
+            // user messages as JSONL on stdin, so --input-format stream-json
+            // MUST be present.
+            true,
+            &mut out,
+        )?;
+
+        assert_eq!(
+            std::fs::read_to_string(temp_dir.path().join("args.txt"))?,
+            "-p\n--input-format\nstream-json\n--output-format\nstream-json\n--verbose\n--session-id\nsession-456\nhello prompt\n"
         );
         Ok(())
     }
