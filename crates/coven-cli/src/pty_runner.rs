@@ -687,6 +687,9 @@ exit 0
             temp_dir.path(),
             "session-456",
             "hello prompt",
+            // forward_stdin=true → long-lived chat mode where claude reads
+            // user messages as JSONL on stdin, so --input-format stream-json
+            // MUST be present.
             true,
             None,
             &mut out,
