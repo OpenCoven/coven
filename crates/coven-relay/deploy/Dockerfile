@@ -6,10 +6,12 @@ WORKDIR /build
 # Copy workspace manifests first for layer caching
 COPY Cargo.toml Cargo.lock ./
 COPY crates/coven-relay/Cargo.toml crates/coven-relay/Cargo.toml
+COPY crates/coven-cli/Cargo.toml crates/coven-cli/Cargo.toml
 
 # Dummy source to cache dependencies
-RUN mkdir -p crates/coven-relay/src && \
+RUN mkdir -p crates/coven-relay/src crates/coven-cli/src && \
     echo 'fn main() {}' > crates/coven-relay/src/main.rs && \
+    echo 'fn main() {}' > crates/coven-cli/src/main.rs && \
     cargo build --release -p coven-relay && \
     rm -rf crates/coven-relay/src
 
