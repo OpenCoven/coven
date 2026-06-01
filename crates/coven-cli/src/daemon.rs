@@ -990,6 +990,18 @@ pub fn serve_next_tcp_connection(
 pub fn bind_api_socket(coven_home: &Path) -> Result<UnixListener> {
     ensure_private_coven_home(coven_home)?;
     let socket_path = daemon_socket_path(coven_home);
+    // Fail closed if the socket path would resolve outside the trusted state
+    // directory: socket creation and cleanup must never cross the COVEN_HOME
+    // boundary. daemon_socket_path() builds `<coven_home>/coven.sock`, so this is
+    // an explicit guard so a future change can't let it escape. See docs/AUTH.md
+    // "Current hardening gap".
+    if socket_path.parent() != Some(coven_home) {
+        anyhow::bail!(
+            "refusing to bind Coven API socket {}: resolves outside Coven home {}",
+            socket_path.display(),
+            coven_home.display()
+        );
+    }
     // Only ever replace a genuine, non-symlink socket. Blindly removing
     // whatever sits at the path would follow an attacker-planted symlink or
     // delete an unrelated file. See docs/AUTH.md "Current hardening gap".
@@ -1846,6 +1858,15 @@ mod tests {
         let home_mode = std::fs::metadata(temp_dir.path())?.permissions().mode() & 0o777;
         assert_eq!(home_mode, 0o700);
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_socket_path_stays_inside_coven_home() {
+        // AUTH.md L134: the socket must resolve directly inside COVEN_HOME, so
+        // bind_api_socket's containment guard always holds for the derived path.
+        let home = std::path::Path::new("/some/coven/home");
+        assert_eq!(daemon_socket_path(home).parent(), Some(home));
     }
 
     #[cfg(unix)]
