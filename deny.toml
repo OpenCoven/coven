@@ -1,0 +1,31 @@
+# cargo-deny configuration — supply-chain gate for the Rust dependency tree.
+# Enforced in CI (.github/workflows/ci.yml). Docs: https://embarkstudios.github.io/cargo-deny/
+#
+# Scope is intentionally the security-relevant checks:
+#   * advisories — known vulnerabilities / RUSTSEC advisories, yanked crates
+#   * bans       — wildcard version requirements (and duplicate-version noise)
+#   * sources    — dependencies must come from the official crates.io registry
+#
+# License compliance is deliberately left out for now so this gate stays focused
+# on security and does not fail on license classification; it can be enabled as
+# a follow-up by adding a `[licenses]` allow-list and `check licenses` in CI.
+
+[advisories]
+# RUSTSEC advisory database. cargo-deny errors on vulnerabilities by default.
+# Refuse yanked crates — a yanked dependency is a supply-chain smell.
+yanked = "deny"
+# Only add advisory IDs here with a written justification, never silently.
+ignore = []
+
+[bans]
+# Duplicate transitive versions are common and noisy — surface but don't fail.
+multiple-versions = "warn"
+# Our own crates must pin real version requirements, never "*".
+wildcards = "deny"
+
+[sources]
+# Only the official crates.io registry is trusted. Reject unknown registries
+# and any git sources (there are none today).
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
