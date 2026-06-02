@@ -148,12 +148,29 @@ impl LiveSessionRuntime {
 
 impl SessionRuntime for LiveSessionRuntime {
     fn launch_session(&self, launch: &SessionLaunch) -> Result<()> {
+        let familiar_ctx = launch
+            .familiar_id
+            .as_deref()
+            .and_then(|fid| {
+                self.coven_home.as_ref().and_then(|home| {
+                    crate::cockpit_sources::read_familiars(home).ok().and_then(|familiars| {
+                        familiars.into_iter().find(|f| f.id == fid).map(|f| {
+                            crate::harness::FamiliarContext {
+                                id: f.id,
+                                display_name: f.display_name,
+                                role: Some(f.role).filter(|r| !r.is_empty()),
+                            }
+                        })
+                    })
+                })
+            });
         let command = pty_runner::build_harness_command_with_conversation(
             &launch.harness,
             &launch.prompt,
             Path::new(&launch.cwd),
             launch.launch_mode,
             launch.conversation.as_ref(),
+            familiar_ctx.as_ref(),
         )?;
         let observer = self
             .coven_home
@@ -1380,6 +1397,7 @@ mod tests {
             title: "stream codex (should be rejected)".to_string(),
             conversation: None,
             conversation_id: None,
+            familiar_id: None,
         };
 
         let error = SessionRuntime::launch_session(&runtime, &launch).unwrap_err();

@@ -107,6 +107,12 @@ enum Command {
         archive: bool,
         #[arg(
             long,
+            value_name = "ID",
+            help = "Familiar id to inject as identity context (e.g. charm). \nThe harness-agnostic identity preamble is injected via each harness's \npreferred mechanism (--system-prompt flag or prompt prefix)."
+        )]
+        familiar: Option<String>,
+        #[arg(
+            long,
             help = "Emit JSONL events on stdout (system.init / user / assistant / tool_result / result)"
         )]
         stream_json: bool,
@@ -270,6 +276,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             labels,
             visibility,
             archive,
+            familiar,
             stream_json,
             stream_json_input,
         }) => run_session(
@@ -282,6 +289,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             labels,
             visibility.as_deref(),
             archive,
+            familiar.as_deref(),
             stream_json,
             stream_json_input,
         ),
@@ -842,6 +850,7 @@ fn run_session(
     labels: Vec<String>,
     visibility: Option<&str>,
     archive: bool,
+    familiar_id: Option<&str>,
     stream_json: bool,
     stream_json_input: bool,
 ) -> Result<()> {
@@ -877,6 +886,32 @@ fn run_session(
         String::new()
     } else {
         prompt_refs::expand_all(&cwd, &conn, &prompt)?
+    };
+
+    // Resolve familiar identity and build effective prompt.
+    // For harnesses with a dedicated --system-prompt flag, identity is injected
+    // via that flag in build_harness_command_with_conversation; the prompt stays
+    // clean. For harnesses without one (Codex), we prepend a bracketed identity
+    // preamble to the prompt here so the integration layer remains harness-agnostic.
+    let familiar_ctx: Option<harness::FamiliarContext> = familiar_id.and_then(|fid| {
+        coven_home_dir().ok().and_then(|home| {
+            cockpit_sources::read_familiars(&home).ok().and_then(|familiars| {
+                familiars.into_iter().find(|f| f.id == fid).map(|f| harness::FamiliarContext {
+                    id: f.id,
+                    display_name: f.display_name,
+                    role: Some(f.role).filter(|r| !r.is_empty()),
+                })
+            })
+        })
+    });
+    let spec = harness::built_in_harness_specs()
+        .into_iter()
+        .find(|s| s.id == selected_harness.id);
+    let effective_prompt = match (&familiar_ctx, spec.as_ref()) {
+        (Some(f), Some(s)) if s.system_prompt_flag.is_none() && !expanded_prompt.is_empty() => {
+            format!("{preamble}\n\n{prompt}", preamble = f.identity_preamble(), prompt = expanded_prompt)
+        }
+        _ => expanded_prompt.clone(),
     };
 
     // Resolve --continue: explicit id, "" (latest), or None (new session).
@@ -1015,11 +1050,15 @@ fn run_session(
     if stream_json && selected_harness.id == "claude" {
         let stdout = io::stdout();
         let mut handle = stdout.lock();
+        let claude_system_prompt: Option<String> = familiar_ctx
+            .as_ref()
+            .map(|f| f.identity_preamble());
         let exit_code = pty_runner::stream_claude(
             &cwd,
             &record.id,
-            &expanded_prompt,
+            &effective_prompt,
             stream_json_input,
+            claude_system_prompt.as_deref(),
             &mut handle,
         );
         drop(handle);
@@ -1092,12 +1131,21 @@ fn run_session(
     } else {
         None
     };
+    // Only pass familiar_ctx to the arg builder for harnesses that have a
+    // system_prompt_flag (e.g. Claude). For harnesses without one (e.g. Codex)
+    // the preamble is already embedded in effective_prompt — passing ctx here
+    // too would produce a double-injection.
+    let familiar_for_args = spec
+        .as_ref()
+        .filter(|s| s.system_prompt_flag.is_some())
+        .and(familiar_ctx.as_ref());
     let command = pty_runner::build_harness_command_with_conversation(
         selected_harness.id,
-        &expanded_prompt,
+        &effective_prompt,
         &cwd,
         harness_launch_mode_for_stdio(),
         conversation_hint.as_ref(),
+        familiar_for_args,
     )?;
     match pty_runner::run_attached(&command) {
         Ok(result) => {

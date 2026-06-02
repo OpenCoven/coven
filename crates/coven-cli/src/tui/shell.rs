@@ -1199,6 +1199,7 @@ fn dispatch_via_local_pty(
         Vec::new(),
         None,
         false,
+        None,
         false,
         false,
     )?;
@@ -1886,6 +1887,7 @@ fn run_guided_harness_session() -> Result<()> {
         Vec::new(),
         None,
         false,
+        None,
         false,
         false,
     )

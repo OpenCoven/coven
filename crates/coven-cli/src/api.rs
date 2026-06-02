@@ -76,6 +76,11 @@ pub struct SessionLaunch {
     /// chat layer typically passes a chat-generated UUID stable for the
     /// lifetime of the conversation. `None` = ungrouped (one-off run).
     pub conversation_id: Option<String>,
+    /// Optional familiar id (e.g. `"charm"`) whose identity should be injected
+    /// into the harness invocation. The daemon resolves this to a `FamiliarContext`
+    /// using the local familiars config and passes it to the harness arg builder.
+    /// `None` = no identity injection (backwards-compatible default).
+    pub familiar_id: Option<String>,
 }
 
 pub trait SessionRuntime {
@@ -376,6 +381,12 @@ fn session_launch_from_payload(payload: Value) -> Result<SessionLaunch> {
         .map(str::trim)
         .filter(|id| !id.is_empty())
         .map(ToOwned::to_owned);
+    let familiar_id = payload
+        .get("familiarId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned);
 
     Ok(SessionLaunch {
         id: Uuid::new_v4().to_string(),
@@ -387,6 +398,7 @@ fn session_launch_from_payload(payload: Value) -> Result<SessionLaunch> {
         title,
         conversation,
         conversation_id,
+        familiar_id,
     })
 }
 

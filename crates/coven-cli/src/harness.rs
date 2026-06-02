@@ -94,6 +94,10 @@ pub struct HarnessCommandSpec {
     pub interactive_prompt_prefix_args: &'static [&'static str],
     pub non_interactive_prompt_prefix_args: &'static [&'static str],
     pub install_hint: &'static str,
+    /// CLI flag name to pass a system-prompt string (e.g. `Some("--system-prompt")`
+    /// for Claude). `None` means the harness has no such flag and identity
+    /// should be injected by prepending a preamble to the prompt instead.
+    pub system_prompt_flag: Option<&'static str>,
 }
 
 impl HarnessCommandSpec {
@@ -128,6 +132,39 @@ pub fn built_in_harnesses() -> Vec<HarnessSummary> {
         .collect()
 }
 
+/// Familiar identity context passed down from `coven run --familiar`.
+/// Each harness spec decides how to surface this to the underlying CLI
+/// (prompt prefix, `--system-prompt` flag, env var, etc.) so the
+/// integration layer is harness-agnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FamiliarContext {
+    /// Canonical familiar id (e.g. `"charm"`).
+    pub id: String,
+    /// Human display name (e.g. `"Charm"`).
+    pub display_name: String,
+    /// Short role/theme description (e.g. `"Voice, Social, and Presence Familiar"`).
+    pub role: Option<String>,
+}
+
+impl FamiliarContext {
+    /// Render a concise identity preamble suitable for prepending to a prompt
+    /// or injecting as a system-prompt block. Kept intentionally short so it
+    /// doesn't crowd the actual task.
+    pub fn identity_preamble(&self) -> String {
+        match &self.role {
+            Some(role) => format!(
+                "[Identity: You are {name}, a {role}. Respond as {name}, not as the underlying tool.]",
+                name = self.display_name,
+                role = role,
+            ),
+            None => format!(
+                "[Identity: You are {name}. Respond as {name}, not as the underlying tool.]",
+                name = self.display_name,
+            ),
+        }
+    }
+}
+
 pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
     vec![
         HarnessCommandSpec {
@@ -142,6 +179,9 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
                 "never",
             ],
             install_hint: "Install Codex with `npm install -g @openai/codex` or `brew install --cask codex`; if it is already installed, make sure `codex` is on PATH and run `codex login` or `codex` once to authenticate, then retry `coven doctor`.",
+            // Codex has no --system-prompt flag; identity is injected as a
+            // bracketed preamble prepended to the prompt.
+            system_prompt_flag: None,
         },
         HarnessCommandSpec {
             id: "claude",
@@ -150,6 +190,7 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
             interactive_prompt_prefix_args: &[],
             non_interactive_prompt_prefix_args: &["--print"],
             install_hint: "Install Claude Code with `npm install -g @anthropic-ai/claude-code`; if it is already installed, make sure `claude` is on PATH and run `claude doctor` to finish local auth/setup, then retry `coven doctor`.",
+            system_prompt_flag: Some("--system-prompt"),
         },
     ]
 }
@@ -160,7 +201,7 @@ pub fn command_parts_for_harness(
     prompt: &str,
     mode: HarnessLaunchMode,
 ) -> Result<(&'static str, Vec<String>)> {
-    command_parts_for_harness_with_conversation(harness_id, prompt, mode, None)
+    command_parts_for_harness_with_conversation(harness_id, prompt, mode, None, None)
 }
 
 /// Build a harness command line, optionally injecting session-continuity
@@ -177,38 +218,67 @@ pub fn command_parts_for_harness_with_conversation(
     prompt: &str,
     mode: HarnessLaunchMode,
     hint: Option<&ConversationHint>,
+    familiar: Option<&FamiliarContext>,
 ) -> Result<(&'static str, Vec<String>)> {
     let spec = built_in_harness_specs()
         .into_iter()
         .find(|spec| spec.id == harness_id)
         .ok_or_else(|| anyhow!("unsupported harness `{harness_id}`"))?;
 
+    // Resolve effective prompt: inject familiar identity preamble when present.
+    // Harnesses with a dedicated --system-prompt flag get identity there instead,
+    // keeping the task prompt clean.
+    let has_system_prompt_flag = spec.system_prompt_flag.is_some();
+    let effective_prompt = match familiar {
+        Some(f) if !has_system_prompt_flag => {
+            format!("{preamble}\n\n{prompt}", preamble = f.identity_preamble())
+        }
+        _ => prompt.to_string(),
+    };
+
     // Stream mode reads prompts from stdin as JSON messages, so the prompt
     // argument is not appended. The continuity hint (claude resume / init)
     // still maps to a CLI flag; codex falls back to one-shot.
     if mode == HarnessLaunchMode::Stream {
-        if let Some(args) = stream_args(&spec, hint) {
+        if let Some(mut args) = stream_args(&spec, hint) {
+            // Claude stream mode: inject identity via --system-prompt flag.
+            if let (Some(flag), Some(f)) = (spec.system_prompt_flag, familiar) {
+                args.insert(0, f.identity_preamble());
+                args.insert(0, flag.to_string());
+            }
             return Ok((spec.executable, args));
         }
         // Harness doesn't support stream: fall through to non-interactive.
         return Ok((
             spec.executable,
-            spec.prompt_args(prompt, HarnessLaunchMode::NonInteractive),
+            spec.prompt_args(&effective_prompt, HarnessLaunchMode::NonInteractive),
         ));
     }
 
     if let Some(hint) = hint {
-        if let Some(args) = continuity_args(&spec, mode, hint) {
+        if let Some(mut args) = continuity_args(&spec, mode, hint) {
+            // Inject identity via --system-prompt for harnesses that support it.
+            if let (Some(flag), Some(f)) = (spec.system_prompt_flag, familiar) {
+                args.insert(0, f.identity_preamble());
+                args.insert(0, flag.to_string());
+            }
             return Ok((
                 spec.executable,
                 args.into_iter()
-                    .chain(std::iter::once(prompt.to_string()))
+                    .chain(std::iter::once(effective_prompt))
                     .collect(),
             ));
         }
     }
 
-    Ok((spec.executable, spec.prompt_args(prompt, mode)))
+    let mut args = spec.prompt_args(&effective_prompt, mode);
+    // Inject identity via --system-prompt for harnesses that support it,
+    // prepending before the prompt args.
+    if let (Some(flag), Some(f)) = (spec.system_prompt_flag, familiar) {
+        args.insert(0, f.identity_preamble());
+        args.insert(0, flag.to_string());
+    }
+    Ok((spec.executable, args))
 }
 
 /// Per-harness translation of stream-mode launch into CLI args. Stream-mode
@@ -496,6 +566,7 @@ mod tests {
             interactive_prompt_prefix_args: &["chat"],
             non_interactive_prompt_prefix_args: &["exec", "-q"],
             install_hint: "Install the future harness.",
+            system_prompt_flag: None,
         };
 
         assert_eq!(
@@ -528,6 +599,7 @@ mod tests {
             "hello",
             HarnessLaunchMode::NonInteractive,
             Some(&hint),
+            None,
         )?;
         assert_eq!(
             parts,
@@ -554,6 +626,7 @@ mod tests {
             "follow up",
             HarnessLaunchMode::NonInteractive,
             Some(&hint),
+            None,
         )?;
         assert_eq!(
             parts,
@@ -580,8 +653,9 @@ mod tests {
             "hello",
             HarnessLaunchMode::Interactive,
             Some(&hint),
-        )?;
-        assert_eq!(parts, ("claude", vec!["hello".to_string()]));
+            None,
+        );
+        assert_eq!(parts.unwrap(), ("claude", vec!["hello".to_string()]));
         Ok(())
     }
 
@@ -596,6 +670,7 @@ mod tests {
             "fix tests",
             HarnessLaunchMode::NonInteractive,
             Some(&hint),
+            None,
         )?;
         assert_eq!(
             parts,
@@ -623,6 +698,7 @@ mod tests {
             "follow up",
             HarnessLaunchMode::NonInteractive,
             Some(&hint),
+            None,
         )?;
         assert_eq!(
             parts,
@@ -655,6 +731,7 @@ mod tests {
             "claude",
             "hello",
             HarnessLaunchMode::NonInteractive,
+            None,
             None,
         )?;
         let legacy =

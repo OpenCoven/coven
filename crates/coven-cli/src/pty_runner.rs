@@ -59,7 +59,7 @@ pub fn build_harness_command(
     cwd: &Path,
     mode: crate::harness::HarnessLaunchMode,
 ) -> Result<HarnessCommand> {
-    build_harness_command_with_conversation(harness_id, prompt, cwd, mode, None)
+    build_harness_command_with_conversation(harness_id, prompt, cwd, mode, None, None)
 }
 
 pub fn build_harness_command_with_conversation(
@@ -68,12 +68,14 @@ pub fn build_harness_command_with_conversation(
     cwd: &Path,
     mode: crate::harness::HarnessLaunchMode,
     conversation: Option<&crate::harness::ConversationHint>,
+    familiar: Option<&crate::harness::FamiliarContext>,
 ) -> Result<HarnessCommand> {
     let (program, args) = crate::harness::command_parts_for_harness_with_conversation(
         harness_id,
         prompt,
         mode,
         conversation,
+        familiar,
     )?;
 
     Ok(HarnessCommand {
@@ -103,9 +105,10 @@ pub fn stream_claude<W: Write>(
     session_id: &str,
     prompt: &str,
     forward_stdin: bool,
+    system_prompt: Option<&str>,
     out: &mut W,
 ) -> Result<i32> {
-    stream_claude_with_program("claude", cwd, session_id, prompt, forward_stdin, out)
+    stream_claude_with_program("claude", cwd, session_id, prompt, forward_stdin, system_prompt, out)
 }
 
 fn stream_claude_with_program<W: Write>(
@@ -114,18 +117,15 @@ fn stream_claude_with_program<W: Write>(
     session_id: &str,
     prompt: &str,
     forward_stdin: bool,
+    system_prompt: Option<&str>,
     out: &mut W,
 ) -> Result<i32> {
-    // `--input-format stream-json` makes claude read user messages as JSONL
-    // on stdin and IGNORE the positional <prompt>. We only want that mode
-    // when the caller is feeding stdin (long-lived chat); for one-shot turns
-    // we drop `--input-format stream-json` so the positional prompt is honored.
-    // Without this branch, one-shot turns hang on stdin then exit with no
-    // assistant text — the symptom that surfaces in Cave as
-    // `_The "claude" harness completed but produced no output._`
     let mut args: Vec<&str> = vec!["-p"];
     if forward_stdin {
         args.extend_from_slice(&["--input-format", "stream-json"]);
+    }
+    if let Some(sp) = system_prompt {
+        args.extend_from_slice(&["--system-prompt", sp]);
     }
     args.extend_from_slice(&[
         "--output-format",
@@ -628,6 +628,7 @@ exit 7
             "session-123",
             "hello prompt",
             false,
+            None,
             &mut out,
         )?;
 
@@ -671,10 +672,8 @@ exit 0
             temp_dir.path(),
             "session-456",
             "hello prompt",
-            // forward_stdin=true → long-lived chat mode where claude reads
-            // user messages as JSONL on stdin, so --input-format stream-json
-            // MUST be present.
             true,
+            None,
             &mut out,
         )?;
 
