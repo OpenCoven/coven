@@ -1245,6 +1245,28 @@ impl App {
                 "  Next     install or authenticate a supported harness".to_string()
             });
         lines.push(next);
+        // Capabilities
+        lines.push("  Capabilities".to_string());
+        let home = std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+        for (harness_id, label) in &[("codex", "Codex"), ("claude", "Claude")] {
+            let m = if *harness_id == "codex" {
+                crate::capabilities::scan_codex_capabilities(&home)
+            } else {
+                crate::capabilities::scan_claude_capabilities(&home)
+            };
+            let instr = if m.global_instructions.present {
+                "✓"
+            } else {
+                "—"
+            };
+            let skills_n = m.skills.len();
+            let plugins_n = m.plugins.len();
+            lines.push(format!(
+                "    {label:<11} instructions {instr}  automations {skills_n}  plugins {plugins_n}"
+            ));
+        }
         self.push_system_message(&lines.join("\n"));
     }
 

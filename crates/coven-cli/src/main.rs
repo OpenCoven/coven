@@ -11,6 +11,7 @@ use clap::{Parser, Subcommand};
 use uuid::Uuid;
 
 mod api;
+mod capabilities;
 mod cockpit_sources;
 mod control_plane;
 mod daemon;

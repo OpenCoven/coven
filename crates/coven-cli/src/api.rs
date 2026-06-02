@@ -198,6 +198,19 @@ pub fn handle_request_with_runtime(
             update_familiar_icon(coven_home, id, body)
         }
         ("GET", "/skills") => json_response(200, &crate::cockpit_sources::scan_skills(coven_home)?),
+        ("GET", p) if p == "/capabilities" || p.starts_with("/capabilities?") => {
+            let refresh = query.map(|q| q.contains("refresh=1")).unwrap_or(false);
+            let resp = crate::capabilities::get_all(coven_home, refresh);
+            json_response(200, &resp)
+        }
+        ("GET", p) if p.starts_with("/capabilities/") => {
+            let harness_id = p.trim_start_matches("/capabilities/");
+            let refresh = query.map(|q| q.contains("refresh=1")).unwrap_or(false);
+            match crate::capabilities::get_one(coven_home, harness_id, refresh) {
+                Some(m) => json_response(200, &m),
+                None => json_response(404, &serde_json::json!({"error": "unknown harness"})),
+            }
+        }
         ("GET", "/memory") => json_response(200, &crate::cockpit_sources::scan_memory(coven_home)?),
         ("GET", "/research") => {
             json_response(200, &crate::cockpit_sources::read_research(coven_home)?)
