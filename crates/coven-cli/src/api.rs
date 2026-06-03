@@ -337,6 +337,7 @@ fn launch_session(
         created_at: now.clone(),
         updated_at: now,
         conversation_id: launch.conversation_id.clone(),
+        familiar_id: launch.familiar_id.clone(),
         labels: Vec::new(),
         visibility: "private".to_string(),
     };
@@ -745,6 +746,7 @@ fn ensure_cockpit_session(conn: &rusqlite::Connection) -> Result<()> {
         created_at: now.clone(),
         updated_at: now,
         conversation_id: None,
+        familiar_id: None,
         labels: Vec::new(),
         visibility: "private".to_string(),
     };
@@ -1286,6 +1288,7 @@ mod tests {
             created_at: "2026-04-27T10:00:00Z".to_string(),
             updated_at: "2026-04-27T10:00:00Z".to_string(),
             conversation_id: None,
+            familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
         };
@@ -2187,6 +2190,7 @@ mod tests {
             created_at: "2026-04-27T10:00:00Z".to_string(),
             updated_at: "2026-04-27T10:00:00Z".to_string(),
             conversation_id: None,
+            familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
         };
@@ -2491,6 +2495,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             conversation_id: None,
+            familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
         };
@@ -2528,6 +2533,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             conversation_id: None,
+            familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
         };
@@ -2570,6 +2576,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             conversation_id: None,
+            familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
         };
@@ -2606,6 +2613,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             conversation_id: None,
+            familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
         };
@@ -2719,6 +2727,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             conversation_id: None,
+            familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
         };
@@ -2819,6 +2828,7 @@ mod tests {
                     created_at: now.into(),
                     updated_at: now.into(),
                     conversation_id: None,
+                    familiar_id: None,
                     labels: Vec::new(),
                     visibility: "private".to_string(),
                 },

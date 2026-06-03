@@ -576,6 +576,7 @@ fn create_local_quest_anchor(
         created_at: timestamp.clone(),
         updated_at: timestamp.clone(),
         conversation_id: None,
+        familiar_id: None,
         labels: Vec::new(),
         visibility: "private".to_string(),
     };

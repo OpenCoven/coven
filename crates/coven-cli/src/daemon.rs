@@ -2387,6 +2387,7 @@ mod tests {
                 created_at: "2026-04-27T10:00:00Z".to_string(),
                 updated_at: "2026-04-27T10:00:00Z".to_string(),
                 conversation_id: None,
+                familiar_id: None,
                 labels: Vec::new(),
                 visibility: "private".to_string(),
             },
@@ -2551,6 +2552,7 @@ mod tests {
             created_at: "2026-04-27T07:00:00Z".to_string(),
             updated_at: "2026-04-27T07:00:00Z".to_string(),
             conversation_id: None,
+            familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
         }

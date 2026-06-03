@@ -660,6 +660,7 @@ fn launch_patch_session(request: &patch::PatchRequest) -> Result<String> {
         created_at: now.clone(),
         updated_at: now.clone(),
         conversation_id: None,
+        familiar_id: None,
         labels: Vec::new(),
         visibility: "private".to_string(),
     };
@@ -972,6 +973,7 @@ fn run_session(
             created_at: now.clone(),
             updated_at: now,
             conversation_id: None,
+            familiar_id: familiar_id.map(|s| s.to_string()),
             labels,
             visibility: visibility.unwrap_or("private").to_string(),
         };
@@ -2370,6 +2372,7 @@ mod tests {
             created_at: "2026-04-27T06:00:00Z".to_string(),
             updated_at: "2026-04-27T06:00:00Z".to_string(),
             conversation_id: None,
+            familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
         };
@@ -2393,6 +2396,7 @@ mod tests {
             created_at: "2026-05-14T07:00:00Z".to_string(),
             updated_at: "2026-05-14T07:00:01Z".to_string(),
             conversation_id: None,
+            familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
         };
@@ -2507,6 +2511,7 @@ mod tests {
             created_at: "2026-05-08T07:00:00Z".to_string(),
             updated_at: "2026-05-08T07:05:00Z".to_string(),
             conversation_id: None,
+            familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
         }

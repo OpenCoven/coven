@@ -30,6 +30,14 @@ pub struct SessionRecord {
     /// resume` and grouping. See `docs/chat-persistence.md`.
     #[serde(default)]
     pub conversation_id: Option<String>,
+    /// Familiar id this session was launched with (`coven run --familiar <id>`).
+    /// Lets clients group sessions by familiar without maintaining a sidecar map.
+    /// `None` for legacy sessions and direct `coven run` invocations without
+    /// the flag. Backfilled by `cwd → ~/.openclaw/workspace/<id>` heuristics
+    /// remains the responsibility of the client (e.g. coven-cave); the daemon
+    /// only persists what the launcher explicitly passed in.
+    #[serde(default)]
+    pub familiar_id: Option<String>,
     #[serde(default)]
     pub labels: Vec<String>,
     #[serde(default = "default_visibility")]
@@ -113,7 +121,8 @@ pub fn open_store(path: &Path) -> Result<Connection> {
             updated_at TEXT NOT NULL,
             conversation_id TEXT,
             labels TEXT,
-            visibility TEXT NOT NULL DEFAULT 'private'
+            visibility TEXT NOT NULL DEFAULT 'private',
+            familiar_id TEXT
         );
 
         CREATE TABLE IF NOT EXISTS events (
@@ -188,6 +197,7 @@ pub fn open_store(path: &Path) -> Result<Connection> {
     ensure_sensitive_artifacts_table(&conn)?;
     ensure_labels_column(&conn)?;
     ensure_visibility_column(&conn)?;
+    ensure_familiar_id_column(&conn)?;
 
     // Backfill: copy any existing events into the FTS index. Safe on fresh dbs.
     conn.execute(
@@ -381,6 +391,25 @@ fn ensure_visibility_column(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_familiar_id_column(conn: &Connection) -> Result<()> {
+    ensure_column(
+        conn,
+        "sessions",
+        "familiar_id",
+        "ALTER TABLE sessions ADD COLUMN familiar_id TEXT",
+    )?;
+    // Index makes "sessions for familiar X" cheap. The column is sparse on
+    // existing stores (legacy sessions are NULL until the client migrates),
+    // so a partial index keeps it small.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_familiar_id
+            ON sessions(familiar_id) WHERE familiar_id IS NOT NULL",
+        [],
+    )
+    .context("failed to create sessions.familiar_id index")?;
+    Ok(())
+}
+
 pub fn upsert_repository(conn: &Connection, record: &RepositoryRecord) -> Result<()> {
     conn.execute(
         "INSERT INTO repositories (
@@ -455,8 +484,8 @@ pub fn insert_session(conn: &Connection, record: &SessionRecord) -> Result<()> {
     conn.execute(
         "INSERT INTO sessions (
             id, project_root, harness, title, status, exit_code, archived_at,
-            created_at, updated_at, conversation_id, labels, visibility
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            created_at, updated_at, conversation_id, labels, visibility, familiar_id
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             &record.id,
             &record.project_root,
@@ -470,6 +499,7 @@ pub fn insert_session(conn: &Connection, record: &SessionRecord) -> Result<()> {
             &record.conversation_id,
             labels_json,
             &record.visibility,
+            &record.familiar_id,
         ],
     )
     .with_context(|| format!("failed to insert session {}", record.id))?;
@@ -487,8 +517,8 @@ pub fn insert_session_if_absent(conn: &Connection, record: &SessionRecord) -> Re
         .execute(
             "INSERT OR IGNORE INTO sessions (
                 id, project_root, harness, title, status, exit_code, archived_at,
-                created_at, updated_at, conversation_id, labels, visibility
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                created_at, updated_at, conversation_id, labels, visibility, familiar_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 &record.id,
                 &record.project_root,
@@ -502,6 +532,7 @@ pub fn insert_session_if_absent(conn: &Connection, record: &SessionRecord) -> Re
                 &record.conversation_id,
                 labels_json,
                 &record.visibility,
+                &record.familiar_id,
             ],
         )
         .with_context(|| format!("failed to upsert session {}", record.id))?;
@@ -578,7 +609,8 @@ fn list_sessions_with_archive_filter(
                 updated_at,
                 conversation_id,
                 labels,
-                visibility
+                visibility,
+                familiar_id
             FROM sessions
             {archive_filter}
             ORDER BY created_at DESC, id DESC",
@@ -612,6 +644,7 @@ fn list_sessions_with_archive_filter(
                 created_at: row.get(7)?,
                 updated_at: row.get(8)?,
                 conversation_id: row.get(9)?,
+                familiar_id: row.get(12)?,
                 labels,
                 visibility,
             })
@@ -1831,6 +1864,7 @@ mod tests {
             created_at: created_at.to_string(),
             updated_at: created_at.to_string(),
             conversation_id: None,
+            familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
         }
@@ -1891,8 +1925,88 @@ mod tests {
             conn.query_row("SELECT visibility FROM sessions WHERE id='s1'", [], |row| {
                 row.get(0)
             })?;
+        let familiar_id: Option<String> = conn.query_row(
+            "SELECT familiar_id FROM sessions WHERE id='s1'",
+            [],
+            |row| row.get(0),
+        )?;
         assert_eq!(labels, None);
         assert_eq!(visibility, "private");
+        assert_eq!(familiar_id, None);
+        Ok(())
+    }
+
+    #[test]
+    fn familiar_id_round_trips_through_insert_and_list() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("test.sqlite3"))?;
+        let mut nova = session_record("with-fam", "2026-06-03T00:00:00Z");
+        nova.familiar_id = Some("nova".to_string());
+        let plain = session_record("no-fam", "2026-06-03T00:00:01Z");
+        insert_session(&conn, &nova)?;
+        insert_session(&conn, &plain)?;
+
+        let listed = list_sessions(&conn)?;
+        let with_fam = listed.iter().find(|s| s.id == "with-fam").unwrap();
+        let no_fam = listed.iter().find(|s| s.id == "no-fam").unwrap();
+        assert_eq!(with_fam.familiar_id.as_deref(), Some("nova"));
+        assert_eq!(no_fam.familiar_id, None);
+        Ok(())
+    }
+
+    #[test]
+    fn familiar_id_index_exists_after_open() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("test.sqlite3"))?;
+        // Sanity: column + index were created by open_store / ensure_familiar_id_column.
+        let cols = table_columns(&conn, "sessions")?;
+        assert!(
+            cols.iter().any(|c| c == "familiar_id"),
+            "sessions.familiar_id column missing; cols={cols:?}"
+        );
+        let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type='index'")?;
+        let indexes: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert!(
+            indexes.iter().any(|i| i == "idx_sessions_familiar_id"),
+            "idx_sessions_familiar_id missing; indexes={indexes:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_db_without_familiar_id_column_migrates_in_place() -> Result<()> {
+        // Simulate a pre-feature store: a session row that pre-dates the
+        // familiar_id column. open_store must add the column without
+        // dropping or rewriting any existing rows.
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("legacy.sqlite3");
+        {
+            let legacy = Connection::open(&path)?;
+            legacy.execute_batch(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    project_root TEXT NOT NULL,
+                    harness TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                INSERT INTO sessions(id, project_root, harness, title, status, created_at, updated_at)
+                  VALUES ('legacy-1', '/tmp', 'codex', 'old', 'completed', '2026-01-01', '2026-01-01');",
+            )?;
+        }
+        let conn = open_store(&path)?;
+        let cols = table_columns(&conn, "sessions")?;
+        assert!(cols.iter().any(|c| c == "familiar_id"));
+        let familiar_id: Option<String> = conn.query_row(
+            "SELECT familiar_id FROM sessions WHERE id='legacy-1'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(familiar_id, None);
         Ok(())
     }
 
