@@ -901,13 +901,18 @@ fn run_session(
     // preamble to the prompt here so the integration layer remains harness-agnostic.
     let familiar_ctx: Option<harness::FamiliarContext> = familiar_id.and_then(|fid| {
         coven_home_dir().ok().and_then(|home| {
-            cockpit_sources::read_familiars(&home).ok().and_then(|familiars| {
-                familiars.into_iter().find(|f| f.id == fid).map(|f| harness::FamiliarContext {
-                    id: f.id,
-                    display_name: f.display_name,
-                    role: Some(f.role).filter(|r| !r.is_empty()),
+            cockpit_sources::read_familiars(&home)
+                .ok()
+                .and_then(|familiars| {
+                    familiars
+                        .into_iter()
+                        .find(|f| f.id == fid)
+                        .map(|f| harness::FamiliarContext {
+                            id: f.id,
+                            display_name: f.display_name,
+                            role: Some(f.role).filter(|r| !r.is_empty()),
+                        })
                 })
-            })
         })
     });
     let spec = harness::built_in_harness_specs()
@@ -915,7 +920,11 @@ fn run_session(
         .find(|s| s.id == selected_harness.id);
     let effective_prompt = match (&familiar_ctx, spec.as_ref()) {
         (Some(f), Some(s)) if s.system_prompt_flag.is_none() && !expanded_prompt.is_empty() => {
-            format!("{preamble}\n\n{prompt}", preamble = f.identity_preamble(), prompt = expanded_prompt)
+            format!(
+                "{preamble}\n\n{prompt}",
+                preamble = f.identity_preamble(),
+                prompt = expanded_prompt
+            )
         }
         _ => expanded_prompt.clone(),
     };
@@ -1056,9 +1065,8 @@ fn run_session(
     if stream_json && selected_harness.id == "claude" {
         let stdout = io::stdout();
         let mut handle = stdout.lock();
-        let claude_system_prompt: Option<String> = familiar_ctx
-            .as_ref()
-            .map(|f| f.identity_preamble());
+        let claude_system_prompt: Option<String> =
+            familiar_ctx.as_ref().map(|f| f.identity_preamble());
         let exit_code = pty_runner::stream_claude(
             &cwd,
             &record.id,

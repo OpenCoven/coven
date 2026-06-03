@@ -108,7 +108,15 @@ pub fn stream_claude<W: Write>(
     system_prompt: Option<&str>,
     out: &mut W,
 ) -> Result<i32> {
-    stream_claude_with_program("claude", cwd, session_id, prompt, forward_stdin, system_prompt, out)
+    stream_claude_with_program(
+        "claude",
+        cwd,
+        session_id,
+        prompt,
+        forward_stdin,
+        system_prompt,
+        out,
+    )
 }
 
 fn stream_claude_with_program<W: Write>(
