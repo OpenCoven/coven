@@ -147,7 +147,11 @@ enum Command {
     },
     #[command(about = "Create, list, diagnose, and prune Coven worktrees")]
     Wt {
-        #[arg(help = "Branch to create or enter in the sibling <repo>.wt directory")]
+        #[arg(
+            help = "Branch to create or enter in the sibling <repo>.wt directory",
+            conflicts_with_all = ["list", "doctor", "prune_merged", "prune_stale"],
+            required_unless_present_any = ["list", "doctor", "prune_merged", "prune_stale"]
+        )]
         branch: Option<String>,
         #[arg(long, conflicts_with_all = ["doctor", "prune_merged", "prune_stale"], help = "List worktrees with claim and dirty state")]
         list: bool,
