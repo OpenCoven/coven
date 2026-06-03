@@ -23,6 +23,9 @@ flowchart TB
   Root --> Sacrifice["sacrifice"]
   Root --> Patch["patch"]
   Root --> Logs["logs"]
+  Root --> Wt["wt"]
+  Root --> Claim["claim"]
+  Root --> Hooks["hooks"]
   Root --> Pc["pc (macOS-first)"]
 
   Daemon --> DStart["start"]
@@ -41,6 +44,19 @@ flowchart TB
   Patch --> POpenclaw["openclaw &lt;prompt&gt;"]
 
   Logs --> LPrune["prune [--dry-run]"]
+
+  Wt --> WtBranch["&lt;branch&gt;"]
+  Wt --> WtList["--list"]
+  Wt --> WtDoctor["--doctor"]
+  Wt --> WtPrune["--prune-merged / --prune-stale DAYS"]
+
+  Claim --> CAcquire["acquire &lt;branch&gt;"]
+  Claim --> CRelease["release &lt;branch&gt;"]
+  Claim --> CHeartbeat["heartbeat &lt;branch&gt;"]
+  Claim --> CCanary["canary &lt;branch&gt;"]
+  Claim --> CStatus["status"]
+
+  Hooks --> HInstall["install"]
 
   Pc --> PcStatus["status [--json]"]
   Pc --> PcTop["top --n N"]
@@ -65,6 +81,11 @@ flowchart TB
 | `coven sacrifice <session-id> --yes` | Permanently delete a non-running session. |
 | `coven patch openclaw <prompt>` | Local OpenClaw rescue loop. Does not commit or push. |
 | `coven logs prune` | Prune expired encrypted raw artifacts and old redacted event logs. |
+| `coven wt <branch>` | Create or enter a sibling `<repo>.wt/<branch-slug>` git worktree. |
+| `coven wt --list/--doctor/--prune-merged/--prune-stale DAYS` | Inspect and clean Coven protocol worktrees. |
+| `coven claim acquire/release/heartbeat/canary <branch>` | Manage TTL-bounded branch ownership for the current agent. |
+| `coven claim status` | Print branch claims from the current repository. |
+| `coven hooks install` | Install local protocol hooks that block unsafe commits and protected pushes. |
 | `coven pc` | macOS-first diagnostics and explicit `--confirm` relief operations. |
 
 ## Common flags by command
@@ -75,6 +96,7 @@ flowchart TB
 | `coven sessions` | `--plain`, `--json`, `--all`, `--manage` |
 | `coven sacrifice` | `--yes` (required) |
 | `coven logs prune` | `--dry-run`, `--raw-days <N>`, `--event-days <N>` |
+| `coven wt` | `--list`, `--doctor`, `--prune-merged`, `--prune-stale <DAYS>` |
 | `coven pc kill` | `--confirm` (required) |
 | `coven pc cache clear` | `--confirm` (required) |
 | `coven pc top` | `--n <N>`, `--verbose` |
@@ -95,6 +117,20 @@ flowchart TB
 - Redacted operational event logs default to 30 days.
 - `--dry-run` prints counts only.
 - `--raw-days <N>` and `--event-days <N>` override the configured retention for one run.
+
+## Parallel Work Protocol
+
+`coven wt`, `coven claim`, and `coven hooks install` implement the local
+Coven Parallel Work Protocol for multi-agent repositories.
+
+- `coven wt <branch>` creates or enters `<repo>.wt/<branch-slug>/`.
+- `coven claim acquire <branch>` writes a TTL-bounded branch claim under git's
+  common directory. Set `COVEN_AGENT_ID` to a stable agent name.
+- `coven hooks install` installs `pre-commit` and `pre-push` hooks. Existing
+  hooks are chained through `<hook>.local`; tracked `core.hooksPath`
+  directories are left untouched.
+- Protected pushes require `.git/MERGE_INTENT` to contain
+  `Enchant merge to main.` unless `COVEN_MERGE_PHRASE` changes the phrase.
 
 ## Exit codes
 
