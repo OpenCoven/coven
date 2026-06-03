@@ -149,12 +149,11 @@ impl LiveSessionRuntime {
 
 impl SessionRuntime for LiveSessionRuntime {
     fn launch_session(&self, launch: &SessionLaunch) -> Result<()> {
-        let familiar_ctx = launch
-            .familiar_id
-            .as_deref()
-            .and_then(|fid| {
-                self.coven_home.as_ref().and_then(|home| {
-                    crate::cockpit_sources::read_familiars(home).ok().and_then(|familiars| {
+        let familiar_ctx = launch.familiar_id.as_deref().and_then(|fid| {
+            self.coven_home.as_ref().and_then(|home| {
+                crate::cockpit_sources::read_familiars(home)
+                    .ok()
+                    .and_then(|familiars| {
                         familiars.into_iter().find(|f| f.id == fid).map(|f| {
                             crate::harness::FamiliarContext {
                                 id: f.id,
@@ -163,8 +162,8 @@ impl SessionRuntime for LiveSessionRuntime {
                             }
                         })
                     })
-                })
-            });
+            })
+        });
         let command = pty_runner::build_harness_command_with_conversation(
             &launch.harness,
             &launch.prompt,
