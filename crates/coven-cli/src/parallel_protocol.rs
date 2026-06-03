@@ -589,7 +589,7 @@ const PRE_COMMIT_HOOK: &str = r#"#!/bin/sh
 set -eu
 
 slug_branch() {
-  printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '-'
+  printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '-' | sed -e 's/^-*//' -e 's/-*$//'
 }
 
 claim_value() {
