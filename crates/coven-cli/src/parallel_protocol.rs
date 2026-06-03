@@ -690,11 +690,11 @@ do
   consume_intent=1
 done
 
-if [ "$consume_intent" = "1" ]; then
-  rm -f "$intent_file"
-fi
-
 if [ -x "$common_dir/hooks/pre-push.local" ]; then
   "$common_dir/hooks/pre-push.local" "$@"
+fi
+
+if [ "$consume_intent" = "1" ]; then
+  rm -f "$intent_file"
 fi
 "#;
