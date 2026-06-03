@@ -318,12 +318,32 @@ fn launch_session(
             return api_error(400, "invalid_request", &error.to_string(), None);
         }
     };
-    let launch = match session_launch_from_payload(payload) {
+    let mut launch = match session_launch_from_payload(payload) {
         Ok(launch) => launch,
         Err(error) => {
             return api_error(400, "invalid_request", &error.to_string(), None);
         }
     };
+    let familiar_ctx = match launch.familiar_id.as_deref() {
+        Some(familiar_id) => match crate::familiar_identity::resolve(coven_home, familiar_id) {
+            Ok(Some(familiar_ctx)) => Some(familiar_ctx),
+            Ok(None) => {
+                let error =
+                    crate::familiar_identity::unknown_familiar_error(coven_home, familiar_id);
+                return api_error(
+                    400,
+                    "unknown_familiar",
+                    &error.to_string(),
+                    Some(json!({ "familiarId": familiar_id })),
+                );
+            }
+            Err(error) => {
+                return api_error(500, "familiar_lookup_failed", &error.to_string(), None);
+            }
+        },
+        None => None,
+    };
+    launch.familiar_id = familiar_ctx.as_ref().map(|familiar| familiar.id.clone());
     let conn = store::open_store(&store_path(coven_home))?;
     let now = current_timestamp();
     let record = store::SessionRecord {
@@ -337,7 +357,7 @@ fn launch_session(
         created_at: now.clone(),
         updated_at: now,
         conversation_id: launch.conversation_id.clone(),
-        familiar_id: launch.familiar_id.clone(),
+        familiar_id: familiar_ctx.as_ref().map(|familiar| familiar.id.clone()),
         labels: Vec::new(),
         visibility: "private".to_string(),
     };
@@ -1529,6 +1549,7 @@ mod tests {
     #[test]
     fn launch_request_persists_familiar_id_on_the_session_row() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
         let project_root = temp_dir.path().join("repo");
         std::fs::create_dir_all(&project_root)?;
         let runtime = RecordingRuntime::default();
@@ -1537,7 +1558,7 @@ mod tests {
             "harness": "claude",
             "launchMode": "nonInteractive",
             "prompt": "hi",
-            "familiarId": "ember"
+            "familiarId": "sage"
         })
         .to_string();
 
@@ -1552,15 +1573,98 @@ mod tests {
 
         assert_eq!(
             runtime.launches.borrow()[0].familiar_id.as_deref(),
-            Some("ember")
+            Some("sage")
         );
 
         // And it round-trips through the session list payload too.
         let list = handle_request("GET", "/sessions", temp_dir.path(), None)?;
         assert!(
-            list.body.contains(r#""familiar_id":"ember""#),
+            list.body.contains(r#""familiar_id":"sage""#),
             "list response should expose familiar_id, got: {}",
             list.body
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn launch_request_rejects_unknown_familiar_id_without_inserting_session() -> anyhow::Result<()>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "claude",
+            "launchMode": "nonInteractive",
+            "prompt": "hi",
+            "familiarId": "missing"
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 400);
+        assert!(
+            response.body.contains("unknown_familiar"),
+            "expected unknown familiar error, got: {}",
+            response.body
+        );
+        assert!(
+            runtime.launches.borrow().is_empty(),
+            "unknown familiar must not launch a runtime"
+        );
+        let list = handle_request("GET", "/sessions", temp_dir.path(), None)?;
+        assert!(
+            list.body == "[]",
+            "unknown familiar must not insert a session row, got: {}",
+            list.body
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn launch_request_reports_familiar_config_errors_without_launching() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        std::fs::write(temp_dir.path().join("familiars.toml"), "[[familiar]\n")?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "claude",
+            "launchMode": "nonInteractive",
+            "prompt": "hi",
+            "familiarId": "sage"
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 500);
+        assert!(
+            response.body.contains("familiar_lookup_failed"),
+            "expected familiar config error, got: {}",
+            response.body
+        );
+        assert!(
+            runtime.launches.borrow().is_empty(),
+            "malformed familiar config must not launch a runtime"
         );
         Ok(())
     }
