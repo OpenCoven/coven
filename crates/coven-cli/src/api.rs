@@ -1527,6 +1527,45 @@ mod tests {
     }
 
     #[test]
+    fn launch_request_persists_familiar_id_on_the_session_row() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "claude",
+            "launchMode": "nonInteractive",
+            "prompt": "hi",
+            "familiarId": "ember"
+        })
+        .to_string();
+
+        handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(
+            runtime.launches.borrow()[0].familiar_id.as_deref(),
+            Some("ember")
+        );
+
+        // And it round-trips through the session list payload too.
+        let list = handle_request("GET", "/sessions", temp_dir.path(), None)?;
+        assert!(
+            list.body.contains(r#""familiar_id":"ember""#),
+            "list response should expose familiar_id, got: {}",
+            list.body
+        );
+        Ok(())
+    }
+
+    #[test]
     fn conversation_id_rejects_shell_metacharacters() {
         // Ids carrying whitespace or shell metacharacters must be rejected so they
         // can never reach the harness CLI's `--session-id`/`--resume`/`resume` argv,
