@@ -489,6 +489,11 @@ fn set_executable(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(unix))]
+fn set_executable(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 fn current_head() -> Result<String> {
     Ok(git_stdout(["rev-parse", "HEAD"])?.trim().to_string())
 }
