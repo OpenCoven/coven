@@ -6,6 +6,23 @@ read_when:
 title: "Changelog y notas de release de Coven"
 ---
 
+## Semana del 3 de junio de 2026
+
+### Nuevas funcionalidades
+
+- **Protocolo de trabajo paralelo de Coven.** Coven ahora incluye comandos `coven wt`, `coven claim` y `coven hooks` para coordinar varios agentes de programación de IA en un mismo repositorio. El protocolo crea worktrees de git aislados, registra claims de rama con TTL, instala hooks encadenables de seguridad, bloquea commits accidentales en ramas protegidas y exige una frase explícita de intención de merge antes de pushes a ramas protegidas. Consulta [issue #167](https://github.com/OpenCoven/coven/issues/167) y [PR #169](https://github.com/OpenCoven/coven/pull/169).
+- **Persistencia de identidad familiar en sesiones.** Las sesiones ahora pueden llevar un `familiar_id` resuelto, dando a dashboards, APIs y superficies de agentes una forma durable de mostrar qué familiar inició o posee una sesión. Consulta [PR #168](https://github.com/OpenCoven/coven/pull/168).
+
+### Actualizaciones
+
+- **Resolución compartida de familiares.** La CLI, el daemon y la API local ahora resuelven identidades familiares por una única ruta compartida antes del lanzamiento, de modo que los metadatos guardados de sesión reflejan la identidad familiar canónica y no una cadena de entrada sin validar.
+- **Guardrails para carriles paralelos.** El protocolo de worktrees incluye superficies de status, doctor, prune, claim acquire/release/heartbeat/canary e instalación de hooks para que la coordinación entre agentes pueda escalar sin depender de scripts shell ad hoc.
+
+### Correcciones de errores
+
+- **Los IDs de familiar desconocidos ya no crean sesiones.** `POST /sessions` ahora rechaza un `familiarId` desconocido con `400 unknown_familiar` antes de insertar una fila de sesión o lanzar un runtime. Una configuración de familiares mal formada devuelve `500 familiar_lookup_failed` sin lanzar nada.
+- **`coven run --familiar <id>` falla temprano con familiares desconocidos.** Los lanzamientos locales por CLI ahora coinciden con el comportamiento del daemon/API y evitan guardar IDs de familiar no resueltos.
+
 ## Semana del 17 de mayo de 2026
 
 ### Correcciones de errores

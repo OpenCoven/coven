@@ -6,6 +6,23 @@ read_when:
 title: "Changelog и release notes Coven"
 ---
 
+## Неделя от 3 июня 2026
+
+### Новые возможности
+
+- **Протокол параллельной работы Coven.** В Coven появились команды `coven wt`, `coven claim` и `coven hooks` для координации нескольких AI-агентов разработки в одном репозитории. Протокол создаёт изолированные git worktree, записывает claims на ветки с TTL, устанавливает цепочечные safety hooks, блокирует случайные коммиты в защищённые ветки и требует явную фразу намерения merge перед push в защищённые ветки. См. [issue #167](https://github.com/OpenCoven/coven/issues/167) и [PR #169](https://github.com/OpenCoven/coven/pull/169).
+- **Сохранение идентичности familiar в сессиях.** Сессии теперь могут хранить разрешённый `familiar_id`, чтобы dashboards, API и агентские поверхности могли стабильно показывать, какой familiar запустил сессию или владеет ей. См. [PR #168](https://github.com/OpenCoven/coven/pull/168).
+
+### Обновления
+
+- **Общая резолюция familiars.** CLI, daemon и локальный API теперь разрешают familiar identities через один общий путь перед запуском, поэтому сохранённые метаданные сессии отражают каноническую familiar identity, а не непроверенную входную строку.
+- **Guardrails для параллельных lane.** Протокол worktree включает поверхности status, doctor, prune, claim acquire/release/heartbeat/canary и установку hooks, чтобы координация агентов масштабировалась без ad hoc shell-скриптов.
+
+### Исправления ошибок
+
+- **Неизвестные familiar IDs больше не создают сессии.** `POST /sessions` теперь отклоняет неизвестный `familiarId` с `400 unknown_familiar` до вставки строки сессии или запуска runtime. Некорректная конфигурация familiars возвращает `500 familiar_lookup_failed` без запуска.
+- **`coven run --familiar <id>` рано завершается для неизвестных familiars.** Локальные CLI-запуски теперь соответствуют поведению daemon/API и не сохраняют неразрешённые familiar IDs.
+
 ## Неделя от 17 мая 2026
 
 ### Исправления ошибок

@@ -6,6 +6,23 @@ read_when:
 title: "Coven changelog and release notes"
 ---
 
+## Week of June 3, 2026
+
+### New features
+
+- **Coven Parallel Work Protocol.** Coven now ships first-class `coven wt`, `coven claim`, and `coven hooks` commands for coordinating multiple AI coding agents in one repository. The protocol creates isolated git worktrees, records TTL-bound agent branch claims, installs chainable safety hooks, blocks accidental commits on protected branches, and requires an explicit merge-intent phrase before protected-branch pushes. See [issue #167](https://github.com/OpenCoven/coven/issues/167) and [PR #169](https://github.com/OpenCoven/coven/pull/169).
+- **Session familiar identity persistence.** Sessions can now carry a resolved `familiar_id`, giving dashboards, APIs, and downstream agent surfaces a durable way to show which familiar launched or owns a session. See [PR #168](https://github.com/OpenCoven/coven/pull/168).
+
+### Updates
+
+- **Shared familiar resolution.** The CLI, daemon, and local API now resolve familiar identities through one shared path before launch, so stored session metadata reflects the canonical familiar identity rather than an unchecked input string.
+- **Parallel-lane guardrails.** The worktree protocol includes status, doctor, prune, claim acquire/release/heartbeat/canary, and hook-install surfaces so agent coordination can scale from a single local checkout to multi-agent work without relying on ad hoc shell scripts.
+
+### Bug fixes
+
+- **Unknown familiar IDs no longer create sessions.** `POST /sessions` now rejects an unknown `familiarId` with `400 unknown_familiar` before inserting a session row or launching a runtime. Malformed familiar configuration returns `500 familiar_lookup_failed` without launching.
+- **`coven run --familiar <id>` fails early for unknown familiars.** Local CLI launches now match daemon/API behavior and avoid silently recording unresolved familiar IDs.
+
 ## Week of May 20, 2026
 
 ### New features
