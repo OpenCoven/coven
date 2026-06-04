@@ -135,6 +135,7 @@
                   "harnesses/claude-code",
                   "harnesses/installing",
                   "harnesses/provider-auth",
+                  "familiars/parallel-lanes",
                   "HARNESS-ADAPTERS",
                   "FUTURE-HARNESSES"
                 ]
