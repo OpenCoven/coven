@@ -58,7 +58,7 @@ Minimal opt-in config:
 
 `allowFallback` defaults to `false`. Enable it only when you intentionally want failed/unavailable Coven launches to fall back to another ACP backend such as `acpx`.
 
-By default, the plugin only maps OpenClaw ACP agent ids for the current Coven v0 scope: Codex and Claude Code. Future harness ids must be explicitly configured in `harnesses` after the Rust daemon supports and validates them.
+By default, the plugin only maps OpenClaw ACP agent ids for the current Coven v0 scope: Codex and Claude Code. Future harness ids, such as Hermes, must be explicitly configured in `harnesses` after the Rust daemon supports and validates them through the generic adapter contract. Do not add special-case OpenClaw or Hermes logic to the daemon.
 
 ## Architecture
 

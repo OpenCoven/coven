@@ -17,6 +17,9 @@ A **harness** is an external coding-agent CLI that Coven can launch and supervis
   <Card title="Claude Code" href="/harnesses/claude-code" icon="brain">
     Anthropic Claude Code. Harness id `claude`.
   </Card>
+  <Card title="OpenClaw bridge" href="/harnesses/openclaw" icon="plug">
+    External ACP runtime bridge through `@opencoven/coven`.
+  </Card>
   <Card title="Future harnesses" href="/FUTURE-HARNESSES" icon="compass">
     Hermes, Aider, Gemini CLI, Cline — adapter direction and roadmap signals.
   </Card>
@@ -30,6 +33,8 @@ flowchart LR
   Adapter --> CodexAdapter[Codex adapter]
   Adapter --> ClaudeAdapter[Claude adapter]
   Adapter -. future .-> Future[Hermes / Aider / Gemini]
+  OpenClaw[OpenClaw] --> Bridge["@opencoven/coven plugin"]
+  Bridge --> Coven
   CodexAdapter --> CodexPty[Codex PTY]
   ClaudeAdapter --> ClaudePty[Claude Code PTY]
 ```
@@ -78,5 +83,6 @@ If `coven doctor` reports a harness as missing, see [Installing harness CLIs](/h
 ## Related
 
 - [Provider auth boundary](/harnesses/provider-auth)
+- [OpenClaw bridge](/harnesses/openclaw)
 - [Harness adapter guide](/HARNESS-ADAPTERS)
 - [Future harness notes](/FUTURE-HARNESSES)

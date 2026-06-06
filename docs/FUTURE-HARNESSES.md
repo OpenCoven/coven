@@ -9,9 +9,9 @@ description: "Notes on what the Coven adapter seam must preserve before adding H
 
 # Future harness notes
 
-Coven v0 intentionally supports only the Codex and Claude Code adapters. This note records what the current adapter seam must preserve before adding additional harnesses such as Hermes.
+Coven v0 intentionally supports only the Codex and Claude Code default adapters. This note records what the adapter seam must preserve before adding additional external harness adapters such as Hermes.
 
-OpenClaw is not a Coven harness target in v0. OpenClaw integration is externalized through the `@opencoven/coven` plugin, which acts as a socket client for the Rust daemon.
+OpenClaw is the first external integration boundary, not a daemon-launched harness target. OpenClaw integration is externalized through the `@opencoven/coven` plugin, which acts as a socket client for the Rust daemon. See [OpenClaw bridge](/harnesses/openclaw).
 
 ## Current adapter contract
 
@@ -63,7 +63,7 @@ A Hermes adapter probably should not be a direct copy of the Codex/Claude shape.
 
 Do not add Hermes to `coven doctor` or `coven run` yet.
 
-For now, keep the adapter seam able to express prefix-arg CLIs (`chat -q <prompt>`) and revisit the actual Hermes adapter after:
+For now, keep the adapter seam able to express prefix-arg CLIs (`chat -q <prompt>`) and revisit the actual Hermes adapter as an external adapter after:
 
 - direct Coven Codex/Claude sessions have been used more;
 - CastCodes-facing attach/open or lane replay has had real usage;
@@ -91,8 +91,13 @@ flowchart LR
     Custom["user-defined custom adapter"]
   end
 
+  subgraph Clients["External clients"]
+    OpenClaw["OpenClaw\n@opencoven/coven bridge"]
+  end
+
   V0 --> Research
   Research --> Later
+  OpenClaw --> V0
 
   style Codex fill:#9A8ECD,stroke:#D4B5FF,color:#1A1825
   style Claude fill:#9A8ECD,stroke:#D4B5FF,color:#1A1825
