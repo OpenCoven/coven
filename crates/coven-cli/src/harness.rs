@@ -479,11 +479,7 @@ fn continuity_args(
             // it from output and feed it back on subsequent turns.
             ConversationHint::Init { .. } => None,
             ConversationHint::Resume { id } => {
-                let mut args: Vec<String> = spec
-                    .non_interactive_prompt_prefix_args
-                    .iter()
-                    .cloned()
-                    .collect();
+                let mut args: Vec<String> = spec.non_interactive_prompt_prefix_args.to_vec();
                 args.push("resume".to_string());
                 args.push(id.clone());
                 Some(args)

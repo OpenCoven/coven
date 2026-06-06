@@ -477,7 +477,7 @@ fn session_launch_from_payload(payload: Value) -> Result<SessionLaunch> {
         .into_iter()
         .map(|spec| spec.id)
         .collect();
-    if !supported.iter().any(|id| *id == harness) {
+    if !supported.contains(&harness) {
         anyhow::bail!(
             "harness `{harness}` is not a supported harness; expected one of {supported:?}"
         );
