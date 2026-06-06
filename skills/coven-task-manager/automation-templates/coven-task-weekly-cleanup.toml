@@ -1,0 +1,19 @@
+version = 1
+id = "coven-task-weekly-cleanup"
+kind = "cron"
+name = "Coven Weekly Task Cleanup"
+status = "PAUSED"
+rrule = "RRULE:FREQ=WEEKLY;BYHOUR=17;BYMINUTE=0;BYDAY=FR"
+model = "gpt-5.5"
+reasoning_effort = "high"
+execution_environment = "worktree"
+cwds = []
+tags = ["coven", "tasks", "cleanup"]
+prompt = '''Use the `coven-task-manager` skill for the weekly Coven task-board cleanup.
+
+Goals:
+- Summarize done, review, blocked, active, inbox, and backlog cards.
+- Summarize simultaneous threads by session, familiar, repo, and branch, then recommend which lanes to resume, park, or merge.
+- Detect duplicate or stale cards.
+- Suggest archive/delete candidates, but do not perform destructive cleanup unless explicitly approved.
+- Update the task freshness report with changes since the last run.'''

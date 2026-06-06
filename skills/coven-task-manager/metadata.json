@@ -1,0 +1,13 @@
+{
+  "name": "coven-task-manager",
+  "description": "Comprehensive Coven task-board freshness: audits stale running work, blocked tasks, review queues, active work, and completed-task hygiene.",
+  "version": "0.1.0",
+  "author": "OpenCoven Team",
+  "category": "operations",
+  "tags": ["tasks", "automation", "freshness", "triage", "cave"],
+  "defaultAutomations": [
+    "coven-task-freshness-daily",
+    "coven-task-blocked-escalation",
+    "coven-task-weekly-cleanup"
+  ]
+}

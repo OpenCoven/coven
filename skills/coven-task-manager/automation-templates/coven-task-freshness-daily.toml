@@ -1,0 +1,22 @@
+version = 1
+id = "coven-task-freshness-daily"
+kind = "cron"
+name = "Coven Task Freshness Daily"
+status = "PAUSED"
+rrule = "RRULE:FREQ=WEEKLY;BYHOUR=8;BYMINUTE=30;BYDAY=SU,MO,TU,WE,TH,FR,SA"
+model = "gpt-5.5"
+reasoning_effort = "high"
+execution_environment = "worktree"
+cwds = []
+tags = ["coven", "tasks", "freshness"]
+prompt = '''Use the `coven-task-manager` skill to run the daily Coven task freshness sweep.
+
+Goals:
+- Load the current Cave task board from the local Coven home.
+- Identify stale running tasks, blocked tasks that need human attention, review-ready work, and stale backlog/inbox items.
+- Read the Thread Coordination section first and reconcile duplicated sessions, overloaded familiars, and repo/branch collisions before spawning or resuming work.
+- Update the task freshness report.
+- Only edit task state when there is concrete evidence from the board, linked sessions, git, CI, or explicit user instructions.
+
+Deliverable:
+- A concise task freshness summary with next actions and any task cards that need human attention.'''

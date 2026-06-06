@@ -1,0 +1,19 @@
+version = 1
+id = "coven-task-blocked-escalation"
+kind = "cron"
+name = "Coven Blocked Task Escalation"
+status = "PAUSED"
+rrule = "RRULE:FREQ=WEEKLY;BYHOUR=10;BYMINUTE=0;BYDAY=MO,TU,WE,TH,FR"
+model = "gpt-5.5"
+reasoning_effort = "high"
+execution_environment = "worktree"
+cwds = []
+tags = ["coven", "tasks", "blocked"]
+prompt = '''Use the `coven-task-manager` skill to review blocked Coven tasks.
+
+Goals:
+- Find blocked cards, cards marked needsHuman, and stale running cards.
+- Use Thread Coordination to avoid escalating the same live session or repo collision multiple times.
+- Separate real blockers from stale bookkeeping.
+- Prepare a short escalation list with owners, evidence, and the smallest next unblock action.
+- Do not close, delete, or mark tasks done without concrete evidence.'''

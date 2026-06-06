@@ -259,10 +259,14 @@ pub fn scan_skills(coven_home: &Path) -> Result<Vec<SkillDto>> {
     let mut out = Vec::new();
     for entry in entries {
         let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
         let dir = entry.path();
+        match fs::metadata(&dir) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => continue,
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to inspect {}", dir.display()));
+            }
+        }
         let metadata_path = dir.join("metadata.json");
         let raw = match fs::read_to_string(&metadata_path) {
             Ok(raw) => raw,
@@ -812,6 +816,30 @@ description = "..."
         assert_eq!(out[1].owner, "unknown");
         assert_eq!(out[1].version, "0.0.0");
         assert_eq!(out[1].category, "general");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_skills_follows_symlinked_skill_dirs() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let canonical = temp.path().join("canonical").join("delta");
+        fs::create_dir_all(&canonical)?;
+        fs::write(
+            canonical.join("metadata.json"),
+            r#"{"name":"Delta","description":"D","author":"coven","category":"operations"}"#,
+        )?;
+
+        let skills_root = temp.path().join(SKILLS_DIR);
+        fs::create_dir_all(&skills_root)?;
+        std::os::unix::fs::symlink(&canonical, skills_root.join("delta"))?;
+
+        let out = scan_skills(temp.path())?;
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "delta");
+        assert_eq!(out[0].name, "Delta");
+        assert_eq!(out[0].owner, "coven");
         Ok(())
     }
 
