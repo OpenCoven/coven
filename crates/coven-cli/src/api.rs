@@ -473,11 +473,12 @@ fn session_launch_from_payload(payload: Value) -> Result<SessionLaunch> {
     // instead of letting the runtime's arg builder surface it later as a
     // 500. Bonus: rejecting here means we never insert a session row for
     // a launch that can't possibly succeed.
-    let supported: Vec<String> = crate::harness::configured_harness_specs()?
-        .into_iter()
-        .map(|spec| spec.id)
+    let supported_specs = crate::harness::configured_harness_specs()?;
+    let supported: Vec<&str> = supported_specs
+        .iter()
+        .map(|spec| spec.id.as_str())
         .collect();
-    if !supported.contains(&harness) {
+    if !supported.contains(&harness.as_str()) {
         anyhow::bail!(
             "harness `{harness}` is not a supported harness; expected one of {supported:?}"
         );
