@@ -719,13 +719,13 @@ fn choose_default_harness() -> Result<patch::HarnessId> {
     anyhow::bail!("no supported harness is available; run `coven doctor` for setup guidance")
 }
 
-fn default_harness_id() -> Option<&'static str> {
+fn default_harness_id() -> Option<String> {
     let harnesses = harness::built_in_harnesses();
     harnesses
         .iter()
         .find(|h| h.id == "codex" && h.available)
         .or_else(|| harnesses.iter().find(|h| h.id == "claude" && h.available))
-        .map(|h| h.id)
+        .map(|h| h.id.clone())
 }
 
 fn launch_patch_session(request: &patch::PatchRequest) -> Result<String> {
@@ -780,7 +780,7 @@ fn launch_patch_session(request: &patch::PatchRequest) -> Result<String> {
         &current_timestamp(),
     )?;
     let command = pty_runner::build_harness_command(
-        selected_harness.id,
+        &selected_harness.id,
         &brief,
         &request.repo.root,
         harness_launch_mode_for_stdio(),
@@ -989,7 +989,7 @@ fn run_session(
     // clean. For harnesses without one (Codex), we prepend a bracketed identity
     // preamble to the prompt here so the integration layer remains harness-agnostic.
     let familiar_ctx = familiar_identity::resolve_optional(&coven_home, familiar_id)?;
-    let spec = harness::built_in_harness_specs()
+    let spec = harness::configured_harness_specs()?
         .into_iter()
         .find(|s| s.id == selected_harness.id);
     let effective_prompt = match (&familiar_ctx, spec.as_ref()) {
@@ -1090,7 +1090,7 @@ fn run_session(
         stream_json,
         &expanded_prompt,
         detach,
-        selected_harness.id,
+        &selected_harness.id,
     );
 
     if detach {
@@ -1229,7 +1229,7 @@ fn run_session(
         .filter(|s| s.system_prompt_flag.is_some())
         .and(familiar_ctx.as_ref());
     let command = pty_runner::build_harness_command_with_conversation(
-        selected_harness.id,
+        &selected_harness.id,
         &effective_prompt,
         &cwd,
         harness_launch_mode_for_stdio(),
@@ -1498,10 +1498,10 @@ fn ensure_successful_http_response(response: &str) -> Result<()> {
 }
 
 fn selected_available_harness(harness_id: &str) -> Result<harness::HarnessSummary> {
-    let harnesses = harness::built_in_harnesses();
+    let harnesses = harness::configured_harnesses()?;
     let known_harnesses = harnesses
         .iter()
-        .map(|harness| harness.id)
+        .map(|harness| harness.id.as_str())
         .collect::<Vec<_>>()
         .join(", ");
     let selected = harnesses
@@ -1516,7 +1516,7 @@ fn selected_available_harness(harness_id: &str) -> Result<harness::HarnessSummar
             harness.install_hint
         )),
         None => Err(anyhow!(
-            "unknown harness `{harness_id}`. Built-in harnesses: {known_harnesses}"
+            "unknown harness `{harness_id}`. Configured harnesses: {known_harnesses}"
         )),
     }
 }

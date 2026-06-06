@@ -1595,7 +1595,8 @@ fn print_cast_non_interactive_frame() {
         .ok()
         .and_then(|cwd| project::canonical_project_root(&cwd).ok());
     let default_harness_id = default_harness_id();
-    let frame = render_cast_frame_for_terminal(project_root.as_deref(), default_harness_id);
+    let frame =
+        render_cast_frame_for_terminal(project_root.as_deref(), default_harness_id.as_deref());
     print!("{frame}");
 }
 
@@ -1872,7 +1873,7 @@ fn run_guided_harness_session() -> Result<()> {
     let reset = theme::reset();
     println!("{primary_strong}Run an agent in this project{reset}");
     println!("Coven will create a session record, validate the project root, then attach to the harness.\n");
-    let default_harness = default_harness_id().unwrap_or("codex");
+    let default_harness = default_harness_id().unwrap_or_else(|| "codex".to_string());
     let harness_prompt = format!("Harness [default: {default_harness}; options: codex, claude]: ");
     let harness =
         prompt_for_optional_line(&harness_prompt)?.unwrap_or_else(|| default_harness.to_string());

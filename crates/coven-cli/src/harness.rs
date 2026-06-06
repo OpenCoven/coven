@@ -1,15 +1,19 @@
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
+use serde::Deserialize;
+
+pub const EXTERNAL_ADAPTER_MANIFEST_ENV: &str = "COVEN_HARNESS_ADAPTER_MANIFEST";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessSummary {
-    pub id: &'static str,
-    pub label: &'static str,
-    pub executable: &'static str,
+    pub id: String,
+    pub label: String,
+    pub executable: String,
     pub available: bool,
-    pub install_hint: &'static str,
+    pub install_hint: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,32 +92,32 @@ pub fn harness_supports_preassigned_session_id(harness_id: &str) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessCommandSpec {
-    pub id: &'static str,
-    pub label: &'static str,
-    pub executable: &'static str,
-    pub interactive_prompt_prefix_args: &'static [&'static str],
-    pub non_interactive_prompt_prefix_args: &'static [&'static str],
-    pub install_hint: &'static str,
+    pub id: String,
+    pub label: String,
+    pub executable: String,
+    pub interactive_prompt_prefix_args: Vec<String>,
+    pub non_interactive_prompt_prefix_args: Vec<String>,
+    pub install_hint: String,
     /// CLI flag name to pass a system-prompt string (e.g. `Some("--system-prompt")`
     /// for Claude). `None` means the harness has no such flag and identity
     /// should be injected by prepending a preamble to the prompt instead.
-    pub system_prompt_flag: Option<&'static str>,
+    pub system_prompt_flag: Option<String>,
 }
 
 impl HarnessCommandSpec {
     pub fn prompt_args(&self, prompt: &str, mode: HarnessLaunchMode) -> Vec<String> {
         let prefix_args = match mode {
-            HarnessLaunchMode::Interactive => self.interactive_prompt_prefix_args,
-            HarnessLaunchMode::NonInteractive => self.non_interactive_prompt_prefix_args,
+            HarnessLaunchMode::Interactive => &self.interactive_prompt_prefix_args,
+            HarnessLaunchMode::NonInteractive => &self.non_interactive_prompt_prefix_args,
             // Stream mode bypasses `prompt_args` entirely (no trailing
             // prompt; messages arrive on stdin). Fall back to
             // non-interactive args if a caller somehow lands here.
-            HarnessLaunchMode::Stream => self.non_interactive_prompt_prefix_args,
+            HarnessLaunchMode::Stream => &self.non_interactive_prompt_prefix_args,
         };
 
         prefix_args
             .iter()
-            .map(|arg| (*arg).to_string())
+            .cloned()
             .chain(std::iter::once(prompt.to_string()))
             .collect()
     }
@@ -122,14 +126,20 @@ impl HarnessCommandSpec {
 pub fn built_in_harnesses() -> Vec<HarnessSummary> {
     built_in_harness_specs()
         .into_iter()
-        .map(|spec| HarnessSummary {
+        .map(HarnessSummary::from_spec)
+        .collect()
+}
+
+impl HarnessSummary {
+    fn from_spec(spec: HarnessCommandSpec) -> Self {
+        Self {
+            available: executable_exists(&spec.executable),
             id: spec.id,
             label: spec.label,
             executable: spec.executable,
-            available: executable_exists(spec.executable),
             install_hint: spec.install_hint,
-        })
-        .collect()
+        }
+    }
 }
 
 /// Familiar identity context passed down from `coven run --familiar`.
@@ -168,31 +178,159 @@ impl FamiliarContext {
 pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
     vec![
         HarnessCommandSpec {
-            id: "codex",
-            label: "Codex",
-            executable: "codex",
-            interactive_prompt_prefix_args: &[],
-            non_interactive_prompt_prefix_args: &[
-                "exec",
-                "--skip-git-repo-check",
-                "--color",
-                "never",
+            id: "codex".to_string(),
+            label: "Codex".to_string(),
+            executable: "codex".to_string(),
+            interactive_prompt_prefix_args: Vec::new(),
+            non_interactive_prompt_prefix_args: vec![
+                "exec".to_string(),
+                "--skip-git-repo-check".to_string(),
+                "--color".to_string(),
+                "never".to_string(),
             ],
-            install_hint: "Install Codex with `npm install -g @openai/codex` or `brew install --cask codex`; if it is already installed, make sure `codex` is on PATH and run `codex login` or `codex` once to authenticate, then retry `coven doctor`.",
+            install_hint: "Install Codex with `npm install -g @openai/codex` or `brew install --cask codex`; if it is already installed, make sure `codex` is on PATH and run `codex login` or `codex` once to authenticate, then retry `coven doctor`.".to_string(),
             // Codex has no --system-prompt flag; identity is injected as a
             // bracketed preamble prepended to the prompt.
             system_prompt_flag: None,
         },
         HarnessCommandSpec {
-            id: "claude",
-            label: "Claude Code",
-            executable: "claude",
-            interactive_prompt_prefix_args: &[],
-            non_interactive_prompt_prefix_args: &["--print"],
-            install_hint: "Install Claude Code with `npm install -g @anthropic-ai/claude-code`; if it is already installed, make sure `claude` is on PATH and run `claude doctor` to finish local auth/setup, then retry `coven doctor`.",
-            system_prompt_flag: Some("--system-prompt"),
+            id: "claude".to_string(),
+            label: "Claude Code".to_string(),
+            executable: "claude".to_string(),
+            interactive_prompt_prefix_args: Vec::new(),
+            non_interactive_prompt_prefix_args: vec!["--print".to_string()],
+            install_hint: "Install Claude Code with `npm install -g @anthropic-ai/claude-code`; if it is already installed, make sure `claude` is on PATH and run `claude doctor` to finish local auth/setup, then retry `coven doctor`.".to_string(),
+            system_prompt_flag: Some("--system-prompt".to_string()),
         },
     ]
+}
+
+pub fn configured_harness_specs() -> Result<Vec<HarnessCommandSpec>> {
+    let mut specs = built_in_harness_specs();
+    specs.extend(external_harness_specs()?);
+    Ok(specs)
+}
+
+pub fn configured_harnesses() -> Result<Vec<HarnessSummary>> {
+    Ok(configured_harness_specs()?
+        .into_iter()
+        .map(HarnessSummary::from_spec)
+        .collect())
+}
+
+fn external_harness_specs() -> Result<Vec<HarnessCommandSpec>> {
+    let Some(manifest_path) = env::var_os(EXTERNAL_ADAPTER_MANIFEST_ENV) else {
+        return Ok(Vec::new());
+    };
+    load_external_harness_specs(Path::new(&manifest_path))
+}
+
+fn load_external_harness_specs(path: &Path) -> Result<Vec<HarnessCommandSpec>> {
+    let raw = fs::read_to_string(path).map_err(|err| {
+        anyhow!(
+            "failed to read harness adapter manifest {}: {err}",
+            path.display()
+        )
+    })?;
+    let registry: ExternalHarnessAdapterRegistry = serde_json::from_str(&raw).map_err(|err| {
+        anyhow!(
+            "failed to parse harness adapter manifest {}: {err}",
+            path.display()
+        )
+    })?;
+    let built_ins = built_in_harness_specs();
+    registry
+        .adapters
+        .into_iter()
+        .map(|adapter| adapter.into_spec(path, &built_ins))
+        .collect()
+}
+
+#[derive(Debug, Deserialize)]
+struct ExternalHarnessAdapterRegistry {
+    #[serde(default)]
+    adapters: Vec<ExternalHarnessAdapterSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExternalHarnessAdapterSpec {
+    id: String,
+    label: String,
+    executable: String,
+    #[serde(alias = "interactivePromptPrefixArgs")]
+    interactive_prompt_prefix_args: Vec<String>,
+    #[serde(alias = "nonInteractivePromptPrefixArgs")]
+    non_interactive_prompt_prefix_args: Vec<String>,
+    install_hint: String,
+    #[serde(default, alias = "systemPromptFlag")]
+    system_prompt_flag: Option<String>,
+}
+
+impl ExternalHarnessAdapterSpec {
+    fn into_spec(
+        self,
+        manifest_path: &Path,
+        built_ins: &[HarnessCommandSpec],
+    ) -> Result<HarnessCommandSpec> {
+        let id = self.id.trim().to_lowercase();
+        if !valid_adapter_id(&id) {
+            anyhow::bail!(
+                "invalid harness adapter id `{}` in {}; use lowercase letters, digits, '.', '_' or '-'",
+                self.id,
+                manifest_path.display()
+            );
+        }
+        if built_ins.iter().any(|spec| spec.id == id) {
+            anyhow::bail!(
+                "external harness adapter `{id}` in {} conflicts with a built-in harness",
+                manifest_path.display()
+            );
+        }
+        let executable = self.executable.trim().to_string();
+        if executable.is_empty()
+            || executable.contains('/')
+            || executable.contains('\\')
+            || executable.chars().any(char::is_whitespace)
+        {
+            anyhow::bail!(
+                "external harness adapter `{id}` in {} has an invalid executable `{}`",
+                manifest_path.display(),
+                self.executable
+            );
+        }
+        if self.label.trim().is_empty() {
+            anyhow::bail!(
+                "external harness adapter `{id}` in {} must include a label",
+                manifest_path.display()
+            );
+        }
+        if self.install_hint.trim().is_empty() {
+            anyhow::bail!(
+                "external harness adapter `{id}` in {} must include an install_hint",
+                manifest_path.display()
+            );
+        }
+        Ok(HarnessCommandSpec {
+            id,
+            label: self.label.trim().to_string(),
+            executable,
+            interactive_prompt_prefix_args: self.interactive_prompt_prefix_args,
+            non_interactive_prompt_prefix_args: self.non_interactive_prompt_prefix_args,
+            install_hint: self.install_hint.trim().to_string(),
+            system_prompt_flag: self
+                .system_prompt_flag
+                .map(|flag| flag.trim().to_string())
+                .filter(|flag| !flag.is_empty()),
+        })
+    }
+}
+
+fn valid_adapter_id(value: &str) -> bool {
+    let mut chars = value.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_lowercase() || first.is_ascii_digit())
+        && chars.all(|ch| {
+            ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-')
+        })
 }
 
 #[cfg(test)]
@@ -200,7 +338,7 @@ pub fn command_parts_for_harness(
     harness_id: &str,
     prompt: &str,
     mode: HarnessLaunchMode,
-) -> Result<(&'static str, Vec<String>)> {
+) -> Result<(String, Vec<String>)> {
     command_parts_for_harness_with_conversation(harness_id, prompt, mode, None, None)
 }
 
@@ -219,8 +357,8 @@ pub fn command_parts_for_harness_with_conversation(
     mode: HarnessLaunchMode,
     hint: Option<&ConversationHint>,
     familiar: Option<&FamiliarContext>,
-) -> Result<(&'static str, Vec<String>)> {
-    let spec = built_in_harness_specs()
+) -> Result<(String, Vec<String>)> {
+    let spec = configured_harness_specs()?
         .into_iter()
         .find(|spec| spec.id == harness_id)
         .ok_or_else(|| anyhow!("unsupported harness `{harness_id}`"))?;
@@ -242,15 +380,15 @@ pub fn command_parts_for_harness_with_conversation(
     if mode == HarnessLaunchMode::Stream {
         if let Some(mut args) = stream_args(&spec, hint) {
             // Claude stream mode: inject identity via --system-prompt flag.
-            if let (Some(flag), Some(f)) = (spec.system_prompt_flag, familiar) {
+            if let (Some(flag), Some(f)) = (spec.system_prompt_flag.as_deref(), familiar) {
                 args.insert(0, f.identity_preamble());
                 args.insert(0, flag.to_string());
             }
-            return Ok((spec.executable, args));
+            return Ok((spec.executable.clone(), args));
         }
         // Harness doesn't support stream: fall through to non-interactive.
         return Ok((
-            spec.executable,
+            spec.executable.clone(),
             spec.prompt_args(&effective_prompt, HarnessLaunchMode::NonInteractive),
         ));
     }
@@ -258,12 +396,12 @@ pub fn command_parts_for_harness_with_conversation(
     if let Some(hint) = hint {
         if let Some(mut args) = continuity_args(&spec, mode, hint) {
             // Inject identity via --system-prompt for harnesses that support it.
-            if let (Some(flag), Some(f)) = (spec.system_prompt_flag, familiar) {
+            if let (Some(flag), Some(f)) = (spec.system_prompt_flag.as_deref(), familiar) {
                 args.insert(0, f.identity_preamble());
                 args.insert(0, flag.to_string());
             }
             return Ok((
-                spec.executable,
+                spec.executable.clone(),
                 args.into_iter()
                     .chain(std::iter::once(effective_prompt))
                     .collect(),
@@ -274,7 +412,7 @@ pub fn command_parts_for_harness_with_conversation(
     let mut args = spec.prompt_args(&effective_prompt, mode);
     // Inject identity via --system-prompt for harnesses that support it,
     // prepending before the prompt args.
-    if let (Some(flag), Some(f)) = (spec.system_prompt_flag, familiar) {
+    if let (Some(flag), Some(f)) = (spec.system_prompt_flag.as_deref(), familiar) {
         args.insert(0, f.identity_preamble());
         args.insert(0, flag.to_string());
     }
@@ -287,7 +425,7 @@ pub fn command_parts_for_harness_with_conversation(
 /// Returns `None` for harnesses that don't support stream mode so the
 /// caller can fall back to a one-shot launch.
 fn stream_args(spec: &HarnessCommandSpec, hint: Option<&ConversationHint>) -> Option<Vec<String>> {
-    match spec.id {
+    match spec.id.as_str() {
         "claude" => {
             let mut args: Vec<String> = vec![
                 "--print".to_string(),
@@ -324,7 +462,7 @@ fn continuity_args(
     if mode != HarnessLaunchMode::NonInteractive {
         return None;
     }
-    match spec.id {
+    match spec.id.as_str() {
         "claude" => {
             let flag = match hint {
                 ConversationHint::Init { .. } => "--session-id",
@@ -344,7 +482,7 @@ fn continuity_args(
                 let mut args: Vec<String> = spec
                     .non_interactive_prompt_prefix_args
                     .iter()
-                    .map(|arg| (*arg).to_string())
+                    .cloned()
                     .collect();
                 args.push("resume".to_string());
                 args.push(id.clone());
@@ -425,9 +563,22 @@ fn executable_candidates<'a>(
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::{Mutex, OnceLock};
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn restore_adapter_manifest_env(previous: Option<std::ffi::OsString>) {
+        match previous {
+            Some(value) => env::set_var(EXTERNAL_ADAPTER_MANIFEST_ENV, value),
+            None => env::remove_var(EXTERNAL_ADAPTER_MANIFEST_ENV),
+        }
+    }
 
     #[test]
     fn executable_exists_in_paths_finds_matching_file() -> anyhow::Result<()> {
@@ -523,11 +674,11 @@ mod tests {
     fn command_parts_for_known_harnesses_append_interactive_prompt() -> anyhow::Result<()> {
         assert_eq!(
             command_parts_for_harness("codex", "fix tests", HarnessLaunchMode::Interactive)?,
-            ("codex", vec!["fix tests".to_string()])
+            ("codex".to_string(), vec!["fix tests".to_string()])
         );
         assert_eq!(
             command_parts_for_harness("claude", "polish ui", HarnessLaunchMode::Interactive)?,
-            ("claude", vec!["polish ui".to_string()])
+            ("claude".to_string(), vec!["polish ui".to_string()])
         );
         Ok(())
     }
@@ -537,7 +688,7 @@ mod tests {
         assert_eq!(
             command_parts_for_harness("codex", "fix tests", HarnessLaunchMode::NonInteractive)?,
             (
-                "codex",
+                "codex".to_string(),
                 vec![
                     "exec".to_string(),
                     "--skip-git-repo-check".to_string(),
@@ -550,7 +701,7 @@ mod tests {
         assert_eq!(
             command_parts_for_harness("claude", "polish ui", HarnessLaunchMode::NonInteractive)?,
             (
-                "claude",
+                "claude".to_string(),
                 vec!["--print".to_string(), "polish ui".to_string()]
             )
         );
@@ -560,12 +711,12 @@ mod tests {
     #[test]
     fn command_spec_supports_prefix_args_for_future_harnesses() {
         let spec = HarnessCommandSpec {
-            id: "future",
-            label: "Future Harness",
-            executable: "future",
-            interactive_prompt_prefix_args: &["chat"],
-            non_interactive_prompt_prefix_args: &["exec", "-q"],
-            install_hint: "Install the future harness.",
+            id: "future".to_string(),
+            label: "Future Harness".to_string(),
+            executable: "future".to_string(),
+            interactive_prompt_prefix_args: vec!["chat".to_string()],
+            non_interactive_prompt_prefix_args: vec!["exec".to_string(), "-q".to_string()],
+            install_hint: "Install the future harness.".to_string(),
             system_prompt_flag: None,
         };
 
@@ -582,11 +733,65 @@ mod tests {
     #[test]
     fn command_parts_reject_unknown_harnesses() {
         assert!(
+            command_parts_for_harness("shell", "hello", HarnessLaunchMode::Interactive)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported harness")
+        );
+        assert!(
             command_parts_for_harness("hermes", "hello", HarnessLaunchMode::Interactive)
                 .unwrap_err()
                 .to_string()
                 .contains("unsupported harness")
         );
+    }
+
+    #[test]
+    fn external_manifest_can_register_hermes_without_making_it_built_in() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let manifest = temp_dir.path().join("adapters.json");
+        fs::write(
+            &manifest,
+            r#"{
+              "adapters": [
+                {
+                  "id": "hermes",
+                  "label": "Hermes Agent",
+                  "executable": "hermes",
+                  "interactive_prompt_prefix_args": ["chat", "--source", "coven", "-q"],
+                  "non_interactive_prompt_prefix_args": ["chat", "--source", "coven", "-Q", "-q"],
+                  "install_hint": "Install Hermes Agent and configure it before using this adapter.",
+                  "system_prompt_flag": null
+                }
+              ]
+            }"#,
+        )?;
+
+        let _guard = env_lock().lock().unwrap();
+        let previous = env::var_os(EXTERNAL_ADAPTER_MANIFEST_ENV);
+        env::set_var(EXTERNAL_ADAPTER_MANIFEST_ENV, &manifest);
+        let parts =
+            command_parts_for_harness("hermes", "audit repo", HarnessLaunchMode::NonInteractive);
+        restore_adapter_manifest_env(previous);
+
+        assert_eq!(
+            parts?,
+            (
+                "hermes".to_string(),
+                vec![
+                    "chat".to_string(),
+                    "--source".to_string(),
+                    "coven".to_string(),
+                    "-Q".to_string(),
+                    "-q".to_string(),
+                    "audit repo".to_string(),
+                ]
+            )
+        );
+        assert!(!built_in_harnesses()
+            .iter()
+            .any(|harness| harness.id == "hermes"));
+        Ok(())
     }
 
     #[test]
@@ -604,7 +809,7 @@ mod tests {
         assert_eq!(
             parts,
             (
-                "claude",
+                "claude".to_string(),
                 vec![
                     "--print".to_string(),
                     "--session-id".to_string(),
@@ -631,7 +836,7 @@ mod tests {
         assert_eq!(
             parts,
             (
-                "claude",
+                "claude".to_string(),
                 vec![
                     "--print".to_string(),
                     "--resume".to_string(),
@@ -655,7 +860,10 @@ mod tests {
             Some(&hint),
             None,
         );
-        assert_eq!(parts.unwrap(), ("claude", vec!["hello".to_string()]));
+        assert_eq!(
+            parts.unwrap(),
+            ("claude".to_string(), vec!["hello".to_string()])
+        );
         Ok(())
     }
 
@@ -675,7 +883,7 @@ mod tests {
         assert_eq!(
             parts,
             (
-                "codex",
+                "codex".to_string(),
                 vec![
                     "exec".to_string(),
                     "--skip-git-repo-check".to_string(),
@@ -703,7 +911,7 @@ mod tests {
         assert_eq!(
             parts,
             (
-                "codex",
+                "codex".to_string(),
                 vec![
                     "exec".to_string(),
                     "--skip-git-repo-check".to_string(),
@@ -722,6 +930,7 @@ mod tests {
     fn preassigned_session_id_support_is_per_harness() {
         assert!(harness_supports_preassigned_session_id("claude"));
         assert!(!harness_supports_preassigned_session_id("codex"));
+        assert!(!harness_supports_preassigned_session_id("hermes"));
         assert!(!harness_supports_preassigned_session_id("unknown"));
     }
 
