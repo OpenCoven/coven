@@ -73,6 +73,15 @@ enum Command {
     Tui,
     #[command(about = "Check local setup and print next steps")]
     Doctor,
+    #[command(
+        name = "adapter",
+        alias = "adapters",
+        about = "List and diagnose harness adapters"
+    )]
+    Adapter {
+        #[command(subcommand)]
+        command: AdapterCommand,
+    },
     #[command(about = "Manage the local Coven daemon")]
     Daemon {
         #[command(subcommand)]
@@ -228,6 +237,20 @@ enum SessionsCommand {
 }
 
 #[derive(Subcommand, Debug)]
+enum AdapterCommand {
+    #[command(about = "List configured harness adapters")]
+    List {
+        #[arg(long, help = "Print adapter reports as JSON")]
+        json: bool,
+    },
+    #[command(about = "Diagnose all adapters, or one adapter id")]
+    Doctor {
+        #[arg(help = "Adapter id to diagnose")]
+        adapter: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum DaemonCommand {
     Start,
     Restart,
@@ -331,6 +354,7 @@ fn run_cli(cli: Cli) -> Result<()> {
     match cli.command {
         None | Some(Command::Chat) | Some(Command::Tui) => run_shared_interactive_shell(),
         Some(Command::Doctor) => run_doctor(),
+        Some(Command::Adapter { command }) => run_adapter_command(command),
         Some(Command::Daemon { command }) => run_daemon_command(command),
         Some(Command::Run {
             harness,
@@ -496,7 +520,7 @@ fn run_doctor() -> Result<()> {
     }
 
     println!("\nHarnesses:");
-    let harnesses = harness::built_in_harnesses();
+    let harnesses = harness::configured_harnesses()?;
     for harness in &harnesses {
         let status = if harness.available {
             "ready"
@@ -505,8 +529,8 @@ fn run_doctor() -> Result<()> {
         };
         let marker = if harness.available { "OK" } else { "!!" };
         println!(
-            "  [{marker}] {:<11} `{}` is {status}",
-            harness.label, harness.executable
+            "  [{marker}] {:<18} `{}` is {status} ({})",
+            harness.label, harness.executable, harness.source
         );
         if !harness.available {
             println!("       {}", harness.install_hint);
@@ -519,6 +543,80 @@ fn run_doctor() -> Result<()> {
         println!("  coven sessions");
     } else {
         println!("  Install or authenticate Codex/Claude Code, then run `coven doctor` again.");
+    }
+    Ok(())
+}
+
+fn run_adapter_command(command: AdapterCommand) -> Result<()> {
+    match command {
+        AdapterCommand::List { json } => run_adapter_list(json),
+        AdapterCommand::Doctor { adapter } => run_adapter_doctor(adapter.as_deref()),
+    }
+}
+
+fn run_adapter_list(json: bool) -> Result<()> {
+    let harnesses = harness::configured_harnesses()?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&harnesses)?);
+        return Ok(());
+    }
+
+    println!("Coven adapters");
+    for harness in harnesses {
+        let availability = if harness.available {
+            "ready"
+        } else {
+            "missing"
+        };
+        let manifest = harness
+            .manifest_path
+            .as_deref()
+            .map(|path| format!(" from {path}"))
+            .unwrap_or_default();
+        println!(
+            "  {:<18} {:<10} `{}` {}{}",
+            harness.id, availability, harness.executable, harness.source, manifest
+        );
+    }
+    Ok(())
+}
+
+fn run_adapter_doctor(adapter: Option<&str>) -> Result<()> {
+    let harnesses = harness::configured_harnesses()?;
+    let filtered: Vec<_> = match adapter {
+        Some(id) => harnesses
+            .into_iter()
+            .filter(|harness| harness.id == id)
+            .collect(),
+        None => harnesses,
+    };
+
+    if let Some(id) = adapter {
+        if filtered.is_empty() {
+            anyhow::bail!(
+                "unknown adapter `{id}`; run `coven adapter list` to see configured adapters"
+            );
+        }
+    }
+
+    println!("Coven adapter doctor");
+    for harness in filtered {
+        let marker = if harness.available { "OK" } else { "!!" };
+        let status = if harness.available {
+            "ready"
+        } else {
+            "missing"
+        };
+        println!(
+            "  [{marker}] {:<18} `{}` is {status}",
+            harness.label, harness.executable
+        );
+        if let Some(path) = harness.manifest_path.as_deref() {
+            println!("       manifest: {path}");
+        }
+        if !harness.available {
+            println!("       {}", harness.install_hint);
+        }
     }
     Ok(())
 }
@@ -2241,6 +2339,25 @@ mod tests {
                 assert_eq!(event_days, Some(14));
             }
             other => panic!("expected logs prune command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_adapter_list_and_doctor_commands() {
+        let list = Cli::parse_from(["coven", "adapter", "list", "--json"]);
+        match list.command {
+            Some(Command::Adapter {
+                command: AdapterCommand::List { json },
+            }) => assert!(json),
+            other => panic!("expected adapter list command, got {other:?}"),
+        }
+
+        let doctor_one = Cli::parse_from(["coven", "adapter", "doctor", "claude"]);
+        match doctor_one.command {
+            Some(Command::Adapter {
+                command: AdapterCommand::Doctor { adapter },
+            }) => assert_eq!(adapter.as_deref(), Some("claude")),
+            other => panic!("expected adapter doctor command, got {other:?}"),
         }
     }
 

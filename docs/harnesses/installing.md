@@ -11,7 +11,7 @@ Coven does **not** bundle harness CLIs. Each supported harness is an independent
 
 ## How detection works
 
-`coven doctor` and `POST /api/v1/sessions` both resolve a harness id (`codex`, `claude`, …) to an executable name on `PATH` using the adapter table in [Harness adapters](/HARNESS-ADAPTERS). If the binary is missing, Coven fails closed with an install hint instead of attempting to launch.
+`coven doctor`, `coven adapter doctor`, and `POST /api/v1/sessions` all resolve a harness id (`codex`, `claude`, …) to an executable name on `PATH` using the adapter registry in [Harness adapters](/HARNESS-ADAPTERS). If the binary is missing, Coven fails closed with an install hint instead of attempting to launch.
 
 ```mermaid
 flowchart LR
@@ -23,7 +23,7 @@ flowchart LR
   Resolve -- yes --> Spawn[Spawn validated argv in PTY]
 ```
 
-The daemon revalidates the harness id on every launch request. Clients cannot widen the allowlist by sending a different argv or path; only built-in adapter ids are accepted.
+The daemon revalidates the harness id on every launch request. Clients cannot widen the allowlist by sending a different argv or path; only bundled compatibility adapters and explicit manifest adapters are accepted.
 
 ## Supported v0 harnesses
 
@@ -32,7 +32,7 @@ The daemon revalidates the harness id on every launch request. Clients cannot wi
 | `codex` | `codex` | `npm install -g @openai/codex` | `codex login` | [Codex harness](/harnesses/codex) |
 | `claude` | `claude` | `npm install -g @anthropic-ai/claude-code` | `claude doctor` | [Claude Code harness](/harnesses/claude-code) |
 
-Other CLIs (Hermes, Aider, Gemini CLI, Cline, custom commands) are **not** part of v0. See [Future harness notes](/FUTURE-HARNESSES) for the adapter direction.
+Other CLIs (Hermes, Aider, Gemini CLI, Cline, custom commands) are **not** bundled in v0. Test them through an explicit manifest and `coven adapter doctor`; see [Future harness notes](/FUTURE-HARNESSES) for the adapter direction.
 
 ## Step-by-step install
 
@@ -65,6 +65,7 @@ Other CLIs (Hermes, Aider, Gemini CLI, Cline, custom commands) are **not** part 
   <Step title="Verify Coven sees the harness">
     ```bash
     coven doctor
+    coven adapter list
     ```
 
     Expected output (abridged):
@@ -77,7 +78,7 @@ Other CLIs (Hermes, Aider, Gemini CLI, Cline, custom commands) are **not** part 
     claude:   ok       (/usr/local/bin/claude 0.x.y)
     ```
 
-    If a row shows `missing`, doctor also prints the exact install command shown in the table above.
+    If a row shows `missing`, doctor also prints the exact install command shown in the table above. `coven adapter list --json` is the machine-readable form for clients such as Coven Cave.
   </Step>
 
   <Step title="Launch a session">

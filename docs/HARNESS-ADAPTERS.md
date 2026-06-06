@@ -9,14 +9,14 @@ description: "How Coven harness adapters work, how external adapters graduate, a
 
 # Harness adapter guide
 
-Coven should treat every harness as an adapter. The daemon can ship a small default adapter set for compatibility, but no harness should become privileged runtime logic. OpenClaw, Hermes, Aider, Gemini, and future agents should enter through the same adapter contract and maturity checklist.
+Coven should treat every harness as an adapter. The daemon ships a small bundled compatibility adapter set for Codex and Claude Code, but no harness should become privileged runtime logic. OpenClaw, Hermes, Aider, Gemini, and future agents should enter through the same adapter contract and maturity checklist.
 
 The goal is a harness-neutral runtime:
 
 - Coven owns project-root validation, PTY supervision, session ids, event replay, and local socket policy.
 - The adapter owns how to detect and invoke one external CLI.
 - Provider auth, model/provider config, tools, skills, and memory stay inside that external harness.
-- Clients can discover supported adapters instead of hard-coding "Codex vs Claude" assumptions.
+- Clients can discover supported adapters with `coven adapter list` instead of hard-coding "Codex vs Claude" assumptions.
 
 ## Current adapter shape
 
@@ -35,7 +35,9 @@ The current implementation expects the prompt to be the final command argument a
 
 New harnesses should not be added as one-off special cases across the daemon, TUI, docs, OpenClaw plugin, and package READMEs. Add a reusable adapter description first, then wire the daemon and clients against that description.
 
-For now, Codex and Claude Code remain the compatibility defaults. Additional harnesses can be tested through an explicit adapter manifest by setting `COVEN_HARNESS_ADAPTER_MANIFEST` to a JSON file:
+For now, Codex and Claude Code remain the bundled compatibility defaults. Additional harnesses can be tested through explicit adapter manifests.
+
+Load one manifest file:
 
 ```json
 {
@@ -53,6 +55,21 @@ For now, Codex and Claude Code remain the compatibility defaults. Additional har
 }
 ```
 
+```sh
+export COVEN_HARNESS_ADAPTER_MANIFEST=/path/to/adapters.json
+coven adapter list
+coven adapter doctor example
+```
+
+Load every `*.json` manifest in one or more directories:
+
+```sh
+export COVEN_HARNESS_ADAPTER_DIRS="$HOME/.coven/adapters:$HOME/.config/coven/adapters"
+coven adapter list --json
+```
+
+Without env vars, Coven also checks `COVEN_HOME/adapters/*.json` when `COVEN_HOME` is set, then `~/.coven/adapters/*.json`, and finally `$XDG_CONFIG_HOME/coven/adapters/*.json`.
+
 The prompt is appended as the final command argument after the configured prefix args. Adapter ids must be lowercase and must not collide with built-in ids. Executables are names only, not shell strings or paths.
 
 This manifest path is for explicit integration work. It is not a public support claim for every adapter listed in a maintainer's local manifest.
@@ -69,9 +86,9 @@ A code-backed adapter should still be shaped as data plus narrow translation fun
 
 Do not promote a harness to public support by only adding it to `built_in_harness_specs()`. That makes the UI and docs look supported before the adapter contract is proven.
 
-## Current default adapters
+## Bundled compatibility adapters
 
-The current default adapters are Codex and Claude Code. They are compatibility defaults, not a model for hardcoding every future harness.
+The bundled compatibility adapters are Codex and Claude Code. They are first-class supported user paths, not a model for hardcoding every future harness.
 
 ### Codex
 
@@ -125,12 +142,26 @@ Before adding a new harness, confirm:
 - failure modes are understandable in `coven doctor`;
 - tests cover command construction and missing executable behavior.
 
+## Adapter commands
+
+Use these commands to debug a machine that only has Codex, Claude Code, or a local manifest adapter installed:
+
+```sh
+coven adapter list
+coven adapter list --json
+coven adapter doctor
+coven adapter doctor codex
+coven adapter doctor claude
+```
+
+`coven doctor` includes the same configured adapter set in its broader local runtime report.
+
 ## Adding a new adapter
 
 1. Start with a research note in `docs/FUTURE-HARNESSES.md` or a dedicated `docs/harnesses/<id>.md` page.
 2. Document the exact CLI contract: install, auth/setup, interactive launch, one-shot prompt launch, quiet/programmatic output mode, resume/session behavior, and unsupported modes.
 3. Add command-construction tests before changing user-facing docs to say the harness is supported.
-4. Add `coven doctor` detection and setup hints.
+4. Add `coven adapter doctor` / `coven doctor` detection and setup hints.
 5. Add launch behavior behind the generic adapter path, not scattered string checks.
 6. Add client compatibility notes for the OpenClaw bridge and any CastCodes surfaces that expose the harness.
 7. Run a smoke test against a real install or clearly document that support is still research-only.

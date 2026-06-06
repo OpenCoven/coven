@@ -1,19 +1,24 @@
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub const EXTERNAL_ADAPTER_MANIFEST_ENV: &str = "COVEN_HARNESS_ADAPTER_MANIFEST";
+pub const EXTERNAL_ADAPTER_DIRS_ENV: &str = "COVEN_HARNESS_ADAPTER_DIRS";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HarnessSummary {
     pub id: String,
     pub label: String,
     pub executable: String,
     pub available: bool,
     pub install_hint: String,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +103,8 @@ pub struct HarnessCommandSpec {
     pub interactive_prompt_prefix_args: Vec<String>,
     pub non_interactive_prompt_prefix_args: Vec<String>,
     pub install_hint: String,
+    pub source: String,
+    pub manifest_path: Option<String>,
     /// CLI flag name to pass a system-prompt string (e.g. `Some("--system-prompt")`
     /// for Claude). `None` means the harness has no such flag and identity
     /// should be injected by prepending a preamble to the prompt instead.
@@ -138,6 +145,8 @@ impl HarnessSummary {
             label: spec.label,
             executable: spec.executable,
             install_hint: spec.install_hint,
+            source: spec.source,
+            manifest_path: spec.manifest_path,
         }
     }
 }
@@ -189,6 +198,8 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
                 "never".to_string(),
             ],
             install_hint: "Install Codex with `npm install -g @openai/codex` or `brew install --cask codex`; if it is already installed, make sure `codex` is on PATH and run `codex login` or `codex` once to authenticate, then retry `coven doctor`.".to_string(),
+            source: "bundled".to_string(),
+            manifest_path: None,
             // Codex has no --system-prompt flag; identity is injected as a
             // bracketed preamble prepended to the prompt.
             system_prompt_flag: None,
@@ -200,6 +211,8 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
             interactive_prompt_prefix_args: Vec::new(),
             non_interactive_prompt_prefix_args: vec!["--print".to_string()],
             install_hint: "Install Claude Code with `npm install -g @anthropic-ai/claude-code`; if it is already installed, make sure `claude` is on PATH and run `claude doctor` to finish local auth/setup, then retry `coven doctor`.".to_string(),
+            source: "bundled".to_string(),
+            manifest_path: None,
             system_prompt_flag: Some("--system-prompt".to_string()),
         },
     ]
@@ -219,13 +232,84 @@ pub fn configured_harnesses() -> Result<Vec<HarnessSummary>> {
 }
 
 fn external_harness_specs() -> Result<Vec<HarnessCommandSpec>> {
-    let Some(manifest_path) = env::var_os(EXTERNAL_ADAPTER_MANIFEST_ENV) else {
-        return Ok(Vec::new());
-    };
-    load_external_harness_specs(Path::new(&manifest_path))
+    let built_ins = built_in_harness_specs();
+    let mut specs = Vec::new();
+    let mut ids: HashSet<String> = built_ins.iter().map(|spec| spec.id.clone()).collect();
+
+    for manifest_path in external_adapter_manifest_paths() {
+        for spec in load_external_harness_specs(&manifest_path, &built_ins)? {
+            if !ids.insert(spec.id.clone()) {
+                anyhow::bail!(
+                    "external harness adapter `{}` in {} duplicates another adapter id",
+                    spec.id,
+                    manifest_path.display()
+                );
+            }
+            specs.push(spec);
+        }
+    }
+    Ok(specs)
 }
 
-fn load_external_harness_specs(path: &Path) -> Result<Vec<HarnessCommandSpec>> {
+fn external_adapter_manifest_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    if let Some(manifest_path) = env::var_os(EXTERNAL_ADAPTER_MANIFEST_ENV) {
+        paths.push(PathBuf::from(manifest_path));
+    }
+
+    if let Some(dir_list) = env::var_os(EXTERNAL_ADAPTER_DIRS_ENV) {
+        for dir in env::split_paths(&dir_list) {
+            paths.extend(adapter_manifest_paths_in_dir(&dir));
+        }
+    }
+
+    if let Some(coven_home) = env::var_os("COVEN_HOME") {
+        paths.extend(adapter_manifest_paths_in_dir(
+            &PathBuf::from(coven_home).join("adapters"),
+        ));
+    } else if let Some(home) = env::var_os("HOME") {
+        paths.extend(adapter_manifest_paths_in_dir(
+            &PathBuf::from(home).join(".coven").join("adapters"),
+        ));
+    }
+
+    if let Some(config_home) = env::var_os("XDG_CONFIG_HOME") {
+        paths.extend(adapter_manifest_paths_in_dir(
+            &PathBuf::from(config_home).join("coven").join("adapters"),
+        ));
+    }
+
+    let mut seen = HashSet::new();
+    paths
+        .into_iter()
+        .filter(|path| seen.insert(path.clone()))
+        .collect()
+}
+
+fn adapter_manifest_paths_in_dir(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+        })
+        .collect();
+    paths.sort();
+    paths
+}
+
+fn load_external_harness_specs(
+    path: &Path,
+    built_ins: &[HarnessCommandSpec],
+) -> Result<Vec<HarnessCommandSpec>> {
     let raw = fs::read_to_string(path).map_err(|err| {
         anyhow!(
             "failed to read harness adapter manifest {}: {err}",
@@ -238,11 +322,10 @@ fn load_external_harness_specs(path: &Path) -> Result<Vec<HarnessCommandSpec>> {
             path.display()
         )
     })?;
-    let built_ins = built_in_harness_specs();
     registry
         .adapters
         .into_iter()
-        .map(|adapter| adapter.into_spec(path, &built_ins))
+        .map(|adapter| adapter.into_spec(path, built_ins))
         .collect()
 }
 
@@ -317,6 +400,8 @@ impl ExternalHarnessAdapterSpec {
             interactive_prompt_prefix_args: self.interactive_prompt_prefix_args,
             non_interactive_prompt_prefix_args: self.non_interactive_prompt_prefix_args,
             install_hint: self.install_hint.trim().to_string(),
+            source: "manifest".to_string(),
+            manifest_path: Some(manifest_path.to_string_lossy().into_owned()),
             system_prompt_flag: self
                 .system_prompt_flag
                 .map(|flag| flag.trim().to_string())
@@ -576,6 +661,13 @@ mod tests {
         }
     }
 
+    fn restore_adapter_dirs_env(previous: Option<std::ffi::OsString>) {
+        match previous {
+            Some(value) => env::set_var(EXTERNAL_ADAPTER_DIRS_ENV, value),
+            None => env::remove_var(EXTERNAL_ADAPTER_DIRS_ENV),
+        }
+    }
+
     #[test]
     fn executable_exists_in_paths_finds_matching_file() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
@@ -713,6 +805,8 @@ mod tests {
             interactive_prompt_prefix_args: vec!["chat".to_string()],
             non_interactive_prompt_prefix_args: vec!["exec".to_string(), "-q".to_string()],
             install_hint: "Install the future harness.".to_string(),
+            source: "manifest".to_string(),
+            manifest_path: None,
             system_prompt_flag: None,
         };
 
@@ -787,6 +881,99 @@ mod tests {
         assert!(!built_in_harnesses()
             .iter()
             .any(|harness| harness.id == "hermes"));
+        Ok(())
+    }
+
+    #[test]
+    fn configured_harness_specs_load_adapter_manifests_from_directory_env() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let manifest_dir = temp_dir.path().join("adapters");
+        fs::create_dir(&manifest_dir)?;
+        fs::write(
+            manifest_dir.join("codex-compatible.json"),
+            r#"{
+              "adapters": [
+                {
+                  "id": "codex-compatible",
+                  "label": "Codex Compatible",
+                  "executable": "codex-compatible",
+                  "interactive_prompt_prefix_args": [],
+                  "non_interactive_prompt_prefix_args": ["exec", "--color", "never"],
+                  "install_hint": "Install the Codex-compatible CLI and put it on PATH.",
+                  "system_prompt_flag": null
+                }
+              ]
+            }"#,
+        )?;
+
+        let _guard = env_lock().lock().unwrap();
+        let previous_manifest = env::var_os(EXTERNAL_ADAPTER_MANIFEST_ENV);
+        let previous_dirs = env::var_os(EXTERNAL_ADAPTER_DIRS_ENV);
+        env::remove_var(EXTERNAL_ADAPTER_MANIFEST_ENV);
+        env::set_var(EXTERNAL_ADAPTER_DIRS_ENV, &manifest_dir);
+
+        let specs = configured_harness_specs()?;
+
+        restore_adapter_manifest_env(previous_manifest);
+        restore_adapter_dirs_env(previous_dirs);
+
+        let custom = specs
+            .iter()
+            .find(|spec| spec.id == "codex-compatible")
+            .expect("directory manifest adapter should load");
+        assert_eq!(custom.label, "Codex Compatible");
+        assert_eq!(custom.executable, "codex-compatible");
+        Ok(())
+    }
+
+    #[test]
+    fn configured_harnesses_include_adapter_source_metadata() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let manifest = temp_dir.path().join("adapters.json");
+        fs::write(
+            &manifest,
+            r#"{
+              "adapters": [
+                {
+                  "id": "solo-codex",
+                  "label": "Solo Codex",
+                  "executable": "codex",
+                  "interactive_prompt_prefix_args": [],
+                  "non_interactive_prompt_prefix_args": ["exec"],
+                  "install_hint": "Install Codex.",
+                  "system_prompt_flag": null
+                }
+              ]
+            }"#,
+        )?;
+
+        let _guard = env_lock().lock().unwrap();
+        let previous_manifest = env::var_os(EXTERNAL_ADAPTER_MANIFEST_ENV);
+        let previous_dirs = env::var_os(EXTERNAL_ADAPTER_DIRS_ENV);
+        env::set_var(EXTERNAL_ADAPTER_MANIFEST_ENV, &manifest);
+        env::remove_var(EXTERNAL_ADAPTER_DIRS_ENV);
+
+        let harnesses = configured_harnesses()?;
+
+        restore_adapter_manifest_env(previous_manifest);
+        restore_adapter_dirs_env(previous_dirs);
+
+        let codex = harnesses
+            .iter()
+            .find(|harness| harness.id == "codex")
+            .unwrap();
+        assert_eq!(codex.source, "bundled");
+        assert!(codex.manifest_path.is_none());
+
+        let custom = harnesses
+            .iter()
+            .find(|harness| harness.id == "solo-codex")
+            .unwrap();
+        assert_eq!(custom.source, "manifest");
+        assert_eq!(
+            custom.manifest_path.as_deref(),
+            Some(manifest.to_string_lossy().as_ref())
+        );
         Ok(())
     }
 

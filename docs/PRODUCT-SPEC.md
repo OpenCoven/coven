@@ -36,7 +36,7 @@ Out of scope for MVP: marketplace plugins, cloud sync, multi-user collaboration,
 
 ## Built-in v0 harness direction
 
-Coven v0 should ship with built-in adapters for Codex and Claude Code. These adapters should detect local CLI availability, construct commands without shell interpolation where possible, run the harness inside a validated project `cwd`, and expose output/input through Coven-managed PTY sessions.
+Coven v0 should ship with bundled compatibility adapters for Codex and Claude Code. These adapters should detect local CLI availability, construct commands without shell interpolation where possible, run the harness inside a validated project `cwd`, and expose output/input through Coven-managed PTY sessions.
 
 Terminal UX should stay centered on the lightweight `coven` command and a human session browser:
 
@@ -53,7 +53,7 @@ In an interactive terminal, `coven sessions` opens a browser with readable actio
 
 ## Future Hermes and adapter path
 
-Hermes and other harnesses should arrive through a small adapter contract after the built-in v0 path is stable. The adapter model should support future targets such as Hermes, Aider, Gemini, OpenCode, and custom command adapters without requiring Coven to become a full plugin marketplace in the MVP.
+Hermes and other harnesses should arrive through the adapter manifest/registry contract after the bundled v0 compatibility path is stable. The adapter model should support future targets such as Hermes, Aider, Gemini, OpenCode, and custom command adapters without requiring Coven to become a full plugin marketplace in the MVP.
 
 ## Current architecture
 
