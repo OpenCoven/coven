@@ -406,10 +406,12 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   const command = args._[0];
   if (command === "report") {
+    const parsedStaleRunningHours = Number(args["stale-running-hours"] ?? 4);
+    const staleRunningHours = Number.isFinite(parsedStaleRunningHours) ? parsedStaleRunningHours : 4;
     const result = await writeTaskFreshnessReport({
       covenHome: args["coven-home"] ?? DEFAULT_COVEN_HOME,
       out: args.out,
-      staleRunningHours: Number(args["stale-running-hours"] ?? 4),
+      staleRunningHours,
     });
     process.stdout.write(`${result.report}\nWrote ${result.path}\n`);
     return;
