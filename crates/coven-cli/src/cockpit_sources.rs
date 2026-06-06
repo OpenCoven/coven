@@ -263,9 +263,12 @@ pub fn scan_skills(coven_home: &Path) -> Result<Vec<SkillDto>> {
         match fs::metadata(&dir) {
             Ok(meta) if meta.is_dir() => {}
             Ok(_) => continue,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
             Err(err) => {
-                return Err(err).with_context(|| format!("failed to inspect {}", dir.display()));
+                return Err(err)
+                    .with_context(|| format!("failed to inspect {}", dir.display()));
             }
+        }
         }
         let metadata_path = dir.join("metadata.json");
         let raw = match fs::read_to_string(&metadata_path) {
