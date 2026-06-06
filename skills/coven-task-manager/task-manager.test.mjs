@@ -11,6 +11,7 @@ import {
   installDefaultAutomations,
   installSkillSymlink,
   loadBoard,
+  parseStaleRunningHours,
 } from "./task-manager.mjs";
 
 test("classifyTasks separates stale running, blocked, review, active, and done cards", () => {
@@ -146,6 +147,14 @@ test("loadBoard reads Cave task cards from a Coven home", async () => {
 
   assert.equal(cards.length, 1);
   assert.equal(cards[0].id, "one");
+});
+
+test("parseStaleRunningHours falls back for invalid CLI values", () => {
+  assert.equal(parseStaleRunningHours(undefined), 4);
+  assert.equal(parseStaleRunningHours("true"), 4);
+  assert.equal(parseStaleRunningHours("nope"), 4);
+  assert.equal(parseStaleRunningHours("0"), 4);
+  assert.equal(parseStaleRunningHours("6"), 6);
 });
 
 test("installDefaultAutomations writes paused Codex automation TOMLs by default", async () => {

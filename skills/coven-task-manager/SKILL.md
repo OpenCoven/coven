@@ -9,9 +9,11 @@ Use this skill when asked to manage, refresh, audit, triage, or summarize Coven 
 
 ## Sources
 
-Start with the Cave task board:
+Start with the Cave task board from the skill directory:
 
-    node ./task-manager.mjs report
+```bash
+node ./task-manager.mjs report
+```
 
 The helper reads `~/.coven/cave-board.json` and writes `~/.coven/task-manager/freshness-report.md` by default.
 

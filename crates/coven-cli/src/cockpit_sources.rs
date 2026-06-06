@@ -265,10 +265,8 @@ pub fn scan_skills(coven_home: &Path) -> Result<Vec<SkillDto>> {
             Ok(_) => continue,
             Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
             Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("failed to inspect {}", dir.display()));
+                return Err(err).with_context(|| format!("failed to inspect {}", dir.display()));
             }
-        }
         }
         let metadata_path = dir.join("metadata.json");
         let raw = match fs::read_to_string(&metadata_path) {
@@ -843,6 +841,23 @@ description = "..."
         assert_eq!(out[0].id, "delta");
         assert_eq!(out[0].name, "Delta");
         assert_eq!(out[0].owner, "coven");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_skills_skips_dangling_symlinks() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let skills_root = temp.path().join(SKILLS_DIR);
+        fs::create_dir_all(&skills_root)?;
+        std::os::unix::fs::symlink(
+            temp.path().join("missing-skill"),
+            skills_root.join("missing-skill"),
+        )?;
+
+        let out = scan_skills(temp.path())?;
+
+        assert!(out.is_empty());
         Ok(())
     }
 

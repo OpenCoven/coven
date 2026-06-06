@@ -402,16 +402,19 @@ function parseArgs(argv) {
   return args;
 }
 
+export function parseStaleRunningHours(value, fallback = 4) {
+  const parsed = Number(value ?? fallback);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const command = args._[0];
   if (command === "report") {
-    const parsedStaleRunningHours = Number(args["stale-running-hours"] ?? 4);
-    const staleRunningHours = Number.isFinite(parsedStaleRunningHours) ? parsedStaleRunningHours : 4;
     const result = await writeTaskFreshnessReport({
       covenHome: args["coven-home"] ?? DEFAULT_COVEN_HOME,
       out: args.out,
-      staleRunningHours,
+      staleRunningHours: parseStaleRunningHours(args["stale-running-hours"]),
     });
     process.stdout.write(`${result.report}\nWrote ${result.path}\n`);
     return;
