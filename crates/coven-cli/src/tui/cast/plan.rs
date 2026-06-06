@@ -92,6 +92,11 @@ where
             harness,
             ref prompt,
         } => harness_spell_plan(harness, prompt, intent.clone()),
+        CastIntent::FamiliarSpell {
+            ref harness,
+            ref prompt,
+            ..
+        } => familiar_spell_plan(*harness, prompt, intent.clone(), &default_harness),
         CastIntent::OpenSessions => simple_plan(
             intent,
             "Open the active session browser",
@@ -327,6 +332,71 @@ fn harness_spell_plan(harness: CastHarness, prompt: &str, intent: CastIntent) ->
             harness,
             source: CastHarnessSource::UserChose,
         }),
+        session_id: None,
+        prompt: Some(prompt.to_string()),
+        title: Some(title),
+    }
+}
+
+fn familiar_spell_plan(
+    harness: Option<CastHarness>,
+    prompt: &str,
+    intent: CastIntent,
+    default_harness: &dyn Fn() -> Option<CastHarness>,
+) -> CastPlan {
+    let decision = classify_prompt_risk(prompt);
+    let title = derive_title(prompt);
+    let headline = format!("Call familiar with spell: {title}");
+    let harness = harness
+        .map(|harness| CastPlanHarness {
+            harness,
+            source: CastHarnessSource::UserChose,
+        })
+        .or_else(|| {
+            default_harness().map(|harness| CastPlanHarness {
+                harness,
+                source: CastHarnessSource::SafeDefault,
+            })
+        });
+    let mut steps = vec![CastStep::new(
+        CastStepKind::LaunchSession,
+        match harness {
+            Some(plan_harness) => format!(
+                "Launch {} inside this project with the spell as the task",
+                plan_harness.harness.label()
+            ),
+            None => {
+                "No harness ready — run `coven doctor` to install Codex or Claude Code".to_string()
+            }
+        },
+    )];
+    if let SafetyDecision::Confirm {
+        ref reason,
+        ref suggestion,
+    } = decision
+    {
+        steps.push(CastStep::new(
+            CastStepKind::Inform,
+            format!("Risk: {reason}. {suggestion}"),
+        ));
+    }
+    if let SafetyDecision::Reject {
+        ref reason,
+        ref alternative,
+    } = decision
+    {
+        steps.push(CastStep::new(
+            CastStepKind::Inform,
+            format!("Rejected: {reason}. {alternative}"),
+        ));
+    }
+    CastPlan {
+        raw_spell: String::new(),
+        intent,
+        headline,
+        steps,
+        decision,
+        harness,
         session_id: None,
         prompt: Some(prompt.to_string()),
         title: Some(title),

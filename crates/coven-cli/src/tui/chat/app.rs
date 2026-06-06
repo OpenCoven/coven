@@ -790,9 +790,15 @@ impl App {
     }
 
     fn execute_cast_plan(&mut self, plan: CastPlan) -> SlashCommandResult {
+        let explicit_callee_id = match &plan.intent {
+            CastIntent::FamiliarSpell { familiar_id, .. } => Some(familiar_id.clone()),
+            _ => None,
+        };
+
         match plan.intent {
             CastIntent::NaturalSpell { ref prompt }
-            | CastIntent::HarnessSpell { ref prompt, .. } => {
+            | CastIntent::HarnessSpell { ref prompt, .. }
+            | CastIntent::FamiliarSpell { ref prompt, .. } => {
                 let Some(plan_harness) = plan.harness else {
                     self.push_system_message(
                         "No harness available. Run `coven doctor` to install Codex or Claude Code.",
@@ -810,10 +816,11 @@ impl App {
                     if let (Some(home), Some(caller_id)) =
                         (self.coven_home.as_deref(), self.familiar_id.as_deref())
                     {
+                        let callee_id = explicit_callee_id.as_deref().unwrap_or("unknown");
                         match crate::coven_calls::emit_running(
                             home,
                             caller_id,
-                            "unknown", // callee resolution is a TODO once delegation routing is wired
+                            callee_id,
                             prompt,
                             Some(&session.id),
                         ) {

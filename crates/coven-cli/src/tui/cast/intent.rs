@@ -53,6 +53,12 @@ pub(crate) enum CastIntent {
         harness: CastHarness,
         prompt: String,
     },
+    /// The user addressed a familiar directly, e.g. `:cody fix the bug`.
+    FamiliarSpell {
+        familiar_id: String,
+        harness: Option<CastHarness>,
+        prompt: String,
+    },
     OpenSessions,
     OpenAllSessions,
     AttachSession {
@@ -103,6 +109,10 @@ pub(crate) fn parse_spell(raw: &str) -> Result<CastIntent> {
 
     if let Some(quest_intent) = parse_natural_quest_trigger(input) {
         return Ok(quest_intent);
+    }
+
+    if let Some(familiar_spell) = parse_familiar_spell(input) {
+        return Ok(familiar_spell);
     }
 
     if let Some(harness_spell) = parse_natural_harness_prefix(input) {
@@ -204,6 +214,42 @@ fn parse_natural_quest_trigger(input: &str) -> Option<CastIntent> {
         }
     }
     None
+}
+
+fn parse_familiar_spell(input: &str) -> Option<CastIntent> {
+    let after_colon = input.strip_prefix(':')?;
+    if after_colon.is_empty() || after_colon.starts_with(':') || after_colon.starts_with(' ') {
+        return None;
+    }
+
+    let (familiar_id, rest) = split_first_token(after_colon);
+    if familiar_id.is_empty()
+        || !familiar_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        || CastHarness::from_token(familiar_id).is_some()
+    {
+        return None;
+    }
+
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let prompt = if rest.starts_with('"') && rest.ends_with('"') && rest.len() >= 2 {
+        rest[1..rest.len() - 1].trim()
+    } else {
+        rest
+    };
+    if prompt.is_empty() {
+        return None;
+    }
+
+    Some(CastIntent::FamiliarSpell {
+        familiar_id: familiar_id.to_string(),
+        harness: None,
+        prompt: prompt.to_string(),
+    })
 }
 
 /// Translate plain-language "run claude X" / "use codex X" / "ask codex X"
@@ -521,6 +567,80 @@ mod tests {
             intent("/quest fix the failing tests"),
             CastIntent::Quest {
                 goal: "fix the failing tests".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_familiar_spell_bare_prompt() {
+        assert_eq!(
+            intent(":sage research this"),
+            CastIntent::FamiliarSpell {
+                familiar_id: "sage".to_string(),
+                harness: None,
+                prompt: "research this".to_string(),
+            }
+        );
+        assert_eq!(
+            intent(":cody refactor the auth module"),
+            CastIntent::FamiliarSpell {
+                familiar_id: "cody".to_string(),
+                harness: None,
+                prompt: "refactor the auth module".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_familiar_spell_quoted_prompt() {
+        assert_eq!(
+            intent(r#":cody "fix the bug""#),
+            CastIntent::FamiliarSpell {
+                familiar_id: "cody".to_string(),
+                harness: None,
+                prompt: "fix the bug".to_string(),
+            }
+        );
+        assert_eq!(
+            intent(r#":sage "  research OpenHands SDK  ""#),
+            CastIntent::FamiliarSpell {
+                familiar_id: "sage".to_string(),
+                harness: None,
+                prompt: "research OpenHands SDK".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_harness_not_confused_as_familiar() {
+        let result = parse_spell(":codex fix this").unwrap();
+        assert!(
+            !matches!(result, CastIntent::FamiliarSpell { .. }),
+            ":codex should not produce FamiliarSpell; got: {result:?}"
+        );
+        let result2 = parse_spell(":claude write a test").unwrap();
+        assert!(
+            !matches!(result2, CastIntent::FamiliarSpell { .. }),
+            ":claude should not produce FamiliarSpell; got: {result2:?}"
+        );
+    }
+
+    #[test]
+    fn parse_familiar_spell_with_hyphen() {
+        assert_eq!(
+            intent(":coven-code build the thing"),
+            CastIntent::FamiliarSpell {
+                familiar_id: "coven-code".to_string(),
+                harness: None,
+                prompt: "build the thing".to_string(),
+            }
+        );
+        assert_eq!(
+            intent(":my_agent do the work"),
+            CastIntent::FamiliarSpell {
+                familiar_id: "my_agent".to_string(),
+                harness: None,
+                prompt: "do the work".to_string(),
             }
         );
     }

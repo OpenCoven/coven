@@ -330,7 +330,9 @@ fn dispatch_cast_plan(plan: CastPlan) -> Result<()> {
     let request_text = outcome_request_text(&plan);
 
     let outcome = match plan.intent.clone() {
-        CastIntent::NaturalSpell { prompt } => dispatch_default_spell(&plan, &prompt)?,
+        CastIntent::NaturalSpell { prompt } | CastIntent::FamiliarSpell { prompt, .. } => {
+            dispatch_default_spell(&plan, &prompt)?
+        }
         CastIntent::HarnessSpell { harness, prompt } => {
             dispatch_harness_spell(&plan, harness.id(), &prompt)?
         }
