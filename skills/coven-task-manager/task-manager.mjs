@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { lstat, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, symlink, unlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -333,15 +333,15 @@ function tomlMultiline(value) {
 }
 
 function automationToml(template, { skillPath, status }) {
+  const normalizedStatus = normalizeAutomationStatus(status);
   return [
     "version = 1",
     `id = ${tomlString(template.id)}`,
     'kind = "cron"',
     `name = ${tomlString(template.name)}`,
     `prompt = ${tomlMultiline(template.prompt)}`,
-    `status = ${tomlString(status)}`,
+    `status = ${tomlString(normalizedStatus)}`,
     `rrule = ${tomlString(template.rrule)}`,
-    'model = "gpt-5.5"',
     'reasoning_effort = "high"',
     'execution_environment = "worktree"',
     "cwds = []",
@@ -357,11 +357,12 @@ export async function installDefaultAutomations({
   status = "PAUSED",
 } = {}) {
   const root = join(expandHome(codexHome), "automations");
+  const normalizedStatus = normalizeAutomationStatus(status);
   const installed = [];
   for (const template of DEFAULT_AUTOMATIONS) {
     const dir = join(root, template.id);
     await mkdir(dir, { recursive: true });
-    const toml = automationToml(template, { skillPath, status });
+    const toml = automationToml(template, { skillPath, status: normalizedStatus });
     await writeFile(join(dir, "automation.toml"), toml, "utf8");
     installed.push({ id: template.id, path: join(dir, "automation.toml") });
   }
@@ -381,7 +382,7 @@ export async function installSkillSymlink({
     if (!current.isSymbolicLink()) {
       throw new Error(`refusing to replace non-symlink skill install at ${target}`);
     }
-    await rm(target, { recursive: true, force: true });
+    await unlink(target);
   }
   await symlink(resolve(skillPath), target, "dir");
   return { path: target, changed: true };
@@ -405,6 +406,11 @@ function parseArgs(argv) {
 export function parseStaleRunningHours(value, fallback = 4) {
   const parsed = Number(value ?? fallback);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+export function normalizeAutomationStatus(value, fallback = "PAUSED") {
+  const status = String(value ?? fallback).trim().toUpperCase();
+  return status === "PAUSED" || status === "ACTIVE" ? status : fallback;
 }
 
 async function main() {

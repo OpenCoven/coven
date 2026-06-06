@@ -4,7 +4,6 @@ kind = "cron"
 name = "Coven Weekly Task Cleanup"
 status = "PAUSED"
 rrule = "RRULE:FREQ=WEEKLY;BYHOUR=17;BYMINUTE=0;BYDAY=FR"
-model = "gpt-5.5"
 reasoning_effort = "high"
 execution_environment = "worktree"
 cwds = []

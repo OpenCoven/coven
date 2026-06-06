@@ -11,6 +11,7 @@ import {
   installDefaultAutomations,
   installSkillSymlink,
   loadBoard,
+  normalizeAutomationStatus,
   parseStaleRunningHours,
 } from "./task-manager.mjs";
 
@@ -157,6 +158,13 @@ test("parseStaleRunningHours falls back for invalid CLI values", () => {
   assert.equal(parseStaleRunningHours("6"), 6);
 });
 
+test("normalizeAutomationStatus accepts only supported automation states", () => {
+  assert.equal(normalizeAutomationStatus(undefined), "PAUSED");
+  assert.equal(normalizeAutomationStatus("active"), "ACTIVE");
+  assert.equal(normalizeAutomationStatus("PAUSED"), "PAUSED");
+  assert.equal(normalizeAutomationStatus("delete-everything"), "PAUSED");
+});
+
 test("installDefaultAutomations writes paused Codex automation TOMLs by default", async () => {
   const root = await mkdtemp(join(tmpdir(), "coven-task-manager-"));
   const codexHome = join(root, ".codex");
@@ -183,6 +191,7 @@ test("installDefaultAutomations writes paused Codex automation TOMLs by default"
   assert.match(contents, /status = "PAUSED"/);
   assert.match(contents, /Use the `coven-task-manager` skill/);
   assert.match(contents, /rrule = "RRULE:FREQ=WEEKLY;BYHOUR=8;BYMINUTE=30;BYDAY=SU,MO,TU,WE,TH,FR,SA"/);
+  assert.doesNotMatch(contents, /^model = /m);
   await stat(first);
 });
 

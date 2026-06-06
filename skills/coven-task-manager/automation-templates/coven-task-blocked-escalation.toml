@@ -4,7 +4,6 @@ kind = "cron"
 name = "Coven Blocked Task Escalation"
 status = "PAUSED"
 rrule = "RRULE:FREQ=WEEKLY;BYHOUR=10;BYMINUTE=0;BYDAY=MO,TU,WE,TH,FR"
-model = "gpt-5.5"
 reasoning_effort = "high"
 execution_environment = "worktree"
 cwds = []
