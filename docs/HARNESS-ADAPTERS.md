@@ -1,19 +1,26 @@
 ---
 title: "Harness adapter guide"
-summary: "The harness adapter shape Coven uses today, the bar for adding new harnesses, and how Codex and Claude Code map onto the v0 adapter surface."
+summary: "How Coven harness adapters work, how external adapters graduate, and why OpenClaw/Hermes should not be hardcoded into the daemon."
 read_when:
   - Reviewing supported harness behavior
   - Evaluating a future harness adapter
-description: "The harness adapter shape Coven uses today, the bar for adding new harnesses, and how Codex and Claude Code map onto the v0 adapter surface."
+description: "How Coven harness adapters work, how external adapters graduate, and why OpenClaw/Hermes should not be hardcoded into the daemon."
 ---
 
 # Harness adapter guide
 
-Coven v0 supports Codex and Claude Code. This guide describes the current adapter shape and the bar for adding more harnesses.
+Coven should treat every harness as an adapter. The daemon can ship a small default adapter set for compatibility, but no harness should become privileged runtime logic. OpenClaw, Hermes, Aider, Gemini, and future agents should enter through the same adapter contract and maturity checklist.
+
+The goal is a harness-neutral runtime:
+
+- Coven owns project-root validation, PTY supervision, session ids, event replay, and local socket policy.
+- The adapter owns how to detect and invoke one external CLI.
+- Provider auth, model/provider config, tools, skills, and memory stay inside that external harness.
+- Clients can discover supported adapters instead of hard-coding "Codex vs Claude" assumptions.
 
 ## Current adapter shape
 
-A built-in harness adapter defines:
+A Coven harness adapter defines:
 
 - stable Coven harness id;
 - user-facing label;
@@ -22,9 +29,27 @@ A built-in harness adapter defines:
 - prompt argument shape for non-interactive mode; and
 - install/authentication hint for `coven doctor`.
 
-The current implementation expects the prompt to be the final command argument after any fixed prefix args.
+The current implementation expects the prompt to be the final command argument after any fixed prefix args. Keep that invariant unless the adapter explicitly documents a safer stdin or protocol mode.
 
-## Built-in harnesses
+## External adapter rule
+
+New harnesses should not be added as one-off special cases across the daemon, TUI, docs, OpenClaw plugin, and package READMEs. Add a reusable adapter description first, then wire the daemon and clients against that description.
+
+For now, a code-backed adapter still lands in this repo, but it should be shaped as data plus narrow translation functions. The direction is an external adapter registry/manifest that can describe:
+
+- `id`, `label`, and `executable`;
+- detection and setup hints;
+- interactive, one-shot, and optional stream/resume argv;
+- whether the adapter supports preassigned upstream session ids;
+- whether the adapter has a dedicated system-prompt/identity flag;
+- output expectations and known unsupported modes; and
+- client compatibility notes for OpenClaw, CastCodes, and other consumers.
+
+Do not promote a harness to public support by only adding it to `built_in_harness_specs()`. That makes the UI and docs look supported before the adapter contract is proven.
+
+## Current default adapters
+
+The current default adapters are Codex and Claude Code. They are compatibility defaults, not a model for hardcoding every future harness.
 
 ### Codex
 
@@ -54,6 +79,18 @@ npm install -g @anthropic-ai/claude-code
 claude doctor
 ```
 
+## First external integration: OpenClaw
+
+OpenClaw is the first external integration boundary for Coven, but it is not a daemon-launched harness id. The package `@opencoven/coven` is an external OpenClaw ACP runtime bridge:
+
+- OpenClaw registers ACP backend id `coven`.
+- The bridge talks to the local Coven daemon over the configured Unix socket.
+- OpenClaw chooses an ACP agent id, maps it to a Coven harness id, and launches a project-scoped Coven session.
+- Coven validates the project root, harness id, session id, input, and kill requests.
+- OpenClaw keeps responsibility for its own UI, chat/session routing, plugin lifecycle, and ACP bindings.
+
+This is the integration shape future clients should follow: consume Coven's socket API and adapter discovery, do not import daemon internals or require Coven to know OpenClaw internals.
+
 ## Adapter requirements
 
 Before adding a new harness, confirm:
@@ -65,6 +102,16 @@ Before adding a new harness, confirm:
 - authentication stays in the harness provider's normal local flow;
 - failure modes are understandable in `coven doctor`;
 - tests cover command construction and missing executable behavior.
+
+## Adding a new adapter
+
+1. Start with a research note in `docs/FUTURE-HARNESSES.md` or a dedicated `docs/harnesses/<id>.md` page.
+2. Document the exact CLI contract: install, auth/setup, interactive launch, one-shot prompt launch, quiet/programmatic output mode, resume/session behavior, and unsupported modes.
+3. Add command-construction tests before changing user-facing docs to say the harness is supported.
+4. Add `coven doctor` detection and setup hints.
+5. Add launch behavior behind the generic adapter path, not scattered string checks.
+6. Add client compatibility notes for the OpenClaw bridge and any CastCodes surfaces that expose the harness.
+7. Run a smoke test against a real install or clearly document that support is still research-only.
 
 ## What not to add yet
 

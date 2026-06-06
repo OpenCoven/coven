@@ -133,6 +133,7 @@
                   "harnesses/index",
                   "harnesses/codex",
                   "harnesses/claude-code",
+                  "harnesses/openclaw",
                   "harnesses/installing",
                   "harnesses/provider-auth",
                   "HARNESS-ADAPTERS",
