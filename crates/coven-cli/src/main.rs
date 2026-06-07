@@ -479,9 +479,97 @@ fn run_sessions_search(query: &str, json: bool) -> Result<()> {
 }
 
 fn run_shared_interactive_shell() -> Result<()> {
+    // Delegate to coven-code (the unified Coven Code TUI) when it is
+    // installed and the user has not explicitly opted out via
+    // `COVEN_LEGACY_TUI=1`. coven-code now hosts the /coven substrate
+    // surface, so it is the canonical interactive front-end.
+    if interactive_delegation_enabled() {
+        if let Some(binary) = coven_code_binary() {
+            try_delegate_to_coven_code(&binary)?;
+            // try_delegate_to_coven_code only returns on failure to exec —
+            // success replaces this process. Fall through to legacy on error.
+        }
+    }
     match interactive_shell_route(None, io::stdin().is_terminal(), io::stdout().is_terminal()) {
         InteractiveShellRoute::Chat => tui::chat::run_chat(),
         InteractiveShellRoute::PlainCast => tui::shell::run(),
+    }
+}
+
+/// Whether to consider handing the interactive shell off to coven-code.
+/// `COVEN_LEGACY_TUI=1` forces the in-process tui::shell experience.
+fn interactive_delegation_enabled() -> bool {
+    !matches!(std::env::var("COVEN_LEGACY_TUI").as_deref(), Ok("1") | Ok("true"))
+}
+
+/// Locate the `coven-code` binary on PATH or in `~/.coven-code/bin/`.
+fn coven_code_binary() -> Option<PathBuf> {
+    if let Ok(path_var) = std::env::var("PATH") {
+        let suffix = if cfg!(windows) { ".exe" } else { "" };
+        let name = format!("coven-code{suffix}");
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join(&name);
+            if is_executable_file(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    if let Some(home) = dirs_next::home_dir() {
+        let suffix = if cfg!(windows) { ".exe" } else { "" };
+        let candidate = home
+            .join(".coven-code")
+            .join("bin")
+            .join(format!("coven-code{suffix}"));
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        return std::fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false);
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Exec `coven-code` in place of the current process. Returns only on failure;
+/// on success the child takes over this PID and stdio.
+fn try_delegate_to_coven_code(binary: &Path) -> Result<()> {
+    let mut command = std::process::Command::new(binary);
+    // Pass through every flag the user supplied to `coven`/`coven tui` so
+    // any future coven-code substrate flags work end-to-end. We strip argv[0]
+    // and the optional leading `tui` subcommand because coven-code expects
+    // its own argv layout.
+    let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    if matches!(args.first().and_then(|a| a.to_str()), Some("tui") | Some("chat")) {
+        args.remove(0);
+    }
+    command.args(args);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = command.exec();
+        // exec only returns on failure.
+        return Err(anyhow!("failed to exec coven-code: {err}"));
+    }
+
+    #[cfg(not(unix))]
+    {
+        let status = command.status().map_err(|e| anyhow!("failed to launch coven-code: {e}"))?;
+        std::process::exit(status.code().unwrap_or(0));
     }
 }
 
@@ -2703,6 +2791,44 @@ mod tests {
             familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
+        }
+    }
+
+    #[test]
+    fn delegation_disabled_when_legacy_env_set() {
+        // SAFETY: tests in this crate run on a single thread by default; if
+        // that ever changes, gate this behind a serial mutex.
+        let prev = std::env::var("COVEN_LEGACY_TUI").ok();
+        std::env::set_var("COVEN_LEGACY_TUI", "1");
+        assert!(!interactive_delegation_enabled());
+        std::env::set_var("COVEN_LEGACY_TUI", "true");
+        assert!(!interactive_delegation_enabled());
+        std::env::remove_var("COVEN_LEGACY_TUI");
+        assert!(interactive_delegation_enabled());
+        if let Some(v) = prev {
+            std::env::set_var("COVEN_LEGACY_TUI", v);
+        }
+    }
+
+    #[test]
+    fn coven_code_binary_lookup_returns_none_for_empty_path() {
+        let prev_path = std::env::var("PATH").ok();
+        let prev_home = std::env::var("HOME").ok();
+        // Point PATH and HOME at empty/nonexistent locations so the lookup
+        // cannot resolve a binary anywhere.
+        std::env::set_var("PATH", "");
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        assert!(coven_code_binary().is_none());
+        if let Some(p) = prev_path {
+            std::env::set_var("PATH", p);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        if let Some(h) = prev_home {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
         }
     }
 }
