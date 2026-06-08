@@ -573,65 +573,19 @@ pub fn mark_running_sessions_orphaned(conn: &Connection, updated_at: &str) -> Re
 }
 
 pub fn get_session(conn: &Connection, session_id: &str) -> Result<Option<SessionRecord>> {
-    let mut stmt = conn
-        .prepare(
+    let mut statement = conn
+        .prepare(&format!(
             "SELECT
-                id,
-                project_root,
-                harness,
-                title,
-                status,
-                exit_code,
-                archived_at,
-                created_at,
-                updated_at,
-                conversation_id,
-                labels,
-                visibility,
-                familiar_id
+                {SESSION_COLUMNS}
             FROM sessions
-            WHERE id = ?1
-            LIMIT 1",
-        )
-        .context("failed to prepare get_session query")?;
+            WHERE id = ?1",
+        ))
+        .context("failed to prepare session lookup query")?;
 
-    let mut rows = stmt
-        .query_map([session_id], |row| {
-            let labels_str: Option<String> = row.get(10)?;
-            let labels: Vec<String> = labels_str
-                .as_deref()
-                .map(serde_json::from_str)
-                .transpose()
-                .map_err(|err| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        10,
-                        rusqlite::types::Type::Text,
-                        Box::new(err),
-                    )
-                })?
-                .unwrap_or_default();
-            let visibility: String = row.get(11)?;
-            Ok(SessionRecord {
-                id: row.get(0)?,
-                project_root: row.get(1)?,
-                harness: row.get(2)?,
-                title: row.get(3)?,
-                status: row.get(4)?,
-                exit_code: row.get(5)?,
-                archived_at: row.get(6)?,
-                created_at: row.get(7)?,
-                updated_at: row.get(8)?,
-                conversation_id: row.get(9)?,
-                familiar_id: row.get(12)?,
-                labels,
-                visibility,
-            })
-        })
-        .context("failed to query session by id")?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("failed to read session row")?;
-
-    Ok(rows.pop())
+    statement
+        .query_row(params![session_id], session_record_from_row)
+        .optional()
+        .with_context(|| format!("failed to read session {session_id}"))
 }
 
 pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionRecord>> {
@@ -654,7 +608,23 @@ fn list_sessions_with_archive_filter(
     let mut statement = conn
         .prepare(&format!(
             "SELECT
-                id,
+                {SESSION_COLUMNS}
+            FROM sessions
+            {archive_filter}
+            ORDER BY created_at DESC, id DESC",
+        ))
+        .context("failed to prepare session list query")?;
+
+    let sessions = statement
+        .query_map([], session_record_from_row)
+        .context("failed to query sessions")?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to read sessions")?;
+
+    Ok(sessions)
+}
+
+const SESSION_COLUMNS: &str = "id,
                 project_root,
                 harness,
                 title,
@@ -666,50 +636,38 @@ fn list_sessions_with_archive_filter(
                 conversation_id,
                 labels,
                 visibility,
-                familiar_id
-            FROM sessions
-            {archive_filter}
-            ORDER BY created_at DESC, id DESC",
-        ))
-        .context("failed to prepare session list query")?;
+                familiar_id";
 
-    let sessions = statement
-        .query_map([], |row| {
-            let labels_str: Option<String> = row.get(10)?;
-            let labels: Vec<String> = labels_str
-                .as_deref()
-                .map(serde_json::from_str)
-                .transpose()
-                .map_err(|err| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        10,
-                        rusqlite::types::Type::Text,
-                        Box::new(err),
-                    )
-                })?
-                .unwrap_or_default();
-            let visibility: String = row.get(11)?;
-            Ok(SessionRecord {
-                id: row.get(0)?,
-                project_root: row.get(1)?,
-                harness: row.get(2)?,
-                title: row.get(3)?,
-                status: row.get(4)?,
-                exit_code: row.get(5)?,
-                archived_at: row.get(6)?,
-                created_at: row.get(7)?,
-                updated_at: row.get(8)?,
-                conversation_id: row.get(9)?,
-                familiar_id: row.get(12)?,
-                labels,
-                visibility,
-            })
-        })
-        .context("failed to query sessions")?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("failed to read sessions")?;
-
-    Ok(sessions)
+fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
+    let labels_str: Option<String> = row.get(10)?;
+    let labels: Vec<String> = labels_str
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                10,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })?
+        .unwrap_or_default();
+    let visibility: String = row.get(11)?;
+    Ok(SessionRecord {
+        id: row.get(0)?,
+        project_root: row.get(1)?,
+        harness: row.get(2)?,
+        title: row.get(3)?,
+        status: row.get(4)?,
+        exit_code: row.get(5)?,
+        archived_at: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+        conversation_id: row.get(9)?,
+        familiar_id: row.get(12)?,
+        labels,
+        visibility,
+    })
 }
 
 pub fn archive_session(conn: &Connection, session_id: &str, archived_at: &str) -> Result<()> {
@@ -1377,6 +1335,26 @@ mod tests {
         assert_eq!(active[0].status, "active");
         assert_eq!(active[0].archived_at, None);
         assert_eq!(active[0].updated_at, "2026-04-27T08:00:00Z");
+        Ok(())
+    }
+
+    #[test]
+    fn get_session_reads_only_the_requested_session_row() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+        let target = session_record("target", "2026-04-27T06:00:00Z");
+        insert_session(&conn, &target)?;
+        conn.execute(
+            "INSERT INTO sessions (
+                id, project_root, harness, title, status, created_at, updated_at, labels
+            ) VALUES (
+                'unrelated', '/tmp/coven-project', 'codex', 'Unrelated',
+                'active', '2026-04-27T07:00:00Z', '2026-04-27T07:00:00Z', '['
+            )",
+            [],
+        )?;
+
+        assert_eq!(get_session(&conn, "target")?, Some(target));
         Ok(())
     }
 
