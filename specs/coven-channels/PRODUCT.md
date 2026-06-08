@@ -88,7 +88,7 @@ interface ChannelConnector {
 }
 ```
 
-`ChannelMessage` is the harness-agnostic envelope. The Discord connector translates it to Discord's API format. Future connectors translate the same envelope to their own formats.
+`ChannelMessage` is the runtime-portable envelope. The Discord connector translates it to Discord's API format. Future connectors translate the same envelope to their own formats.
 
 ## Configuration
 

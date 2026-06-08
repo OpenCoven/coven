@@ -46,7 +46,7 @@ These six are mandatory. A packet missing any one is rejected by the daemon (a `
 
 Each harness already has a "resume" semantics (Claude `--resume <uuid>`, Codex `exec resume`). Those are intra-harness; they restore one harness's view of one conversation. They don't transfer to another harness, and they don't make the state inspectable by anything other than the harness itself.
 
-The handoff packet is **harness-agnostic, human-readable, machine-parseable, and inspectable in CastCodes**. It's what the runtime needs the moment a second harness gets involved.
+The handoff packet is **runtime-portable, human-readable, machine-parseable, and inspectable in CastCodes**. It's what the runtime needs the moment a second harness gets involved.
 
 ## Flow
 

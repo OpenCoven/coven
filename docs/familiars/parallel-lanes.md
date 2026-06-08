@@ -7,7 +7,7 @@ description: "Parallel specialist lanes in OpenCoven: running multiple familiars
 ---
 
 Parallel lanes let several agents work in the same repository without sharing
-the same mutable checkout. Coven treats this as a harness-agnostic protocol:
+the same mutable checkout. Coven treats this as a runtime-portable protocol:
 Codex, Claude Code, OpenClaw familiars, CastCodes agents, and future runtimes
 can all participate as long as they use the same git worktree, claim, and hook
 contracts.
