@@ -1494,58 +1494,6 @@ fn parse_request_line(line: &str) -> Result<(&str, &str)> {
     Ok((method, path))
 }
 
-/// After binding a named pipe listener, restrict its DACL to owner-only access.
-/// This is the equivalent of `chmod 0600` on a Unix socket.
-///
-/// # Safety
-/// Caller must ensure `handle` is a valid open pipe handle.
-#[cfg(windows)]
-unsafe fn restrict_pipe_to_owner(handle: windows_sys::Win32::Foundation::HANDLE) -> Result<()> {
-    use windows_sys::Win32::{
-        Foundation::LocalFree,
-        Security::{
-            Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SetSecurityInfo},
-            DACL_SECURITY_INFORMATION, SE_KERNEL_OBJECT,
-        },
-    };
-
-    // D:(A;;GA;;;OW) — Allow Generic All for the object Owner.
-    let sddl = windows_sys::w!("D:(A;;GA;;;OW)");
-    let mut sd: *mut std::ffi::c_void = std::ptr::null_mut();
-    let mut sd_len: u32 = 0;
-    if ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, &mut sd, &mut sd_len) == 0 {
-        anyhow::bail!(
-            "failed to build owner-only security descriptor: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    // SAFETY: sd is a valid LocalAlloc'd security descriptor.
-    let acl = {
-        use windows_sys::Win32::Security::GetSecurityDescriptorDacl;
-        let mut present = 0i32;
-        let mut acl_ptr = std::ptr::null_mut();
-        let mut defaulted = 0i32;
-        GetSecurityDescriptorDacl(sd, &mut present, &mut acl_ptr, &mut defaulted);
-        acl_ptr
-    };
-    let rc = SetSecurityInfo(
-        handle,
-        SE_KERNEL_OBJECT,
-        DACL_SECURITY_INFORMATION,
-        std::ptr::null(),
-        std::ptr::null(),
-        acl,
-        std::ptr::null(),
-    );
-    LocalFree(sd as _);
-    if rc != 0 {
-        anyhow::bail!(
-            "SetSecurityInfo failed on named pipe: error {rc}"
-        );
-    }
-    Ok(())
-}
-
 #[cfg(windows)]
 fn windows_pipe_name(coven_home: &Path) -> String {
     use std::hash::{Hash, Hasher};
@@ -1576,46 +1524,6 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
         .name(name)
         .create_sync()
         .context("failed to bind Windows named pipe")?;
-
-    // Restrict the pipe to owner-only access immediately after creation.
-    // Uses SetNamedSecurityInfoW on the pipe object path.
-    #[cfg(windows)]
-    {
-        use std::ffi::OsStr;
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::{
-            Foundation::LocalFree,
-            Security::{
-                Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW},
-                GetSecurityDescriptorDacl,
-                DACL_SECURITY_INFORMATION, SE_KERNEL_OBJECT,
-            },
-        };
-        let pipe_path = format!("\\\\\\.\\\\pipe\\\\", ) + &windows_pipe_name(coven_home);
-        let pipe_path_w: Vec<u16> = OsStr::new(&pipe_path)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let sddl = windows_sys::w!("D:(A;;GA;;;OW)");
-        let mut sd: *mut std::ffi::c_void = std::ptr::null_mut();
-        let mut sd_len: u32 = 0;
-        if unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, &mut sd, &mut sd_len) } != 0 {
-            let mut present = 0i32;
-            let mut acl_ptr = std::ptr::null_mut();
-            let mut defaulted = 0i32;
-            unsafe { GetSecurityDescriptorDacl(sd, &mut present, &mut acl_ptr, &mut defaulted) };
-            unsafe { SetNamedSecurityInfoW(
-                pipe_path_w.as_ptr() as *mut _,
-                SE_KERNEL_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                std::ptr::null(),
-                std::ptr::null(),
-                acl_ptr,
-                std::ptr::null(),
-            ) };
-            unsafe { LocalFree(sd as _) };
-        }
-    }
 
     let runtime = Arc::new(LiveSessionRuntime::with_coven_home(
         coven_home.to_path_buf(),
