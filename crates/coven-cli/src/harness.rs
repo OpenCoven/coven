@@ -475,7 +475,7 @@ pub fn command_parts_for_harness_with_conversation(
         return Ok((
             spec.executable.clone(),
             sanitize_argv_for_platform(
-                spec.prompt_args(&effective_prompt, HarnessLaunchMode::NonInteractive)
+                spec.prompt_args(&effective_prompt, HarnessLaunchMode::NonInteractive),
             ),
         ));
     }
@@ -538,7 +538,7 @@ fn sanitize_argv_for_platform(args: Vec<String>) -> Vec<String> {
                         c => escaped.push(c),
                     }
                 }
-                format!("\"{}\"" , escaped)
+                format!("\"{}\"", escaped)
             } else {
                 arg
             }
