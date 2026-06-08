@@ -190,7 +190,35 @@ impl SessionRuntime for LiveSessionRuntime {
                 );
             }
             let piped = pty_runner::spawn_piped_with_observer(&command, observer)?;
-            let mut killer_box: Box<dyn RuntimeKiller> = Box::new(PipedKiller { pid: piped.pid });
+            #[cfg(windows)]
+            let job_handle = {
+                use windows_sys::Win32::{
+                    Foundation::INVALID_HANDLE_VALUE,
+                    System::{
+                        JobObjects::{AssignProcessToJobObject, CreateJobObjectW},
+                        Threading::{OpenProcess, PROCESS_ALL_ACCESS},
+                    },
+                };
+                // SAFETY: Windows API calls; handles are owned by PipedKiller.
+                unsafe {
+                    let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                    if job != INVALID_HANDLE_VALUE && job != 0 as _ {
+                        let ph = OpenProcess(PROCESS_ALL_ACCESS, 0, piped.pid);
+                        if ph != INVALID_HANDLE_VALUE && ph != 0 as _ {
+                            AssignProcessToJobObject(job, ph);
+                            windows_sys::Win32::Foundation::CloseHandle(ph);
+                        }
+                        Some(job)
+                    } else {
+                        None
+                    }
+                }
+            };
+            let mut killer_box: Box<dyn RuntimeKiller> = Box::new(PipedKiller {
+                pid: piped.pid,
+                #[cfg(windows)]
+                job_handle,
+            });
             let mut input = piped.input;
             // Send the launch's prompt as the first stream-json user
             // message so the chat doesn't need a separate send call right
@@ -335,6 +363,20 @@ fn write_stream_message(input: &mut dyn Write, text: &str) -> Result<()> {
 /// harness that ignores it linger past the user's request.
 struct PipedKiller {
     pid: u32,
+    /// On Windows, a Job Object handle that owns the child process tree.
+    /// Calling TerminateJobObject on it kills the child and all descendants.
+    #[cfg(windows)]
+    job_handle: Option<windows_sys::Win32::Foundation::HANDLE>,
+}
+
+#[cfg(windows)]
+impl Drop for PipedKiller {
+    fn drop(&mut self) {
+        if let Some(h) = self.job_handle.take() {
+            // SAFETY: h is a valid handle owned by this struct.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(h) };
+        }
+    }
 }
 
 impl RuntimeKiller for PipedKiller {
@@ -357,7 +399,42 @@ impl RuntimeKiller for PipedKiller {
         Ok(())
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    fn kill(&mut self) -> Result<()> {
+        use windows_sys::Win32::{
+            Foundation::INVALID_HANDLE_VALUE,
+            System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE},
+        };
+        // Prefer Job Object kill (terminates the whole child tree).
+        if let Some(h) = self.job_handle.take() {
+            // SAFETY: h is a valid job handle; exit code 1 is conventional.
+            let rc = unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(h, 1) };
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(h) };
+            if rc == 0 {
+                // Fall back to direct TerminateProcess on the root pid.
+                unsafe {
+                    let ph = OpenProcess(PROCESS_TERMINATE, 0, self.pid);
+                    if ph != INVALID_HANDLE_VALUE && ph != 0 as _ {
+                        TerminateProcess(ph, 1);
+                        windows_sys::Win32::Foundation::CloseHandle(ph);
+                    }
+                }
+            }
+            return Ok(());
+        }
+        // No job object — fall back to TerminateProcess on the root pid.
+        unsafe {
+            let ph = OpenProcess(PROCESS_TERMINATE, 0, self.pid);
+            if ph == INVALID_HANDLE_VALUE || ph == 0 as _ {
+                return Ok(()); // Already gone.
+            }
+            TerminateProcess(ph, 1);
+            windows_sys::Win32::Foundation::CloseHandle(ph);
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(unix, windows)))]
     fn kill(&mut self) -> Result<()> {
         anyhow::bail!(
             "stream-mode harness kill not implemented on this platform (pid {})",
