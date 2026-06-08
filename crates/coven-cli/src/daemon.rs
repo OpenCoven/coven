@@ -1514,7 +1514,9 @@ unsafe fn restrict_pipe_to_owner(handle: windows_sys::Win32::Foundation::HANDLE)
     use windows_sys::Win32::{
         Foundation::LocalFree,
         Security::{
-            Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SetSecurityInfo},
+            Authorization::{
+                ConvertStringSecurityDescriptorToSecurityDescriptorW, SetSecurityInfo,
+            },
             DACL_SECURITY_INFORMATION, SE_KERNEL_OBJECT,
         },
     };
@@ -1549,9 +1551,7 @@ unsafe fn restrict_pipe_to_owner(handle: windows_sys::Win32::Foundation::HANDLE)
     );
     LocalFree(sd as _);
     if rc != 0 {
-        anyhow::bail!(
-            "SetSecurityInfo failed on named pipe: error {rc}"
-        );
+        anyhow::bail!("SetSecurityInfo failed on named pipe: error {rc}");
     }
     Ok(())
 }
@@ -1596,12 +1596,13 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
         use windows_sys::Win32::{
             Foundation::LocalFree,
             Security::{
-                Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW},
-                GetSecurityDescriptorDacl,
-                DACL_SECURITY_INFORMATION, SE_KERNEL_OBJECT,
+                Authorization::{
+                    ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
+                },
+                GetSecurityDescriptorDacl, DACL_SECURITY_INFORMATION, SE_KERNEL_OBJECT,
             },
         };
-        let pipe_path = format!("\\\\\\.\\\\pipe\\\\", ) + &windows_pipe_name(coven_home);
+        let pipe_path = format!("\\\\\\.\\\\pipe\\\\",) + &windows_pipe_name(coven_home);
         let pipe_path_w: Vec<u16> = OsStr::new(&pipe_path)
             .encode_wide()
             .chain(std::iter::once(0))
@@ -1609,20 +1610,25 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
         let sddl = windows_sys::w!("D:(A;;GA;;;OW)");
         let mut sd: *mut std::ffi::c_void = std::ptr::null_mut();
         let mut sd_len: u32 = 0;
-        if unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, &mut sd, &mut sd_len) } != 0 {
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, &mut sd, &mut sd_len)
+        } != 0
+        {
             let mut present = 0i32;
             let mut acl_ptr = std::ptr::null_mut();
             let mut defaulted = 0i32;
             unsafe { GetSecurityDescriptorDacl(sd, &mut present, &mut acl_ptr, &mut defaulted) };
-            unsafe { SetNamedSecurityInfoW(
-                pipe_path_w.as_ptr() as *mut _,
-                SE_KERNEL_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                std::ptr::null(),
-                std::ptr::null(),
-                acl_ptr,
-                std::ptr::null(),
-            ) };
+            unsafe {
+                SetNamedSecurityInfoW(
+                    pipe_path_w.as_ptr() as *mut _,
+                    SE_KERNEL_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    acl_ptr,
+                    std::ptr::null(),
+                )
+            };
             unsafe { LocalFree(sd as _) };
         }
     }
