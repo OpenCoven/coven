@@ -106,8 +106,13 @@ pub fn open_store(path: &Path) -> Result<Connection> {
 
     let conn = Connection::open(path)
         .with_context(|| format!("failed to open Coven store at {}", path.display()))?;
+    // WAL mode allows concurrent readers alongside a single writer and avoids
+    // "database is locked" errors under typical daemon + API concurrency.
+    // busy_timeout gives writers up to 5 s to retry before returning SQLITE_BUSY.
     conn.execute_batch(
-        "PRAGMA foreign_keys = ON;
+        "PRAGMA journal_mode = WAL;
+        PRAGMA busy_timeout = 5000;
+        PRAGMA foreign_keys = ON;
 
         CREATE TABLE IF NOT EXISTS sessions (
             id TEXT PRIMARY KEY NOT NULL,
