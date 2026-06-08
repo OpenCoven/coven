@@ -1510,6 +1510,7 @@ fn parse_request_line(line: &str) -> Result<(&str, &str)> {
 /// # Safety
 /// Caller must ensure `handle` is a valid open pipe handle.
 #[cfg(windows)]
+#[allow(dead_code)]
 unsafe fn restrict_pipe_to_owner(handle: windows_sys::Win32::Foundation::HANDLE) -> Result<()> {
     use windows_sys::Win32::{
         Foundation::LocalFree,
