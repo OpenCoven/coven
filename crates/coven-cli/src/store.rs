@@ -573,9 +573,65 @@ pub fn mark_running_sessions_orphaned(conn: &Connection, updated_at: &str) -> Re
 }
 
 pub fn get_session(conn: &Connection, session_id: &str) -> Result<Option<SessionRecord>> {
-    Ok(list_sessions_including_archived(conn)?
-        .into_iter()
-        .find(|session| session.id == session_id))
+    let mut stmt = conn
+        .prepare(
+            "SELECT
+                id,
+                project_root,
+                harness,
+                title,
+                status,
+                exit_code,
+                archived_at,
+                created_at,
+                updated_at,
+                conversation_id,
+                labels,
+                visibility,
+                familiar_id
+            FROM sessions
+            WHERE id = ?1
+            LIMIT 1",
+        )
+        .context("failed to prepare get_session query")?;
+
+    let mut rows = stmt
+        .query_map([session_id], |row| {
+            let labels_str: Option<String> = row.get(10)?;
+            let labels: Vec<String> = labels_str
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|err| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        10,
+                        rusqlite::types::Type::Text,
+                        Box::new(err),
+                    )
+                })?
+                .unwrap_or_default();
+            let visibility: String = row.get(11)?;
+            Ok(SessionRecord {
+                id: row.get(0)?,
+                project_root: row.get(1)?,
+                harness: row.get(2)?,
+                title: row.get(3)?,
+                status: row.get(4)?,
+                exit_code: row.get(5)?,
+                archived_at: row.get(6)?,
+                created_at: row.get(7)?,
+                updated_at: row.get(8)?,
+                conversation_id: row.get(9)?,
+                familiar_id: row.get(12)?,
+                labels,
+                visibility,
+            })
+        })
+        .context("failed to query session by id")?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to read session row")?;
+
+    Ok(rows.pop())
 }
 
 pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionRecord>> {
