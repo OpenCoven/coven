@@ -906,6 +906,16 @@ fn daemon_health_reports_pid(socket: &str, expected_pid: u32) -> Result<bool> {
 
 #[cfg(unix)]
 fn daemon_status_from_health_socket(socket: &str) -> Result<Option<DaemonStatus>> {
+    let socket_path = std::path::Path::new(socket);
+    // Fail-closed: refuse to connect to a socket that is not owned by the
+    // current effective uid. A foreign-owned socket could be an attacker's
+    // listener planted at the expected path.
+    if let Ok(metadata) = std::fs::symlink_metadata(socket_path) {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid() only reads the effective uid and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        check_owned_by_current_user(socket_path, metadata.uid(), euid)?;
+    }
     let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("failed to connect to Coven daemon socket {socket}"))?;
     stream
