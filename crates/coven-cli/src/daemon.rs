@@ -1119,6 +1119,17 @@ pub const TCP_IO_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(unix)]
 pub const MAX_TCP_BODY_BYTES: usize = 1024 * 1024;
 
+/// Body cap for Unix socket and Windows named pipe transports.
+/// These transports are local-only, so the risk is lower than TCP, but a
+/// runaway or hostile local process should not be able to allocate unbounded
+/// memory. 4 MiB is generous for any legitimate request payload.
+pub const MAX_SOCKET_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+/// I/O timeout for Unix socket and Windows named pipe connections.
+/// Prevents a stalled or slow-writing client from holding a handler thread
+/// indefinitely.
+pub const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(60);
+
 #[cfg(unix)]
 fn ensure_loopback_addrs(addrs: &[SocketAddr]) -> Result<()> {
     if addrs.is_empty() {
@@ -1584,10 +1595,25 @@ pub fn serve_next_connection(
     let (stream, _) = listener
         .accept()
         .context("failed to accept API connection")?;
+    // Apply I/O timeout so a stalled client doesn't hold the handler thread forever.
+    stream
+        .set_read_timeout(Some(SOCKET_IO_TIMEOUT))
+        .context("failed to set read timeout on Unix socket")?;
+    stream
+        .set_write_timeout(Some(SOCKET_IO_TIMEOUT))
+        .context("failed to set write timeout on Unix socket")?;
     let read = stream.try_clone().context("failed to clone Unix stream")?;
-    // Unix socket has no body cap — only local processes can reach it and the
-    // socket permission bits already gate access.
-    handle_http_stream(read, stream, coven_home, status, runtime, None, false)
+    // Apply a body cap even on local Unix sockets: a buggy or hostile local
+    // process should not be able to OOM the daemon with a huge payload.
+    handle_http_stream(
+        read,
+        stream,
+        coven_home,
+        status,
+        runtime,
+        Some(MAX_SOCKET_BODY_BYTES),
+        false,
+    )
 }
 
 fn http_reason_phrase(status: u16) -> &'static str {
@@ -1812,6 +1838,9 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
                 continue;
             }
         };
+        // Apply I/O timeouts to prevent stalled clients from blocking the handler.
+        let _ = stream.set_recv_timeout(Some(SOCKET_IO_TIMEOUT));
+        let _ = stream.set_send_timeout(Some(SOCKET_IO_TIMEOUT));
         // Stream implements Read + Write via shared reference on Windows.
         // The handler reads the full request before writing, so sharing &stream is safe.
         if let Err(error) = handle_http_stream(
@@ -1820,7 +1849,7 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
             coven_home,
             Some(status.clone()),
             runtime.as_ref(),
-            None,
+            Some(MAX_SOCKET_BODY_BYTES),
             false,
         ) {
             eprintln!("coven daemon: pipe connection error: {error:#}");
