@@ -519,24 +519,22 @@ pub fn scan_copilot_capabilities(home_dir: &Path) -> HarnessCapabilityManifest {
     let mut warnings: Vec<CapabilityWarning> = Vec::new();
     let mut plugins: Vec<HarnessPlugin> = Vec::new();
 
-    // Build candidate list.  On macOS the Library path is preferred.
-    let mut candidates: Vec<PathBuf> = Vec::new();
+    // Build candidate list. On macOS the Library path is preferred.
+    let xdg_candidate = home_dir
+        .join(".config")
+        .join("github-copilot")
+        .join("mcp.json");
     #[cfg(target_os = "macos")]
-    {
-        candidates.push(
-            home_dir
-                .join("Library")
-                .join("Application Support")
-                .join("GitHub Copilot")
-                .join("mcp.json"),
-        );
-    }
-    candidates.push(
+    let candidates: Vec<PathBuf> = vec![
         home_dir
-            .join(".config")
-            .join("github-copilot")
+            .join("Library")
+            .join("Application Support")
+            .join("GitHub Copilot")
             .join("mcp.json"),
-    );
+        xdg_candidate,
+    ];
+    #[cfg(not(target_os = "macos"))]
+    let candidates: Vec<PathBuf> = vec![xdg_candidate];
 
     if let Some((v, _)) = load_first_json(&candidates, &mut warnings, "mcp.json") {
         if let Some(servers) = v.get("mcpServers").and_then(|s| s.as_object()) {
