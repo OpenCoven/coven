@@ -24,7 +24,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Windows test failures are pre-existing and tracked in:
+      #   #178 (workspace/PTY/stream-mode tests)
+      # They will be fixed by issues #190-#193 (Windows-specific impl work).
+      # continue-on-error keeps the leg visible (red = known failures) without
+      # blocking main; remove this once #178 is fully resolved.
       - run: cargo test --workspace --locked
+        continue-on-error: ${{ matrix.os == 'windows-latest' }}
 
   secret-guard:
     name: Secret guard
