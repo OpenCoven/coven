@@ -679,7 +679,18 @@ impl DaemonStartController for SystemDaemonStartController {
             }
             daemon_health_reports_pid(&status.socket, status.pid).unwrap_or(false)
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                if daemon_health_reports_pid_windows(&status.socket, status.pid).unwrap_or(false) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            daemon_health_reports_pid_windows(&status.socket, status.pid).unwrap_or(false)
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = status;
             let _ = timeout;
@@ -707,7 +718,31 @@ impl DaemonStopController for SystemDaemonStopController {
                 )
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::{
+                Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+                System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE},
+            };
+            // SAFETY: Windows API calls; handle is closed immediately.
+            unsafe {
+                let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+                if handle == INVALID_HANDLE_VALUE || handle == 0 as _ {
+                    // Process already gone — treat as success.
+                    return Ok(());
+                }
+                let rc = TerminateProcess(handle, 1);
+                CloseHandle(handle);
+                if rc == 0 {
+                    anyhow::bail!(
+                        "failed to terminate Coven daemon pid {pid}: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+            }
+            Ok(())
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = pid;
             Ok(())
@@ -727,7 +762,25 @@ impl DaemonStopController for SystemDaemonStopController {
                 .map(|status| status.success())
                 .unwrap_or(false)
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::{
+                Foundation::{CloseHandle, INVALID_HANDLE_VALUE, STILL_ACTIVE},
+                System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_INFORMATION},
+            };
+            // SAFETY: handle is closed immediately after query.
+            unsafe {
+                let handle = OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid);
+                if handle == INVALID_HANDLE_VALUE || handle == 0 as _ {
+                    return false;
+                }
+                let mut exit_code: u32 = 0;
+                let ok = GetExitCodeProcess(handle, &mut exit_code);
+                CloseHandle(handle);
+                ok != 0 && exit_code == STILL_ACTIVE as u32
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = pid;
             false
@@ -750,7 +803,12 @@ impl DaemonStopController for SystemDaemonStopController {
         {
             daemon_health_reports_pid(&status.socket, status.pid).unwrap_or(false)
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            // On Windows, probe the named pipe health endpoint.
+            daemon_health_reports_pid_windows(&status.socket, status.pid).unwrap_or(false)
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = status;
             true
@@ -895,6 +953,40 @@ fn daemon_status_from_default_socket(coven_home: &Path) -> Result<Option<DaemonS
 fn daemon_status_from_default_socket(coven_home: &Path) -> Result<Option<DaemonStatus>> {
     let _ = coven_home;
     Ok(None)
+}
+
+#[cfg(windows)]
+fn daemon_health_reports_pid_windows(pipe_name: &str, expected_pid: u32) -> Result<bool> {
+    use interprocess::local_socket::{prelude::*, GenericNamespaced, Stream};
+    use std::io::{Read, Write};
+
+    let name = pipe_name
+        .to_ns_name::<GenericNamespaced>()
+        .context("failed to parse pipe name for health check")?;
+    let mut stream = match Stream::connect(name) {
+        Ok(s) => s,
+        Err(_) => return Ok(false),
+    };
+    stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: coven\r\n\r\n")
+        .context("failed to write Windows health request")?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .context("failed to read Windows health response")?;
+    let Some((_, body)) = response.split_once("\r\n\r\n") else {
+        return Ok(false);
+    };
+    let body: DaemonHealthStatus =
+        serde_json::from_str(body).context("failed to parse Windows health response")?;
+    if body.ok {
+        Ok(body
+            .daemon
+            .map(|s| s.pid == expected_pid)
+            .unwrap_or(false))
+    } else {
+        Ok(false)
+    }
 }
 
 #[cfg(unix)]
