@@ -980,10 +980,7 @@ fn daemon_health_reports_pid_windows(pipe_name: &str, expected_pid: u32) -> Resu
     let body: DaemonHealthStatus =
         serde_json::from_str(body).context("failed to parse Windows health response")?;
     if body.ok {
-        Ok(body
-            .daemon
-            .map(|s| s.pid == expected_pid)
-            .unwrap_or(false))
+        Ok(body.daemon.map(|s| s.pid == expected_pid).unwrap_or(false))
     } else {
         Ok(false)
     }
