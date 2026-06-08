@@ -469,12 +469,14 @@ pub fn command_parts_for_harness_with_conversation(
                 args.insert(0, f.identity_preamble());
                 args.insert(0, flag.to_string());
             }
-            return Ok((spec.executable.clone(), args));
+            return Ok((spec.executable.clone(), sanitize_argv_for_platform(args)));
         }
         // Harness doesn't support stream: fall through to non-interactive.
         return Ok((
             spec.executable.clone(),
-            spec.prompt_args(&effective_prompt, HarnessLaunchMode::NonInteractive),
+            sanitize_argv_for_platform(
+                spec.prompt_args(&effective_prompt, HarnessLaunchMode::NonInteractive)
+            ),
         ));
     }
 
@@ -501,7 +503,7 @@ pub fn command_parts_for_harness_with_conversation(
         args.insert(0, f.identity_preamble());
         args.insert(0, flag.to_string());
     }
-    Ok((spec.executable, args))
+    Ok((spec.executable, sanitize_argv_for_platform(args)))
 }
 
 /// Per-harness translation of stream-mode launch into CLI args. Stream-mode
@@ -509,6 +511,46 @@ pub fn command_parts_for_harness_with_conversation(
 /// messages and stdout is a stream of newline-delimited JSON events.
 /// Returns `None` for harnesses that don't support stream mode so the
 /// caller can fall back to a one-shot launch.
+/// On Windows, harness executables often resolve to `.cmd` shims that are
+/// invoked through `cmd.exe`. cmd.exe interprets metacharacters like
+/// `& | < > ^ %` in arguments even inside double-quoted strings in some
+/// invocation paths. Neutralize them by percent-encoding the dangerous
+/// characters so they pass through as literal text.
+///
+/// On non-Windows platforms this is a no-op: the OS exec model passes
+/// argv entries as null-terminated byte arrays without shell parsing.
+#[cfg(windows)]
+fn sanitize_argv_for_platform(args: Vec<String>) -> Vec<String> {
+    // Characters that cmd.exe treats as special even inside double quotes
+    // when the outer caller is cmd.exe itself (i.e. when running a .cmd shim).
+    const CMD_METACHARACTERS: &[char] = &['&', '|', '<', '>', '^', '%', '!'];
+    args.into_iter()
+        .map(|arg| {
+            if arg.chars().any(|c| CMD_METACHARACTERS.contains(&c)) {
+                // Wrap in double quotes and escape embedded quotes + carets.
+                // This is the canonical cmd.exe quoting convention.
+                let mut escaped = String::with_capacity(arg.len() + 4);
+                for ch in arg.chars() {
+                    match ch {
+                        '^' => escaped.push_str("^^"),
+                        '"' => escaped.push_str("\\\""),
+                        '%' => escaped.push_str("%%"),
+                        c => escaped.push(c),
+                    }
+                }
+                format!("\"{}\"" , escaped)
+            } else {
+                arg
+            }
+        })
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn sanitize_argv_for_platform(args: Vec<String>) -> Vec<String> {
+    args
+}
+
 fn stream_args(spec: &HarnessCommandSpec, hint: Option<&ConversationHint>) -> Option<Vec<String>> {
     match spec.id.as_str() {
         "claude" => {
