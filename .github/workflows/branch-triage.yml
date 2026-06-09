@@ -1,0 +1,49 @@
+name: Branch Triage
+
+on:
+  # Run every Monday at 09:00 UTC
+  schedule:
+    - cron: "0 9 * * 1"
+  # Allow manual trigger with optional dry-run
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Dry run (classify only, no deletes or merges)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      base-branch:
+        description: "Base branch to triage against"
+        required: false
+        default: main
+      stale-days:
+        description: "Days of inactivity before a zero-commit branch is SUPERSEDED (0 = off)"
+        required: false
+        default: "30"
+
+permissions:
+  contents: write       # push rebased branches
+  pull-requests: write  # merge PRs
+
+jobs:
+  triage:
+    name: Triage branches
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history needed for unique-commit counting
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run branch triage
+        uses: ./.github/actions/branch-triage
+        with:
+          base-branch: ${{ inputs.base-branch || 'main' }}
+          merge-strategy: squash
+          dry-run: ${{ inputs.dry-run || 'false' }}
+          stale-days: ${{ inputs.stale-days || '30' }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
