@@ -60,4 +60,4 @@ jobs:
       # mutable action tag. Config lives in deny.toml at the repo root.
       - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
         with:
-          command: check advisories bans sources
+          command: check advisories licenses bans sources
