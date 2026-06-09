@@ -1,14 +1,11 @@
 # cargo-deny configuration — supply-chain gate for the Rust dependency tree.
 # Enforced in CI (.github/workflows/ci.yml). Docs: https://embarkstudios.github.io/cargo-deny/
 #
-# Scope is intentionally the security-relevant checks:
+# Scope is intentionally the supply-chain relevant checks:
 #   * advisories — known vulnerabilities / RUSTSEC advisories, yanked crates
+#   * licenses   — only explicitly allowed dependency licenses pass
 #   * bans       — wildcard version requirements (and duplicate-version noise)
 #   * sources    — dependencies must come from the official crates.io registry
-#
-# License compliance is deliberately left out for now so this gate stays focused
-# on security and does not fail on license classification; it can be enabled as
-# a follow-up by adding a `[licenses]` allow-list and `check licenses` in CI.
 
 [advisories]
 # RUSTSEC advisory database. cargo-deny errors on vulnerabilities by default.
@@ -19,6 +16,26 @@ yanked = "deny"
 # unmaintained, not vulnerable, and reports no safe upgrade. Keep this scoped
 # here until turbovec/faer/tokenizers move off paste or we replace that stack.
 ignore = ["RUSTSEC-2024-0436"]
+
+[licenses]
+# Explicit allow-list for licenses currently present in the resolved workspace
+# dependency graph. New licenses fail CI until they are reviewed here.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8
 
 [bans]
 # Duplicate transitive versions are common and noisy — surface but don't fail.
