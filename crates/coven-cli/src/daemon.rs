@@ -42,7 +42,6 @@ pub enum DaemonStatusState {
     Stale(DaemonStatus),
 }
 
-#[cfg(unix)]
 #[derive(Debug, Deserialize)]
 struct DaemonHealthStatus {
     ok: bool,
@@ -368,6 +367,9 @@ struct PipedKiller {
     #[cfg(windows)]
     job_handle: Option<windows_sys::Win32::Foundation::HANDLE>,
 }
+
+#[cfg(windows)]
+unsafe impl Send for PipedKiller {}
 
 #[cfg(windows)]
 impl Drop for PipedKiller {
@@ -1709,8 +1711,9 @@ unsafe fn restrict_pipe_to_owner(handle: windows_sys::Win32::Foundation::HANDLE)
         Security::{
             Authorization::{
                 ConvertStringSecurityDescriptorToSecurityDescriptorW, SetSecurityInfo,
+                SE_KERNEL_OBJECT,
             },
-            DACL_SECURITY_INFORMATION, SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
         },
     };
 
@@ -1737,10 +1740,10 @@ unsafe fn restrict_pipe_to_owner(handle: windows_sys::Win32::Foundation::HANDLE)
         handle,
         SE_KERNEL_OBJECT,
         DACL_SECURITY_INFORMATION,
-        std::ptr::null(),
-        std::ptr::null(),
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
         acl,
-        std::ptr::null(),
+        std::ptr::null_mut(),
     );
     LocalFree(sd as _);
     if rc != 0 {
@@ -1791,8 +1794,9 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
             Security::{
                 Authorization::{
                     ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
+                    SE_KERNEL_OBJECT,
                 },
-                GetSecurityDescriptorDacl, DACL_SECURITY_INFORMATION, SE_KERNEL_OBJECT,
+                GetSecurityDescriptorDacl, DACL_SECURITY_INFORMATION,
             },
         };
         let pipe_path = format!("\\\\\\.\\\\pipe\\\\",) + &windows_pipe_name(coven_home);
@@ -1816,10 +1820,10 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
                     pipe_path_w.as_ptr() as *mut _,
                     SE_KERNEL_OBJECT,
                     DACL_SECURITY_INFORMATION,
-                    std::ptr::null(),
-                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
                     acl_ptr,
-                    std::ptr::null(),
+                    std::ptr::null_mut(),
                 )
             };
             unsafe { LocalFree(sd as _) };
