@@ -473,7 +473,7 @@ mod workspace_resolution_tests {
         fs::create_dir_all(&custom_ws).unwrap();
 
         let toml = format!(
-            "[[familiar]]\nid = \"sage\"\ndisplay_name = \"Sage\"\nrole = \"Research\"\ndescription = \"Reads.\"\nworkspace = \"{}\"\n",
+            "[[familiar]]\nid = \"sage\"\ndisplay_name = \"Sage\"\nrole = \"Research\"\ndescription = \"Reads.\"\nworkspace = '{}'\n",
             custom_ws.display()
         );
         fs::write(temp.path().join("familiars.toml"), toml).unwrap();

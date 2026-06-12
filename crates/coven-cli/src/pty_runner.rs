@@ -600,6 +600,7 @@ mod tests {
         assert_eq!(command.cwd(), cwd);
     }
 
+    #[cfg(unix)]
     #[test]
     fn spawn_detached_starts_pty_and_returns_input_and_kill_handles() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
@@ -819,6 +820,9 @@ exit 0
         .unwrap();
 
         assert_eq!(command.program(), "claude");
+        #[cfg(windows)]
+        assert_eq!(command.args(), &["\"explain && exit\""]);
+        #[cfg(not(windows))]
         assert_eq!(command.args(), &["explain && exit"]);
         assert_eq!(command.cwd(), cwd);
     }

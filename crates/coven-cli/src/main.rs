@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 #[cfg(unix)]
 use std::io::Read;
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -531,22 +531,24 @@ fn legacy_tui_opted_in() -> bool {
 
 /// Locate the `coven-code` binary on PATH or in `~/.coven-code/bin/`.
 fn coven_code_binary() -> Option<PathBuf> {
-    if let Ok(path_var) = std::env::var("PATH") {
-        let suffix = if cfg!(windows) { ".exe" } else { "" };
-        let name = format!("coven-code{suffix}");
-        for dir in std::env::split_paths(&path_var) {
+    let path_var = std::env::var_os("PATH");
+    let home = dirs_next::home_dir();
+    coven_code_binary_from(path_var.as_deref(), home.as_deref())
+}
+
+fn coven_code_binary_from(path_var: Option<&OsStr>, home: Option<&Path>) -> Option<PathBuf> {
+    let suffix = if cfg!(windows) { ".exe" } else { "" };
+    let name = format!("coven-code{suffix}");
+    if let Some(path_var) = path_var {
+        for dir in std::env::split_paths(path_var) {
             let candidate = dir.join(&name);
             if is_executable_file(&candidate) {
                 return Some(candidate);
             }
         }
     }
-    if let Some(home) = dirs_next::home_dir() {
-        let suffix = if cfg!(windows) { ".exe" } else { "" };
-        let candidate = home
-            .join(".coven-code")
-            .join("bin")
-            .join(format!("coven-code{suffix}"));
+    if let Some(home) = home {
+        let candidate = home.join(".coven-code").join("bin").join(&name);
         if is_executable_file(&candidate) {
             return Some(candidate);
         }
@@ -2875,23 +2877,7 @@ mod tests {
 
     #[test]
     fn coven_code_binary_lookup_returns_none_for_empty_path() {
-        let prev_path = std::env::var("PATH").ok();
-        let prev_home = std::env::var("HOME").ok();
-        // Point PATH and HOME at empty/nonexistent locations so the lookup
-        // cannot resolve a binary anywhere.
-        std::env::set_var("PATH", "");
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", tmp.path());
-        assert!(coven_code_binary().is_none());
-        if let Some(p) = prev_path {
-            std::env::set_var("PATH", p);
-        } else {
-            std::env::remove_var("PATH");
-        }
-        if let Some(h) = prev_home {
-            std::env::set_var("HOME", h);
-        } else {
-            std::env::remove_var("HOME");
-        }
+        assert!(coven_code_binary_from(Some(OsStr::new("")), Some(tmp.path())).is_none());
     }
 }

@@ -47,20 +47,10 @@ pub enum HarnessLaunchMode {
 
 /// Whether the harness CLI has a long-lived JSON-streaming mode the daemon
 /// can keep alive across chat turns. Claude does (`stream-json`); codex
-/// doesn't (only one-shot `codex exec`). Gated to Unix today because the
-/// daemon's stream-mode kill path relies on Unix process-group semantics
-/// (`setsid()` at spawn, then `kill(-pid, SIGKILL)` to tear down the
-/// harness plus any subprocesses it spawned in one syscall). A Windows
-/// process-tree termination path would let this widen. See
-/// `docs/chat-persistence.md`.
-#[cfg(unix)]
+/// doesn't (only one-shot `codex exec`). Unix kills the stream process tree
+/// with process groups; Windows uses a Job Object owned by the daemon.
 pub fn harness_supports_stream_mode(harness_id: &str) -> bool {
     harness_id == "claude"
-}
-
-#[cfg(not(unix))]
-pub fn harness_supports_stream_mode(_harness_id: &str) -> bool {
-    false
 }
 
 /// Hint passed when a chat turn wants to participate in a multi-turn
