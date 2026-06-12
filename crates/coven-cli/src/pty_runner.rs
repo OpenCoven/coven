@@ -627,11 +627,26 @@ mod tests {
         Ok(())
     }
 
+    /// Serializes the fake-claude tests: each writes an executable script and
+    /// immediately spawns it. Run in parallel, one test's `fork` can inherit
+    /// another's still-open write fd and the exec fails with ETXTBSY
+    /// ("Text file busy") — a real CI flake, not a theoretical one.
+    #[cfg(unix)]
+    static FAKE_CLAUDE_SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(unix)]
+    fn fake_claude_spawn_guard() -> std::sync::MutexGuard<'static, ()> {
+        FAKE_CLAUDE_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[cfg(unix)]
     #[test]
     fn stream_claude_forwards_jsonl_and_returns_exit_code() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
+        let _guard = fake_claude_spawn_guard();
         let temp_dir = tempfile::tempdir()?;
         let fake_claude = temp_dir.path().join("fake-claude");
         std::fs::write(
@@ -680,6 +695,7 @@ exit 7
     fn stream_claude_includes_input_format_when_forwarding_stdin() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
+        let _guard = fake_claude_spawn_guard();
         let temp_dir = tempfile::tempdir()?;
         let fake_claude = temp_dir.path().join("fake-claude");
         std::fs::write(
@@ -720,6 +736,7 @@ exit 0
     fn stream_claude_resumes_with_resume_flag_not_session_id() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
+        let _guard = fake_claude_spawn_guard();
         let temp_dir = tempfile::tempdir()?;
         let fake_claude = temp_dir.path().join("fake-claude");
         std::fs::write(
