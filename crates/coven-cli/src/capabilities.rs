@@ -224,10 +224,10 @@ pub fn scan_codex_capabilities(home_dir: &Path) -> HarnessCapabilityManifest {
     let automations_dir = base.join("automations");
     if let Ok(entries) = fs::read_dir(&automations_dir) {
         for entry in entries.flatten() {
-            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            let dir = entry.path();
+            if !is_directory_entry(&dir) {
                 continue;
             }
-            let dir = entry.path();
             let id = entry.file_name().to_string_lossy().into_owned();
             let (name, description, version, tags) = parse_automation_toml(&dir, &mut warnings);
             skills.push(HarnessSkill {
@@ -613,17 +613,27 @@ pub fn scan_claude_capabilities(home_dir: &Path) -> HarnessCapabilityManifest {
     }
     plugins.sort_by(|a, b| a.id.cmp(&b.id));
 
+    let mut skills = scan_claude_skills(&base, &mut warnings);
+    skills.sort_by(|a, b| a.id.cmp(&b.id));
+
     HarnessCapabilityManifest {
         harness_id: "claude".to_string(),
         scanned_at: now,
         global_instructions,
-        skills: Vec::new(),
+        skills,
         plugins,
         warnings,
     }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn is_directory_entry(path: &Path) -> bool {
+    match fs::metadata(path) {
+        Ok(metadata) => metadata.is_dir(),
+        Err(_) => false,
+    }
+}
 
 fn probe_instructions(path: &Path) -> GlobalInstructions {
     match fs::metadata(path) {
@@ -650,6 +660,143 @@ struct AutomationToml {
     version: Option<String>,
     #[serde(default)]
     tags: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ClaudeSkillMetadata {
+    name: String,
+    description: Option<String>,
+    version: Option<String>,
+    tags: Vec<String>,
+}
+
+fn scan_claude_skills(
+    claude_dir: &Path,
+    warnings: &mut Vec<CapabilityWarning>,
+) -> Vec<HarnessSkill> {
+    let mut skills = Vec::new();
+    let skills_dir = claude_dir.join("skills");
+    let entries = match fs::read_dir(&skills_dir) {
+        Ok(entries) => entries,
+        Err(_) => return skills,
+    };
+
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !is_directory_entry(&dir) {
+            continue;
+        }
+
+        let skill_path = dir.join("SKILL.md");
+        if !skill_path.exists() {
+            continue;
+        }
+
+        let id = entry.file_name().to_string_lossy().into_owned();
+        let metadata = parse_claude_skill_md(&skill_path, &id, warnings);
+        skills.push(HarnessSkill {
+            id,
+            name: metadata.name,
+            source: "harness-native",
+            harness_id: "claude".to_string(),
+            path: dir.to_string_lossy().into_owned(),
+            description: metadata.description,
+            version: metadata.version,
+            tags: metadata.tags,
+        });
+    }
+
+    skills
+}
+
+fn parse_claude_skill_md(
+    path: &Path,
+    fallback_id: &str,
+    warnings: &mut Vec<CapabilityWarning>,
+) -> ClaudeSkillMetadata {
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) => {
+            warnings.push(CapabilityWarning {
+                kind: "permission_denied".to_string(),
+                path: path.to_string_lossy().into_owned(),
+                message: format!("could not read SKILL.md: {err}"),
+            });
+            return ClaudeSkillMetadata {
+                name: fallback_id.to_string(),
+                description: None,
+                version: None,
+                tags: Vec::new(),
+            };
+        }
+    };
+
+    let mut metadata = ClaudeSkillMetadata {
+        name: fallback_id.to_string(),
+        description: None,
+        version: None,
+        tags: Vec::new(),
+    };
+
+    let mut lines = raw.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return metadata;
+    }
+
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed == "---" {
+            break;
+        }
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim() {
+            "name" => {
+                if let Some(name) = parse_frontmatter_string(value) {
+                    metadata.name = name;
+                }
+            }
+            "description" => {
+                metadata.description = parse_frontmatter_string(value);
+            }
+            "version" => {
+                metadata.version = parse_frontmatter_string(value);
+            }
+            "tags" => {
+                metadata.tags = parse_frontmatter_string_list(value);
+            }
+            _ => {}
+        }
+    }
+
+    metadata
+}
+
+fn parse_frontmatter_string(value: &str) -> Option<String> {
+    let unquoted = value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+        .unwrap_or(value)
+        .trim();
+    if unquoted.is_empty() {
+        None
+    } else {
+        Some(unquoted.to_string())
+    }
+}
+
+fn parse_frontmatter_string_list(value: &str) -> Vec<String> {
+    let value = value.trim();
+    let Some(inner) = value.strip_prefix('[').and_then(|v| v.strip_suffix(']')) else {
+        return Vec::new();
+    };
+    inner
+        .split(',')
+        .filter_map(|item| parse_frontmatter_string(item.trim()))
+        .collect()
 }
 
 fn parse_automation_toml(
@@ -789,6 +936,36 @@ tags = ["bugs", "daily"]"#,
         assert_eq!(m.warnings[0].kind, "parse_error");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn scan_codex_follows_symlinked_automation_dirs() {
+        let home = tmp();
+        let real_auto = home.path().join("real-automations").join("nightly-triage");
+        fs::create_dir_all(&real_auto).unwrap();
+        fs::write(
+            real_auto.join("automation.toml"),
+            r#"name = "Nightly triage"
+description = "Reviews stale branches."
+tags = ["triage"]"#,
+        )
+        .unwrap();
+
+        let autos = home.path().join(".codex").join("automations");
+        fs::create_dir_all(&autos).unwrap();
+        std::os::unix::fs::symlink(&real_auto, autos.join("nightly-triage")).unwrap();
+
+        let m = scan_codex_capabilities(home.path());
+
+        assert_eq!(m.skills.len(), 1);
+        assert_eq!(m.skills[0].id, "nightly-triage");
+        assert_eq!(m.skills[0].name, "Nightly triage");
+        assert_eq!(
+            m.skills[0].description.as_deref(),
+            Some("Reviews stale branches.")
+        );
+        assert_eq!(m.skills[0].tags, vec!["triage"]);
+    }
+
     // ── Claude ─────────────────────────────────────────────────────────────
 
     #[test]
@@ -881,6 +1058,68 @@ tags = ["bugs", "daily"]"#,
         let m = scan_claude_capabilities(home.path());
         assert_eq!(m.plugins.len(), 1);
         assert_eq!(m.plugins[0].id, "test");
+    }
+
+    #[test]
+    fn scan_claude_scans_skill_frontmatter() {
+        let home = tmp();
+        let skill = home.path().join(".claude").join("skills").join("reviewer");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            r#"---
+name: "Review Helper"
+description: "Reviews code changes."
+version: "1.2.3"
+tags: ["review", "code"]
+---
+
+# Review Helper
+"#,
+        )
+        .unwrap();
+
+        let m = scan_claude_capabilities(home.path());
+
+        assert_eq!(m.skills.len(), 1);
+        let skill = &m.skills[0];
+        assert_eq!(skill.id, "reviewer");
+        assert_eq!(skill.name, "Review Helper");
+        assert_eq!(skill.description.as_deref(), Some("Reviews code changes."));
+        assert_eq!(skill.version.as_deref(), Some("1.2.3"));
+        assert_eq!(skill.tags, vec!["review", "code"]);
+        assert!(m.warnings.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_claude_follows_symlinked_skill_dirs() {
+        let home = tmp();
+        let real_skill = home.path().join("real-skills").join("brainstorming");
+        fs::create_dir_all(&real_skill).unwrap();
+        fs::write(
+            real_skill.join("SKILL.md"),
+            r#"---
+name: Brainstorming
+description: Explore before building.
+---
+"#,
+        )
+        .unwrap();
+
+        let skills = home.path().join(".claude").join("skills");
+        fs::create_dir_all(&skills).unwrap();
+        std::os::unix::fs::symlink(&real_skill, skills.join("brainstorming")).unwrap();
+
+        let m = scan_claude_capabilities(home.path());
+
+        assert_eq!(m.skills.len(), 1);
+        assert_eq!(m.skills[0].id, "brainstorming");
+        assert_eq!(m.skills[0].name, "Brainstorming");
+        assert_eq!(
+            m.skills[0].description.as_deref(),
+            Some("Explore before building.")
+        );
     }
 
     // ── Cursor ─────────────────────────────────────────────────────────────────
