@@ -1383,6 +1383,7 @@ fn run_session(
         let exit_code = pty_runner::stream_claude(
             &cwd,
             &record.id,
+            is_resume,
             &effective_prompt,
             stream_json_input,
             claude_system_prompt.as_deref(),
