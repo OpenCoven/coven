@@ -899,7 +899,11 @@ exit 0
         #[cfg(windows)]
         assert_eq!(
             command.args(),
-            &["--permission-mode", "bypassPermissions", "\"explain && exit\""]
+            &[
+                "--permission-mode",
+                "bypassPermissions",
+                "\"explain && exit\""
+            ]
         );
         #[cfg(not(windows))]
         assert_eq!(

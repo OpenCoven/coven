@@ -1214,7 +1214,9 @@ mod tests {
     fn non_claude_harnesses_do_not_get_permission_bypass() -> anyhow::Result<()> {
         let (_, args) =
             command_parts_for_harness("codex", "fix tests", HarnessLaunchMode::NonInteractive)?;
-        assert!(!args.iter().any(|a| a == "--permission-mode" || a == "bypassPermissions"));
+        assert!(!args
+            .iter()
+            .any(|a| a == "--permission-mode" || a == "bypassPermissions"));
         Ok(())
     }
 
