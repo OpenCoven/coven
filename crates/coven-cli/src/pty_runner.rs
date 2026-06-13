@@ -772,7 +772,7 @@ exit 0
 
         assert_eq!(
             std::fs::read_to_string(temp_dir.path().join("args.txt"))?,
-            "-p\n--output-format\nstream-json\n--verbose\n--resume\nsession-789\nhello again\n"
+            "-p\n--permission-mode\nbypassPermissions\n--output-format\nstream-json\n--verbose\n--resume\nsession-789\nhello again\n"
         );
         Ok(())
     }
