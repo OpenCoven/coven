@@ -151,6 +151,98 @@ impl LiveSessionRuntime {
     }
 }
 
+/// Claude Code shows a "Do you trust the files in this folder?" dialog the
+/// first time it opens an *interactive* session in a directory it hasn't seen.
+/// That dialog is NOT governed by `--permission-mode`, so an unattended cave
+/// task session launched in a fresh directory stalls on it. (Only the
+/// interactive TUI path hits this — `-p`/stream launches skip the trust dialog
+/// per `claude --help`.) Pre-seed the trust decision in `~/.claude.json` — the
+/// same state the dialog writes on "Yes" — so these sessions start cleanly.
+fn ensure_claude_trusts_dir(dir: &str) {
+    let Some(home) = dirs_next::home_dir() else {
+        return;
+    };
+    ensure_dir_trusted_in_config(&home.join(".claude.json"), dir);
+}
+
+/// Core of [`ensure_claude_trusts_dir`], split out so it can be unit-tested
+/// against an arbitrary config path. Best-effort: every failure is swallowed
+/// so trust-seeding can never block a launch. Only writes when the directory
+/// isn't already trusted, to stay off this shared file (Claude Code rewrites
+/// it constantly) in the common case.
+fn ensure_dir_trusted_in_config(config_path: &std::path::Path, dir: &str) {
+    // Claude Code keys `projects` by the canonicalized absolute path
+    // (e.g. macOS resolves `/tmp/x` to `/private/tmp/x`). Match that so the
+    // seeded entry is the one the trust check actually looks up.
+    let key = std::fs::canonicalize(dir)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| dir.to_string());
+
+    let mut root: serde_json::Value = std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let already_trusted = root
+        .get("projects")
+        .and_then(|p| p.get(&key))
+        .and_then(|e| e.get("hasTrustDialogAccepted"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if already_trusted {
+        return;
+    }
+
+    let Some(obj) = root.as_object_mut() else {
+        return;
+    };
+    let Some(projects) = obj
+        .entry("projects")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+    else {
+        return;
+    };
+    let Some(entry) = projects
+        .entry(key)
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+    else {
+        return;
+    };
+    entry.insert(
+        "hasTrustDialogAccepted".to_string(),
+        serde_json::Value::Bool(true),
+    );
+
+    let Ok(serialized) = serde_json::to_string(&root) else {
+        return;
+    };
+    // Atomic write: a uniquely-named temp in the same dir + rename, mirroring
+    // Claude Code's own update strategy so a concurrent writer never sees a
+    // half-written config. The temp inherits 0600 so we never widen the
+    // permissions of a file that can hold credentials.
+    let seq = CLAUDE_JSON_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = config_path.with_file_name(format!(
+        ".claude.json.coven-{}-{}.tmp",
+        std::process::id(),
+        seq
+    ));
+    if std::fs::write(&tmp, serialized).is_err() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    if std::fs::rename(&tmp, config_path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+static CLAUDE_JSON_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl SessionRuntime for LiveSessionRuntime {
     fn launch_session(&self, launch: &SessionLaunch) -> Result<()> {
         let familiar_ctx = match (&self.coven_home, launch.familiar_id.as_deref()) {
@@ -243,6 +335,16 @@ impl SessionRuntime for LiveSessionRuntime {
                 input,
                 killer_box,
             );
+        }
+
+        // Interactive claude launches hit the workspace trust dialog (not
+        // covered by `--permission-mode`); pre-trust the cwd so unattended
+        // task sessions don't stall on it. No-op for other harnesses and for
+        // `-p`/stream modes, which skip the dialog.
+        if launch.harness == "claude"
+            && launch.launch_mode == crate::harness::HarnessLaunchMode::Interactive
+        {
+            ensure_claude_trusts_dir(&launch.cwd);
         }
 
         let detached = pty_runner::spawn_detached_with_observer(&command, observer)?;
@@ -1865,6 +1967,85 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seeds_trust_for_new_dir_into_missing_config() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let work = tempfile::tempdir()?;
+        let config = home.path().join(".claude.json");
+        assert!(!config.exists());
+
+        ensure_dir_trusted_in_config(&config, work.path().to_str().unwrap());
+
+        let key = std::fs::canonicalize(work.path())?
+            .to_string_lossy()
+            .into_owned();
+        let root: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&config)?)?;
+        assert_eq!(
+            root["projects"][&key]["hasTrustDialogAccepted"],
+            serde_json::json!(true)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn seeding_trust_preserves_existing_config() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let work = tempfile::tempdir()?;
+        let config = home.path().join(".claude.json");
+        std::fs::write(
+            &config,
+            serde_json::to_string(&serde_json::json!({
+                "numStartups": 7,
+                "projects": {
+                    "/some/other/repo": { "hasTrustDialogAccepted": true, "ignorePatterns": ["x"] }
+                }
+            }))?,
+        )?;
+
+        ensure_dir_trusted_in_config(&config, work.path().to_str().unwrap());
+
+        let key = std::fs::canonicalize(work.path())?
+            .to_string_lossy()
+            .into_owned();
+        let root: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&config)?)?;
+        // Untouched siblings survive...
+        assert_eq!(root["numStartups"], serde_json::json!(7));
+        assert_eq!(
+            root["projects"]["/some/other/repo"]["ignorePatterns"],
+            serde_json::json!(["x"])
+        );
+        // ...and the new dir is now trusted.
+        assert_eq!(
+            root["projects"][&key]["hasTrustDialogAccepted"],
+            serde_json::json!(true)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn seeding_trust_is_noop_when_already_trusted() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let work = tempfile::tempdir()?;
+        let config = home.path().join(".claude.json");
+        let key = std::fs::canonicalize(work.path())?
+            .to_string_lossy()
+            .into_owned();
+        // Pre-trusted, with a sibling field that must not be disturbed.
+        std::fs::write(
+            &config,
+            serde_json::to_string(&serde_json::json!({
+                "projects": { &key: { "hasTrustDialogAccepted": true, "allowedTools": ["Bash"] } }
+            }))?,
+        )?;
+        let before = std::fs::read_to_string(&config)?;
+
+        ensure_dir_trusted_in_config(&config, work.path().to_str().unwrap());
+
+        // Already trusted → file left byte-for-byte unchanged (no rewrite).
+        assert_eq!(std::fs::read_to_string(&config)?, before);
+        Ok(())
+    }
 
     #[test]
     fn output_observer_records_each_callback_as_an_event() -> Result<()> {
