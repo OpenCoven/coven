@@ -7,6 +7,9 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 #[cfg(unix)]
 use std::ffi::CString;
 use std::io::{BufRead, BufReader, Read};
@@ -15,13 +18,8 @@ use std::os::unix::{
     ffi::OsStrExt,
     fs::{FileTypeExt, MetadataExt, PermissionsExt},
     net::{UnixListener, UnixStream},
+    prelude::AsRawFd,
 };
-#[cfg(unix)]
-use std::sync::OnceLock;
-
-use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
 
 use crate::{
     api::{SessionLaunch, SessionRuntime},
@@ -755,13 +753,148 @@ pub fn ensure_background_server(
     current_exe: &Path,
     started_at: String,
 ) -> Result<DaemonStatus> {
-    ensure_background_server_with_controllers(
+    let _lock = acquire_daemon_lifecycle_lock(coven_home)?;
+    let status = ensure_background_server_with_controllers(
         coven_home,
         current_exe,
         started_at,
         &SystemDaemonStopController,
         &SystemDaemonStartController,
-    )
+    )?;
+    #[cfg(unix)]
+    cleanup_unreachable_duplicate_daemons(coven_home, status.pid);
+    Ok(status)
+}
+
+fn daemon_lifecycle_lock_path(coven_home: &Path) -> PathBuf {
+    coven_home.join("daemon.lock")
+}
+
+#[cfg(unix)]
+fn cleanup_unreachable_duplicate_daemons(coven_home: &Path, active_pid: u32) {
+    use sysinfo::{Pid, ProcessesToUpdate, Signal, System};
+
+    let mut sys = System::new_all();
+    sys.refresh_all();
+    let candidates: Vec<(Pid, u64, Vec<std::ffi::OsString>)> = sys
+        .processes()
+        .iter()
+        .filter_map(|(pid, process)| {
+            let pid_u32 = pid.as_u32();
+            if pid_u32 == active_pid
+                || !process_is_coven_daemon_serve(process.cmd())
+                || !process_coven_home_matches(process.environ(), coven_home)
+            {
+                return None;
+            }
+            Some((*pid, process.start_time(), process.cmd().to_vec()))
+        })
+        .collect();
+
+    for (pid, start_time, cmd) in candidates {
+        sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+        let Some(process) = sys.process(pid) else {
+            continue;
+        };
+        if process.start_time() != start_time
+            || process.cmd() != cmd.as_slice()
+            || !process_is_coven_daemon_serve(process.cmd())
+            || !process_coven_home_matches(process.environ(), coven_home)
+        {
+            continue;
+        }
+        match process.kill_with(Signal::Term) {
+            Some(true) => append_daemon_recovery_log(
+                coven_home,
+                &format!(
+                    "terminated unreachable duplicate daemon pid={} active_pid={}",
+                    pid.as_u32(),
+                    active_pid
+                ),
+            ),
+            Some(false) | None => append_daemon_recovery_log(
+                coven_home,
+                &format!(
+                    "failed to terminate unreachable duplicate daemon pid={} active_pid={}",
+                    pid.as_u32(),
+                    active_pid
+                ),
+            ),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn process_is_coven_daemon_serve(cmd: &[std::ffi::OsString]) -> bool {
+    cmd.windows(2)
+        .any(|pair| pair[0].as_os_str() == "daemon" && pair[1].as_os_str() == "serve")
+}
+
+#[cfg(unix)]
+fn process_coven_home_matches(environ: &[std::ffi::OsString], coven_home: &Path) -> bool {
+    environ.iter().any(|entry| {
+        let bytes = entry.as_os_str().as_bytes();
+        bytes
+            .strip_prefix(b"COVEN_HOME=")
+            .is_some_and(|value| value == coven_home.as_os_str().as_bytes())
+    })
+}
+
+#[cfg(unix)]
+struct DaemonLifecycleLock {
+    file: std::fs::File,
+}
+
+#[cfg(unix)]
+impl Drop for DaemonLifecycleLock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn acquire_daemon_lifecycle_lock(coven_home: &Path) -> Result<DaemonLifecycleLock> {
+    ensure_private_coven_home(coven_home)?;
+    let lock_path = daemon_lifecycle_lock_path(coven_home);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| {
+            format!(
+                "failed to open daemon lifecycle lock {}",
+                lock_path.display()
+            )
+        })?;
+    std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600)).with_context(
+        || {
+            format!(
+                "failed to set daemon lifecycle lock permissions {}",
+                lock_path.display()
+            )
+        },
+    )?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        anyhow::bail!(
+            "failed to lock daemon lifecycle {}: {}",
+            lock_path.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(DaemonLifecycleLock { file })
+}
+
+#[cfg(not(unix))]
+struct DaemonLifecycleLock;
+
+#[cfg(not(unix))]
+fn acquire_daemon_lifecycle_lock(coven_home: &Path) -> Result<DaemonLifecycleLock> {
+    ensure_private_coven_home(coven_home)?;
+    Ok(DaemonLifecycleLock)
 }
 
 pub fn recover_orphaned_sessions(coven_home: &Path, updated_at: &str) -> Result<usize> {
@@ -810,7 +943,28 @@ pub fn clear_status(coven_home: &Path) -> Result<bool> {
 }
 
 pub fn stop_background_server(coven_home: &Path) -> Result<bool> {
+    let _lock = acquire_daemon_lifecycle_lock(coven_home)?;
     stop_background_server_with_controller(coven_home, &SystemDaemonStopController)
+}
+
+pub fn restart_background_server(
+    coven_home: &Path,
+    current_exe: &Path,
+    started_at: String,
+) -> Result<(bool, DaemonStatus)> {
+    let _lock = acquire_daemon_lifecycle_lock(coven_home)?;
+    let was_running =
+        stop_background_server_with_controller(coven_home, &SystemDaemonStopController)?;
+    let status = start_background_server(coven_home, current_exe, started_at)?;
+    if !SystemDaemonStartController.wait_for_running_daemon(&status, Duration::from_secs(2)) {
+        anyhow::bail!(
+            "started Coven daemon pid {} but its socket did not become ready",
+            status.pid
+        );
+    }
+    #[cfg(unix)]
+    cleanup_unreachable_duplicate_daemons(coven_home, status.pid);
+    Ok((was_running, status))
 }
 
 pub fn background_server_status(coven_home: &Path) -> Result<Option<DaemonStatusState>> {
@@ -1385,39 +1539,33 @@ pub fn append_daemon_recovery_log(coven_home: &Path, msg: &str) {
 struct ShutdownGuard {
     socket_path: PathBuf,
     status_path: PathBuf,
+    pid: u32,
 }
 
 #[cfg(unix)]
 impl Drop for ShutdownGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.socket_path);
-        let _ = std::fs::remove_file(&self.status_path);
+        if daemon_status_file_pid(&self.status_path) == Some(self.pid) {
+            let _ = std::fs::remove_file(&self.socket_path);
+            let _ = std::fs::remove_file(&self.status_path);
+        }
     }
 }
 
-// Paths captured at signal-handler install time so the async-signal-safe
-// handler can unlink them without allocating. CString avoids touching the
-// allocator from inside the handler.
 #[cfg(unix)]
-static SIGNAL_SOCKET_PATH: OnceLock<CString> = OnceLock::new();
-#[cfg(unix)]
-static SIGNAL_STATUS_PATH: OnceLock<CString> = OnceLock::new();
+fn daemon_status_file_pid(status_path: &Path) -> Option<u32> {
+    std::fs::read_to_string(status_path)
+        .ok()
+        .and_then(|json| serde_json::from_str::<DaemonStatus>(&json).ok())
+        .map(|status| status.pid)
+}
 
 #[cfg(unix)]
 extern "C" fn handle_termination_signal(sig: libc::c_int) {
-    // Only async-signal-safe calls below. unlink(2), write(2), and _exit(2) are
-    // all on the POSIX async-signal-safe list. Anything that might allocate or
-    // take a lock is forbidden.
-    if let Some(path) = SIGNAL_SOCKET_PATH.get() {
-        unsafe {
-            libc::unlink(path.as_ptr());
-        }
-    }
-    if let Some(path) = SIGNAL_STATUS_PATH.get() {
-        unsafe {
-            libc::unlink(path.as_ptr());
-        }
-    }
+    // Only async-signal-safe calls below. Anything that might allocate or take
+    // a lock is forbidden. The ownership-aware ShutdownGuard handles normal
+    // unwinding cleanup; signal exits leave stale metadata for the next
+    // status/start command to validate and clear.
     let msg: &[u8] = b"coven daemon: received termination signal, exiting\n";
     unsafe {
         libc::write(
@@ -1431,14 +1579,10 @@ extern "C" fn handle_termination_signal(sig: libc::c_int) {
 
 #[cfg(unix)]
 fn install_termination_signal_handlers(socket_path: &Path, status_path: &Path) -> Result<()> {
-    let socket_cstr = CString::new(socket_path.as_os_str().as_bytes())
+    let _socket_cstr = CString::new(socket_path.as_os_str().as_bytes())
         .context("daemon socket path contained an interior NUL")?;
-    let status_cstr = CString::new(status_path.as_os_str().as_bytes())
+    let _status_cstr = CString::new(status_path.as_os_str().as_bytes())
         .context("daemon status path contained an interior NUL")?;
-    // OnceLock::set is idempotent: a second `coven daemon serve` invocation in
-    // the same process (only happens in tests) reuses the first install.
-    let _ = SIGNAL_SOCKET_PATH.set(socket_cstr);
-    let _ = SIGNAL_STATUS_PATH.set(status_cstr);
 
     for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
         // SAFETY: sigaction is the documented POSIX API for installing signal
@@ -1505,6 +1649,7 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
     let _shutdown_guard = ShutdownGuard {
         socket_path: socket_path.clone(),
         status_path: status_path.clone(),
+        pid: status.pid,
     };
     append_daemon_recovery_log(
         coven_home,
@@ -3269,7 +3414,14 @@ mod tests {
         let socket_path = daemon_socket_path(temp_dir.path());
         let status_path = daemon_status_path(temp_dir.path());
         std::fs::write(&socket_path, b"")?;
-        std::fs::write(&status_path, b"{}")?;
+        std::fs::write(
+            &status_path,
+            serde_json::to_string(&DaemonStatus {
+                pid: 42,
+                started_at: "2026-06-14T00:00:00Z".to_string(),
+                socket: socket_path.to_string_lossy().into_owned(),
+            })?,
+        )?;
         assert!(socket_path.exists());
         assert!(status_path.exists());
 
@@ -3277,6 +3429,7 @@ mod tests {
             let _guard = ShutdownGuard {
                 socket_path: socket_path.clone(),
                 status_path: status_path.clone(),
+                pid: 42,
             };
             // Files are still present while the guard is alive.
             assert!(socket_path.exists());
@@ -3301,7 +3454,43 @@ mod tests {
         let _guard = ShutdownGuard {
             socket_path,
             status_path,
+            pid: 42,
         };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_guard_preserves_socket_and_status_for_newer_daemon() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let socket_path = daemon_socket_path(temp_dir.path());
+        let status_path = daemon_status_path(temp_dir.path());
+        std::fs::write(&socket_path, b"newer daemon socket")?;
+        std::fs::write(
+            &status_path,
+            serde_json::to_string(&DaemonStatus {
+                pid: 100,
+                started_at: "2026-06-14T00:01:00Z".to_string(),
+                socket: socket_path.to_string_lossy().into_owned(),
+            })?,
+        )?;
+
+        {
+            let _guard = ShutdownGuard {
+                socket_path: socket_path.clone(),
+                status_path: status_path.clone(),
+                pid: 42,
+            };
+        }
+
+        assert!(
+            socket_path.exists(),
+            "an older daemon must not remove a newer daemon socket on shutdown"
+        );
+        assert!(
+            status_path.exists(),
+            "an older daemon must not remove newer daemon status on shutdown"
+        );
+        Ok(())
     }
 
     #[cfg(unix)]
