@@ -1,0 +1,49 @@
+{
+  "name": "ambient-fantasy-02",
+  "model": "kling3_0",
+  "defaults": {"aspect_ratio": "9:16", "mode": "std", "sound": "on", "duration": 10},
+  "scenes": [
+    {
+      "id": "b01",
+      "slug": "crystal-cave",
+      "image": "outputs/keyframes/ambient02/crystal_cave.png",
+      "prompt": "Single water drops fall slowly from the stalactites into the glowing blue pool, soft rings ripple outward and fade, the underwater glow pulses very slowly, fine luminous particles drift upward. Locked camera, completely static tripod shot, loopable motion, seamless transition. Maintains exact appearance throughout. Audio: deep cave silence, slow echoing water drips, soft resonant cavern reverb, faint crystalline hum.",
+      "acceptance": ["Camera does not move", "Drips and ripples are slow and rhythmic", "Crystals do not morph"]
+    },
+    {
+      "id": "b02",
+      "slug": "moonlit-greenhouse",
+      "image": "outputs/keyframes/ambient02/moonlit_greenhouse.png",
+      "prompt": "The bioluminescent flowers pulse their glow very slowly and out of sync with each other, glowing pollen particles drift lazily upward through the moonbeams, leaves stir almost imperceptibly. Locked camera, completely static tripod shot, loopable motion, seamless transition. Maintains exact appearance throughout. Audio: hushed night air, faint glass creaks of the greenhouse, soft cricket chirps outside, gentle ethereal shimmer.",
+      "acceptance": ["No camera movement", "Flower glow pulses are slow and unsynchronized", "Glass and foliage stay stable"]
+    },
+    {
+      "id": "b03",
+      "slug": "deepsea-jellyfish",
+      "image": "outputs/keyframes/ambient02/deepsea_jellyfish.png",
+      "prompt": "The jellyfish bells contract and relax in slow continuous pulses, their tentacles sway gently in the current, glowing plankton particles drift past, the bioluminescence brightens and dims softly. Locked camera, completely static shot, loopable motion, seamless transition. Maintains exact appearance throughout. Audio: deep muffled underwater ambience, soft low water pressure rumble, faint slow pulsing tones.",
+      "acceptance": ["Camera stays locked", "Jellyfish pulse smoothly without morphing", "Hypnotic drifting pace"]
+    },
+    {
+      "id": "b04",
+      "slug": "cloud-temple",
+      "image": "outputs/keyframes/ambient02/cloud_temple.png",
+      "prompt": "The waterfalls of golden light flow slowly and continuously down into the clouds, the moonlit cloud sea rolls and drifts very gently, glowing particles rise around the columns, mist curls softly. Locked wide camera, completely static shot, loopable motion, seamless transition. Maintains exact appearance throughout. Audio: vast high-altitude wind, soft continuous cascade of shimmering light like distant water, deep serene choral pad, very quiet.",
+      "acceptance": ["No camera movement", "Light waterfalls flow continuously", "Temple does not warp"]
+    },
+    {
+      "id": "b05",
+      "slug": "jungle-rain",
+      "image": "outputs/keyframes/ambient02/jungle_rain.png",
+      "prompt": "Raindrops patter steadily onto the broad leaves, bead up and roll off in slow trickles, the leaves dip and spring back gently under the drops, the lantern flame flickers softly, fine rain streaks fall through its glow. Locked camera, completely static tripod shot, loopable motion, seamless transition. Maintains exact appearance throughout. Audio: steady soft rain on broad leaves, fat drops plopping onto foliage, distant jungle night ambience, faint warm lantern crackle.",
+      "acceptance": ["Camera does not move", "Leaf bounce physics look real", "Rain rhythm is steady and loopable"]
+    },
+    {
+      "id": "b06",
+      "slug": "snow-shrine",
+      "image": "outputs/keyframes/ambient02/snow_shrine.png",
+      "prompt": "Snowflakes drift down slowly and continuously, the brazier embers glow and breathe with a soft orange pulse, occasional tiny sparks rise and fade, thin smoke curls upward gently. Locked camera, completely static shot, loopable motion, seamless transition. Maintains exact appearance throughout. Audio: muffled snowy silence, soft crackle and pop of the brazier embers, faint cold wind, deep winter calm.",
+      "acceptance": ["No camera movement", "Snowfall is continuous and even", "Shrine and brazier stay solid"]
+    }
+  ]
+}

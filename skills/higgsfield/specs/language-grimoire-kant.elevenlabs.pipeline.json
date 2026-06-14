@@ -1,0 +1,306 @@
+{
+  "name": "language-grimoire-kant",
+  "keyframes": {
+    "model": "nano_banana_2",
+    "defaults": {
+      "aspect_ratio": "9:16",
+      "resolution": "2k"
+    },
+    "images": [
+      {
+        "id": "s01",
+        "out": "s01_impossible.png",
+        "prompt": "Dark Romantic 19th-century oil painting, visible brushwork: extreme close-up of a human eye in warm candlelight, and reflected in the dark iris, faint small luminous abstract marks drifting like embers, soft and unreadable. Deep shadow around. Vertical composition. No text."
+      },
+      {
+        "id": "s02",
+        "out": "s02_spear.png",
+        "prompt": "Dark Romantic 19th-century oil painting: deep prehistory — by firelight at a cave mouth, a weathered early human carefully shaves a long wooden spear with a stone flake, utterly absorbed, while a younger figure watches the hands intently, learning. Warm ember light against immense darkness. No text, no writing anywhere. Vertical composition."
+      },
+      {
+        "id": "s03",
+        "out": "s03_wolf.png",
+        "prompt": "Dark Romantic 19th-century oil painting: a paleolithic camp at dusk, one fur-clad figure on a rock with a hand cupped to the mouth mid-shout, and a dozen others below frozen mid-motion, all heads turned the same direction toward the dark treeline, fire scattering sparks. Vertical composition. No text."
+      },
+      {
+        "id": "s04",
+        "out": "s04_dead_speak.png",
+        "prompt": "Dark Romantic 19th-century oil painting: an ancient scribe's desk by oil-lamp, weathered hands pressing a stylus into a clay tablet, the marks soft and unreadable, and behind the scribe a vast dark hall where faint pale figures of past generations stand listening in shadow. Vertical composition. No text."
+      },
+      {
+        "id": "s05",
+        "out": "s05_limits.png",
+        "prompt": "Dark Romantic 19th-century oil painting: a solitary man in a plain dark jacket standing in a bare austere room, staring at a vast wall of fog where the room simply ends, his hand half-raised toward the grey limit. Cold restrained palette. Vertical composition. No text."
+      },
+      {
+        "id": "s06",
+        "out": "s06_kant_walk.png",
+        "prompt": "Dark Romantic 19th-century oil painting: a small precise man in an 18th-century coat and tricorn hat walking a cobbled Prussian street at dusk beneath a church clocktower, townsfolk checking pocket watches as he passes, long shadows, lamplight. Clock face soft and unreadable. Vertical composition. No text."
+      },
+      {
+        "id": "s07",
+        "out": "s07_triangle.png",
+        "prompt": "Dark Romantic 19th-century oil painting: on a dark wooden table, a drafting compass and a perfect luminous triangle drawn in pale chalk-light hovering slightly above the paper, candle flame beside it, deep shadow around. No letters, no numbers. Vertical composition. No text."
+      },
+      {
+        "id": "s08",
+        "out": "s08_synthetic.png",
+        "prompt": "Dark Romantic 19th-century oil painting: the same 18th-century philosopher seated at his desk at night, eyes closed in fierce concentration, and above his head a small constellation of seven and then five faint ember-points of light drawing together into one new brighter light, the universe visible through the window behind obeying in silence. No letters, no numbers. Vertical composition. No text."
+      },
+      {
+        "id": "s09",
+        "out": "s09_grimoire.png",
+        "prompt": "Dark Romantic 19th-century oil painting: two ancient books open side by side on a dark lectern by candlelight — one a humble school grammar, one an ornate spellbook with metal clasps — and the same faint ember-glow rising identically from both pages, the writing in each soft and completely unreadable. Vertical composition. No text."
+      },
+      {
+        "id": "s10",
+        "out": "s10_runes.png",
+        "prompt": "Dark Romantic 19th-century oil painting, visible brushwork: a grey-haired wanderer hanging from a colossal world-tree in a storm, one arm reaching down into rising ember-bright angular lights like ancient runes emerging from black water, hair and cloak whipping in the wind. Reverent, dynamic, ecstatic, not gruesome. Vertical composition. No text."
+      },
+      {
+        "id": "s11",
+        "out": "s11_fable.png",
+        "prompt": "Dark Romantic 19th-century oil painting: a grandmother telling a story to children by a hearth, her hands casting a shadow on the wall — and the shadow is a wolf standing upright, while around it in the firelight drift faint ghostly scenes of hunts, winters, and warnings, soft and abstract. Vertical composition. No text."
+      },
+      {
+        "id": "s12",
+        "out": "s12_rite.png",
+        "prompt": "Dark Romantic 19th-century oil painting: a young woman reading alone by a window at night, book in her lap, utterly still, and leaning over her shoulder the faint translucent figure of an old author whispering, his form made of drifting pale light. Tender not frightening. The book's pages soft and unreadable. Vertical composition. No text."
+      },
+      {
+        "id": "s13",
+        "out": "s13_midnight.png",
+        "prompt": "Dark Romantic 19th-century oil painting: a dark modern room at midnight, a person seen from behind in lamplight facing a soft rectangle of pale glowing light on the desk, and out of the glow a whole faint luminous world rising — mountains, figures, a tree, a raven — like smoke taking shape. The glowing rectangle's surface soft and completely unreadable. Vertical composition. No text."
+      },
+      {
+        "id": "s14",
+        "out": "s14_unbroken.png",
+        "prompt": "Dark Romantic 19th-century oil painting: a single composition braided from three light sources in darkness — a paleolithic fire with a spear leaning beside it at the bottom, a candle and open book in the middle, and a soft pale glow at the top, one unbroken thread of ember-light rising through all three. Abstract, reverent. Vertical composition. No text."
+      },
+      {
+        "id": "s15",
+        "out": "s15_emblem.png",
+        "prompt": "Dark Romantic 19th-century oil painting: a single small ember of light shaped vaguely like a quill stroke rising from darkness into a vast night sky already faintly seeded with others like it, stars indistinguishable from letters. Soft, minimal, vast. Vertical composition. No text."
+      }
+    ]
+  },
+  "clips": {
+    "model": "kling3_0",
+    "defaults": {
+      "aspect_ratio": "9:16",
+      "mode": "std",
+      "sound": "on"
+    },
+    "scenes": [
+      {
+        "id": "s01",
+        "slug": "impossible",
+        "image": "<auto>",
+        "params": {
+          "duration": 10
+        },
+        "prompt": "The luminous marks drift slowly across the dark iris, the eye shifts focus minutely, candlelight breathing on the skin. Locked camera, very slow push-in. Audio: a quiet room, candle flutter, a soft page turn, no speech. Maintains exact appearance and painted oil style throughout, no warping, consistent lighting."
+      },
+      {
+        "id": "s02",
+        "slug": "spears",
+        "image": "<auto>",
+        "params": {
+          "duration": 15
+        },
+        "prompt": "The old hands shave the spear in steady strokes, wood curls falling, sparks rising, the young watcher leaning closer. Locked camera, very slow push-in. Audio: stone on wood, fire crackle, night, no speech. Maintains exact appearance and painted oil style throughout, no warping, consistent lighting."
+      },
+      {
+        "id": "s03",
+        "slug": "wolf",
+        "image": "<auto>",
+        "params": {
+          "duration": 13
+        },
+        "prompt": "The shouting figure's call rings out, every head snaps toward the treeline in sequence, figures rise and reach for spears, fire sparks swirling. Locked camera. Audio: one echoing human call, then rushed movement and crackling fire, no speech. Maintains exact appearance and painted oil style throughout, no warping, consistent lighting."
+      },
+      {
+        "id": "s04",
+        "slug": "dead-speak",
+        "image": "<auto>",
+        "params": {
+          "duration": 9
+        },
+        "prompt": "The stylus presses careful marks as the pale figures in the dark lean in almost imperceptibly, lamplight wavering. Slow push-in past the scribe's shoulder. Audio: stylus tapping clay, lamp hiss, vast hall silence, no speech. Maintains exact appearance and painted oil style throughout, no warping, consistent lighting."
+      },
+      {
+        "id": "s05",
+        "slug": "limits",
+        "image": "<auto>",
+        "params": {
+          "duration": 12
+        },
+        "prompt": "The fog wall churns slowly where the room ends, his raised hand hesitates and lowers, dust drifting in the cold light. Locked camera. Audio: muffled silence, one distant indistinct murmur swallowed by fog, no speech. Maintains exact appearance and painted oil style throughout, no warping, consistent lighting."
+      },
+      {
+        "id": "s06",
+        "slug": "kant-walk",
+        "image": "<auto>",
+        "params": {
+          "duration": 14
+        },
+        "prompt": "He walks with perfectly regular steps, townsfolk glance at their watches as he passes, lamplight flickering, his shadow stretching ahead. Slow tracking shot. Audio: regular footsteps on cobbles, evening town murmur, a church bell far away, no speech. Maintains exact appearance and painted oil style throughout, no warping, consistent lighting."
+      },
+      {
+        "id": "s07",
+        "slug": "triangle",
+        "image": "<auto>",
+        "params": {
+          "duration": 11
+        },
+        "prompt": "The luminous triangle rotates very slowly above the paper, the compass glints, candle flame steady. Locked camera, slow push-in. Audio: deep study quiet, candle burn, one soft chime, no speech. Maintains exact appearance and painted oil style throughout, no warping, consistent lighting."
+      },
+      {
+        "id": "s08",
+        "slug": "synthetic",
+        "image": "<auto>",
+        "params": {
+          "duration": 15
+        },
+        "prompt": "The ember points drift together and fuse into one brighter light that pulses once, his closed eyes tightening then easing, the night sky outside holding still. Locked camera. Audio: a low rising hum resolving into a single warm tone, no speech. Maintains exact appearance and painted oil style throughout, no warping, consistent lighting."
+      },
+      {
+        "id": "s09",
+        "slug": "grimoire",
+        "image": "<auto>",
+        "params": {
+          "duration": 15
+        },
+        "prompt": "The identical ember-glow rises from both books in slow synchrony, candle flames leaning together, clasps glinting. Locked camera, very slow push-in. Audio: paper breathing, candle crackle, a faint double chime, no speech. Maintains exact appearance and painted oil style throughout, no warping, consistent lighting."
+      },
+      {
+        "id": "s10",
+        "slug": "runes",
+        "image": "<auto>",
+        "params": {
+          "duration": 10
+        },
+        "prompt": "His hand plunges into the rising embers as they stream around his arm, hair whipping, the tree heaving. Locked camera with slight shake. Audio: rushing wind and embers, the tree cracking, no speech. Maintains exact appearance and painted oil style throughout, no warping, consistent lighting."
+      },
+      {
+        "id": "s11",
+        "slug": "fable",
+        "image": "<auto>",
+        "params": {
+          "duration": 12
+        },
+        "prompt": "The wolf-shadow prowls slowly across the wall as her hands move, the children shrink closer together, the ghostly scenes drifting in the firelight. Locked camera. Audio: fire crackle, her unintelligible soft storytelling murmur, a child's gasp, no speech with words. Maintains exact appearance and painted oil style throughout, no warping, consistent lighting."
+      },
+      {
+        "id": "s12",
+        "slug": "rite",
+        "image": "<auto>",
+        "params": {
+          "duration": 14
+        },
+        "prompt": "She turns a page and the translucent author leans closer, his light-form drifting like slow smoke, her eyes moving along the lines. Locked camera, very slow push-in. Audio: night quiet, page turn, the faintest whisper just below hearing, no clear speech. Maintains exact appearance and painted oil style throughout, no warping, consistent lighting."
+      },
+      {
+        "id": "s13",
+        "slug": "midnight",
+        "image": "<auto>",
+        "params": {
+          "duration": 15
+        },
+        "prompt": "The luminous world rises and turns slowly out of the glow — mountains, the tree, the raven crossing — as the seated figure stays motionless. Locked camera. Audio: deep night room tone, a soft electrical hum, one raven call far away, no speech. Maintains exact appearance and painted oil style throughout, no warping, consistent lighting."
+      },
+      {
+        "id": "s14",
+        "slug": "unbroken",
+        "image": "<auto>",
+        "params": {
+          "duration": 15
+        },
+        "prompt": "The thread of ember-light pulses slowly upward through fire, candle, and glow, each source breathing in turn. Very slow tilt up. Audio: layered quiet — fire crackle below, page whisper, soft hum above, no speech. Maintains exact appearance and painted oil style throughout, no warping, consistent lighting."
+      },
+      {
+        "id": "s15",
+        "slug": "emblem",
+        "image": "<auto>",
+        "params": {
+          "duration": 5
+        },
+        "prompt": "The single ember-stroke rises slowly to join the seeded sky, stars pulsing faintly like distant letters. Locked camera, slow tilt up. Audio: vast night silence, one soft final chime, no speech. Maintains exact appearance and painted oil style throughout, no warping, consistent lighting."
+      }
+    ]
+  },
+  "narration": {
+    "engine": "elevenlabs",
+    "voice_id": "PUT_YOUR_ELEVENLABS_VOICE_ID_HERE",
+    "model_id": "eleven_multilingual_v2",
+    "stability": 0.5,
+    "similarity_boost": 0.8,
+    "style": 0.35,
+    "segments": [
+      {
+        "id": "01",
+        "text": "You are doing something impossible right now. A stranger is rearranging your thoughts from far away, using nothing but small dark shapes."
+      },
+      {
+        "id": "02",
+        "text": "Three hundred thousand years ago, in what is now Germany, someone shaped a wooden spear and balanced it so well that it still flew true. There was no writing. And yet a thought crossed from one mind into another, and outlived them both."
+      },
+      {
+        "id": "03",
+        "text": "Then came a stranger miracle. A band of humans agreed that a sound would stand for a thing. The sound wolf is not a wolf. It weighs nothing. But shout it, and a whole camp moves."
+      },
+      {
+        "id": "04",
+        "text": "When we learned to trap sounds in marks, the dead began to speak. Writing is the only technology that lets a mind outlive its body."
+      },
+      {
+        "id": "05",
+        "text": "A philosopher named Wittgenstein left a warning about all this. The limits of my language, he said, mean the limits of my world. What you cannot say, you can barely think."
+      },
+      {
+        "id": "06",
+        "text": "And Immanuel Kant, walking the same streets of Königsberg every day at the same hour, noticed something stranger. Some knowledge comes from experience. Fire burns. You learn that the hard way."
+      },
+      {
+        "id": "07",
+        "text": "Some knowledge is true before any experience, simply by definition. Every triangle has three sides. The certainty arrives with the words themselves."
+      },
+      {
+        "id": "08",
+        "text": "But a third kind haunted him. Truths the mind brings to the world before any experience — that the world then obeys. You know the difference between your leg jumping at the doctor's hammer and kicking it on purpose. Nothing taught you that. Nothing needed to. Kant called such knowledge the synthetic a priori. Sparks the mind strikes on its own — that reality honors anyway."
+      },
+      {
+        "id": "09",
+        "text": "The old languages remember what we forgot. Grammar and grimoire, the book of spells, are the same word. You spell a word. You cast a spell. Our ancestors heard letters and magic in a single breath. Perhaps they were paying closer attention than we are."
+      },
+      {
+        "id": "10",
+        "text": "The myths were honest about the cost. Odin hung nine nights on the world-tree for the runes. Meaning is never free. It never has been."
+      },
+      {
+        "id": "11",
+        "text": "So we wrapped what we knew in stories. Allegory. Foreshadowing. Rhyme. Not decoration — compression. A fable is a thousand warnings folded into one talking animal."
+      },
+      {
+        "id": "12",
+        "text": "And every time you read, you perform the oldest rite there is. You stare at silent marks, and a voice that is not yours wakes up inside your head. We do it so often, we forget to be astonished."
+      },
+      {
+        "id": "13",
+        "text": "Now we whisper words to machines, and they answer with voices, with pictures, with whole worlds. Arthur Clarke said that any sufficiently advanced technology is indistinguishable from magic. He may have had it backwards. Magic was always just sufficiently advanced language."
+      },
+      {
+        "id": "14",
+        "text": "From a balanced spear, to a truth the mind mints by itself, to a sentence typed at midnight that becomes a world. It is one unbroken project. Minds reaching for other minds. Paying for meaning. And finding it."
+      },
+      {
+        "id": "15",
+        "text": "Follow, for more of the oldest ideas, made visible."
+      }
+    ]
+  },
+  "assemble": {
+    "captions": false,
+    "ambient_vol": 0.25
+  }
+}

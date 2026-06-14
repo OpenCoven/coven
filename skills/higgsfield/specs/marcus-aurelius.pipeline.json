@@ -1,0 +1,111 @@
+{
+  "name": "ep05-marcus-aurelius",
+  "narration": {
+    "voice": "en-US-AndrewMultilingualNeural",
+    "rate": "-5%",
+    "segments": [
+      {"id": "01", "text": "The most powerful man on earth kept a private journal reminding himself to be decent. He never meant a single page to be read by anyone else."},
+      {"id": "02", "text": "Marcus Aurelius ruled Rome through plague and constant war. On the cold Danube frontier, in a military camp, he wrote the Meditations by lamplight, page after page."},
+      {"id": "03", "text": "He reminded himself: you have power over your mind, not outside events. Realize this, and you will find strength. He wrote it as an order to himself."},
+      {"id": "04", "text": "Each morning he told himself: today I will meet the meddling, the ungrateful, the arrogant. And he resolved to be kind to them anyway."},
+      {"id": "05", "text": "He could have had anything. Instead he sold the palace treasures to fund plague relief, slept on a plank bed, and called himself a student of philosophy."},
+      {"id": "06", "text": "His private notebook outlived his empire. Two thousand years later, we still read an emperor's reminders to be humble. Follow for more lessons the ancients already knew."}
+    ]
+  },
+  "keyframes": {
+    "model": "nano_banana_2",
+    "defaults": {"aspect_ratio": "9:16", "resolution": "2k"},
+    "images": [
+      {
+        "id": "ref",
+        "out": "marcus_ref.png",
+        "prompt": "Character portrait, full body: Marcus Aurelius the Roman emperor, dignified man around 55 years old, short curly grey-brown hair, full curly beard in the classical Marcus Aurelius style, weary kind deep-set eyes, calm thoughtful sun-lined face, wearing a white toga with a purple-trimmed border, simple leather sandals. Standing in a quiet marble palace colonnade in soft morning light. Painterly cinematic realism, theatrical golden lighting, like a neoclassical oil painting come to life. No text."
+      },
+      {
+        "id": "s01",
+        "out": "s01_hook.png",
+        "refs": ["outputs/keyframes/ep05-marcus-aurelius/marcus_ref.png"],
+        "prompt": "Same character as the reference image: the grey-bearded emperor with short curly hair and weary kind eyes, wearing his purple-trimmed white toga, seated alone at a small wooden desk in a vast dark palace room at night, writing in a small bound journal that lies out of focus before him, a single oil lamp lighting his face, the grandeur of the room lost in shadow behind him. Painterly cinematic realism, neoclassical oil painting style, chiaroscuro lamplight. Vertical composition. No text."
+      },
+      {
+        "id": "s02",
+        "out": "s02_camp.png",
+        "refs": ["outputs/keyframes/ep05-marcus-aurelius/marcus_ref.png"],
+        "prompt": "Same character as the reference image: the grey-bearded emperor with short curly hair and weary kind eyes, wearing a heavy military cloak over a bronze cuirass, seated at a rough camp table inside a Roman legionary tent on a winter night, writing in a small bound journal held out of focus, an oil lamp glowing beside him, spears and a standard leaning in the shadows, faint cold blue night visible through the tent flap. Painterly cinematic realism, neoclassical oil painting style, warm lamplight against cold night. Vertical composition. No text."
+      },
+      {
+        "id": "s03",
+        "out": "s03_mind.png",
+        "refs": ["outputs/keyframes/ep05-marcus-aurelius/marcus_ref.png"],
+        "prompt": "Same character as the reference image: the grey-bearded emperor with short curly hair and weary kind eyes, wearing his military cloak over armor, standing alone and perfectly composed on a wooden rampart above a fortified camp at grey dawn, wind pulling at his cloak, dark storm clouds and the wide Danube river plain stretching behind him, his expression steady and untroubled. Painterly cinematic realism, neoclassical oil painting style, cold dawn light with a single break of sun on his face. Vertical composition. No text."
+      },
+      {
+        "id": "s04",
+        "out": "s04_morning.png",
+        "refs": ["outputs/keyframes/ep05-marcus-aurelius/marcus_ref.png"],
+        "prompt": "Same character as the reference image: the grey-bearded emperor with short curly hair and weary kind eyes, wearing his purple-trimmed white toga, standing at the top of marble steps in early morning light, greeting a waiting crowd of petitioners and officials, his hand extended kindly toward an old man at the front while others press forward with demanding faces, his own face patient and warm. Painterly cinematic realism, neoclassical oil painting style, soft golden morning light. Vertical composition. No text."
+      },
+      {
+        "id": "s05",
+        "out": "s05_treasures.png",
+        "refs": ["outputs/keyframes/ep05-marcus-aurelius/marcus_ref.png"],
+        "prompt": "Same character as the reference image: the grey-bearded emperor with short curly hair and weary kind eyes, wearing a plain undecorated tunic, standing in a palace courtyard watching servants carry out gold vessels, silver platters and folded silks toward waiting carts for public auction, his face content and unattached, and behind him through an open doorway a sparse room with a bare wooden plank bed. Painterly cinematic realism, neoclassical oil painting style, clear honest daylight. Vertical composition. No text."
+      },
+      {
+        "id": "s06",
+        "out": "s06_legacy.png",
+        "refs": ["outputs/keyframes/ep05-marcus-aurelius/marcus_ref.png"],
+        "prompt": "Same character as the reference image: the grey-bearded emperor with short curly hair and weary kind eyes, older and gaunter now, wearing his military cloak, seated in his lamplit tent at night, gently closing the small worn bound journal under his hand, his eyes lowered in quiet peace, the lamp flame small and steady beside him. Painterly cinematic realism, neoclassical oil painting style, intimate oil-lamp glow fading to darkness at the edges. Vertical composition. No text."
+      }
+    ]
+  },
+  "clips": {
+    "model": "kling3_0",
+    "defaults": {"aspect_ratio": "9:16", "mode": "std", "sound": "on"},
+    "scenes": [
+      {
+        "id": "s01",
+        "slug": "hook",
+        "image": "<auto>",
+        "prompt": "He writes slowly and deliberately, pauses, then lifts his eyes in thought before returning to the page. Slow push-in toward his lamplit face. Consistent lamplight, maintains exact appearance throughout. Audio: quill scratching softly, lamp flame flutter, deep night silence of a vast room.",
+        "acceptance": ["Private, secretive intimacy reads", "No readable writing on the page"]
+      },
+      {
+        "id": "s02",
+        "slug": "camp",
+        "image": "<auto>",
+        "prompt": "He writes steadily while the tent canvas shifts in the wind and the lamp flame sways, then he draws his cloak tighter and keeps writing. Very slow push-in. Consistent lamplight, maintains exact appearance throughout. Audio: wind buffeting canvas, distant camp sounds and a sentry call, lamp flame crackle.",
+        "acceptance": ["Cold frontier hardship reads", "Face and beard consistent in low light"]
+      },
+      {
+        "id": "s03",
+        "slug": "mind",
+        "image": "<auto>",
+        "prompt": "His cloak whips in the wind and clouds drift fast behind him while he stands perfectly still, breathing slowly, gaze level at the horizon. Slow crane up revealing the camp and river plain below. Consistent dawn light, maintains exact appearance throughout. Audio: strong wind, distant rolling thunder, faint camp noise far below.",
+        "acceptance": ["Stillness against the storm reads as the doctrine", "Armor and cloak stay consistent"]
+      },
+      {
+        "id": "s04",
+        "slug": "morning",
+        "image": "<auto>",
+        "prompt": "He steps down toward the crowd and clasps the old man's hand warmly, nodding with patience as others press in around him. Slow lateral dolly right along the steps. Consistent morning light, maintains exact appearance throughout. Audio: murmuring crowd, overlapping pleading voices, morning birds and city sounds.",
+        "acceptance": ["Kindness toward a demanding crowd reads", "Crowd animates naturally without distortion"]
+      },
+      {
+        "id": "s05",
+        "slug": "treasures",
+        "image": "<auto>",
+        "prompt": "Servants carry the gold and silks past him toward the carts while he watches calmly, then gives a small approving nod and turns toward his bare room. Locked camera with subtle push-in. Consistent daylight, maintains exact appearance throughout. Audio: footsteps on stone, clinking metal vessels, cart wheels and courtyard echo.",
+        "acceptance": ["Detachment from wealth reads clearly", "Plank bed visible through the doorway"]
+      },
+      {
+        "id": "s06",
+        "slug": "legacy",
+        "image": "<auto>",
+        "prompt": "He closes the journal gently, rests his hand flat on its cover, and exhales slowly as the lamp flame breathes light across his face. Very slow push-in toward the journal under his hand. Consistent oil-lamp glow, maintains exact appearance throughout. Audio: soft cover closing, lamp flame crackle, quiet night wind outside the tent.",
+        "acceptance": ["Quiet finality and legacy land", "Journal cover plain with no readable text"]
+      }
+    ]
+  },
+  "assemble": {"captions": true, "ambient_vol": 0.25}
+}

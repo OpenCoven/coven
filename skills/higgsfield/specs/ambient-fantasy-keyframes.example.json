@@ -1,0 +1,38 @@
+{
+  "name": "ambient-fantasy-02-keyframes",
+  "model": "seedream_v4_5",
+  "out_dir": "outputs/keyframes/ambient02",
+  "defaults": {"aspect_ratio": "9:16"},
+  "images": [
+    {
+      "id": "b01",
+      "out": "crystal_cave.png",
+      "prompt": "A vast crystal cave interior, symmetric centered composition: a perfectly still glowing blue pool in the center, luminous translucent stalactites hanging above it dripping water, soft cyan light radiating from beneath the pool surface, fine glowing particles drifting in the air, dark smooth rock walls with no distractions, volumetric light shafts, magical serene atmosphere, photoreal fantasy render. Vertical composition. No text."
+    },
+    {
+      "id": "b02",
+      "out": "moonlit_greenhouse.png",
+      "prompt": "A moonlit Victorian glass greenhouse interior, symmetric centered composition: a central stone path lined with bioluminescent flowers glowing soft teal and violet, glass panes above revealing a full moon, gentle silver moonbeams falling through the glass, faint glowing pollen particles floating in the air, lush dark foliage with no distractions, tranquil magical atmosphere, photoreal fantasy render. Vertical composition. No text."
+    },
+    {
+      "id": "b03",
+      "out": "deepsea_jellyfish.png",
+      "prompt": "Deep dark ocean water, symmetric centered composition: a graceful group of bioluminescent jellyfish glowing soft blue and pink, drifting in the center of frame, long delicate translucent tentacles trailing below, tiny glowing plankton particles suspended in the black water, faint god rays from far above, empty dark background with no distractions, serene otherworldly atmosphere, photoreal render. Vertical composition. No text."
+    },
+    {
+      "id": "b04",
+      "out": "cloud_temple.png",
+      "prompt": "A white marble temple floating above an endless sea of moonlit clouds, symmetric centered composition: the temple perfectly centered with slow waterfalls of glowing golden light spilling from its terraces down into the clouds, soft mist, glowing particles drifting around the columns, full moon high above, vast calm sky with no distractions, ethereal sacred atmosphere, photoreal fantasy render. Vertical composition. No text."
+    },
+    {
+      "id": "b05",
+      "out": "jungle_rain.png",
+      "prompt": "Night rain in a dense jungle, symmetric centered composition: broad glossy banana and monstera leaves filling the frame, large raindrops beading and rolling on the leaf surfaces, a warm paper lantern glowing amber in the center casting soft light through the wet foliage, fine rain streaks catching the lantern glow, dark background with no distractions, cozy tranquil atmosphere, photoreal render. Vertical composition. No text."
+    },
+    {
+      "id": "b06",
+      "out": "snow_shrine.png",
+      "prompt": "Gentle snowfall on a quiet wooden shrine at night, symmetric centered composition: the small shrine perfectly centered under a snow-laden roof, a bronze brazier in front glowing softly with warm embers, snowflakes drifting down through the firelight, untouched smooth snow on the ground, dark calm forest behind with no distractions, peaceful sacred winter atmosphere, photoreal render. Vertical composition. No text."
+    }
+  ]
+}

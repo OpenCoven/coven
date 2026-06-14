@@ -1,0 +1,10 @@
+{
+  "brands": {
+    "magic-philosophy": {
+      "name": "Magic Philosophy",
+      "tags_base": ["aiart", "philosophy", "myth", "language"],
+      "yt_suffix": ""
+    }
+  },
+  "videos": []
+}
