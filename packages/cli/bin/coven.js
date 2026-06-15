@@ -13,20 +13,17 @@ const packagedBinary = path.resolve(
   process.arch,
   process.platform === 'win32' ? 'coven.exe' : 'coven'
 );
-const repoDebugBinary = path.resolve(
-  __dirname,
-  '..',
-  '..',
-  '..',
-  'target',
-  'debug',
-  process.platform === 'win32' ? 'coven.exe' : 'coven'
-);
-const binary = existsSync(packagedBinary) ? packagedBinary : repoDebugBinary;
+if (!existsSync(packagedBinary)) {
+  console.error(
+    `Coven packaged binary not found at ${packagedBinary}. ` +
+      'Reinstall @opencoven/cli for your platform.'
+  );
+  process.exit(1);
+}
 
-const result = spawnSync(binary, process.argv.slice(2), { stdio: 'inherit' });
+const result = spawnSync(packagedBinary, process.argv.slice(2), { stdio: 'inherit' });
 if (result.error) {
-  console.error(`Failed to launch Coven binary at ${binary}: ${result.error.message}`);
+  console.error(`Failed to launch Coven binary at ${packagedBinary}: ${result.error.message}`);
   process.exit(1);
 }
 process.exit(result.status ?? 1);
