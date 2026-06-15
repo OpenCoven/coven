@@ -112,15 +112,26 @@ Do not substitute gradient, mark-only, black-only, monoline, or external avatar 
 
 ### Primary Typefaces
 
-**UI / System (Default):**
-- **Inter** (web, cross-platform)
-- **SF Pro** (Apple environments: iOS, macOS, watchOS)
+**UI / Body (Default):**
+- **Inter** — canonical cross-platform choice
+- **Geist Sans** — acceptable on Vercel/Next surfaces (CovenCave default; already preloaded)
+- **SF Pro Text** — Apple-platform fallback
 - Fallback: system-ui stack
 
 **Display / Brand (Headlines, Hero):**
-- **Satoshi** (preferred, distinctive but technical)
-- **Neue Montreal** (alternative, modern, geometric)
-- **Geist** (optional, if Satoshi unavailable)
+- **Satoshi** — preferred; distinctive but technical
+- **Neue Montreal** — alternative, modern, geometric
+- **Geist** — fallback if Satoshi unavailable
+
+**Mono / Code:**
+- **JetBrains Mono** — canonical for all code, terminal output, session IDs, hashes, paths, labels, and badges
+- **SF Mono** — Apple-platform fallback
+- **Geist Mono** — acceptable on Vercel/Next surfaces (CovenCave preloaded default; swap to JetBrains Mono as user-selectable default)
+
+### CovenCave Font Defaults
+Cave exposes a user-selectable font catalog (`src/lib/font-catalog.ts`). Configured defaults:
+- **Sans:** `geist` → `--font-geist-sans` (preloaded, renders immediately)
+- **Mono:** `jetbrains-mono` → `--font-jetbrains-mono` (matches DESIGN.md canon)
 
 ### Rules
 - **Tight tracking** on headers (letterspacing: -0.02em)

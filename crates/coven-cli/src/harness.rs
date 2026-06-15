@@ -47,20 +47,10 @@ pub enum HarnessLaunchMode {
 
 /// Whether the harness CLI has a long-lived JSON-streaming mode the daemon
 /// can keep alive across chat turns. Claude does (`stream-json`); codex
-/// doesn't (only one-shot `codex exec`). Gated to Unix today because the
-/// daemon's stream-mode kill path relies on Unix process-group semantics
-/// (`setsid()` at spawn, then `kill(-pid, SIGKILL)` to tear down the
-/// harness plus any subprocesses it spawned in one syscall). A Windows
-/// process-tree termination path would let this widen. See
-/// `docs/chat-persistence.md`.
-#[cfg(unix)]
+/// doesn't (only one-shot `codex exec`). Unix kills the stream process tree
+/// with process groups; Windows uses a Job Object owned by the daemon.
 pub fn harness_supports_stream_mode(harness_id: &str) -> bool {
     harness_id == "claude"
-}
-
-#[cfg(not(unix))]
-pub fn harness_supports_stream_mode(_harness_id: &str) -> bool {
-    false
 }
 
 /// Hint passed when a chat turn wants to participate in a multi-turn
@@ -427,6 +417,24 @@ pub fn command_parts_for_harness(
     command_parts_for_harness_with_conversation(harness_id, prompt, mode, None, None)
 }
 
+/// Claude Code prompts before running tool calls that aren't pre-allowlisted.
+/// Cave launches claude sessions in a PTY with no human attached, so such a
+/// prompt stalls the session until a watchdog fails it (observed: an SSO
+/// review task hung ~5 min on a `gh pr view` permission prompt, then exited
+/// 1). Force `bypassPermissions` on every claude launch — interactive,
+/// non-interactive, and stream — so unattended sessions never block. The flag
+/// is order-independent among claude's other flags, so we prepend it.
+fn with_claude_permission_flags(harness_id: &str, args: Vec<String>) -> Vec<String> {
+    if harness_id != "claude" {
+        return args;
+    }
+    let mut flagged = Vec::with_capacity(args.len() + 2);
+    flagged.push("--permission-mode".to_string());
+    flagged.push("bypassPermissions".to_string());
+    flagged.extend(args);
+    flagged
+}
+
 /// Build a harness command line, optionally injecting session-continuity
 /// flags so the harness CLI resumes a prior conversation. Claude uses
 /// `--session-id`/`--resume` (works in both NonInteractive and Stream
@@ -469,13 +477,19 @@ pub fn command_parts_for_harness_with_conversation(
                 args.insert(0, f.identity_preamble());
                 args.insert(0, flag.to_string());
             }
-            return Ok((spec.executable.clone(), sanitize_argv_for_platform(args)));
+            return Ok((
+                spec.executable.clone(),
+                with_claude_permission_flags(harness_id, sanitize_argv_for_platform(args)),
+            ));
         }
         // Harness doesn't support stream: fall through to non-interactive.
         return Ok((
             spec.executable.clone(),
-            sanitize_argv_for_platform(
-                spec.prompt_args(&effective_prompt, HarnessLaunchMode::NonInteractive),
+            with_claude_permission_flags(
+                harness_id,
+                sanitize_argv_for_platform(
+                    spec.prompt_args(&effective_prompt, HarnessLaunchMode::NonInteractive),
+                ),
             ),
         ));
     }
@@ -489,9 +503,12 @@ pub fn command_parts_for_harness_with_conversation(
             }
             return Ok((
                 spec.executable.clone(),
-                args.into_iter()
-                    .chain(std::iter::once(effective_prompt))
-                    .collect(),
+                with_claude_permission_flags(
+                    harness_id,
+                    args.into_iter()
+                        .chain(std::iter::once(effective_prompt))
+                        .collect(),
+                ),
             ));
         }
     }
@@ -503,7 +520,10 @@ pub fn command_parts_for_harness_with_conversation(
         args.insert(0, f.identity_preamble());
         args.insert(0, flag.to_string());
     }
-    Ok((spec.executable, sanitize_argv_for_platform(args)))
+    Ok((
+        spec.executable,
+        with_claude_permission_flags(harness_id, sanitize_argv_for_platform(args)),
+    ))
 }
 
 /// Per-harness translation of stream-mode launch into CLI args. Stream-mode
@@ -808,7 +828,14 @@ mod tests {
         );
         assert_eq!(
             command_parts_for_harness("claude", "polish ui", HarnessLaunchMode::Interactive)?,
-            ("claude".to_string(), vec!["polish ui".to_string()])
+            (
+                "claude".to_string(),
+                vec![
+                    "--permission-mode".to_string(),
+                    "bypassPermissions".to_string(),
+                    "polish ui".to_string(),
+                ]
+            )
         );
         Ok(())
     }
@@ -832,7 +859,12 @@ mod tests {
             command_parts_for_harness("claude", "polish ui", HarnessLaunchMode::NonInteractive)?,
             (
                 "claude".to_string(),
-                vec!["--print".to_string(), "polish ui".to_string()]
+                vec![
+                    "--permission-mode".to_string(),
+                    "bypassPermissions".to_string(),
+                    "--print".to_string(),
+                    "polish ui".to_string(),
+                ]
             )
         );
         Ok(())
@@ -1036,6 +1068,8 @@ mod tests {
             (
                 "claude".to_string(),
                 vec![
+                    "--permission-mode".to_string(),
+                    "bypassPermissions".to_string(),
                     "--print".to_string(),
                     "--session-id".to_string(),
                     "abc-123".to_string(),
@@ -1063,6 +1097,8 @@ mod tests {
             (
                 "claude".to_string(),
                 vec![
+                    "--permission-mode".to_string(),
+                    "bypassPermissions".to_string(),
                     "--print".to_string(),
                     "--resume".to_string(),
                     "abc-123".to_string(),
@@ -1087,7 +1123,14 @@ mod tests {
         );
         assert_eq!(
             parts.unwrap(),
-            ("claude".to_string(), vec!["hello".to_string()])
+            (
+                "claude".to_string(),
+                vec![
+                    "--permission-mode".to_string(),
+                    "bypassPermissions".to_string(),
+                    "hello".to_string(),
+                ]
+            )
         );
         Ok(())
     }
@@ -1148,6 +1191,32 @@ mod tests {
                 ]
             )
         );
+        Ok(())
+    }
+
+    #[test]
+    fn claude_stream_mode_bypasses_permission_prompts() -> anyhow::Result<()> {
+        let (program, args) = command_parts_for_harness_with_conversation(
+            "claude",
+            "hello",
+            HarnessLaunchMode::Stream,
+            None,
+            None,
+        )?;
+        assert_eq!(program, "claude");
+        // The bypass flag is prepended ahead of stream-mode's own flags.
+        assert_eq!(&args[..2], &["--permission-mode", "bypassPermissions"]);
+        assert!(args.iter().any(|a| a == "--output-format"));
+        Ok(())
+    }
+
+    #[test]
+    fn non_claude_harnesses_do_not_get_permission_bypass() -> anyhow::Result<()> {
+        let (_, args) =
+            command_parts_for_harness("codex", "fix tests", HarnessLaunchMode::NonInteractive)?;
+        assert!(!args
+            .iter()
+            .any(|a| a == "--permission-mode" || a == "bypassPermissions"));
         Ok(())
     }
 

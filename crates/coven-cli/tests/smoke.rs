@@ -7,7 +7,7 @@ use std::net::Shutdown;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -113,6 +113,125 @@ fn daemon_status_recovers_corrupt_metadata_from_live_daemon_health() -> anyhow::
         recovered.get("pid").and_then(Value::as_u64).is_some(),
         "daemon status metadata should be restored from health"
     );
+    Ok(())
+}
+
+#[test]
+fn daemon_start_is_idempotent_when_daemon_is_already_running() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let coven = coven_bin();
+    let _daemon_guard = DaemonGuard {
+        coven: coven.clone(),
+        coven_home: coven_home.clone(),
+        path: path.clone(),
+    };
+
+    let first = run_coven(&coven, &coven_home, &path, &["daemon", "start"])?;
+    assert_success("first daemon start", &first);
+    wait_for_daemon_health(&coven_home)?;
+    let first_pid = daemon_status_pid(&coven_home)?;
+
+    let second = run_coven(&coven, &coven_home, &path, &["daemon", "start"])?;
+    assert_success("second daemon start", &second);
+    wait_for_daemon_health(&coven_home)?;
+    let second_pid = daemon_status_pid(&coven_home)?;
+
+    assert_eq!(
+        second_pid, first_pid,
+        "daemon start should reuse the verified running daemon instead of spawning another serve process"
+    );
+    Ok(())
+}
+
+#[test]
+fn concurrent_daemon_start_commands_share_one_daemon() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let coven = coven_bin();
+    let _daemon_guard = DaemonGuard {
+        coven: coven.clone(),
+        coven_home: coven_home.clone(),
+        path: path.clone(),
+    };
+
+    let first = Command::new(&coven)
+        .args(["daemon", "start"])
+        .env("COVEN_HOME", &coven_home)
+        .env("PATH", &path)
+        .spawn()?;
+    let second = Command::new(&coven)
+        .args(["daemon", "start"])
+        .env("COVEN_HOME", &coven_home)
+        .env("PATH", &path)
+        .spawn()?;
+
+    let first = first.wait_with_output()?;
+    let second = second.wait_with_output()?;
+    assert_success("first concurrent daemon start", &first);
+    assert_success("second concurrent daemon start", &second);
+    wait_for_daemon_health(&coven_home)?;
+
+    let recovery_log = fs::read_to_string(coven_home.join("daemon-recovery.log"))?;
+    let starts = recovery_log.matches("daemon starting pid=").count();
+    assert_eq!(
+        starts, 1,
+        "concurrent daemon start commands should launch exactly one serve process\n{recovery_log}"
+    );
+    Ok(())
+}
+
+#[test]
+fn daemon_start_cleans_up_unreachable_duplicate_daemons() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let coven = coven_bin();
+    let _daemon_guard = DaemonGuard {
+        coven: coven.clone(),
+        coven_home: coven_home.clone(),
+        path: path.clone(),
+    };
+
+    let first = run_coven(&coven, &coven_home, &path, &["daemon", "start"])?;
+    assert_success("first daemon start", &first);
+    wait_for_daemon_health(&coven_home)?;
+    let first_pid = daemon_status_pid(&coven_home)?;
+
+    let mut duplicate = Command::new(&coven)
+        .args(["daemon", "serve"])
+        .env("COVEN_HOME", &coven_home)
+        .env("PATH", &path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    wait_until("duplicate daemon to take over socket", || {
+        wait_for_daemon_health(&coven_home)?;
+        Ok(daemon_status_pid(&coven_home)? != first_pid)
+    })?;
+
+    let active_before_cleanup = daemon_status_pid(&coven_home)?;
+    assert_ne!(
+        first_pid, active_before_cleanup,
+        "test setup should leave the first daemon unreachable through the socket"
+    );
+
+    let cleanup = run_coven(&coven, &coven_home, &path, &["daemon", "start"])?;
+    assert_success("daemon start cleanup", &cleanup);
+
+    wait_until("unreachable duplicate daemon cleanup", || {
+        Ok(!pid_is_alive(first_pid as u32))
+    })?;
+    assert!(
+        pid_is_alive(active_before_cleanup as u32),
+        "cleanup must preserve the daemon that owns the socket"
+    );
+
+    let _ = duplicate.kill();
+    let _ = duplicate.wait();
     Ok(())
 }
 
@@ -391,6 +510,27 @@ fn wait_for_daemon_health(coven_home: &Path) -> anyhow::Result<()> {
         let (status, body) = unix_http_request(coven_home, "GET", "/health", None)?;
         Ok(status == 200 && body.contains(r#""ok":true"#))
     })
+}
+
+fn daemon_status_pid(coven_home: &Path) -> anyhow::Result<u64> {
+    let status = fs::read_to_string(coven_home.join("daemon.json"))?;
+    let status = serde_json::from_str::<Value>(&status)?;
+    status
+        .get("pid")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("daemon status should include pid"))
+}
+
+fn pid_is_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn launch_daemon_session(

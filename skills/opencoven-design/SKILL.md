@@ -108,9 +108,14 @@ Do not use gradients or glows for:
 Use the repo typography tokens.
 
 ```css
+/* UI / body — Inter is canonical; Geist Sans is fine on Vercel/Next surfaces */
 --oc-font-ui: Inter, "SF Pro Text", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+
+/* Display — headlines and hero copy only */
 --oc-font-display: Satoshi, "Neue Montreal", Geist, Inter, "SF Pro Display", -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
---oc-font-mono: "SF Mono", SFMono-Regular, ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+
+/* Mono — JetBrains Mono is canonical; SF Mono is the Apple fallback */
+--oc-font-mono: "JetBrains Mono", "SF Mono", SFMono-Regular, ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
 
 --oc-tracking-heading: -0.02em;
 --oc-tracking-hero: -0.055em;
@@ -119,11 +124,18 @@ Use the repo typography tokens.
 --oc-line-heading: 1.2;
 ```
 
+### CovenCave Defaults
+
+Cave (`coven-cave`) uses a user-selectable font catalog. The configured defaults:
+- **Sans:** `geist` — `--font-geist-sans`, preloaded, renders immediately
+- **Mono:** `jetbrains-mono` — `--font-jetbrains-mono`, matches DESIGN.md canon
+
 ### Typography Rules
 
 - Use UI font for product surfaces, controls, tables, body text, and docs prose.
 - Use display font for hero headlines and major product headings only.
-- Use mono font for commands, session IDs, logs, event streams, diffs, paths, hashes, and API payloads.
+- Use mono font for ALL of: commands, session IDs, logs, event streams, diffs, paths, hashes, API payloads, terminal output, and uppercase labels / badges.
+- JetBrains Mono is the canonical mono face — prefer it over SF Mono, Geist Mono, or system mono on any surface where you control the font.
 - Keep body line height at 1.4 and headings at 1.2.
 - Avoid all-caps except for compact labels, badges, and nav group headings.
 - Do not add playful, cursive, serif, or decorative fonts.
@@ -368,6 +380,6 @@ Return changed files, verification run, and any brand exceptions.
 
 ---
 
-Last updated: 2026-05-17
-Version: 1.1.0
+Last updated: 2026-06-13
+Version: 1.2.0
 License: MIT

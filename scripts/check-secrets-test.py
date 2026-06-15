@@ -62,6 +62,22 @@ class SecretGuardLockfileTests(unittest.TestCase):
 
         self.assertEqual(hits, [("packages/openclaw-coven/pnpm-lock.yaml", 1, "generic_assignment")])
 
+    def test_environment_secret_reads_do_not_trigger_generic_assignment(self) -> None:
+        text = '    api_key = os.environ.get("ELEVENLABS_API_KEY")\n'
+
+        hits = check_secrets.scan_text(text, "skills/higgsfield/scripts/elevenlabs_narrate.py")
+
+        self.assertEqual(hits, [])
+
+    def test_literal_secret_assignments_still_trigger_generic_assignment(self) -> None:
+        key_name = "api" + "_key"
+        secret_value = "S" * 24
+        text = f'    {key_name} = "{secret_value}"\n'
+
+        hits = check_secrets.scan_text(text, "docs/example.py")
+
+        self.assertEqual(hits, [("docs/example.py", 1, "generic_assignment")])
+
     def test_known_fake_private_key_fixture_does_not_trigger(self) -> None:
         text = (
             '    "-----BEGIN PRIVATE KEY-----\\n'

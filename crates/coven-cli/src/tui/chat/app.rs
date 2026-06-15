@@ -566,7 +566,7 @@ impl App {
             // conversation state through the harness CLI's own resume
             // mechanism (--session-id/--resume for claude when not in
             // stream mode, `exec resume <id>` for codex). Stream-mode
-            // harnesses (claude on unix) take a fast-path inside
+            // harnesses (claude) take a fast-path inside
             // `run_harness_prompt` that reuses the existing long-lived
             // daemon session via `forward_input_to_session` instead.
             // See docs/chat-persistence.md.

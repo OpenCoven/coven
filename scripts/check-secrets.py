@@ -43,6 +43,10 @@ SECRET_RULES: list[tuple[str, re.Pattern[str]]] = [
 ALLOW_LINE = re.compile(
     r"(?i)(example|placeholder|your_|<.*>|op://|secret scanning|secret guard|missing|expected|description|readme|docs/|abcdefghijklmnopqrstuvwxyz|custom-coven-home)"
 )
+ENV_SECRET_READ = re.compile(
+    r"(?i)\b(?:api[_-]?key|secret|token|password|private[_-]?key)\b\s*[:=]\s*"
+    r"(?:os\.environ(?:\.get)?\(|std::env::var\(|env::var\(|process\.env\.)"
+)
 
 
 def sh(*args: str) -> str:
@@ -166,6 +170,8 @@ def scan_text(text: str, path: str) -> list[tuple[str, int, str]]:
         allow = bool(ALLOW_LINE.search(line))
         for name, pattern in SECRET_RULES:
             if name == "private_key" and is_known_fake_private_key_fixture(line):
+                continue
+            if name == "generic_assignment" and ENV_SECRET_READ.search(line):
                 continue
             if pattern.search(line) and not (allow and name != "private_key"):
                 hits.append((path, line_number, name))

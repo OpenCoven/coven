@@ -97,12 +97,20 @@ pub fn run_attached(command: &HarnessCommand) -> Result<PtyRunResult> {
 /// --session-id <id> <prompt>` already emits the Coven-compatible JSONL
 /// schema; we just forward each line untouched to `out`.
 ///
+/// `is_resume` picks the session flag: `--session-id <id>` only CREATES
+/// sessions — passing an id that already exists fails with "Session ID
+/// <id> is already in use", which made every `coven run --continue` turn
+/// error and lose the conversation. Resumed turns use `--resume <id>`,
+/// which continues the session in place (in `-p` mode the id is kept, so
+/// the Coven session record id stays valid for the next turn).
+///
 /// When `forward_stdin` is true, lines on our stdin are piped to claude's
 /// stdin so callers can feed additional user messages mid-run. Stderr is
 /// inherited so claude's own diagnostics land on the terminal.
 pub fn stream_claude<W: Write>(
     cwd: &Path,
     session_id: &str,
+    is_resume: bool,
     prompt: &str,
     forward_stdin: bool,
     system_prompt: Option<&str>,
@@ -112,6 +120,7 @@ pub fn stream_claude<W: Write>(
         "claude",
         cwd,
         session_id,
+        is_resume,
         prompt,
         forward_stdin,
         system_prompt,
@@ -119,10 +128,12 @@ pub fn stream_claude<W: Write>(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stream_claude_with_program<W: Write>(
     program: &str,
     cwd: &Path,
     session_id: &str,
+    is_resume: bool,
     prompt: &str,
     forward_stdin: bool,
     system_prompt: Option<&str>,
@@ -135,20 +146,23 @@ fn stream_claude_with_program<W: Write>(
     // Without this branch, one-shot turns hang on stdin then exit with no
     // assistant text — the symptom that surfaces in Cave as
     // `_The "claude" harness completed but produced no output._`
-    let mut args: Vec<&str> = vec!["-p"];
+    // Bypass permission prompts: this stream runs unattended (no TTY for a
+    // human to answer a tool-permission prompt), so a prompt would hang the
+    // turn. Mirrors the `with_claude_permission_flags` injection on the
+    // PTY/interactive launch path in `harness.rs`.
+    let mut args: Vec<&str> = vec!["-p", "--permission-mode", "bypassPermissions"];
     if forward_stdin {
         args.extend_from_slice(&["--input-format", "stream-json"]);
     }
     if let Some(sp) = system_prompt {
         args.extend_from_slice(&["--system-prompt", sp]);
     }
-    args.extend_from_slice(&[
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--session-id",
-        session_id,
-    ]);
+    args.extend_from_slice(&["--output-format", "stream-json", "--verbose"]);
+    if is_resume {
+        args.extend_from_slice(&["--resume", session_id]);
+    } else {
+        args.extend_from_slice(&["--session-id", session_id]);
+    }
 
     let mut child = std::process::Command::new(program)
         .args(&args)
@@ -600,6 +614,7 @@ mod tests {
         assert_eq!(command.cwd(), cwd);
     }
 
+    #[cfg(unix)]
     #[test]
     fn spawn_detached_starts_pty_and_returns_input_and_kill_handles() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
@@ -616,11 +631,26 @@ mod tests {
         Ok(())
     }
 
+    /// Serializes the fake-claude tests: each writes an executable script and
+    /// immediately spawns it. Run in parallel, one test's `fork` can inherit
+    /// another's still-open write fd and the exec fails with ETXTBSY
+    /// ("Text file busy") — a real CI flake, not a theoretical one.
+    #[cfg(unix)]
+    static FAKE_CLAUDE_SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(unix)]
+    fn fake_claude_spawn_guard() -> std::sync::MutexGuard<'static, ()> {
+        FAKE_CLAUDE_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[cfg(unix)]
     #[test]
     fn stream_claude_forwards_jsonl_and_returns_exit_code() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
+        let _guard = fake_claude_spawn_guard();
         let temp_dir = tempfile::tempdir()?;
         let fake_claude = temp_dir.path().join("fake-claude");
         std::fs::write(
@@ -641,6 +671,7 @@ exit 7
             fake_claude.to_str().unwrap(),
             temp_dir.path(),
             "session-123",
+            false,
             "hello prompt",
             false,
             None,
@@ -654,7 +685,7 @@ exit 7
         // which is the bug this commit fixes.
         assert_eq!(
             std::fs::read_to_string(temp_dir.path().join("args.txt"))?,
-            "-p\n--output-format\nstream-json\n--verbose\n--session-id\nsession-123\nhello prompt\n"
+            "-p\n--permission-mode\nbypassPermissions\n--output-format\nstream-json\n--verbose\n--session-id\nsession-123\nhello prompt\n"
         );
         assert_eq!(
             String::from_utf8(out)?,
@@ -668,6 +699,7 @@ exit 7
     fn stream_claude_includes_input_format_when_forwarding_stdin() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
+        let _guard = fake_claude_spawn_guard();
         let temp_dir = tempfile::tempdir()?;
         let fake_claude = temp_dir.path().join("fake-claude");
         std::fs::write(
@@ -686,6 +718,7 @@ exit 0
             fake_claude.to_str().unwrap(),
             temp_dir.path(),
             "session-456",
+            false,
             "hello prompt",
             // forward_stdin=true → long-lived chat mode where claude reads
             // user messages as JSONL on stdin, so --input-format stream-json
@@ -697,7 +730,49 @@ exit 0
 
         assert_eq!(
             std::fs::read_to_string(temp_dir.path().join("args.txt"))?,
-            "-p\n--input-format\nstream-json\n--output-format\nstream-json\n--verbose\n--session-id\nsession-456\nhello prompt\n"
+            "-p\n--permission-mode\nbypassPermissions\n--input-format\nstream-json\n--output-format\nstream-json\n--verbose\n--session-id\nsession-456\nhello prompt\n"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stream_claude_resumes_with_resume_flag_not_session_id() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = fake_claude_spawn_guard();
+        let temp_dir = tempfile::tempdir()?;
+        let fake_claude = temp_dir.path().join("fake-claude");
+        std::fs::write(
+            &fake_claude,
+            r#"#!/bin/sh
+printf '%s\n' "$@" > args.txt
+exit 0
+"#,
+        )?;
+        let mut permissions = std::fs::metadata(&fake_claude)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_claude, permissions)?;
+
+        let mut out = Vec::new();
+        let _code = stream_claude_with_program(
+            fake_claude.to_str().unwrap(),
+            temp_dir.path(),
+            "session-789",
+            // is_resume=true → the session already exists. `--session-id`
+            // only creates sessions and fails with "Session ID <id> is
+            // already in use" on reuse, so resumed turns MUST go through
+            // `--resume` or every `coven run --continue` loses the chat.
+            true,
+            "hello again",
+            false,
+            None,
+            &mut out,
+        )?;
+
+        assert_eq!(
+            std::fs::read_to_string(temp_dir.path().join("args.txt"))?,
+            "-p\n--permission-mode\nbypassPermissions\n--output-format\nstream-json\n--verbose\n--resume\nsession-789\nhello again\n"
         );
         Ok(())
     }
@@ -819,7 +894,22 @@ exit 0
         .unwrap();
 
         assert_eq!(command.program(), "claude");
-        assert_eq!(command.args(), &["explain && exit"]);
+        // claude always launches with permission prompts bypassed (the flag is
+        // prepended after platform sanitization, so it stays unquoted).
+        #[cfg(windows)]
+        assert_eq!(
+            command.args(),
+            &[
+                "--permission-mode",
+                "bypassPermissions",
+                "\"explain && exit\""
+            ]
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            command.args(),
+            &["--permission-mode", "bypassPermissions", "explain && exit"]
+        );
         assert_eq!(command.cwd(), cwd);
     }
 }

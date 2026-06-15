@@ -5,7 +5,7 @@
   "accent": "violet",
   "grid": "4px",
   "sourceOfTruth": "DESIGN.md",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "OpenCoven Team",
   "license": "MIT",
   "tags": ["design", "ui", "constraints", "dark-mode", "cockpit", "brand"],
@@ -13,5 +13,14 @@
     "foundation": "black",
     "accent": "violet",
     "palette": "OpenCoven --oc-* token system"
+  },
+  "typography": {
+    "ui": "Inter (canonical); Geist Sans on Vercel/Next surfaces",
+    "display": "Satoshi; Neue Montreal fallback",
+    "mono": "JetBrains Mono (canonical); SF Mono on Apple; Geist Mono on Vercel/Next"
+  },
+  "coven_cave_defaults": {
+    "sans": "geist",
+    "mono": "jetbrains-mono"
   }
 }

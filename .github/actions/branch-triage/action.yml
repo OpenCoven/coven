@@ -1,0 +1,66 @@
+name: Branch Triage
+description: >
+  Classify, rebase, merge, and prune git branches.
+  Merges open PRs, deletes merged/superseded branches, removes orphaned
+  worktrees, and writes a Markdown summary to the job summary.
+
+inputs:
+  base-branch:
+    description: The protected base branch to measure all others against.
+    required: false
+    default: main
+  merge-strategy:
+    description: >
+      How to merge open PRs: "squash" (default), "merge", or "rebase".
+    required: false
+    default: squash
+  dry-run:
+    description: >
+      If "true", classify and report but do not delete branches or merge PRs.
+    required: false
+    default: "false"
+  stale-days:
+    description: >
+      Branches with no unique commits vs base AND last-commit older than this
+      many days are classified as SUPERSEDED without asking.
+      Set to 0 to disable age check (unique-commit check only).
+    required: false
+    default: "30"
+  github-token:
+    description: >
+      GitHub token with repo write access (contents + pull-requests).
+      Defaults to the standard GITHUB_TOKEN.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  merged-count:
+    description: Number of PRs merged.
+    value: ${{ steps.triage.outputs.merged_count }}
+  deleted-count:
+    description: Number of branches deleted (merged + superseded).
+    value: ${{ steps.triage.outputs.deleted_count }}
+  kept-count:
+    description: Number of REVIEW branches left untouched (need manual decision).
+    value: ${{ steps.triage.outputs.kept_count }}
+
+runs:
+  using: composite
+  steps:
+    - name: Configure git identity
+      shell: bash
+      run: |
+        git config --global user.email "actions@github.com"
+        git config --global user.name "GitHub Actions"
+
+    - name: Run branch triage
+      id: triage
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        BASE_BRANCH: ${{ inputs.base-branch }}
+        MERGE_STRATEGY: ${{ inputs.merge-strategy }}
+        DRY_RUN: ${{ inputs.dry-run }}
+        STALE_DAYS: ${{ inputs.stale-days }}
+      run: |
+        "${{ github.action_path }}/triage.sh"
