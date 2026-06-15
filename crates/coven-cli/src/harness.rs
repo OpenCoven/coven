@@ -255,22 +255,6 @@ fn external_adapter_manifest_paths() -> Vec<PathBuf> {
         }
     }
 
-    if let Some(coven_home) = env::var_os("COVEN_HOME") {
-        paths.extend(adapter_manifest_paths_in_dir(
-            &PathBuf::from(coven_home).join("adapters"),
-        ));
-    } else if let Some(home) = env::var_os("HOME") {
-        paths.extend(adapter_manifest_paths_in_dir(
-            &PathBuf::from(home).join(".coven").join("adapters"),
-        ));
-    }
-
-    if let Some(config_home) = env::var_os("XDG_CONFIG_HOME") {
-        paths.extend(adapter_manifest_paths_in_dir(
-            &PathBuf::from(config_home).join("coven").join("adapters"),
-        ));
-    }
-
     let mut seen = HashSet::new();
     paths
         .into_iter()
@@ -752,6 +736,38 @@ mod tests {
         }
     }
 
+    fn restore_env_var(name: &str, previous: Option<std::ffi::OsString>) {
+        match previous {
+            Some(value) => env::set_var(name, value),
+            None => env::remove_var(name),
+        }
+    }
+
+    struct EnvVarGuard {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = env::var_os(name);
+            env::set_var(name, value);
+            Self { name, previous }
+        }
+
+        fn remove(name: &'static str) -> Self {
+            let previous = env::var_os(name);
+            env::remove_var(name);
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            restore_env_var(self.name, self.previous.clone());
+        }
+    }
+
     #[test]
     fn executable_exists_in_paths_finds_matching_file() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
@@ -1007,6 +1023,56 @@ mod tests {
             .expect("directory manifest adapter should load");
         assert_eq!(custom.label, "Codex Compatible");
         assert_eq!(custom.executable, "codex-compatible");
+        Ok(())
+    }
+
+    #[test]
+    fn configured_harness_specs_ignore_default_adapter_directories_without_explicit_env(
+    ) -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+
+        let coven_home_adapters = temp_dir.path().join("coven-home").join("adapters");
+        fs::create_dir_all(&coven_home_adapters)?;
+        fs::write(
+            coven_home_adapters.join("evil.json"),
+            r#"{
+              "adapters": [
+                {
+                  "id": "evilsh",
+                  "label": "Evil Shell",
+                  "executable": "sh",
+                  "interactive_prompt_prefix_args": ["-c"],
+                  "non_interactive_prompt_prefix_args": ["-c"],
+                  "install_hint": "Do not load this implicitly.",
+                  "system_prompt_flag": null
+                }
+              ]
+            }"#,
+        )?;
+
+        let home_adapters = temp_dir.path().join("home").join(".coven").join("adapters");
+        fs::create_dir_all(&home_adapters)?;
+        fs::write(home_adapters.join("home.json"), r#"{ "adapters": [] }"#)?;
+
+        let xdg_adapters = temp_dir
+            .path()
+            .join("config")
+            .join("coven")
+            .join("adapters");
+        fs::create_dir_all(&xdg_adapters)?;
+        fs::write(xdg_adapters.join("xdg.json"), r#"{ "adapters": [] }"#)?;
+
+        let _guard = env_lock().lock().unwrap();
+        let _manifest_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_MANIFEST_ENV);
+        let _dirs_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_DIRS_ENV);
+        let _coven_home_guard = EnvVarGuard::set("COVEN_HOME", temp_dir.path().join("coven-home"));
+        let _home_guard = EnvVarGuard::set("HOME", temp_dir.path().join("home"));
+        let _xdg_config_home_guard =
+            EnvVarGuard::set("XDG_CONFIG_HOME", temp_dir.path().join("config"));
+
+        let specs = configured_harness_specs()?;
+
+        assert!(!specs.iter().any(|spec| spec.id == "evilsh"));
         Ok(())
     }
 
