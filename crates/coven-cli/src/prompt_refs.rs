@@ -336,6 +336,23 @@ mod tests {
         assert!(expanded.starts_with("[missing @"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn expand_path_rejects_symlink_escape_outside_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let outside = temp.path().join("outside.txt");
+        let root = temp.path().join("root");
+        let link = root.join("linked-secret.txt");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&outside, "SECRET").unwrap();
+        symlink(&outside, &link).unwrap();
+
+        let expanded = expand_path(&root, "linked-secret.txt").unwrap();
+        assert_eq!(expanded, "[missing @linked-secret.txt]");
+    }
+
     #[test]
     fn expand_path_truncates_at_max_lines() {
         let temp = tempfile::tempdir().unwrap();
