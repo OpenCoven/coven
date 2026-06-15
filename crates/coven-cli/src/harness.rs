@@ -424,7 +424,17 @@ pub fn command_parts_for_harness(
 /// unattended environment may opt in to bypassing prompts with
 /// `COVEN_CLAUDE_BYPASS_PERMISSIONS=1`.
 pub fn claude_permission_bypass_enabled() -> bool {
-    env::var(CLAUDE_BYPASS_PERMISSIONS_ENV)
+    claude_permission_bypass_enabled_from_value(
+        env::var(CLAUDE_BYPASS_PERMISSIONS_ENV).ok().as_deref(),
+    )
+}
+
+fn with_claude_permission_flags(harness_id: &str, args: Vec<String>) -> Vec<String> {
+    with_claude_permission_flags_enabled(harness_id, args, claude_permission_bypass_enabled())
+}
+
+fn claude_permission_bypass_enabled_from_value(value: Option<&str>) -> bool {
+    value
         .map(|value| {
             let value = value.trim();
             value == "1" || value.eq_ignore_ascii_case("true")
@@ -432,8 +442,12 @@ pub fn claude_permission_bypass_enabled() -> bool {
         .unwrap_or(false)
 }
 
-fn with_claude_permission_flags(harness_id: &str, args: Vec<String>) -> Vec<String> {
-    if harness_id != "claude" || !claude_permission_bypass_enabled() {
+fn with_claude_permission_flags_enabled(
+    harness_id: &str,
+    args: Vec<String>,
+    bypass_enabled: bool,
+) -> Vec<String> {
+    if harness_id != "claude" || !bypass_enabled {
         return args;
     }
     let mut flagged = Vec::with_capacity(args.len() + 2);
@@ -735,13 +749,6 @@ mod tests {
         match previous {
             Some(value) => env::set_var(EXTERNAL_ADAPTER_DIRS_ENV, value),
             None => env::remove_var(EXTERNAL_ADAPTER_DIRS_ENV),
-        }
-    }
-
-    fn restore_claude_bypass_env(previous: Option<std::ffi::OsString>) {
-        match previous {
-            Some(value) => env::set_var(CLAUDE_BYPASS_PERMISSIONS_ENV, value),
-            None => env::remove_var(CLAUDE_BYPASS_PERMISSIONS_ENV),
         }
     }
 
@@ -1204,17 +1211,26 @@ mod tests {
     }
 
     #[test]
-    fn claude_permission_bypass_requires_explicit_env_opt_in() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().unwrap();
-        let previous = env::var_os(CLAUDE_BYPASS_PERMISSIONS_ENV);
-        env::set_var(CLAUDE_BYPASS_PERMISSIONS_ENV, "1");
+    fn claude_permission_bypass_requires_explicit_opt_in_values() {
+        assert!(claude_permission_bypass_enabled_from_value(Some("1")));
+        assert!(claude_permission_bypass_enabled_from_value(Some("true")));
+        assert!(claude_permission_bypass_enabled_from_value(Some(" TRUE ")));
+        assert!(!claude_permission_bypass_enabled_from_value(None));
+        assert!(!claude_permission_bypass_enabled_from_value(Some("0")));
+        assert!(!claude_permission_bypass_enabled_from_value(Some("false")));
+    }
 
-        let (_, args) =
-            command_parts_for_harness("claude", "hello", HarnessLaunchMode::Interactive)?;
-
-        restore_claude_bypass_env(previous);
-        assert_eq!(&args[..2], &["--permission-mode", "bypassPermissions"]);
-        Ok(())
+    #[test]
+    fn claude_permission_bypass_opt_in_adds_flags() {
+        let args = with_claude_permission_flags_enabled("claude", vec!["hello".to_string()], true);
+        assert_eq!(
+            args,
+            vec![
+                "--permission-mode".to_string(),
+                "bypassPermissions".to_string(),
+                "hello".to_string()
+            ]
+        );
     }
 
     #[test]

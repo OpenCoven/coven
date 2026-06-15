@@ -139,6 +139,31 @@ fn stream_claude_with_program<W: Write>(
     system_prompt: Option<&str>,
     out: &mut W,
 ) -> Result<i32> {
+    stream_claude_with_program_and_permission_bypass(
+        program,
+        cwd,
+        session_id,
+        is_resume,
+        prompt,
+        forward_stdin,
+        system_prompt,
+        crate::harness::claude_permission_bypass_enabled(),
+        out,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stream_claude_with_program_and_permission_bypass<W: Write>(
+    program: &str,
+    cwd: &Path,
+    session_id: &str,
+    is_resume: bool,
+    prompt: &str,
+    forward_stdin: bool,
+    system_prompt: Option<&str>,
+    permission_bypass_enabled: bool,
+    out: &mut W,
+) -> Result<i32> {
     // `--input-format stream-json` makes claude read user messages as JSONL
     // on stdin and IGNORE the positional <prompt>. We only want that mode
     // when the caller is feeding stdin (long-lived chat); for one-shot turns
@@ -147,7 +172,7 @@ fn stream_claude_with_program<W: Write>(
     // assistant text — the symptom that surfaces in Cave as
     // `_The "claude" harness completed but produced no output._`
     let mut args: Vec<&str> = vec!["-p"];
-    if crate::harness::claude_permission_bypass_enabled() {
+    if permission_bypass_enabled {
         args.extend_from_slice(&["--permission-mode", "bypassPermissions"]);
     }
     if forward_stdin {
@@ -730,6 +755,45 @@ exit 0
         assert_eq!(
             std::fs::read_to_string(temp_dir.path().join("args.txt"))?,
             "-p\n--input-format\nstream-json\n--output-format\nstream-json\n--verbose\n--session-id\nsession-456\nhello prompt\n"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stream_claude_honors_permission_bypass_opt_in() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = fake_claude_spawn_guard();
+        let temp_dir = tempfile::tempdir()?;
+        let fake_claude = temp_dir.path().join("fake-claude");
+        std::fs::write(
+            &fake_claude,
+            r#"#!/bin/sh
+printf '%s\n' "$@" > args.txt
+exit 0
+"#,
+        )?;
+        let mut permissions = std::fs::metadata(&fake_claude)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_claude, permissions)?;
+
+        let mut out = Vec::new();
+        let _code = stream_claude_with_program_and_permission_bypass(
+            fake_claude.to_str().unwrap(),
+            temp_dir.path(),
+            "session-456",
+            false,
+            "hello prompt",
+            false,
+            None,
+            true,
+            &mut out,
+        )?;
+
+        assert_eq!(
+            std::fs::read_to_string(temp_dir.path().join("args.txt"))?,
+            "-p\n--permission-mode\nbypassPermissions\n--output-format\nstream-json\n--verbose\n--session-id\nsession-456\nhello prompt\n"
         );
         Ok(())
     }
