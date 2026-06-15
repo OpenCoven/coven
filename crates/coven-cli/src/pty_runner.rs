@@ -146,11 +146,10 @@ fn stream_claude_with_program<W: Write>(
     // Without this branch, one-shot turns hang on stdin then exit with no
     // assistant text — the symptom that surfaces in Cave as
     // `_The "claude" harness completed but produced no output._`
-    // Bypass permission prompts: this stream runs unattended (no TTY for a
-    // human to answer a tool-permission prompt), so a prompt would hang the
-    // turn. Mirrors the `with_claude_permission_flags` injection on the
-    // PTY/interactive launch path in `harness.rs`.
-    let mut args: Vec<&str> = vec!["-p", "--permission-mode", "bypassPermissions"];
+    let mut args: Vec<&str> = vec!["-p"];
+    if crate::harness::claude_permission_bypass_enabled() {
+        args.extend_from_slice(&["--permission-mode", "bypassPermissions"]);
+    }
     if forward_stdin {
         args.extend_from_slice(&["--input-format", "stream-json"]);
     }
@@ -685,7 +684,7 @@ exit 7
         // which is the bug this commit fixes.
         assert_eq!(
             std::fs::read_to_string(temp_dir.path().join("args.txt"))?,
-            "-p\n--permission-mode\nbypassPermissions\n--output-format\nstream-json\n--verbose\n--session-id\nsession-123\nhello prompt\n"
+            "-p\n--output-format\nstream-json\n--verbose\n--session-id\nsession-123\nhello prompt\n"
         );
         assert_eq!(
             String::from_utf8(out)?,
@@ -730,7 +729,7 @@ exit 0
 
         assert_eq!(
             std::fs::read_to_string(temp_dir.path().join("args.txt"))?,
-            "-p\n--permission-mode\nbypassPermissions\n--input-format\nstream-json\n--output-format\nstream-json\n--verbose\n--session-id\nsession-456\nhello prompt\n"
+            "-p\n--input-format\nstream-json\n--output-format\nstream-json\n--verbose\n--session-id\nsession-456\nhello prompt\n"
         );
         Ok(())
     }
@@ -772,7 +771,7 @@ exit 0
 
         assert_eq!(
             std::fs::read_to_string(temp_dir.path().join("args.txt"))?,
-            "-p\n--permission-mode\nbypassPermissions\n--output-format\nstream-json\n--verbose\n--resume\nsession-789\nhello again\n"
+            "-p\n--output-format\nstream-json\n--verbose\n--resume\nsession-789\nhello again\n"
         );
         Ok(())
     }
@@ -894,22 +893,10 @@ exit 0
         .unwrap();
 
         assert_eq!(command.program(), "claude");
-        // claude always launches with permission prompts bypassed (the flag is
-        // prepended after platform sanitization, so it stays unquoted).
         #[cfg(windows)]
-        assert_eq!(
-            command.args(),
-            &[
-                "--permission-mode",
-                "bypassPermissions",
-                "\"explain && exit\""
-            ]
-        );
+        assert_eq!(command.args(), &["\"explain && exit\""]);
         #[cfg(not(windows))]
-        assert_eq!(
-            command.args(),
-            &["--permission-mode", "bypassPermissions", "explain && exit"]
-        );
+        assert_eq!(command.args(), &["explain && exit"]);
         assert_eq!(command.cwd(), cwd);
     }
 }

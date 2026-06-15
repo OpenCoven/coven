@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 pub const EXTERNAL_ADAPTER_MANIFEST_ENV: &str = "COVEN_HARNESS_ADAPTER_MANIFEST";
 pub const EXTERNAL_ADAPTER_DIRS_ENV: &str = "COVEN_HARNESS_ADAPTER_DIRS";
+pub const CLAUDE_BYPASS_PERMISSIONS_ENV: &str = "COVEN_CLAUDE_BYPASS_PERMISSIONS";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HarnessSummary {
@@ -418,14 +419,21 @@ pub fn command_parts_for_harness(
 }
 
 /// Claude Code prompts before running tool calls that aren't pre-allowlisted.
-/// Cave launches claude sessions in a PTY with no human attached, so such a
-/// prompt stalls the session until a watchdog fails it (observed: an SSO
-/// review task hung ~5 min on a `gh pr view` permission prompt, then exited
-/// 1). Force `bypassPermissions` on every claude launch — interactive,
-/// non-interactive, and stream — so unattended sessions never block. The flag
-/// is order-independent among claude's other flags, so we prepend it.
+/// Preserve those prompts by default so untrusted prompt text cannot silently
+/// drive tool execution. Operators that run Claude in an explicitly trusted,
+/// unattended environment may opt in to bypassing prompts with
+/// `COVEN_CLAUDE_BYPASS_PERMISSIONS=1`.
+pub fn claude_permission_bypass_enabled() -> bool {
+    env::var(CLAUDE_BYPASS_PERMISSIONS_ENV)
+        .map(|value| {
+            let value = value.trim();
+            value == "1" || value.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false)
+}
+
 fn with_claude_permission_flags(harness_id: &str, args: Vec<String>) -> Vec<String> {
-    if harness_id != "claude" {
+    if harness_id != "claude" || !claude_permission_bypass_enabled() {
         return args;
     }
     let mut flagged = Vec::with_capacity(args.len() + 2);
@@ -730,6 +738,13 @@ mod tests {
         }
     }
 
+    fn restore_claude_bypass_env(previous: Option<std::ffi::OsString>) {
+        match previous {
+            Some(value) => env::set_var(CLAUDE_BYPASS_PERMISSIONS_ENV, value),
+            None => env::remove_var(CLAUDE_BYPASS_PERMISSIONS_ENV),
+        }
+    }
+
     #[test]
     fn executable_exists_in_paths_finds_matching_file() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
@@ -828,14 +843,7 @@ mod tests {
         );
         assert_eq!(
             command_parts_for_harness("claude", "polish ui", HarnessLaunchMode::Interactive)?,
-            (
-                "claude".to_string(),
-                vec![
-                    "--permission-mode".to_string(),
-                    "bypassPermissions".to_string(),
-                    "polish ui".to_string(),
-                ]
-            )
+            ("claude".to_string(), vec!["polish ui".to_string()])
         );
         Ok(())
     }
@@ -859,12 +867,7 @@ mod tests {
             command_parts_for_harness("claude", "polish ui", HarnessLaunchMode::NonInteractive)?,
             (
                 "claude".to_string(),
-                vec![
-                    "--permission-mode".to_string(),
-                    "bypassPermissions".to_string(),
-                    "--print".to_string(),
-                    "polish ui".to_string(),
-                ]
+                vec!["--print".to_string(), "polish ui".to_string()]
             )
         );
         Ok(())
@@ -1068,8 +1071,6 @@ mod tests {
             (
                 "claude".to_string(),
                 vec![
-                    "--permission-mode".to_string(),
-                    "bypassPermissions".to_string(),
                     "--print".to_string(),
                     "--session-id".to_string(),
                     "abc-123".to_string(),
@@ -1097,8 +1098,6 @@ mod tests {
             (
                 "claude".to_string(),
                 vec![
-                    "--permission-mode".to_string(),
-                    "bypassPermissions".to_string(),
                     "--print".to_string(),
                     "--resume".to_string(),
                     "abc-123".to_string(),
@@ -1123,14 +1122,7 @@ mod tests {
         );
         assert_eq!(
             parts.unwrap(),
-            (
-                "claude".to_string(),
-                vec![
-                    "--permission-mode".to_string(),
-                    "bypassPermissions".to_string(),
-                    "hello".to_string(),
-                ]
-            )
+            ("claude".to_string(), vec!["hello".to_string()])
         );
         Ok(())
     }
@@ -1195,7 +1187,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_stream_mode_bypasses_permission_prompts() -> anyhow::Result<()> {
+    fn claude_stream_mode_preserves_permission_prompts_by_default() -> anyhow::Result<()> {
         let (program, args) = command_parts_for_harness_with_conversation(
             "claude",
             "hello",
@@ -1204,9 +1196,24 @@ mod tests {
             None,
         )?;
         assert_eq!(program, "claude");
-        // The bypass flag is prepended ahead of stream-mode's own flags.
-        assert_eq!(&args[..2], &["--permission-mode", "bypassPermissions"]);
+        assert!(!args
+            .iter()
+            .any(|a| a == "--permission-mode" || a == "bypassPermissions"));
         assert!(args.iter().any(|a| a == "--output-format"));
+        Ok(())
+    }
+
+    #[test]
+    fn claude_permission_bypass_requires_explicit_env_opt_in() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().unwrap();
+        let previous = env::var_os(CLAUDE_BYPASS_PERMISSIONS_ENV);
+        env::set_var(CLAUDE_BYPASS_PERMISSIONS_ENV, "1");
+
+        let (_, args) =
+            command_parts_for_harness("claude", "hello", HarnessLaunchMode::Interactive)?;
+
+        restore_claude_bypass_env(previous);
+        assert_eq!(&args[..2], &["--permission-mode", "bypassPermissions"]);
         Ok(())
     }
 
