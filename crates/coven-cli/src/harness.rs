@@ -659,6 +659,31 @@ mod tests {
         }
     }
 
+    struct EnvVarGuard {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = env::var_os(name);
+            env::set_var(name, value);
+            Self { name, previous }
+        }
+
+        fn remove(name: &'static str) -> Self {
+            let previous = env::var_os(name);
+            env::remove_var(name);
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            restore_env_var(self.name, self.previous.clone());
+        }
+    }
+
     #[test]
     fn executable_exists_in_paths_finds_matching_file() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
@@ -954,25 +979,14 @@ mod tests {
         fs::write(xdg_adapters.join("xdg.json"), r#"{ "adapters": [] }"#)?;
 
         let _guard = env_lock().lock().unwrap();
-        let previous_manifest = env::var_os(EXTERNAL_ADAPTER_MANIFEST_ENV);
-        let previous_dirs = env::var_os(EXTERNAL_ADAPTER_DIRS_ENV);
-        let previous_coven_home = env::var_os("COVEN_HOME");
-        let previous_home = env::var_os("HOME");
-        let previous_xdg_config_home = env::var_os("XDG_CONFIG_HOME");
-
-        env::remove_var(EXTERNAL_ADAPTER_MANIFEST_ENV);
-        env::remove_var(EXTERNAL_ADAPTER_DIRS_ENV);
-        env::set_var("COVEN_HOME", temp_dir.path().join("coven-home"));
-        env::set_var("HOME", temp_dir.path().join("home"));
-        env::set_var("XDG_CONFIG_HOME", temp_dir.path().join("config"));
+        let _manifest_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_MANIFEST_ENV);
+        let _dirs_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_DIRS_ENV);
+        let _coven_home_guard = EnvVarGuard::set("COVEN_HOME", temp_dir.path().join("coven-home"));
+        let _home_guard = EnvVarGuard::set("HOME", temp_dir.path().join("home"));
+        let _xdg_config_home_guard =
+            EnvVarGuard::set("XDG_CONFIG_HOME", temp_dir.path().join("config"));
 
         let specs = configured_harness_specs()?;
-
-        restore_adapter_manifest_env(previous_manifest);
-        restore_adapter_dirs_env(previous_dirs);
-        restore_env_var("COVEN_HOME", previous_coven_home);
-        restore_env_var("HOME", previous_home);
-        restore_env_var("XDG_CONFIG_HOME", previous_xdg_config_home);
 
         assert!(!specs.iter().any(|spec| spec.id == "evilsh"));
         Ok(())
