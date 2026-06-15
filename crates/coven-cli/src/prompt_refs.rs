@@ -69,6 +69,9 @@ pub fn expand_path(cwd: &Path, raw: &str) -> Result<String> {
     if !full.exists() {
         return Ok(format!("[missing @{raw}]"));
     }
+    let Some(full) = resolve_path_inside(cwd, &full) else {
+        return Ok(format!("[missing @{raw}]"));
+    };
     let mime = guess_mime(&full);
     if mime.starts_with("image/") {
         let bytes = std::fs::metadata(&full)?.len();
@@ -170,17 +173,29 @@ fn walkdir(root: &Path) -> Vec<PathBuf> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
                 if path.file_name().and_then(|s| s.to_str()) == Some(".git") {
                     continue;
                 }
                 stack.push(path);
-            } else {
+            } else if meta.is_file() {
                 out.push(path);
             }
         }
     }
     out
+}
+
+fn resolve_path_inside(root: &Path, candidate: &Path) -> Option<PathBuf> {
+    let root = std::fs::canonicalize(root).ok()?;
+    let candidate = std::fs::canonicalize(candidate).ok()?;
+    candidate.starts_with(&root).then_some(candidate)
 }
 
 /// Expand every `@path`, `@T-<id>`, and `@@search` ref found in `prompt`.
@@ -297,6 +312,28 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let expanded = expand_path(temp.path(), "nope.md").unwrap();
         assert_eq!(expanded, "[missing @nope.md]");
+    }
+
+    #[test]
+    fn expand_path_rejects_parent_traversal_outside_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = temp.path().join("outside.txt");
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&outside, "SECRET").unwrap();
+        let expanded = expand_path(&root, "../outside.txt").unwrap();
+        assert_eq!(expanded, "[missing @../outside.txt]");
+    }
+
+    #[test]
+    fn expand_path_rejects_absolute_path_outside_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = temp.path().join("outside.txt");
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&outside, "SECRET").unwrap();
+        let expanded = expand_path(&root, outside.to_str().unwrap()).unwrap();
+        assert!(expanded.starts_with("[missing @"));
     }
 
     #[test]
