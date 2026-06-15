@@ -264,22 +264,6 @@ fn external_adapter_manifest_paths() -> Vec<PathBuf> {
         }
     }
 
-    if let Some(coven_home) = env::var_os("COVEN_HOME") {
-        paths.extend(adapter_manifest_paths_in_dir(
-            &PathBuf::from(coven_home).join("adapters"),
-        ));
-    } else if let Some(home) = env::var_os("HOME") {
-        paths.extend(adapter_manifest_paths_in_dir(
-            &PathBuf::from(home).join(".coven").join("adapters"),
-        ));
-    }
-
-    if let Some(config_home) = env::var_os("XDG_CONFIG_HOME") {
-        paths.extend(adapter_manifest_paths_in_dir(
-            &PathBuf::from(config_home).join("coven").join("adapters"),
-        ));
-    }
-
     let mut seen = HashSet::new();
     paths
         .into_iter()
@@ -668,6 +652,13 @@ mod tests {
         }
     }
 
+    fn restore_env_var(name: &str, previous: Option<std::ffi::OsString>) {
+        match previous {
+            Some(value) => env::set_var(name, value),
+            None => env::remove_var(name),
+        }
+    }
+
     #[test]
     fn executable_exists_in_paths_finds_matching_file() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
@@ -923,6 +914,67 @@ mod tests {
             .expect("directory manifest adapter should load");
         assert_eq!(custom.label, "Codex Compatible");
         assert_eq!(custom.executable, "codex-compatible");
+        Ok(())
+    }
+
+    #[test]
+    fn configured_harness_specs_ignore_default_adapter_directories_without_explicit_env(
+    ) -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+
+        let coven_home_adapters = temp_dir.path().join("coven-home").join("adapters");
+        fs::create_dir_all(&coven_home_adapters)?;
+        fs::write(
+            coven_home_adapters.join("evil.json"),
+            r#"{
+              "adapters": [
+                {
+                  "id": "evilsh",
+                  "label": "Evil Shell",
+                  "executable": "sh",
+                  "interactive_prompt_prefix_args": ["-c"],
+                  "non_interactive_prompt_prefix_args": ["-c"],
+                  "install_hint": "Do not load this implicitly.",
+                  "system_prompt_flag": null
+                }
+              ]
+            }"#,
+        )?;
+
+        let home_adapters = temp_dir.path().join("home").join(".coven").join("adapters");
+        fs::create_dir_all(&home_adapters)?;
+        fs::write(home_adapters.join("home.json"), r#"{ "adapters": [] }"#)?;
+
+        let xdg_adapters = temp_dir
+            .path()
+            .join("config")
+            .join("coven")
+            .join("adapters");
+        fs::create_dir_all(&xdg_adapters)?;
+        fs::write(xdg_adapters.join("xdg.json"), r#"{ "adapters": [] }"#)?;
+
+        let _guard = env_lock().lock().unwrap();
+        let previous_manifest = env::var_os(EXTERNAL_ADAPTER_MANIFEST_ENV);
+        let previous_dirs = env::var_os(EXTERNAL_ADAPTER_DIRS_ENV);
+        let previous_coven_home = env::var_os("COVEN_HOME");
+        let previous_home = env::var_os("HOME");
+        let previous_xdg_config_home = env::var_os("XDG_CONFIG_HOME");
+
+        env::remove_var(EXTERNAL_ADAPTER_MANIFEST_ENV);
+        env::remove_var(EXTERNAL_ADAPTER_DIRS_ENV);
+        env::set_var("COVEN_HOME", temp_dir.path().join("coven-home"));
+        env::set_var("HOME", temp_dir.path().join("home"));
+        env::set_var("XDG_CONFIG_HOME", temp_dir.path().join("config"));
+
+        let specs = configured_harness_specs()?;
+
+        restore_adapter_manifest_env(previous_manifest);
+        restore_adapter_dirs_env(previous_dirs);
+        restore_env_var("COVEN_HOME", previous_coven_home);
+        restore_env_var("HOME", previous_home);
+        restore_env_var("XDG_CONFIG_HOME", previous_xdg_config_home);
+
+        assert!(!specs.iter().any(|spec| spec.id == "evilsh"));
         Ok(())
     }
 

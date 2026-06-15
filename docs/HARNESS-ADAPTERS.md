@@ -68,7 +68,7 @@ export COVEN_HARNESS_ADAPTER_DIRS="$HOME/.coven/adapters:$HOME/.config/coven/ada
 coven adapter list --json
 ```
 
-Without env vars, Coven also checks `COVEN_HOME/adapters/*.json` when `COVEN_HOME` is set, then `~/.coven/adapters/*.json`, and finally `$XDG_CONFIG_HOME/coven/adapters/*.json`.
+Coven does not auto-discover adapter manifests from `COVEN_HOME`, `~/.coven`, or `$XDG_CONFIG_HOME`. External manifests are trusted code-launch configuration, so operators must opt in with `COVEN_HARNESS_ADAPTER_MANIFEST` or `COVEN_HARNESS_ADAPTER_DIRS`.
 
 The prompt is appended as the final command argument after the configured prefix args. Adapter ids must be lowercase and must not collide with built-in ids. Executables are names only, not shell strings or paths.
 
