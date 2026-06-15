@@ -1,7 +1,8 @@
 # Familiar Identity Model Design
 
 Date: 2026-06-15
-Status: Draft architecture canon
+Status: Draft
+Canonicality: Proposed
 Owner: OpenCoven / Coven daemon
 Source: Valentina's "OpenCoven Should Not Treat Identity As Configuration" research report
 

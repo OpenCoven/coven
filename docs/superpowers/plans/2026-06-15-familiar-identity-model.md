@@ -49,7 +49,7 @@ Create `schemas/familiar/coven.familiar.v1.schema.json`:
     "schema_version": { "const": "coven.familiar.v1" },
     "id": {
       "type": "string",
-      "pattern": "^[a-z][a-z0-9-]{1,63}$"
+      "pattern": "^[a-z][a-z0-9-]{0,63}$"
     },
     "display_name": {
       "type": "string",
@@ -198,6 +198,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct FamiliarManifest {
     pub schema_version: String,
     pub id: String,
@@ -208,6 +209,7 @@ pub struct FamiliarManifest {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct FamiliarIdentity {
     pub purpose: String,
     pub roles: Vec<String>,
@@ -216,6 +218,7 @@ pub struct FamiliarIdentity {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct FamiliarSkills {
     #[serde(default)]
     pub required: Vec<String>,
@@ -226,9 +229,13 @@ pub struct FamiliarSkills {
 impl FamiliarManifest {
     pub fn from_yaml(source: &str) -> Result<Self> {
         let manifest: Self = serde_yaml::from_str(source).context("failed to parse familiar manifest YAML")?;
-        anyhow::ensure!(manifest.schema_version == "coven.familiar.v1", "unsupported familiar schema version");
+        anyhow::ensure!(
+            manifest.schema_version == "coven.familiar.v1",
+            "unsupported familiar schema version: expected \"coven.familiar.v1\", found \"{}\"",
+            manifest.schema_version
+        );
         anyhow::ensure!(!manifest.id.trim().is_empty(), "familiar id is required");
-        anyhow::ensure!(!manifest.identity.roles.is_empty(), "familiar roles are required");
+        anyhow::ensure!(!manifest.identity.roles.is_empty(), "familiar roles are required: at least one role must be declared");
         Ok(manifest)
     }
 }
@@ -311,6 +318,7 @@ Create `crates/coven-cli/src/familiar_identity/effective.rs`:
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct EffectiveFamiliar {
     pub schema_version: String,
     pub id: String,
@@ -322,6 +330,7 @@ pub struct EffectiveFamiliar {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct EffectiveFamiliarProvenance {
     pub manifest_path: Option<String>,
     pub resolved_from: Vec<String>,
@@ -462,7 +471,7 @@ fn effective_familiar_converts_to_launch_context() {
 - [ ] **Step 3: Run targeted tests**
 
 ```bash
-cargo test -p coven-cli harness:: effective_familiar_converts_to_launch_context
+cargo test -p coven-cli harness::effective_familiar_converts_to_launch_context
 ```
 
 If Cargo rejects multiple filters, run:
@@ -499,9 +508,9 @@ Expected JSON contains:
 
 ```json
 {
-  "schema_version": "coven.effective_familiar.v1",
+  "schemaVersion": "coven.effective_familiar.v1",
   "id": "nova",
-  "display_name": "Nova"
+  "displayName": "Nova"
 }
 ```
 
