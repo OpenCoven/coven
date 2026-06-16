@@ -1,10 +1,18 @@
 name: Dependabot auto-merge
 
-# Auto-merge Dependabot pull requests that resolve a security advisory.
+# Auto-merge low-risk Dependabot version bumps.
 #
-# Scope: security updates ONLY. The merge step is gated on the `ghsa-id`
-# metadata output, which is non-empty only when the PR addresses a Dependabot
-# security alert. Routine version-update PRs are left for manual review.
+# Scope: semver patch + minor updates. Dependabot ships security fixes as
+# patch/minor bumps, so this reliably covers them; major-version bumps are left
+# for manual review. Gating uses the `update-type` metadata output, which works
+# with the default GITHUB_TOKEN.
+#
+# Why not gate on `ghsa-id` (true security-only): the `ghsa-id`/`alert-state`
+# outputs are populated only when `alert-lookup: true` AND `github-token` is a
+# PAT or GitHub App token with "Dependabot alerts: read" — the default
+# GITHUB_TOKEN cannot read alerts, so that gate would silently never fire. If
+# such a token is provisioned later, switch to alert-lookup for precise
+# security-only scope.
 #
 # `pull_request_target` runs in the base-repo context so the GITHUB_TOKEN can
 # enable auto-merge (Dependabot PRs get a read-only token under `pull_request`).
@@ -28,10 +36,10 @@ jobs:
     steps:
       - name: Fetch Dependabot metadata
         id: meta
-        uses: dependabot/fetch-metadata@v2
+        uses: dependabot/fetch-metadata@v3
 
-      - name: Enable auto-merge for security updates
-        if: ${{ steps.meta.outputs.ghsa-id != '' }}
+      - name: Enable auto-merge for patch and minor updates
+        if: ${{ steps.meta.outputs.update-type == 'version-update:semver-patch' || steps.meta.outputs.update-type == 'version-update:semver-minor' }}
         run: gh pr merge --auto --squash "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
