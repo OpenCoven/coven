@@ -31,10 +31,11 @@ jobs:
         uses: dependabot/fetch-metadata@v2
 
       - name: Enable auto-merge for security updates
-        # TEMPORARY (verification only): the `|| ... number == 238` clause lets the
-        # regex bump PR #238 exercise the full merge path so we can confirm
-        # auto-merge engages and CI-gates. Revert to the bare `ghsa-id` gate after.
-        if: ${{ steps.meta.outputs.ghsa-id != '' || github.event.pull_request.number == 238 }}
+        # TEMPORARY (verification only): the `|| head_ref == regex…` clause lets the
+        # regex bump PR exercise the full merge path so we can confirm auto-merge
+        # engages and CI-gates. Matched by branch name so it survives a Dependabot
+        # `recreate` (new PR number, same branch). Revert to the bare gate after.
+        if: ${{ steps.meta.outputs.ghsa-id != '' || github.head_ref == 'dependabot/cargo/regex-1.12.4' }}
         run: gh pr merge --auto --squash "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
