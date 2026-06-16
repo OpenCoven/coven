@@ -1,3 +1,12 @@
+---
+title: "Coven runtime architecture"
+summary: "How Coven's Rust daemon, CLI, TUI, comux cockpit, and OpenClaw plugin compose around the local socket API, PTY adapters, and the event store."
+read_when:
+  - Understanding Coven's runtime topology
+  - Designing a client around the local socket API
+description: "Coven runtime topology: the Rust daemon, CLI, TUI, comux, and OpenClaw composed around the local socket API, PTY adapters, and the event store."
+---
+
 # Coven Architecture
 
 Coven is a local-first harness substrate. The Rust CLI/daemon is the authority layer; clients such as the CLI TUI, comux, and the optional OpenClaw plugin are presentation/integration layers.
