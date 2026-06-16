@@ -677,6 +677,8 @@ fn run_doctor() -> Result<()> {
         }
     }
 
+    print_familiars_section(&home);
+
     println!("\nNext steps:");
     if let Some(default) = default_harness_id() {
         println!("  coven run {default} \"explain this repo in 5 bullets\"");
@@ -685,6 +687,50 @@ fn run_doctor() -> Result<()> {
         println!("  Install or authenticate Codex/Claude Code, then run `coven doctor` again.");
     }
     Ok(())
+}
+
+/// Surface the configured familiars so operators can confirm which identities
+/// `coven run --familiar <id>` will resolve, and how fresh each one's memory is.
+/// Identity is the product's spine, so doctor should make it as visible as the
+/// daemon and harness state — without claiming anything the manifest doesn't say.
+fn print_familiars_section(home: &Path) {
+    let manifest = home.join("familiars.toml");
+    let familiars = match cockpit_sources::read_familiars(home) {
+        Ok(familiars) => familiars,
+        Err(err) => {
+            println!("\nFamiliars:");
+            println!("  !! could not read {}: {err:#}", manifest.display());
+            return;
+        }
+    };
+
+    if familiars.is_empty() {
+        println!("\nFamiliars:");
+        println!("  none configured ({})", manifest.display());
+        println!(
+            "  Declare [[familiar]] entries there, then run with \
+             `coven run <harness> --familiar <id> \"...\"`."
+        );
+        return;
+    }
+
+    println!("\nFamiliars ({}):", manifest.display());
+    let id_width = familiars
+        .iter()
+        .map(|familiar| familiar.id.len())
+        .max()
+        .unwrap_or(0);
+    for familiar in &familiars {
+        let role = if familiar.role.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", familiar.role)
+        };
+        println!(
+            "  {:<id_width$} {}{}  (memory: {})",
+            familiar.id, familiar.display_name, role, familiar.memory_freshness
+        );
+    }
 }
 
 fn run_adapter_command(command: AdapterCommand) -> Result<()> {

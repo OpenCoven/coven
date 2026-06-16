@@ -236,6 +236,53 @@ fn daemon_start_cleans_up_unreachable_duplicate_daemons() -> anyhow::Result<()> 
 }
 
 #[test]
+fn doctor_lists_configured_familiars() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    fs::create_dir_all(&coven_home)?;
+    fs::write(
+        coven_home.join("familiars.toml"),
+        r#"
+[[familiar]]
+id = "charm"
+display_name = "Charm"
+role = "Voice, Social, and Presence Familiar"
+description = "Keeps the coven sociable."
+"#,
+    )?;
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let coven = coven_bin();
+
+    let output = run_coven(&coven, &coven_home, &path, &["doctor"])?;
+
+    assert_success("doctor with familiars", &output);
+    assert_stdout_contains("doctor with familiars", &output, "Familiars (");
+    assert_stdout_contains("doctor with familiars", &output, "charm");
+    assert_stdout_contains(
+        "doctor with familiars",
+        &output,
+        "Voice, Social, and Presence Familiar",
+    );
+    Ok(())
+}
+
+#[test]
+fn doctor_reports_no_familiars_when_manifest_absent() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    fs::create_dir_all(&coven_home)?;
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let coven = coven_bin();
+
+    let output = run_coven(&coven, &coven_home, &path, &["doctor"])?;
+
+    assert_success("doctor without familiars", &output);
+    assert_stdout_contains("doctor without familiars", &output, "none configured");
+    assert_stdout_contains("doctor without familiars", &output, "familiars.toml");
+    Ok(())
+}
+
+#[test]
 fn doctor_reports_live_daemon_socket_status() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let coven_home = temp_dir.path().join("coven-home");
