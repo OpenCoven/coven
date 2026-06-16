@@ -4480,9 +4480,9 @@ dependencies = [
 
 [[package]]
 name = "turbovec"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "499c587338ef613f0a19e633f6aa63fe42d7003c44886889b934841846c4d552"
+checksum = "0715a5a1365e86d0ae6396fa0c011f319b8e8024b3896cd16e6468e29ed3a325"
 dependencies = [
  "faer",
  "ndarray",
