@@ -129,3 +129,17 @@ fn hex_hash(s: &str) -> String {
     // lowercase hex, so existing chunk hashes stay stable.
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::hex_hash;
+
+    #[test]
+    fn hex_hash_matches_known_sha256() {
+        assert_eq!(
+            hex_hash("hello"),
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+        assert_eq!(hex_hash("hello").len(), 64);
+    }
+}

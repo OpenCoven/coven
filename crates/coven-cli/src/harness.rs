@@ -936,7 +936,8 @@ mod tests {
     #[test]
     fn executable_exists_in_paths_finds_matching_file() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
-        let executable = temp_dir.path().join("codex");
+        let executable_name = if cfg!(windows) { "codex.exe" } else { "codex" };
+        let executable = temp_dir.path().join(executable_name);
         fs::write(&executable, "")?;
         make_executable(&executable)?;
 
