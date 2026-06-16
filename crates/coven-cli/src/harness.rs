@@ -100,6 +100,61 @@ pub struct HarnessCommandSpec {
     /// for Claude). `None` means the harness has no such flag and identity
     /// should be injected by prepending a preamble to the prompt instead.
     pub system_prompt_flag: Option<String>,
+    /// CLI flag name to select a model (e.g. `Some("--model")` for both Codex and
+    /// Claude). When set, `coven run --model <ID>` forwards `[flag, <model>]`.
+    /// `None` (and no `model_arg_template`) means the harness declares no model
+    /// mechanism, so `--model` is a no-op for it (warn, don't error).
+    pub model_flag: Option<String>,
+    /// Optional argv template for harnesses whose model selection isn't a simple
+    /// `--flag <value>` pair (e.g. Codex's `-c model=<value>`). The template is
+    /// split on whitespace into argv tokens and the `{model}` placeholder is
+    /// substituted in each token (no shell quoting). Takes precedence over
+    /// `model_flag` when both are set.
+    pub model_arg_template: Option<String>,
+}
+
+impl HarnessCommandSpec {
+    /// Whether this harness declares any way to take a model selection.
+    /// Adapters that declare none make `coven run --model` a warned no-op.
+    pub fn supports_model(&self) -> bool {
+        self.model_flag.is_some() || self.model_arg_template.is_some()
+    }
+
+    /// Translate a requested model id into argv tokens for this harness,
+    /// stripping the `provider/` namespace first. Returns an empty vec when the
+    /// harness declares no model mechanism (caller decides whether to warn).
+    pub fn model_args(&self, model: &str) -> Vec<String> {
+        let normalized = normalize_model_id(model);
+        if let Some(template) = self.model_arg_template.as_deref() {
+            return expand_model_template(template, normalized);
+        }
+        if let Some(flag) = self.model_flag.as_deref() {
+            return vec![flag.to_string(), normalized.to_string()];
+        }
+        Vec::new()
+    }
+}
+
+/// Strip a leading `provider/` namespace from a model id. Cave stores and sends
+/// namespaced ids (e.g. `openai/gpt-5.5`, `anthropic/claude-…`), but the harness
+/// CLIs (`codex --model`, `claude --model`) expect the bare model id. Coven
+/// strips the first `provider/` segment before forwarding; a bare id with no
+/// slash passes through unchanged. This is the documented contract Cave matches.
+pub fn normalize_model_id(model: &str) -> &str {
+    match model.split_once('/') {
+        Some((provider, rest)) if !provider.is_empty() && !rest.is_empty() => rest,
+        _ => model,
+    }
+}
+
+/// Expand a `model_arg_template` into argv tokens: split on whitespace, then
+/// substitute every `{model}` placeholder with `model` in each token. No shell
+/// quote interpretation — each whitespace-separated token becomes one argv entry.
+fn expand_model_template(template: &str, model: &str) -> Vec<String> {
+    template
+        .split_whitespace()
+        .map(|token| token.replace("{model}", model))
+        .collect()
 }
 
 impl HarnessCommandSpec {
@@ -194,6 +249,11 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
             // Codex has no --system-prompt flag; identity is injected as a
             // bracketed preamble prepended to the prompt.
             system_prompt_flag: None,
+            // `codex --model <MODEL>` selects the model. (`-c model="<MODEL>"`
+            // is the equivalent override form, available via model_arg_template
+            // for adapters that prefer it.)
+            model_flag: Some("--model".to_string()),
+            model_arg_template: None,
         },
         HarnessCommandSpec {
             id: "claude".to_string(),
@@ -205,6 +265,9 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
             source: "bundled".to_string(),
             manifest_path: None,
             system_prompt_flag: Some("--system-prompt".to_string()),
+            // `claude --model <model>` accepts an alias or full model id.
+            model_flag: Some("--model".to_string()),
+            model_arg_template: None,
         },
     ]
 }
@@ -322,6 +385,14 @@ struct ExternalHarnessAdapterSpec {
     install_hint: String,
     #[serde(default, alias = "systemPromptFlag")]
     system_prompt_flag: Option<String>,
+    /// How this adapter takes a model selection. Declare `model_flag` for a
+    /// simple `--flag <value>` pair, or `model_arg_template` for anything else
+    /// (e.g. `"-c model={model}"`). Omit both and `coven run --model` is a
+    /// warned no-op for this adapter rather than an error.
+    #[serde(default, alias = "modelFlag")]
+    model_flag: Option<String>,
+    #[serde(default, alias = "modelArgTemplate")]
+    model_arg_template: Option<String>,
 }
 
 impl ExternalHarnessAdapterSpec {
@@ -381,6 +452,14 @@ impl ExternalHarnessAdapterSpec {
                 .system_prompt_flag
                 .map(|flag| flag.trim().to_string())
                 .filter(|flag| !flag.is_empty()),
+            model_flag: self
+                .model_flag
+                .map(|flag| flag.trim().to_string())
+                .filter(|flag| !flag.is_empty()),
+            model_arg_template: self
+                .model_arg_template
+                .map(|tmpl| tmpl.trim().to_string())
+                .filter(|tmpl| !tmpl.is_empty()),
         })
     }
 }
@@ -399,7 +478,7 @@ pub fn command_parts_for_harness(
     prompt: &str,
     mode: HarnessLaunchMode,
 ) -> Result<(String, Vec<String>)> {
-    command_parts_for_harness_with_conversation(harness_id, prompt, mode, None, None)
+    command_parts_for_harness_with_conversation(harness_id, prompt, mode, None, None, None)
 }
 
 /// Claude Code prompts before running tool calls that aren't pre-allowlisted.
@@ -456,12 +535,21 @@ pub fn command_parts_for_harness_with_conversation(
     mode: HarnessLaunchMode,
     hint: Option<&ConversationHint>,
     familiar: Option<&FamiliarContext>,
+    model: Option<&str>,
 ) -> Result<(String, Vec<String>)> {
     let spec = configured_harness_specs()?
         .into_iter()
         .find(|spec| spec.id == harness_id)
         .ok_or_else(|| anyhow!("unsupported harness `{harness_id}`"))?;
     let program = spawn_executable_for_platform(&spec.executable);
+
+    // Model selection forwards to the harness's native flag as a normal option
+    // ahead of the prompt positional. Adapters that declare no model mechanism
+    // yield no args (the run layer warns); a blank/missing model is a no-op.
+    let model_args: Vec<String> = match model.map(str::trim) {
+        Some(m) if !m.is_empty() => spec.model_args(m),
+        _ => Vec::new(),
+    };
 
     // Resolve effective prompt: inject familiar identity preamble when present.
     // Harnesses with a dedicated --system-prompt flag get identity there instead,
@@ -486,7 +574,10 @@ pub fn command_parts_for_harness_with_conversation(
             }
             return Ok((
                 program,
-                with_claude_permission_flags(harness_id, sanitize_argv_for_platform(args)),
+                with_claude_permission_flags(
+                    harness_id,
+                    sanitize_argv_for_platform(prepend_model_args(&model_args, args)),
+                ),
             ));
         }
         // Harness doesn't support stream: fall through to non-interactive.
@@ -494,9 +585,10 @@ pub fn command_parts_for_harness_with_conversation(
             program,
             with_claude_permission_flags(
                 harness_id,
-                sanitize_argv_for_platform(
+                sanitize_argv_for_platform(prepend_model_args(
+                    &model_args,
                     spec.prompt_args(&effective_prompt, HarnessLaunchMode::NonInteractive),
-                ),
+                )),
             ),
         ));
     }
@@ -508,15 +600,13 @@ pub fn command_parts_for_harness_with_conversation(
                 args.insert(0, f.identity_preamble());
                 args.insert(0, flag.to_string());
             }
-            return Ok((
-                program,
-                with_claude_permission_flags(
-                    harness_id,
-                    args.into_iter()
-                        .chain(std::iter::once(effective_prompt))
-                        .collect(),
-                ),
-            ));
+            let args = prepend_model_args(
+                &model_args,
+                args.into_iter()
+                    .chain(std::iter::once(effective_prompt))
+                    .collect(),
+            );
+            return Ok((program, with_claude_permission_flags(harness_id, args)));
         }
     }
 
@@ -529,8 +619,24 @@ pub fn command_parts_for_harness_with_conversation(
     }
     Ok((
         program,
-        with_claude_permission_flags(harness_id, sanitize_argv_for_platform(args)),
+        with_claude_permission_flags(
+            harness_id,
+            sanitize_argv_for_platform(prepend_model_args(&model_args, args)),
+        ),
     ))
+}
+
+/// Prepend resolved model argv tokens ahead of `args` (which ends with the
+/// prompt positional). Keeps `--model` parsing before the prompt, matching how
+/// Cave emits the flag.
+fn prepend_model_args(model_args: &[String], args: Vec<String>) -> Vec<String> {
+    if model_args.is_empty() {
+        return args;
+    }
+    let mut out = Vec::with_capacity(model_args.len() + args.len());
+    out.extend_from_slice(model_args);
+    out.extend(args);
+    out
 }
 
 /// Per-harness translation of stream-mode launch into CLI args. Stream-mode
@@ -985,6 +1091,8 @@ mod tests {
             source: "manifest".to_string(),
             manifest_path: None,
             system_prompt_flag: None,
+            model_flag: None,
+            model_arg_template: None,
         };
 
         assert_eq!(
@@ -1215,6 +1323,7 @@ mod tests {
             HarnessLaunchMode::NonInteractive,
             Some(&hint),
             None,
+            None,
         )?;
         assert_eq!(
             parts,
@@ -1241,6 +1350,7 @@ mod tests {
             "follow up",
             HarnessLaunchMode::NonInteractive,
             Some(&hint),
+            None,
             None,
         )?;
         assert_eq!(
@@ -1269,6 +1379,7 @@ mod tests {
             HarnessLaunchMode::Interactive,
             Some(&hint),
             None,
+            None,
         );
         assert_eq!(
             parts.unwrap(),
@@ -1288,6 +1399,7 @@ mod tests {
             "fix tests",
             HarnessLaunchMode::NonInteractive,
             Some(&hint),
+            None,
             None,
         )?;
         assert_eq!(
@@ -1317,6 +1429,7 @@ mod tests {
             HarnessLaunchMode::NonInteractive,
             Some(&hint),
             None,
+            None,
         )?;
         assert_eq!(
             parts,
@@ -1342,6 +1455,7 @@ mod tests {
             "claude",
             "hello",
             HarnessLaunchMode::Stream,
+            None,
             None,
             None,
         )?;
@@ -1395,11 +1509,220 @@ mod tests {
     }
 
     #[test]
+    fn normalize_model_id_strips_provider_prefix() {
+        assert_eq!(normalize_model_id("openai/gpt-5.5"), "gpt-5.5");
+        assert_eq!(
+            normalize_model_id("anthropic/claude-sonnet-4"),
+            "claude-sonnet-4"
+        );
+        // Bare ids pass through unchanged.
+        assert_eq!(normalize_model_id("gpt-5.5"), "gpt-5.5");
+        assert_eq!(normalize_model_id("sonnet"), "sonnet");
+        // Only the first segment is treated as the provider namespace.
+        assert_eq!(normalize_model_id("a/b/c"), "b/c");
+        // Degenerate leading/trailing slash is left as-is rather than emptied.
+        assert_eq!(normalize_model_id("/gpt"), "/gpt");
+        assert_eq!(normalize_model_id("gpt/"), "gpt/");
+    }
+
+    #[test]
+    fn built_in_harnesses_declare_a_model_flag() {
+        for id in ["codex", "claude"] {
+            let spec = built_in_harness_specs()
+                .into_iter()
+                .find(|s| s.id == id)
+                .unwrap();
+            assert!(spec.supports_model(), "{id} should support --model");
+            assert_eq!(
+                spec.model_args("anything"),
+                vec!["--model".to_string(), "anything".to_string()]
+            );
+        }
+    }
+
+    #[test]
+    fn codex_forwards_model_before_prompt_with_prefix_stripped() -> anyhow::Result<()> {
+        let (program, args) = command_parts_for_harness_with_conversation(
+            "codex",
+            "fix tests",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            None,
+            Some("openai/gpt-5.5"),
+        )?;
+        assert_eq!(program, "codex");
+        assert_eq!(
+            args,
+            vec![
+                "--model".to_string(),
+                "gpt-5.5".to_string(),
+                "exec".to_string(),
+                "--skip-git-repo-check".to_string(),
+                "--color".to_string(),
+                "never".to_string(),
+                "fix tests".to_string(),
+            ]
+        );
+        // The model flag/value sit ahead of the trailing prompt positional.
+        let model_pos = args.iter().position(|a| a == "--model").unwrap();
+        let prompt_pos = args.iter().position(|a| a == "fix tests").unwrap();
+        assert!(model_pos < prompt_pos);
+        Ok(())
+    }
+
+    #[test]
+    fn claude_forwards_model_with_prefix_stripped() -> anyhow::Result<()> {
+        let (_, args) = command_parts_for_harness_with_conversation(
+            "claude",
+            "hi",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            None,
+            Some("anthropic/claude-sonnet-4"),
+        )?;
+        assert_eq!(
+            args,
+            vec![
+                "--model".to_string(),
+                "claude-sonnet-4".to_string(),
+                "--print".to_string(),
+                "hi".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn no_model_leaves_args_unchanged() -> anyhow::Result<()> {
+        let with_model = command_parts_for_harness_with_conversation(
+            "codex",
+            "fix tests",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            None,
+            None,
+        )?;
+        let blank_model = command_parts_for_harness_with_conversation(
+            "codex",
+            "fix tests",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            None,
+            Some("   "),
+        )?;
+        let legacy =
+            command_parts_for_harness("codex", "fix tests", HarnessLaunchMode::NonInteractive)?;
+        assert_eq!(with_model, legacy);
+        assert_eq!(blank_model, legacy, "a blank model is a no-op");
+        Ok(())
+    }
+
+    #[test]
+    fn external_adapter_model_arg_template_expands_placeholder() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let manifest = temp_dir.path().join("adapters.json");
+        fs::write(
+            &manifest,
+            r#"{
+              "adapters": [
+                {
+                  "id": "templated",
+                  "label": "Templated Adapter",
+                  "executable": "templated",
+                  "interactive_prompt_prefix_args": [],
+                  "non_interactive_prompt_prefix_args": ["run"],
+                  "install_hint": "Install the templated adapter and put it on PATH.",
+                  "model_arg_template": "-c model={model}"
+                }
+              ]
+            }"#,
+        )?;
+
+        let _guard = env_lock().lock().unwrap();
+        let previous = env::var_os(EXTERNAL_ADAPTER_MANIFEST_ENV);
+        env::set_var(EXTERNAL_ADAPTER_MANIFEST_ENV, &manifest);
+        let parts = command_parts_for_harness_with_conversation(
+            "templated",
+            "do it",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            None,
+            Some("openai/gpt-5.5"),
+        );
+        restore_adapter_manifest_env(previous);
+
+        assert_eq!(
+            parts?,
+            (
+                "templated".to_string(),
+                vec![
+                    "-c".to_string(),
+                    "model=gpt-5.5".to_string(),
+                    "run".to_string(),
+                    "do it".to_string(),
+                ]
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn external_adapter_without_model_mechanism_is_a_noop() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let manifest = temp_dir.path().join("adapters.json");
+        fs::write(
+            &manifest,
+            r#"{
+              "adapters": [
+                {
+                  "id": "plainadapter",
+                  "label": "Plain Adapter",
+                  "executable": "plainadapter",
+                  "interactive_prompt_prefix_args": [],
+                  "non_interactive_prompt_prefix_args": ["run"],
+                  "install_hint": "Install the plain adapter and put it on PATH."
+                }
+              ]
+            }"#,
+        )?;
+
+        let _guard = env_lock().lock().unwrap();
+        let previous = env::var_os(EXTERNAL_ADAPTER_MANIFEST_ENV);
+        env::set_var(EXTERNAL_ADAPTER_MANIFEST_ENV, &manifest);
+        let spec = configured_harness_specs()?
+            .into_iter()
+            .find(|s| s.id == "plainadapter")
+            .expect("adapter should load");
+        // Passing a model must NOT inject any args (the run layer warns instead).
+        let parts = command_parts_for_harness_with_conversation(
+            "plainadapter",
+            "do it",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            None,
+            Some("openai/gpt-5.5"),
+        );
+        restore_adapter_manifest_env(previous);
+
+        assert!(!spec.supports_model());
+        assert!(spec.model_args("openai/gpt-5.5").is_empty());
+        assert_eq!(
+            parts?,
+            (
+                "plainadapter".to_string(),
+                vec!["run".to_string(), "do it".to_string()]
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
     fn none_hint_matches_legacy_command_parts() -> anyhow::Result<()> {
         let with_none = command_parts_for_harness_with_conversation(
             "claude",
             "hello",
             HarnessLaunchMode::NonInteractive,
+            None,
             None,
             None,
         )?;

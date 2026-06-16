@@ -31,6 +31,11 @@ pub struct System {
     pub session_id: String,
     pub tools: Vec<String>,
     pub agent_mode: Option<String>,
+    /// The model the session was launched on, echoed back so clients (Cave) can
+    /// confirm acceptance and render `applied` vs `pending`. Carries the id
+    /// exactly as requested on `coven run --model` (namespaced form preserved,
+    /// e.g. `anthropic/claude-…`); `None` when no `--model` was passed.
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -174,6 +179,7 @@ mod tests {
             session_id: "s1".into(),
             tools: vec!["bash".into(), "read_file".into()],
             agent_mode: Some("plan".into()),
+            model: Some("anthropic/claude-sonnet-4".into()),
         });
         let mut buf = Vec::new();
         emit_event(&mut buf, &event).unwrap();
@@ -184,6 +190,7 @@ mod tests {
         assert_eq!(v["cwd"], "/Users/example/project");
         assert_eq!(v["tools"][0], "bash");
         assert_eq!(v["agent_mode"], "plan");
+        assert_eq!(v["model"], "anthropic/claude-sonnet-4");
     }
 
     #[test]
@@ -284,6 +291,7 @@ mod tests {
                 session_id: "s1".into(),
                 tools: vec![],
                 agent_mode: None,
+                model: None,
             }),
         )
         .unwrap();

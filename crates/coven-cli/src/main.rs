@@ -129,6 +129,12 @@ enum Command {
         familiar: Option<String>,
         #[arg(
             long,
+            value_name = "ID",
+            help = "Model to run the harness on. Accepts a namespaced id (e.g. \nopenai/gpt-5.5, anthropic/claude-...); Coven strips the provider/ \nprefix and forwards the bare id to the harness's native model flag \n(codex/claude --model). Adapters that declare no model mechanism warn \nand continue. Echoed back in the stream-json system.init `model` field."
+        )]
+        model: Option<String>,
+        #[arg(
+            long,
             help = "Emit JSONL events on stdout (system.init / user / assistant / tool_result / result)"
         )]
         stream_json: bool,
@@ -367,6 +373,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             visibility,
             archive,
             familiar,
+            model,
             stream_json,
             stream_json_input,
         }) => run_session(
@@ -380,6 +387,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             visibility.as_deref(),
             archive,
             familiar.as_deref(),
+            model.as_deref(),
             stream_json,
             stream_json_input,
         ),
@@ -1230,6 +1238,7 @@ fn run_session(
     visibility: Option<&str>,
     archive: bool,
     familiar_id: Option<&str>,
+    model: Option<&str>,
     stream_json: bool,
     stream_json_input: bool,
 ) -> Result<()> {
@@ -1277,6 +1286,24 @@ fn run_session(
     let spec = harness::configured_harness_specs()?
         .into_iter()
         .find(|s| s.id == selected_harness.id);
+
+    // Resolve the requested model. Cave sends a namespaced id; the harness arg
+    // builders strip the provider/ prefix and forward the bare id to the native
+    // model flag, while `system.init` echoes the requested id verbatim so Cave
+    // can confirm acceptance with an exact match. Adapters that declare no model
+    // mechanism warn (don't error) so a selection degrades gracefully. A blank
+    // value is ignored.
+    let requested_model: Option<&str> = model.map(str::trim).filter(|m| !m.is_empty());
+    if let (Some(requested), Some(s)) = (requested_model, spec.as_ref()) {
+        if !s.supports_model() {
+            eprintln!(
+                "warning: harness `{}` declares no model mechanism; --model {} is ignored \
+                 (declare model_flag or model_arg_template in the adapter manifest to enable it)",
+                s.id, requested
+            );
+        }
+    }
+
     let effective_prompt = match (&familiar_ctx, spec.as_ref()) {
         (Some(f), Some(s)) if s.system_prompt_flag.is_none() && !expanded_prompt.is_empty() => {
             format!(
@@ -1364,6 +1391,7 @@ fn run_session(
             session_id: record.id.clone(),
             tools: Vec::new(),
             agent_mode: None,
+            model: requested_model.map(str::to_string),
         }))?;
     }
 
@@ -1434,6 +1462,7 @@ fn run_session(
             &effective_prompt,
             stream_json_input,
             claude_system_prompt.as_deref(),
+            requested_model,
             &mut handle,
         );
         drop(handle);
@@ -1521,6 +1550,7 @@ fn run_session(
         harness_launch_mode_for_stdio(),
         conversation_hint.as_ref(),
         familiar_for_args,
+        requested_model,
     )?;
     match pty_runner::run_attached(&command) {
         Ok(result) => {

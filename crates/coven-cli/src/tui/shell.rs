@@ -1203,6 +1203,8 @@ fn dispatch_via_local_pty(
         None,
         false,
         None,
+        // model: the cast/shell path does not select a model.
+        None,
         false,
         false,
     )?;
@@ -1891,6 +1893,8 @@ fn run_guided_harness_session() -> Result<()> {
         Vec::new(),
         None,
         false,
+        None,
+        // model: the cast/shell path does not select a model.
         None,
         false,
         false,

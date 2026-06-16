@@ -259,6 +259,9 @@ impl SessionRuntime for LiveSessionRuntime {
             launch.launch_mode,
             launch.conversation.as_ref(),
             familiar_ctx.as_ref(),
+            // The daemon launch path does not carry a model selection yet;
+            // `coven run --model` drives the foreground path. Default to None.
+            None,
         )?;
         let observer = self
             .coven_home

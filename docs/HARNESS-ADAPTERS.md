@@ -74,6 +74,38 @@ The prompt is appended as the final command argument after the configured prefix
 
 This manifest path is for explicit integration work. It is not a public support claim for every adapter listed in a maintainer's local manifest.
 
+## Model selection (`coven run --model`)
+
+`coven run --model <ID>` selects the model a harness runs on and forwards it to the harness's native flag. Clients such as Cave drive harnesses through `coven run … -- <prompt>` and pass `--model` ahead of the `--` separator (it is a normal option, so it always parses before the variadic prompt positional).
+
+Two decisions clients must match:
+
+- **Provider-prefix handling — Coven strips it.** Cave stores and sends a namespaced id (e.g. `openai/gpt-5.5`, `anthropic/claude-sonnet-4`). Coven strips the leading `provider/` segment and forwards the **bare** id to the harness (`codex --model gpt-5.5`, `claude --model claude-sonnet-4`), because the native CLIs expect bare model ids. A bare id with no slash is forwarded unchanged. Only the first `/` segment is treated as the provider namespace.
+- **`system.init` echo field — `model`.** When `--stream-json` is set, the `system.init` event carries a `model` field with the id **exactly as requested** on `--model` (namespaced form preserved), or `null` when no `--model` was passed. Echoing the requested id verbatim lets a client confirm acceptance (`applied` vs `pending`) with an exact match against its stored selection, independent of Coven's internal prefix-stripping.
+
+Built-in Codex and Claude adapters both declare `--model`. External adapters declare how they take a model in the manifest:
+
+- `model_flag` (alias `modelFlag`): a simple `--flag <value>` pair. Coven forwards `[flag, <bare-model>]`.
+- `model_arg_template` (alias `modelArgTemplate`): for anything else (e.g. Codex's config-override form `-c model=<value>`). The template is split on whitespace into argv tokens and every `{model}` placeholder is substituted with the bare model id — no shell quoting, so write `"-c model={model}"`, not `'-c model="{model}"'`. Takes precedence over `model_flag` when both are set.
+
+An adapter that declares **neither** field makes `--model` a **warned no-op** for that adapter: Coven prints a warning to stderr and continues the run rather than failing.
+
+```json
+{
+  "adapters": [
+    {
+      "id": "example",
+      "label": "Example Harness",
+      "executable": "example",
+      "interactive_prompt_prefix_args": [],
+      "non_interactive_prompt_prefix_args": ["run", "--quiet"],
+      "install_hint": "Install Example Harness and make sure `example` is on PATH.",
+      "model_flag": "--model"
+    }
+  ]
+}
+```
+
 A code-backed adapter should still be shaped as data plus narrow translation functions. The adapter registry/manifest can describe:
 
 - `id`, `label`, and `executable`;
@@ -96,6 +128,7 @@ The bundled compatibility adapters are Codex and Claude Code. They are first-cla
 - Executable: `codex`
 - Interactive prefix args: none
 - Non-interactive prefix args: `exec --skip-git-repo-check --color never`
+- Model flag: `--model` (the equivalent `-c model=<value>` override is available to external adapters via `model_arg_template`)
 
 Setup hint:
 
@@ -110,6 +143,7 @@ codex login
 - Executable: `claude`
 - Interactive prefix args: none
 - Non-interactive prefix args: `--print`
+- Model flag: `--model`
 
 Setup hint:
 

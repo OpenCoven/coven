@@ -54,4 +54,46 @@ fn stream_json_emits_init_and_result_for_codex_dry_run() {
     assert_eq!(last["type"], "result");
     assert_eq!(last["subtype"], "success");
     assert_eq!(last["is_error"], false);
+
+    // No --model passed: system.init carries a null model field.
+    assert!(first["model"].is_null(), "model defaults to null: {first}");
+}
+
+#[test]
+#[ignore = "requires built coven binary; run with `cargo test -- --ignored`"]
+fn stream_json_init_echoes_requested_model_verbatim() {
+    let out = Command::new(env!("CARGO_BIN_EXE_coven"))
+        .args([
+            "run",
+            "codex",
+            "--stream-json",
+            "--detach",
+            "--model",
+            "openai/gpt-5.5",
+            "ping",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to spawn coven binary");
+
+    assert!(
+        out.status.success(),
+        "coven run --detach --stream-json --model failed: status={:?} stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let stdout = String::from_utf8(out.stdout).expect("stdout not utf-8");
+    let first_line = stdout
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .expect("expected at least one frame");
+    let first: serde_json::Value =
+        serde_json::from_str(first_line).expect("first line is not valid JSON");
+    assert_eq!(first["type"], "system");
+    assert_eq!(first["subtype"], "init");
+    // system.init echoes the requested id verbatim (namespaced form preserved)
+    // so Cave can confirm acceptance with an exact match.
+    assert_eq!(first["model"], "openai/gpt-5.5");
 }
