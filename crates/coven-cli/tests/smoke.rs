@@ -184,7 +184,7 @@ fn concurrent_daemon_start_commands_share_one_daemon() -> anyhow::Result<()> {
 }
 
 #[test]
-fn daemon_start_cleans_up_unreachable_duplicate_daemons() -> anyhow::Result<()> {
+fn daemon_serve_refuses_to_take_over_a_healthy_socket() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let coven_home = temp_dir.path().join("coven-home");
     let path = std::env::var_os("PATH").unwrap_or_default();
@@ -200,6 +200,9 @@ fn daemon_start_cleans_up_unreachable_duplicate_daemons() -> anyhow::Result<()> 
     wait_for_daemon_health(&coven_home)?;
     let first_pid = daemon_status_pid(&coven_home)?;
 
+    // A second `daemon serve` against the live socket must refuse to take over.
+    // Unlinking the incumbent's socket would not stop it — it would keep running
+    // on the orphaned inode — so the duplicate has to exit on its own instead.
     let mut duplicate = Command::new(&coven)
         .args(["daemon", "serve"])
         .env("COVEN_HOME", &coven_home)
@@ -208,30 +211,27 @@ fn daemon_start_cleans_up_unreachable_duplicate_daemons() -> anyhow::Result<()> 
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
-    wait_until("duplicate daemon to take over socket", || {
-        wait_for_daemon_health(&coven_home)?;
-        Ok(daemon_status_pid(&coven_home)? != first_pid)
+    wait_until("duplicate daemon to exit on its own", || {
+        Ok(duplicate.try_wait()?.is_some())
     })?;
-
-    let active_before_cleanup = daemon_status_pid(&coven_home)?;
-    assert_ne!(
-        first_pid, active_before_cleanup,
-        "test setup should leave the first daemon unreachable through the socket"
-    );
-
-    let cleanup = run_coven(&coven, &coven_home, &path, &["daemon", "start"])?;
-    assert_success("daemon start cleanup", &cleanup);
-
-    wait_until("unreachable duplicate daemon cleanup", || {
-        Ok(!pid_is_alive(first_pid as u32))
-    })?;
+    let duplicate_status = duplicate.wait()?;
     assert!(
-        pid_is_alive(active_before_cleanup as u32),
-        "cleanup must preserve the daemon that owns the socket"
+        !duplicate_status.success(),
+        "duplicate serve should fail rather than take over the live socket"
     );
 
-    let _ = duplicate.kill();
-    let _ = duplicate.wait();
+    // The incumbent is untouched: still the recorded owner, still healthy, and the
+    // refused duplicate must not have clobbered daemon.json on its way out.
+    wait_for_daemon_health(&coven_home)?;
+    assert_eq!(
+        first_pid,
+        daemon_status_pid(&coven_home)?,
+        "incumbent must remain the recorded socket owner after a refused takeover"
+    );
+    assert!(
+        pid_is_alive(first_pid as u32),
+        "incumbent daemon must stay alive after a refused takeover"
+    );
     Ok(())
 }
 

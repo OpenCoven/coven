@@ -1661,13 +1661,19 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
             .to_string_lossy()
             .into_owned(),
     };
-    write_status(coven_home, &status)?;
     let socket_path = daemon_socket_path(coven_home);
     let status_path = daemon_status_path(coven_home);
     // Install the shutdown hooks before anything else that can fail: a panic
-    // during recovery or bind would otherwise leave daemon.json on disk.
+    // during recovery or bind would otherwise leave a socket file behind.
     install_daemon_panic_hook(coven_home, &socket_path, &status_path);
     install_termination_signal_handlers(&socket_path, &status_path)?;
+    // Acquire the socket BEFORE claiming any on-disk daemon state. bind_api_socket
+    // refuses to take over a socket a healthy daemon already owns; if it bails we
+    // must not yet have written daemon.json or armed the ShutdownGuard, or the
+    // guard would delete the incumbent's status file and unlink its live socket on
+    // our way out — re-orphaning the very daemon we declined to replace.
+    let unix_listener = bind_api_socket(coven_home)?;
+    write_status(coven_home, &status)?;
     let _shutdown_guard = ShutdownGuard {
         socket_path: socket_path.clone(),
         status_path: status_path.clone(),
@@ -1682,7 +1688,6 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
         ),
     );
     recover_orphaned_sessions(coven_home, &started_at)?;
-    let unix_listener = bind_api_socket(coven_home)?;
     let runtime = Arc::new(LiveSessionRuntime::with_coven_home(
         coven_home.to_path_buf(),
     ));
