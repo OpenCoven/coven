@@ -1686,9 +1686,66 @@ fn install_daemon_panic_hook(coven_home: &Path, socket_path: &Path, status_path:
     }));
 }
 
+/// Path of the serve-lifetime single-writer lock. Distinct from the
+/// `daemon.lock` *lifecycle* lock that `ensure_background_server` holds only
+/// across a start/stop — this one is held by the `serve` process for its entire
+/// life, so it must be a separate file or the two would deadlock at startup.
+#[cfg(unix)]
+fn daemon_serve_lock_path(coven_home: &Path) -> PathBuf {
+    coven_home.join("daemon-serve.lock")
+}
+
+/// Acquire an exclusive, process-lifetime advisory lock so at most one `serve`
+/// process ever runs against a given Coven home.
+///
+/// `ensure_background_server` already serializes `daemon start`/`stop` and prunes
+/// unreachable duplicates — but a `coven daemon serve` run *directly* (e.g. from
+/// a dev build) bypasses all of that. The socket-takeover guard in
+/// `bind_api_socket` only refuses a *healthy* incumbent that answers `/health`;
+/// a daemon that is alive but wedged would have its socket reclaimed, leaving
+/// two processes writing one SQLite store — the loser then fails the
+/// `events_fts` backfill with "database is locked". This OS lock is independent
+/// of socket health and of the start path: a live incumbent still holds it, so a
+/// duplicate fails fast with a clear message. `flock` releases automatically
+/// when the fd closes — normal exit, panic, or SIGKILL — so it never wedges shut.
+#[cfg(unix)]
+fn acquire_serve_lock(coven_home: &Path) -> Result<std::fs::File> {
+    std::fs::create_dir_all(coven_home)
+        .with_context(|| format!("failed to create Coven home {}", coven_home.display()))?;
+    let path = daemon_serve_lock_path(coven_home);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("failed to open serve lock {}", path.display()))?;
+    // SAFETY: flock only operates on the provided fd; it cannot corrupt memory.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            anyhow::bail!(
+                "another Coven daemon is already serving this home (holds {}); refusing to \
+                 start a second daemon, which would contend for the SQLite store",
+                path.display()
+            );
+        }
+        return Err(err)
+            .with_context(|| format!("failed to acquire serve lock {}", path.display()));
+    }
+    Ok(file)
+}
+
 #[cfg(unix)]
 pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&str>) -> Result<()> {
     use std::sync::Arc;
+    // First thing, before touching the socket or the store: take the
+    // single-writer serve lock and hold it for the whole process lifetime. It
+    // is the authoritative guard against two daemons writing one SQLite store —
+    // catching the wedged-but-alive incumbent the socket guard can't, and the
+    // direct `daemon serve` path that bypasses ensure_background_server.
+    let _serve_lock = acquire_serve_lock(coven_home)?;
     let status = DaemonStatus {
         pid: std::process::id(),
         started_at: started_at.clone(),
@@ -2239,6 +2296,25 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn serve_lock_is_exclusive_and_reusable() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        // First acquisition holds the exclusive serve lock.
+        let first = acquire_serve_lock(home.path())?;
+        // A second acquisition while the first is held must fail — this is what
+        // stops a duplicate daemon from contending for the SQLite store.
+        assert!(
+            acquire_serve_lock(home.path()).is_err(),
+            "second serve lock acquisition must fail while the first is held"
+        );
+        // Releasing the lock lets the next daemon take it — it never wedges shut.
+        drop(first);
+        let _second =
+            acquire_serve_lock(home.path()).expect("lock should be reacquirable once released");
+        Ok(())
+    }
 
     #[test]
     fn seeds_trust_for_new_dir_into_missing_config() -> Result<()> {
