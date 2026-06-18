@@ -1491,6 +1491,24 @@ pub fn bind_api_socket(coven_home: &Path) -> Result<UnixListener> {
             }
             // SAFETY: geteuid() only reads the effective uid and cannot fail.
             check_owned_by_current_user(&socket_path, metadata.uid(), unsafe { libc::geteuid() })?;
+            // Break the socket-takeover orphan cycle: before unlinking and
+            // rebinding, probe the existing socket's /health endpoint. If a live
+            // daemon is already serving here, refuse to take over. Removing its
+            // socket inode would not stop it — the incumbent keeps running on the
+            // now-unlinked inode (no longer reachable by new clients, but never
+            // exiting), leaking a zombie that competes for the path. Repeated
+            // takeovers are how a single daemon turns into dozens. Only a dead or
+            // stale socket — connection refused, or a non-ok health body — may be
+            // reclaimed. See OpenCoven/coven#197 and docs/AUTH.md.
+            if let Ok(Some(incumbent)) =
+                daemon_status_from_health_socket(&socket_path.to_string_lossy())
+            {
+                anyhow::bail!(
+                    "a healthy Coven daemon (pid {}) is already serving {}; refusing to take over",
+                    incumbent.pid,
+                    socket_path.display()
+                );
+            }
             std::fs::remove_file(&socket_path).with_context(|| {
                 format!("failed to remove stale socket {}", socket_path.display())
             })?;
@@ -2619,6 +2637,60 @@ mod tests {
         assert!(
             msg.contains("non-loopback"),
             "unexpected error message: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bind_api_socket_refuses_to_take_over_a_healthy_incumbent() {
+        use crate::api::NoopSessionRuntime;
+        use std::thread;
+        let temp = tempfile::tempdir().expect("tempdir");
+        ensure_private_coven_home(temp.path()).expect("ensure home");
+        let home = temp.path().to_path_buf();
+
+        // Stand up an incumbent daemon: a bound socket plus a thread that answers
+        // a single /health probe, reporting a recognizable pid.
+        let incumbent = bind_api_socket(&home).expect("bind incumbent");
+        let socket = daemon_socket_path(&home).to_string_lossy().into_owned();
+        let server_home = home.clone();
+        let status = DaemonStatus {
+            pid: 4242,
+            started_at: "2026-06-18T00:00:00Z".to_string(),
+            socket,
+        };
+        let server = thread::spawn(move || {
+            serve_next_connection(&incumbent, &server_home, Some(status), &NoopSessionRuntime)
+                .expect("serve health probe");
+        });
+
+        // A second daemon must NOT clobber the live socket. It should bail and
+        // name the incumbent pid rather than unlink the inode out from under it.
+        let error = bind_api_socket(&home).expect_err("must refuse takeover");
+        server.join().expect("incumbent server thread");
+        let msg = format!("{error:#}");
+        assert!(
+            msg.contains("refusing to take over") && msg.contains("4242"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bind_api_socket_reclaims_a_dead_socket_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        ensure_private_coven_home(temp.path()).expect("ensure home");
+        let home = temp.path().to_path_buf();
+
+        // A crashed daemon (SIGKILL bypasses Drop) leaves the socket file behind
+        // with nothing listening — connecting refuses. Reclaiming it must still
+        // succeed, otherwise the guard would wedge every restart.
+        let dead = bind_api_socket(&home).expect("first bind");
+        drop(dead); // closes the listener; the socket file lingers, unserved
+        let reclaimed = bind_api_socket(&home);
+        assert!(
+            reclaimed.is_ok(),
+            "should reclaim a dead socket: {reclaimed:?}"
         );
     }
 
