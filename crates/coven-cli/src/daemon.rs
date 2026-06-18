@@ -1717,23 +1717,80 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
             .context("failed to spawn TCP API thread")?;
     }
 
-    // Per-connection errors are isolated: a malformed HTTP request from one
-    // client used to bring down the entire daemon (because `?` propagated the
-    // error out of the accept loop and serve_forever returned), leaving the
-    // socket file behind. Now connection errors are logged and the loop
-    // continues, matching the TCP path's policy.
+    // Handle each accepted connection on its own thread. The Unix accept loop
+    // used to be serial — accept, then run the handler to completion before
+    // accepting again — so one slow handler (a blocking session spawn, a stuck
+    // filesystem op) stalled *every* subsequent request: the socket kept
+    // accepting but nothing got answered, and polling clients piled up "broken
+    // pipe" as they timed out. Threading the handlers fixes that. It is safe by
+    // construction: the TCP path and these handlers already share one
+    // `Arc<LiveSessionRuntime>`, so request handling is already concurrency-safe
+    // (TCP + Unix have always run at the same time).
+    //
+    // In-flight handlers are capped; past the cap we serve inline so a flood
+    // applies backpressure instead of spawning unbounded threads. Per-connection
+    // errors stay isolated (logged, loop continues) so one malformed request
+    // can't bring the daemon down or orphan the socket.
+    const MAX_INFLIGHT: usize = 64;
+    let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    use std::sync::atomic::Ordering;
     loop {
-        if let Err(error) = serve_next_connection(
-            &unix_listener,
-            coven_home,
-            Some(status.clone()),
-            runtime.as_ref(),
-        ) {
-            eprintln!("coven daemon: unix connection error: {error:#}");
-            append_daemon_recovery_log(coven_home, &format!("unix connection error: {error:#}"));
-            // A short pause keeps tight error loops (e.g. a wedged listener)
-            // from spinning the CPU. 100ms matches the TCP path above.
-            std::thread::sleep(std::time::Duration::from_millis(100));
+        let (stream, _) = match unix_listener.accept() {
+            Ok(pair) => pair,
+            Err(error) => {
+                eprintln!("coven daemon: unix accept error: {error:#}");
+                append_daemon_recovery_log(coven_home, &format!("unix accept error: {error:#}"));
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                continue;
+            }
+        };
+        let conn_status = Some(status.clone());
+
+        if inflight.load(Ordering::Relaxed) >= MAX_INFLIGHT {
+            // Backpressure: at capacity, serve this one on the accept thread.
+            if let Err(error) =
+                serve_accepted_connection(stream, coven_home, conn_status, runtime.as_ref())
+            {
+                eprintln!("coven daemon: unix connection error: {error:#}");
+                append_daemon_recovery_log(
+                    coven_home,
+                    &format!("unix connection error: {error:#}"),
+                );
+            }
+            continue;
+        }
+
+        inflight.fetch_add(1, Ordering::Relaxed);
+        let conn_home = coven_home.to_path_buf();
+        let conn_runtime = Arc::clone(&runtime);
+        let conn_inflight = Arc::clone(&inflight);
+        let spawn_result = std::thread::Builder::new()
+            .name("coven-unix-api".into())
+            .spawn(move || {
+                if let Err(error) = serve_accepted_connection(
+                    stream,
+                    &conn_home,
+                    conn_status,
+                    conn_runtime.as_ref(),
+                ) {
+                    eprintln!("coven daemon: unix connection error: {error:#}");
+                    append_daemon_recovery_log(
+                        &conn_home,
+                        &format!("unix connection error: {error:#}"),
+                    );
+                }
+                conn_inflight.fetch_sub(1, Ordering::Relaxed);
+            });
+        if let Err(error) = spawn_result {
+            // Thread budget exhausted: the closure (and the connection) is
+            // dropped, so undo the counter we optimistically bumped. Rare; the
+            // client simply retries.
+            inflight.fetch_sub(1, Ordering::Relaxed);
+            eprintln!("coven daemon: failed to spawn unix handler thread: {error:#}");
+            append_daemon_recovery_log(
+                coven_home,
+                &format!("failed to spawn unix handler thread: {error:#}"),
+            );
         }
     }
 }
@@ -1861,7 +1918,10 @@ fn write_forbidden<W: Write>(write: &mut W, reason: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+// Accept + serve in one call. Production no longer uses this (the accept loop
+// threads each connection via serve_accepted_connection); it remains for tests
+// that drive a listener end-to-end, hence cfg(test).
+#[cfg(all(unix, test))]
 pub fn serve_next_connection(
     listener: &UnixListener,
     coven_home: &Path,
@@ -1871,6 +1931,20 @@ pub fn serve_next_connection(
     let (stream, _) = listener
         .accept()
         .context("failed to accept API connection")?;
+    serve_accepted_connection(stream, coven_home, status, runtime)
+}
+
+/// Serve a single already-accepted Unix connection. Split out of
+/// `serve_next_connection` so the accept loop can hand each connection to its
+/// own thread (see `serve_forever`) — accept stays serial and cheap, while the
+/// blocking request handling runs off the accept thread.
+#[cfg(unix)]
+fn serve_accepted_connection(
+    stream: UnixStream,
+    coven_home: &Path,
+    status: Option<DaemonStatus>,
+    runtime: &dyn SessionRuntime,
+) -> Result<()> {
     // Best-effort I/O timeouts so a stalled client doesn't pin the handler
     // thread forever. These are an optimization, not a precondition: on macOS
     // setsockopt(SO_RCVTIMEO) returns EINVAL (os error 22) for some accepted
