@@ -663,6 +663,43 @@ pub fn daemon_socket_path(coven_home: &Path) -> PathBuf {
     coven_home.join("coven.sock")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum DaemonIpcPlatform {
+    Unix,
+    Windows,
+}
+
+fn daemon_windows_pipe_name(coven_home: &Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    coven_home.to_string_lossy().hash(&mut h);
+    format!("coven-daemon-{:016x}.sock", h.finish())
+}
+
+fn daemon_startup_status_socket_for_platform(
+    coven_home: &Path,
+    platform: DaemonIpcPlatform,
+) -> String {
+    match platform {
+        DaemonIpcPlatform::Unix => daemon_socket_path(coven_home)
+            .to_string_lossy()
+            .into_owned(),
+        DaemonIpcPlatform::Windows => daemon_windows_pipe_name(coven_home),
+    }
+}
+
+fn daemon_startup_status_socket(coven_home: &Path) -> String {
+    #[cfg(windows)]
+    {
+        daemon_startup_status_socket_for_platform(coven_home, DaemonIpcPlatform::Windows)
+    }
+    #[cfg(not(windows))]
+    {
+        daemon_startup_status_socket_for_platform(coven_home, DaemonIpcPlatform::Unix)
+    }
+}
+
 // Fail closed when daemon state already exists but is owned by a different
 // user: a path we do not own could have been planted by another local user to
 // capture the socket, status, or SQLite ledger. See docs/AUTH.md
@@ -743,9 +780,7 @@ pub fn start_background_server(
     let status = DaemonStatus {
         pid: child.id(),
         started_at,
-        socket: daemon_socket_path(coven_home)
-            .to_string_lossy()
-            .into_owned(),
+        socket: daemon_startup_status_socket(coven_home),
     };
     write_status(coven_home, &status)?;
     Ok(status)
@@ -2126,10 +2161,7 @@ unsafe fn restrict_pipe_to_owner(handle: windows_sys::Win32::Foundation::HANDLE)
 
 #[cfg(windows)]
 fn windows_pipe_name(coven_home: &Path) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    coven_home.to_string_lossy().hash(&mut h);
-    format!("coven-daemon-{:016x}.sock", h.finish())
+    daemon_windows_pipe_name(coven_home)
 }
 
 #[cfg(windows)]
@@ -2878,6 +2910,25 @@ mod tests {
         // bind_api_socket's containment guard always holds for the derived path.
         let home = std::path::Path::new("/some/coven/home");
         assert_eq!(daemon_socket_path(home).parent(), Some(home));
+    }
+
+    #[test]
+    fn daemon_startup_status_socket_uses_unix_socket_for_unix_platform() {
+        let home = Path::new("/tmp/coven-home");
+        assert_eq!(
+            daemon_startup_status_socket_for_platform(home, DaemonIpcPlatform::Unix),
+            daemon_socket_path(home).to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn daemon_startup_status_socket_uses_named_pipe_for_windows_platform() {
+        let home = Path::new("C:/Users/Sonic/.coven");
+        let socket = daemon_startup_status_socket_for_platform(home, DaemonIpcPlatform::Windows);
+
+        assert!(socket.starts_with("coven-daemon-"), "socket={socket}");
+        assert!(socket.ends_with(".sock"), "socket={socket}");
+        assert_ne!(socket, daemon_socket_path(home).to_string_lossy());
     }
 
     #[cfg(unix)]
