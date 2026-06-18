@@ -1866,13 +1866,17 @@ pub fn serve_next_connection(
     let (stream, _) = listener
         .accept()
         .context("failed to accept API connection")?;
-    // Apply I/O timeout so a stalled client doesn't hold the handler thread forever.
-    stream
-        .set_read_timeout(Some(SOCKET_IO_TIMEOUT))
-        .context("failed to set read timeout on Unix socket")?;
-    stream
-        .set_write_timeout(Some(SOCKET_IO_TIMEOUT))
-        .context("failed to set write timeout on Unix socket")?;
+    // Best-effort I/O timeouts so a stalled client doesn't pin the handler
+    // thread forever. These are an optimization, not a precondition: on macOS
+    // setsockopt(SO_RCVTIMEO) returns EINVAL (os error 22) for some accepted
+    // fds (e.g. a peer already half-closed by accept time), and a connection
+    // that merely could not have a timeout applied is still serviceable. Making
+    // this fatal aborted those connections and flooded the recovery log with
+    // "failed to set read timeout" — to a polling client like CovenCave it looked
+    // like the daemon constantly dropping. Mirror the named-pipe path, which
+    // already sets these best-effort, and serve the request regardless.
+    let _ = stream.set_read_timeout(Some(SOCKET_IO_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(SOCKET_IO_TIMEOUT));
     let read = stream.try_clone().context("failed to clone Unix stream")?;
     // Apply a body cap even on local Unix sockets: a buggy or hostile local
     // process should not be able to OOM the daemon with a huge payload.
