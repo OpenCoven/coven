@@ -496,13 +496,7 @@ fn run_shared_interactive_shell() -> Result<()> {
     // hatch is an explicit `COVEN_LEGACY_TUI=1`, which keeps the legacy
     // in-process tui::shell available during the transition.
     if legacy_tui_opted_in() {
-        eprintln!(
-            "coven: warning — COVEN_LEGACY_TUI is set; falling back to the legacy slash shell.\n\
-             coven: the legacy shell is deprecated and will be removed in a future release.\n\
-             coven: install coven-code to use the supported interactive UI:\n\
-             coven:   npm install -g @opencoven/coven-code\n\
-             coven:   # or: curl -fsSL https://github.com/OpenCoven/coven-code/releases/latest/download/install.sh | bash\n"
-        );
+        eprintln!("{}", legacy_tui_warning_message(target_shell()));
         return match interactive_shell_route(
             None,
             io::stdin().is_terminal(),
@@ -521,16 +515,69 @@ fn run_shared_interactive_shell() -> Result<()> {
 
 /// Build a single, user-actionable error for the missing-coven-code case.
 fn missing_coven_code_error() -> anyhow::Error {
-    anyhow!(
+    anyhow!(missing_coven_code_error_message(target_shell()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetShell {
+    Posix,
+    PowerShell,
+}
+
+fn target_shell() -> TargetShell {
+    if cfg!(windows) {
+        TargetShell::PowerShell
+    } else {
+        TargetShell::Posix
+    }
+}
+
+fn missing_coven_code_error_message(shell: TargetShell) -> String {
+    format!(
         "coven-code is required for the interactive Coven UI but was not found on PATH \
          or under ~/.coven-code/bin.\n\n\
-         Install it with one of:\n\
-           npm install -g @opencoven/coven-code\n\
-           curl -fsSL https://github.com/OpenCoven/coven-code/releases/latest/download/install.sh | bash\n\n\
+         Install it with:\n\
+         {install}\n\n\
          If you need the legacy slash shell temporarily, run:\n\
-           COVEN_LEGACY_TUI=1 coven\n\
-         (the legacy shell will be removed in a future release.)"
+         {legacy}\n\
+         (the legacy shell will be removed in a future release.)",
+        install = coven_code_install_instructions(shell),
+        legacy = legacy_tui_instructions(shell),
     )
+}
+
+fn legacy_tui_warning_message(shell: TargetShell) -> String {
+    format!(
+        "coven: warning — COVEN_LEGACY_TUI is set; falling back to the legacy slash shell.\n\
+         coven: the legacy shell is deprecated and will be removed in a future release.\n\
+         coven: install coven-code to use the supported interactive UI:\n\
+         {install}",
+        install = coven_code_install_instructions(shell)
+            .lines()
+            .map(|line| format!("coven: {line}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+fn coven_code_install_instructions(shell: TargetShell) -> &'static str {
+    match shell {
+        TargetShell::Posix => {
+            "  npm install -g @opencoven/coven-code\n  curl -fsSL https://github.com/OpenCoven/coven-code/releases/latest/download/install.sh | bash"
+        }
+        TargetShell::PowerShell => {
+            "  npm install -g @opencoven/coven-code\n  irm https://github.com/OpenCoven/coven-code/releases/latest/download/install.ps1 | iex"
+        }
+    }
+}
+
+fn legacy_tui_instructions(shell: TargetShell) -> &'static str {
+    match shell {
+        TargetShell::Posix => "  COVEN_LEGACY_TUI=1 coven",
+        TargetShell::PowerShell => {
+            "  $env:COVEN_LEGACY_TUI = \"1\"\n  coven\n  Remove-Item Env:COVEN_LEGACY_TUI"
+        }
+    }
 }
 
 /// `COVEN_LEGACY_TUI=1` (or `=true`) opts back into the in-process tui::shell.
@@ -3119,10 +3166,20 @@ mod tests {
         // The error message is the primary onboarding surface when coven-code
         // is absent, so it must list at least one concrete install path and
         // mention the legacy escape hatch.
-        let msg = format!("{:#}", missing_coven_code_error());
+        let msg = missing_coven_code_error_message(TargetShell::Posix);
         assert!(msg.contains("npm install -g @opencoven/coven-code"));
         assert!(msg.contains("install.sh"));
         assert!(msg.contains("COVEN_LEGACY_TUI=1"));
+    }
+
+    #[test]
+    fn missing_coven_code_error_includes_windows_powershell_instructions() {
+        let msg = missing_coven_code_error_message(TargetShell::PowerShell);
+
+        assert!(msg.contains("irm https://github.com/OpenCoven/coven-code/releases/latest/download/install.ps1 | iex"));
+        assert!(msg.contains("$env:COVEN_LEGACY_TUI = \"1\""));
+        assert!(msg.contains("Remove-Item Env:COVEN_LEGACY_TUI"));
+        assert!(!msg.contains("install.sh | bash"));
     }
 
     #[test]

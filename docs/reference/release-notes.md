@@ -16,6 +16,7 @@ title: "Coven changelog and release notes"
 
 - **Clearer unsupported-harness guidance.** Unknown harness errors now show configured harness ids and point Hermes users directly to `coven adapter install hermes` followed by `coven adapter doctor hermes`; other external harnesses still use trusted adapter manifests or the explicit manifest environment variables.
 - **Windows home-directory fallback.** `coven doctor` and store-path resolution now work in PowerShell environments where `HOME` is absent by falling back through `USERPROFILE`, `HOMEDRIVE` + `HOMEPATH`, and the platform home directory before asking users to set `COVEN_HOME`.
+- **PowerShell-native `coven-code` install guidance.** On Windows, `coven` now points missing interactive-UI users to the `install.ps1` installer and PowerShell-compatible `COVEN_LEGACY_TUI` syntax instead of showing Unix `curl | bash` commands.
 
 ## Week of June 3, 2026
 
