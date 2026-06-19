@@ -480,7 +480,8 @@ fn session_launch_from_payload(payload: Value) -> Result<SessionLaunch> {
         .collect();
     if !supported.contains(&harness.as_str()) {
         anyhow::bail!(
-            "harness `{harness}` is not a supported harness; expected one of {supported:?}"
+            "{}",
+            crate::harness::unsupported_harness_message(&harness, &supported)
         );
     }
     let launch_mode = launch_mode_from_payload(&payload)?;
@@ -2004,8 +2005,15 @@ mod tests {
 
         assert_eq!(response.status, 400);
         assert!(
-            response.body.contains("not a supported harness"),
-            "expected supported-harness validation message, got: {}",
+            response.body.contains("unsupported harness `hermes`"),
+            "expected unsupported-harness validation message, got: {}",
+            response.body
+        );
+        assert!(
+            response
+                .body
+                .contains(crate::harness::EXTERNAL_ADAPTER_MANIFEST_ENV),
+            "expected external adapter manifest guidance, got: {}",
             response.body
         );
         assert!(

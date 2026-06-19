@@ -38,7 +38,7 @@ mod theme;
 mod tui;
 mod verification;
 
-const DEFAULT_COVEN_HOME_DIR: &str = ".coven";
+pub(crate) const DEFAULT_COVEN_HOME_DIR: &str = ".coven";
 pub(crate) const STORE_FILE_NAME: &str = "coven.sqlite3";
 const DEFAULT_SESSION_STATUS: &str = "created";
 const RUNNING_SESSION_STATUS: &str = "running";
@@ -253,6 +253,11 @@ enum AdapterCommand {
     Doctor {
         #[arg(help = "Adapter id to diagnose")]
         adapter: Option<String>,
+    },
+    #[command(about = "Install a trusted local adapter recipe")]
+    Install {
+        #[arg(help = "Adapter recipe to install, e.g. hermes")]
+        adapter: String,
     },
 }
 
@@ -745,6 +750,7 @@ fn run_adapter_command(command: AdapterCommand) -> Result<()> {
     match command {
         AdapterCommand::List { json } => run_adapter_list(json),
         AdapterCommand::Doctor { adapter } => run_adapter_doctor(adapter.as_deref()),
+        AdapterCommand::Install { adapter } => run_adapter_install(&adapter),
     }
 }
 
@@ -812,6 +818,47 @@ fn run_adapter_doctor(adapter: Option<&str>) -> Result<()> {
             println!("       {}", harness.install_hint);
         }
     }
+    Ok(())
+}
+
+fn run_adapter_install(adapter: &str) -> Result<()> {
+    let manifest = harness::known_adapter_manifest(adapter).ok_or_else(|| {
+        anyhow!(
+            "unknown adapter recipe `{adapter}`. Known recipes: {}",
+            harness::known_adapter_recipe_names().join(", ")
+        )
+    })?;
+    let coven_home = coven_home_dir()?;
+    let adapter_dir = harness::trusted_adapter_dir(&coven_home);
+    let manifest_path = harness::trusted_adapter_manifest_path(&coven_home, adapter);
+
+    std::fs::create_dir_all(&adapter_dir).with_context(|| {
+        format!(
+            "failed to create trusted adapter directory {}",
+            adapter_dir.display()
+        )
+    })?;
+    if manifest_path.exists() {
+        println!(
+            "Adapter `{adapter}` is already installed at {}",
+            manifest_path.display()
+        );
+    } else {
+        std::fs::write(&manifest_path, manifest).with_context(|| {
+            format!(
+                "failed to write trusted adapter manifest {}",
+                manifest_path.display()
+            )
+        })?;
+        println!(
+            "Installed adapter `{adapter}` at {}",
+            manifest_path.display()
+        );
+    }
+
+    println!("Next steps:");
+    println!("  coven adapter doctor {adapter}");
+    println!("  coven run {adapter} \"what is in this project?\"");
     Ok(())
 }
 
@@ -1815,14 +1862,14 @@ fn ensure_successful_http_response(response: &str) -> Result<()> {
 
 fn selected_available_harness(harness_id: &str) -> Result<harness::HarnessSummary> {
     let harnesses = harness::configured_harnesses()?;
-    let known_harnesses = harnesses
+    let configured_ids = harnesses
         .iter()
         .map(|harness| harness.id.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
+        .collect::<Vec<_>>();
     let selected = harnesses
-        .into_iter()
-        .find(|harness| harness.id == harness_id);
+        .iter()
+        .find(|harness| harness.id == harness_id)
+        .cloned();
 
     match selected {
         Some(harness) if harness.available => Ok(harness),
@@ -1832,7 +1879,8 @@ fn selected_available_harness(harness_id: &str) -> Result<harness::HarnessSummar
             harness.install_hint
         )),
         None => Err(anyhow!(
-            "unknown harness `{harness_id}`. Configured harnesses: {known_harnesses}"
+            "{}",
+            harness::unsupported_harness_message(harness_id, &configured_ids)
         )),
     }
 }
@@ -1875,17 +1923,53 @@ fn coven_store_path_if_exists() -> Result<Option<PathBuf>> {
 }
 
 fn coven_home_dir() -> Result<PathBuf> {
-    coven_home_from_env(std::env::var_os("COVEN_HOME"), std::env::var_os("HOME"))
+    coven_home_from_env(
+        std::env::var_os("COVEN_HOME"),
+        std::env::var_os("HOME"),
+        std::env::var_os("USERPROFILE"),
+        std::env::var_os("HOMEDRIVE"),
+        std::env::var_os("HOMEPATH"),
+        dirs_next::home_dir().map(OsString::from),
+    )
 }
 
-fn coven_home_from_env(coven_home: Option<OsString>, home: Option<OsString>) -> Result<PathBuf> {
+fn coven_home_from_env(
+    coven_home: Option<OsString>,
+    home: Option<OsString>,
+    user_profile: Option<OsString>,
+    home_drive: Option<OsString>,
+    home_path: Option<OsString>,
+    platform_home: Option<OsString>,
+) -> Result<PathBuf> {
     if let Some(coven_home) = coven_home.filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(coven_home));
     }
 
-    let home =
-        home.ok_or_else(|| anyhow!("HOME is not set; set COVEN_HOME to choose a store path"))?;
+    let home = home
+        .filter(|value| !value.is_empty())
+        .or_else(|| user_profile.filter(|value| !value.is_empty()))
+        .or_else(|| windows_home_from_drive_and_path(home_drive, home_path))
+        .or_else(|| platform_home.filter(|value| !value.is_empty()))
+        .ok_or_else(|| {
+            anyhow!(
+                "could not find a home directory for Coven. Set COVEN_HOME to choose a store path, \
+for example `COVEN_HOME=$HOME/.coven` on macOS/Linux or \
+`$env:COVEN_HOME=\"$env:USERPROFILE\\.coven\"` in PowerShell."
+            )
+        })?;
     Ok(PathBuf::from(home).join(DEFAULT_COVEN_HOME_DIR))
+}
+
+fn windows_home_from_drive_and_path(
+    home_drive: Option<OsString>,
+    home_path: Option<OsString>,
+) -> Option<OsString> {
+    let drive = home_drive?.into_string().ok()?;
+    let path = home_path?.into_string().ok()?;
+    if drive.is_empty() || path.is_empty() {
+        return None;
+    }
+    Some(OsString::from(format!("{drive}{path}")))
 }
 
 #[cfg(test)]
@@ -1909,6 +1993,44 @@ mod tests {
         MagicalTuiMove, MagicalTuiRequest, MAGICAL_TUI_MAX_INNER_WIDTH,
     };
     use crossterm::event::KeyEventKind;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn restore_env_var(name: &str, previous: Option<OsString>) {
+        match previous {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
+    }
+
+    struct EnvVarGuard {
+        name: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: impl AsRef<OsStr>) -> Self {
+            let previous = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, previous }
+        }
+
+        fn remove(name: &'static str) -> Self {
+            let previous = std::env::var_os(name);
+            std::env::remove_var(name);
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            restore_env_var(self.name, self.previous.clone());
+        }
+    }
 
     #[test]
     fn tui_launcher_and_session_browser_are_owned_by_tui_modules() {
@@ -1987,6 +2109,10 @@ mod tests {
         let path = coven_home_from_env(
             Some(OsString::from("/tmp/custom-coven-home")),
             Some(OsString::from("/tmp/ignored-home")),
+            None,
+            None,
+            None,
+            None,
         )?;
 
         assert_eq!(path, PathBuf::from("/tmp/custom-coven-home"));
@@ -1995,9 +2121,34 @@ mod tests {
 
     #[test]
     fn coven_home_from_env_defaults_under_home() -> Result<()> {
-        let path = coven_home_from_env(None, Some(OsString::from("/tmp/user-home")))?;
+        let path = coven_home_from_env(
+            None,
+            Some(OsString::from("/tmp/user-home")),
+            None,
+            None,
+            None,
+            None,
+        )?;
 
         assert_eq!(path, PathBuf::from("/tmp/user-home").join(".coven"));
+        Ok(())
+    }
+
+    #[test]
+    fn coven_home_from_env_uses_windows_drive_and_path_when_needed() -> Result<()> {
+        let path = coven_home_from_env(
+            None,
+            None,
+            None,
+            Some(OsString::from("C:")),
+            Some(OsString::from("\\Users\\hostname")),
+            None,
+        )?;
+
+        assert_eq!(
+            path,
+            PathBuf::from("C:\\Users\\hostname").join(DEFAULT_COVEN_HOME_DIR)
+        );
         Ok(())
     }
 
@@ -2577,6 +2728,27 @@ mod tests {
             }) => assert_eq!(adapter.as_deref(), Some("claude")),
             other => panic!("expected adapter doctor command, got {other:?}"),
         }
+
+        let install = Cli::parse_from(["coven", "adapter", "install", "hermes"]);
+        match install.command {
+            Some(Command::Adapter {
+                command: AdapterCommand::Install { adapter },
+            }) => assert_eq!(adapter, "hermes"),
+            other => panic!("expected adapter install command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coven_home_uses_userprofile_when_home_is_missing() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let user_profile = temp_dir.path().join("windows-user");
+        let _guard = env_lock().lock().unwrap();
+        let _coven_home = EnvVarGuard::remove("COVEN_HOME");
+        let _home = EnvVarGuard::remove("HOME");
+        let _user_profile = EnvVarGuard::set("USERPROFILE", &user_profile);
+
+        assert_eq!(coven_home_dir()?, user_profile.join(DEFAULT_COVEN_HOME_DIR));
+        Ok(())
     }
 
     #[test]

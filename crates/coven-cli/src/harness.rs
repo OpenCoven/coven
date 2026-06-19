@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub const EXTERNAL_ADAPTER_MANIFEST_ENV: &str = "COVEN_HARNESS_ADAPTER_MANIFEST";
 pub const EXTERNAL_ADAPTER_DIRS_ENV: &str = "COVEN_HARNESS_ADAPTER_DIRS";
 pub const CLAUDE_BYPASS_PERMISSIONS_ENV: &str = "COVEN_CLAUDE_BYPASS_PERMISSIONS";
+pub const TRUSTED_ADAPTERS_DIR_NAME: &str = "adapters";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HarnessSummary {
@@ -285,6 +286,20 @@ pub fn configured_harnesses() -> Result<Vec<HarnessSummary>> {
         .collect())
 }
 
+pub fn unsupported_harness_message(harness_id: &str, configured_ids: &[&str]) -> String {
+    let configured = if configured_ids.is_empty() {
+        "(none)".to_string()
+    } else {
+        configured_ids.join(", ")
+    };
+    format!(
+        "unsupported harness `{harness_id}`. Configured harnesses: {configured}. \
+To use Hermes, run `coven adapter install hermes`, then `coven adapter doctor hermes`. \
+For other external harnesses, create a trusted adapter manifest under COVEN_HOME/{TRUSTED_ADAPTERS_DIR_NAME} \
+or set {EXTERNAL_ADAPTER_MANIFEST_ENV} / {EXTERNAL_ADAPTER_DIRS_ENV} before starting Coven."
+    )
+}
+
 fn external_harness_specs() -> Result<Vec<HarnessCommandSpec>> {
     let built_ins = built_in_harness_specs();
     let mut specs = Vec::new();
@@ -308,6 +323,12 @@ fn external_harness_specs() -> Result<Vec<HarnessCommandSpec>> {
 fn external_adapter_manifest_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
+    if let Some(coven_home) = coven_home_from_process_env() {
+        paths.extend(adapter_manifest_paths_in_dir(&trusted_adapter_dir(
+            &coven_home,
+        )));
+    }
+
     if let Some(manifest_path) = env::var_os(EXTERNAL_ADAPTER_MANIFEST_ENV) {
         paths.push(PathBuf::from(manifest_path));
     }
@@ -323,6 +344,21 @@ fn external_adapter_manifest_paths() -> Vec<PathBuf> {
         .into_iter()
         .filter(|path| seen.insert(path.clone()))
         .collect()
+}
+
+pub fn trusted_adapter_dir(coven_home: &Path) -> PathBuf {
+    coven_home.join(TRUSTED_ADAPTERS_DIR_NAME)
+}
+
+pub fn trusted_adapter_manifest_path(coven_home: &Path, adapter_id: &str) -> PathBuf {
+    trusted_adapter_dir(coven_home).join(format!("{adapter_id}.json"))
+}
+
+fn coven_home_from_process_env() -> Option<PathBuf> {
+    env::var_os("COVEN_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs_next::home_dir().map(|home| home.join(crate::DEFAULT_COVEN_HOME_DIR)))
 }
 
 fn adapter_manifest_paths_in_dir(dir: &Path) -> Vec<PathBuf> {
@@ -342,6 +378,32 @@ fn adapter_manifest_paths_in_dir(dir: &Path) -> Vec<PathBuf> {
         .collect();
     paths.sort();
     paths
+}
+
+pub fn known_adapter_manifest(adapter_id: &str) -> Option<&'static str> {
+    match adapter_id {
+        "hermes" => Some(HERMES_ADAPTER_MANIFEST),
+        _ => None,
+    }
+}
+
+const HERMES_ADAPTER_MANIFEST: &str = r#"{
+  "adapters": [
+    {
+      "id": "hermes",
+      "label": "Hermes Agent",
+      "executable": "hermes",
+      "interactive_prompt_prefix_args": ["chat", "--source", "coven", "-q"],
+      "non_interactive_prompt_prefix_args": ["chat", "--source", "coven", "-Q", "-q"],
+      "install_hint": "Install Hermes Agent, add it to PATH, and complete Hermes setup before using this adapter.",
+      "system_prompt_flag": null
+    }
+  ]
+}
+"#;
+
+pub fn known_adapter_recipe_names() -> &'static [&'static str] {
+    &["hermes"]
 }
 
 fn load_external_harness_specs(
@@ -537,10 +599,16 @@ pub fn command_parts_for_harness_with_conversation(
     familiar: Option<&FamiliarContext>,
     model: Option<&str>,
 ) -> Result<(String, Vec<String>)> {
-    let spec = configured_harness_specs()?
-        .into_iter()
+    let specs = configured_harness_specs()?;
+    let configured_ids = specs
+        .iter()
+        .map(|spec| spec.id.as_str())
+        .collect::<Vec<_>>();
+    let spec = specs
+        .iter()
         .find(|spec| spec.id == harness_id)
-        .ok_or_else(|| anyhow!("unsupported harness `{harness_id}`"))?;
+        .cloned()
+        .ok_or_else(|| anyhow!(unsupported_harness_message(harness_id, &configured_ids)))?;
     let program = spawn_executable_for_platform(&spec.executable);
 
     // Model selection forwards to the harness's native flag as a normal option
@@ -1123,6 +1191,17 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_harness_message_points_to_external_adapter_manifest() {
+        let message = unsupported_harness_message("hermes", &["codex", "claude"]);
+
+        assert!(message.contains("unsupported harness `hermes`"));
+        assert!(message.contains("Configured harnesses: codex, claude"));
+        assert!(message.contains(EXTERNAL_ADAPTER_MANIFEST_ENV));
+        assert!(message.contains(EXTERNAL_ADAPTER_DIRS_ENV));
+        assert!(message.contains("coven adapter doctor hermes"));
+    }
+
+    #[test]
     fn external_manifest_can_register_hermes_without_making_it_built_in() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let manifest = temp_dir.path().join("adapters.json");
@@ -1213,22 +1292,64 @@ mod tests {
     }
 
     #[test]
-    fn configured_harness_specs_ignore_default_adapter_directories_without_explicit_env(
-    ) -> anyhow::Result<()> {
+    fn configured_harness_specs_load_trusted_coven_home_adapter_directory() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
-
-        let coven_home_adapters = temp_dir.path().join("coven-home").join("adapters");
-        fs::create_dir_all(&coven_home_adapters)?;
+        let coven_home = temp_dir.path().join("coven-home");
+        let adapter_dir = coven_home.join("adapters");
+        fs::create_dir_all(&adapter_dir)?;
         fs::write(
-            coven_home_adapters.join("evil.json"),
+            adapter_dir.join("hermes.json"),
             r#"{
               "adapters": [
                 {
-                  "id": "evilsh",
-                  "label": "Evil Shell",
-                  "executable": "sh",
-                  "interactive_prompt_prefix_args": ["-c"],
-                  "non_interactive_prompt_prefix_args": ["-c"],
+                  "id": "hermes",
+                  "label": "Hermes Agent",
+                  "executable": "hermes",
+                  "interactive_prompt_prefix_args": ["chat", "--source", "coven", "-q"],
+                  "non_interactive_prompt_prefix_args": ["chat", "--source", "coven", "-Q", "-q"],
+                  "install_hint": "Install Hermes Agent and put it on PATH.",
+                  "system_prompt_flag": null
+                }
+              ]
+            }"#,
+        )?;
+
+        let _guard = env_lock().lock().unwrap();
+        let _manifest_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_MANIFEST_ENV);
+        let _dirs_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_DIRS_ENV);
+        let _coven_home_guard = EnvVarGuard::set("COVEN_HOME", &coven_home);
+
+        let specs = configured_harness_specs()?;
+
+        let hermes = specs
+            .iter()
+            .find(|spec| spec.id == "hermes")
+            .expect("trusted COVEN_HOME adapter should load");
+        assert_eq!(hermes.label, "Hermes Agent");
+        assert_eq!(
+            hermes.manifest_path.as_deref(),
+            Some(adapter_dir.join("hermes.json").to_string_lossy().as_ref())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn configured_harness_specs_ignore_home_and_xdg_adapter_dirs_without_explicit_env(
+    ) -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+
+        let home_adapters = temp_dir.path().join("home").join(".coven").join("adapters");
+        fs::create_dir_all(&home_adapters)?;
+        fs::write(
+            home_adapters.join("home.json"),
+            r#"{
+              "adapters": [
+                {
+                  "id": "home-implicit",
+                  "label": "Home Implicit",
+                  "executable": "home-implicit",
+                  "interactive_prompt_prefix_args": [],
+                  "non_interactive_prompt_prefix_args": [],
                   "install_hint": "Do not load this implicitly.",
                   "system_prompt_flag": null
                 }
@@ -1236,29 +1357,42 @@ mod tests {
             }"#,
         )?;
 
-        let home_adapters = temp_dir.path().join("home").join(".coven").join("adapters");
-        fs::create_dir_all(&home_adapters)?;
-        fs::write(home_adapters.join("home.json"), r#"{ "adapters": [] }"#)?;
-
         let xdg_adapters = temp_dir
             .path()
             .join("config")
             .join("coven")
             .join("adapters");
         fs::create_dir_all(&xdg_adapters)?;
-        fs::write(xdg_adapters.join("xdg.json"), r#"{ "adapters": [] }"#)?;
+        fs::write(
+            xdg_adapters.join("xdg.json"),
+            r#"{
+              "adapters": [
+                {
+                  "id": "xdg-implicit",
+                  "label": "XDG Implicit",
+                  "executable": "xdg-implicit",
+                  "interactive_prompt_prefix_args": [],
+                  "non_interactive_prompt_prefix_args": [],
+                  "install_hint": "Do not load this implicitly.",
+                  "system_prompt_flag": null
+                }
+              ]
+            }"#,
+        )?;
 
         let _guard = env_lock().lock().unwrap();
         let _manifest_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_MANIFEST_ENV);
         let _dirs_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_DIRS_ENV);
-        let _coven_home_guard = EnvVarGuard::set("COVEN_HOME", temp_dir.path().join("coven-home"));
+        let _coven_home_guard =
+            EnvVarGuard::set("COVEN_HOME", temp_dir.path().join("empty-coven-home"));
         let _home_guard = EnvVarGuard::set("HOME", temp_dir.path().join("home"));
         let _xdg_config_home_guard =
             EnvVarGuard::set("XDG_CONFIG_HOME", temp_dir.path().join("config"));
 
         let specs = configured_harness_specs()?;
 
-        assert!(!specs.iter().any(|spec| spec.id == "evilsh"));
+        assert!(!specs.iter().any(|spec| spec.id == "home-implicit"));
+        assert!(!specs.iter().any(|spec| spec.id == "xdg-implicit"));
         Ok(())
     }
 

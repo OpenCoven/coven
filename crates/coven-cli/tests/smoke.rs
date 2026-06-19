@@ -308,6 +308,36 @@ fn doctor_reports_live_daemon_socket_status() -> anyhow::Result<()> {
 }
 
 #[test]
+fn adapter_install_hermes_writes_trusted_manifest() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let coven = coven_bin();
+
+    let install = run_coven(
+        &coven,
+        &coven_home,
+        &path,
+        &["adapter", "install", "hermes"],
+    )?;
+
+    assert_success("adapter install hermes", &install);
+    assert_stdout_contains(
+        "adapter install hermes",
+        &install,
+        "Installed adapter `hermes`",
+    );
+    assert!(coven_home.join("adapters").join("hermes.json").exists());
+
+    let doctor = run_coven(&coven, &coven_home, &path, &["adapter", "doctor", "hermes"])?;
+
+    assert_success("adapter doctor hermes", &doctor);
+    assert_stdout_contains("adapter doctor hermes", &doctor, "Hermes Agent");
+    assert_stdout_contains("adapter doctor hermes", &doctor, "manifest:");
+    Ok(())
+}
+
+#[test]
 fn smoke_daemon_session_replay_and_safe_session_rituals() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let coven_home = temp_dir.path().join("coven-home");

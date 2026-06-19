@@ -38,7 +38,15 @@ Install and authenticate at least one harness CLI before expecting `coven run` t
 
 ## Windows notes
 
+- `coven doctor` should work in PowerShell even when the `HOME` environment variable is absent. Coven resolves its default store from `COVEN_HOME`, `HOME`, `USERPROFILE`, `HOMEDRIVE` + `HOMEPATH`, or the platform home directory.
 - Keep `COVEN_HOME` on a local path owned by your Windows user when you override it.
+- To override the store path in PowerShell, use:
+
+```powershell
+$env:COVEN_HOME="$env:USERPROFILE\.coven"
+coven doctor
+```
+
 - Run Coven and your harness CLI from the same environment. A harness installed only inside WSL2 is not available to native Windows PowerShell unless you expose it separately.
 - If terminal input behaves oddly, update to the latest wrapper and run `coven tui` again. The Windows TUI filters key-press events so typed characters, arrows, and Enter should be handled once.
 
