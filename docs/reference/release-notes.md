@@ -6,6 +6,17 @@ read_when:
 title: "Coven changelog and release notes"
 ---
 
+## Week of June 18, 2026
+
+### New features
+
+- **Trusted Hermes adapter recipe (v0.0.41).** `coven adapter install hermes` now writes a trusted local adapter manifest under `COVEN_HOME/adapters/hermes.json`, and Coven loads manifests from that Coven-owned trust store automatically. New users no longer need to hand-write JSON or set `COVEN_HARNESS_ADAPTER_MANIFEST` just to try Hermes. See [Hermes harness notes](/harnesses/hermes) and [PR #245](https://github.com/OpenCoven/coven/pull/245).
+
+### Bug fixes
+
+- **Clearer unsupported-harness guidance.** Unknown harness errors now show configured harness ids and point Hermes users directly to `coven adapter install hermes` followed by `coven adapter doctor hermes`; other external harnesses still use trusted adapter manifests or the explicit manifest environment variables.
+- **Windows home-directory fallback.** `coven doctor` and store-path resolution now work in PowerShell environments where `HOME` is absent by falling back through `USERPROFILE`, `HOMEDRIVE` + `HOMEPATH`, and the platform home directory before asking users to set `COVEN_HOME`.
+
 ## Week of June 3, 2026
 
 ### New features
