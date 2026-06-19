@@ -98,6 +98,39 @@ The Rust daemon is the authority boundary. All clients — including the CLI its
 
 ---
 
+## Requirements
+
+| Requirement                  | Notes                                                                       |
+| ---------------------------- | --------------------------------------------------------------------------- |
+| **Rust stable toolchain**    | Required only when building from source                                     |
+| **Git**                      | Required                                                                    |
+| **macOS or Linux**           | Daemon socket and PTY behavior; Windows x64 support staged for next release |
+| **Node.js 18+**              | Required only for npm wrapper or package/plugin development                 |
+| **At least one harness CLI** | Codex and/or Claude Code (see below)                                        |
+
+### Installing harness CLIs
+
+Run `coven doctor` first — it prints specific install hints for any missing harness.
+
+**Codex (OpenAI):**
+
+```bash
+npm install -g @openai/codex
+# or: brew install --cask codex
+codex login
+```
+
+**Claude Code (Anthropic):**
+
+```bash
+npm install -g @anthropic-ai/claude-code
+claude doctor
+```
+
+After installing and authenticating, run `coven doctor` again to confirm the harness is detected. If `doctor` still reports missing, ensure the harness binary is on your `PATH`.
+
+---
+
 ## Install
 
 Coven is available as an npm wrapper for the fastest install, or you can build from source.
@@ -178,39 +211,6 @@ coven patch openclaw
 ```
 
 Choose a repo, choose a harness, get a verified patch.
-
----
-
-## Requirements
-
-| Requirement                  | Notes                                                                       |
-| ---------------------------- | --------------------------------------------------------------------------- |
-| **Rust stable toolchain**    | Required only when building from source                                     |
-| **Git**                      | Required                                                                    |
-| **macOS or Linux**           | Daemon socket and PTY behavior; Windows x64 support staged for next release |
-| **Node.js 18+**              | Required only for npm wrapper or package/plugin development                 |
-| **At least one harness CLI** | Codex and/or Claude Code (see below)                                        |
-
-### Installing harness CLIs
-
-Run `coven doctor` first — it prints specific install hints for any missing harness.
-
-**Codex (OpenAI):**
-
-```bash
-npm install -g @openai/codex
-# or: brew install --cask codex
-codex login
-```
-
-**Claude Code (Anthropic):**
-
-```bash
-npm install -g @anthropic-ai/claude-code
-claude doctor
-```
-
-After installing and authenticating, run `coven doctor` again to confirm the harness is detected. If `doctor` still reports missing, ensure the harness binary is on your `PATH`.
 
 ---
 
