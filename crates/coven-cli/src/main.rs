@@ -597,20 +597,36 @@ fn coven_code_binary() -> Option<PathBuf> {
 }
 
 fn coven_code_binary_from(path_var: Option<&OsStr>, home: Option<&Path>) -> Option<PathBuf> {
-    let suffix = if cfg!(windows) { ".exe" } else { "" };
-    let name = format!("coven-code{suffix}");
+    let names: &[&str] = if cfg!(windows) {
+        &["coven-code.exe", "coven-code.cmd", "coven-code.bat"]
+    } else {
+        &["coven-code"]
+    };
+    coven_code_binary_from_names(path_var, home, names)
+}
+
+fn coven_code_binary_from_names(
+    path_var: Option<&OsStr>,
+    home: Option<&Path>,
+    names: &[&str],
+) -> Option<PathBuf> {
     if let Some(path_var) = path_var {
         for dir in std::env::split_paths(path_var) {
-            let candidate = dir.join(&name);
-            if is_executable_file(&candidate) {
-                return Some(candidate);
+            for name in names {
+                let candidate = dir.join(name);
+                if is_executable_file(&candidate) {
+                    return Some(candidate);
+                }
             }
         }
     }
     if let Some(home) = home {
-        let candidate = home.join(".coven-code").join("bin").join(&name);
-        if is_executable_file(&candidate) {
-            return Some(candidate);
+        let bin_dir = home.join(".coven-code").join("bin");
+        for name in names {
+            let candidate = bin_dir.join(name);
+            if is_executable_file(&candidate) {
+                return Some(candidate);
+            }
         }
     }
     None
@@ -3186,5 +3202,29 @@ mod tests {
     fn coven_code_binary_lookup_returns_none_for_empty_path() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(coven_code_binary_from(Some(OsStr::new("")), Some(tmp.path())).is_none());
+    }
+
+    #[test]
+    fn coven_code_binary_lookup_finds_windows_npm_cmd_shim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shim = tmp.path().join("coven-code.cmd");
+        std::fs::write(&shim, "@echo off\r\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&shim).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&shim, permissions).unwrap();
+        }
+        let path_var = std::env::join_paths([tmp.path()]).unwrap();
+
+        assert_eq!(
+            coven_code_binary_from_names(
+                Some(path_var.as_os_str()),
+                None,
+                &["coven-code.exe", "coven-code.cmd", "coven-code.bat"]
+            ),
+            Some(shim)
+        );
     }
 }
