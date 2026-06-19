@@ -240,6 +240,16 @@ Choose a repo, choose a harness, get a verified patch.
 | `coven run <harness> <prompt>`                 | Launch a project-scoped harness session                          |
 | `coven run <harness> <prompt> --cwd <path>`    | Launch from a cwd inside the project root                        |
 | `coven run <harness> <prompt> --title <title>` | Set a readable session title                                     |
+| `coven run <harness> <prompt> --model <id>`    | Forward a model override to the harness                          |
+| `coven run <harness> --continue`               | Resume the latest active session for this project                |
+| `coven run <harness> --continue <id>`          | Resume a specific session by id                                  |
+| `coven run <harness> <prompt> --detach`        | Create the session record without launching the harness          |
+| `coven run <harness> <prompt> --labels <l>`    | Attach comma-separated labels to the session                     |
+| `coven run <harness> <prompt> --visibility <v>`| Set visibility: `private` (default), `workspace`, or `shared`   |
+| `coven run <harness> <prompt> --archive`       | Auto-archive the session when the run completes                  |
+| `coven run <harness> <prompt> --familiar <id>` | Inject a familiar identity preamble (e.g. `--familiar charm`)    |
+| `coven run <harness> <prompt> --stream-json`   | Emit JSONL events on stdout (for tooling/piping)                 |
+| `coven run claude <p> --stream-json --stream-json-input` | Also read JSONL user messages from stdin             |
 | `coven sessions`                               | Open the session browser in a terminal; print a table when piped |
 | `coven sessions --all`                         | Browse active and archived sessions; print all when piped        |
 | `coven sessions --manage`                      | Force the interactive session browser                            |
