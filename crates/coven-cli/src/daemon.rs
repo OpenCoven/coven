@@ -1263,6 +1263,10 @@ fn background_server_status_with_controller(
         return Ok(Some(DaemonStatusState::Stale(status)));
     }
 
+    if let Some(recovered) = recover_missing_status_from_default_socket(coven_home, controller)? {
+        return Ok(Some(recovered));
+    }
+
     clear_status_and_socket(coven_home)?;
     Ok(None)
 }
