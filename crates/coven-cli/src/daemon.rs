@@ -3467,7 +3467,9 @@ mod tests {
                 .into_owned(),
         };
         let stale = DaemonStatus {
-            pid: u32::MAX,
+            // Keep this within the range Linux `kill -0` treats as a plain
+            // PID; u32::MAX can be interpreted as -1 by the shell utility.
+            pid: 999_999,
             started_at: "2026-04-27T09:00:00Z".to_string(),
             socket: daemon_socket_path(temp_dir.path())
                 .to_string_lossy()
