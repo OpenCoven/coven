@@ -585,6 +585,7 @@ dependencies = [
  "toml_edit",
  "unicode-width",
  "uuid",
+ "widestring",
  "windows-sys 0.61.2",
 ]
 

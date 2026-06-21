@@ -2202,78 +2202,18 @@ fn parse_request_line(line: &str) -> Result<(&str, &str)> {
     Ok((method, path))
 }
 
-/// After binding a named pipe listener, restrict its DACL to owner-only access.
-/// This is the equivalent of `chmod 0600` on a Unix socket.
-///
-/// # Safety
-/// Caller must ensure `handle` is a valid open pipe handle.
 #[cfg(windows)]
-unsafe fn restrict_pipe_to_owner(handle: windows_sys::Win32::Foundation::HANDLE) -> Result<()> {
-    use windows_sys::Win32::{
-        Foundation::LocalFree,
-        Security::{
-            Authorization::{
-                ConvertStringSecurityDescriptorToSecurityDescriptorW, SetSecurityInfo,
-                SE_KERNEL_OBJECT,
-            },
-            GetSecurityDescriptorDacl, DACL_SECURITY_INFORMATION,
-        },
-    };
+fn owner_only_pipe_security_descriptor(
+) -> Result<interprocess::os::windows::security_descriptor::SecurityDescriptor> {
+    use interprocess::os::windows::security_descriptor::SecurityDescriptor;
+    use widestring::U16CString;
 
-    struct LocalSecurityDescriptor(*mut std::ffi::c_void);
-
-    impl Drop for LocalSecurityDescriptor {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                // SAFETY: ConvertStringSecurityDescriptorToSecurityDescriptorW allocates the
-                // descriptor with LocalAlloc; LocalFree is the required deallocator.
-                unsafe { LocalFree(self.0 as _) };
-            }
-        }
-    }
-
-    // D:(A;;GA;;;OW) — Allow Generic All for the object Owner.
-    let sddl = windows_sys::w!("D:(A;;GA;;;OW)");
-    let mut raw_sd: *mut std::ffi::c_void = std::ptr::null_mut();
-    let mut sd_len: u32 = 0;
-    if ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, &mut raw_sd, &mut sd_len) == 0
-    {
-        anyhow::bail!(
-            "failed to build owner-only security descriptor: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    let sd = LocalSecurityDescriptor(raw_sd);
-
-    let mut present = 0i32;
-    let mut acl_ptr = std::ptr::null_mut();
-    let mut defaulted = 0i32;
-    if GetSecurityDescriptorDacl(sd.0, &mut present, &mut acl_ptr, &mut defaulted) == 0 {
-        anyhow::bail!(
-            "failed to extract owner-only named pipe DACL: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    if present == 0 || acl_ptr.is_null() {
-        anyhow::bail!("owner-only named pipe DACL was not present in security descriptor");
-    }
-
-    let rc = SetSecurityInfo(
-        handle,
-        SE_KERNEL_OBJECT,
-        DACL_SECURITY_INFORMATION,
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        acl_ptr,
-        std::ptr::null_mut(),
-    );
-    if rc != 0 {
-        anyhow::bail!(
-            "SetSecurityInfo failed on named pipe: {}",
-            std::io::Error::from_raw_os_error(rc as i32)
-        );
-    }
-    Ok(())
+    // D:(A;;GA;;;OW) — allow Generic All for the object owner only. This is the
+    // Windows named-pipe equivalent of binding a Unix socket with mode 0600.
+    let sddl = U16CString::from_str("D:(A;;GA;;;OW)")
+        .context("failed to encode owner-only named pipe security descriptor")?;
+    SecurityDescriptor::deserialize(&sddl)
+        .context("failed to build owner-only named pipe security descriptor")
 }
 
 #[cfg(windows)]
@@ -2283,7 +2223,10 @@ fn windows_pipe_name(coven_home: &Path) -> String {
 
 #[cfg(windows)]
 pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&str>) -> Result<()> {
-    use interprocess::local_socket::{prelude::*, GenericNamespaced, ListenerOptions};
+    use interprocess::{
+        local_socket::{prelude::*, GenericNamespaced, ListenerOptions},
+        os::windows::local_socket::ListenerOptionsExt,
+    };
     use std::sync::Arc;
 
     let _ = tcp_addr; // TCP not wired on Windows in this prototype
@@ -2299,27 +2242,12 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
     let name = windows_pipe_name(coven_home)
         .to_ns_name::<GenericNamespaced>()
         .context("failed to create named pipe name")?;
+    let security_descriptor = owner_only_pipe_security_descriptor()?;
     let listener = ListenerOptions::new()
         .name(name)
+        .security_descriptor(security_descriptor)
         .create_sync()
         .context("failed to bind Windows named pipe")?;
-
-    // Restrict the pipe to owner-only access immediately after creation. If hardening
-    // fails, return an error instead of serving the unauthenticated daemon API on a
-    // pipe that still has Windows' default security descriptor.
-    use std::os::windows::io::AsRawHandle;
-    let raw_handle = match &listener {
-        interprocess::local_socket::Listener::NamedPipe(named_pipe) => {
-            named_pipe.as_ref().as_raw_handle()
-        }
-    };
-    let hardening_result =
-        unsafe { restrict_pipe_to_owner(raw_handle as windows_sys::Win32::Foundation::HANDLE) }
-            .context("failed to restrict Windows named pipe to the current owner");
-    if let Err(error) = hardening_result {
-        let _ = clear_status(coven_home);
-        return Err(error);
-    }
 
     let runtime = Arc::new(LiveSessionRuntime::with_coven_home(
         coven_home.to_path_buf(),
@@ -3872,6 +3800,13 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
         assert!(response.contains("\"apiVersion\""), "got: {response}");
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn owner_only_pipe_security_descriptor_parses_sddl() -> Result<()> {
+        owner_only_pipe_security_descriptor()?;
         Ok(())
     }
 
