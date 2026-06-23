@@ -204,16 +204,50 @@ pub fn open_store(path: &Path) -> Result<Connection> {
     ensure_visibility_column(&conn)?;
     ensure_familiar_id_column(&conn)?;
 
-    // Backfill: copy any existing events into the FTS index. Safe on fresh dbs.
-    conn.execute(
-        "INSERT INTO events_fts(rowid, payload_json)
-         SELECT e.rowid, e.payload_json
-         FROM events e
-         LEFT JOIN events_fts f ON f.rowid = e.rowid
-         WHERE f.rowid IS NULL",
-        [],
-    )
-    .context("failed to backfill events_fts")?;
+    // Backfill: index any events that predate the FTS table (a one-time
+    // migration of a pre-FTS store). After the table+triggers exist, every new
+    // event is indexed by the `events_fts_insert` trigger, so this only matters
+    // on the first open after upgrade.
+    //
+    // Two things are deliberate here:
+    //
+    // 1. Probe with a READ before writing. `open_store` runs on EVERY
+    //    connection, and the daemon opens a fresh connection per API request
+    //    (see api.rs). An unconditional write means every request grabs the WAL
+    //    write lock just to open the store. Under concurrency (the chat bridge
+    //    firing several requests while the harness streams events) those opens
+    //    pile up on the single WAL writer; once the wait exceeds `busy_timeout`
+    //    the open fails with SQLITE_BUSY ("database is locked") and the whole
+    //    request dies. The probe takes only a SHARED lock and never contends
+    //    with the writer, so the steady-state open path does zero writes.
+    //
+    // 2. Rebuild via the FTS5 'rebuild' command, not an `INSERT ... SELECT`
+    //    dedup join. `events_fts` is an external-content table, so its `rowid`
+    //    resolves through the content (`events`) table — `LEFT JOIN events_fts
+    //    f ON f.rowid = e.rowid WHERE f.rowid IS NULL` is therefore ALWAYS
+    //    empty and the old backfill silently indexed nothing. 'rebuild'
+    //    repopulates the index from the content table the way FTS5 intends.
+    //
+    // The emptiness probe reads `events_fts_docsize` — FTS5's shadow table with
+    // one row per *indexed* document — not `events_fts` itself. A plain
+    // `SELECT ... FROM events_fts` walks the external content rowids and so
+    // looks non-empty even when nothing is indexed; `_docsize` reflects the
+    // real index, so it correctly reports "freshly created, never populated".
+    let index_is_empty: bool = conn
+        .query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM events_fts_docsize)",
+            [],
+            |row| row.get(0),
+        )
+        .context("failed to probe events_fts index state")?;
+    let has_events: bool = conn
+        .query_row("SELECT EXISTS(SELECT 1 FROM events)", [], |row| row.get(0))
+        .context("failed to probe events for backfill")?;
+
+    if index_is_empty && has_events {
+        conn.execute("INSERT INTO events_fts(events_fts) VALUES('rebuild')", [])
+            .context("failed to backfill events_fts")?;
+    }
 
     Ok(conn)
 }
@@ -1944,6 +1978,51 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].event_id, "e1");
         assert_eq!(hits[0].session_id, "s1");
+        Ok(())
+    }
+
+    #[test]
+    fn open_store_backfills_events_predating_the_fts_index() -> Result<()> {
+        // Reproduce a real pre-FTS store: `sessions`/`events` populated before
+        // the FTS index and its triggers existed (so the rows were never
+        // trigger-indexed). The first `open_store` after upgrade must index
+        // them via the backfill — and the *conditional* backfill must behave
+        // exactly like the original unconditional one.
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("test.sqlite3");
+        let legacy = Connection::open(&path)?;
+        legacy.execute_batch(
+            "CREATE TABLE sessions (
+                 id TEXT PRIMARY KEY NOT NULL, project_root TEXT NOT NULL,
+                 harness TEXT NOT NULL, title TEXT NOT NULL, status TEXT NOT NULL,
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+             );
+             CREATE TABLE events (
+                 id TEXT PRIMARY KEY NOT NULL, session_id TEXT NOT NULL,
+                 kind TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL
+             );
+             INSERT INTO sessions(id, project_root, harness, title, status, created_at, updated_at)
+                 VALUES('s1', '/tmp', 'codex', 't', 'created', '2026-01-01', '2026-01-01');
+             INSERT INTO events(id, session_id, kind, payload_json, created_at)
+                 VALUES('e1', 's1', 'stdout', '{\"text\":\"phoenix rises\"}', '2026-01-01');",
+        )?;
+        drop(legacy);
+
+        // Upgrade open: creates events_fts + triggers, then backfills the
+        // pre-existing event (no trigger ever fired for it).
+        let upgraded = open_store(&path)?;
+        let hits = search_events(&upgraded, "phoenix")?;
+        assert_eq!(
+            hits.len(),
+            1,
+            "pre-FTS event should be backfilled into the index"
+        );
+        assert_eq!(hits[0].event_id, "e1");
+
+        // Re-opening an already-indexed store stays a no-op and keeps working.
+        drop(upgraded);
+        let reopened = open_store(&path)?;
+        assert_eq!(search_events(&reopened, "phoenix")?.len(), 1);
         Ok(())
     }
 
