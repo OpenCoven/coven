@@ -138,7 +138,7 @@ Known client shapes:
 - `coven` CLI/TUI.
 - comux legacy/reference cockpit.
 - external OpenClaw plugin package `@opencoven/coven`.
-- future OpenMeow or desktop intake surfaces.
+- future desktop intake surfaces.
 
 Clients are convenience layers, not trust roots.
 

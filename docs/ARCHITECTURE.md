@@ -23,7 +23,6 @@ flowchart LR
     Comux["comux cockpit"]
     OpenClaw[OpenClaw]
     Plugin["@opencoven/coven plugin"]
-    OpenMeow["OpenMeow chat / intent client"]
   end
 
   subgraph DaemonCore["Daemon core"]
@@ -54,7 +53,6 @@ flowchart LR
   Comux -->|"HTTP over Unix socket"| Daemon
   OpenClaw --> Plugin
   Plugin -->|"HTTP over Unix socket"| Daemon
-  OpenMeow -->|"capabilities + actions"| Daemon
 
   Daemon --> Control
   Control --> Policy
@@ -147,9 +145,9 @@ flowchart TD
   style Ledger      fill:#86efac,stroke:#16a34a,color:#000
 ```
 
-## OpenMeow / automation boundary
+## Intake / automation boundary
 
-OpenMeow should remain a chat UI, local echo/optimistic rendering surface, intent-capture layer, and tiny fast-path host for ultra-simple local actions. It should not become the automation engine.
+The chat/intake client should remain a chat UI, local echo/optimistic rendering surface, intent-capture layer, and tiny fast-path host for ultra-simple local actions. It should not become the automation engine.
 
 Coven is the canonical shared local runtime for reusable automation because it centralizes:
 
@@ -163,11 +161,11 @@ Coven is the canonical shared local runtime for reusable automation because it c
 The intended flow is:
 
 ```text
-user -> OpenMeow -> Coven -> adapters -> desktop/apps
-desktop/apps -> Coven -> OpenMeow UI updates
+user -> chat/intake client -> Coven -> adapters -> desktop/apps
+desktop/apps -> Coven -> chat/intake client UI updates
 ```
 
-`GET /api/v1/capabilities` lets OpenMeow and other clients discover what Coven can route. `POST /api/v1/actions` gives clients a stable intent envelope without coupling them directly to brittle OS automation APIs.
+`GET /api/v1/capabilities` lets the chat/intake client and other clients discover what Coven can route. `POST /api/v1/actions` gives clients a stable intent envelope without coupling them directly to brittle OS automation APIs.
 
 ## Current user-facing surface
 

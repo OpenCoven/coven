@@ -49,7 +49,7 @@ write_stub start/showcase.md "Showcase" \
     Two supported harnesses, more on the way through the adapter spec.
   </Card>
   <Card title=\"comux JSON sessions\" icon=\"braces\" href=\"/sessions/comux-json\">
-    Session shape that comux, OpenMeow, and external clients can replay.
+    Session shape that comux and external clients can replay.
   </Card>
   <Card title=\"Rituals over flags\" icon=\"moon\" href=\"/rituals\">
     Archive, summon, sacrifice — explicit verbs around destructive operations.
@@ -219,12 +219,12 @@ write_stub start/coven-tui.md "Coven TUI" \
 The TUI is the recommended starting point for new users."
 
 write_stub start/automation.md "Automation overview" \
-  "Where automation lives in the Coven stack and how it relates to OpenMeow." \
+  "Where automation lives in the Coven stack and how it relates to the chat/intake client." \
   "Choosing where to put automation that calls Coven" \
-"Coven is the canonical shared local runtime for reusable automation. OpenMeow stays a chat UI and intent layer. The flow is:
+"Coven is the canonical shared local runtime for reusable automation. The chat/intake client stays a chat UI and intent layer. The flow is:
 
 \`\`\`text
-user -> OpenMeow -> Coven -> adapters -> desktop/apps
+user -> chat/intake client -> Coven -> adapters -> desktop/apps
 \`\`\`
 
 See [Automation](/automation) for the full surface."
@@ -250,7 +250,7 @@ write_stub concepts/features.md "Features" \
     Versioned HTTP-over-Unix-socket contract under \`/api/v1\`.
   </Card>
   <Card title=\"Control plane\" icon=\"compass\">
-    Capability discovery + action routing for clients like comux and OpenMeow.
+    Capability discovery + action routing for clients like comux.
   </Card>
 </Columns>"
 
@@ -262,7 +262,6 @@ flowchart LR
   User[Developer] --> CLI[coven CLI / TUI]
   CLI --> Daemon[Coven daemon]
   Comux[comux] --> Daemon
-  OpenMeow[OpenMeow] --> Daemon
   Plugin[@opencoven/coven plugin] --> Daemon
   Daemon --> Adapter[Adapter router]
   Adapter --> Codex[Codex PTY]

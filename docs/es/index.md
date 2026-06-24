@@ -37,7 +37,7 @@ description: "Coven es un runtime local-first que supervisa CLIs de agentes de c
 
 ## ¿Qué es Coven?
 
-Coven es un **sustrato de runtime local-first**: un único daemon en Rust que posee los PTYs de los harnesses, el estado de las sesiones y un registro append-only de eventos en tu propia máquina. Clientes como la CLI/TUI `coven`, el cockpit comux, OpenMeow y el plugin externo OpenClaw coordinan a través de un único contrato versionado HTTP-sobre-socket-Unix.
+Coven es un **sustrato de runtime local-first**: un único daemon en Rust que posee los PTYs de los harnesses, el estado de las sesiones y un registro append-only de eventos en tu propia máquina. Clientes como la CLI/TUI `coven`, el cockpit comux y el plugin externo OpenClaw coordinan a través de un único contrato versionado HTTP-sobre-socket-Unix.
 
 **¿Para quién es?** Desarrolladores y operadores que quieren que sus familiares de IA sigan ejecutándose localmente, recuerden lo que hicieron y permanezcan dentro de límites del proyecto que puedas auditar.
 
@@ -57,7 +57,6 @@ Coven es un **sustrato de runtime local-first**: un único daemon en Rust que po
 flowchart LR
   A["coven CLI / TUI"] --> B["Coven daemon"]
   C["comux cockpit"] --> B
-  D["OpenMeow"] --> B
   E["@opencoven/coven plugin"] --> B
   B --> F["Codex PTY"]
   B --> G["Claude Code PTY"]
@@ -87,7 +86,7 @@ El daemon es la única fuente de verdad para las sesiones, el ciclo de vida del 
     `GET /api/v1/health` primero; luego sesiones, eventos, capabilities y acciones por socket Unix.
   </Card>
   <Card title="Integración de clientes" icon="plug-zap" href="/CLIENT-INTEGRATION">
-    comux, OpenMeow y el puente OpenClaw se integran como clientes del socket, no como autoridades de lanzamiento.
+    comux y el puente OpenClaw se integran como clientes del socket, no como autoridades de lanzamiento.
   </Card>
 </Columns>
 
@@ -163,7 +162,7 @@ coven daemon restart
     Configuración por harness, límite de auth del proveedor y expectativas del adaptador.
   </Card>
   <Card title="API local" href="/API" icon="plug">
-    API por socket versionada para comux, OpenMeow, plugin OpenClaw y tus propios clientes.
+    API por socket versionada para comux, plugin OpenClaw y tus propios clientes.
   </Card>
   <Card title="Sesiones" href="/SESSION-LIFECYCLE" icon="moon">
     Archive, summon y sacrifice — los verbos seguros para principiantes alrededor del estado de sesión.

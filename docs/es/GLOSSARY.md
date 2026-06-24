@@ -48,7 +48,7 @@ Una funcionalidad del daemon o del adaptador descubrible devuelta por `GET /api/
 
 ## Cliente
 
-Cualquier proceso o UI que habla con el daemon de Coven, incluida la CLI, comux, OpenMeow o el plugin de OpenClaw.
+Cualquier proceso o UI que habla con el daemon de Coven, incluida la CLI, comux o el plugin de OpenClaw.
 
 ## comux
 

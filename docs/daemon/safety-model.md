@@ -56,7 +56,7 @@ Coven's destructive operations require explicit confirmation:
 - `coven pc relief --confirm` — kill processes or clear caches.
 - `coven patch openclaw` — never commits or pushes in v0.
 
-Clients that wrap Coven (CastCodes, comux, OpenMeow, OpenClaw plugin) must surface the same confirmations and never strip them.
+Clients that wrap Coven (CastCodes, comux, OpenClaw plugin) must surface the same confirmations and never strip them.
 
 ## Related
 

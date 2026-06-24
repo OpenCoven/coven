@@ -37,7 +37,7 @@ The local-first AI coding workspace powered by Coven. CastCodes is the primary p
 
 ## Client
 
-Any process or UI that talks to the Coven daemon. CastCodes is the primary public client; the CLI, comux, OpenMeow, and the OpenClaw plugin are operator, legacy, or advanced client shapes.
+Any process or UI that talks to the Coven daemon. CastCodes is the primary public client; the CLI, comux, and the OpenClaw plugin are operator, legacy, or advanced client shapes.
 
 ## comux
 

@@ -79,7 +79,7 @@ Coven is the local runtime substrate. CastCodes is the primary workspace and pub
 
 comux proved visible terminal-cockpit primitives such as panes, worktree isolation, agent launchers, rituals, diff review, merge/PR cleanup, lifecycle hooks, and Coven session visibility. Those primitives should fold into CastCodes-native concepts instead of positioning comux as a second flagship cockpit.
 
-OpenClaw can delegate project-scoped harness launches to Coven only through the external `@opencoven/coven` plugin, not through bundled OpenClaw core code. OpenMeow-like surfaces may consume Coven session status, intake, or notifications where useful, but they are advanced integration paths rather than the beginner product story.
+OpenClaw can delegate project-scoped harness launches to Coven only through the external `@opencoven/coven` plugin, not through bundled OpenClaw core code. Chat/intake surfaces may consume Coven session status, intake, or notifications where useful, but they are advanced integration paths rather than the beginner product story.
 
 Coven should integrate with these projects without being owned by any one of them: it is the room where harnesses run, while CastCodes is the product where most users should feel that runtime.
 

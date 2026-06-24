@@ -17,7 +17,7 @@ OpenCoven está construyendo un workspace de agentes local-first donde harnesses
 
 - **Coven** es el sustrato de runtime: sesiones de harness limitadas al proyecto, PTYs, logs y APIs locales.
 - **comux** es el cockpit: paneles visibles, worktrees, carriles de agente, rituales, revisión y flujo de merge.
-- **Integraciones OpenMeow / OpenClaw** son superficies de captura y orquestación que pueden entregar trabajo al mismo runtime local sin ocultar lo que pasó.
+- **Las superficies de captura y la integración con OpenClaw** son superficies de captura y orquestación que pueden entregar trabajo al mismo runtime local sin ocultar lo que pasó.
 
 La promesa simple:
 
@@ -128,9 +128,9 @@ Lab:
 
 - Exploración de cockpit nativo de macOS.
 - Atajos de escritorio y cambio más rápido de proyecto/sesión.
-- Handoff de captura de OpenMeow a sesiones de comux/Coven.
+- Handoff de captura del cliente de chat/captura a sesiones de comux/Coven.
 
-### Ruta de integración OpenClaw / OpenMeow
+### Ruta de integración OpenClaw / captura
 
 **Estado:** dirección de puente opcional, no bundled en el núcleo de OpenClaw.
 
@@ -144,7 +144,7 @@ Now:
 
 - Tratar la API de Coven como el límite de compatibilidad.
 - Añadir tests de compatibilidad antes de promover el uso amplio del plugin.
-- Mantener honesto el copy de OpenMeow/OpenClaw: la captura y la orquestación se sientan por encima de Coven; no reemplazan el sustrato de runtime.
+- Mantener honesto el copy de captura/OpenClaw: la captura y la orquestación se sientan por encima de Coven; no reemplazan el sustrato de runtime.
 
 Next:
 
@@ -231,7 +231,7 @@ Estado: **next/later**
 
 Estado: **next/lab**
 
-- [ ] La captura de OpenMeow/OpenClaw crea o solicita una tarea de Coven
+- [ ] La captura del cliente de chat/captura u OpenClaw crea o solicita una tarea de Coven
 - [ ] Coven posee la sesión y el log de eventos
 - [ ] comux muestra la sesión para revisión
 - [ ] el usuario hace merge, PR, archiva o borra trabajo explícitamente
@@ -306,7 +306,7 @@ Debemos mantener las actualizaciones de Discord ligeras y repetibles.
 - No prometas fechas a menos que ya estemos en modo release.
 - Enlaza el trabajo shipped a commits, releases, issues o docs.
 - Marca los experimentos como **Lab** en lugar de fingir que son elementos comprometidos del roadmap.
-- Separa **runtime de Coven**, **cockpit comux** y **captura OpenMeow/OpenClaw** para que la gente entienda la arquitectura.
+- Separa **runtime de Coven**, **cockpit comux** y **captura/OpenClaw** para que la gente entienda la arquitectura.
 - Prefiere issues públicos pequeños sobre tareas vagas gigantes.
 - Pide ayuda solo cuando la tarea tenga una condición clara de aceptación.
 
