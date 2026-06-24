@@ -6,6 +6,17 @@ read_when:
 title: "Coven changelog and release notes"
 ---
 
+## Week of June 24, 2026
+
+### New features
+
+- **Co-published `@opencoven/coven` npm wrapper (v0.0.49).** The release pipeline now publishes a second wrapper package name, `@opencoven/coven`, alongside the existing `@opencoven/cli`. Both wrappers depend on the same `@opencoven/cli-*` native platform packages, so installing either one ends up with the same `coven` binary. This lets docs and onboarding advertise the canonical *coven* name without breaking existing `@opencoven/cli` installs. See [PR #257](https://github.com/OpenCoven/coven/pull/257) and the [releasing runbook](/reference/releasing) for the trusted-publisher one-time setup the new package needs before its first OIDC release.
+- **Coven Group Chat spec (v0.0.49).** Added the v1 design for a server-side group-chat primitive under `specs/coven-group-chat/` (PRODUCT + TECH). Today, group chat exists only as an iOS client-side fan-out illusion; the spec defines a durable, synced server object with monotonic event ordering so iOS, web, and CLI all read the same group. Implementation tracked separately. See [PR #258](https://github.com/OpenCoven/coven/pull/258).
+
+### Updates
+
+- **OpenMeow references removed from docs and code (v0.0.49).** OpenMeow is not an OpenCoven application — CastCodes is the canonical client. Stray OpenMeow examples and labels in English/Spanish/Russian docs, `DESIGN.md`, `ARCHITECTURE.md`, `AUTH.md`, `API-CONTRACT.md`, and related references were rewritten in product-neutral language. `crates/coven-cli/src/api.rs` renames the `openmeow` test origin to `external-client`, and `skills/coven-task-manager` drops `openmeow` from the recognized repo-label list. No runtime behavior changes. See [PR #256](https://github.com/OpenCoven/coven/pull/256).
+
 ## Week of June 18, 2026
 
 ### New features

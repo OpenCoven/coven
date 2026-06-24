@@ -6,6 +6,17 @@ read_when:
 title: "Changelog y notas de release de Coven"
 ---
 
+## Semana del 24 de junio de 2026
+
+### Nuevas funcionalidades
+
+- **Wrapper de npm `@opencoven/coven` copublicado (v0.0.49).** El pipeline de release ahora publica un segundo nombre de wrapper, `@opencoven/coven`, junto con `@opencoven/cli`. Ambos wrappers dependen de los mismos paquetes nativos `@opencoven/cli-*`, así que instalar cualquiera de los dos termina en el mismo binario `coven`. Esto permite que docs y onboarding anuncien el nombre canónico *coven* sin romper instalaciones existentes de `@opencoven/cli`. Consulta [PR #257](https://github.com/OpenCoven/coven/pull/257) y el [runbook de releasing](/reference/releasing) para la configuración única de Trusted Publisher que necesita el paquete nuevo antes de su primer release OIDC.
+- **Spec de Coven Group Chat (v0.0.49).** Se añadió el diseño v1 para una primitiva de chat grupal del lado del servidor en `specs/coven-group-chat/` (PRODUCT + TECH). Hoy el chat grupal sólo existe como una ilusión de fan-out en el cliente iOS; el spec define un objeto de servidor durable y sincronizado, con ordenación monótona de eventos para que iOS, web y CLI lean el mismo grupo. La implementación se rastrea por separado. Consulta [PR #258](https://github.com/OpenCoven/coven/pull/258).
+
+### Actualizaciones
+
+- **Referencias a OpenMeow eliminadas en docs y código (v0.0.49).** OpenMeow no es una aplicación de OpenCoven — CastCodes es el cliente canónico. Ejemplos y etiquetas sueltas de OpenMeow en docs en inglés/español/ruso, `DESIGN.md`, `ARCHITECTURE.md`, `AUTH.md`, `API-CONTRACT.md` y referencias relacionadas se reescribieron en lenguaje neutro al producto. `crates/coven-cli/src/api.rs` renombra el origen de prueba `openmeow` a `external-client`, y `skills/coven-task-manager` elimina `openmeow` de la lista de etiquetas de repo reconocidas. No hay cambios de comportamiento en runtime. Consulta [PR #256](https://github.com/OpenCoven/coven/pull/256).
+
 ## Semana del 18 de junio de 2026
 
 ### Nuevas funcionalidades

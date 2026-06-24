@@ -6,6 +6,17 @@ read_when:
 title: "Changelog и release notes Coven"
 ---
 
+## Неделя от 24 июня 2026
+
+### Новые возможности
+
+- **Сопубликованный npm-обёртка `@opencoven/coven` (v0.0.49).** Release-pipeline теперь публикует второе имя обёртки, `@opencoven/coven`, рядом с существующим `@opencoven/cli`. Обе обёртки зависят от одних и тех же native-пакетов `@opencoven/cli-*`, поэтому установка любой из них даёт тот же бинарь `coven`. Это позволяет docs и онбордингу рекламировать каноническое имя *coven*, не ломая существующие установки `@opencoven/cli`. См. [PR #257](https://github.com/OpenCoven/coven/pull/257) и [руководство по релизам](/reference/releasing) для одноразовой настройки Trusted Publisher, которая нужна для первого OIDC-релиза нового пакета.
+- **Spec Coven Group Chat (v0.0.49).** Добавлен v1-дизайн серверной примитивы группового чата в `specs/coven-group-chat/` (PRODUCT + TECH). Сегодня групповой чат существует только как клиентская fan-out-иллюзия в iOS; spec определяет долговременный серверный объект с монотонной нумерацией событий, чтобы iOS, web и CLI видели одну и ту же группу. Реализация отслеживается отдельно. См. [PR #258](https://github.com/OpenCoven/coven/pull/258).
+
+### Обновления
+
+- **Убраны упоминания OpenMeow в docs и коде (v0.0.49).** OpenMeow не является приложением OpenCoven — канонический клиент это CastCodes. Оставшиеся примеры и метки OpenMeow в английских/испанских/русских docs, в `DESIGN.md`, `ARCHITECTURE.md`, `AUTH.md`, `API-CONTRACT.md` и смежных файлах переписаны нейтрально по отношению к продукту. `crates/coven-cli/src/api.rs` переименовывает тестовое origin `openmeow` в `external-client`, а `skills/coven-task-manager` убирает `openmeow` из списка распознаваемых меток репозиториев. Изменений в runtime-поведении нет. См. [PR #256](https://github.com/OpenCoven/coven/pull/256).
+
 ## Неделя от 18 июня 2026
 
 ### Новые возможности
