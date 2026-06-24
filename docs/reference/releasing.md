@@ -84,6 +84,15 @@ npm view @opencoven/cli-windows version dist-tags
 
 All four should now show the tag's version as `latest`. The package pages on npmjs.com should display a **"Provenance"** badge with a link back to the GitHub Actions run.
 
+Create or update the matching GitHub Release from the successful workflow artifacts. Package the downloaded binaries with the same public asset names as prior releases:
+
+- `coven-vX.Y.Z-macos-aarch64.tar.gz`
+- `coven-vX.Y.Z-linux-x64.tar.gz`
+- `coven-vX.Y.Z-windows-x64.zip`
+- `SHA256SUMS`
+
+The release body should include the npm install command, published package list, action run URL, tagged commit, and compare link. This GitHub Release is the public binary/checksum surface; npm provenance remains the package-integrity surface.
+
 If any package did not publish, do not re-tag with the same version (npm forbids overwrite). Inspect the failed job, fix the underlying cause, then push a new patch-bumped signed tag.
 
 ## Recovering from a refused release

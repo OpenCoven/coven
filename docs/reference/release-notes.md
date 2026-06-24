@@ -10,10 +10,16 @@ title: "Coven changelog and release notes"
 
 ### New features
 
+- **Run reasoning controls (v0.0.48).** `coven run` now accepts `--think` and `--speed fast|balanced|thorough` alongside `--model`. Claude launches map the hints to `--effort`; unsupported harnesses warn and continue instead of failing. See [issue #246](https://github.com/OpenCoven/coven/issues/246), [PR #254](https://github.com/OpenCoven/coven/pull/254), and [Run command reference](/reference/cli-run).
 - **Trusted Hermes adapter recipe (v0.0.41).** `coven adapter install hermes` now writes a trusted local adapter manifest under `COVEN_HOME/adapters/hermes.json`, and Coven loads manifests from that Coven-owned trust store automatically. New users no longer need to hand-write JSON or set `COVEN_HARNESS_ADAPTER_MANIFEST` just to try Hermes. See [Hermes harness notes](/harnesses/hermes) and [PR #245](https://github.com/OpenCoven/coven/pull/245).
+
+### Updates
+
+- **Windows x64 package status.** The public README now reflects that `@opencoven/cli-windows` is published, not staged. Windows users can install through the universal `@opencoven/cli` wrapper and verify local harness availability with `coven doctor`.
 
 ### Bug fixes
 
+- **Resilient FTS event-index backfill (v0.0.48).** Existing-event backfill for `events_fts` now runs in bounded batches, records completion in `store_meta`, applies `busy_timeout` to read-only store connections, and treats `SQLITE_BUSY` as non-fatal so search indexing cannot block all agent dispatch on large histories. See [issue #249](https://github.com/OpenCoven/coven/issues/249) and [PR #254](https://github.com/OpenCoven/coven/pull/254).
 - **Clearer unsupported-harness guidance.** Unknown harness errors now show configured harness ids and point Hermes users directly to `coven adapter install hermes` followed by `coven adapter doctor hermes`; other external harnesses still use trusted adapter manifests or the explicit manifest environment variables.
 - **Windows home-directory fallback.** `coven doctor` and store-path resolution now work in PowerShell environments where `HOME` is absent by falling back through `USERPROFILE`, `HOMEDRIVE` + `HOMEPATH`, and the platform home directory before asking users to set `COVEN_HOME`.
 - **PowerShell-native `coven-code` install guidance.** On Windows, `coven` now points missing interactive-UI users to the `install.ps1` installer and PowerShell-compatible `COVEN_LEGACY_TUI` syntax instead of showing Unix `curl | bash` commands.

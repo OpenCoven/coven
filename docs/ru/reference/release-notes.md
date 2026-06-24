@@ -6,6 +6,23 @@ read_when:
 title: "Changelog и release notes Coven"
 ---
 
+## Неделя от 18 июня 2026
+
+### Новые возможности
+
+- **Управление reasoning для `coven run` (v0.0.48).** `coven run` теперь принимает `--think` и `--speed fast|balanced|thorough` вместе с `--model`. Запуски Claude преобразуют эти подсказки в `--effort`; неподдерживаемые harnesses предупреждают и продолжают работу вместо аварийного завершения. См. [issue #246](https://github.com/OpenCoven/coven/issues/246), [PR #254](https://github.com/OpenCoven/coven/pull/254) и [справочник `coven run`](/reference/cli-run).
+- **Доверенный рецепт адаптера Hermes (v0.0.41).** `coven adapter install hermes` теперь записывает доверенный локальный manifest в `COVEN_HOME/adapters/hermes.json`, а Coven автоматически загружает manifests из собственного trust store. Новым пользователям больше не нужно вручную писать JSON или задавать `COVEN_HARNESS_ADAPTER_MANIFEST`, чтобы попробовать Hermes.
+
+### Обновления
+
+- **Статус пакета Windows x64.** Публичный README теперь отражает, что `@opencoven/cli-windows` опубликован, а не находится в staging. Пользователи Windows могут установить универсальный wrapper `@opencoven/cli` и проверить локальные harnesses через `coven doctor`.
+
+### Исправления ошибок
+
+- **Устойчивый backfill FTS-индекса событий (v0.0.48).** Backfill существующих событий в `events_fts` теперь выполняется ограниченными batch-ами, записывает завершение в `store_meta`, применяет `busy_timeout` к read-only соединениям и считает `SQLITE_BUSY` нефатальным, чтобы поисковая индексация не блокировала все запуски агентов на больших историях. См. [issue #249](https://github.com/OpenCoven/coven/issues/249) и [PR #254](https://github.com/OpenCoven/coven/pull/254).
+- **Более понятная подсказка для неподдерживаемых harnesses.** Ошибки неизвестного harness теперь показывают настроенные IDs и направляют пользователей Hermes к `coven adapter install hermes`, затем к `coven adapter doctor hermes`.
+- **Fallback домашнего каталога на Windows.** `coven doctor` и выбор store path работают в PowerShell без `HOME`, последовательно проверяя `USERPROFILE`, `HOMEDRIVE` + `HOMEPATH` и системный home перед тем, как попросить задать `COVEN_HOME`.
+
 ## Неделя от 3 июня 2026
 
 ### Новые возможности

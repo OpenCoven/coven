@@ -104,7 +104,7 @@ The Rust daemon is the authority boundary. All clients — including the CLI its
 | ---------------------------- | --------------------------------------------------------------------------- |
 | **Rust stable toolchain**    | Required only when building from source                                     |
 | **Git**                      | Required                                                                    |
-| **macOS or Linux**           | Daemon socket and PTY behavior; Windows x64 support staged for next release |
+| **macOS, Linux, or Windows x64** | Native npm packages are published for all three platforms                  |
 | **Node.js 18+**              | Required only for npm wrapper or package/plugin development                 |
 | **At least one harness CLI** | Codex and/or Claude Code (see below)                                        |
 
@@ -151,7 +151,7 @@ coven doctor
 | `@opencoven/cli`           | Universal wrapper — auto-selects your platform |
 | `@opencoven/cli-macos`     | macOS (arm64 + x64)                            |
 | `@opencoven/cli-linux-x64` | Linux x64                                      |
-| `@opencoven/cli-windows`   | Windows x64 (staging for next release)         |
+| `@opencoven/cli-windows`   | Windows x64                                    |
 
 ### Build from source (recommended for contributors)
 
@@ -611,7 +611,7 @@ No. Coven itself is fully local. Your harness CLIs (Codex, Claude Code) require 
 
 **Q: Is Windows supported?**
 
-The `@opencoven/cli-windows` package is staged for the next release. The daemon socket and PTY behavior currently target macOS and Linux. Adventurous Windows users may build from source.
+Yes. `@opencoven/cli-windows` ships a native Windows x64 binary, and the universal `@opencoven/cli` wrapper selects it automatically. Run `coven doctor` from the same PowerShell, Windows Terminal, or WSL2 environment where your harness CLI is installed.
 
 **Q: What is `coven pc`?**
 
