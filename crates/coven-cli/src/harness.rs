@@ -47,6 +47,53 @@ pub enum HarnessLaunchMode {
     Stream,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HarnessSpeed {
+    Fast,
+    Balanced,
+    Thorough,
+}
+
+impl HarnessSpeed {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "fast" => Ok(Self::Fast),
+            "balanced" => Ok(Self::Balanced),
+            "thorough" => Ok(Self::Thorough),
+            other => {
+                anyhow::bail!("invalid speed `{other}`; expected one of: fast, balanced, thorough")
+            }
+        }
+    }
+
+    fn claude_effort(self) -> &'static str {
+        match self {
+            Self::Fast => "low",
+            Self::Balanced => "medium",
+            Self::Thorough => "high",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HarnessLaunchOptions<'a> {
+    pub model: Option<&'a str>,
+    pub think: bool,
+    pub speed: Option<HarnessSpeed>,
+}
+
+impl<'a> HarnessLaunchOptions<'a> {
+    fn normalized_model(self) -> Option<&'a str> {
+        self.model.map(str::trim).filter(|m| !m.is_empty())
+    }
+
+    pub(crate) fn claude_effort(self) -> Option<&'static str> {
+        self.speed
+            .map(HarnessSpeed::claude_effort)
+            .or_else(|| self.think.then_some("high"))
+    }
+}
+
 /// Whether the harness CLI has a long-lived JSON-streaming mode the daemon
 /// can keep alive across chat turns. Claude does (`stream-json`); codex
 /// doesn't (only one-shot `codex exec`). Unix kills the stream process tree
@@ -84,6 +131,14 @@ impl ConversationHint {
 /// session ids (e.g. codex) return `false`; the chat app captures the id from
 /// the first turn's output instead. See `docs/chat-persistence.md`.
 pub fn harness_supports_preassigned_session_id(harness_id: &str) -> bool {
+    harness_id == "claude"
+}
+
+pub fn harness_supports_think(harness_id: &str) -> bool {
+    harness_id == "claude"
+}
+
+pub fn harness_supports_speed(harness_id: &str) -> bool {
     harness_id == "claude"
 }
 
@@ -540,7 +595,14 @@ pub fn command_parts_for_harness(
     prompt: &str,
     mode: HarnessLaunchMode,
 ) -> Result<(String, Vec<String>)> {
-    command_parts_for_harness_with_conversation(harness_id, prompt, mode, None, None, None)
+    command_parts_for_harness_with_conversation(
+        harness_id,
+        prompt,
+        mode,
+        None,
+        None,
+        HarnessLaunchOptions::default(),
+    )
 }
 
 /// Claude Code prompts before running tool calls that aren't pre-allowlisted.
@@ -597,7 +659,7 @@ pub fn command_parts_for_harness_with_conversation(
     mode: HarnessLaunchMode,
     hint: Option<&ConversationHint>,
     familiar: Option<&FamiliarContext>,
-    model: Option<&str>,
+    options: HarnessLaunchOptions<'_>,
 ) -> Result<(String, Vec<String>)> {
     let specs = configured_harness_specs()?;
     let configured_ids = specs
@@ -614,10 +676,11 @@ pub fn command_parts_for_harness_with_conversation(
     // Model selection forwards to the harness's native flag as a normal option
     // ahead of the prompt positional. Adapters that declare no model mechanism
     // yield no args (the run layer warns); a blank/missing model is a no-op.
-    let model_args: Vec<String> = match model.map(str::trim) {
+    let model_args: Vec<String> = match options.normalized_model() {
         Some(m) if !m.is_empty() => spec.model_args(m),
         _ => Vec::new(),
     };
+    let launch_option_args = launch_option_args(harness_id, options);
 
     // Resolve effective prompt: inject familiar identity preamble when present.
     // Harnesses with a dedicated --system-prompt flag get identity there instead,
@@ -644,7 +707,11 @@ pub fn command_parts_for_harness_with_conversation(
                 program,
                 with_claude_permission_flags(
                     harness_id,
-                    sanitize_argv_for_platform(prepend_model_args(&model_args, args)),
+                    sanitize_argv_for_platform(prepend_launch_args(
+                        &model_args,
+                        &launch_option_args,
+                        args,
+                    )),
                 ),
             ));
         }
@@ -653,8 +720,9 @@ pub fn command_parts_for_harness_with_conversation(
             program,
             with_claude_permission_flags(
                 harness_id,
-                sanitize_argv_for_platform(prepend_model_args(
+                sanitize_argv_for_platform(prepend_launch_args(
                     &model_args,
+                    &launch_option_args,
                     spec.prompt_args(&effective_prompt, HarnessLaunchMode::NonInteractive),
                 )),
             ),
@@ -668,8 +736,9 @@ pub fn command_parts_for_harness_with_conversation(
                 args.insert(0, f.identity_preamble());
                 args.insert(0, flag.to_string());
             }
-            let args = prepend_model_args(
+            let args = prepend_launch_args(
                 &model_args,
+                &launch_option_args,
                 args.into_iter()
                     .chain(std::iter::once(effective_prompt))
                     .collect(),
@@ -689,20 +758,35 @@ pub fn command_parts_for_harness_with_conversation(
         program,
         with_claude_permission_flags(
             harness_id,
-            sanitize_argv_for_platform(prepend_model_args(&model_args, args)),
+            sanitize_argv_for_platform(prepend_launch_args(&model_args, &launch_option_args, args)),
         ),
     ))
 }
 
-/// Prepend resolved model argv tokens ahead of `args` (which ends with the
-/// prompt positional). Keeps `--model` parsing before the prompt, matching how
-/// Cave emits the flag.
-fn prepend_model_args(model_args: &[String], args: Vec<String>) -> Vec<String> {
-    if model_args.is_empty() {
+fn launch_option_args(harness_id: &str, options: HarnessLaunchOptions<'_>) -> Vec<String> {
+    if harness_id != "claude" {
+        return Vec::new();
+    }
+    options
+        .claude_effort()
+        .map(|effort| vec!["--effort".to_string(), effort.to_string()])
+        .unwrap_or_default()
+}
+
+/// Prepend resolved launch argv tokens ahead of `args` (which ends with the
+/// prompt positional). Keeps Coven-managed options before the prompt, matching
+/// how Cave emits run flags.
+fn prepend_launch_args(
+    model_args: &[String],
+    option_args: &[String],
+    args: Vec<String>,
+) -> Vec<String> {
+    if model_args.is_empty() && option_args.is_empty() {
         return args;
     }
-    let mut out = Vec::with_capacity(model_args.len() + args.len());
+    let mut out = Vec::with_capacity(model_args.len() + option_args.len() + args.len());
     out.extend_from_slice(model_args);
+    out.extend_from_slice(option_args);
     out.extend(args);
     out
 }
@@ -1458,7 +1542,7 @@ mod tests {
             HarnessLaunchMode::NonInteractive,
             Some(&hint),
             None,
-            None,
+            HarnessLaunchOptions::default(),
         )?;
         assert_eq!(
             parts,
@@ -1486,7 +1570,7 @@ mod tests {
             HarnessLaunchMode::NonInteractive,
             Some(&hint),
             None,
-            None,
+            HarnessLaunchOptions::default(),
         )?;
         assert_eq!(
             parts,
@@ -1514,7 +1598,7 @@ mod tests {
             HarnessLaunchMode::Interactive,
             Some(&hint),
             None,
-            None,
+            HarnessLaunchOptions::default(),
         );
         assert_eq!(
             parts.unwrap(),
@@ -1535,7 +1619,7 @@ mod tests {
             HarnessLaunchMode::NonInteractive,
             Some(&hint),
             None,
-            None,
+            HarnessLaunchOptions::default(),
         )?;
         assert_eq!(
             parts,
@@ -1564,7 +1648,7 @@ mod tests {
             HarnessLaunchMode::NonInteractive,
             Some(&hint),
             None,
-            None,
+            HarnessLaunchOptions::default(),
         )?;
         assert_eq!(
             parts,
@@ -1592,7 +1676,7 @@ mod tests {
             HarnessLaunchMode::Stream,
             None,
             None,
-            None,
+            HarnessLaunchOptions::default(),
         )?;
         assert_eq!(program, "claude");
         assert!(!args
@@ -1683,7 +1767,10 @@ mod tests {
             HarnessLaunchMode::NonInteractive,
             None,
             None,
-            Some("openai/gpt-5.5"),
+            HarnessLaunchOptions {
+                model: Some("openai/gpt-5.5"),
+                ..Default::default()
+            },
         )?;
         assert_eq!(program, "codex");
         assert_eq!(
@@ -1713,7 +1800,10 @@ mod tests {
             HarnessLaunchMode::NonInteractive,
             None,
             None,
-            Some("anthropic/claude-sonnet-4"),
+            HarnessLaunchOptions {
+                model: Some("anthropic/claude-sonnet-4"),
+                ..Default::default()
+            },
         )?;
         assert_eq!(
             args,
@@ -1728,6 +1818,82 @@ mod tests {
     }
 
     #[test]
+    fn claude_think_maps_to_effort_high() -> anyhow::Result<()> {
+        let (_, args) = command_parts_for_harness_with_conversation(
+            "claude",
+            "hi",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            None,
+            HarnessLaunchOptions {
+                think: true,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(
+            args,
+            vec![
+                "--effort".to_string(),
+                "high".to_string(),
+                "--print".to_string(),
+                "hi".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn claude_speed_maps_to_effort_levels() -> anyhow::Result<()> {
+        let (_, fast_args) = command_parts_for_harness_with_conversation(
+            "claude",
+            "hi",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            None,
+            HarnessLaunchOptions {
+                speed: Some(HarnessSpeed::Fast),
+                ..Default::default()
+            },
+        )?;
+        let (_, thorough_args) = command_parts_for_harness_with_conversation(
+            "claude",
+            "hi",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            None,
+            HarnessLaunchOptions {
+                speed: Some(HarnessSpeed::Thorough),
+                ..Default::default()
+            },
+        )?;
+
+        assert_eq!(fast_args[0..2], ["--effort", "low"]);
+        assert_eq!(thorough_args[0..2], ["--effort", "high"]);
+        Ok(())
+    }
+
+    #[test]
+    fn codex_ignores_think_and_speed_launch_hints() -> anyhow::Result<()> {
+        let with_hints = command_parts_for_harness_with_conversation(
+            "codex",
+            "fix tests",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            None,
+            HarnessLaunchOptions {
+                think: true,
+                speed: Some(HarnessSpeed::Thorough),
+                ..Default::default()
+            },
+        )?;
+        let legacy =
+            command_parts_for_harness("codex", "fix tests", HarnessLaunchMode::NonInteractive)?;
+
+        assert_eq!(with_hints, legacy);
+        Ok(())
+    }
+
+    #[test]
     fn no_model_leaves_args_unchanged() -> anyhow::Result<()> {
         let with_model = command_parts_for_harness_with_conversation(
             "codex",
@@ -1735,7 +1901,7 @@ mod tests {
             HarnessLaunchMode::NonInteractive,
             None,
             None,
-            None,
+            HarnessLaunchOptions::default(),
         )?;
         let blank_model = command_parts_for_harness_with_conversation(
             "codex",
@@ -1743,7 +1909,10 @@ mod tests {
             HarnessLaunchMode::NonInteractive,
             None,
             None,
-            Some("   "),
+            HarnessLaunchOptions {
+                model: Some("   "),
+                ..Default::default()
+            },
         )?;
         let legacy =
             command_parts_for_harness("codex", "fix tests", HarnessLaunchMode::NonInteractive)?;
@@ -1782,7 +1951,10 @@ mod tests {
             HarnessLaunchMode::NonInteractive,
             None,
             None,
-            Some("openai/gpt-5.5"),
+            HarnessLaunchOptions {
+                model: Some("openai/gpt-5.5"),
+                ..Default::default()
+            },
         );
         restore_adapter_manifest_env(previous);
 
@@ -1835,7 +2007,10 @@ mod tests {
             HarnessLaunchMode::NonInteractive,
             None,
             None,
-            Some("openai/gpt-5.5"),
+            HarnessLaunchOptions {
+                model: Some("openai/gpt-5.5"),
+                ..Default::default()
+            },
         );
         restore_adapter_manifest_env(previous);
 
@@ -1859,7 +2034,7 @@ mod tests {
             HarnessLaunchMode::NonInteractive,
             None,
             None,
-            None,
+            HarnessLaunchOptions::default(),
         )?;
         let legacy =
             command_parts_for_harness("claude", "hello", HarnessLaunchMode::NonInteractive)?;

@@ -1206,6 +1206,8 @@ fn dispatch_via_local_pty(
         // model: the cast/shell path does not select a model.
         None,
         false,
+        None,
+        false,
         false,
     )?;
     let mut notes = plan_outcome_notes(plan);
@@ -1895,6 +1897,8 @@ fn run_guided_harness_session() -> Result<()> {
         false,
         None,
         // model: the cast/shell path does not select a model.
+        None,
+        false,
         None,
         false,
         false,

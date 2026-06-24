@@ -10,6 +10,9 @@ use crate::{
     privacy::{self, PrivacyConfig},
 };
 
+const FTS_BACKFILL_BATCH_SIZE: i64 = 1_000;
+const FTS_BACKFILL_COMPLETE_KEY: &str = "events_fts_backfill_complete";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub id: String,
@@ -106,15 +109,9 @@ pub fn open_store(path: &Path) -> Result<Connection> {
 
     let conn = Connection::open(path)
         .with_context(|| format!("failed to open Coven store at {}", path.display()))?;
-    // WAL mode allows concurrent readers alongside a single writer and avoids
-    // "database is locked" errors under typical daemon + API concurrency.
-    // busy_timeout gives writers up to 5 s to retry before returning SQLITE_BUSY.
+    configure_writable_connection(&conn)?;
     conn.execute_batch(
-        "PRAGMA journal_mode = WAL;
-        PRAGMA busy_timeout = 5000;
-        PRAGMA foreign_keys = ON;
-
-        CREATE TABLE IF NOT EXISTS sessions (
+        "CREATE TABLE IF NOT EXISTS sessions (
             id TEXT PRIMARY KEY NOT NULL,
             project_root TEXT NOT NULL,
             harness TEXT NOT NULL,
@@ -174,6 +171,11 @@ pub fn open_store(path: &Path) -> Result<Connection> {
             updated_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS store_meta (
+            key TEXT PRIMARY KEY NOT NULL,
+            value TEXT NOT NULL
+        );
+
         CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
             payload_json,
             content='events',
@@ -204,52 +206,81 @@ pub fn open_store(path: &Path) -> Result<Connection> {
     ensure_visibility_column(&conn)?;
     ensure_familiar_id_column(&conn)?;
 
-    // Backfill: index any events that predate the FTS table (a one-time
-    // migration of a pre-FTS store). After the table+triggers exist, every new
-    // event is indexed by the `events_fts_insert` trigger, so this only matters
-    // on the first open after upgrade.
-    //
-    // Two things are deliberate here:
-    //
-    // 1. Probe with a READ before writing. `open_store` runs on EVERY
-    //    connection, and the daemon opens a fresh connection per API request
-    //    (see api.rs). An unconditional write means every request grabs the WAL
-    //    write lock just to open the store. Under concurrency (the chat bridge
-    //    firing several requests while the harness streams events) those opens
-    //    pile up on the single WAL writer; once the wait exceeds `busy_timeout`
-    //    the open fails with SQLITE_BUSY ("database is locked") and the whole
-    //    request dies. The probe takes only a SHARED lock and never contends
-    //    with the writer, so the steady-state open path does zero writes.
-    //
-    // 2. Rebuild via the FTS5 'rebuild' command, not an `INSERT ... SELECT`
-    //    dedup join. `events_fts` is an external-content table, so its `rowid`
-    //    resolves through the content (`events`) table — `LEFT JOIN events_fts
-    //    f ON f.rowid = e.rowid WHERE f.rowid IS NULL` is therefore ALWAYS
-    //    empty and the old backfill silently indexed nothing. 'rebuild'
-    //    repopulates the index from the content table the way FTS5 intends.
-    //
-    // The emptiness probe reads `events_fts_docsize` — FTS5's shadow table with
-    // one row per *indexed* document — not `events_fts` itself. A plain
-    // `SELECT ... FROM events_fts` walks the external content rowids and so
-    // looks non-empty even when nothing is indexed; `_docsize` reflects the
-    // real index, so it correctly reports "freshly created, never populated".
-    let index_is_empty: bool = conn
-        .query_row(
-            "SELECT NOT EXISTS(SELECT 1 FROM events_fts_docsize)",
-            [],
-            |row| row.get(0),
-        )
-        .context("failed to probe events_fts index state")?;
-    let has_events: bool = conn
-        .query_row("SELECT EXISTS(SELECT 1 FROM events)", [], |row| row.get(0))
-        .context("failed to probe events for backfill")?;
-
-    if index_is_empty && has_events {
-        conn.execute("INSERT INTO events_fts(events_fts) VALUES('rebuild')", [])
-            .context("failed to backfill events_fts")?;
-    }
+    backfill_events_fts_if_needed(&conn)?;
 
     Ok(conn)
+}
+
+fn configure_writable_connection(conn: &Connection) -> Result<()> {
+    // WAL mode allows concurrent readers alongside a single writer and avoids
+    // "database is locked" errors under typical daemon + API concurrency.
+    // busy_timeout gives writers up to 5 s to retry before returning SQLITE_BUSY.
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA busy_timeout = 5000;
+         PRAGMA foreign_keys = ON;",
+    )
+    .context("failed to configure writable Coven store connection")?;
+    Ok(())
+}
+
+fn configure_read_only_connection(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "PRAGMA busy_timeout = 5000;
+         PRAGMA foreign_keys = ON;",
+    )
+    .context("failed to configure read-only Coven store connection")?;
+    Ok(())
+}
+
+fn backfill_events_fts_if_needed(conn: &Connection) -> Result<()> {
+    let already_complete: Option<String> = conn
+        .query_row(
+            "SELECT value FROM store_meta WHERE key = ?1",
+            [FTS_BACKFILL_COMPLETE_KEY],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to read events_fts backfill state")?;
+    if already_complete.as_deref() == Some("1") {
+        return Ok(());
+    }
+
+    loop {
+        let inserted = match conn.execute(
+            "INSERT INTO events_fts(rowid, payload_json)
+             SELECT e.rowid, e.payload_json
+             FROM events e
+             LEFT JOIN events_fts_docsize d ON d.id = e.rowid
+             WHERE d.id IS NULL
+             ORDER BY e.rowid
+             LIMIT ?1",
+            [FTS_BACKFILL_BATCH_SIZE],
+        ) {
+            Ok(inserted) => inserted,
+            Err(error) => {
+                eprintln!(
+                    "warning: events_fts backfill skipped for now; session dispatch will continue ({error})"
+                );
+                return Ok(());
+            }
+        };
+        if inserted == 0 {
+            break;
+        }
+    }
+
+    if let Err(error) = conn.execute(
+        "INSERT INTO store_meta(key, value)
+         VALUES(?1, '1')
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [FTS_BACKFILL_COMPLETE_KEY],
+    ) {
+        eprintln!(
+            "warning: events_fts backfill completed but could not record completion ({error})"
+        );
+    }
+    Ok(())
 }
 
 fn ensure_event_privacy_columns(conn: &Connection) -> Result<()> {
@@ -318,6 +349,7 @@ pub fn open_existing_store_read_only(path: &Path) -> Result<Option<Connection>> 
 
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("failed to open Coven store read-only at {}", path.display()))?;
+    configure_read_only_connection(&conn)?;
     Ok(Some(conn))
 }
 
@@ -2023,6 +2055,49 @@ mod tests {
         drop(upgraded);
         let reopened = open_store(&path)?;
         assert_eq!(search_events(&reopened, "phoenix")?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn events_fts_backfill_busy_is_non_fatal() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("test.sqlite3");
+        let conn = open_store(&path)?;
+        insert_session(&conn, &session_record("session-1", "2026-04-27T06:00:00Z"))?;
+        insert_event(
+            &conn,
+            &EventRecord {
+                seq: 0,
+                id: "event-1".to_string(),
+                session_id: "session-1".to_string(),
+                kind: "output".to_string(),
+                payload_json: r#"{"data":"phoenix rises"}"#.to_string(),
+                created_at: "2026-04-27T06:01:00Z".to_string(),
+            },
+        )?;
+        conn.execute(
+            "INSERT INTO events_fts(events_fts) VALUES('delete-all')",
+            [],
+        )?;
+        conn.execute(
+            "DELETE FROM store_meta WHERE key = 'events_fts_backfill_complete'",
+            [],
+        )?;
+        conn.execute_batch("PRAGMA busy_timeout = 1")?;
+
+        let locker = Connection::open(&path)?;
+        locker.execute_batch("PRAGMA busy_timeout = 1; BEGIN IMMEDIATE")?;
+
+        backfill_events_fts_if_needed(&conn)?;
+
+        let complete: Option<String> = conn
+            .query_row(
+                "SELECT value FROM store_meta WHERE key = 'events_fts_backfill_complete'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        assert_eq!(complete, None);
         Ok(())
     }
 
