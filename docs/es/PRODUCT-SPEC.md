@@ -64,9 +64,9 @@ flowchart LR
 
 Para diagramas más completos, consulta [Diagramas de arquitectura](/ARCHITECTURE).
 
-## Relación con comux, OpenClaw y OpenMeow
+## Relación con comux y OpenClaw
 
-Coven es el sustrato de runtime local. comux puede convertirse en el cockpit visual para paneles e historial de sesión gestionados por Coven. OpenClaw puede delegar los lanzamientos de harness limitados al proyecto a Coven solo a través del plugin externo `@opencoven/coven`, no a través de código bundled del núcleo de OpenClaw. OpenMeow puede consumir el estado de sesión, la captura o las notificaciones de Coven donde sea útil.
+Coven es el sustrato de runtime local. comux puede convertirse en el cockpit visual para paneles e historial de sesión gestionados por Coven. OpenClaw puede delegar los lanzamientos de harness limitados al proyecto a Coven solo a través del plugin externo `@opencoven/coven`, no a través de código bundled del núcleo de OpenClaw. El cliente de chat/captura puede consumir el estado de sesión, la captura o las notificaciones de Coven donde sea útil.
 
 Coven debe integrarse con estos proyectos sin ser propiedad de ninguno: es la habitación compartida donde se ejecutan los harnesses, no toda la UI ni el orquestador.
 

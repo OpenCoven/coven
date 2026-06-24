@@ -126,7 +126,7 @@ coven run codex "inspect the CLI package" --cwd packages/cli
 - CLI/TUI `coven`.
 - Кокпит comux.
 - Внешний пакет плагина OpenClaw `@opencoven/coven`.
-- Будущие OpenMeow или десктоп-поверхности приёма.
+- Будущие поверхности ввода или десктоп-поверхности приёма.
 
 Клиенты — это слои удобства, а не корни доверия.
 

@@ -15,7 +15,6 @@ Cada cliente es no confiable para fines de aplicación, incluidos:
 
 - la CLI/TUI;
 - comux;
-- OpenMeow;
 - el plugin externo de OpenClaw;
 - los scripts; y
 - los futuros clientes de escritorio.
@@ -28,7 +27,6 @@ flowchart TB
     direction LR
     CLI[coven CLI / TUI]
     Comux[comux]
-    Meow[OpenMeow]
     Plugin["@opencoven/coven plugin"]
     Scripts[Scripts / other clients]
   end

@@ -112,7 +112,7 @@ function extractBranch(card) {
 function extractRepo(card) {
   const labels = Array.isArray(card.labels) ? card.labels.map((label) => String(label).toLowerCase()) : [];
   const projectLabel = labels.find((label) =>
-    ["cave", "coven", "openclaw", "openmeow", "opentrust", "covencave"].includes(label),
+    ["cave", "coven", "openclaw", "opentrust", "covencave"].includes(label),
   );
   if (projectLabel) return projectLabel === "covencave" ? "cave" : projectLabel;
 

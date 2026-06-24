@@ -77,7 +77,7 @@ flowchart LR
 
 ## Capabilities плоскости управления
 
-`GET /api/v1/capabilities` — это точка обнаружения для first-party клиентов, таких как OpenMeow. Возвращает id capabilities, владение адаптера, доступность, подсказки политики и id действий. Это предотвращает hardcoding клиентов того, что может делать демон.
+`GET /api/v1/capabilities` — это точка обнаружения для first-party клиентов, таких как клиент чата/ввода. Возвращает id capabilities, владение адаптера, доступность, подсказки политики и id действий. Это предотвращает hardcoding клиентов того, что может делать демон.
 
 ```json
 {
@@ -104,12 +104,12 @@ flowchart LR
 
 ## Действия плоскости управления
 
-`POST /api/v1/actions` принимает конверт intent в стиле OpenMeow. Демон маршрутизирует только известные действия; неизвестные действия отказываются в закрытом виде до того, как любой адаптер сможет выполниться.
+`POST /api/v1/actions` принимает конверт intent в стиле клиента чата/ввода. Демон маршрутизирует только известные действия; неизвестные действия отказываются в закрытом виде до того, как любой адаптер сможет выполниться.
 
 ```json
 {
   "action": "coven.capabilities.refresh",
-  "origin": "open-meow",
+  "origin": "external-client",
   "intentId": "intent-1",
   "args": {}
 }
@@ -126,7 +126,7 @@ flowchart LR
   "event": {
     "kind": "capabilities.refreshed",
     "action": "coven.capabilities.refresh",
-    "origin": "open-meow",
+    "origin": "external-client",
     "intentId": "intent-1",
     "payload": { "capabilities": 3 }
   }

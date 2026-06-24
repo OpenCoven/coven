@@ -1,6 +1,6 @@
 ---
 title: "Guía de integración de clientes"
-description: "Cómo comux, OpenMeow, OpenClaw y otros clientes deben hablar con la API por socket del daemon de Coven sin duplicar la política o autoridad del runtime."
+description: "Cómo comux, OpenClaw y otros clientes deben hablar con la API por socket del daemon de Coven sin duplicar la política o autoridad del runtime."
 ---
 
 # Guía de integración de clientes
@@ -104,9 +104,9 @@ El plugin no debe:
 - asumir que las rutas no versionadas son estables; ni
 - ampliar los permisos de raíz de proyecto.
 
-## OpenMeow y superficies de captura
+## Superficies de captura
 
-Los clientes tipo OpenMeow se tratan mejor como capas de captura y presentación.
+Los clientes de chat/captura se tratan mejor como capas de captura y presentación.
 
 Responsabilidades útiles:
 

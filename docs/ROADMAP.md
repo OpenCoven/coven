@@ -169,7 +169,7 @@ Next:
 Lab:
 
 - Desktop shortcuts and faster project/session switching.
-- OpenMeow intake handoff into CastCodes/Coven sessions.
+- Chat/intake handoff into CastCodes/Coven sessions.
 
 ### Advanced integration paths
 
@@ -185,7 +185,7 @@ Now:
 
 - Treat the Coven API as the compatibility boundary.
 - Add compatibility tests before encouraging broad plugin usage.
-- Keep OpenMeow/OpenClaw copy honest: advanced intake and orchestration sit above Coven; they do not replace CastCodes as the public workspace or Coven as the runtime substrate.
+- Keep intake/OpenClaw copy honest: advanced intake and orchestration sit above Coven; they do not replace CastCodes as the public workspace or Coven as the runtime substrate.
 
 Next:
 
@@ -350,7 +350,7 @@ We should keep Discord updates lightweight and repeatable.
 - Link shipped work to commits, releases, issues, or docs.
 - Mark experiments as **Lab** instead of pretending they are committed roadmap items.
 - Lead beginner/product updates with **CastCodes as the workspace** and **Coven as the runtime**.
-- Mention comux, OpenMeow, or OpenClaw only when the update is explicitly about migration, legacy/reference context, or advanced compatibility.
+- Mention comux or OpenClaw only when the update is explicitly about migration, legacy/reference context, or advanced compatibility.
 - Prefer small public issues over giant vague tasks.
 - Ask for help only when the task has a clear acceptance condition.
 

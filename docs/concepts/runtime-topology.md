@@ -13,7 +13,6 @@ flowchart LR
   User --> CLI[coven CLI / TUI]
   CLI --> Daemon
   Comux[comux legacy/reference] -.-> Daemon
-  OpenMeow[OpenMeow advanced intake] -.-> Daemon
   Plugin["@opencoven/coven plugin"] -.-> Daemon
   Daemon --> Adapter[Adapter router]
   Adapter --> Codex[Codex PTY]

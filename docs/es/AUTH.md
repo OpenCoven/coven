@@ -17,7 +17,7 @@ La solución actual es un **modelo de acceso local del mismo usuario**:
 - Las credenciales del proveedor del harness se quedan en el flujo de auth local normal del proveedor del harness.
 - Coven no debe leer, proxificar, persistir ni emitir credenciales de Codex, Claude Code, OpenAI, Anthropic, GitHub u OpenClaw.
 
-Esta es intencionalmente una postura MVP local-first. Es adecuada para clientes locales del mismo usuario como la CLI/TUI de Coven, comux, OpenMeow y el plugin externo OpenClaw. No es un esquema de auth de API remota.
+Esta es intencionalmente una postura MVP local-first. Es adecuada para clientes locales del mismo usuario como la CLI/TUI de Coven, comux y el plugin externo OpenClaw. No es un esquema de auth de API remota.
 
 ```mermaid
 flowchart LR

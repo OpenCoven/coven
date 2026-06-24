@@ -109,7 +109,7 @@ Todos los errores de la API usan el siguiente sobre estable. Los clientes deben 
 
 ## Forma del catálogo de capabilities (`v1`)
 
-`GET /api/v1/capabilities` devuelve el catálogo de capabilities del daemon/plano de control. Este es el handshake previsto para OpenMeow al decidir qué acciones mostrar o enrutar a través de Coven.
+`GET /api/v1/capabilities` devuelve el catálogo de capabilities del daemon/plano de control. Este es el handshake previsto para el cliente de chat/captura al decidir qué acciones mostrar o enrutar a través de Coven.
 
 ```json
 {
@@ -148,7 +148,7 @@ Los clientes deben ignorar ids de capability e ids de acción futuros desconocid
 ```json
 {
   "action": "coven.capabilities.refresh",
-  "origin": "open-meow",
+  "origin": "external-client",
   "intentId": "intent-1",
   "args": {}
 }
@@ -165,7 +165,7 @@ Las acciones seguras completadas inmediatamente devuelven `200`:
   "event": {
     "kind": "capabilities.refreshed",
     "action": "coven.capabilities.refresh",
-    "origin": "open-meow",
+    "origin": "external-client",
     "intentId": "intent-1",
     "payload": { "capabilities": 3 }
   }

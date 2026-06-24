@@ -1276,7 +1276,7 @@ mod tests {
         let temp_dir = tempfile::tempdir()?;
         let body = json!({
             "action": "coven.capabilities.refresh",
-            "origin": "open-meow",
+            "origin": "external-client",
             "intentId": "intent-1"
         })
         .to_string();
@@ -1295,7 +1295,7 @@ mod tests {
             .body
             .contains(r#""action":"coven.capabilities.refresh""#));
         assert!(response.body.contains(r#""kind":"capabilities.refreshed""#));
-        assert!(response.body.contains(r#""origin":"open-meow""#));
+        assert!(response.body.contains(r#""origin":"external-client""#));
         assert!(response.body.contains(r#""intentId":"intent-1""#));
         Ok(())
     }
@@ -1331,7 +1331,7 @@ mod tests {
             "/api/v1/actions",
             temp_dir.path(),
             None,
-            Some(r#"{"origin":"open-meow"}"#),
+            Some(r#"{"origin":"external-client"}"#),
         )?;
         let empty = handle_request_with_body(
             "POST",
@@ -1367,7 +1367,7 @@ mod tests {
         let temp_dir = tempfile::tempdir()?;
         let body = json!({
             "action": "desktop.deleteEverything",
-            "origin": "open-meow"
+            "origin": "external-client"
         })
         .to_string();
 

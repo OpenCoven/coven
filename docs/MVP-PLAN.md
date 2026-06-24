@@ -45,7 +45,7 @@ OpenCoven should not force users into one basket. Coven gives the OpenCoven ecos
 - Project-scoped autonomy boundaries.
 - Persistent session/event history.
 - Attachability and visibility.
-- A path for comux, OpenMeow, and external adapters such as `@opencoven/coven` to coordinate work without hard-coding one agent provider.
+- A path for comux and external adapters such as `@opencoven/coven` to coordinate work without hard-coding one agent provider.
 
 ## 3. Naming and package rules
 
@@ -182,7 +182,6 @@ flowchart TD
   API --> Comux[comux cockpit]
   API --> OpenClawPlugin[external @opencoven/coven plugin]
   OpenClawPlugin --> OpenClaw[OpenClaw ACP runtime]
-  API --> OpenMeow[OpenMeow intake/status]
 ```
 
 ## 8. Runtime session model
@@ -423,12 +422,11 @@ Rules:
 - Direct GitHub release artifacts.
 - Optional package manager support for cargo, mise, or asdf if demand appears.
 
-## 14. Relationship to comux, OpenClaw, and OpenMeow
+## 14. Relationship to comux and OpenClaw
 
 ```mermaid
 flowchart TD
-  OpenMeow[OpenMeow intake] --> OpenClaw[OpenClaw routing / memory / permissions]
-  OpenClaw --> Plugin[external @opencoven/coven plugin]
+  OpenClaw[OpenClaw routing / memory / permissions] --> Plugin[external @opencoven/coven plugin]
   Plugin --> Coven[Coven harness substrate]
   Comux[comux cockpit] --> Coven
   Coven --> Codex[Codex]
@@ -451,9 +449,9 @@ OpenClaw should use Coven only through the external `@opencoven/coven` plugin. T
 
 The plugin is not part of Coven's trust root. Rust must revalidate all project roots, cwd values, harness ids, input, and kill requests.
 
-### OpenMeow role
+### Intake-client role
 
-OpenMeow remains intake/status/handoff. It should not embed full terminals. It should toss tasks toward OpenClaw/Coven/comux and show compact session status.
+The chat/intake client remains intake/status/handoff. It should not embed full terminals. It should toss tasks toward OpenClaw/Coven/comux and show compact session status.
 
 ## 15. Phased roadmap
 

@@ -89,7 +89,7 @@ The Rust daemon is the authority boundary. All clients — including the CLI its
 - **🔌 Harness-neutral runtime** — v0 focuses on Codex and Claude Code with a clean adapter path for future harnesses (Hermes, Aider, Gemini, and user-defined CLIs).
 - **🖥️ Interactive session browser** — Live and completed work can be selected, rejoined, viewed, archived, restored, or sacrificed without memorizing IDs.
 - **📡 Attachable PTY sessions** — Live sessions can be replayed or followed from explicit CLI verbs.
-- **🔌 Local daemon API** — CastCodes, comux, OpenMeow, and the OpenClaw plugin coordinate through one versioned socket contract (`coven.daemon.v1`).
+- **🔌 Local daemon API** — CastCodes, comux, and the OpenClaw plugin coordinate through one versioned socket contract (`coven.daemon.v1`).
 - **🗄️ SQLite-backed history** — Session metadata and event logs survive daemon restarts.
 - **🦀 Rust authority layer** — Launch, cwd, input, kill, and path-sensitive requests are revalidated in Rust. Clients are never the trust boundary.
 - **🔒 External OpenClaw bridge** — `@opencoven/coven` is an opt-in plugin; OpenClaw core does not include Coven code.
@@ -381,8 +381,7 @@ Developer
   ├── CastCodes workspace ─────────────────────┐
   ├── coven CLI / TUI ─────────────────────────┤ HTTP over Unix socket
   ├── comux (legacy/reference) ────────────────┤ ~/.coven/coven.sock
-  ├── @opencoven/coven (OpenClaw plugin) ───────┤
-  └── OpenMeow ──────────────────────────────────┘
+  └── @opencoven/coven (OpenClaw plugin) ───────┘
                                                 │
                                 ┌───────────────▼──────────────────┐
                                 │         Coven Rust Daemon         │
@@ -547,7 +546,6 @@ Coven is the runtime layer. Other surfaces in the OpenCoven ecosystem sit above 
 | **[CastCodes](https://github.com/OpenCoven/cast-codes)** | Primary public workspace; the local-first AI coding product built on Coven | HTTP over Unix socket                    |
 | **comux**                                                | Legacy terminal cockpit (useful reference; not the future public story)    | HTTP over Unix socket                    |
 | **OpenClaw**                                             | External coding agent; integrates via opt-in plugin only                   | `@opencoven/coven` plugin → socket       |
-| **OpenMeow**                                             | Desktop companion surface for advanced intake                              | Capability discovery + `/api/v1/actions` |
 
 > **Important:** OpenClaw core does not contain Coven code. The integration lives exclusively in `packages/openclaw-coven` and publishes as `@opencoven/coven`. This separation keeps the trust boundary clean — the plugin is treated as an untrusted socket client, and the Rust daemon revalidates every request it makes.
 

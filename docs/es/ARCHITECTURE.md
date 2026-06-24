@@ -24,7 +24,7 @@ flowchart LR
   Comux[comux cockpit] -->|HTTP over Unix socket| Daemon
   OpenClaw[OpenClaw] --> Plugin[external @opencoven/coven plugin]
   Plugin -->|HTTP over Unix socket| Daemon
-  OpenMeow[OpenMeow chat/intent client] -->|capabilities + actions| Daemon
+  ChatClient[chat/intent client] -->|capabilities + actions| Daemon
 
   Daemon --> Control[Control plane: capability discovery + action routing]
   Control --> Policy[Policy + permission hints]
@@ -87,9 +87,9 @@ flowchart TD
   Spawn --> Ledger[Persist session + events]
 ```
 
-## Límite de OpenMeow / automatización
+## Límite de captura / automatización
 
-OpenMeow debe seguir siendo una interfaz de chat, una superficie de renderizado optimista/eco local, una capa de captura de intenciones y un host pequeño y rápido para acciones locales ultra simples. No debe convertirse en el motor de automatización.
+El cliente de chat/captura debe seguir siendo una interfaz de chat, una superficie de renderizado optimista/eco local, una capa de captura de intenciones y un host pequeño y rápido para acciones locales ultra simples. No debe convertirse en el motor de automatización.
 
 Coven es el runtime local compartido canónico para la automatización reutilizable porque centraliza:
 
@@ -103,11 +103,11 @@ Coven es el runtime local compartido canónico para la automatización reutiliza
 El flujo previsto es:
 
 ```text
-user -> OpenMeow -> Coven -> adapters -> desktop/apps
-desktop/apps -> Coven -> OpenMeow UI updates
+user -> chat/capture client -> Coven -> adapters -> desktop/apps
+desktop/apps -> Coven -> chat/capture client UI updates
 ```
 
-`GET /api/v1/capabilities` permite a OpenMeow y a otros clientes descubrir qué puede enrutar Coven. `POST /api/v1/actions` ofrece a los clientes un sobre de intención estable sin acoplarlos directamente a APIs frágiles de automatización del sistema operativo.
+`GET /api/v1/capabilities` permite al cliente de chat/captura y a otros clientes descubrir qué puede enrutar Coven. `POST /api/v1/actions` ofrece a los clientes un sobre de intención estable sin acoplarlos directamente a APIs frágiles de automatización del sistema operativo.
 
 ## Límite de adaptadores futuros
 

@@ -458,12 +458,6 @@ animation: breathe 2.5s ease-in-out infinite;
 - [ ] Ensure consistent color usage in UI
 - [ ] Update badge / shield colors
 
-#### OpenSorceryAI/open-meow
-- [ ] Update app icon to OpenCoven sigil (if applicable)
-- [ ] Apply color palette to UI
-- [ ] Update hero section imagery
-- [ ] Ensure landing page follows layout structure
-
 #### Landing Page (docs.opencoven.ai)
 - [ ] Hero section: centered sigil + glow
 - [ ] Capabilities grid: 90% black/white, 10% purple

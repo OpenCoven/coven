@@ -54,7 +54,7 @@ El log de eventos append-only registra el stdout/stderr del harness tal como se 
 
 ### Integraciones de cliente
 
-Los clientes (comux, OpenMeow, el plugin de OpenClaw) se conectan al socket local. No pueden obtener tokens del proveedor desde el daemon porque el daemon no los tiene. Cualquier cliente que quiera mostrar "logged in as ..." debe llamar directamente al comando de estado propio del harness.
+Los clientes (comux, el cliente de chat/captura, el plugin de OpenClaw) se conectan al socket local. No pueden obtener tokens del proveedor desde el daemon porque el daemon no los tiene. Cualquier cliente que quiera mostrar "logged in as ..." debe llamar directamente al comando de estado propio del harness.
 
 ## Login del proveedor por harness
 

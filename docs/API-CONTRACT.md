@@ -117,7 +117,7 @@ All API errors use the following stable envelope. Clients must branch on `error.
 
 ## Capability catalog shape (`v1`)
 
-`GET /api/v1/capabilities` returns the daemon/control-plane capability catalog. This is the intended OpenMeow handshake for deciding which actions to show or route through Coven.
+`GET /api/v1/capabilities` returns the daemon/control-plane capability catalog. This is the intended intake-client handshake for deciding which actions to show or route through Coven.
 
 ```json
 {
@@ -156,7 +156,7 @@ Clients should ignore unknown future capability ids and action ids unless they e
 ```json
 {
   "action": "coven.capabilities.refresh",
-  "origin": "open-meow",
+  "origin": "external-client",
   "intentId": "intent-1",
   "args": {}
 }
@@ -173,7 +173,7 @@ Immediately completed safe actions return `200`:
   "event": {
     "kind": "capabilities.refreshed",
     "action": "coven.capabilities.refresh",
-    "origin": "open-meow",
+    "origin": "external-client",
     "intentId": "intent-1",
     "payload": { "capabilities": 3 }
   }

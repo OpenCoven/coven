@@ -24,7 +24,7 @@ flowchart LR
   Comux[comux cockpit] -->|HTTP over Unix socket| Daemon
   OpenClaw[OpenClaw] --> Plugin[external @opencoven/coven plugin]
   Plugin -->|HTTP over Unix socket| Daemon
-  OpenMeow[OpenMeow chat/intent client] -->|capabilities + actions| Daemon
+  ChatClient[chat/intent client] -->|capabilities + actions| Daemon
 
   Daemon --> Control[Control plane: capability discovery + action routing]
   Control --> Policy[Policy + permission hints]
@@ -87,9 +87,9 @@ flowchart TD
   Spawn --> Ledger[Persist session + events]
 ```
 
-## Граница OpenMeow / автоматизации
+## Граница ввода / автоматизации
 
-OpenMeow должен оставаться чат-интерфейсом, поверхностью для локального эхо/оптимистичного рендеринга, слоем захвата намерений и небольшим быстрым хостом для ультра-простых локальных действий. Он не должен становиться движком автоматизации.
+Клиент чата/ввода должен оставаться чат-интерфейсом, поверхностью для локального эхо/оптимистичного рендеринга, слоем захвата намерений и небольшим быстрым хостом для ультра-простых локальных действий. Он не должен становиться движком автоматизации.
 
 Coven — это канонический общий локальный рантайм для переиспользуемой автоматизации, потому что он централизует:
 
@@ -103,11 +103,11 @@ Coven — это канонический общий локальный рант
 Предполагаемый поток таков:
 
 ```text
-user -> OpenMeow -> Coven -> adapters -> desktop/apps
-desktop/apps -> Coven -> OpenMeow UI updates
+user -> chat/intent client -> Coven -> adapters -> desktop/apps
+desktop/apps -> Coven -> chat/intent client UI updates
 ```
 
-`GET /api/v1/capabilities` позволяет OpenMeow и другим клиентам обнаружить, что Coven может маршрутизировать. `POST /api/v1/actions` даёт клиентам стабильный конверт намерений без жёсткой связки с хрупкими API автоматизации ОС.
+`GET /api/v1/capabilities` позволяет клиенту чата/ввода и другим клиентам обнаружить, что Coven может маршрутизировать. `POST /api/v1/actions` даёт клиентам стабильный конверт намерений без жёсткой связки с хрупкими API автоматизации ОС.
 
 ## Граница будущих адаптеров
 

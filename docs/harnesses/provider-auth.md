@@ -54,7 +54,7 @@ The append-only event log records harness stdout/stderr as it is emitted. The da
 
 ### Client integrations
 
-Clients (CastCodes, comux, OpenMeow, the OpenClaw plugin) connect to the local socket. They cannot fetch provider tokens from the daemon because the daemon does not have them. Any client that wants to display "logged in as ..." must call the harness's own status command directly.
+Clients (CastCodes, comux, the OpenClaw plugin) connect to the local socket. They cannot fetch provider tokens from the daemon because the daemon does not have them. Any client that wants to display "logged in as ..." must call the harness's own status command directly.
 
 ## Provider login per harness
 

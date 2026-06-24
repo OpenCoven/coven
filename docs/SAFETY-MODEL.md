@@ -20,7 +20,6 @@ Every client is untrusted for enforcement purposes, including:
 - CastCodes;
 - the CLI/TUI;
 - comux;
-- OpenMeow;
 - the external OpenClaw plugin;
 - scripts; and
 - future desktop clients.
@@ -34,7 +33,6 @@ flowchart TB
     CastCodes[CastCodes]
     CLI[coven CLI / TUI]
     Comux[comux]
-    Meow[OpenMeow]
     Plugin["@opencoven/coven plugin"]
     Scripts[Scripts / other clients]
   end

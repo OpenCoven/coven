@@ -122,7 +122,7 @@ Use:
 Avoid leading with:
 
 - comux as the active flagship cockpit;
-- OpenMeow as required intake;
+- the chat/intake client as required intake;
 - OpenClaw bridge as the primary user story;
 - optional clients as the first-contact explanation; and
 - broad ecosystem diagrams before the CastCodes + Coven story is clear.

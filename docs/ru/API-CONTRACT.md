@@ -109,7 +109,7 @@ flowchart TD
 
 ## Форма каталога capabilities (`v1`)
 
-`GET /api/v1/capabilities` возвращает каталог capabilities демона/плоскости управления. Это предполагаемый handshake OpenMeow для решения, какие действия показывать или маршрутизировать через Coven.
+`GET /api/v1/capabilities` возвращает каталог capabilities демона/плоскости управления. Это предполагаемый handshake клиента чата/ввода для решения, какие действия показывать или маршрутизировать через Coven.
 
 ```json
 {
@@ -148,7 +148,7 @@ flowchart TD
 ```json
 {
   "action": "coven.capabilities.refresh",
-  "origin": "open-meow",
+  "origin": "external-client",
   "intentId": "intent-1",
   "args": {}
 }
@@ -165,7 +165,7 @@ flowchart TD
   "event": {
     "kind": "capabilities.refreshed",
     "action": "coven.capabilities.refresh",
-    "origin": "open-meow",
+    "origin": "external-client",
     "intentId": "intent-1",
     "payload": { "capabilities": 3 }
   }

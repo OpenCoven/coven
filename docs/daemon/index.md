@@ -15,7 +15,7 @@ The Coven daemon is a single Rust process per host. It owns:
 - Capability discovery and action routing in front of adapters.
 - Path canonicalization, project-root validation, and authority checks.
 
-Clients (CastCodes, `coven` CLI/TUI, comux, OpenMeow, the external OpenClaw plugin) **never** spawn harness PTYs themselves. They ask the daemon.
+Clients (CastCodes, `coven` CLI/TUI, comux, the external OpenClaw plugin) **never** spawn harness PTYs themselves. They ask the daemon.
 
 <Columns>
   <Card title="Lifecycle" href="/daemon/lifecycle" icon="play-circle">

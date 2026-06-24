@@ -77,7 +77,7 @@ Cuando no haya metadatos del daemon disponibles, `daemon` es `null`.
 
 ## Capabilities del plano de control
 
-`GET /api/v1/capabilities` es el punto de descubrimiento para clientes de primera parte como OpenMeow. Devuelve ids de capability, propiedad del adaptador, disponibilidad, pistas de política e ids de acción. Esto evita que los clientes hardcodeen lo que el daemon puede hacer.
+`GET /api/v1/capabilities` es el punto de descubrimiento para clientes de primera parte como el cliente de chat/captura. Devuelve ids de capability, propiedad del adaptador, disponibilidad, pistas de política e ids de acción. Esto evita que los clientes hardcodeen lo que el daemon puede hacer.
 
 ```json
 {
@@ -104,12 +104,12 @@ Cuando no haya metadatos del daemon disponibles, `daemon` es `null`.
 
 ## Acciones del plano de control
 
-`POST /api/v1/actions` acepta un sobre de intent estilo OpenMeow. El daemon solo enruta acciones conocidas; las acciones desconocidas fallan en cerrado antes de que pueda ejecutarse cualquier adaptador.
+`POST /api/v1/actions` acepta un sobre de intent estilo cliente de captura. El daemon solo enruta acciones conocidas; las acciones desconocidas fallan en cerrado antes de que pueda ejecutarse cualquier adaptador.
 
 ```json
 {
   "action": "coven.capabilities.refresh",
-  "origin": "open-meow",
+  "origin": "external-client",
   "intentId": "intent-1",
   "args": {}
 }
@@ -126,7 +126,7 @@ Las acciones seguras completadas inmediatamente devuelven `200` con un payload c
   "event": {
     "kind": "capabilities.refreshed",
     "action": "coven.capabilities.refresh",
-    "origin": "open-meow",
+    "origin": "external-client",
     "intentId": "intent-1",
     "payload": { "capabilities": 3 }
   }

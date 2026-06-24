@@ -126,9 +126,9 @@ The plugin should not:
 - assume unversioned routes are stable; or
 - widen project-root permissions.
 
-## OpenMeow and intake surfaces
+## Intake surfaces
 
-OpenMeow-like clients are advanced intake and presentation layers. They should not become the first-contact public story for Coven.
+Chat/intake clients are advanced intake and presentation layers. They should not become the first-contact public story for Coven.
 
 Useful responsibilities:
 
