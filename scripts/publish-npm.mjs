@@ -7,6 +7,8 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
 const distRoot = path.join(repoRoot, 'npm', 'dist');
+const primaryWrapperPackageName = '@opencoven/cli';
+const wrapperPackageNames = [primaryWrapperPackageName, '@opencoven/coven'];
 
 const targets = {
   macos: {
@@ -78,15 +80,17 @@ function main() {
   });
 
   if (!skipWrapper) {
-    const wrapperDir = writeWrapperPackage(version);
-    run('npm', publishArgs(dryRun), {
-      cwd: wrapperDir,
-      env: publishEnv(dryRun)
-    });
+    for (const packageName of wrapperPackageNames) {
+      const wrapperDir = writeWrapperPackage(version, packageName);
+      run('npm', publishArgs(dryRun), {
+        cwd: wrapperDir,
+        env: publishEnv(dryRun)
+      });
+    }
   }
 
   console.log(`Prepared npm packages in ${distRoot}`);
-  console.log(`${dryRun ? 'Dry-run completed' : 'Publish completed'} for ${target.packageName}${skipWrapper ? '' : ' and @opencoven/cli'} at version ${version}.`);
+  console.log(`${dryRun ? 'Dry-run completed' : 'Publish completed'} for ${target.packageName}${skipWrapper ? '' : ` and ${wrapperPackageNames.join(', ')}`} at version ${version}.`);
 }
 
 function writePlatformPackage(targetName, target, binaryPath, version) {
@@ -108,18 +112,30 @@ function writePlatformPackage(targetName, target, binaryPath, version) {
   return outDir;
 }
 
-function writeWrapperPackage(version) {
-  const outDir = path.join(distRoot, 'coven');
+function writeWrapperPackage(version, packageName = primaryWrapperPackageName) {
+  const outDir = path.join(distRoot, wrapperPackageDirName(packageName));
   cpSync(path.join(repoRoot, 'npm', 'coven'), outDir, { recursive: true });
   const packagePath = path.join(outDir, 'package.json');
   const packageJson = JSON.parse(readFileSync(packagePath, 'utf8'));
+  packageJson.name = packageName;
   packageJson.version = version;
-  for (const packageName of Object.keys(packageJson.optionalDependencies)) {
-    packageJson.optionalDependencies[packageName] = version;
+  for (const optionalName of Object.keys(packageJson.optionalDependencies)) {
+    packageJson.optionalDependencies[optionalName] = version;
   }
   writeFileSync(packagePath, `${JSON.stringify(packageJson, null, 2)}\n`);
+  rewriteWrapperText(path.join(outDir, 'README.md'), packageName);
+  rewriteWrapperText(path.join(outDir, 'bin', 'coven.js'), packageName);
   chmodSync(path.join(outDir, 'bin', 'coven.js'), 0o755);
   return outDir;
+}
+
+function rewriteWrapperText(filePath, packageName) {
+  const text = readFileSync(filePath, 'utf8');
+  writeFileSync(filePath, wrapperTextForPackage(text, packageName));
+}
+
+export function wrapperTextForPackage(text, packageName) {
+  return text.replace(/@opencoven\/cli(?!-)/g, packageName);
 }
 
 export function releaseVersion(env = process.env, packageVersion = wrapperPackageVersion()) {
@@ -138,6 +154,14 @@ export function releaseVersion(env = process.env, packageVersion = wrapperPackag
 
 export function targetPackageName(targetName) {
   return targets[targetName]?.packageName;
+}
+
+export function wrapperPackageNameList() {
+  return [...wrapperPackageNames];
+}
+
+export function wrapperPackageDirName(packageName) {
+  return packageName === primaryWrapperPackageName ? 'coven' : 'coven-alias';
 }
 
 export function defaultTargetName(platform, arch) {

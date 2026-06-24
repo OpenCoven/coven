@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
-import { defaultTargetName, isOidcContext, publishArgs, publishEnv, releaseVersion, targetPackageName, validatePublishToken, validatePublishVersion } from './publish-npm.mjs';
+import { defaultTargetName, isOidcContext, publishArgs, publishEnv, releaseVersion, targetPackageName, validatePublishToken, validatePublishVersion, wrapperPackageDirName, wrapperPackageNameList, wrapperTextForPackage } from './publish-npm.mjs';
 
 const OIDC_ENV = {
   ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'fake-oidc-token',
@@ -56,6 +56,20 @@ test('wrapper declares linux x64 native package as an optional dependency', () =
   const packagePath = new URL(['..', 'npm', 'coven', 'package.json'].join('/'), import.meta.url);
   const packageJson = JSON.parse(readFileSync(packagePath, 'utf8'));
   assert.equal(packageJson.optionalDependencies['@opencoven/cli-linux-x64'], '0.0.0');
+});
+
+test('release publishes the current and coven-named wrapper packages', () => {
+  assert.deepEqual(wrapperPackageNameList(), ['@opencoven/cli', '@opencoven/coven']);
+  assert.equal(wrapperPackageDirName('@opencoven/cli'), 'coven');
+  assert.equal(wrapperPackageDirName('@opencoven/coven'), 'coven-alias');
+});
+
+test('coven-named wrapper keeps cli-prefixed native package names', () => {
+  const source = '@opencoven/cli uses @opencoven/cli-macos and @opencoven/cli-linux-x64';
+  assert.equal(
+    wrapperTextForPackage(source, '@opencoven/coven'),
+    '@opencoven/coven uses @opencoven/cli-macos and @opencoven/cli-linux-x64'
+  );
 });
 
 test('wrapper declares windows native package as an optional dependency', () => {
