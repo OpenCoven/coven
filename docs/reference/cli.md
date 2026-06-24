@@ -92,7 +92,7 @@ flowchart TB
 
 | Command | Flags |
 |---|---|
-| `coven run` | `--cwd <path>`, `--title <text>`, `--detach` |
+| `coven run` | `--cwd <path>`, `--title <text>`, `--detach`, `--model <id>`, `--think`, `--speed fast\|balanced\|thorough` |
 | `coven sessions` | `--plain`, `--json`, `--all`, `--manage` |
 | `coven sacrifice` | `--yes` (required) |
 | `coven logs prune` | `--dry-run`, `--raw-days <N>`, `--event-days <N>` |

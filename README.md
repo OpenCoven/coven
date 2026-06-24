@@ -241,6 +241,8 @@ Choose a repo, choose a harness, get a verified patch.
 | `coven run <harness> <prompt> --cwd <path>`    | Launch from a cwd inside the project root                        |
 | `coven run <harness> <prompt> --title <title>` | Set a readable session title                                     |
 | `coven run <harness> <prompt> --model <id>`    | Forward a model override to the harness                          |
+| `coven run <harness> <prompt> --think`         | Request deeper reasoning when the harness supports it            |
+| `coven run <harness> <prompt> --speed <level>` | Set a latency/reasoning hint: `fast`, `balanced`, or `thorough`  |
 | `coven run <harness> --continue`               | Resume the latest active session for this project                |
 | `coven run <harness> --continue <id>`          | Resume a specific session by id                                  |
 | `coven run <harness> <prompt> --detach`        | Create the session record without launching the harness          |

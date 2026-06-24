@@ -59,7 +59,15 @@ pub fn build_harness_command(
     cwd: &Path,
     mode: crate::harness::HarnessLaunchMode,
 ) -> Result<HarnessCommand> {
-    build_harness_command_with_conversation(harness_id, prompt, cwd, mode, None, None, None)
+    build_harness_command_with_conversation(
+        harness_id,
+        prompt,
+        cwd,
+        mode,
+        None,
+        None,
+        crate::harness::HarnessLaunchOptions::default(),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -70,7 +78,7 @@ pub fn build_harness_command_with_conversation(
     mode: crate::harness::HarnessLaunchMode,
     conversation: Option<&crate::harness::ConversationHint>,
     familiar: Option<&crate::harness::FamiliarContext>,
-    model: Option<&str>,
+    options: crate::harness::HarnessLaunchOptions<'_>,
 ) -> Result<HarnessCommand> {
     let (program, args) = crate::harness::command_parts_for_harness_with_conversation(
         harness_id,
@@ -78,7 +86,7 @@ pub fn build_harness_command_with_conversation(
         mode,
         conversation,
         familiar,
-        model,
+        options,
     )?;
 
     Ok(HarnessCommand {
@@ -118,7 +126,7 @@ pub fn stream_claude<W: Write>(
     prompt: &str,
     forward_stdin: bool,
     system_prompt: Option<&str>,
-    model: Option<&str>,
+    options: crate::harness::HarnessLaunchOptions<'_>,
     out: &mut W,
 ) -> Result<i32> {
     stream_claude_with_program(
@@ -129,7 +137,7 @@ pub fn stream_claude<W: Write>(
         prompt,
         forward_stdin,
         system_prompt,
-        model,
+        options,
         out,
     )
 }
@@ -143,7 +151,7 @@ fn stream_claude_with_program<W: Write>(
     prompt: &str,
     forward_stdin: bool,
     system_prompt: Option<&str>,
-    model: Option<&str>,
+    options: crate::harness::HarnessLaunchOptions<'_>,
     out: &mut W,
 ) -> Result<i32> {
     stream_claude_with_program_and_permission_bypass(
@@ -154,7 +162,7 @@ fn stream_claude_with_program<W: Write>(
         prompt,
         forward_stdin,
         system_prompt,
-        model,
+        options,
         crate::harness::claude_permission_bypass_enabled(),
         out,
     )
@@ -169,7 +177,7 @@ fn stream_claude_with_program_and_permission_bypass<W: Write>(
     prompt: &str,
     forward_stdin: bool,
     system_prompt: Option<&str>,
-    model: Option<&str>,
+    options: crate::harness::HarnessLaunchOptions<'_>,
     permission_bypass_enabled: bool,
     out: &mut W,
 ) -> Result<i32> {
@@ -182,7 +190,8 @@ fn stream_claude_with_program_and_permission_bypass<W: Write>(
     // `_The "claude" harness completed but produced no output._`
     // Strip the `provider/` namespace so claude's `--model` gets a bare id,
     // matching the non-stream path (`harness::normalize_model_id`).
-    let normalized_model: Option<&str> = model
+    let normalized_model: Option<&str> = options
+        .model
         .map(str::trim)
         .filter(|m| !m.is_empty())
         .map(crate::harness::normalize_model_id);
@@ -199,6 +208,9 @@ fn stream_claude_with_program_and_permission_bypass<W: Write>(
     }
     if let Some(m) = normalized_model {
         args.extend_from_slice(&["--model", m]);
+    }
+    if let Some(effort) = options.claude_effort() {
+        args.extend_from_slice(&["--effort", effort]);
     }
     args.extend_from_slice(&["--output-format", "stream-json", "--verbose"]);
     if is_resume {
@@ -718,7 +730,7 @@ exit 7
             "hello prompt",
             false,
             None,
-            None,
+            crate::harness::HarnessLaunchOptions::default(),
             &mut out,
         )?;
 
@@ -769,7 +781,7 @@ exit 0
             // MUST be present.
             true,
             None,
-            None,
+            crate::harness::HarnessLaunchOptions::default(),
             &mut out,
         )?;
 
@@ -808,7 +820,7 @@ exit 0
             "hello prompt",
             false,
             None,
-            None,
+            crate::harness::HarnessLaunchOptions::default(),
             true,
             &mut out,
         )?;
@@ -852,7 +864,7 @@ exit 0
             "hello again",
             false,
             None,
-            None,
+            crate::harness::HarnessLaunchOptions::default(),
             &mut out,
         )?;
 
@@ -892,13 +904,58 @@ exit 0
             false,
             None,
             // Namespaced id is normalized to the bare model before forwarding.
-            Some("anthropic/claude-sonnet-4"),
+            crate::harness::HarnessLaunchOptions {
+                model: Some("anthropic/claude-sonnet-4"),
+                ..Default::default()
+            },
             &mut out,
         )?;
 
         assert_eq!(
             std::fs::read_to_string(temp_dir.path().join("args.txt"))?,
             "-p\n--model\nclaude-sonnet-4\n--output-format\nstream-json\n--verbose\n--session-id\nsession-123\nhello prompt\n"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stream_claude_forwards_think_as_effort_high() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = fake_claude_spawn_guard();
+        let temp_dir = tempfile::tempdir()?;
+        let fake_claude = temp_dir.path().join("fake-claude");
+        std::fs::write(
+            &fake_claude,
+            r#"#!/bin/sh
+printf '%s\n' "$@" > args.txt
+exit 0
+"#,
+        )?;
+        let mut permissions = std::fs::metadata(&fake_claude)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_claude, permissions)?;
+
+        let mut out = Vec::new();
+        let _code = stream_claude_with_program(
+            fake_claude.to_str().unwrap(),
+            temp_dir.path(),
+            "session-123",
+            false,
+            "hello prompt",
+            false,
+            None,
+            crate::harness::HarnessLaunchOptions {
+                think: true,
+                ..Default::default()
+            },
+            &mut out,
+        )?;
+
+        assert_eq!(
+            std::fs::read_to_string(temp_dir.path().join("args.txt"))?,
+            "-p\n--effort\nhigh\n--output-format\nstream-json\n--verbose\n--session-id\nsession-123\nhello prompt\n"
         );
         Ok(())
     }

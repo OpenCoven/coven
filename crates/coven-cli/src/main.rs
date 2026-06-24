@@ -135,6 +135,18 @@ enum Command {
         model: Option<String>,
         #[arg(
             long,
+            help = "Request deeper reasoning when the harness supports it. Unsupported harnesses warn and continue."
+        )]
+        think: bool,
+        #[arg(
+            long,
+            value_name = "LEVEL",
+            value_parser = ["fast", "balanced", "thorough"],
+            help = "Latency/reasoning hint: fast, balanced, or thorough. Unsupported harnesses warn and continue."
+        )]
+        speed: Option<String>,
+        #[arg(
+            long,
             help = "Emit JSONL events on stdout (system.init / user / assistant / tool_result / result)"
         )]
         stream_json: bool,
@@ -379,6 +391,8 @@ fn run_cli(cli: Cli) -> Result<()> {
             archive,
             familiar,
             model,
+            think,
+            speed,
             stream_json,
             stream_json_input,
         }) => run_session(
@@ -393,6 +407,8 @@ fn run_cli(cli: Cli) -> Result<()> {
             archive,
             familiar.as_deref(),
             model.as_deref(),
+            think,
+            speed.as_deref(),
             stream_json,
             stream_json_input,
         ),
@@ -1349,6 +1365,8 @@ fn run_session(
     archive: bool,
     familiar_id: Option<&str>,
     model: Option<&str>,
+    think: bool,
+    speed: Option<&str>,
     stream_json: bool,
     stream_json_input: bool,
 ) -> Result<()> {
@@ -1404,6 +1422,7 @@ fn run_session(
     // mechanism warn (don't error) so a selection degrades gracefully. A blank
     // value is ignored.
     let requested_model: Option<&str> = model.map(str::trim).filter(|m| !m.is_empty());
+    let requested_speed = speed.map(harness::HarnessSpeed::parse).transpose()?;
     if let (Some(requested), Some(s)) = (requested_model, spec.as_ref()) {
         if !s.supports_model() {
             eprintln!(
@@ -1413,6 +1432,30 @@ fn run_session(
             );
         }
     }
+    if think && !harness::harness_supports_think(&selected_harness.id) {
+        eprintln!(
+            "warning: harness `{}` does not support --think; ignoring the request",
+            selected_harness.id
+        );
+    }
+    if let Some(speed) = requested_speed {
+        if !harness::harness_supports_speed(&selected_harness.id) {
+            eprintln!(
+                "warning: harness `{}` does not support --speed {}; ignoring the request",
+                selected_harness.id,
+                match speed {
+                    harness::HarnessSpeed::Fast => "fast",
+                    harness::HarnessSpeed::Balanced => "balanced",
+                    harness::HarnessSpeed::Thorough => "thorough",
+                }
+            );
+        }
+    }
+    let launch_options = harness::HarnessLaunchOptions {
+        model: requested_model,
+        think,
+        speed: requested_speed,
+    };
 
     let effective_prompt = match (&familiar_ctx, spec.as_ref()) {
         (Some(f), Some(s)) if s.system_prompt_flag.is_none() && !expanded_prompt.is_empty() => {
@@ -1572,7 +1615,7 @@ fn run_session(
             &effective_prompt,
             stream_json_input,
             claude_system_prompt.as_deref(),
-            requested_model,
+            launch_options,
             &mut handle,
         );
         drop(handle);
@@ -1660,7 +1703,7 @@ fn run_session(
         harness_launch_mode_for_stdio(),
         conversation_hint.as_ref(),
         familiar_for_args,
-        requested_model,
+        launch_options,
     )?;
     match pty_runner::run_attached(&command) {
         Ok(result) => {

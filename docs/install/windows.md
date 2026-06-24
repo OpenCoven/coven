@@ -31,6 +31,7 @@ The default command opens the prompt-first TUI. You can also use the explicit CL
 coven doctor
 coven daemon start
 coven run codex "fix the failing tests"
+coven run claude "audit this branch" --think
 coven sessions
 ```
 
