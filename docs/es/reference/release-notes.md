@@ -6,6 +6,23 @@ read_when:
 title: "Changelog y notas de release de Coven"
 ---
 
+## Semana del 18 de junio de 2026
+
+### Nuevas funcionalidades
+
+- **Controles de razonamiento para `coven run` (v0.0.48).** `coven run` ahora acepta `--think` y `--speed fast|balanced|thorough` junto con `--model`. Los lanzamientos de Claude traducen esos hints a `--effort`; los harnesses sin soporte avisan y continúan en vez de fallar. Consulta [issue #246](https://github.com/OpenCoven/coven/issues/246), [PR #254](https://github.com/OpenCoven/coven/pull/254) y [referencia de `coven run`](/reference/cli-run).
+- **Receta confiable del adaptador Hermes (v0.0.41).** `coven adapter install hermes` ahora escribe un manifiesto confiable local bajo `COVEN_HOME/adapters/hermes.json`, y Coven carga automáticamente manifiestos desde ese trust store propio. Los usuarios nuevos ya no necesitan escribir JSON a mano ni configurar `COVEN_HARNESS_ADAPTER_MANIFEST` solo para probar Hermes.
+
+### Actualizaciones
+
+- **Estado del paquete Windows x64.** El README público ahora refleja que `@opencoven/cli-windows` ya está publicado, no en staging. En Windows se puede instalar con el wrapper universal `@opencoven/cli` y verificar los harnesses locales con `coven doctor`.
+
+### Correcciones de errores
+
+- **Backfill resiliente del índice FTS de eventos (v0.0.48).** El backfill de eventos existentes hacia `events_fts` ahora corre en lotes acotados, registra su finalización en `store_meta`, aplica `busy_timeout` a conexiones de lectura y trata `SQLITE_BUSY` como no fatal, de modo que la indexación de búsqueda no bloquea todos los lanzamientos de agentes en historiales grandes. Consulta [issue #249](https://github.com/OpenCoven/coven/issues/249) y [PR #254](https://github.com/OpenCoven/coven/pull/254).
+- **Guía más clara para harnesses no soportados.** Los errores de harness desconocido ahora muestran los IDs configurados y orientan a usuarios de Hermes hacia `coven adapter install hermes` seguido de `coven adapter doctor hermes`.
+- **Fallback de directorio home en Windows.** `coven doctor` y la resolución del store funcionan en PowerShell cuando `HOME` no existe, probando `USERPROFILE`, `HOMEDRIVE` + `HOMEPATH` y el home de la plataforma antes de pedir `COVEN_HOME`.
+
 ## Semana del 3 de junio de 2026
 
 ### Nuevas funcionalidades
