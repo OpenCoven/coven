@@ -3,15 +3,15 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>OpenCoven — Orchestrate Intelligence</title>
+    <title>OpenCoven - Coven Runtime</title>
     <meta
       name="description"
-      content="OpenCoven orchestrates multi-agent systems, tools, and workflows under intentional local control."
+      content="Coven is the local runtime that powers CastCodes with project-scoped harness sessions, append-only events, and a typed local socket API."
     />
-    <meta property="og:title" content="OpenCoven" />
+    <meta property="og:title" content="OpenCoven - Coven Runtime" />
     <meta
       property="og:description"
-      content="Multi-agent systems. Unified control. Real execution."
+      content="Local-first project-scoped harness sessions, append-only events, logs, artifacts, and authority boundaries."
     />
     <meta property="og:type" content="website" />
     <meta property="og:url" content="https://opencoven.ai/" />
@@ -28,24 +28,22 @@
     <style>
       :root {
         color-scheme: dark;
-        --bg: var(--oc-black);
-        --panel: rgba(255, 255, 255, 0.035);
-        --panel-strong: rgba(255, 255, 255, 0.06);
-        --line: rgba(255, 255, 255, 0.1);
-        --line-soft: rgba(255, 255, 255, 0.075);
-        --text: rgba(255, 255, 255, 0.94);
-        --muted: rgba(255, 255, 255, 0.62);
-        --faint: rgba(255, 255, 255, 0.42);
-        --violet: var(--oc-purple-2);
-        --violet-2: var(--oc-purple-3);
-        --violet-3: var(--oc-purple-1);
-        --ink: var(--oc-surface-2);
-        --radius-xl: 2rem;
-        --radius-2xl: 3.5rem;
-        --shadow: 0 32px 120px rgba(0, 0, 0, 0.45);
-        font-family:
-          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
-          "Segoe UI", sans-serif;
+        --bg: #050409;
+        --surface: #0f0a19;
+        --surface-2: #171021;
+        --surface-3: #211732;
+        --terminal: #08060d;
+        --line: rgba(216, 199, 255, 0.12);
+        --line-strong: rgba(229, 216, 255, 0.22);
+        --line-violet: rgba(183, 151, 255, 0.35);
+        --text: rgba(251, 247, 255, 0.96);
+        --muted: rgba(217, 204, 238, 0.72);
+        --faint: rgba(194, 177, 222, 0.48);
+        --violet: #aa88ff;
+        --violet-2: #d8c8ff;
+        --violet-3: #7f5af0;
+        --green: #76f5b6;
+        --amber: #f0c678;
       }
 
       * {
@@ -53,6 +51,7 @@
       }
 
       html {
+        background: var(--bg);
         scroll-behavior: smooth;
       }
 
@@ -60,8 +59,16 @@
         margin: 0;
         min-height: 100vh;
         overflow-x: hidden;
-        background: var(--bg);
+        background:
+          radial-gradient(circle at 50% -20%, rgba(127, 90, 240, 0.24), transparent 34rem),
+          radial-gradient(circle at 85% 12%, rgba(170, 136, 255, 0.14), transparent 28rem),
+          linear-gradient(rgba(180, 145, 255, 0.035) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(180, 145, 255, 0.035) 1px, transparent 1px),
+          var(--bg);
+        background-size: auto, auto, 34px 34px, 34px 34px, auto;
         color: var(--text);
+        font-family: var(--oc-font-ui);
+        line-height: 1.5;
       }
 
       a {
@@ -69,96 +76,22 @@
         text-decoration: none;
       }
 
-      .background {
-        position: fixed;
-        inset: 0;
-        pointer-events: none;
-        z-index: 0;
-        overflow: hidden;
+      a:focus-visible,
+      button:focus-visible {
+        outline: 2px solid rgba(154, 142, 205, 0.72);
+        outline-offset: 2px;
       }
 
-      .glow-top,
-      .glow-side,
-      .glow-bottom {
-        display: none;
+      p,
+      h1,
+      h2,
+      h3 {
+        margin: 0;
       }
 
-      .glow-top {
-        left: 50%;
-        top: -18rem;
-        width: 44rem;
-        height: 44rem;
-        transform: translateX(-50%);
-        background: rgba(139, 92, 246, 0.22);
-      }
-
-      .glow-side {
-        right: -20rem;
-        bottom: 12rem;
-        width: 48rem;
-        height: 48rem;
-        background: rgba(91, 60, 255, 0.18);
-      }
-
-      .glow-bottom {
-        left: -22rem;
-        bottom: -26rem;
-        width: 52rem;
-        height: 52rem;
-        background: rgba(184, 146, 255, 0.12);
-      }
-
-      .grid-bg {
-        position: absolute;
-        inset: 0;
-        opacity: 0.14;
-        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='72' height='72' viewBox='0 0 72 72'%3E%3Cpath d='M72 0H0v72' fill='none' stroke='rgba(255,255,255,0.16)' stroke-width='1'/%3E%3C/svg%3E");
-        background-size: 72px 72px;
-      }
-
-      .noise {
-        position: absolute;
-        inset: 0;
-        opacity: 0;
-      }
-
-      .page {
-        position: relative;
-        z-index: 1;
-      }
-
-      .container {
-        width: min(100% - 3rem, 1180px);
-        margin-inline: auto;
-      }
-
-      header {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        padding-block: 1.5rem;
-        border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-        backdrop-filter: none;
-        position: sticky;
-        top: 0;
-        z-index: 100;
-      }
-
-      .brand {
-        display: inline-flex;
-        align-items: center;
-        gap: 0.8rem;
-        font-weight: 700;
-        letter-spacing: -0.02em;
-      }
-
-      .brand-mark,
-      .footer-mark {
-        display: grid;
-        place-items: center;
-        border: 1px solid rgba(184, 146, 255, 0.2);
-        background: var(--oc-black);
-        box-shadow: 0 0 0 1px rgba(139, 92, 246, 0.08), 0 20px 60px rgba(0, 0, 0, 0.35);
+      code,
+      .mono {
+        font-family: var(--oc-font-mono);
       }
 
       .svg-sprite {
@@ -168,706 +101,784 @@
         overflow: hidden;
       }
 
-      .logo {
-        display: block;
-        color: var(--violet);
-        filter: drop-shadow(0 0 24px rgba(139, 92, 246, 0.32));
+      .site {
+        width: 100%;
+        max-width: 100%;
+        min-height: 100vh;
+        overflow-x: hidden;
+        background:
+          linear-gradient(180deg, rgba(5, 4, 9, 0.12), rgba(5, 4, 9, 0.94) 650px),
+          transparent;
       }
 
-      .logo-small {
-        width: 2.25rem;
-        height: 2.25rem;
+      .container {
+        width: 100%;
+        max-width: 1212px;
+        margin-inline: auto;
+        padding-inline: 16px;
       }
 
-      .logo-footer {
-        width: 1.25rem;
-        height: 1.25rem;
+      .topbar {
+        position: sticky;
+        top: 0;
+        z-index: 20;
+        border-bottom: 1px solid var(--line);
+        background: rgba(5, 4, 9, 0.86);
+      }
+
+      .topbar-inner {
+        display: flex;
+        min-height: 64px;
+        align-items: center;
+        justify-content: space-between;
+        gap: 20px;
+      }
+
+      .brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 12px;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+      }
+
+      .brand-mark,
+      .intro-mark,
+      .footer-mark {
+        display: grid;
+        place-items: center;
+        border: 1px solid var(--line-violet);
+        background: #090611;
+        color: #ffffff;
       }
 
       .brand-mark {
-        width: 3.15rem;
-        height: 3.15rem;
-        border-radius: 1.05rem;
+        width: 36px;
+        height: 36px;
+        border-radius: 8px;
       }
 
-      .footer-mark {
-        width: 2.1rem;
-        height: 2.1rem;
-        border-radius: 0.8rem;
+      .brand-mark svg {
+        width: 24px;
+        height: 24px;
       }
 
-      nav {
+      .nav {
         display: flex;
-        gap: 2rem;
-        color: rgba(255,255,255,.55);
-        font-size: 0.9rem;
-      }
-
-      nav a {
-        transition: color .2s ease;
-      }
-
-      nav a:hover {
-        color: white;
-      }
-
-      .hero {
-        display: grid;
-        grid-template-columns: minmax(0, 1fr) minmax(420px, 500px);
         align-items: center;
-        gap: 3.5rem;
-        min-height: calc(100vh - 90px);
-        padding-block: 4rem 8rem;
+        gap: 4px;
       }
 
-      .hero > * {
+      .nav a {
+        border-radius: 5px;
+        padding: 8px 10px;
+        color: var(--muted);
+        font-size: 13px;
+        transition: background 160ms ease, color 160ms ease;
+      }
+
+      .nav a:hover {
+        background: var(--surface-2);
+        color: var(--text);
+      }
+
+      main {
+        padding-block: 24px 76px;
+      }
+
+      .home-intro {
+        position: relative;
+        isolation: isolate;
+        display: grid;
+        width: 100%;
+        max-width: 100%;
+        min-height: min(680px, calc(100vh - 112px));
+        grid-template-columns: minmax(0, 1.04fr) minmax(360px, 0.78fr);
+        gap: 34px;
+        align-items: center;
+        overflow: hidden;
+        border: 1px solid rgba(222, 205, 255, 0.16);
+        border-radius: 30px;
+        background:
+          radial-gradient(circle at 70% 18%, rgba(170, 136, 255, 0.22), transparent 18rem),
+          linear-gradient(rgba(212, 194, 255, 0.065) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(212, 194, 255, 0.065) 1px, transparent 1px),
+          linear-gradient(135deg, #130d20 0%, #0a0711 48%, #151022 100%);
+        background-size: auto, 42px 42px, 42px 42px, auto;
+        padding: clamp(26px, 4.8vw, 58px);
+      }
+
+      .home-intro::after {
+        position: absolute;
+        inset: 0;
+        z-index: -1;
+        background:
+          radial-gradient(circle at 18% 22%, rgba(255, 255, 255, 0.09), transparent 18rem),
+          linear-gradient(180deg, rgba(255, 255, 255, 0.04), transparent 45%);
+        content: "";
+      }
+
+      .home-intro > *,
+      .card,
+      .step,
+      .flow-node {
         min-width: 0;
       }
 
-      .eyebrow {
-        display: inline-flex;
-        align-items: center;
-        gap: 0.5rem;
-        padding: 0.55rem 1rem;
-        border: 1px solid rgba(184, 146, 255, 0.24);
-        border-radius: 999px;
-        background: rgba(184, 146, 255, 0.065);
-        backdrop-filter: none;
-        color: rgba(230, 216, 255, 0.92);
-        font-size: 0.72rem;
-        font-weight: 700;
-        letter-spacing: 0.22em;
-        text-transform: uppercase;
-        transition: all 0.3s ease;
-      }
-
-      .eyebrow:hover {
-        background: rgba(184, 146, 255, 0.09);
-        border-color: rgba(184, 146, 255, 0.36);
-      }
-
-      h1,
-      h2,
-      h3,
-      p {
-        margin: 0;
-      }
-
-      h1 {
-        max-width: 850px;
-        margin-top: 1.5rem;
-        color: var(--oc-white);
-        font-size: clamp(3.4rem, 9.2vw, 7.8rem);
-        line-height: 1.0;
-        letter-spacing: -0.08em;
-        font-weight: 820;
-        text-wrap: balance;
-      }
-
-      h1 span {
-        display: block;
-      }
-
-      .lead {
+      .hero-copy {
         max-width: 690px;
-        margin-top: 1.8rem;
-        color: rgba(245, 245, 247, 0.72);
-        font-size: clamp(1.02rem, 1.8vw, 1.22rem);
-        line-height: 1.7;
-        font-weight: 420;
-        letter-spacing: -0.01em;
       }
 
-      .hero-actions,
-      .cta-actions {
+      .hero-eyebrow-row {
         display: flex;
-        gap: 1rem;
-        margin-top: 2.6rem;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 12px;
       }
 
-      .hero-actions .button,
-      .cta-actions .button {
-        flex: 1 1 0;
-        max-width: 240px;
+      .intro-mark {
+        width: 44px;
+        height: 44px;
+        flex: 0 0 auto;
+        border-radius: 14px;
+      }
+
+      .intro-mark svg {
+        width: 28px;
+        height: 28px;
+      }
+
+      .home-intro-kicker {
+        display: inline-flex;
+        min-height: 38px;
+        align-items: center;
+        max-width: 100%;
+        border: 1px solid rgba(216, 199, 255, 0.18);
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.045);
+        padding: 0 14px;
+        color: var(--violet-2);
+        font-family: var(--oc-font-mono);
+        font-size: 11px;
+        font-weight: 800;
+        letter-spacing: 0.16em;
+        line-height: 1.35;
+        overflow-wrap: anywhere;
+        text-align: center;
+        text-transform: uppercase;
+      }
+
+      .home-intro h1 {
+        margin-top: 28px;
+        max-width: 100%;
+        color: #ffffff;
+        font-family: var(--oc-font-display);
+        font-size: clamp(48px, 7.6vw, 96px);
+        font-weight: 850;
+        letter-spacing: 0;
+        line-height: 0.92;
+        overflow-wrap: break-word;
+      }
+
+      .home-intro h1 span {
+        display: block;
+        color: var(--violet-2);
+      }
+
+      .home-intro .lead {
+        margin-top: 24px;
+        max-width: 660px;
+        color: var(--text);
+        font-size: clamp(18px, 2.2vw, 23px);
+        font-weight: 600;
+        letter-spacing: 0;
+        line-height: 1.45;
+        overflow-wrap: break-word;
+      }
+
+      .home-intro .support {
+        margin-top: 14px;
+        max-width: 630px;
+        color: var(--muted);
+        font-size: 16px;
+        line-height: 1.7;
+        overflow-wrap: break-word;
+      }
+
+      .actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin-top: 30px;
       }
 
       .button {
         display: inline-flex;
+        min-height: 50px;
         align-items: center;
         justify-content: center;
-        gap: 0.55rem;
-        min-height: 3.2rem;
-        padding-inline: 1.4rem;
-        border-radius: 1.15rem;
-        font-size: 0.92rem;
-        font-weight: 780;
-        letter-spacing: -0.01em;
-        transition:
-          background 0.25s ease,
-          border-color 0.25s ease,
-          box-shadow 0.25s ease;
-        box-shadow: 0 4px 32px rgba(0, 0, 0, 0.12);
-      }
-
-      .button:hover {
-        transform: none;
-        box-shadow: 0 8px 48px rgba(0, 0, 0, 0.2);
-      }
-
-      .button:active {
-        transform: none;
+        gap: 8px;
+        border: 1px solid var(--line);
+        border-radius: 16px;
+        padding: 0 18px;
+        font-family: var(--oc-font-mono);
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        transition: background 160ms ease, border-color 160ms ease, color 160ms ease;
       }
 
       .button-primary {
-        background: white;
-        color: var(--oc-black);
-        font-weight: 800;
+        border-color: #ffffff;
+        background: #ffffff;
+        color: #0a0612;
       }
 
       .button-primary:hover {
-        background: var(--oc-purple-1);
-        color: var(--oc-white);
+        border-color: var(--violet-2);
+        background: var(--violet-2);
       }
 
       .button-secondary {
-        border: 1.5px solid rgba(255,255,255,.15);
-        background: rgba(255,255,255,.05);
-        color: rgba(255,255,255,.88);
-        backdrop-filter: none;
+        border-color: rgba(255, 255, 255, 0.14);
+        background: rgba(255, 255, 255, 0.055);
+        color: var(--text);
       }
 
       .button-secondary:hover {
-        border-color: rgba(255,255,255,.28);
-        background: rgba(255,255,255,.1);
-        backdrop-filter: none;
+        border-color: var(--line-strong);
+        background: rgba(255, 255, 255, 0.09);
       }
 
-      .hero-console {
-        position: relative;
-        width: min(100%, 560px);
-        min-width: 0;
-        margin-inline: auto;
-        padding: 1rem;
-        transform: translateY(-1rem);
-        border: 1px solid rgba(224, 210, 255, 0.14);
-        border-radius: 2rem;
-        background: var(--oc-surface-2);
-        box-shadow:
-          0 32px 120px rgba(0, 0, 0, 0.45),
-          0 0 0 1px rgba(139, 92, 246, 0.08),
-          inset 0 0 0 1px rgba(255, 255, 255, 0.035);
-      }
-
-      .hero-console::before {
-        content: "";
-        position: absolute;
-        inset: -1.1rem;
-        z-index: -1;
-        border: 1px solid rgba(139, 92, 246, 0.12);
-        border-radius: 2.7rem;
-        box-shadow: 0 0 80px rgba(139, 92, 246, 0.16);
-      }
-
-      .console-header {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 1rem;
-        padding: 0.85rem 0.9rem 1rem;
-        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-      }
-
-      .console-brand {
-        display: flex;
-        min-width: 0;
-        align-items: center;
-        gap: 0.78rem;
-      }
-
-      .console-logo {
-        display: grid;
-        place-items: center;
-        width: 3.15rem;
-        height: 3.15rem;
-        border: 1px solid rgba(139, 92, 246, 0.28);
-        border-radius: 1.05rem;
-        background: var(--oc-black);
-        box-shadow: 0 0 34px rgba(139, 92, 246, 0.2);
-      }
-
-      .logo-console {
-        width: 2.25rem;
-        height: 2.25rem;
-      }
-
-      .console-title {
-        font-weight: 780;
-        letter-spacing: -0.02em;
-      }
-
-      .console-subtitle {
-        margin-top: 0.18rem;
-        color: rgba(255, 255, 255, 0.46);
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-        font-size: 0.74rem;
-      }
-
-      .console-status {
-        flex: 0 0 auto;
-        padding: 0.38rem 0.62rem;
-        border: 1px solid rgba(139, 92, 246, 0.24);
-        border-radius: 999px;
-        background: rgba(139, 92, 246, 0.1);
-        color: rgba(230, 216, 255, 0.88);
-        font-size: 0.68rem;
-        font-weight: 780;
-        letter-spacing: 0.08em;
-        text-transform: uppercase;
-      }
-
-      .manager-grid {
-        display: grid;
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-        gap: 0.75rem;
-        margin-top: 1rem;
-      }
-
-      .manager-card {
-        min-width: 0;
-        padding: 1rem;
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        border-radius: 1.25rem;
-        background: rgba(255, 255, 255, 0.028);
-      }
-
-      .manager-card strong {
-        display: block;
-        font-size: 0.95rem;
-        letter-spacing: -0.02em;
-      }
-
-      .manager-card span {
-        display: block;
-        margin-top: 0.45rem;
-        color: rgba(255, 255, 255, 0.48);
-        font-size: 0.78rem;
-      }
-
-      .manager-pill {
-        display: inline-flex;
-        margin-top: 0.9rem;
-        padding: 0.38rem 0.62rem;
-        border: 1px solid rgba(139, 92, 246, 0.24);
-        border-radius: 999px;
-        background: rgba(139, 92, 246, 0.1);
-        color: rgba(230, 216, 255, 0.88);
-        font-size: 0.68rem;
-        font-style: normal;
-        font-weight: 780;
-        text-transform: uppercase;
-        letter-spacing: 0.08em;
-      }
-
-      .console-terminal {
-        margin-top: 0.75rem;
-        padding: 1rem;
-        border: 1px solid rgba(139, 92, 246, 0.12);
-        border-radius: 1.25rem;
-        background: var(--oc-black);
-        overflow-x: auto;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-        font-size: 0.78rem;
-        line-height: 1.72;
-      }
-
-      .console-terminal div {
-        overflow-wrap: anywhere;
-      }
-
-      .console-terminal .muted {
-        color: rgba(255, 255, 255, 0.44);
-      }
-
-      .console-terminal .accent {
-        color: rgba(184, 146, 255, 0.92);
-      }
-
-      .console-metrics {
-        display: grid;
-        grid-template-columns: repeat(3, 1fr);
-        gap: 0.75rem;
-        margin-top: 0.75rem;
-      }
-
-      .console-metric {
-        padding: 0.85rem;
-        border: 1px solid rgba(255, 255, 255, 0.07);
-        border-radius: 1rem;
-        background: rgba(255, 255, 255, 0.024);
-      }
-
-      .console-metric span {
-        display: block;
-        color: rgba(255, 255, 255, 0.38);
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-        font-size: 0.68rem;
-      }
-
-      .console-metric strong {
-        display: block;
-        margin-top: 0.32rem;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-        font-size: 1.08rem;
-      }
-
-      section {
-        padding-block: 5.5rem;
-      }
-
-      .section-kicker {
-        color: rgba(184, 146, 255, 0.78);
-        font-size: 0.78rem;
-        font-weight: 800;
-        letter-spacing: 0.22em;
-        text-transform: uppercase;
-      }
-
-      h2 {
-        margin-top: 1rem;
-        max-width: 760px;
-        font-size: clamp(2.6rem, 5vw, 5rem);
-        line-height: 0.95;
-        letter-spacing: -0.07em;
-        font-weight: 760;
-      }
-
-      .section-copy {
-        margin-top: 1.2rem;
-        max-width: 650px;
-        color: var(--muted);
-        line-height: 1.75;
-      }
-
-      .feature-grid {
-        display: grid;
-        grid-template-columns: repeat(3, 1fr);
-        gap: 1rem;
-        margin-top: 3rem;
-      }
-
-      .feature-card,
-      .link-card,
-      .terminal-panel,
-      .stat-card,
-      .install-card {
-        border: 1px solid var(--line-soft);
-        background: var(--panel);
-        box-shadow: 0 24px 80px rgba(0,0,0,.24);
-        backdrop-filter: none;
-      }
-
-      .feature-card {
-        min-height: 235px;
-        padding: 1.7rem;
-        border-radius: 1.7rem;
-      }
-
-      .feature-icon {
-        width: 2.65rem;
-        height: 2.65rem;
-        display: grid;
-        place-items: center;
-        border-radius: 1rem;
-        color: var(--violet-2);
-        background: rgba(184, 146, 255, 0.08);
-        border: 1px solid rgba(184,146,255,.12);
-      }
-
-      .feature-card h3 {
-        margin-top: 1.35rem;
-        font-size: 1.12rem;
-        letter-spacing: -0.02em;
-      }
-
-      .feature-card p {
-        margin-top: 0.75rem;
-        color: rgba(255,255,255,.55);
-        line-height: 1.7;
-        font-size: 0.95rem;
-      }
-
-      .split {
-        display: grid;
-        grid-template-columns: 0.94fr 1.06fr;
-        align-items: center;
-        gap: 3rem;
-      }
-
-      .check-list {
-        margin-top: 2rem;
-        display: grid;
-        gap: 0.85rem;
-        color: rgba(255,255,255,.72);
-        font-size: 0.95rem;
-      }
-
-      .check {
-        display: flex;
-        align-items: center;
-        gap: 0.75rem;
-      }
-
-      .dot {
-        width: 0.4rem;
-        height: 0.4rem;
-        border-radius: 999px;
-        background: var(--violet-2);
-        box-shadow: 0 0 20px rgba(184,146,255,.65);
-      }
-
-      .terminal-panel {
-        border-radius: var(--radius-xl);
-        padding: 1rem;
-        background: rgba(8, 8, 18, 0.9);
+      .terminal-card {
+        overflow: hidden;
+        border: 1px solid rgba(216, 199, 255, 0.16);
+        border-radius: 24px;
+        background: rgba(8, 6, 13, 0.92);
       }
 
       .terminal-top {
         display: flex;
+        min-height: 54px;
         align-items: center;
         justify-content: space-between;
-        padding: 0.95rem 1rem;
-        border: 1px solid rgba(255,255,255,.08);
-        border-radius: 1.25rem;
-        background: rgba(255,255,255,.03);
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-        font-size: 0.82rem;
-        color: rgba(255,255,255,.7);
+        gap: 16px;
+        border-bottom: 1px solid var(--line);
+        padding: 0 16px;
+        color: var(--muted);
+        font-family: var(--oc-font-mono);
+        font-size: 12px;
+      }
+
+      .terminal-title {
+        display: inline-flex;
+        min-width: 0;
+        align-items: center;
+        gap: 10px;
+      }
+
+      .window-dots {
+        display: inline-flex;
+        gap: 6px;
+      }
+
+      .window-dots span {
+        display: block;
+        width: 9px;
+        height: 9px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.28);
+        font-size: 0;
+      }
+
+      .window-dots span:first-child {
+        background: #ff6b7d;
+      }
+
+      .window-dots span:nth-child(2) {
+        background: var(--amber);
+      }
+
+      .window-dots span:nth-child(3) {
+        background: var(--green);
       }
 
       .live {
-        padding: 0.35rem 0.65rem;
+        flex: 0 0 auto;
+        border: 1px solid rgba(118, 245, 182, 0.3);
         border-radius: 999px;
-        background: rgba(139, 92, 246, 0.17);
-        color: rgba(230,216,255,.9);
-        font-family: inherit;
-        font-size: 0.72rem;
+        padding: 4px 8px;
+        color: var(--green);
+        font-size: 10px;
+        font-weight: 800;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
       }
 
-      .terminal-lines {
+      .terminal-body {
         display: grid;
-        gap: 0.75rem;
-        margin-top: 0.9rem;
+        gap: 16px;
+        padding: 18px;
+        font-family: var(--oc-font-mono);
+        font-size: 13px;
+        line-height: 1.65;
       }
 
       .terminal-block {
-        padding: 1rem;
-        border: 1px solid rgba(255,255,255,.08);
-        border-radius: 1.2rem;
-        background: rgba(255,255,255,.027);
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-        font-size: 0.78rem;
-        line-height: 1.7;
+        border: 1px solid rgba(216, 199, 255, 0.1);
+        border-radius: 16px;
+        background:
+          linear-gradient(rgba(170, 136, 255, 0.045) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(170, 136, 255, 0.045) 1px, transparent 1px),
+          rgba(255, 255, 255, 0.026);
+        background-size: 26px 26px;
+        padding: 14px;
+      }
+
+      .terminal-line {
+        color: var(--muted);
+        overflow-wrap: anywhere;
+      }
+
+      .terminal-line + .terminal-line {
+        margin-top: 6px;
       }
 
       .prompt {
-        color: rgba(255,255,255,.48);
+        color: var(--violet-2);
       }
 
-      .output {
-        color: rgba(216, 201, 255, .88);
+      .ok {
+        color: var(--green);
       }
 
-      .session-grid {
+      .dim {
+        color: var(--faint);
+      }
+
+      .terminal-metrics {
         display: grid;
-        grid-template-columns: repeat(2, 1fr);
-        gap: 0.75rem;
-        margin-top: 0.9rem;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 10px;
       }
 
-      .stat-card {
-        padding: 1rem;
-        border-radius: 1.2rem;
+      .terminal-metric {
+        border: 1px solid rgba(216, 199, 255, 0.1);
+        border-radius: 14px;
+        background: rgba(255, 255, 255, 0.03);
+        padding: 12px;
       }
 
-      .stat-label {
-        color: rgba(255,255,255,.38);
-        font-size: 0.75rem;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-      }
-
-      .stat-value {
-        margin-top: 0.35rem;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-        font-size: 1.5rem;
-      }
-
-      .install-card {
-        padding: clamp(1.5rem, 6vw, 3rem);
-        border-radius: 2.4rem;
-        background: rgba(255,255,255,.035);
-        text-align: center;
-      }
-
-      .install-card h2 {
-        margin-inline: auto;
-      }
-
-      .code-copy {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 1rem;
-        max-width: 760px;
-        margin: 2.2rem auto 0;
-        padding: 1rem 1.1rem;
-        border: 1px solid rgba(255,255,255,.1);
-        border-radius: 1.25rem;
-        background: rgba(0,0,0,.28);
-        color: rgba(255,255,255,.72);
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-        font-size: 0.92rem;
-        text-align: left;
-        overflow-x: auto;
-      }
-
-      .code-copy button {
-        border: 0;
-        border-radius: 0.8rem;
-        padding: 0.6rem 0.8rem;
-        background: rgba(184,146,255,.12);
-        color: rgba(230,216,255,.9);
-        cursor: pointer;
-        font-weight: 700;
-      }
-
-      .mini-grid {
-        display: grid;
-        grid-template-columns: repeat(3, 1fr);
-        gap: 0.85rem;
-        max-width: 760px;
-        margin: 1rem auto 0;
-        text-align: left;
-      }
-
-      .mini {
-        padding: 1rem;
-        border: 1px solid rgba(255,255,255,.085);
-        border-radius: 1.1rem;
-        background: rgba(255,255,255,.025);
-        font-size: 0.78rem;
-        color: rgba(255,255,255,.55);
-      }
-
-      .mini strong {
+      .terminal-metric span {
         display: block;
-        margin-bottom: 0.35rem;
-        color: rgba(255,255,255,.82);
+        color: var(--faint);
+        font-size: 10px;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
       }
 
-      .link-grid {
+      .terminal-metric strong {
+        display: block;
+        margin-top: 4px;
+        color: var(--text);
+        font-size: 16px;
+        font-weight: 800;
+      }
+
+      .card-row {
         display: grid;
-        grid-template-columns: repeat(3, 1fr);
-        gap: 1rem;
-        margin-top: 3rem;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 14px;
+        margin-top: 26px;
       }
 
-      .link-card {
-        padding: 1.4rem;
-        border-radius: 1.35rem;
-        transition:
-          background 0.2s ease,
-          border-color 0.2s ease;
+      .card-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 14px;
+        margin-top: 24px;
       }
 
-      .link-card:hover {
-        transform: none;
-        border-color: rgba(184,146,255,.2);
-        background: rgba(255,255,255,.06);
+      .card,
+      .step,
+      .diagram,
+      .note-panel {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background:
+          linear-gradient(rgba(199, 177, 255, 0.035) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(199, 177, 255, 0.035) 1px, transparent 1px),
+          rgba(15, 10, 25, 0.92);
+        background-size: 28px 28px;
       }
 
-      .link-card h3 {
-        margin-top: 0.9rem;
-        font-size: 1rem;
+      .card {
+        min-height: 148px;
+        padding: 20px;
+        transition: background 160ms ease, border-color 160ms ease;
       }
 
-      .link-card p {
-        margin-top: 0.55rem;
-        color: rgba(255,255,255,.55);
-        font-size: 0.9rem;
+      a.card:hover {
+        border-color: var(--line-violet);
+        background:
+          linear-gradient(rgba(199, 177, 255, 0.045) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(199, 177, 255, 0.045) 1px, transparent 1px),
+          rgba(23, 16, 33, 0.96);
+        background-size: 28px 28px;
+      }
+
+      .card-icon {
+        display: inline-flex;
+        width: 30px;
+        height: 30px;
+        align-items: center;
+        justify-content: center;
+        border: 1px solid var(--line-violet);
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.035);
+        color: var(--violet-2);
+      }
+
+      .card h3 {
+        margin-top: 14px;
+        color: #ffffff;
+        font-size: 15px;
+        font-weight: 750;
+        letter-spacing: -0.01em;
+      }
+
+      .card p {
+        margin-top: 8px;
+        color: var(--muted);
+        font-size: 14px;
         line-height: 1.6;
       }
 
-      footer {
-        border-top: 1px solid rgba(255,255,255,.08);
-        padding-block: 2rem;
-        color: rgba(255,255,255,.5);
-        font-size: 0.82rem;
+      section {
+        padding-top: 76px;
+      }
+
+      .section-head {
+        max-width: 760px;
+      }
+
+      .kicker {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        border: 1px solid rgba(216, 199, 255, 0.14);
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.035);
+        padding: 7px 10px;
+        color: var(--violet-2);
+        font-family: var(--oc-font-mono);
+        font-size: 10px;
+        font-weight: 800;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+      }
+
+      .kicker::before {
+        display: block;
+        width: 20px;
+        height: 1px;
+        background: var(--violet);
+        content: "";
+      }
+
+      h2 {
+        margin-top: 16px;
+        color: #ffffff;
+        font-family: var(--oc-font-display);
+        font-size: clamp(28px, 4vw, 46px);
+        font-weight: 800;
+        letter-spacing: 0;
+        line-height: 1.08;
+      }
+
+      .section-copy {
+        margin-top: 14px;
+        color: var(--muted);
+        font-size: 16px;
+        line-height: 1.7;
+      }
+
+      .split {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(330px, 0.92fr);
+        gap: 28px;
+        align-items: start;
+      }
+
+      .checks {
+        display: grid;
+        gap: 12px;
+        margin: 22px 0 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .checks li {
+        display: grid;
+        grid-template-columns: 10px minmax(0, 1fr);
+        gap: 12px;
+        color: var(--muted);
+        font-size: 15px;
+        line-height: 1.6;
+      }
+
+      .checks li::before {
+        width: 6px;
+        height: 6px;
+        margin-top: 9px;
+        border-radius: 999px;
+        background: var(--violet);
+        content: "";
+      }
+
+      .diagram {
+        padding: 18px;
+      }
+
+      .diagram-title {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 14px;
+        border-bottom: 1px solid var(--line);
+        padding-bottom: 12px;
+        color: var(--muted);
+        font-family: var(--oc-font-mono);
+        font-size: 11px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .status {
+        border: 1px solid var(--line-violet);
+        border-radius: 4px;
+        padding: 3px 7px;
+        color: var(--violet-2);
+      }
+
+      .flow {
+        display: grid;
+        gap: 10px;
+        margin-top: 14px;
+      }
+
+      .flow-row {
+        display: grid;
+        grid-template-columns: 1fr 26px 1fr;
+        gap: 10px;
+        align-items: center;
+      }
+
+      .flow-node {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: rgba(8, 6, 13, 0.7);
+        padding: 12px;
+      }
+
+      .flow-node strong {
+        display: block;
+        color: #ffffff;
+        font-size: 13px;
+      }
+
+      .flow-node span {
+        display: block;
+        margin-top: 4px;
+        color: var(--faint);
+        font-family: var(--oc-font-mono);
+        font-size: 11px;
+      }
+
+      .arrow {
+        color: var(--violet);
+        font-family: var(--oc-font-mono);
+        text-align: center;
+      }
+
+      .steps {
+        display: grid;
+        gap: 12px;
+        margin-top: 22px;
+      }
+
+      .step {
+        display: grid;
+        grid-template-columns: 34px minmax(0, 1fr);
+        gap: 14px;
+        padding: 20px;
+      }
+
+      .step-number {
+        display: grid;
+        width: 34px;
+        height: 34px;
+        place-items: center;
+        border: 1px solid var(--line-violet);
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.035);
+        color: var(--violet-2);
+        font-family: var(--oc-font-mono);
+        font-size: 12px;
+        font-weight: 800;
+      }
+
+      .step h3 {
+        color: #ffffff;
+        font-size: 15px;
+        font-weight: 750;
+      }
+
+      .step p {
+        margin-top: 7px;
+        color: var(--muted);
+        font-size: 14px;
+        line-height: 1.6;
+      }
+
+      pre {
+        margin: 12px 0 0;
+        overflow-x: auto;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--terminal);
+        padding: 12px;
+        color: var(--text);
+        font-family: var(--oc-font-mono);
+        font-size: 13px;
+        line-height: 1.6;
+      }
+
+      .note-panel {
+        margin-top: 22px;
+        padding: 18px;
+      }
+
+      .note-panel p {
+        color: var(--muted);
+        font-size: 15px;
+        line-height: 1.65;
+      }
+
+      .session-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 18px;
+      }
+
+      .session-actions span {
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        padding: 6px 8px;
+        color: var(--text);
+        font-family: var(--oc-font-mono);
+        font-size: 11px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .footer {
+        border-top: 1px solid var(--line);
+        padding-block: 24px;
+        color: var(--faint);
+        font-size: 13px;
       }
 
       .footer-inner {
         display: flex;
         align-items: center;
         justify-content: space-between;
-        gap: 1rem;
+        gap: 20px;
       }
 
       .footer-brand {
-        display: flex;
+        display: inline-flex;
         align-items: center;
-        gap: 0.7rem;
+        gap: 10px;
+      }
+
+      .footer-mark {
+        width: 28px;
+        height: 28px;
+        border-radius: 6px;
+      }
+
+      .footer-mark svg {
+        width: 18px;
+        height: 18px;
+      }
+
+      .footer-links {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 14px;
+      }
+
+      .footer-links a {
+        color: var(--muted);
+      }
+
+      .footer-links a:hover {
+        color: var(--text);
       }
 
       svg.icon {
-        width: 1.25rem;
-        height: 1.25rem;
+        width: 17px;
+        height: 17px;
       }
 
-      @media (max-width: 1100px) {
-        .hero {
-          grid-template-columns: 1fr;
-          gap: 3rem;
-          min-height: auto;
-          padding-block: 3rem 6rem;
-        }
-
-        .hero-console {
-          width: min(100%, 620px);
-        }
-      }
-
-      @media (max-width: 900px) {
-        nav {
+      @media (max-width: 860px) {
+        .nav {
           display: none;
         }
 
-        header {
-          padding-block: 1.2rem;
-        }
-
-        .split,
-        .feature-grid,
-        .link-grid,
-        .mini-grid {
+        .home-intro,
+        .split {
           grid-template-columns: 1fr;
         }
 
-        .hero {
-          padding-top: 2.5rem;
-          gap: 3rem;
+        .home-intro {
           min-height: auto;
-          padding-bottom: 5rem;
+          border-radius: 22px;
         }
 
-        h1 {
-          font-size: clamp(2.8rem, 8vw, 5.2rem);
+        .home-intro > * {
+          width: 100%;
+          max-width: 100%;
         }
 
-        .lead {
-          font-size: clamp(0.95rem, 1.4vw, 1.1rem);
+        .hero-copy {
+          max-width: none;
         }
 
-        .feature-card {
-          min-height: auto;
+        .intro-mark {
+          width: 42px;
+          height: 42px;
+        }
+
+        .intro-mark svg {
+          width: 27px;
+          height: 27px;
+        }
+
+        .card-row,
+        .card-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .flow-row {
+          grid-template-columns: 1fr;
+        }
+
+        .arrow {
+          display: none;
         }
 
         .footer-inner {
@@ -876,100 +887,58 @@
         }
       }
 
-      @media (max-width: 640px) {
+      @media (max-width: 560px) {
         .container {
-          width: min(100% - 1.8rem, 1180px);
+          padding-inline: 12px;
         }
 
-        header {
-          padding-block: 1.2rem;
+        main {
+          padding-top: 18px;
         }
 
-        h1 {
-          margin-top: 1.2rem;
-          font-size: clamp(2.35rem, 12vw, 3.15rem);
+        .home-intro {
+          padding: 22px;
+        }
+
+        .home-intro .lead,
+        .home-intro .support {
+          max-width: 100%;
+        }
+
+        .home-intro h1 {
+          font-size: clamp(36px, 11vw, 44px);
           line-height: 0.98;
-          letter-spacing: -0.065em;
         }
 
-        .lead {
-          margin-top: 1.5rem;
-          font-size: 0.95rem;
-          line-height: 1.65;
+        .home-intro-kicker {
+          min-height: 0;
+          font-size: 9px;
+          letter-spacing: 0.1em;
+          padding-block: 9px;
         }
 
-        .hero-actions,
-        .cta-actions {
+        .actions {
           flex-direction: column;
-          gap: 0.75rem;
-          margin-top: 2rem;
         }
 
         .button {
           width: 100%;
-          min-height: 3rem;
-          font-size: 0.88rem;
         }
 
-        .eyebrow {
-          padding: 0.45rem 0.8rem;
-          font-size: 0.68rem;
-        }
-
-        .hero-console {
-          margin-top: 2rem;
-          width: 100%;
-          padding: 0.75rem;
-          border-radius: 1.55rem;
-          transform: none;
-        }
-
-        .hero-console::before {
-          inset: -0.6rem;
-          border-radius: 2rem;
-        }
-
-        .console-header {
+        .terminal-top {
           align-items: flex-start;
-        }
-
-        .console-status {
-          display: none;
-        }
-
-        .manager-grid {
-          grid-template-columns: 1fr;
-        }
-
-        .console-metrics {
-          display: none;
-        }
-
-        .session-grid {
-          grid-template-columns: 1fr;
-        }
-
-        .code-copy {
-          align-items: stretch;
           flex-direction: column;
-          gap: 0.5rem;
+          justify-content: center;
+          padding-block: 12px;
         }
 
-        .mini-grid {
+        .terminal-metrics {
           grid-template-columns: 1fr;
-          gap: 0.65rem;
-        }
-
-        .mini {
-          padding: 0.75rem;
-          font-size: 0.75rem;
         }
       }
     </style>
-    <link rel="stylesheet" href="./brand.css" />
   </head>
   <body>
-
     <svg class="svg-sprite" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
       <symbol id="opencoven-mark" viewBox="0 0 1024 1024">
         <path fill="currentColor" d="M512 82c121 90 213 219 280 389 21 53 52 101 94 144-82-14-152-48-210-102-35-33-65-72-90-117-19 68-44 129-74 182-30-53-55-114-74-182-25 45-55 84-90 117-58 54-128 88-210 102 42-43 73-91 94-144C299 301 391 172 512 82Z"/>
@@ -980,239 +949,296 @@
         <path fill="currentColor" d="M397 760h230v48H397zM452 808h120l-34 73h-52l-34-73Zm60 52l46 108h-92l46-108Z"/>
       </symbol>
     </svg>
-    <div class="background" aria-hidden="true">
-      <div class="glow-top"></div>
-      <div class="glow-side"></div>
-      <div class="glow-bottom"></div>
-      <div class="grid-bg"></div>
-      <div class="noise"></div>
-    </div>
 
-    <div class="page">
-      <header class="container">
-        <a class="brand" href="#top" aria-label="OpenCoven home">
-          <span class="brand-mark"><svg class="logo logo-small" aria-hidden="true"><use href="#opencoven-mark"></use></svg></span>
-          <span>OpenCoven</span>
-        </a>
-        <nav aria-label="Primary navigation">
-          <a href="#runtime">Runtime</a>
-          <a href="#features">Features</a>
-          <a href="#install">Install</a>
-          <a href="#community">Community</a>
-        </nav>
+    <div class="site">
+      <header class="topbar">
+        <div class="container topbar-inner">
+          <a class="brand" href="#top" aria-label="OpenCoven home">
+            <span class="brand-mark"><svg aria-hidden="true"><use href="#opencoven-mark"></use></svg></span>
+            <span>OpenCoven</span>
+          </a>
+          <nav class="nav" aria-label="Primary navigation">
+            <a href="#what">What is Coven?</a>
+            <a href="#capabilities">Capabilities</a>
+            <a href="#quickstart">Quick start</a>
+            <a href="https://docs.opencoven.ai/">Docs</a>
+          </nav>
+        </div>
       </header>
 
       <main id="top">
-        <section class="container hero">
-          <div>
-            <div class="eyebrow">
-              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8L12 3z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8L19 15z"/></svg>
-              Collective intelligence · controlled power
-            </div>
-            <h1><span>Orchestrate</span><span>Intelligence.</span></h1>
-            <p class="lead">
-              Multi-agent systems. Unified control. Real execution.
-              Coven gives agents, tools, and workflows a local orchestration layer
-              where autonomous work remains visible, bounded, and deliberate.
-            </p>
-            <div class="hero-actions">
-              <a class="button button-primary" href="#install">
-                Get Started
-                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14"/><path d="M13 5l7 7-7 7"/></svg>
-              </a>
-              <a class="button button-secondary" href="https://github.com/OpenCoven/coven#readme">
-                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2M9 5a2 2 0 0 0 2 2h2a2 2 0 0 0 2-2M9 5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2m-3 7h3m-3 4h3"/></svg>
-                View Docs
-              </a>
-            </div>
-          </div>
-
-          <aside class="hero-console" aria-label="Coven manager console preview">
-            <div class="console-header">
-              <div class="console-brand">
-                <span class="console-logo"><svg class="logo logo-console" aria-hidden="true"><use href="#opencoven-mark"></use></svg></span>
-                <div>
-                  <div class="console-title">Coven daemon</div>
-                  <div class="console-subtitle">localhost · project scoped</div>
-                </div>
+        <div class="container">
+          <section class="home-intro" aria-labelledby="hero-title">
+            <div class="hero-copy">
+              <div class="hero-eyebrow-row">
+                <span class="intro-mark"><svg aria-hidden="true"><use href="#opencoven-mark"></use></svg></span>
+                <p class="home-intro-kicker">Substrate framework for persistent agents</p>
               </div>
-              <span class="console-status">live</span>
-            </div>
-
-            <div class="manager-grid">
-              <div class="manager-card">
-                <strong>Codex</strong>
-                <span>fix failing tests</span>
-                <em class="manager-pill">running</em>
-              </div>
-              <div class="manager-card">
-                <strong>Claude Code</strong>
-                <span>polish UI copy</span>
-                <em class="manager-pill">attached</em>
-              </div>
-            </div>
-
-            <div class="console-terminal">
-              <div class="muted">$ coven sessions</div>
-              <div class="accent">codex-73k2  running   repo:opencoven/coven</div>
-              <div class="accent">claude-k1x9 attached  pane:comux/main</div>
-              <div class="muted">$ coven attach codex-73k2</div>
-            </div>
-
-            <div class="console-metrics">
-              <div class="console-metric"><span>scope</span><strong>repo</strong></div>
-              <div class="console-metric"><span>events</span><strong>1.2k</strong></div>
-              <div class="console-metric"><span>api</span><strong>local</strong></div>
-            </div>
-          </aside>
-        </section>
-
-        <section id="features" class="container">
-          <div class="section-kicker">Developer-native control</div>
-          <h2>The control plane for agent managers.</h2>
-          <p class="section-copy">
-            Coding harnesses already plan, edit, test, and report. Coven manages those managers:
-            local process supervision, attachable PTYs, session metadata, and a small API
-            that other tools can trust without absorbing the runtime.
-          </p>
-          <div class="feature-grid">
-            <article class="feature-card">
-              <div class="feature-icon"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 17l6-6-6-6"/><path d="M12 19h8"/></svg></div>
-              <h3>Local harness runtime</h3>
-              <p>Run Codex and Claude Code inside explicit project boundaries with foreground, detached, and attachable session flows.</p>
-            </article>
-            <article class="feature-card">
-              <div class="feature-icon"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg></div>
-              <h3>Visible execution</h3>
-              <p>List, attach, inspect, and recover session state without digging through invisible agent internals or terminal archaeology.</p>
-            </article>
-            <article class="feature-card">
-              <div class="feature-icon"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3v12"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg></div>
-              <h3>Client substrate</h3>
-              <p>Give comux, OpenClaw plugins, and future OpenCoven surfaces one stable local API for session orchestration.</p>
-            </article>
-          </div>
-        </section>
-
-        <section id="runtime" class="container">
-          <div class="split">
-            <div>
-              <div class="section-kicker">Local-first runtime</div>
-              <h2>A daemon you own.</h2>
-              <p class="section-copy">
-                Coven runs on your machine, in your repo, with local SQLite-backed metadata.
-                The boundary is the project root; the job is keeping autonomous work visible and controllable.
+              <h1 id="hero-title">Familiars that <span>Recall,</span><span>Reason, and</span><span>React.</span></h1>
+              <p class="lead">
+                Coven is the local-first runtime underneath CastCodes: project-scoped
+                harness sessions, append-only events, logs, artifacts, and authority
+                boundaries for coding agents you can actually inspect.
               </p>
-              <div class="check-list">
-                <div class="check"><span class="dot"></span> Strict project-root session boundaries</div>
-                <div class="check"><span class="dot"></span> Local daemon API over Unix socket</div>
-                <div class="check"><span class="dot"></span> SQLite metadata and event history</div>
-                <div class="check"><span class="dot"></span> External OpenClaw plugin via ClawHub</div>
+              <p class="support">
+                Run Codex, Claude Code, and future harnesses as visible CastCodes
+                lanes. Inspect the work, preserve context, verify changes, and merge
+                with confidence.
+              </p>
+              <div class="actions">
+                <a class="button button-primary" href="https://docs.opencoven.ai/GETTING-STARTED">Get Started</a>
+                <a class="button button-secondary" href="https://github.com/OpenCoven/coven">GitHub</a>
+                <a class="button button-secondary" href="https://discord.gg/opencoven">Discord</a>
               </div>
             </div>
-            <div class="terminal-panel">
+            <aside class="terminal-card" aria-label="Coven terminal preview">
               <div class="terminal-top">
-                <span>coven://project/open</span>
+                <span class="terminal-title">
+                  <span class="window-dots" aria-hidden="true"><span>.</span><span>.</span><span>.</span></span>
+                  <span>coven -- zsh</span>
+                </span>
                 <span class="live">live</span>
               </div>
-              <div class="terminal-lines">
+              <div class="terminal-body">
                 <div class="terminal-block">
-                  <div class="prompt">$ coven daemon start</div>
-                  <div class="output">&gt; listening on local socket</div>
-                  <div class="output">&gt; project root verified</div>
+                  <div class="terminal-line"><span class="prompt">$</span> coven daemon status</div>
+                  <div class="terminal-line"><span class="ok">●</span> daemon online on local socket</div>
+                  <div class="terminal-line dim">scope: ~/code/opencoven/coven</div>
                 </div>
                 <div class="terminal-block">
-                  <div class="prompt">$ coven run codex "fix failing tests"</div>
-                  <div class="output">&gt; session codex-73k2 created</div>
-                  <div class="output">&gt; attach with coven attach codex-73k2</div>
+                  <div class="terminal-line"><span class="prompt">$</span> coven sessions --live</div>
+                  <div class="terminal-line"><span class="ok">codex-73k2</span> running docs-style-landing</div>
+                  <div class="terminal-line"><span class="ok">claude-k1x9</span> attached visual polish</div>
+                  <div class="terminal-line dim">events: append-only | artifacts: local</div>
+                </div>
+                <div class="terminal-metrics" aria-label="Runtime metrics">
+                  <div class="terminal-metric"><span>harnesses</span><strong>2 ready</strong></div>
+                  <div class="terminal-metric"><span>events</span><strong>1.2k</strong></div>
+                  <div class="terminal-metric"><span>authority</span><strong>local</strong></div>
                 </div>
               </div>
-              <div class="session-grid">
-                <div class="stat-card"><div class="stat-label">sessions.running</div><div class="stat-value">02</div></div>
-                <div class="stat-card"><div class="stat-label">harnesses.ready</div><div class="stat-value">codex</div></div>
-                <div class="stat-card"><div class="stat-label">events.tailed</div><div class="stat-value">1.2k</div></div>
-                <div class="stat-card"><div class="stat-label">scope</div><div class="stat-value">repo</div></div>
+            </aside>
+          </section>
+
+          <div class="card-row" aria-label="Start here">
+            <a class="card" href="https://docs.opencoven.ai/GETTING-STARTED">
+              <span class="card-icon" aria-hidden="true">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 13h8"/><path d="M12 4l7 7-7 7"/><path d="M5 5v14"/></svg>
+              </span>
+              <h3>Get started</h3>
+              <p>Install Coven, run <code>coven doctor</code>, and launch a project-scoped harness session.</p>
+            </a>
+            <a class="card" href="https://docs.opencoven.ai/ARCHITECTURE">
+              <span class="card-icon" aria-hidden="true">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v4"/><path d="M12 18v4"/><path d="M2 12h4"/><path d="M18 12h4"/></svg>
+              </span>
+              <h3>Runtime model</h3>
+              <p>Daemon, PTY supervision, project-root validation, sessions, events, and local socket authority.</p>
+            </a>
+            <a class="card" href="https://docs.opencoven.ai/reference/cli">
+              <span class="card-icon" aria-hidden="true">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 17l6-6-6-6"/><path d="M12 19h8"/></svg>
+              </span>
+              <h3>CLI reference</h3>
+              <p>Current <code>coven</code> commands: run, sessions, attach, daemon, doctor, archive, summon, and sacrifice.</p>
+            </a>
+          </div>
+
+          <section id="what" class="split">
+            <div class="section-head">
+              <p class="kicker">What is Coven?</p>
+              <h2>A local-first runtime substrate for visible coding agents.</h2>
+              <p class="section-copy">
+                Coven is a single Rust daemon that owns harness PTYs, session
+                state, and an append-only event ledger on your machine. CastCodes
+                is the primary workspace and public proof surface for that
+                runtime. The <code>coven</code> CLI/TUI remains the operator
+                surface for installing, checking, and managing the daemon directly.
+              </p>
+              <ul class="checks">
+                <li><strong>Local-first.</strong> The daemon, store, and socket live under <code>$COVEN_HOME</code>.</li>
+                <li><strong>Harness-neutral.</strong> Codex and Claude Code run through the same supervised PTY layer.</li>
+                <li><strong>Project-rooted.</strong> Every launch pins and revalidates a canonical project root.</li>
+                <li><strong>Inspectable.</strong> Sessions and events are SQLite rows you can browse, replay, archive, summon, or sacrifice.</li>
+              </ul>
+            </div>
+
+            <aside class="diagram" aria-label="Coven runtime diagram">
+              <div class="diagram-title">
+                <span>Runtime topology</span>
+                <span class="status">local socket</span>
+              </div>
+              <div class="flow">
+                <div class="flow-row">
+                  <div class="flow-node"><strong>CastCodes workspace</strong><span>human cockpit</span></div>
+                  <div class="arrow">-&gt;</div>
+                  <div class="flow-node"><strong>Coven daemon</strong><span>authority boundary</span></div>
+                </div>
+                <div class="flow-row">
+                  <div class="flow-node"><strong>coven CLI / TUI</strong><span>operator surface</span></div>
+                  <div class="arrow">-&gt;</div>
+                  <div class="flow-node"><strong>Session ledger</strong><span>append-only events</span></div>
+                </div>
+                <div class="flow-row">
+                  <div class="flow-node"><strong>Codex PTY</strong><span>supervised harness</span></div>
+                  <div class="arrow">&lt;-&gt;</div>
+                  <div class="flow-node"><strong>Claude Code PTY</strong><span>same lifecycle</span></div>
+                </div>
+              </div>
+            </aside>
+          </section>
+
+          <section id="capabilities">
+            <div class="section-head">
+              <p class="kicker">Key capabilities</p>
+              <h2>One runtime model for sessions, events, harnesses, and rituals.</h2>
+              <p class="section-copy">
+                Coven keeps AI coding work local, project-scoped, and auditable
+                while letting clients build richer cockpit experiences on top.
+              </p>
+            </div>
+            <div class="card-grid">
+              <a class="card" href="https://docs.opencoven.ai/HARNESS-ADAPTERS">
+                <span class="card-icon" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l8 4-8 4-8-4 8-4Z"/><path d="M4 12l8 4 8-4"/><path d="M4 18l8 4 8-4"/></svg></span>
+                <h3>Harness-neutral runtime</h3>
+                <p>Codex and Claude Code launched through one supervised PTY layer.</p>
+              </a>
+              <a class="card" href="https://docs.opencoven.ai/SESSION-LIFECYCLE">
+                <span class="card-icon" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7h6l2 2h10v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg></span>
+                <h3>Project-scoped sessions</h3>
+                <p>Every session pins a canonical project root and refuses to wander.</p>
+              </a>
+              <a class="card" href="https://docs.opencoven.ai/SESSION-LIFECYCLE">
+                <span class="card-icon" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 4h11v16H8z"/><path d="M5 7h3"/><path d="M5 12h3"/><path d="M5 17h3"/></svg></span>
+                <h3>Append-only event log</h3>
+                <p>Replay output, recover from daemon restarts, and audit what a harness actually did.</p>
+              </a>
+              <a class="card" href="https://docs.opencoven.ai/SESSION-LIFECYCLE">
+                <span class="card-icon" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A8.5 8.5 0 1 1 11.2 3 6.5 6.5 0 0 0 21 12.8Z"/></svg></span>
+                <h3>Rituals</h3>
+                <p>Archive, summon, and sacrifice - explicit verbs around session state.</p>
+              </a>
+              <a class="card" href="https://docs.opencoven.ai/API">
+                <span class="card-icon" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 7v4"/><path d="M15 13v4"/><path d="M7 9h4"/><path d="M13 15h4"/><path d="M8 12h8"/></svg></span>
+                <h3>Local socket API</h3>
+                <p><code>GET /api/v1/health</code> first; then sessions, events, capabilities, and actions.</p>
+              </a>
+              <a class="card" href="https://docs.opencoven.ai/CASTCODES-INTEGRATION">
+                <span class="card-icon" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7 0l2-2a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-2 2a5 5 0 0 0 7 7l1-1"/></svg></span>
+                <h3>CastCodes integration</h3>
+                <p>CastCodes is the public workspace; Coven remains the runtime authority underneath.</p>
+              </a>
+            </div>
+          </section>
+
+          <section id="quickstart">
+            <div class="section-head">
+              <p class="kicker">Quick start</p>
+              <h2>Install, check the environment, start the daemon, then launch a session.</h2>
+            </div>
+            <div class="steps">
+              <div class="step">
+                <span class="step-number">01</span>
+                <div>
+                  <h3>Install Coven</h3>
+                  <pre><code>npm install -g @opencoven/cli</code></pre>
+                </div>
+              </div>
+              <div class="step">
+                <span class="step-number">02</span>
+                <div>
+                  <h3>Check your environment</h3>
+                  <pre><code>coven doctor</code></pre>
+                  <p><code>doctor</code> reports whether supported harnesses are on <code>PATH</code> and what to install next.</p>
+                </div>
+              </div>
+              <div class="step">
+                <span class="step-number">03</span>
+                <div>
+                  <h3>Start the daemon</h3>
+                  <pre><code>coven daemon start
+coven daemon status</code></pre>
+                </div>
+              </div>
+              <div class="step">
+                <span class="step-number">04</span>
+                <div>
+                  <h3>Launch your first session</h3>
+                  <pre><code>cd /path/to/your/project
+coven run codex "describe this repo"</code></pre>
+                </div>
               </div>
             </div>
-          </div>
-        </section>
+          </section>
 
-        <section id="install" class="container">
-          <div class="install-card">
-            <div class="section-kicker">Public early access</div>
-            <h2>Bring any familiar into the circle.</h2>
-            <p class="section-copy" style="margin-inline:auto;">
-              Coven is early, public, and developer-facing. Clone the repo, start the daemon,
-              and run Codex or Claude Code where the work is visible.
-            </p>
-            <div class="code-copy" role="group" aria-label="Install command">
-              <code>git clone https://github.com/OpenCoven/coven.git</code>
-              <button type="button" data-copy="git clone https://github.com/OpenCoven/coven.git">Copy</button>
+          <section>
+            <div class="section-head">
+              <p class="kicker">Session browser</p>
+              <h2>Browse live and archived work without losing the ledger.</h2>
+              <p class="section-copy">
+                <code>coven sessions</code> opens a human-friendly browser of every
+                live and archived session. Rejoin a PTY, view the log, restore an
+                archived session, archive finished work, or permanently sacrifice
+                non-running sessions with explicit confirmation.
+              </p>
+              <div class="session-actions" aria-label="Session rituals">
+                <span>Rejoin</span>
+                <span>View log</span>
+                <span>Summon</span>
+                <span>Archive</span>
+                <span>Sacrifice</span>
+              </div>
             </div>
-            <div class="mini-grid">
-              <div class="mini"><strong>1. Build</strong><code>cargo build --workspace --locked</code></div>
-              <div class="mini"><strong>2. Start</strong><code>coven daemon start</code></div>
-              <div class="mini"><strong>3. Run</strong><code>coven run codex "fix tests"</code></div>
-            </div>
-            <div class="cta-actions" style="justify-content:center;">
-              <a class="button button-primary" href="https://github.com/OpenCoven/coven#readme">Read the docs</a>
-              <a class="button button-secondary" href="https://github.com/OpenCoven/coven/issues">File an issue</a>
-            </div>
-          </div>
-        </section>
+          </section>
 
-        <section id="community" class="container">
-          <div class="section-kicker">OpenCoven ecosystem</div>
-          <h2>Shape the substrate with us.</h2>
-          <p class="section-copy">
-            The v0 path starts with Codex, Claude Code, comux, and the external OpenClaw plugin.
-            Future harnesses and clients plug into the same local contract.
-          </p>
-          <div class="link-grid">
-            <a class="link-card" href="https://github.com/OpenCoven/coven">
-              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 22v-4a4.8 4.8 0 0 0-1-3.5c3 0 6-2 6-5.5.08-1.25-.27-2.48-1-3.5.28-1.15.28-2.35 0-3.5 0 0-1 0-3 1.5-2.64-.5-5.36-.5-8 0C6 2 5 2 5 2c-.3 1.15-.3 2.35 0 3.5A5.4 5.4 0 0 0 4 9c0 3.5 3 5.5 6 5.5-.39.49-.68 1.3-.8 2.1-1.8.8-3.2.3-4.2-1.1 0 0-.8-1.5-2-1.6 0 0-1.3 0-.1.8 0 0 .9.4 1.5 2 0 0 .8 2.5 4.7 1.7V22"/></svg>
-              <h3>GitHub</h3>
-              <p>Source, roadmap, issues, and release work.</p>
-            </a>
-            <a class="link-card" href="https://github.com/OpenCoven/coven/blob/main/docs/MVP-PLAN.md">
-              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M4 4.5A2.5 2.5 0 0 1 6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5z"/></svg>
-              <h3>MVP plan</h3>
-              <p>Current scope, API direction, and done criteria.</p>
-            </a>
-            <a class="link-card" href="https://discord.gg/opencoven">
-              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"/></svg>
-              <h3>Discord</h3>
-              <p>Join the OpenCoven community: discord.gg/opencoven.</p>
-            </a>
-          </div>
-        </section>
+          <section>
+            <div class="section-head">
+              <p class="kicker">Start here</p>
+              <h2>Read the product docs by the boundary you need to understand.</h2>
+            </div>
+            <div class="card-grid">
+              <a class="card" href="https://docs.opencoven.ai/CONCEPTS">
+                <h3>Concepts</h3>
+                <p>Runtime topology, authority boundary, session lifecycle, and the control plane.</p>
+              </a>
+              <a class="card" href="https://docs.opencoven.ai/HARNESS-ADAPTERS">
+                <h3>Harnesses</h3>
+                <p>Per-harness setup, provider auth boundary, and adapter expectations.</p>
+              </a>
+              <a class="card" href="https://docs.opencoven.ai/API">
+                <h3>Local API</h3>
+                <p>Versioned socket API for CastCodes and advanced local clients.</p>
+              </a>
+              <a class="card" href="https://docs.opencoven.ai/SAFETY-MODEL">
+                <h3>Safety model</h3>
+                <p>Trust boundary, secret handling, socket posture, and automation approvals.</p>
+              </a>
+              <a class="card" href="https://docs.opencoven.ai/TROUBLESHOOTING">
+                <h3>Troubleshooting</h3>
+                <p>Daemon diagnostics, harness install hints, orphan recovery, and verification.</p>
+              </a>
+              <a class="card" href="https://docs.opencoven.ai/ROADMAP">
+                <h3>Roadmap</h3>
+                <p>Current milestones, adapter direction, and public product boundaries.</p>
+              </a>
+            </div>
+          </section>
+        </div>
       </main>
 
-      <footer>
+      <footer class="footer">
         <div class="container footer-inner">
           <div class="footer-brand">
-            <span class="footer-mark"><svg class="logo logo-footer" aria-hidden="true"><use href="#opencoven-mark"></use></svg></span>
-            <span>© 2026 OpenCoven. MIT licensed.</span>
+            <span class="footer-mark"><svg aria-hidden="true"><use href="#opencoven-mark"></use></svg></span>
+            <span>OpenCoven - Knowledge is freedom.</span>
           </div>
-          <a href="https://x.com/OpenCvn">@OpenCvn</a>
+          <div class="footer-links" aria-label="Footer links">
+            <a href="https://docs.opencoven.ai/">Docs</a>
+            <a href="https://github.com/OpenCoven/coven">GitHub</a>
+            <a href="https://x.com/OpenCvn">X</a>
+          </div>
         </div>
       </footer>
     </div>
-
-    <script>
-      for (const button of document.querySelectorAll("[data-copy]")) {
-        button.addEventListener("click", async () => {
-          const text = button.getAttribute("data-copy");
-          try {
-            await navigator.clipboard.writeText(text);
-            const old = button.textContent;
-            button.textContent = "Copied";
-            setTimeout(() => (button.textContent = old), 1400);
-          } catch {
-            button.textContent = "Copy failed";
-          }
-        });
-      }
-    </script>
   </body>
 </html>
