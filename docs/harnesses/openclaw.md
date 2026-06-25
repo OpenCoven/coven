@@ -1,5 +1,5 @@
 ---
-summary: "OpenClaw integration through the external @opencoven/coven ACP runtime bridge."
+summary: "OpenClaw integration through the external OpenClaw bridge ACP runtime bridge."
 read_when:
   - Integrating OpenClaw with Coven
   - Checking whether OpenClaw is a daemon harness
@@ -9,13 +9,13 @@ description: "OpenClaw integrates with Coven through an external ACP runtime bri
 
 # OpenClaw bridge
 
-OpenClaw is Coven's first external integration boundary. It should not be modeled as a daemon-owned harness like `coven run openclaw`. Instead, OpenClaw connects through the `@opencoven/coven` plugin package and uses Coven as a local session runtime.
+OpenClaw is Coven's first external integration boundary. It should not be modeled as a daemon-owned harness like `coven run openclaw`. Instead, OpenClaw connects through the external OpenClaw bridge plugin package and uses Coven as a local session runtime.
 
 ## Integration shape
 
 ```mermaid
 flowchart LR
-  OpenClaw[OpenClaw ACP runtime] --> Bridge["@opencoven/coven plugin"]
+  OpenClaw[OpenClaw ACP runtime] --> Bridge["OpenClaw bridge plugin"]
   Bridge --> Socket["Coven local socket API"]
   Socket --> Daemon["Coven daemon"]
   Daemon --> Adapter["Harness adapter router"]
@@ -50,7 +50,7 @@ Coven owns:
 Install the external plugin:
 
 ```bash
-openclaw plugins install clawhub:@opencoven/coven
+openclaw plugins install clawhub:OpenClaw bridge
 ```
 
 Then opt into the Coven ACP backend in OpenClaw config:

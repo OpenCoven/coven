@@ -25,7 +25,7 @@ flowchart LR
     direction LR
     CLI[coven CLI / TUI]
     Comux[comux]
-    Plugin["@opencoven/coven\nOpenClaw plugin"]
+    Plugin["OpenClaw bridge\nOpenClaw plugin"]
     Other[Other same-user clients]
   end
 
@@ -82,7 +82,7 @@ Coven запускает поддерживаемые локальные CLI har
 
 ### Защитные меры внешнего OpenClaw-плагина
 
-Интеграция OpenClaw вынесена через `@opencoven/coven`. Ядро OpenClaw не является корнем доверия Coven.
+Интеграция OpenClaw вынесена через external OpenClaw bridge plugin. Ядро OpenClaw не является корнем доверия Coven.
 
 Плагин отключён по умолчанию и должен быть явно выбран как ACP-backend. Он валидирует якорь доверия локального socket перед подключением:
 

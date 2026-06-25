@@ -338,7 +338,7 @@ Add a separate `coven doctor openclaw` or `coven repair openclaw-install` path f
 
 ### Phase 4: OpenClaw plugin integration
 
-Expose the same repair loop through the external `@opencoven/coven` OpenClaw plugin when OpenClaw is healthy enough to delegate work.
+Expose the same repair loop through the external external OpenClaw bridge plugin OpenClaw plugin when OpenClaw is healthy enough to delegate work.
 
 ## Open questions deferred from v0
 

@@ -24,7 +24,7 @@ flowchart LR
   Session --> Ritual[Rituals: archive / summon / sacrifice]
   Client[Client] --> SocketAPI
   Client --> Comux[comux]
-  Client --> Plugin["@opencoven/coven (OpenClaw plugin)"]
+  Client --> Plugin["OpenClaw bridge (OpenClaw plugin)"]
 ```
 
 Определения следуют по алфавиту.
@@ -92,7 +92,7 @@ Append-only запись для вывода, выхода или метадан
 
 ## Плагин OpenClaw
 
-Внешний пакет `@opencoven/coven`, который позволяет OpenClaw использовать Coven через socket API. Не является частью ядра OpenClaw.
+Внешний пакет external OpenClaw bridge plugin, который позволяет OpenClaw использовать Coven через socket API. Не является частью ядра OpenClaw.
 
 ## Корень проекта
 

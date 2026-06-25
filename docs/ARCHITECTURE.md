@@ -22,7 +22,7 @@ flowchart LR
     CLI["coven CLI / TUI"]
     Comux["comux cockpit"]
     OpenClaw[OpenClaw]
-    Plugin["@opencoven/coven plugin"]
+    Plugin["OpenClaw bridge plugin"]
   end
 
   subgraph DaemonCore["Daemon core"]

@@ -84,7 +84,7 @@ comux должен оставаться полезным, когда Coven не 
 
 ## Плагин OpenClaw
 
-Интеграция OpenClaw принадлежит внешнему пакету `@opencoven/coven`, а не ядру OpenClaw.
+Интеграция OpenClaw принадлежит внешнему пакету external OpenClaw bridge plugin, а не ядру OpenClaw.
 
 Плагин должен:
 

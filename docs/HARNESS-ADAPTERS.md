@@ -154,7 +154,7 @@ claude doctor
 
 ## First external integration: OpenClaw
 
-OpenClaw is the first external integration boundary for Coven, but it is not a daemon-launched harness id. The package `@opencoven/coven` is an external OpenClaw ACP runtime bridge:
+OpenClaw is the first external integration boundary for Coven, but it is not a daemon-launched harness id. The external OpenClaw bridge plugin is an external OpenClaw ACP runtime bridge:
 
 - OpenClaw registers ACP backend id `coven`.
 - The bridge talks to the local Coven daemon over the configured Unix socket.

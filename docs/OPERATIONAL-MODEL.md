@@ -20,7 +20,7 @@ flowchart LR
   CastCodes[CastCodes workspace] --> Socket[HTTP over Unix socket]
   CLI[coven CLI / TUI] --> Rust[local Rust CLI/daemon]
   Comux[comux legacy/reference] -.-> Socket
-  OpenClaw[OpenClaw] --> Plugin[external @opencoven/coven plugin]
+  OpenClaw[OpenClaw] --> Plugin[external OpenClaw bridge plugin]
   Plugin -.-> Socket
   Socket --> Rust
   Rust --> Guard[project-root + cwd guard]
@@ -32,7 +32,7 @@ flowchart LR
 
 See [Architecture diagrams](/ARCHITECTURE) for the fuller runtime topology and lifecycle diagrams.
 
-OpenClaw core does not include OpenCoven or Coven. The OpenClaw integration lives outside the OpenClaw repo as the ClawHub package `@opencoven/coven`, sourced from `packages/openclaw-coven` in this repo. That package is an opt-in compatibility adapter, not part of the Coven trust root.
+OpenClaw core does not include OpenCoven or Coven. The OpenClaw integration lives outside the OpenClaw repo as the ClawHub package external OpenClaw bridge plugin, sourced from `packages/openclaw-coven` in this repo. That package is an opt-in compatibility adapter, not part of the Coven trust root.
 
 The current auth posture is documented in [Authentication and local access](/AUTH). Coven uses a same-user local Unix-socket access model today. It does not provide OAuth, JWT, bearer-token, API-key, cookie, RBAC, or remote network auth for the daemon API.
 
@@ -86,7 +86,7 @@ comux is a legacy/reference cockpit client. It may list, launch, open, and attac
 
 ### OpenClaw
 
-OpenClaw integration is externalized through `@opencoven/coven`.
+OpenClaw integration is externalized through external OpenClaw bridge plugin.
 
 The plugin:
 

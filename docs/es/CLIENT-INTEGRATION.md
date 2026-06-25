@@ -84,7 +84,7 @@ comux debe seguir siendo útil cuando Coven no está instalado. Si Coven falta, 
 
 ## Plugin de OpenClaw
 
-La integración con OpenClaw pertenece al paquete externo `@opencoven/coven`, no al núcleo de OpenClaw.
+La integración con OpenClaw pertenece al paquete externo external OpenClaw bridge plugin, no al núcleo de OpenClaw.
 
 El plugin debe:
 

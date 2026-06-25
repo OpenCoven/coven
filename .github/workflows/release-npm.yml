@@ -4,7 +4,7 @@ name: Release npm packages
 #
 # Trigger: any `v*` tag push starts the workflow.
 # Auth: npm trusted publishing via GitHub Actions OIDC — no long-lived NPM_TOKEN required. Configure
-#       @opencoven/cli, @opencoven/coven, and each @opencoven/cli-* native package on npmjs.com
+#       @opencoven/cli and each @opencoven/cli-* native package on npmjs.com
 #       -> Settings -> Trusted Publishers before the first OIDC release.
 # Gate: the `verify-tag` job requires an SSH-signed annotated tag, confirms GitHub has cryptographically
 #       verified it, and checks that local git verification trusts the release signing key

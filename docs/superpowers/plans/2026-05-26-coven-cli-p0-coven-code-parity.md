@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Bring four foundational features from `@opencoven/coven-code` (Node) into `coven-cli` (Rust): unified JSONC settings, thread/session upgrades, file references in prompts, and a documented stream-JSON I/O protocol.
+**Goal:** Bring four foundational features from `OpenClaw bridge-code` (Node) into `coven-cli` (Rust): unified JSONC settings, thread/session upgrades, file references in prompts, and a documented stream-JSON I/O protocol.
 
 **Architecture:** Layer the new features on top of the existing `store.rs` (SQLite ledger) and `harness.rs` (Codex/Claude PTY runner). All four features sit at the I/O boundary — no changes to the agent loop, no new auth path, no remote calls. The work is split into four phases that each end in a shippable commit; phases 1–4 are ordered by dependency (settings → threads → file refs → stream-JSON), but file-refs is independent and could ship at any point.
 
@@ -23,7 +23,7 @@ The plan was originally drafted assuming the state of `security/private-session-
 
 ## Design decisions (locked in — challenge before execution if you disagree)
 
-1. **Stream-JSON event schema = Coven Code's exact JSONL shape**, which mirrors Anthropic's tool-use shape (`type`, `message`, `tool_use_id`, `session_id`, etc.). External SDKs written against `@opencoven/coven-code` should switch CLIs without modifying their parser. See `docs/STREAM-JSON.md` introduced in Phase 4.
+1. **Stream-JSON event schema = Coven Code's exact JSONL shape**, which mirrors Anthropic's tool-use shape (`type`, `message`, `tool_use_id`, `session_id`, etc.). External SDKs written against `OpenClaw bridge-code` should switch CLIs without modifying their parser. See `docs/STREAM-JSON.md` introduced in Phase 4.
 2. **Settings canonical = `~/.config/coven/settings.json`** (JSONC, `covenCli.*` keyspace). Existing `~/.coven/repos.toml` and `~/.coven/privacy.toml` remain readable as fallbacks for one release. When both define the same key, JSONC wins and a one-time stderr warning lists the keys overridden. `familiars.toml` is data, not config — out of scope for this plan.
 3. **Thread search uses SQLite FTS5** (already shipped in rusqlite's bundled SQLite build) over the redacted `events.payload_json` column only. No raw-artifact decryption during search; that would defeat the privacy default.
 4. **Visibility levels = `private | workspace | shared`** (three levels — simpler than Coven Code's five, room to expand later). Default `private`.
@@ -2031,7 +2031,7 @@ git commit -S -m "feat(coven-cli): stream-JSON pass-through for claude with init
 `coven run <harness> --stream-json` emits newline-delimited JSON events on stdout.
 With `--stream-json-input`, user messages are read line-by-line from stdin as JSON.
 
-The schema matches `@opencoven/coven-code` exactly; SDKs that target Coven Code work
+The schema matches `OpenClaw bridge-code` exactly; SDKs that target Coven Code work
 unchanged against Coven CLI.
 
 ## Event types

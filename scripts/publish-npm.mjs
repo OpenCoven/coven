@@ -8,7 +8,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
 const distRoot = path.join(repoRoot, 'npm', 'dist');
 const primaryWrapperPackageName = '@opencoven/cli';
-const wrapperPackageNames = [primaryWrapperPackageName, '@opencoven/coven'];
+const wrapperPackageNames = [primaryWrapperPackageName];
 
 const targets = {
   macos: {

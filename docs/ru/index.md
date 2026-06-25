@@ -58,7 +58,7 @@ flowchart LR
   A["coven CLI / TUI"] --> B["Coven daemon"]
   C["comux cockpit"] --> B
   D["chat/intent client"] --> B
-  E["@opencoven/coven plugin"] --> B
+  E["OpenClaw bridge plugin"] --> B
   B --> F["Codex PTY"]
   B --> G["Claude Code PTY"]
   B --> H["Future harness PTYs"]

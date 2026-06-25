@@ -1,5 +1,5 @@
 ---
-summary: "The external @opencoven/coven package that lets OpenClaw consume Coven."
+summary: "The external OpenClaw bridge package that lets OpenClaw consume Coven."
 read_when:
   - Integrating with OpenClaw
 title: "OpenClaw bridge"

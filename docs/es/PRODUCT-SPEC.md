@@ -55,7 +55,7 @@ flowchart LR
   User[Developer] --> CLI[coven CLI / TUI]
   CLI --> Daemon[Coven Rust daemon]
   Comux[comux] --> Daemon
-  OpenClaw[OpenClaw] --> Plugin[external @opencoven/coven plugin]
+  OpenClaw[OpenClaw] --> Plugin[external OpenClaw bridge plugin]
   Plugin --> Daemon
   Daemon --> Store[(SQLite session ledger)]
   Daemon --> Router[Codex / Claude adapter router]
@@ -66,7 +66,7 @@ Para diagramas más completos, consulta [Diagramas de arquitectura](/ARCHITECTUR
 
 ## Relación con comux y OpenClaw
 
-Coven es el sustrato de runtime local. comux puede convertirse en el cockpit visual para paneles e historial de sesión gestionados por Coven. OpenClaw puede delegar los lanzamientos de harness limitados al proyecto a Coven solo a través del plugin externo `@opencoven/coven`, no a través de código bundled del núcleo de OpenClaw. El cliente de chat/captura puede consumir el estado de sesión, la captura o las notificaciones de Coven donde sea útil.
+Coven es el sustrato de runtime local. comux puede convertirse en el cockpit visual para paneles e historial de sesión gestionados por Coven. OpenClaw puede delegar los lanzamientos de harness limitados al proyecto a Coven solo a través del plugin externo external OpenClaw bridge plugin, no a través de código bundled del núcleo de OpenClaw. El cliente de chat/captura puede consumir el estado de sesión, la captura o las notificaciones de Coven donde sea útil.
 
 Coven debe integrarse con estos proyectos sin ser propiedad de ninguno: es la habitación compartida donde se ejecutan los harnesses, no toda la UI ni el orquestador.
 
@@ -74,7 +74,7 @@ Coven debe integrarse con estos proyectos sin ser propiedad de ninguno: es la ha
 
 La integración con OpenClaw se externaliza. El repo de OpenClaw no debe incluir código de OpenCoven o Coven, y Coven no debe depender de los internos de OpenClaw.
 
-El paquete `@opencoven/coven` es un adaptador de compatibilidad:
+El paquete external OpenClaw bridge plugin es un adaptador de compatibilidad:
 
 - Las llamadas de runtime ACP de OpenClaw entran al plugin.
 - El plugin valida la configuración y se conecta al socket local de Coven.
@@ -104,7 +104,7 @@ flowchart TB
     Store["SQLite session ledger + events"]
     Rituals["Archive / Summon / Sacrifice"]
     Api["/api/v1 socket API"]
-    Plugin["External @opencoven/coven plugin"]
+    Plugin["External OpenClaw bridge plugin"]
     Docs["Public docs and distribution"]
   end
 

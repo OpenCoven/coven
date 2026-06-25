@@ -58,18 +58,15 @@ test('wrapper declares linux x64 native package as an optional dependency', () =
   assert.equal(packageJson.optionalDependencies['@opencoven/cli-linux-x64'], '0.0.0');
 });
 
-test('release publishes the current and coven-named wrapper packages', () => {
-  assert.deepEqual(wrapperPackageNameList(), ['@opencoven/cli', '@opencoven/coven']);
+test('release publishes only the canonical @opencoven/cli wrapper package', () => {
+  assert.deepEqual(wrapperPackageNameList(), ['@opencoven/cli']);
   assert.equal(wrapperPackageDirName('@opencoven/cli'), 'coven');
-  assert.equal(wrapperPackageDirName('@opencoven/coven'), 'coven-alias');
 });
 
-test('coven-named wrapper keeps cli-prefixed native package names', () => {
+test('wrapperTextForPackage rewrites @opencoven/cli only when given a different target package name', () => {
   const source = '@opencoven/cli uses @opencoven/cli-macos and @opencoven/cli-linux-x64';
-  assert.equal(
-    wrapperTextForPackage(source, '@opencoven/coven'),
-    '@opencoven/coven uses @opencoven/cli-macos and @opencoven/cli-linux-x64'
-  );
+  // No-op when called with the primary package name.
+  assert.equal(wrapperTextForPackage(source, '@opencoven/cli'), source);
 });
 
 test('wrapper declares windows native package as an optional dependency', () => {
@@ -336,7 +333,7 @@ test('packageVersionPublished returns true when npm view exits 0 (version exists
 });
 
 test('packageVersionPublished returns false when npm view exits non-zero (E404, not yet published)', () => {
-  const result = packageVersionPublished('@opencoven/coven', '0.0.49', () => ({ status: 1 }));
+  const result = packageVersionPublished('@opencoven/cli', '99.99.99', () => ({ status: 1 }));
   assert.equal(result, false);
 });
 

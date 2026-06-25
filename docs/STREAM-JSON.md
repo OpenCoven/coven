@@ -4,7 +4,7 @@
 stdout. With `--stream-json-input`, user messages are read line-by-line from
 stdin as JSON (claude harness only).
 
-The schema matches `@opencoven/coven-code` exactly; SDKs that target Coven
+The schema matches `OpenClaw bridge-code` exactly; SDKs that target Coven
 Code work unchanged against Coven CLI.
 
 ## Event types

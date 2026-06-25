@@ -25,7 +25,7 @@ flowchart LR
     direction LR
     CLI[coven CLI / TUI]
     Comux[comux]
-    Plugin["@opencoven/coven\nOpenClaw plugin"]
+    Plugin["OpenClaw bridge\nOpenClaw plugin"]
     Other[Other same-user clients]
   end
 
@@ -82,7 +82,7 @@ Ejemplos:
 
 ### Salvaguardas del plugin externo OpenClaw
 
-La integración con OpenClaw se externaliza a través de `@opencoven/coven`. El núcleo de OpenClaw no es una raíz de confianza de Coven.
+La integración con OpenClaw se externaliza a través de external OpenClaw bridge plugin. El núcleo de OpenClaw no es una raíz de confianza de Coven.
 
 El plugin está deshabilitado por defecto y debe seleccionarse explícitamente como backend ACP. Valida el ancla de confianza del socket local antes de conectarse:
 

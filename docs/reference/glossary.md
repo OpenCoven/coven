@@ -89,7 +89,7 @@ A declared skill of a harness, used by the router for task matching. Example: `"
 
 ## OpenClaw plugin
 
-The external package `@opencoven/coven`, which lets OpenClaw use Coven through the socket API. It is not part of OpenClaw core.
+The external package external OpenClaw bridge plugin, which lets OpenClaw use Coven through the socket API. It is not part of OpenClaw core.
 
 ## OpenCoven
 

@@ -22,7 +22,7 @@ flowchart LR
   Rust --> Daemon[Coven daemon]
 
   Comux[comux cockpit] -->|HTTP over Unix socket| Daemon
-  OpenClaw[OpenClaw] --> Plugin[external @opencoven/coven plugin]
+  OpenClaw[OpenClaw] --> Plugin[external OpenClaw bridge plugin]
   Plugin -->|HTTP over Unix socket| Daemon
   ChatClient[chat/intent client] -->|capabilities + actions| Daemon
 

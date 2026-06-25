@@ -106,7 +106,7 @@ comux should remain useful when Coven is not installed. If Coven is missing, pre
 
 ## OpenClaw plugin
 
-OpenClaw integration belongs in the external `@opencoven/coven` package, not OpenClaw core.
+OpenClaw integration belongs in the external OpenClaw bridge plugin, not OpenClaw core.
 
 The plugin should:
 

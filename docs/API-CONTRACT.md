@@ -9,7 +9,7 @@ description: "The versioned coven.daemon.v1 contract under /api/v1: health negot
 
 # Coven local API contract
 
-The Coven daemon socket API is a public compatibility boundary for comux and external clients such as `@opencoven/coven`.
+The Coven daemon socket API is a public compatibility boundary for comux and external clients such as external OpenClaw bridge plugin.
 
 ## Current stable version
 
@@ -355,7 +355,7 @@ Shared non-success responses use the structured error envelope:
 ## comux and OpenClaw bridge compatibility
 
 - comux reads the `capabilities` object from `/health` to decide which features to use.
-- The `@opencoven/coven` OpenClaw bridge (`packages/openclaw-coven`) is updated in this repo alongside the daemon and uses `apiVersion === "coven.daemon.v1"` as its contract guard.
+- The external OpenClaw bridge plugin OpenClaw bridge (`packages/openclaw-coven`) is updated in this repo alongside the daemon and uses `apiVersion === "coven.daemon.v1"` as its contract guard.
 - Client updates to use `afterSeq` cursors and paginated event envelopes may happen independently of the daemon update; the daemon-enforced shape is the source of truth.
 - The `supportedApiVersions` field has been removed from the health response in `coven.daemon.v1`; clients should check `apiVersion` directly.
 

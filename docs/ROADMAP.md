@@ -178,7 +178,7 @@ Lab:
 Shipped:
 
 - Technical OpenClaw bridge spike completed and intentionally parked before merging into core.
-- External `@opencoven/coven` plugin direction established so OpenClaw core stays clean.
+- External external OpenClaw bridge plugin direction established so OpenClaw core stays clean.
 - Local socket/API boundary makes Coven the authority layer.
 
 Now:

@@ -5,7 +5,7 @@ description: "Версионированный контракт coven.daemon.v1 
 
 # Контракт локального API Coven
 
-Socket API демона Coven — это публичная граница совместимости для comux и внешних клиентов, таких как `@opencoven/coven`.
+Socket API демона Coven — это публичная граница совместимости для comux и внешних клиентов, таких как external OpenClaw bridge plugin.
 
 ## Текущая стабильная версия
 
@@ -314,7 +314,7 @@ sequenceDiagram
 ## Совместимость с comux и мостом OpenClaw
 
 - comux читает объект `capabilities` из `/health`, чтобы решить, какие функции использовать.
-- Мост `@opencoven/coven` OpenClaw (`packages/openclaw-coven`) обновляется в этом репозитории вместе с демоном и использует `apiVersion === "coven.daemon.v1"` как защиту контракта.
+- Мост external OpenClaw bridge plugin OpenClaw (`packages/openclaw-coven`) обновляется в этом репозитории вместе с демоном и использует `apiVersion === "coven.daemon.v1"` как защиту контракта.
 - Обновления клиентов для использования курсоров `afterSeq` и пагинированных конвертов событий могут происходить независимо от обновления демона; форма, применяемая демоном, — это источник истины.
 - Поле `supportedApiVersions` было удалено из ответа health в `coven.daemon.v1`; клиенты должны проверять `apiVersion` напрямую.
 

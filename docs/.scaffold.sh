@@ -262,7 +262,7 @@ flowchart LR
   User[Developer] --> CLI[coven CLI / TUI]
   CLI --> Daemon[Coven daemon]
   Comux[comux] --> Daemon
-  Plugin[@opencoven/coven plugin] --> Daemon
+  Plugin[OpenClaw bridge plugin] --> Daemon
   Daemon --> Adapter[Adapter router]
   Adapter --> Codex[Codex PTY]
   Adapter --> Claude[Claude Code PTY]
@@ -427,7 +427,7 @@ for pair in \
   "plugins/index|Plugins overview|Bundled and external plugins that extend Coven.|Browsing the plugin surface" \
   "plugins/manage|Manage plugins|Install, enable, disable, and remove plugins.|Adjusting installed plugins" \
   "plugins/building-plugins|Building plugins|Write a plugin against Coven's plugin SDK.|Authoring a new plugin" \
-  "plugins/openclaw-bridge|OpenClaw bridge|The external @opencoven/coven package that lets OpenClaw consume Coven.|Integrating with OpenClaw"; do
+  "plugins/openclaw-bridge|OpenClaw bridge|The external OpenClaw bridge package that lets OpenClaw consume Coven.|Integrating with OpenClaw"; do
   IFS='|' read -r path title summary when <<< "$pair"
   write_stub "$path" "$title" "$summary" "$when" "Stub — fill in."
 done

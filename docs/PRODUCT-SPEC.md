@@ -64,7 +64,7 @@ flowchart LR
   User --> CLI[coven CLI / TUI]
   CLI --> Daemon
   Comux[comux legacy/reference] -.-> Daemon
-  OpenClaw[OpenClaw] --> Plugin[external @opencoven/coven plugin]
+  OpenClaw[OpenClaw] --> Plugin[external OpenClaw bridge plugin]
   Plugin -.-> Daemon
   Daemon --> Store[(SQLite session ledger)]
   Daemon --> Router[Codex / Claude adapter router]
@@ -79,7 +79,7 @@ Coven is the local runtime substrate. CastCodes is the primary workspace and pub
 
 comux proved visible terminal-cockpit primitives such as panes, worktree isolation, agent launchers, rituals, diff review, merge/PR cleanup, lifecycle hooks, and Coven session visibility. Those primitives should fold into CastCodes-native concepts instead of positioning comux as a second flagship cockpit.
 
-OpenClaw can delegate project-scoped harness launches to Coven only through the external `@opencoven/coven` plugin, not through bundled OpenClaw core code. Chat/intake surfaces may consume Coven session status, intake, or notifications where useful, but they are advanced integration paths rather than the beginner product story.
+OpenClaw can delegate project-scoped harness launches to Coven only through the external OpenClaw bridge plugin, not through bundled OpenClaw core code. Chat/intake surfaces may consume Coven session status, intake, or notifications where useful, but they are advanced integration paths rather than the beginner product story.
 
 Coven should integrate with these projects without being owned by any one of them: it is the room where harnesses run, while CastCodes is the product where most users should feel that runtime.
 
@@ -87,7 +87,7 @@ Coven should integrate with these projects without being owned by any one of the
 
 The OpenClaw integration is externalized. The OpenClaw repo should not include OpenCoven or Coven code, and Coven should not depend on OpenClaw internals.
 
-The package `@opencoven/coven` is a compatibility adapter:
+The external OpenClaw bridge plugin is a compatibility adapter:
 
 - OpenClaw ACP runtime calls enter the plugin.
 - The plugin validates config and connects to the local Coven socket.
@@ -117,7 +117,7 @@ flowchart TB
     Store["SQLite session ledger + events"]
     Rituals["Archive / Summon / Sacrifice"]
     Api["/api/v1 socket API"]
-    Plugin["External @opencoven/coven plugin"]
+    Plugin["External OpenClaw bridge plugin"]
     Docs["Public docs and distribution"]
   end
 

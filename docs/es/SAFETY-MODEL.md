@@ -27,7 +27,7 @@ flowchart TB
     direction LR
     CLI[coven CLI / TUI]
     Comux[comux]
-    Plugin["@opencoven/coven plugin"]
+    Plugin["OpenClaw bridge plugin"]
     Scripts[Scripts / other clients]
   end
 

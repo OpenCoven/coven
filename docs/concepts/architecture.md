@@ -23,7 +23,7 @@ flowchart LR
   Rust --> Daemon
 
   Comux[comux legacy/reference] -.->|HTTP over Unix socket| Daemon
-  OpenClaw[OpenClaw] --> Plugin[external @opencoven/coven plugin]
+  OpenClaw[OpenClaw] --> Plugin[external OpenClaw bridge plugin]
   Plugin -.->|HTTP over Unix socket| Daemon
 
   Daemon --> Control[Control plane: capability discovery + action routing]

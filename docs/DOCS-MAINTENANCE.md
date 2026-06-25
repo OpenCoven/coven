@@ -37,7 +37,7 @@ Do not include:
 - Runtime/daemon/CLI: **Coven**
 - Command: `coven`
 - CLI package: `@opencoven/cli`
-- OpenClaw plugin package: `@opencoven/coven`
+- OpenClaw plugin package: external OpenClaw bridge plugin
 - Discord: `discord.gg/opencoven`
 - X / Twitter: `@OpenCvn`
 

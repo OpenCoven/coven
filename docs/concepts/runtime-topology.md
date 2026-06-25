@@ -13,7 +13,7 @@ flowchart LR
   User --> CLI[coven CLI / TUI]
   CLI --> Daemon
   Comux[comux legacy/reference] -.-> Daemon
-  Plugin["@opencoven/coven plugin"] -.-> Daemon
+  Plugin["OpenClaw bridge plugin"] -.-> Daemon
   Daemon --> Adapter[Adapter router]
   Adapter --> Codex[Codex PTY]
   Adapter --> Claude[Claude Code PTY]

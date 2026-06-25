@@ -57,7 +57,7 @@ Coven es un **sustrato de runtime local-first**: un único daemon en Rust que po
 flowchart LR
   A["coven CLI / TUI"] --> B["Coven daemon"]
   C["comux cockpit"] --> B
-  E["@opencoven/coven plugin"] --> B
+  E["OpenClaw bridge plugin"] --> B
   B --> F["Codex PTY"]
   B --> G["Claude Code PTY"]
   B --> H["Future harness PTYs"]

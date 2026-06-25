@@ -55,7 +55,7 @@ flowchart LR
   User[Developer] --> CLI[coven CLI / TUI]
   CLI --> Daemon[Coven Rust daemon]
   Comux[comux] --> Daemon
-  OpenClaw[OpenClaw] --> Plugin[external @opencoven/coven plugin]
+  OpenClaw[OpenClaw] --> Plugin[external OpenClaw bridge plugin]
   Plugin --> Daemon
   Daemon --> Store[(SQLite session ledger)]
   Daemon --> Router[Codex / Claude adapter router]
@@ -66,7 +66,7 @@ flowchart LR
 
 ## Отношения с comux и OpenClaw
 
-Coven — это локальная runtime-подложка. comux может стать визуальным кокпитом для панелей и истории сессий, управляемых Coven. OpenClaw может делегировать запуски harness'а, ограниченные проектом, в Coven только через внешний плагин `@opencoven/coven`, а не через bundled-код ядра OpenClaw. Клиент чата/ввода может потреблять статус сессии, приём или уведомления Coven там, где это полезно.
+Coven — это локальная runtime-подложка. comux может стать визуальным кокпитом для панелей и истории сессий, управляемых Coven. OpenClaw может делегировать запуски harness'а, ограниченные проектом, в Coven только через внешний плагин external OpenClaw bridge plugin, а не через bundled-код ядра OpenClaw. Клиент чата/ввода может потреблять статус сессии, приём или уведомления Coven там, где это полезно.
 
 Coven должен интегрироваться с этими проектами, не принадлежа никому из них: это общая комната, где запускаются harness'ы, а не вся UI или оркестратор.
 
@@ -74,7 +74,7 @@ Coven должен интегрироваться с этими проектам
 
 Интеграция OpenClaw вынесена. Репо OpenClaw не должно включать код OpenCoven или Coven, а Coven не должен зависеть от внутренностей OpenClaw.
 
-Пакет `@opencoven/coven` — это адаптер совместимости:
+Пакет external OpenClaw bridge plugin — это адаптер совместимости:
 
 - Вызовы ACP-runtime OpenClaw входят в плагин.
 - Плагин валидирует конфиг и подключается к локальному socket Coven.
@@ -104,7 +104,7 @@ flowchart TB
     Store["SQLite session ledger + events"]
     Rituals["Archive / Summon / Sacrifice"]
     Api["/api/v1 socket API"]
-    Plugin["External @opencoven/coven plugin"]
+    Plugin["External OpenClaw bridge plugin"]
     Docs["Public docs and distribution"]
   end
 

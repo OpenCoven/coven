@@ -29,7 +29,7 @@ flowchart TB
     CLI[coven CLI / TUI]
     Comux[comux]
     ChatClient[chat/intent client]
-    Plugin["@opencoven/coven plugin"]
+    Plugin["OpenClaw bridge plugin"]
     Scripts[Scripts / other clients]
   end
 

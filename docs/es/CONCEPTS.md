@@ -125,7 +125,7 @@ Formas de cliente conocidas:
 
 - CLI/TUI `coven`.
 - Cockpit comux.
-- Paquete externo del plugin OpenClaw `@opencoven/coven`.
+- Paquete externo del plugin OpenClaw external OpenClaw bridge plugin.
 - Futura superficie de captura o de escritorio.
 
 Los clientes son capas de conveniencia, no raíces de confianza.

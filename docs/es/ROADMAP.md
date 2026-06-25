@@ -137,7 +137,7 @@ Lab:
 Shipped:
 
 - Spike técnico del puente de OpenClaw completado y parqueado intencionalmente antes de fusionar al núcleo.
-- Dirección del plugin externo `@opencoven/coven` establecida para que el núcleo de OpenClaw permanezca limpio.
+- Dirección del plugin externo external OpenClaw bridge plugin establecida para que el núcleo de OpenClaw permanezca limpio.
 - El límite del socket/API local hace de Coven la capa de autoridad.
 
 Now:

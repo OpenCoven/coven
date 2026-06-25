@@ -30,7 +30,7 @@ flowchart LR
     CastCodes[CastCodes]
     CLI[coven CLI / TUI]
     Comux[comux]
-    Plugin["@opencoven/coven\nOpenClaw plugin"]
+    Plugin["OpenClaw bridge\nOpenClaw plugin"]
     Other[Other same-user clients]
   end
 
@@ -88,7 +88,7 @@ Examples:
 
 ### External OpenClaw plugin guardrails
 
-OpenClaw integration is externalized through `@opencoven/coven`. OpenClaw core is not a Coven trust root.
+OpenClaw integration is externalized through external OpenClaw bridge plugin. OpenClaw core is not a Coven trust root.
 
 The plugin is disabled by default and must be explicitly selected as the ACP backend. It validates the local socket trust anchor before connecting:
 

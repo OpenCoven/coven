@@ -137,7 +137,7 @@ Known client shapes:
 - CastCodes workspace.
 - `coven` CLI/TUI.
 - comux legacy/reference cockpit.
-- external OpenClaw plugin package `@opencoven/coven`.
+- external OpenClaw plugin package external OpenClaw bridge plugin.
 - future desktop intake surfaces.
 
 Clients are convenience layers, not trust roots.
