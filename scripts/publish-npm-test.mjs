@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
-import { defaultTargetName, isOidcContext, publishArgs, publishEnv, releaseVersion, targetPackageName, validatePublishToken, validatePublishVersion, wrapperPackageDirName, wrapperPackageNameList, wrapperTextForPackage } from './publish-npm.mjs';
+import { defaultTargetName, isOidcContext, packageVersionPublished, publishArgs, publishEnv, releaseVersion, targetPackageName, validatePublishToken, validatePublishVersion, wrapperPackageDirName, wrapperPackageNameList, wrapperTextForPackage } from './publish-npm.mjs';
 
 const OIDC_ENV = {
   ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'fake-oidc-token',
@@ -328,4 +328,24 @@ test('prepublish smoke has explicit dry-run version override and registry failur
 
   assert.match(script, /COVEN_NPM_DRY_RUN_VERSION/);
   assert.match(script, /Could not read current \$\{packageName\} version/);
+});
+
+test('packageVersionPublished returns true when npm view exits 0 (version exists on registry)', () => {
+  const result = packageVersionPublished('@opencoven/cli', '0.0.49', () => ({ status: 0 }));
+  assert.equal(result, true);
+});
+
+test('packageVersionPublished returns false when npm view exits non-zero (E404, not yet published)', () => {
+  const result = packageVersionPublished('@opencoven/coven', '0.0.49', () => ({ status: 1 }));
+  assert.equal(result, false);
+});
+
+test('publish-npm.mjs gates real publishes behind packageVersionPublished for rerun safety', () => {
+  const scriptPath = new URL('publish-npm.mjs', import.meta.url);
+  const script = readFileSync(scriptPath, 'utf8');
+
+  assert.match(script, /function publishOrSkip\(/);
+  assert.match(script, /Skipping \$\{packageName\}@\$\{version\}: already published/);
+  assert.match(script, /publishOrSkip\(target\.packageName/);
+  assert.match(script, /publishOrSkip\(packageName/);
 });

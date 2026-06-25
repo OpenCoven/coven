@@ -74,23 +74,47 @@ function main() {
 
   const platformDir = writePlatformPackage(targetName, target, binaryPath, version);
 
-  run('npm', publishArgs(dryRun), {
-    cwd: platformDir,
-    env: publishEnv(dryRun)
-  });
+  publishOrSkip(target.packageName, version, dryRun, platformDir);
 
   if (!skipWrapper) {
     for (const packageName of wrapperPackageNames) {
       const wrapperDir = writeWrapperPackage(version, packageName);
-      run('npm', publishArgs(dryRun), {
-        cwd: wrapperDir,
-        env: publishEnv(dryRun)
-      });
+      publishOrSkip(packageName, version, dryRun, wrapperDir);
     }
   }
 
   console.log(`Prepared npm packages in ${distRoot}`);
   console.log(`${dryRun ? 'Dry-run completed' : 'Publish completed'} for ${target.packageName}${skipWrapper ? '' : ` and ${wrapperPackageNames.join(', ')}`} at version ${version}.`);
+}
+
+function publishOrSkip(packageName, version, dryRun, cwd) {
+  if (!dryRun && packageVersionPublished(packageName, version)) {
+    console.log(`Skipping ${packageName}@${version}: already published to npm.`);
+    return;
+  }
+  run('npm', publishArgs(dryRun), {
+    cwd,
+    env: publishEnv(dryRun)
+  });
+}
+
+export function packageVersionPublished(packageName, version, runner = npmViewRunner) {
+  const result = runner(packageName, version);
+  if (result.status === 0) {
+    return true;
+  }
+  // npm view exits non-zero (commonly 1) with E404 when the version doesn't exist.
+  // Any other surface (network error, auth error) returns false so the caller still
+  // attempts the publish and surfaces the real error.
+  return false;
+}
+
+function npmViewRunner(packageName, version) {
+  return spawnSync('npm', ['view', `${packageName}@${version}`, 'version'], {
+    cwd: repoRoot,
+    env: process.env,
+    stdio: ['ignore', 'ignore', 'ignore']
+  });
 }
 
 function writePlatformPackage(targetName, target, binaryPath, version) {
