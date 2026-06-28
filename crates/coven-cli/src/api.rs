@@ -253,6 +253,38 @@ pub fn handle_request_with_runtime(
                 }
             }
         }
+        ("DELETE", p) if p.starts_with("/skills/eval-loop/") && p.ends_with("/run-lock") => {
+            let familiar_id = p
+                .trim_start_matches("/skills/eval-loop/")
+                .trim_end_matches("/run-lock");
+            let force = body
+                .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+                .and_then(|v| v.get("force").and_then(|force| force.as_bool()))
+                .unwrap_or(false);
+            match crate::eval_loop::clear_eval_loop_lock(coven_home, familiar_id, force) {
+                Ok(cleared) => json_response(
+                    200,
+                    &serde_json::json!({
+                        "ok": true,
+                        "cleared": cleared,
+                        "familiarId": familiar_id,
+                    }),
+                ),
+                Err(err) => {
+                    let msg = err.to_string();
+                    if msg.contains("not stale") {
+                        api_error(
+                            409,
+                            "lock_not_stale",
+                            &msg,
+                            Some(serde_json::json!({ "familiarId": familiar_id })),
+                        )
+                    } else {
+                        Err(err)
+                    }
+                }
+            }
+        }
         ("GET", p) if p == "/capabilities" || p.starts_with("/capabilities?") => {
             let refresh = query.map(|q| q.contains("refresh=1")).unwrap_or(false);
             let resp = crate::capabilities::get_all(coven_home, refresh);
@@ -3131,6 +3163,54 @@ mod tests {
         }
         let first = &codes[0];
         assert_eq!(first["type"], "status");
+        Ok(())
+    }
+
+    #[test]
+    fn delete_eval_loop_run_lock_clears_with_force() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let eval_dir = home.join("familiars").join("sage").join("eval-loop");
+        std::fs::create_dir_all(&eval_dir)?;
+        std::fs::write(eval_dir.join("run.lock"), "run-123")?;
+
+        let response = handle_request_with_body(
+            "DELETE",
+            "/api/v1/skills/eval-loop/sage/run-lock",
+            home,
+            None,
+            Some(r#"{"force":true}"#),
+        )?;
+
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["cleared"], true);
+        assert!(!eval_dir.join("run.lock").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn delete_eval_loop_run_lock_rejects_fresh_lock_without_force() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let eval_dir = home.join("familiars").join("sage").join("eval-loop");
+        std::fs::create_dir_all(&eval_dir)?;
+        std::fs::write(eval_dir.join("run.json"), r#"{"runId":"run-123"}"#)?;
+        std::fs::write(eval_dir.join("run.lock"), "run-123")?;
+
+        let response = handle_request_with_body(
+            "DELETE",
+            "/api/v1/skills/eval-loop/sage/run-lock",
+            home,
+            None,
+            Some(r#"{"force":false}"#),
+        )?;
+
+        assert_eq!(response.status, 409);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "lock_not_stale");
+        assert!(eval_dir.join("run.lock").exists());
         Ok(())
     }
 
