@@ -15,6 +15,7 @@ use uuid::Uuid;
 mod api;
 mod capabilities;
 mod cockpit_sources;
+mod codex_login;
 mod control_plane;
 mod coven_calls;
 mod daemon;
@@ -269,6 +270,11 @@ enum AdapterCommand {
     #[command(about = "Install a trusted local adapter recipe")]
     Install {
         #[arg(help = "Adapter recipe to install, e.g. hermes")]
+        adapter: String,
+    },
+    #[command(about = "Run the adapter's login flow (with preflight cleanup of stale state)")]
+    Login {
+        #[arg(help = "Adapter id to authenticate, e.g. codex")]
         adapter: String,
     },
 }
@@ -830,6 +836,7 @@ fn run_adapter_command(command: AdapterCommand) -> Result<()> {
         AdapterCommand::List { json } => run_adapter_list(json),
         AdapterCommand::Doctor { adapter } => run_adapter_doctor(adapter.as_deref()),
         AdapterCommand::Install { adapter } => run_adapter_install(&adapter),
+        AdapterCommand::Login { adapter } => run_adapter_login(&adapter),
     }
 }
 
@@ -939,6 +946,77 @@ fn run_adapter_install(adapter: &str) -> Result<()> {
     println!("  coven adapter doctor {adapter}");
     println!("  coven run {adapter} \"what is in this project?\"");
     Ok(())
+}
+
+/// `coven adapter login <adapter>` — wrap a vendor login flow with preflight
+/// cleanup of stale state (currently: kill orphaned codex OAuth listeners
+/// holding port 1455).
+fn run_adapter_login(adapter: &str) -> Result<()> {
+    match adapter {
+        "codex" => run_codex_login(),
+        other => {
+            anyhow::bail!(
+                "adapter `{other}` does not need a login shim. Run its native login command \
+                 directly, or open an issue if it has a stale-state failure mode like Codex's \
+                 port-1455 OAuth bug."
+            )
+        }
+    }
+}
+
+fn run_codex_login() -> Result<()> {
+    use codex_login::{preflight_codex_oauth_port, PreflightOutcome, CODEX_OAUTH_PORT};
+    use std::process::Command;
+
+    println!("Coven codex login");
+    print!("  Preflight: checking port {CODEX_OAUTH_PORT}... ");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+
+    match preflight_codex_oauth_port()? {
+        PreflightOutcome::PortFree => {
+            println!("free");
+        }
+        PreflightOutcome::ClearedStaleCodex { killed_pid } => {
+            println!("freed (killed stale codex pid {killed_pid})");
+        }
+        PreflightOutcome::HeldByOther { pid, descriptor } => {
+            println!("held");
+            anyhow::bail!(
+                "port {CODEX_OAUTH_PORT} is held by pid {pid} (`{descriptor}`), which does NOT \
+                 look like a codex OAuth helper. Refusing to kill it. \
+                 Run `lsof -i tcp:{CODEX_OAUTH_PORT}` to investigate, then either stop that \
+                 process or rerun `coven adapter login codex` once it is gone."
+            );
+        }
+        PreflightOutcome::HeldUnknown => {
+            println!("held");
+            anyhow::bail!(
+                "port {CODEX_OAUTH_PORT} is held but we could not identify the process (lsof \
+                 missing or returned ambiguous results). Run `lsof -i tcp:{CODEX_OAUTH_PORT}` \
+                 to investigate, then retry `coven adapter login codex`."
+            );
+        }
+    }
+
+    println!("  Launching `codex login`...");
+    println!();
+
+    let status = Command::new("codex")
+        .arg("login")
+        .status()
+        .with_context(|| {
+            "failed to exec `codex login`. Install Codex with `npm install -g @openai/codex`."
+        })?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "`codex login` exited with status {}. If you saw an OAuth port error again, the port \
+             may have been reclaimed between preflight and launch — rerun `coven adapter login codex`.",
+            status
+        )
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
