@@ -22,7 +22,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -45,6 +45,7 @@ const RESULTS_TSV: &str = "results.tsv";
 const EVAL_LOOP_DIR: &str = "eval-loop";
 const RUN_SPEC_FILE: &str = "run.json";
 const RUN_LOCK_FILE: &str = "run.lock";
+const STALE_LOCK_AFTER_SECS: i64 = 60 * 60;
 
 // ── DTOs ─────────────────────────────────────────────────────────────────────
 
@@ -75,6 +76,21 @@ pub struct EvalLoopStateDto {
     pub total_accepted: u32,
     pub total_reverted: u32,
     pub running: bool,
+    pub lock: EvalLoopLockDto,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvalLoopLockDto {
+    pub locked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    pub run_json_exists: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_updated_at: Option<String>,
+    pub stale: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -107,15 +123,20 @@ pub fn get_eval_loop_state(
     let tsv_path = workspace.join(RESULTS_TSV);
 
     let raw = match fs::read_to_string(&tsv_path) {
-        Ok(raw) => raw,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Ok(raw) => Some(raw),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => None,
         Err(err) => {
             return Err(err).with_context(|| format!("failed to read {}", tsv_path.display()))
         }
     };
 
-    let iterations = parse_results_tsv(&raw);
-    let running = is_running(&workspace);
+    let lock = eval_loop_lock(&workspace);
+    if raw.is_none() && !lock.locked && !lock.run_json_exists {
+        return Ok(None);
+    }
+
+    let iterations = raw.as_deref().map(parse_results_tsv).unwrap_or_default();
+    let running = lock.locked;
 
     let mut track_counts = TrackCounts::default();
     let mut total_accepted: u32 = 0;
@@ -146,6 +167,7 @@ pub fn get_eval_loop_state(
         total_accepted,
         total_reverted,
         running,
+        lock,
     }))
 }
 
@@ -186,6 +208,31 @@ pub fn enqueue_run(coven_home: &Path, familiar_id: &str, track: &str) -> Result<
     Ok(spec)
 }
 
+/// Clear the eval-loop run lock for a familiar.
+///
+/// Returns `Ok(false)` when no lock exists. Fresh locks require `force` so an
+/// active familiar run is not interrupted by accident.
+pub fn clear_eval_loop_lock(coven_home: &Path, familiar_id: &str, force: bool) -> Result<bool> {
+    let workspace = familiar_workspace(coven_home, familiar_id);
+    let eval_dir = workspace.join(EVAL_LOOP_DIR);
+    let lock_path = eval_dir.join(RUN_LOCK_FILE);
+
+    if !lock_path.exists() {
+        return Ok(false);
+    }
+
+    let lock = eval_loop_lock(&workspace);
+    if !force && !lock.stale {
+        anyhow::bail!(
+            "eval-loop run lock for familiar `{familiar_id}` is not stale; pass force=true to clear it"
+        );
+    }
+
+    fs::remove_file(&lock_path)
+        .with_context(|| format!("failed to remove run lock at {}", lock_path.display()))?;
+    Ok(true)
+}
+
 // ── Private helpers ───────────────────────────────────────────────────────────
 
 fn familiar_workspace(coven_home: &Path, familiar_id: &str) -> PathBuf {
@@ -202,8 +249,62 @@ fn familiar_workspace(coven_home: &Path, familiar_id: &str) -> PathBuf {
         .unwrap_or_else(|| coven_home.join("familiars").join(familiar_id))
 }
 
-fn is_running(workspace: &Path) -> bool {
-    workspace.join(EVAL_LOOP_DIR).join(RUN_LOCK_FILE).exists()
+fn eval_loop_lock(workspace: &Path) -> EvalLoopLockDto {
+    let eval_dir = workspace.join(EVAL_LOOP_DIR);
+    let lock_path = eval_dir.join(RUN_LOCK_FILE);
+    let spec_path = eval_dir.join(RUN_SPEC_FILE);
+    let locked = lock_path.exists();
+    let run_json_exists = spec_path.exists();
+    let run_id = if locked {
+        fs::read_to_string(&lock_path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+    let requested_at = read_run_requested_at(&spec_path);
+    let lock_updated_at = lock_path
+        .metadata()
+        .and_then(|meta| meta.modified())
+        .ok()
+        .map(|modified| {
+            let dt: DateTime<Utc> = modified.into();
+            dt.to_rfc3339_opts(SecondsFormat::Millis, true)
+        });
+    let stale = locked
+        && (!run_json_exists
+            || requested_at
+                .as_deref()
+                .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+                .map(|dt| {
+                    Utc::now()
+                        .signed_duration_since(dt.with_timezone(&Utc))
+                        .num_seconds()
+                        > STALE_LOCK_AFTER_SECS
+                })
+                .unwrap_or(false));
+
+    EvalLoopLockDto {
+        locked,
+        run_id,
+        run_json_exists,
+        requested_at,
+        lock_updated_at,
+        stale,
+    }
+}
+
+fn read_run_requested_at(spec_path: &Path) -> Option<String> {
+    let raw = fs::read_to_string(spec_path).ok()?;
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("requestedAt")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
 }
 
 fn validate_track(track: &str) -> Result<&str> {
@@ -405,6 +506,63 @@ mod tests {
     }
 
     #[test]
+    fn get_eval_loop_state_reports_lock_without_results_tsv() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("familiars").join("sage");
+        let eval_dir = workspace.join(EVAL_LOOP_DIR);
+        fs::create_dir_all(&eval_dir).unwrap();
+        fs::write(eval_dir.join(RUN_LOCK_FILE), "first-run").unwrap();
+
+        let state = get_eval_loop_state(temp.path(), "sage").unwrap().unwrap();
+
+        assert!(state.running);
+        assert!(state.iterations.is_empty());
+        assert_eq!(state.lock.run_id.as_deref(), Some("first-run"));
+    }
+
+    #[test]
+    fn get_eval_loop_state_reports_lock_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("familiars").join("sage");
+        let eval_dir = workspace.join(EVAL_LOOP_DIR);
+        fs::create_dir_all(&eval_dir).unwrap();
+        fs::write(workspace.join(RESULTS_TSV), "").unwrap();
+        fs::write(eval_dir.join(RUN_SPEC_FILE), r#"{"runId":"run-123"}"#).unwrap();
+        fs::write(eval_dir.join(RUN_LOCK_FILE), "run-123").unwrap();
+
+        let state = get_eval_loop_state(temp.path(), "sage").unwrap().unwrap();
+
+        assert!(state.lock.locked);
+        assert_eq!(state.lock.run_id.as_deref(), Some("run-123"));
+        assert!(state.lock.run_json_exists);
+        assert!(state.lock.lock_updated_at.is_some());
+        assert!(!state.lock.stale);
+    }
+
+    #[test]
+    fn get_eval_loop_state_marks_old_lock_stale() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("familiars").join("sage");
+        let eval_dir = workspace.join(EVAL_LOOP_DIR);
+        fs::create_dir_all(&eval_dir).unwrap();
+        fs::write(workspace.join(RESULTS_TSV), "").unwrap();
+        let requested_at =
+            (Utc::now() - chrono::Duration::hours(2)).to_rfc3339_opts(SecondsFormat::Millis, true);
+        fs::write(
+            eval_dir.join(RUN_SPEC_FILE),
+            format!(r#"{{"runId":"old-run","requestedAt":"{requested_at}"}}"#),
+        )
+        .unwrap();
+        let lock_path = eval_dir.join(RUN_LOCK_FILE);
+        fs::write(&lock_path, "old-run").unwrap();
+
+        let state = get_eval_loop_state(temp.path(), "sage").unwrap().unwrap();
+
+        assert!(state.lock.locked);
+        assert!(state.lock.stale);
+    }
+
+    #[test]
     fn enqueue_run_writes_spec_and_lock() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("familiars").join("sage");
@@ -444,6 +602,55 @@ mod tests {
 
         let err = enqueue_run(temp.path(), "sage", "prompt").unwrap_err();
         assert!(err.to_string().contains("already in progress"));
+    }
+
+    #[test]
+    fn clear_eval_loop_lock_removes_stale_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("familiars").join("sage");
+        let eval_dir = workspace.join(EVAL_LOOP_DIR);
+        fs::create_dir_all(&eval_dir).unwrap();
+        let lock_path = eval_dir.join(RUN_LOCK_FILE);
+        let requested_at =
+            (Utc::now() - chrono::Duration::hours(2)).to_rfc3339_opts(SecondsFormat::Millis, true);
+        fs::write(
+            eval_dir.join(RUN_SPEC_FILE),
+            format!(r#"{{"runId":"old-run","requestedAt":"{requested_at}"}}"#),
+        )
+        .unwrap();
+        fs::write(&lock_path, "old-run").unwrap();
+
+        let cleared = clear_eval_loop_lock(temp.path(), "sage", false).unwrap();
+
+        assert!(cleared);
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn clear_eval_loop_lock_requires_force_for_fresh_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("familiars").join("sage");
+        let eval_dir = workspace.join(EVAL_LOOP_DIR);
+        fs::create_dir_all(&eval_dir).unwrap();
+        let lock_path = eval_dir.join(RUN_LOCK_FILE);
+        fs::write(eval_dir.join(RUN_SPEC_FILE), r#"{"runId":"fresh-run"}"#).unwrap();
+        fs::write(&lock_path, "fresh-run").unwrap();
+
+        let err = clear_eval_loop_lock(temp.path(), "sage", false).unwrap_err();
+
+        assert!(err.to_string().contains("not stale"));
+        assert!(lock_path.exists());
+    }
+
+    #[test]
+    fn clear_eval_loop_lock_returns_false_when_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("familiars").join("sage");
+        fs::create_dir_all(workspace.join(EVAL_LOOP_DIR)).unwrap();
+
+        let cleared = clear_eval_loop_lock(temp.path(), "sage", false).unwrap();
+
+        assert!(!cleared);
     }
 
     #[test]
