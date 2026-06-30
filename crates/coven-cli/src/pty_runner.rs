@@ -196,32 +196,40 @@ fn stream_claude_with_program_and_permission_bypass<W: Write>(
         .filter(|m| !m.is_empty())
         .map(crate::harness::normalize_model_id);
 
-    let mut args: Vec<&str> = vec!["-p"];
+    let mut args: Vec<String> = vec!["-p".to_string()];
     if permission_bypass_enabled {
-        args.extend_from_slice(&["--permission-mode", "bypassPermissions"]);
+        args.extend([
+            "--permission-mode".to_string(),
+            "bypassPermissions".to_string(),
+        ]);
     }
     if forward_stdin {
-        args.extend_from_slice(&["--input-format", "stream-json"]);
+        args.extend(["--input-format".to_string(), "stream-json".to_string()]);
     }
     if let Some(sp) = system_prompt {
-        args.extend_from_slice(&["--system-prompt", sp]);
+        args.extend(["--system-prompt".to_string(), sp.to_string()]);
     }
     if let Some(m) = normalized_model {
-        args.extend_from_slice(&["--model", m]);
+        args.extend(["--model".to_string(), m.to_string()]);
     }
     if let Some(effort) = options.claude_effort() {
-        args.extend_from_slice(&["--effort", effort]);
+        args.extend(["--effort".to_string(), effort.to_string()]);
     }
-    args.extend_from_slice(&["--output-format", "stream-json", "--verbose"]);
+    args.extend([
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+        "--verbose".to_string(),
+    ]);
     if is_resume {
-        args.extend_from_slice(&["--resume", session_id]);
+        args.extend(["--resume".to_string(), session_id.to_string()]);
     } else {
-        args.extend_from_slice(&["--session-id", session_id]);
+        args.extend(["--session-id".to_string(), session_id.to_string()]);
     }
+    args.push(prompt.to_string());
+    let args = crate::harness::sanitize_argv_for_platform(args);
 
     let mut child = std::process::Command::new(program)
         .args(&args)
-        .arg(prompt)
         .current_dir(cwd)
         .stdin(if forward_stdin {
             Stdio::piped()
@@ -1078,7 +1086,7 @@ exit 0
 
         assert_eq!(command.program(), "claude");
         #[cfg(windows)]
-        assert_eq!(command.args(), &["\"explain && exit\""]);
+        assert_eq!(command.args(), &["explain ^&^& exit"]);
         #[cfg(not(windows))]
         assert_eq!(command.args(), &["explain && exit"]);
         assert_eq!(command.cwd(), cwd);

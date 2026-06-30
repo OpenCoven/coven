@@ -736,13 +736,13 @@ pub fn command_parts_for_harness_with_conversation(
                 args.insert(0, f.identity_preamble());
                 args.insert(0, flag.to_string());
             }
-            let args = prepend_launch_args(
+            let args = sanitize_argv_for_platform(prepend_launch_args(
                 &model_args,
                 &launch_option_args,
                 args.into_iter()
                     .chain(std::iter::once(effective_prompt))
                     .collect(),
-            );
+            ));
             return Ok((program, with_claude_permission_flags(harness_id, args)));
         }
     }
@@ -798,42 +798,42 @@ fn prepend_launch_args(
 /// caller can fall back to a one-shot launch.
 /// On Windows, harness executables often resolve to `.cmd` shims that are
 /// invoked through `cmd.exe`. cmd.exe interprets metacharacters like
-/// `& | < > ^ %` in arguments even inside double-quoted strings in some
-/// invocation paths. Neutralize them by percent-encoding the dangerous
-/// characters so they pass through as literal text.
+/// `& | < > ^ % ! "` in arguments even inside double-quoted strings in some
+/// invocation paths. Neutralize them by caret-escaping the dangerous
+/// characters and leave argument-boundary quoting to `std::process::Command`.
 ///
 /// On non-Windows platforms this is a no-op: the OS exec model passes
 /// argv entries as null-terminated byte arrays without shell parsing.
 #[cfg(windows)]
-fn sanitize_argv_for_platform(args: Vec<String>) -> Vec<String> {
-    // Characters that cmd.exe treats as special even inside double quotes
-    // when the outer caller is cmd.exe itself (i.e. when running a .cmd shim).
-    const CMD_METACHARACTERS: &[char] = &['&', '|', '<', '>', '^', '%', '!'];
+pub(crate) fn sanitize_argv_for_platform(args: Vec<String>) -> Vec<String> {
     args.into_iter()
-        .map(|arg| {
-            if arg.chars().any(|c| CMD_METACHARACTERS.contains(&c)) {
-                // Wrap in double quotes and escape embedded quotes + carets.
-                // This is the canonical cmd.exe quoting convention.
-                let mut escaped = String::with_capacity(arg.len() + 4);
-                for ch in arg.chars() {
-                    match ch {
-                        '^' => escaped.push_str("^^"),
-                        '"' => escaped.push_str("\\\""),
-                        '%' => escaped.push_str("%%"),
-                        c => escaped.push(c),
-                    }
-                }
-                format!("\"{}\"", escaped)
-            } else {
-                arg
-            }
-        })
+        .map(|arg| escape_cmd_shim_metacharacters(&arg))
         .collect()
 }
 
 #[cfg(not(windows))]
-fn sanitize_argv_for_platform(args: Vec<String>) -> Vec<String> {
+pub(crate) fn sanitize_argv_for_platform(args: Vec<String>) -> Vec<String> {
     args
+}
+
+#[cfg(any(windows, test))]
+fn escape_cmd_shim_metacharacters(arg: &str) -> String {
+    // Characters that cmd.exe treats as special when a `.cmd` shim causes argv
+    // to be re-parsed. The caller still passes a single argv entry; this only
+    // neutralizes characters within that entry.
+    const CMD_METACHARACTERS: &[char] = &['&', '|', '<', '>', '^', '%', '!', '"'];
+    if !arg.chars().any(|c| CMD_METACHARACTERS.contains(&c)) {
+        return arg.to_string();
+    }
+
+    let mut escaped = String::with_capacity(arg.len() * 2);
+    for ch in arg.chars() {
+        if CMD_METACHARACTERS.contains(&ch) {
+            escaped.push('^');
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 fn stream_args(spec: &HarnessCommandSpec, hint: Option<&ConversationHint>) -> Option<Vec<String>> {
@@ -1154,6 +1154,17 @@ mod tests {
 
         assert_eq!(resolved, temp_dir.path().join("codex.cmd"));
         Ok(())
+    }
+
+    #[test]
+    fn cmd_shim_metacharacters_are_caret_escaped_without_wrapping() {
+        assert_eq!(escape_cmd_shim_metacharacters("safe prompt"), "safe prompt");
+
+        let escaped = escape_cmd_shim_metacharacters(r#"a&b|c<d>e^f%g!h"i"#);
+
+        assert_eq!(escaped, r#"a^&b^|c^<d^>e^^f^%g^!h^"i"#);
+        assert!(!escaped.starts_with('"'));
+        assert!(!escaped.ends_with('"'));
     }
 
     #[test]
