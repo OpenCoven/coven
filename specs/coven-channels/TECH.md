@@ -33,13 +33,18 @@ coven/
         discord/
           index.ts          # DiscordConnector class
           format.ts         # ChannelMessage → Discord API payload translation
-          auth.ts           # token resolution (env → keychain → error)
+          auth.ts           # token resolution (1Password ref → op read → error)
+        telegram/
+          index.ts          # TelegramConnector class
+          format.ts         # ChannelMessage → Telegram text chunks
+          auth.ts           # token resolution (1Password ref → op read → error)
       test/
-        discord.smoke.ts    # smoke test: send to test channel
+        discord.smoke.ts    # smoke test: send to Discord test channel
+        telegram.smoke.ts   # smoke test: send to Telegram test target
       docs/                 # symlink or source for coven/docs/channels/
 ```
 
-The package is TypeScript (matching the existing `coven/packages/` conventions). It has no Rust dependency in v1 — it speaks directly to the Discord REST API over HTTPS. The Rust daemon does not mediate channel posts in v1; that's a future integration point if Coven needs to audit or throttle outbound messages.
+The package is TypeScript (matching the existing `coven/packages/` conventions). It has no Rust dependency in v1 — it speaks directly to Discord and Telegram bot APIs over HTTPS. The Rust daemon does not mediate channel posts in v1; that's a future integration point if Coven needs to audit or throttle outbound messages.
 
 ## Types
 
@@ -109,6 +114,29 @@ export class DiscordConnector implements ChannelConnector {
 }
 ```
 
+## TelegramConnector
+
+```typescript
+// src/telegram/index.ts
+import { ChannelConnector, ChannelMessage } from '../types.js';
+import { toTelegramTexts } from './format.js';
+
+export class TelegramConnector implements ChannelConnector {
+  constructor(token: string, options?: { targets?: Record<string, string> }) {
+    // token and logical target mapping are private implementation details
+  }
+
+  async send(targetIdOrName: string, message: ChannelMessage): Promise<void> {
+    // Resolve logical target names, render ChannelMessage to Telegram text,
+    // chunk long output, and POST each chunk to sendMessage.
+  }
+}
+```
+
+Telegram v1 is outbound-only. It does not receive updates, run pairing, approve
+commands, or replace OpenClaw's mature Telegram runtime. Inbound migration is a
+separate v2 track after outbound smoke and compatibility checks pass.
+
 ## Payload translation
 
 ```typescript
@@ -144,40 +172,36 @@ export function toDiscordPayload(msg: ChannelMessage): DiscordPayload {
 
 ```mermaid
 flowchart TD
-    A[resolveToken called] --> B{COVEN_DISCORD_TOKEN set?}
-    B -->|Yes| C[Return env token]
-    B -->|No| D{keychain available?}
-    D -->|Yes| E{Secret in keychain?}
-    E -->|Yes| F[Return keychain token]
-    E -->|No| G[Throw: token not found]
-    D -->|No| G
+    A[resolveToken called] --> B{platform token ref set?}
+    B -->|Yes| C[op read reference]
+    C --> D{Secret value returned?}
+    D -->|Yes| E[Return token]
+    D -->|No| F[Throw: empty 1Password value]
+    B -->|No| G[Throw: token reference not found]
 ```
 
-Token is **never** written to `daemon.json`, `coven.toml`, or any config file. Error messages never include the token value.
+Token and smoke-test channel ID values are **never** written to `daemon.json`,
+`coven.toml`, command lines, or chat messages. Runtime config may contain
+1Password references such as `op://VAULT/ITEM/token`; error messages never
+include resolved secret values.
 
 ```typescript
 // src/discord/auth.ts
 
 export async function resolveToken(): Promise<string> {
-  // 1. Explicit env var (CI, containers, dev override)
-  if (process.env.COVEN_DISCORD_TOKEN) {
-    return process.env.COVEN_DISCORD_TOKEN;
+const reference = process.env.COVEN_DISCORD_TOKEN_REF;
+  if (!reference) {
+    throw new Error(
+      'Discord bot token reference not found. Set COVEN_DISCORD_TOKEN_REF.'
+    );
   }
-  // 2. Keychain (macOS: security find-generic-password, Linux: libsecret via @opencoven/keychain if available)
-  try {
-    const { readSecret } = await import('@opencoven/keychain');
-    const token = await readSecret('coven.discord.token');
-    if (token) return token;
-  } catch {
-    // keychain not available; continue
-  }
-  throw new Error(
-    'Discord bot token not found. Set COVEN_DISCORD_TOKEN.'
-  );
+  return readOnePasswordReference(reference);
 }
 ```
 
-Token is **never** written to `daemon.json`, `coven.toml`, or any config file. Error messages never include the token value.
+Telegram uses the same pattern through `COVEN_TELEGRAM_TOKEN_REF`. Tokens are
+**never** written to `daemon.json`, `coven.toml`, or any config file. Error
+messages never include token values or token-bearing Telegram API URLs.
 
 ## Factory / public API
 
@@ -185,17 +209,34 @@ Token is **never** written to `daemon.json`, `coven.toml`, or any config file. E
 // src/index.ts
 export { ChannelConnector, ChannelMessage } from './types.js';
 export { DiscordConnector } from './discord/index.js';
+export { TelegramConnector } from './telegram/index.js';
 
-export type ConnectorKind = 'discord'; // extend as connectors are added
+export type ConnectorKind = 'discord' | 'telegram'; // extend as connectors are added
 
 export async function createConnector(kind: ConnectorKind): Promise<ChannelConnector> {
   switch (kind) {
     case 'discord':
       return DiscordConnector.create();
+    case 'telegram':
+      return TelegramConnector.create();
     default:
       throw new Error(`Unknown connector kind: ${kind}`);
   }
 }
+```
+
+Telegram callers use the same factory:
+
+```typescript
+const telegram = await createConnector('telegram', {
+  targets: {
+    'val-dm': await readOnePasswordReference('op://VAULT/ITEM/val-dm-chat-id'),
+  },
+});
+
+await telegram.send('val-dm', {
+  text: 'Coven Channels Telegram smoke test',
+});
 ```
 
 ## How a familiar uses this
@@ -226,11 +267,15 @@ Familiars reference channels by logical name, not raw Discord IDs. The mapping l
 
 ```toml
 [channels.discord.channels]
-coven-general   = "1234567890123456789"
-coven-updates   = "9876543210987654321"
+coven-general   = "op://VAULT/ITEM/coven-general-channel-id"
+coven-updates   = "op://VAULT/ITEM/coven-updates-channel-id"
+
+[channels.telegram.targets]
+val-dm          = "op://VAULT/ITEM/val-dm-chat-id"
 ```
 
-The connector resolves logical names before calling the API. Familiars never hardcode Discord snowflakes.
+The calling layer resolves 1Password-backed logical names before calling the API.
+Familiars never hardcode Discord snowflakes or Telegram chat IDs.
 
 ## Error handling
 
@@ -262,25 +307,38 @@ flowchart TD
 ## Smoke test
 
 ```typescript
-// test/discord.smoke.ts
-// Run with: COVEN_DISCORD_TOKEN=... COVEN_TEST_CHANNEL_ID=... node --test test/discord.smoke.ts
+// test/discord.smoke.ts and test/telegram.smoke.ts
+// Run with:
+//   COVEN_DISCORD_TOKEN_REF='op://VAULT/ITEM/token' \
+//   COVEN_DISCORD_TEST_CHANNEL_NAME='coven-smoke-test' \
+//   node --test test/discord.smoke.ts
 
-import { createConnector } from '../src/index.js';
+import {
+  DiscordConnector,
+  readOnePasswordReference,
+  resolveDiscordChannelIdByName,
+  resolveOnePasswordReference,
+} from '../src/index.js';
 
-const channelId = process.env.COVEN_TEST_CHANNEL_ID;
-if (!channelId) throw new Error('COVEN_TEST_CHANNEL_ID required');
+const tokenRef = resolveOnePasswordReference('COVEN_DISCORD_TOKEN_REF');
+if (!tokenRef) throw new Error('COVEN_DISCORD_TOKEN_REF required');
+const token = await readOnePasswordReference(tokenRef);
+const channelId = await resolveDiscordChannelIdByName(
+  token,
+  process.env.COVEN_DISCORD_TEST_CHANNEL_NAME ?? 'coven-smoke-test',
+);
 
-const connector = await createConnector('discord');
+const connector = new DiscordConnector(token);
 await connector.send(channelId, {
   embed: {
-    title: '🧪 Coven Channels smoke test',
+    title: 'Coven Channels smoke test',
     description: 'If you see this, the connector works.',
     color: 0x8E3DFF,
     author: { name: 'Charm ✨' },
     timestamp: new Date().toISOString(),
   },
 });
-console.log('✅ Smoke test passed');
+console.log('Smoke test sent.');
 ```
 
 ## Future v2 extension points
@@ -310,8 +368,8 @@ Familiar routing (which familiar handles which mentions) is a higher-level conce
 
 ## Dependencies
 
-- `node-fetch` or native `fetch` (Node ≥18 has it built-in)
-- `@opencoven/keychain` (optional peer dep, for keychain token resolution)
+- native `fetch` (Node ≥18 has it built-in)
+- 1Password CLI `op`, for resolving secret references
 - No Rust FFI, no daemon dependency in v1
 
 ## package.json sketch
@@ -326,7 +384,7 @@ Familiar routing (which familiar handles which mentions) is a higher-level conce
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc",
-    "test:smoke": "node --test test/discord.smoke.ts"
+    "test:smoke": "node --test test/*.smoke.ts"
   },
   "license": "MIT"
 }

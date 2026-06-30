@@ -11,6 +11,11 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
   - package-ecosystem: npm
+    directory: /packages/channels
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+  - package-ecosystem: npm
     directory: /docs
     schedule:
       interval: weekly

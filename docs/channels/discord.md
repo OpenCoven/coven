@@ -32,6 +32,9 @@ sequenceDiagram
 
 ## Setup
 
+For the full Developer Portal, OAuth2, bot permission, and 1Password checklist,
+see [Discord setup checklist](./discord-setup.md).
+
 ### 1. Create the Discord bot
 
 1. Go to [discord.com/developers/applications](https://discord.com/developers/applications) and create a new application.
@@ -40,14 +43,11 @@ sequenceDiagram
 
 ### 2. Store the token
 
-Never put the token in a config file. Store it in your environment:
+Never put the token in a config file, command, or chat message. Store it in
+1Password, then expose only the 1Password reference to Coven:
 
 ```sh
-# env (for CI or one-off use)
-export COVEN_DISCORD_TOKEN=your_token_here
-
-# For persistent local use, add it to your shell profile or a .env file
-# that is gitignored and sourced before running the Coven daemon.
+export COVEN_DISCORD_TOKEN_REF='op://VAULT/ITEM/token'
 ```
 
 ### 3. Map logical channel names
@@ -59,8 +59,9 @@ In `coven.toml` (or `daemon.json`):
 enabled = true
 
 [channels.discord.channels]
-coven-general = "YOUR_CHANNEL_ID"
-coven-updates = "YOUR_UPDATES_CHANNEL_ID"
+# Keep private/test channel IDs in local-only config or 1Password-backed setup.
+coven-general = "<local channel id>"
+coven-updates = "<local channel id>"
 ```
 
 To find a channel ID: right-click a channel in Discord → **Copy Channel ID** (requires Developer Mode enabled in Discord settings).
@@ -100,13 +101,17 @@ From a reader's perspective, posts feel like they come from the familiar. From a
 
 ## Smoke test
 
-> **Note:** Not runnable until `packages/channels/` is implemented.
-
-To verify the connector is working once the package lands:
+To verify the connector against a real Discord channel:
 
 ```sh
-COVEN_TEST_CHANNEL_ID=YOUR_CHANNEL_ID node --test packages/channels/test/discord.smoke.ts
+cd packages/channels
+export COVEN_DISCORD_TOKEN_REF='op://VAULT/ITEM/token'
+export COVEN_DISCORD_TEST_CHANNEL_NAME='coven-smoke-test'
+npm run test:smoke
 ```
+
+Use `COVEN_DISCORD_TEST_CHANNEL_REF` instead when you want to resolve the test
+channel ID from 1Password directly.
 
 ## Bidirectionality (v2)
 
@@ -124,7 +129,7 @@ This uses the Discord Gateway WebSocket and requires the `Message Content Intent
 
 | Error | Fix |
 |---|---|
-| `Discord bot token not found` | Set `COVEN_DISCORD_TOKEN` or run `coven secrets set discord.token <token>` |
+| `Discord bot token reference not found` | Set `COVEN_DISCORD_TOKEN_REF` to a 1Password reference |
 | `403 Missing Permissions` | Ensure the bot has `Send Messages` + `Embed Links` in the target channel |
 | `404 Unknown Channel` | Check the channel ID in `coven.toml` and that the bot is in the server |
 | `401 Unauthorized` | Token is wrong or expired — regenerate in the Discord Dev Portal |

@@ -19,6 +19,7 @@
 *.pfx
 node_modules/
 packages/*/node_modules/
+packages/*/dist/
 *.tgz
 packages/*/pnpm-workspace.yaml
 __pycache__/

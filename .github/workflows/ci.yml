@@ -48,6 +48,23 @@ jobs:
           python-version: '3.x'
       - run: python scripts/check-secrets.py
 
+  channels:
+    name: Channels package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: packages/channels/package-lock.json
+      - run: npm ci
+        working-directory: packages/channels
+      - run: npm run build
+        working-directory: packages/channels
+      - run: npm test
+        working-directory: packages/channels
+
   cargo-deny:
     name: Dependency audit
     runs-on: ubuntu-latest
