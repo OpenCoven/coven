@@ -1,23 +1,20 @@
 name: Dependabot auto-merge
 
-# Auto-merge low-risk Dependabot version bumps.
+# Auto-merge Dependabot PRs only when they are tied to a Dependabot security
+# alert. Routine version bumps, even semver patch/minor updates, must remain
+# manual-review PRs so a compromised upstream release cannot flow into main via
+# this workflow alone.
 #
-# Scope: semver patch + minor updates. Dependabot ships security fixes as
-# patch/minor bumps, so this reliably covers them; major-version bumps are left
-# for manual review. Gating uses the `update-type` metadata output, which works
-# with the default GITHUB_TOKEN.
+# Security-alert metadata requires dependabot/fetch-metadata's alert lookup.
+# That lookup is intentionally configured with a repository/App/PAT secret rather
+# than the default GITHUB_TOKEN, because GitHub's default token cannot read
+# Dependabot alerts. If the secret is not configured, this workflow fails closed
+# instead of falling back to broad version-update auto-merge.
 #
-# Why not gate on `ghsa-id` (true security-only): the `ghsa-id`/`alert-state`
-# outputs are populated only when `alert-lookup: true` AND `github-token` is a
-# PAT or GitHub App token with "Dependabot alerts: read" — the default
-# GITHUB_TOKEN cannot read alerts, so that gate would silently never fire. If
-# such a token is provisioned later, switch to alert-lookup for precise
-# security-only scope.
-#
-# `pull_request_target` runs in the base-repo context so the GITHUB_TOKEN can
-# enable auto-merge (Dependabot PRs get a read-only token under `pull_request`).
-# This workflow never checks out or executes PR code — it only reads metadata
-# and calls the merge API — so the elevated trigger is safe here.
+# `pull_request_target` runs in the base-repo context so the token can enable
+# auto-merge (Dependabot PRs get a read-only token under `pull_request`). This
+# workflow never checks out or executes PR code — it only reads metadata and
+# calls the merge API — so the elevated trigger is safe here.
 #
 # `main` is not branch-protected, so auto-merge is not a hard CI gate: it merges
 # once the CI checks that are pending at enable-time succeed. If a strict
@@ -34,12 +31,15 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ github.actor == 'dependabot[bot]' }}
     steps:
-      - name: Fetch Dependabot metadata
+      - name: Fetch Dependabot security metadata
         id: meta
         uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+        with:
+          alert-lookup: true
+          github-token: ${{ secrets.DEPENDABOT_ALERTS_TOKEN }}
 
-      - name: Enable auto-merge for patch and minor updates
-        if: ${{ steps.meta.outputs.update-type == 'version-update:semver-patch' || steps.meta.outputs.update-type == 'version-update:semver-minor' }}
+      - name: Enable auto-merge for security updates
+        if: ${{ steps.meta.outputs.ghsa-id != '' && steps.meta.outputs.alert-state == 'OPEN' }}
         run: gh pr merge --auto --squash "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
