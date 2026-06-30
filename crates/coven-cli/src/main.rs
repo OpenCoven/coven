@@ -845,8 +845,14 @@ fn run_adapter_install(adapter: &str) -> Result<()> {
             manifest_path.display()
         );
     } else {
-        if manifest_path.symlink_metadata().is_ok() {
-            std::fs::remove_file(&manifest_path).with_context(|| {
+        if let Ok(metadata) = manifest_path.symlink_metadata() {
+            let remove_result =
+                if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+                    std::fs::remove_dir_all(&manifest_path)
+                } else {
+                    std::fs::remove_file(&manifest_path)
+                };
+            remove_result.with_context(|| {
                 format!(
                     "failed to replace trusted adapter manifest {}",
                     manifest_path.display()

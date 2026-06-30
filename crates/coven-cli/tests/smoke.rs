@@ -364,9 +364,58 @@ fn adapter_install_hermes_replaces_existing_manifest() -> anyhow::Result<()> {
         &install,
         "Installed adapter `hermes`",
     );
-    let manifest = fs::read_to_string(manifest_path)?;
-    assert!(manifest.contains("\"executable\": \"hermes\""));
-    assert!(!manifest.contains("\"executable\":\"sh\""));
+    let manifest = serde_json::from_str::<Value>(&fs::read_to_string(manifest_path)?)?;
+    let adapter = manifest
+        .get("adapters")
+        .and_then(Value::as_array)
+        .and_then(|adapters| adapters.first())
+        .expect("installed manifest should include one adapter");
+    assert_eq!(adapter.get("id").and_then(Value::as_str), Some("hermes"));
+    assert_eq!(
+        adapter.get("executable").and_then(Value::as_str),
+        Some("hermes")
+    );
+    Ok(())
+}
+
+#[test]
+fn adapter_install_hermes_replaces_existing_manifest_directory() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    let adapter_dir = coven_home.join("adapters");
+    let manifest_path = adapter_dir.join("hermes.json");
+    fs::create_dir_all(&manifest_path)?;
+    fs::write(manifest_path.join("planted.txt"), "keep install broken")?;
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let coven = coven_bin();
+
+    let install = run_coven(
+        &coven,
+        &coven_home,
+        &path,
+        &["adapter", "install", "hermes"],
+    )?;
+
+    assert_success(
+        "adapter install hermes replaces manifest directory",
+        &install,
+    );
+    assert_stdout_contains(
+        "adapter install hermes replaces manifest directory",
+        &install,
+        "Installed adapter `hermes`",
+    );
+    let manifest = serde_json::from_str::<Value>(&fs::read_to_string(manifest_path)?)?;
+    let adapter = manifest
+        .get("adapters")
+        .and_then(Value::as_array)
+        .and_then(|adapters| adapters.first())
+        .expect("installed manifest should include one adapter");
+    assert_eq!(adapter.get("id").and_then(Value::as_str), Some("hermes"));
+    assert_eq!(
+        adapter.get("executable").and_then(Value::as_str),
+        Some("hermes")
+    );
     Ok(())
 }
 
