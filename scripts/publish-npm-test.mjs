@@ -340,12 +340,13 @@ test('packageVersionPublished returns false when npm view exits non-zero (E404, 
   assert.equal(result, false);
 });
 
-test('publish-npm.mjs gates real publishes behind packageVersionPublished for rerun safety', () => {
+test('publish-npm.mjs fails closed when a package version already exists', () => {
   const scriptPath = new URL('publish-npm.mjs', import.meta.url);
   const script = readFileSync(scriptPath, 'utf8');
 
-  assert.match(script, /function publishOrSkip\(/);
-  assert.match(script, /Skipping \$\{packageName\}@\$\{version\}: already published/);
-  assert.match(script, /publishOrSkip\(target\.packageName/);
-  assert.match(script, /publishOrSkip\(packageName/);
+  assert.match(script, /function publishPackage\(/);
+  assert.match(script, /Refusing to publish wrappers that could trust an unverified pre-existing artifact/);
+  assert.match(script, /publishPackage\(target\.packageName/);
+  assert.match(script, /publishPackage\(packageName/);
+  assert.doesNotMatch(script, /Skipping \$\{packageName\}@\$\{version\}: already published/);
 });

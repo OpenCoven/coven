@@ -74,12 +74,12 @@ function main() {
 
   const platformDir = writePlatformPackage(targetName, target, binaryPath, version);
 
-  publishOrSkip(target.packageName, version, dryRun, platformDir);
+  publishPackage(target.packageName, version, dryRun, platformDir);
 
   if (!skipWrapper) {
     for (const packageName of wrapperPackageNames) {
       const wrapperDir = writeWrapperPackage(version, packageName);
-      publishOrSkip(packageName, version, dryRun, wrapperDir);
+      publishPackage(packageName, version, dryRun, wrapperDir);
     }
   }
 
@@ -87,10 +87,9 @@ function main() {
   console.log(`${dryRun ? 'Dry-run completed' : 'Publish completed'} for ${target.packageName}${skipWrapper ? '' : ` and ${wrapperPackageNames.join(', ')}`} at version ${version}.`);
 }
 
-function publishOrSkip(packageName, version, dryRun, cwd) {
+function publishPackage(packageName, version, dryRun, cwd) {
   if (!dryRun && packageVersionPublished(packageName, version)) {
-    console.log(`Skipping ${packageName}@${version}: already published to npm.`);
-    return;
+    fail(`${packageName}@${version} is already published to npm. Refusing to publish wrappers that could trust an unverified pre-existing artifact.`);
   }
   run('npm', publishArgs(dryRun), {
     cwd,
