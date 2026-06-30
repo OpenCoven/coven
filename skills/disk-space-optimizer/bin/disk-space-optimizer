@@ -1,0 +1,167 @@
+#!/bin/bash
+# disk-space-optimizer: Automated disk cleanup script
+# Usage: ./disk-space-optimizer [analyze|cleanup|report|candidates]
+
+set -e
+
+WORKSPACE_HOME="${WORKSPACE_HOME:-.}"
+ACTION="${1:-report}"
+AGGRESSIVE="${2:---safe}"
+
+COLOR_GREEN='\033[0;32m'
+COLOR_YELLOW='\033[1;33m'
+COLOR_RED='\033[0;31m'
+NC='\033[0m' # No Color
+
+log_action() { echo -e "${COLOR_GREEN}✓${NC} $1"; }
+log_warn() { echo -e "${COLOR_YELLOW}⚠${NC} $1"; }
+log_error() { echo -e "${COLOR_RED}❌${NC} $1"; }
+
+# ANALYZE: Identify what can be cleaned
+analyze() {
+  echo "=== Disk Analysis ==="
+  
+  echo -e "\n${COLOR_YELLOW}Overall Disk Usage${NC}"
+  df -h ~ | tail -1
+  
+  echo -e "\n${COLOR_YELLOW}Top Space Consumers${NC}"
+  du -sh ~/.npm ~/.cache ~/.openclaw/workspace ~/Documents/GitHub 2>/dev/null | sort -rh
+  
+  echo -e "\n${COLOR_YELLOW}Largest Build Artifacts${NC}"
+  find ~/Documents/GitHub -maxdepth 3 -type d \( -name ".next" -o -name "target" -o -name "build" -o -name "dist" \) -exec du -sh {} \; 2>/dev/null | sort -rh | head -10
+  
+  echo -e "\n${COLOR_YELLOW}Repository Activity (Last 30 Days)${NC}"
+  cd ~/Documents/GitHub
+  for repo in */; do
+    commits=$(git -C "$repo" log --oneline --since='30 days ago' 2>/dev/null | wc -l)
+    size=$(du -sh "$repo" 2>/dev/null | cut -f1)
+    if [ "$commits" -eq 0 ]; then
+      echo -e "${COLOR_RED}STALE${NC} | $size | $repo"
+    else
+      echo -e "${COLOR_GREEN}ACTIVE${NC} ($commits commits) | $size | $repo"
+    fi
+  done | sort -t'|' -k2 -rh | head -20
+}
+
+# CLEANUP: Remove safe artifacts
+cleanup() {
+  freed=0
+  
+  echo "=== Disk Cleanup ==="
+  
+  # 1. npm cache
+  if [ -d ~/.npm ]; then
+    npm_size=$(du -sh ~/.npm 2>/dev/null | cut -f1)
+    log_action "Clearing npm cache ($npm_size)"
+    npm cache clean --force 2>/dev/null || true
+    rm -rf ~/.npm
+    freed=$((freed + $(echo "$npm_size" | sed 's/G//' | cut -d. -f1)))
+  fi
+  
+  # 2. Dev caches
+  for cache in zig puppeteer cmux uv pre-commit cnoke; do
+    if [ -d ~/.cache/$cache ]; then
+      cache_size=$(du -sh ~/.cache/$cache 2>/dev/null | cut -f1)
+      log_action "Removing ~/.cache/$cache ($cache_size)"
+      rm -rf ~/.cache/$cache
+    fi
+  done
+  
+  # 3. Stale repo artifacts
+  cd ~/Documents/GitHub
+  for repo in */; do
+    commits=$(git -C "$repo" log --oneline --since='30 days ago' 2>/dev/null | wc -l)
+    if [ "$commits" -eq 0 ]; then
+      for artifact in ".next" "target" "build" "dist"; do
+        artifact_path="$repo/$artifact"
+        if [ -d "$artifact_path" ]; then
+          size=$(du -sh "$artifact_path" 2>/dev/null | cut -f1)
+          log_warn "Removing $artifact_path ($size) — stale repo"
+          rm -rf "$artifact_path"
+        fi
+      done
+      
+      # Remove node_modules from stale repos
+      nm_path="$repo/node_modules"
+      if [ -d "$nm_path" ]; then
+        size=$(du -sh "$nm_path" 2>/dev/null | cut -f1)
+        log_action "Removing $nm_path ($size) — stale repo"
+        rm -rf "$nm_path"
+      fi
+    fi
+  done
+  
+  echo -e "\n${COLOR_GREEN}Cleanup complete!${NC}"
+  echo "Run 'disk-space-optimizer report' to see results."
+}
+
+# REPORT: Show current state
+report() {
+  echo "=== Disk Space Report ==="
+  echo ""
+  df -h ~ | tail -1
+  echo ""
+  echo "Active repos with artifacts:"
+  cd ~/Documents/GitHub
+  for repo in */; do
+    commits=$(git -C "$repo" log --oneline --since='7 days ago' 2>/dev/null | wc -l)
+    if [ "$commits" -gt 0 ]; then
+      size=$(du -sh "$repo" 2>/dev/null | cut -f1)
+      echo "  $commits commits/7d | $size | $repo"
+    fi
+  done | sort -rn | head -10
+}
+
+# CANDIDATES: Show what can be safely removed
+candidates() {
+  days="${2:-30}"
+  echo "=== Cleanup Candidates (no commits in $days days) ==="
+  
+  cd ~/Documents/GitHub
+  for repo in */; do
+    commits=$(git -C "$repo" log --oneline --since="$days days ago" 2>/dev/null | wc -l)
+    if [ "$commits" -eq 0 ]; then
+      size=$(du -sh "$repo" 2>/dev/null | cut -f1)
+      
+      # Show removable artifacts
+      artifacts=""
+      for art in ".next" "target" "build" "dist" "node_modules"; do
+        if [ -d "$repo/$art" ]; then
+          art_size=$(du -sh "$repo/$art" 2>/dev/null | cut -f1)
+          artifacts="$artifacts\n    - $art: $art_size"
+        fi
+      done
+      
+      echo -e "\n${COLOR_YELLOW}$repo${NC} — Total: $size"
+      if [ -n "$artifacts" ]; then
+        echo -e "  Removable:$artifacts"
+      fi
+    fi
+  done
+}
+
+# Run requested action
+case "$ACTION" in
+  analyze)
+    analyze
+    ;;
+  cleanup)
+    read -p "Proceed with cleanup? (y/N) " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+      cleanup
+    else
+      log_warn "Cleanup cancelled."
+    fi
+    ;;
+  report)
+    report
+    ;;
+  candidates)
+    candidates
+    ;;
+  *)
+    echo "Usage: $0 {analyze|cleanup|report|candidates}"
+    exit 1
+    ;;
+esac

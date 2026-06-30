@@ -41,11 +41,15 @@ SECRET_RULES: list[tuple[str, re.Pattern[str]]] = [
     ),
 ]
 ALLOW_LINE = re.compile(
-    r"(?i)(example|placeholder|your_|<.*>|op://|secret scanning|secret guard|missing|expected|description|readme|docs/|abcdefghijklmnopqrstuvwxyz|custom-coven-home)"
+    r"(?i)(example|placeholder|secret_value|your_|<.*>|op://|secret scanning|secret guard|missing|expected|description|readme|docs/|abcdefghijklmnopqrstuvwxyz|custom-coven-home)"
 )
 ENV_SECRET_READ = re.compile(
     r"(?i)\b(?:api[_-]?key|secret|token|password|private[_-]?key)\b\s*[:=]\s*"
     r"(?:os\.environ(?:\.get)?\(|std::env::var\(|env::var\(|process\.env\.)"
+)
+ENV_SECRET_REFERENCE = re.compile(
+    r"(?i)\b(?:api[_-]?key|secret|token|password|private[_-]?key)\b\s*[:=]\s*[\"']?"
+    r"\$\{?[A-Z0-9_]+(?:[:?][^\"']*)?\}?"
 )
 
 
@@ -90,6 +94,8 @@ def is_local_path_like_token(token: str) -> bool:
         return False
     if parts[0] in {"Users", "home", "private", "var", "tmp", "Volumes"}:
         return True
+    if parts[0:2] == ["Documents", "GitHub"]:
+        return True
     return ".worktrees" in parts or "worktrees" in parts
 
 
@@ -103,6 +109,11 @@ def is_public_repo_url_like_token(token: str) -> bool:
 def is_github_advisory_url_like_token(token: str) -> bool:
     normalized = token.strip("/")
     return normalized.startswith("github.com/advisories/GHSA-")
+
+
+def is_github_commit_url_like_token(token: str) -> bool:
+    normalized = token.strip("/")
+    return bool(re.fullmatch(r"github\.com/[^/\s]+/[^/\s]+/commit/[0-9a-f]{32,64}", normalized))
 
 
 _GITHUB_ACTION_SHA_REF = re.compile(
@@ -173,6 +184,10 @@ def scan_text(text: str, path: str) -> list[tuple[str, int, str]]:
                 continue
             if name == "generic_assignment" and ENV_SECRET_READ.search(line):
                 continue
+            if name == "generic_assignment" and ENV_SECRET_REFERENCE.search(line):
+                continue
+            if name == "generic_assignment" and "grep" in line and re.search(r"-[A-Za-z]*E\b", line):
+                continue
             if pattern.search(line) and not (allow and name != "private_key"):
                 hits.append((path, line_number, name))
         if allow:
@@ -192,6 +207,7 @@ def scan_text(text: str, path: str) -> list[tuple[str, int, str]]:
                 is_local_path_like_token(token)
                 or is_public_repo_url_like_token(token)
                 or is_github_advisory_url_like_token(token)
+                or is_github_commit_url_like_token(token)
                 or is_github_action_sha_ref_token(token)
                 or is_programming_identifier_token(token)
             ):

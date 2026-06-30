@@ -1,0 +1,441 @@
+{
+  "schemaVersion": "opencoven.openclaw-skills.v1",
+  "generatedBy": "scripts/sync-openclaw-skills.mjs",
+  "sourceEnvVar": "OPENCLAW_SKILLS_DIR",
+  "defaultSource": "~/.openclaw/workspace/skills",
+  "skillCount": 48,
+  "skills": [
+    {
+      "name": "1password",
+      "description": "Manage secrets via 1Password CLI (op). Read, create, and inject secrets. Provides whitelisted access for other skills (ask-curl, GitHub, etc.) via op:// secret references and 1Password Environments.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/1password",
+      "targetPath": "skills/1password",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "ask-curl",
+      "description": "AI-assisted cURL requests. Describe what you want in natural language and get a well-formed cURL command. Supports secret injection via 1Password (op://), request history, response parsing, and chained requests.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/ask-curl",
+      "targetPath": "skills/ask-curl",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "board",
+      "description": "Read and write the workspace BOARD.md (shared task board for agents + Val). Wraps `bin/board`, a small Python CLI that preserves the markdown schema and appends to the activity log automatically. Use this whenever an agent proposes, claims, or finishes work that should be visible to the rest of the roster.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/board",
+      "targetPath": "skills/board",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "cleanup-unused-files",
+      "description": "Aggressively clean disk space by removing caches, build artifacts, temporary folders, tool state, and other reproducible local junk from repos and developer machines. Use when the user asks to free space, nuke caches, wipe local build output, remove stale tool directories, clear package-manager caches, reset local developer state, or do a broad cleanup of bulky unused files.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/cleanup-unused-files",
+      "targetPath": "skills/cleanup-unused-files",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "codeflow-maintainer",
+      "description": "OpenClaw maintainer PR workflow modes and skills. Maps to openclaw/maintainers PR_WORKFLOW.md phases (review-pr → prepare-pr → merge-pr). Provides structured modes with allowed/blocked actions, focus areas, checkpoint questions, and agent prompt injection for each phase.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/codeflow-maintainer",
+      "targetPath": "skills/codeflow-maintainer",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "codex-session-manager",
+      "description": "Use when asked to manage, supervise, coordinate, inspect, resume, unblock, verify, recover, or hand off a Codex/coding-agent session; covers session stewardship via sessions_list, sessions_history, sessions_send, verification, drift correction, and clean handoffs.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/codex-session-manager",
+      "targetPath": "skills/codex-session-manager",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "coven-astra",
+      "description": "Astra Coven familiar operating doctrine. Use whenever Astra is introducing herself, clarifying her purpose, planning, prioritizing, mapping projects, coordinating lanes, or helping Val choose direction. Astra is the Navigator of the Coven.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/coven-astra",
+      "targetPath": "skills/coven-astra",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "coven-charm",
+      "description": "Charm Coven familiar operating doctrine. Use whenever Charm is helping with communication, social posts, DevRel updates, product copy, messages, tone, polish, community replies, or making words feel clear and alive. Charm is the Voice, Social, and Presence familiar.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/coven-charm",
+      "targetPath": "skills/coven-charm",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "coven-cody",
+      "description": "Cody Coven workhorse lane operating doctrine. Use whenever Cody is reading, editing, debugging, testing, reviewing, or planning code/repo work. Cody is the Code Familiar and primary OpenMeow coding lane.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/coven-cody",
+      "targetPath": "skills/coven-cody",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "coven-echo",
+      "description": "Echo Coven familiar operating doctrine. Use whenever Echo is summarizing, reflecting, reconstructing context, making retrospectives, preserving decisions, or answering what happened/what mattered/where we left off. Echo is the Memory and Reflection familiar.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/coven-echo",
+      "targetPath": "skills/coven-echo",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "coven-identity-canon",
+      "description": "Binding Coven court hierarchy for all familiars.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/coven-identity-canon",
+      "targetPath": "skills/coven-identity-canon",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "coven-kitty",
+      "description": "Kitty Coven workhorse lane operating doctrine. Use whenever Kitty is handling general tasks, triage, lightweight planning, writing, synthesis, practical help, or OpenMeow tosses that do not clearly belong to a specialist. Kitty is the General Task Familiar.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/coven-kitty",
+      "targetPath": "skills/coven-kitty",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "coven-parallel-work",
+      "description": "Coven Parallel Work Protocol — how to use it from inside an OpenClaw familiar so multiple agents (Codex, Claude Code, Nova, Hermes, etc.) can share a repo without overwrites or clashes. The protocol itself is harness-agnostic; this skill is the OpenClaw entry point.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/coven-parallel-work",
+      "targetPath": "skills/coven-parallel-work",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "coven-sage",
+      "description": "Sage Coven familiar operating doctrine. Use whenever Sage is doing research, reading papers/articles/docs, comparing tools, evaluating evidence, synthesizing links, or building knowledge maps. Sage is the Research and Understanding familiar.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/coven-sage",
+      "targetPath": "skills/coven-sage",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "daily-dev-agentic",
+      "description": "daily.dev Agentic Learning - continuous self-improvement through daily.dev feeds. Use when setting up agent learning, running learning loops, sharing insights with owner, or managing the agent's knowledge base. Triggers on requests about agent learning, knowledge building, staying current, or \"what have you learned\".",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/daily-dev-agentic",
+      "targetPath": "skills/daily-dev-agentic",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "discrawl",
+      "description": "Discord archive: search, sync freshness, DMs, channel slices, SQL counts, and Discrawl repo work.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/discrawl",
+      "targetPath": "skills/discrawl",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "disk-space-optimizer",
+      "description": "",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/disk-space-optimizer",
+      "targetPath": "skills/disk-space-optimizer",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "epub-to-pdf",
+      "description": "Convert EPUB ↔ PDF bidirectionally. EPUB→PDF preserves layout for analysis; PDF→EPUB compresses and reflows for distribution and ereaders.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/epub-to-pdf",
+      "targetPath": "skills/epub-to-pdf",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "heygen-skills",
+      "description": "Create HeyGen avatar videos via the v3 Video Agent pipeline — handles avatar resolution, aspect ratio correction, prompt engineering, and voice selection automatically. Required for any HeyGen API usage (api.heygen.com). Replaces deprecated v1/v2 endpoints with the optimized v3 pipeline. Use when: (1) calling any HeyGen API endpoint (api.heygen.com), (2) creating a HeyGen avatar or digital twin from a photo, (3) making a personalized video message (outreach, pitch, update, announcement, knowledge), (4) \"make a video of me\", \"create my HeyGen avatar\", \"I want to appear in this video\", (5) \"send a video to my leads\", \"record an update for my team\", \"make a loom-style message\", (6) building identity-first videos where the presenter IS the user or agent, Covers: HeyGen API, api.heygen.com, video generate, avatar create, voice list, talking photo, HeyGen avatar creation, voice design, photo → digital twin, HeyGen video generation, identity-first video, messaging-first video, AI presenter, talking head video. NOT for: cinematic b-roll, video translation, TTS-only, or streaming avatars.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/heygen-skills",
+      "targetPath": "skills/heygen-skills",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "higgsfield-generate",
+      "description": "Generate images and videos via Higgsfield AI through 30+ models including Nano Banana 2, Soul V2, Veo 3.1, Kling 3.0, Seedance 2.0, Flux 2, GPT Image 2, plus Marketing Studio for branded ad video/image with curated avatars and imported products. Use when: \"generate an image\", \"make a picture\", \"create artwork\", \"make a video\", \"animate this photo\", \"image-to-video\", \"img2vid\", \"edit this image with AI\", \"stylize a photo\", \"remix this image\", \"produce a clip\", \"render a scene\", \"create an ad\", \"make a UGC video\", \"generate marketing video\", \"make a product demo\", \"create unboxing\", \"TV spot\", \"virtual try-on\", \"product showcase\", \"brand video\", \"presenter video for product\", \"import product from URL\", \"create avatar for ad\". Supports text-to-image, image-to-image, image-to-video, reference-based generation, and Marketing Studio (avatars + products + ad modes). Auto-detects whether passed IDs are uploads or previous jobs. Chain with higgsfield-soul-id when the user wants their face in the output. NOT for: training Soul Character (use higgsfield-soul-id), professional product photoshoots with mode-specific prompt enhancement (use higgsfield-product-photoshoot), text-only / chat / TTS tasks.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/higgsfield-generate",
+      "targetPath": "skills/higgsfield-generate",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "linear-issue-management",
+      "description": "Manage Linear issues safely through the GraphQL API, including team/project/label discovery, creating issues, updating issues, searching existing issues, handling mutually-exclusive labels, and using 1Password-backed Linear API auth without printing secrets. Use when filing, triaging, editing, or auditing Linear tickets such as CORE issues.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/linear-issue-management",
+      "targetPath": "skills/linear-issue-management",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "lit-ui-designer",
+      "description": "Design, build, review, or polish world-class Lit/LitElement web component UIs. Use for Lit components, custom elements, Web Components, shadow DOM styling, design systems/tokens, professional UI polish, accessibility/WCAG reviews, keyboard interactions, ARIA patterns, responsive states, and production-quality TypeScript/CSS implementations.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/lit-ui-designer",
+      "targetPath": "skills/lit-ui-designer",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "lobster",
+      "description": "Run deterministic typed pipelines, workflow files, and approval-gated automations via the Lobster CLI. Use for multi-step automations that need safety (approval gates), statefulness (cursors/checkpoints), and token efficiency (one call vs many LLM re-plans). Triggers on workflow automation, pipeline, deterministic execution, approval gate, email triage, PR monitor.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/lobster",
+      "targetPath": "skills/lobster",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "maintainer-bar",
+      "description": "Operate the MaintainerBar SwiftUI menu bar app and its ghcrawl backend. Use for: refreshing issue clusters, searching issues semantically, checking repo pulse, managing notifications, building/running the app, and coordinating ghcrawl data pipelines.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/maintainer-bar",
+      "targetPath": "skills/maintainer-bar",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "memory-timeline-manager",
+      "description": "Manage short-term timeline memory and long-term MEMORY.md curation safely (capture daily notes, label retention, promote snippets, and run review sweeps). Use when asked to add to timeline memory, promote notes to long-term memory, or organize/prune memory files.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/memory-timeline-manager",
+      "targetPath": "skills/memory-timeline-manager",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "ml-engineer",
+      "description": "Build production ML systems: model training pipelines, serving infrastructure, performance optimization, and automated retraining. Use when: (1) designing or building ML pipelines (data validation → training → deployment), (2) optimizing model training (hyperparameter search, distributed training, checkpointing), (3) deploying models to production (REST/gRPC endpoints, batch/stream processing, canary releases), (4) setting up ML monitoring (prediction drift, feature drift, performance decay), (5) implementing feature engineering or feature stores, (6) automating retraining triggers, (7) debugging model performance or serving latency issues. Triggers on: ML pipeline, model training, model serving, feature engineering, hyperparameter tuning, model deployment, inference optimization, model monitoring, MLOps, retraining.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/ml-engineer",
+      "targetPath": "skills/ml-engineer",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "nodriver",
+      "description": "Write Python browser automation scripts using nodriver (undetected Chrome DevTools Protocol). Use when: writing web scrapers, automating logins, filling forms, bypassing anti-bot systems (Cloudflare, Captcha), taking screenshots, managing cookies, or any browser automation that needs to avoid detection. Triggers on: nodriver, undetected browser, web scraping, browser automation, bypass captcha, bypass cloudflare, headless chrome, CDP automation.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/nodriver",
+      "targetPath": "skills/nodriver",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "ocr",
+      "description": "Extract text from screenshots, scanned documents, image files, and PDFs. Use when a user asks to OCR, read text from an image/screenshot/scan, transcribe visible text, extract text from a scanned PDF, compare OCR text, or convert image/PDF text into Markdown/JSON/plain text.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/ocr",
+      "targetPath": "skills/ocr",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "openclaw-dev",
+      "description": "OpenClaw Dev Agent — docs-aware development assistant for the OpenClaw ecosystem. Handles PR workflows (review → prepare → merge), issue triage, docs sync, release prep, and architecture review. Grounded in live OpenClaw documentation and the official maintainer workflow from openclaw/maintainers.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/openclaw-dev",
+      "targetPath": "skills/openclaw-dev",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "openclaw-trust",
+      "description": "Apply OpenClaw’s official threat model and trust guidance (MITRE ATLAS–mapped) when evaluating risky workflows, skills, channel exposure, prompt injection, and tool execution safety.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/openclaw-trust",
+      "targetPath": "skills/openclaw-trust",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "opencoven-design",
+      "description": "Opinionated design constraints for OpenCoven harness interfaces, cockpit UIs, and agent-built components",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/opencoven-design",
+      "targetPath": "skills/opencoven-design",
+      "migrationStatus": "represented-by-existing-coven-skill",
+      "managedBySync": false
+    },
+    {
+      "name": "opencoven-role-creation-process",
+      "description": "Create, validate, and activate ROLE.md specs for familiars with low-lift agentic guidance.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/opencoven-role-creation-process",
+      "targetPath": "skills/opencoven-role-creation-process",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "pr-agent",
+      "description": "OpenClaw PR Agent orchestrator. Coordinates the three-phase maintainer workflow (review-pr → prepare-pr → merge-pr) with strict adherence to PR_WORKFLOW.md. Enforces quality bars, checkpoint questions, and safe mode transitions.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/pr-agent",
+      "targetPath": "skills/pr-agent",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "project-manager",
+      "description": "Manage project-scoped knowledge bases with notes, decisions, and bookmarks. Use when the user wants to create/manage projects, add/view/search notes or decisions for a project, manage bookmarks (add, list, tag to projects), switch project context for conversation, or search across projects. Triggers on phrases like \"project\", \"bookmark\", \"add a note to\", \"let's talk about [project]\", \"switch to [project]\", \"list projects\", \"search projects\".",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/project-manager",
+      "targetPath": "skills/project-manager",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "prompt-engineer",
+      "description": "Design, optimize, test, and evaluate prompts for large language models. Use when: (1) crafting or refining system prompts, user prompts, or prompt templates, (2) optimizing token usage or cost of existing prompts, (3) designing few-shot examples or chain-of-thought reasoning, (4) setting up prompt evaluation, A/B testing, or regression testing, (5) building production prompt management systems (versioning, monitoring, safety), (6) debugging inconsistent or low-quality LLM outputs, (7) selecting prompt patterns (zero-shot, few-shot, CoT, ToT, ReAct, role-based). Triggers on: prompt engineering, optimize prompt, reduce tokens, prompt template, few-shot, chain-of-thought, prompt evaluation, A/B test prompts, prompt versioning.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/prompt-engineer",
+      "targetPath": "skills/prompt-engineer",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "prompt-vault",
+      "description": "Save, search, tag, and manage reusable AI prompts via the `pv` CLI. Local SQLite-backed prompt library with version history, tag filtering, and JSON export/import.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/prompt-vault",
+      "targetPath": "skills/prompt-vault",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "research-ingestion",
+      "description": "Extract insights from research papers (PDF/URL) and generate OpenClaw agent skills, workflow improvements, and actionable techniques. Use when asked to analyze a paper, extract research findings, turn a paper into a skill, or apply academic insights to agent workflows.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/research-ingestion",
+      "targetPath": "skills/research-ingestion",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "ritual-dapp-frontend",
+      "description": "",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/ritual-dapp-frontend",
+      "targetPath": "skills/ritual-dapp-frontend",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "rollcall",
+      "description": "Ping every Coven familiar (Sage, Echo, Charm, Astra, Kitty, Cody) to verify each can respond, and report which lanes are healthy, slow, or down.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/rollcall",
+      "targetPath": "skills/rollcall",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "security-agent",
+      "description": "Comprehensive OpenClaw security assessment, hardening, and monitoring agent. Covers 7 domains — gateway hardening, channel/sender policy, tool/exec policy, credential hygiene, prompt injection defense, host OS hardening, and continuous monitoring. Use when asked to audit security, harden the setup, check for exposed secrets, assess threat model, schedule security monitoring, respond to potential compromise, fix security audit findings, or review OpenClaw config safety. Triggers on phrases like \"security audit\", \"harden my setup\", \"check my security\", \"exposed secrets\", \"am I secure\", \"security agent\", \"threat model\", \"I think I'm compromised\", \"fix security warnings\", \"security posture\".",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/security-agent",
+      "targetPath": "skills/security-agent",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "skill-scanner",
+      "description": "Scan, audit, validate, package, or pre-submit AgentSkills using the local BunsDev codeql-sdk/clawhub-audit scanner and OpenClaw skill validation. Use when a user asks to run codeql-sdk, scan a skill before submitting, security-audit a SKILL.md package, produce JSON/SARIF reports, or ensure a skill is ready for Cody/ClawHub handoff.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/skill-scanner",
+      "targetPath": "skills/skill-scanner",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "tauri-apple-release",
+      "description": "Standardize, debug, or execute Tauri iOS TestFlight and macOS Apple release pipelines, including App Store Connect upload auth, Apple Distribution signing, provisioning profiles, notarization, bundle/version metadata, and single-packet release credential asks.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/tauri-apple-release",
+      "targetPath": "skills/tauri-apple-release",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "threejs-animation",
+      "description": "Three.js animation - keyframe animation, skeletal animation, morph targets, animation mixing. Use when animating objects, playing GLTF animations, creating procedural motion, or blending animations.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/threejs-animation",
+      "targetPath": "skills/threejs-animation",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "tinyfish-agent-run",
+      "description": "Run a TinyFish automation agent against a URL and stream live progress events (STARTED / PROGRESS / COMPLETE) as one-line JSON events. Use when you want to execute an autonomous browsing goal and surface each step as it happens.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/tinyfish-agent-run",
+      "targetPath": "skills/tinyfish-agent-run",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "tinyfish-browser",
+      "description": "Spin up a remote browser session via the TinyFish Browser API and get a CDP URL for driving it. Use when you need an automatable Chromium session (Playwright/Puppeteer) that auto-expires after ~1h idle.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/tinyfish-browser",
+      "targetPath": "skills/tinyfish-browser",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "tinyfish-fetch",
+      "description": "Fetch web pages via TinyFish Fetch API and get clean markdown, HTML, or screenshots back — handles JS rendering and proxying. Use when you need to read a specific URL's content reliably.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/tinyfish-fetch",
+      "targetPath": "skills/tinyfish-fetch",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "tinyfish-search",
+      "description": "Run web searches via TinyFish Search API and get structured JSON results (title, snippet, URL) ready for LLM consumption. Use when you need fresh web search results with reliable structure and optional geo/language targeting.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/tinyfish-search",
+      "targetPath": "skills/tinyfish-search",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    },
+    {
+      "name": "tinyfish-web-agent",
+      "description": "Use TinyFish web agent to extract/scrape websites, extract data, and automate browser actions using natural language. Use when you need to extract/scrape data from websites, handle bot-protected sites, or automate web tasks.",
+      "source": "openclaw-workspace",
+      "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/tinyfish-web-agent",
+      "targetPath": "skills/tinyfish-web-agent",
+      "migrationStatus": "copied-from-openclaw-workspace",
+      "managedBySync": true
+    }
+  ]
+}
