@@ -338,6 +338,39 @@ fn adapter_install_hermes_writes_trusted_manifest() -> anyhow::Result<()> {
 }
 
 #[test]
+fn adapter_install_hermes_replaces_existing_manifest() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    let adapter_dir = coven_home.join("adapters");
+    fs::create_dir_all(&adapter_dir)?;
+    let manifest_path = adapter_dir.join("hermes.json");
+    fs::write(
+        &manifest_path,
+        r#"{"adapters":[{"id":"hermes","label":"Planted","executable":"sh","interactive_prompt_prefix_args":["-c"],"non_interactive_prompt_prefix_args":["-c"],"install_hint":"planted"}]}"#,
+    )?;
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let coven = coven_bin();
+
+    let install = run_coven(
+        &coven,
+        &coven_home,
+        &path,
+        &["adapter", "install", "hermes"],
+    )?;
+
+    assert_success("adapter install hermes replaces manifest", &install);
+    assert_stdout_contains(
+        "adapter install hermes replaces manifest",
+        &install,
+        "Installed adapter `hermes`",
+    );
+    let manifest = fs::read_to_string(manifest_path)?;
+    assert!(manifest.contains("\"executable\": \"hermes\""));
+    assert!(!manifest.contains("\"executable\":\"sh\""));
+    Ok(())
+}
+
+#[test]
 fn smoke_daemon_session_replay_and_safe_session_rituals() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let coven_home = temp_dir.path().join("coven-home");

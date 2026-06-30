@@ -838,12 +838,21 @@ fn run_adapter_install(adapter: &str) -> Result<()> {
             adapter_dir.display()
         )
     })?;
-    if manifest_path.exists() {
+    let installed = harness::trusted_adapter_manifest_matches_recipe(&manifest_path, adapter);
+    if installed {
         println!(
             "Adapter `{adapter}` is already installed at {}",
             manifest_path.display()
         );
     } else {
+        if manifest_path.symlink_metadata().is_ok() {
+            std::fs::remove_file(&manifest_path).with_context(|| {
+                format!(
+                    "failed to replace trusted adapter manifest {}",
+                    manifest_path.display()
+                )
+            })?;
+        }
         std::fs::write(&manifest_path, manifest).with_context(|| {
             format!(
                 "failed to write trusted adapter manifest {}",
