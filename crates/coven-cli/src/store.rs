@@ -787,7 +787,19 @@ pub fn latest_active_for_project(conn: &Connection, project_root: &str) -> Resul
     .context("failed to query latest active session for project")
 }
 
+fn fts_literal_query(query: &str) -> Option<String> {
+    let terms = query.split_whitespace().filter(|term| !term.is_empty());
+    let mut out = Vec::new();
+    for term in terms {
+        out.push(format!("\"{}\"", term.replace('"', "\"\"")));
+    }
+    (!out.is_empty()).then(|| out.join(" "))
+}
+
 pub fn search_events(conn: &Connection, query: &str) -> Result<Vec<SearchHit>> {
+    let Some(fts_query) = fts_literal_query(query) else {
+        return Ok(Vec::new());
+    };
     let mut stmt = conn
         .prepare(
             "SELECT e.id, e.session_id, e.kind, snippet(events_fts, 0, '[', ']', '…', 16), e.created_at
@@ -799,7 +811,7 @@ pub fn search_events(conn: &Connection, query: &str) -> Result<Vec<SearchHit>> {
         )
         .context("failed to prepare events_fts search")?;
     let rows = stmt
-        .query_map([query], |row| {
+        .query_map([fts_query], |row| {
             Ok(SearchHit {
                 event_id: row.get(0)?,
                 session_id: row.get(1)?,
@@ -2010,6 +2022,26 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].event_id, "e1");
         assert_eq!(hits[0].session_id, "s1");
+        Ok(())
+    }
+
+    #[test]
+    fn search_events_treats_numeric_colon_query_as_literal() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("test.sqlite3"))?;
+        conn.execute(
+            "INSERT INTO sessions(id, project_root, harness, title, status, created_at, updated_at)
+             VALUES('s1', '/tmp', 'codex', 't', 'created', '2026-01-01', '2026-01-01')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO events(id, session_id, kind, payload_json, created_at)
+             VALUES('e1', 's1', 'stdout', '{\"text\":\"demo step 0:\"}', '2026-01-01')",
+            [],
+        )?;
+        let hits = search_events(&conn, "0:")?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].event_id, "e1");
         Ok(())
     }
 
