@@ -24,7 +24,7 @@ Launch, observe, attach, and coordinate agent work through one neutral runtime s
 
 > **⚠️ Early MVP** — Coven is a local-first runtime in active development. It is usable by adventurous developers on macOS and Linux. The npm package is live. Expect rough edges.
 >
-> **🔒 PRs Closed Until July 2026** — We are currently only accepting Issues and Bug Reports. Pull Requests will be closed without review until July 2026. If you have a fix or feature in mind, open an issue to track it.
+> **🎆 Independence Day PR Event — Opens Saturday, July 4, 2026** — We are accepting Issues and Bug Reports now, and external Pull Requests open starting Saturday, July 4, 2026. Until then, open an issue for any fix or feature you want to track.
 
 ---
 
@@ -672,11 +672,11 @@ For the full diagnostic flowchart and detailed resolution steps, see [`docs/TROU
 
 ## Contributing
 
-> **⚠️ Contribution Status — Updated May 2026**
+> **⚠️ Contribution Status — Updated June 2026**
 >
-> **We are currently only accepting Issues and Bug Reports.** Pull Requests will not be reviewed or merged until **July 2026**.
-> Please do not open PRs at this time — they will be closed without review.
-> If you have a fix or feature in mind, open an issue to track it and we will pick it up when the window reopens.
+> **Independence Day PR Event:** external Pull Requests open starting **Saturday, July 4, 2026**.
+> Until then, we are accepting Issues and Bug Reports only.
+> If you have a fix or feature in mind, open an issue to track it and bring the PR when the event opens.
 
 ### First 10 minutes (source checkout)
 
