@@ -408,6 +408,7 @@ pub fn trusted_adapter_manifest_matches_recipe(path: &Path, adapter_id: &str) ->
         return false;
     }
     fs::read_to_string(path).is_ok_and(|actual| actual == expected)
+}
 
 fn coven_home_from_process_env() -> Option<PathBuf> {
     env::var_os("COVEN_HOME")
