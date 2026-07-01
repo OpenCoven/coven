@@ -47,10 +47,10 @@ def scan(obj, path=''):
         for i, v in enumerate(obj):
             scan(v, f'{path}[{i}]')
 
-with open('$CONFIG') as f:
+with open(sys.argv[1]) as f:
     config = json.load(f)
     scan(config)
-" 2>/dev/null || echo "SKIP: Could not parse config as JSON"
+" "$CONFIG" 2>/dev/null || echo "SKIP: Could not parse config as JSON"
 
 # Check identity directory permissions
 echo ""
