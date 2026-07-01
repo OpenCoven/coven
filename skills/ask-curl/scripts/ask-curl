@@ -47,11 +47,15 @@ if ! $NO_OP && command -v op &>/dev/null && [ -f "$ENV_FILE" ]; then
 fi
 
 # Execute
+set +e
 if $USE_OP; then
-  RESPONSE=$(op run --env-file="$ENV_FILE" -- curl -w '\n%{http_code}' "${CURL_ARGS[@]}" 2>&1) || true
+  RESPONSE=$(op run --env-file="$ENV_FILE" -- curl -w '\n%{http_code}' "${CURL_ARGS[@]}" 2>&1)
+  CURL_STATUS=$?
 else
-  RESPONSE=$(curl -w '\n%{http_code}' "${CURL_ARGS[@]}" 2>&1) || true
+  RESPONSE=$(curl -w '\n%{http_code}' "${CURL_ARGS[@]}" 2>&1)
+  CURL_STATUS=$?
 fi
+set -e
 
 # Split response and status code
 HTTP_CODE=$(echo "$RESPONSE" | tail -1)
