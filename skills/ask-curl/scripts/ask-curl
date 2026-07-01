@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# ask-curl: Execute curl with optional 1Password secret injection
+# Usage: ask-curl [--dry-run] [--no-op] <curl args...>
+#
+# If op CLI is available and env file exists, secrets are injected via `op run`.
+# Otherwise falls back to plain curl with environment variables.
+
+set -euo pipefail
+
+ENV_FILE="${ASK_CURL_ENV:-$HOME/.config/ask-curl/env.curl}"
+HISTORY_FILE="${ASK_CURL_HISTORY:-$HOME/.config/ask-curl/history.jsonl}"
+DRY_RUN=false
+NO_OP=false
+
+# Parse wrapper flags
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=true; shift ;;
+    --no-op)   NO_OP=true; shift ;;
+    *)         break ;;
+  esac
+done
+
+if [ $# -eq 0 ]; then
+  echo "Usage: ask-curl [--dry-run] [--no-op] <curl args...>"
+  exit 1
+fi
+
+# Build the curl command
+CURL_ARGS=("$@")
+
+# Add defaults if not already present
+has_flag() { for a in "${CURL_ARGS[@]}"; do [[ "$a" == "$1" ]] && return 0; done; return 1; }
+has_flag "-s" || CURL_ARGS=("-s" "${CURL_ARGS[@]}")
+has_flag "--max-time" || CURL_ARGS=("--max-time" "30" "${CURL_ARGS[@]}")
+
+# Dry run: just print the command
+if $DRY_RUN; then
+  echo "curl ${CURL_ARGS[*]}"
+  exit 0
+fi
+
+# Determine execution method
+USE_OP=false
+if ! $NO_OP && command -v op &>/dev/null && [ -f "$ENV_FILE" ]; then
+  USE_OP=true
+fi
+
+# Execute
+if $USE_OP; then
+  if RESPONSE=$(op run --env-file="$ENV_FILE" -- curl -w '\n%{http_code}' "${CURL_ARGS[@]}" 2>&1); then
+    CURL_STATUS=0
+  else
+    CURL_STATUS=$?
+  fi
+else
+  if RESPONSE=$(curl -w '\n%{http_code}' "${CURL_ARGS[@]}" 2>&1); then
+    CURL_STATUS=0
+  else
+    CURL_STATUS=$?
+  fi
+fi
+
+# Split response and status code
+HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+BODY=$(echo "$RESPONSE" | sed '$d')
+
+# Output
+echo "$BODY"
+
+# Log to history (sanitized)
+mkdir -p "$(dirname "$HISTORY_FILE")"
+# Extract method and URL from args
+METHOD="GET"
+URL=""
+for i in "${!CURL_ARGS[@]}"; do
+  case "${CURL_ARGS[$i]}" in
+    -X) METHOD="${CURL_ARGS[$((i+1))]}" ;;
+    http://*|https://*) URL="${CURL_ARGS[$i]}" ;;
+  esac
+done
+[ -z "$URL" ] && URL="${CURL_ARGS[-1]}"
+
+if [[ "$HTTP_CODE" =~ ^[0-9]{3}$ ]]; then
+  LOG_STATUS=$((10#$HTTP_CODE))
+else
+  LOG_STATUS=null
+fi
+
+echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"method\":\"$METHOD\",\"url\":\"$URL\",\"status\":$LOG_STATUS}" \
+  >> "$HISTORY_FILE" 2>/dev/null || true
+
+# Exit with appropriate code
+if [ "$CURL_STATUS" -ne 0 ] || [ "$HTTP_CODE" = "000" ]; then
+  exit 1
+fi
+
+if [ "$HTTP_CODE" -ge 400 ] 2>/dev/null; then
+  exit 1
+fi

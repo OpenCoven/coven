@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# cv-wt-protocol pre-commit hook
+# Refuses commits that violate the Coven parallel-work protocol.
+#
+# Rules enforced:
+#   1. No commits on $COVEN_PRIMARY_BRANCH (default: main) unless
+#      COVEN_ALLOW_PRIMARY_COMMIT=1 is set in env.
+#   2. No commits if a different agent holds an active claim on the
+#      current branch (claim file: .git/agent-claims/<branch>).
+#   3. HEAD canary: if .git/AGENT_HEAD_AT_START exists and disagrees
+#      with current HEAD, refuse — HEAD moved out from under the agent.
+#
+# Bypass any check with --no-verify (logs a warning if used).
+
+set -euo pipefail
+
+repo_root=$(git rev-parse --show-toplevel)
+git_common=$(git rev-parse --git-common-dir)
+primary=${COVEN_PRIMARY_BRANCH:-main}
+branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
+agent=${COVEN_AGENT_ID:-${USER:-unknown}}
+
+red()    { printf '\033[31m%s\033[0m\n' "$*" >&2; }
+yellow() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
+
+# 1. Primary-branch guard
+if [ "$branch" = "$primary" ] && [ "${COVEN_ALLOW_PRIMARY_COMMIT:-0}" != "1" ]; then
+  red "✗ pre-commit (cv-wt-protocol): refusing commit on protected branch '$primary'."
+  red "  Open a feature branch via:  cv-wt <branch-name>"
+  red "  Or override (rare):         COVEN_ALLOW_PRIMARY_COMMIT=1 git commit ..."
+  exit 1
+fi
+
+# 2. Agent-claim guard
+claim_dir="$git_common/agent-claims"
+claim_file="$claim_dir/$(echo "$branch" | tr '/' '-')"
+if [ -f "$claim_file" ]; then
+  claimant=$(awk -F= '/^agent=/ {print $2}' "$claim_file" 2>/dev/null)
+  ttl_until=$(awk -F= '/^ttl_until=/ {print $2}' "$claim_file" 2>/dev/null)
+  now=$(date +%s)
+  if [ -n "$ttl_until" ] && [ "$now" -lt "$ttl_until" ]; then
+    if [ -n "$claimant" ] && [ "$claimant" != "$agent" ]; then
+      red "✗ pre-commit (cv-wt-protocol): branch '$branch' is claimed by agent '$claimant'."
+      red "  Your agent id: '$agent' (override via \$COVEN_AGENT_ID)."
+      red "  Either coordinate with '$claimant', or wait for claim to expire ($(date -r "$ttl_until" 2>/dev/null || date -d "@$ttl_until"))."
+      exit 1
+    fi
+  fi
+fi
+
+# 3. HEAD canary
+canary="$git_common/AGENT_HEAD_AT_START"
+if [ -f "$canary" ]; then
+  expected=$(awk '{print $1}' "$canary")
+  current=$(git rev-parse HEAD)
+  expected_branch=$(awk '{print $2}' "$canary")
+  if [ -n "$expected_branch" ] && [ "$expected_branch" != "$branch" ]; then
+    yellow "⚠ pre-commit (cv-wt-protocol): branch changed since session start ($expected_branch → $branch). Continuing — but verify this was intentional."
+  elif [ "$expected" != "$current" ] && [ "$(git merge-base "$expected" "$current" 2>/dev/null)" != "$expected" ]; then
+    red "✗ pre-commit (cv-wt-protocol): HEAD moved out from under your session."
+    red "  Expected: $expected"
+    red "  Current:  $current"
+    red "  Another agent likely reset/rebased this branch. Investigate before committing."
+    red "  To accept the new HEAD and continue: rm $canary"
+    exit 1
+  fi
+fi
+
+# Chain to repo-specific hook if present (preserved during install).
+self_path="$0"
+self_dir=$(cd "$(dirname "$self_path")" && pwd)
+local_hook="$self_dir/pre-commit.local"
+if [ -x "$local_hook" ]; then
+  exec "$local_hook" "$@"
+fi
+
+exit 0

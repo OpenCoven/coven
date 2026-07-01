@@ -17,6 +17,24 @@ Canonical Coven-wide skills live here. Each skill is a directory with a `SKILL.m
 | `opencoven-design` | OpenCoven design system and visual language reference |
 | `higgsfield` | Runtime-portable image and video generation via Higgsfield API (curl + jq only) |
 
+## OpenClaw Skill Migration
+
+OpenClaw workspace skills are migrated into this directory so Coven can be the canonical skill home across harnesses.
+
+- Coverage manifest: `skills/openclaw-skills-manifest.json`
+- Sync script: `scripts/sync-openclaw-skills.mjs`
+- Default source: `~/.openclaw/workspace/skills`
+- Override source: `OPENCLAW_SKILLS_DIR=/path/to/skills`
+
+Run:
+
+```bash
+node scripts/sync-openclaw-skills.mjs
+node scripts/sync-openclaw-skills.mjs --check
+```
+
+The sync follows symlinked OpenClaw skills and copies real files into `skills/<skill-name>/`. Existing richer Coven-native skills can be represented without overwrite; `opencoven-design` is currently preserved this way while still counted in the 100% OpenClaw coverage manifest.
+
 ## Adding a new Coven skill
 
 1. Create `coven/skills/<skill-name>/SKILL.md` + implementation files

@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# cv-wt-protocol pre-push hook
+# Blocks pushes to protected branches without explicit user consent.
+#
+# Rules enforced:
+#   1. Never `git push` to $COVEN_PRIMARY_BRANCH (default: main) or
+#      any branch matching $COVEN_PROTECTED_REGEX (default: ^(release|hotfix)/)
+#      unless .git/MERGE_INTENT exists AND contains the canonical phrase.
+#   2. Force-push to a protected branch is always refused.
+#
+# After our checks pass, chains to `pre-push.local` if present (the
+# repo's pre-existing pre-push hook, preserved during install).
+
+set -euo pipefail
+
+primary=${COVEN_PRIMARY_BRANCH:-main}
+protected_re=${COVEN_PROTECTED_REGEX:-'^(release|hotfix)/'}
+phrase=${COVEN_MERGE_PHRASE:-'Enchant merge to main.'}
+git_common=$(git rev-parse --git-common-dir)
+intent_file="$git_common/MERGE_INTENT"
+
+red()    { printf '\033[31m%s\033[0m\n' "$*" >&2; }
+yellow() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
+
+# Cache stdin (git feeds it once, can't reread).
+stdin_cache=$(mktemp)
+trap 'rm -f "$stdin_cache"' EXIT
+cat > "$stdin_cache"
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ -z "$remote_ref" ] && continue
+  remote_branch=${remote_ref#refs/heads/}
+
+  protected=0
+  if [ "$remote_branch" = "$primary" ]; then protected=1; fi
+  if echo "$remote_branch" | grep -Eq "$protected_re"; then protected=1; fi
+  [ "$protected" -eq 0 ] && continue
+
+  # Force-push detection.
+  if [ "$remote_sha" != "0000000000000000000000000000000000000000" ]; then
+    if ! git merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
+      red "✗ pre-push (cv-wt-protocol): force-push to protected branch '$remote_branch' refused."
+      red "  Force-pushing protected branches destroys other agents' work."
+      exit 1
+    fi
+  fi
+
+  # Require user-typed merge intent.
+  if [ ! -f "$intent_file" ]; then
+    red "✗ pre-push (cv-wt-protocol): push to protected branch '$remote_branch' requires explicit merge intent."
+    red "  Have the user type the canonical phrase, then write it to:"
+    red "    $intent_file"
+    red "  Phrase (configurable via \$COVEN_MERGE_PHRASE):"
+    red "    $phrase"
+    exit 1
+  fi
+  if ! grep -Fxq "$phrase" "$intent_file"; then
+    red "✗ pre-push (cv-wt-protocol): $intent_file present but does not contain the canonical phrase."
+    red "  Required (exact match, single line):"
+    red "    $phrase"
+    exit 1
+  fi
+  yellow "⚠ pre-push (cv-wt-protocol): merge intent confirmed for '$remote_branch'. Consuming intent file."
+  rm -f "$intent_file"
+done < "$stdin_cache"
+
+# Chain to repo-specific pre-push if present.
+self_path="$0"
+self_dir=$(cd "$(dirname "$self_path")" && pwd)
+local_hook="$self_dir/pre-push.local"
+if [ -x "$local_hook" ]; then
+  exec "$local_hook" "$@" < "$stdin_cache"
+fi
+
+exit 0
