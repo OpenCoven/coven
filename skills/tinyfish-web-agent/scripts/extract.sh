@@ -36,6 +36,10 @@ while [ $# -gt 0 ]; do
       shift
       ;;
     --proxy)
+      if [ $# -lt 2 ]; then
+        echo "Error: --proxy requires a COUNTRY code" >&2
+        exit 1
+      fi
       PROXY_COUNTRY="$2"
       shift 2
       ;;
