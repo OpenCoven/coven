@@ -9,8 +9,8 @@ fi
 SKILL_DIR="$1"
 SKILL_NAME="$(basename "$SKILL_DIR")"
 REPORT_DIR="${2:-$(dirname "$SKILL_DIR")/.scan-reports/$SKILL_NAME}"
-SDK_CLI="/Users/buns/Documents/GitHub/BunsDev/codeql-sdk/dist/cli.js"
-PACKAGER="$HOME/.nvm/versions/node/v24.13.0/lib/node_modules/openclaw/skills/skill-creator/scripts/package_skill.py"
+SDK_CLI="${CODEQL_SDK_CLI:-/Users/buns/Documents/GitHub/BunsDev/codeql-sdk/dist/cli.js}"
+PACKAGER="${OPENCLAW_SKILL_PACKAGER:-$HOME/.nvm/versions/node/v24.13.0/lib/node_modules/openclaw/skills/skill-creator/scripts/package_skill.py}"
 DIST_DIR="${REPORT_DIR}/dist"
 
 if [[ ! -f "$SKILL_DIR/SKILL.md" ]]; then
