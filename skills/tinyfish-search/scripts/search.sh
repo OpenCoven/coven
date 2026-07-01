@@ -28,12 +28,19 @@ LOCATION=""
 LANGUAGE=""
 
 while [ $# -gt 0 ]; do
-  case "$1" in
     --location)
+      if [ $# -lt 2 ]; then
+        echo "Error: --location requires a country code (CC)" >&2
+        exit 1
+      fi
       LOCATION="$2"
       shift 2
       ;;
     --language)
+      if [ $# -lt 2 ]; then
+        echo "Error: --language requires a language code (LL)" >&2
+        exit 1
+      fi
       LANGUAGE="$2"
       shift 2
       ;;
