@@ -36,6 +36,10 @@ pub struct System {
     /// exactly as requested on `coven run --model` (namespaced form preserved,
     /// e.g. `anthropic/claude-…`); `None` when no `--model` was passed.
     pub model: Option<String>,
+    /// The sandbox/permission policy the session was launched with, echoed back
+    /// so clients (Cave) can confirm the Access chip was enforced. Canonical
+    /// form (`full` / `read-only`); `None` when no `--permission` was passed.
+    pub permission: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -180,6 +184,7 @@ mod tests {
             tools: vec!["bash".into(), "read_file".into()],
             agent_mode: Some("plan".into()),
             model: Some("anthropic/claude-sonnet-4".into()),
+            permission: Some("read-only".into()),
         });
         let mut buf = Vec::new();
         emit_event(&mut buf, &event).unwrap();
@@ -191,6 +196,7 @@ mod tests {
         assert_eq!(v["tools"][0], "bash");
         assert_eq!(v["agent_mode"], "plan");
         assert_eq!(v["model"], "anthropic/claude-sonnet-4");
+        assert_eq!(v["permission"], "read-only");
     }
 
     #[test]
@@ -292,6 +298,7 @@ mod tests {
                 tools: vec![],
                 agent_mode: None,
                 model: None,
+                permission: None,
             }),
         )
         .unwrap();

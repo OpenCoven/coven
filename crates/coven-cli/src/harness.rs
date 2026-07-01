@@ -75,11 +75,50 @@ impl HarnessSpeed {
     }
 }
 
+/// Sandbox/permission policy requested for a harness run. Maps to each
+/// harness's native sandbox flag (codex `--sandbox`, claude `--permission-mode`)
+/// so the composer's Access chip is actually enforced rather than advisory.
+/// `Full` preserves today's behavior (no restriction); `ReadOnly` locks the
+/// harness out of writes/network per its native read-only mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Permission {
+    Full,
+    ReadOnly,
+}
+
+impl Permission {
+    /// Parse a CLI value. Accepts `"full"` / `"read-only"` (trimmed,
+    /// case-insensitive); bails on anything else.
+    pub fn parse(s: &str) -> Result<Permission> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "full" => Ok(Permission::Full),
+            "read-only" => Ok(Permission::ReadOnly),
+            other => {
+                anyhow::bail!("invalid permission `{other}`; expected one of: full, read-only")
+            }
+        }
+    }
+
+    /// Canonical string form, echoed back in the stream-json `system.init`
+    /// `permission` field so clients (Cave) can confirm acceptance.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Permission::Full => "full",
+            Permission::ReadOnly => "read-only",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HarnessLaunchOptions<'a> {
     pub model: Option<&'a str>,
     pub think: bool,
     pub speed: Option<HarnessSpeed>,
+    /// Sandbox/permission policy. `None` leaves the harness at its default
+    /// (equivalent to `Full`); `Some(_)` forwards the harness's native
+    /// sandbox flag when the spec declares one. `Option<Permission>` stays
+    /// `Copy` because `Permission` is `Copy`.
+    pub permission: Option<Permission>,
 }
 
 impl<'a> HarnessLaunchOptions<'a> {
@@ -142,6 +181,16 @@ pub fn harness_supports_speed(harness_id: &str) -> bool {
     harness_id == "claude"
 }
 
+/// How a harness translates a `Permission` into its native sandbox flag.
+/// `flag` is the CLI flag name (e.g. `--sandbox`); `full`/`read_only` are the
+/// values passed for each policy. Mirrors the `model_flag` design.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxMapping {
+    pub flag: String,
+    pub full: String,
+    pub read_only: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessCommandSpec {
     pub id: String,
@@ -167,6 +216,11 @@ pub struct HarnessCommandSpec {
     /// substituted in each token (no shell quoting). Takes precedence over
     /// `model_flag` when both are set.
     pub model_arg_template: Option<String>,
+    /// How this harness enforces a sandbox/permission policy. `Some(_)` maps
+    /// `coven run --permission <full|read-only>` to `[flag, value]`; `None`
+    /// means the harness declares no sandbox mechanism, so `--permission` is a
+    /// warned no-op for it (mirrors `model_flag`).
+    pub sandbox: Option<SandboxMapping>,
 }
 
 impl HarnessCommandSpec {
@@ -188,6 +242,29 @@ impl HarnessCommandSpec {
             return vec![flag.to_string(), normalized.to_string()];
         }
         Vec::new()
+    }
+
+    /// Whether this harness declares any way to enforce a sandbox/permission
+    /// policy. Adapters that declare none make `coven run --permission` a
+    /// warned no-op.
+    pub fn supports_permission(&self) -> bool {
+        self.sandbox.is_some()
+    }
+
+    /// Translate a requested permission policy into argv tokens for this
+    /// harness. Returns an empty vec when the harness declares no sandbox
+    /// mechanism (caller decides whether to warn).
+    pub fn sandbox_args(&self, permission: Permission) -> Vec<String> {
+        match &self.sandbox {
+            Some(mapping) => vec![
+                mapping.flag.clone(),
+                match permission {
+                    Permission::Full => mapping.full.clone(),
+                    Permission::ReadOnly => mapping.read_only.clone(),
+                },
+            ],
+            None => Vec::new(),
+        }
     }
 }
 
@@ -310,6 +387,13 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
             // for adapters that prefer it.)
             model_flag: Some("--model".to_string()),
             model_arg_template: None,
+            // `codex exec --sandbox <mode>`: full → danger-full-access,
+            // read-only → read-only. Verified against the installed codex CLI.
+            sandbox: Some(SandboxMapping {
+                flag: "--sandbox".to_string(),
+                full: "danger-full-access".to_string(),
+                read_only: "read-only".to_string(),
+            }),
         },
         HarnessCommandSpec {
             id: "claude".to_string(),
@@ -324,6 +408,13 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
             // `claude --model <model>` accepts an alias or full model id.
             model_flag: Some("--model".to_string()),
             model_arg_template: None,
+            // `claude --permission-mode <mode>`: full → bypassPermissions,
+            // read-only → plan. Verified against the installed claude CLI.
+            sandbox: Some(SandboxMapping {
+                flag: "--permission-mode".to_string(),
+                full: "bypassPermissions".to_string(),
+                read_only: "plan".to_string(),
+            }),
         },
     ]
 }
@@ -641,6 +732,9 @@ impl ExternalHarnessAdapterSpec {
                 .model_arg_template
                 .map(|tmpl| tmpl.trim().to_string())
                 .filter(|tmpl| !tmpl.is_empty()),
+            // External adapters declare no sandbox mechanism today, so
+            // `coven run --permission` warns and continues for them.
+            sandbox: None,
         })
     }
 }
@@ -744,6 +838,14 @@ pub fn command_parts_for_harness_with_conversation(
         Some(m) if !m.is_empty() => spec.model_args(m),
         _ => Vec::new(),
     };
+    // Sandbox/permission policy forwards to the harness's native flag ahead of
+    // the prompt positional, mirroring model selection. Harnesses that declare
+    // no sandbox mechanism yield no args (the run layer warns); `None` leaves
+    // the harness at its default (equivalent to `Full`).
+    let sandbox_args: Vec<String> = match options.permission {
+        Some(p) => spec.sandbox_args(p),
+        None => Vec::new(),
+    };
     let launch_option_args = launch_option_args(harness_id, options);
 
     // Resolve effective prompt: inject familiar identity preamble when present.
@@ -773,6 +875,7 @@ pub fn command_parts_for_harness_with_conversation(
                     harness_id,
                     sanitize_argv_for_platform(prepend_launch_args(
                         &model_args,
+                        &sandbox_args,
                         &launch_option_args,
                         args,
                     )),
@@ -786,6 +889,7 @@ pub fn command_parts_for_harness_with_conversation(
                 harness_id,
                 sanitize_argv_for_platform(prepend_launch_args(
                     &model_args,
+                    &sandbox_args,
                     &launch_option_args,
                     spec.prompt_args(&effective_prompt, HarnessLaunchMode::NonInteractive),
                 )),
@@ -802,6 +906,7 @@ pub fn command_parts_for_harness_with_conversation(
             }
             let args = sanitize_argv_for_platform(prepend_launch_args(
                 &model_args,
+                &sandbox_args,
                 &launch_option_args,
                 args.into_iter()
                     .chain(std::iter::once(effective_prompt))
@@ -822,7 +927,12 @@ pub fn command_parts_for_harness_with_conversation(
         program,
         with_claude_permission_flags(
             harness_id,
-            sanitize_argv_for_platform(prepend_launch_args(&model_args, &launch_option_args, args)),
+            sanitize_argv_for_platform(prepend_launch_args(
+                &model_args,
+                &sandbox_args,
+                &launch_option_args,
+                args,
+            )),
         ),
     ))
 }
@@ -842,14 +952,17 @@ fn launch_option_args(harness_id: &str, options: HarnessLaunchOptions<'_>) -> Ve
 /// how Cave emits run flags.
 fn prepend_launch_args(
     model_args: &[String],
+    sandbox_args: &[String],
     option_args: &[String],
     args: Vec<String>,
 ) -> Vec<String> {
-    if model_args.is_empty() && option_args.is_empty() {
+    if model_args.is_empty() && sandbox_args.is_empty() && option_args.is_empty() {
         return args;
     }
-    let mut out = Vec::with_capacity(model_args.len() + option_args.len() + args.len());
+    let mut out =
+        Vec::with_capacity(model_args.len() + sandbox_args.len() + option_args.len() + args.len());
     out.extend_from_slice(model_args);
+    out.extend_from_slice(sandbox_args);
     out.extend_from_slice(option_args);
     out.extend(args);
     out
@@ -1324,6 +1437,7 @@ mod tests {
             system_prompt_flag: None,
             model_flag: None,
             model_arg_template: None,
+            sandbox: None,
         };
 
         assert_eq!(
@@ -2063,6 +2177,150 @@ mod tests {
             command_parts_for_harness("codex", "fix tests", HarnessLaunchMode::NonInteractive)?;
         assert_eq!(with_model, legacy);
         assert_eq!(blank_model, legacy, "a blank model is a no-op");
+        Ok(())
+    }
+
+    #[test]
+    fn permission_parse_round_trips_and_rejects_unknown() {
+        assert_eq!(Permission::parse("full").unwrap(), Permission::Full);
+        assert_eq!(
+            Permission::parse("read-only").unwrap(),
+            Permission::ReadOnly
+        );
+        // Trimmed + case-insensitive.
+        assert_eq!(Permission::parse("  Full ").unwrap(), Permission::Full);
+        assert_eq!(
+            Permission::parse("READ-ONLY").unwrap(),
+            Permission::ReadOnly
+        );
+        assert_eq!(Permission::Full.as_str(), "full");
+        assert_eq!(Permission::ReadOnly.as_str(), "read-only");
+        assert_eq!(
+            Permission::parse(Permission::Full.as_str()).unwrap(),
+            Permission::Full
+        );
+        let err = Permission::parse("write").unwrap_err().to_string();
+        assert!(err.contains("invalid permission"), "{err}");
+        assert!(err.contains("full, read-only"), "{err}");
+    }
+
+    #[test]
+    fn built_in_harnesses_map_permission_to_native_sandbox_flag() {
+        let codex = built_in_harness_specs()
+            .into_iter()
+            .find(|s| s.id == "codex")
+            .unwrap();
+        assert!(codex.supports_permission());
+        assert_eq!(
+            codex.sandbox_args(Permission::Full),
+            vec!["--sandbox".to_string(), "danger-full-access".to_string()]
+        );
+        assert_eq!(
+            codex.sandbox_args(Permission::ReadOnly),
+            vec!["--sandbox".to_string(), "read-only".to_string()]
+        );
+
+        let claude = built_in_harness_specs()
+            .into_iter()
+            .find(|s| s.id == "claude")
+            .unwrap();
+        assert!(claude.supports_permission());
+        assert_eq!(
+            claude.sandbox_args(Permission::Full),
+            vec![
+                "--permission-mode".to_string(),
+                "bypassPermissions".to_string()
+            ]
+        );
+        assert_eq!(
+            claude.sandbox_args(Permission::ReadOnly),
+            vec!["--permission-mode".to_string(), "plan".to_string()]
+        );
+    }
+
+    #[test]
+    fn spec_without_sandbox_mechanism_is_a_permission_noop() {
+        let spec = HarnessCommandSpec {
+            id: "future".to_string(),
+            label: "Future Harness".to_string(),
+            executable: "future".to_string(),
+            interactive_prompt_prefix_args: Vec::new(),
+            non_interactive_prompt_prefix_args: vec!["run".to_string()],
+            install_hint: "Install the future harness.".to_string(),
+            source: "manifest".to_string(),
+            manifest_path: None,
+            system_prompt_flag: None,
+            model_flag: None,
+            model_arg_template: None,
+            sandbox: None,
+        };
+        assert!(!spec.supports_permission());
+        assert!(spec.sandbox_args(Permission::Full).is_empty());
+        assert!(spec.sandbox_args(Permission::ReadOnly).is_empty());
+    }
+
+    #[test]
+    fn codex_forwards_permission_before_prompt() -> anyhow::Result<()> {
+        let (_, args) = command_parts_for_harness_with_conversation(
+            "codex",
+            "fix tests",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            None,
+            HarnessLaunchOptions {
+                permission: Some(Permission::ReadOnly),
+                ..Default::default()
+            },
+        )?;
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--sandbox".to_string(), "read-only".to_string()]),
+            "expected --sandbox read-only in {args:?}"
+        );
+        let sandbox_pos = args.iter().position(|a| a == "--sandbox").unwrap();
+        let prompt_pos = args.iter().position(|a| a == "fix tests").unwrap();
+        assert!(sandbox_pos < prompt_pos, "{args:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn claude_forwards_permission_full_maps_to_bypass() -> anyhow::Result<()> {
+        let (_, args) = command_parts_for_harness_with_conversation(
+            "claude",
+            "hi",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            None,
+            HarnessLaunchOptions {
+                permission: Some(Permission::Full),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(
+            args,
+            vec![
+                "--permission-mode".to_string(),
+                "bypassPermissions".to_string(),
+                "--print".to_string(),
+                "hi".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn no_permission_leaves_args_unchanged() -> anyhow::Result<()> {
+        let with_opt = command_parts_for_harness_with_conversation(
+            "codex",
+            "fix tests",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            None,
+            HarnessLaunchOptions::default(),
+        )?;
+        let legacy =
+            command_parts_for_harness("codex", "fix tests", HarnessLaunchMode::NonInteractive)?;
+        assert_eq!(with_opt, legacy, "no permission is a no-op");
         Ok(())
     }
 

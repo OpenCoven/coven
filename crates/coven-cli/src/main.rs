@@ -147,6 +147,13 @@ enum Command {
         speed: Option<String>,
         #[arg(
             long,
+            value_name = "MODE",
+            value_parser = ["full", "read-only"],
+            help = "Sandbox/permission policy for the harness: full (default) or read-only. Maps to each harness's native flag (codex --sandbox, claude --permission-mode). Harnesses with no sandbox mechanism warn and continue."
+        )]
+        permission: Option<String>,
+        #[arg(
+            long,
             help = "Emit JSONL events on stdout (system.init / user / assistant / tool_result / result)"
         )]
         stream_json: bool,
@@ -393,6 +400,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             model,
             think,
             speed,
+            permission,
             stream_json,
             stream_json_input,
         }) => run_session(
@@ -409,6 +417,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             model.as_deref(),
             think,
             speed.as_deref(),
+            permission.as_deref(),
             stream_json,
             stream_json_input,
         ),
@@ -1382,6 +1391,7 @@ fn run_session(
     model: Option<&str>,
     think: bool,
     speed: Option<&str>,
+    permission: Option<&str>,
     stream_json: bool,
     stream_json_input: bool,
 ) -> Result<()> {
@@ -1438,6 +1448,12 @@ fn run_session(
     // value is ignored.
     let requested_model: Option<&str> = model.map(str::trim).filter(|m| !m.is_empty());
     let requested_speed = speed.map(harness::HarnessSpeed::parse).transpose()?;
+    // Resolve the requested sandbox/permission policy. It forwards to the
+    // harness's native flag (codex `--sandbox`, claude `--permission-mode`) so
+    // the composer's Access chip is enforced. Harnesses that declare no sandbox
+    // mechanism warn (don't error) so a selection degrades gracefully. Absent
+    // (`None`) leaves the harness at its default (equivalent to `full`).
+    let requested_permission = permission.map(harness::Permission::parse).transpose()?;
     if let (Some(requested), Some(s)) = (requested_model, spec.as_ref()) {
         if !s.supports_model() {
             eprintln!(
@@ -1466,10 +1482,21 @@ fn run_session(
             );
         }
     }
+    if let (Some(requested), Some(s)) = (requested_permission, spec.as_ref()) {
+        if !s.supports_permission() {
+            eprintln!(
+                "warning: harness `{}` declares no sandbox mechanism; --permission {} is ignored \
+                 (declare a sandbox mapping in the adapter to enable it)",
+                s.id,
+                requested.as_str()
+            );
+        }
+    }
     let launch_options = harness::HarnessLaunchOptions {
         model: requested_model,
         think,
         speed: requested_speed,
+        permission: requested_permission,
     };
 
     let effective_prompt = match (&familiar_ctx, spec.as_ref()) {
@@ -1560,6 +1587,7 @@ fn run_session(
             tools: Vec::new(),
             agent_mode: None,
             model: requested_model.map(str::to_string),
+            permission: requested_permission.map(|p| p.as_str().to_string()),
         }))?;
     }
 
