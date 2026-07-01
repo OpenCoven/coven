@@ -29,8 +29,8 @@ echo ""
 echo "--- Config Field Scan ---"
 
 # Use python3 to safely inspect JSON without exposing values
-python3 -c "
-import json, sys, re
+if ! python3 - "$CONFIG" 2>/dev/null <<'PY'
+import json, sys
 
 def scan(obj, path=''):
     if isinstance(obj, dict):
@@ -50,7 +50,10 @@ def scan(obj, path=''):
 with open(sys.argv[1]) as f:
     config = json.load(f)
     scan(config)
-" "$CONFIG" 2>/dev/null || echo "SKIP: Could not parse config as JSON"
+PY
+then
+  echo "SKIP: Could not parse config as JSON"
+fi
 
 # Check identity directory permissions
 echo ""

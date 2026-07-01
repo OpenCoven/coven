@@ -26,9 +26,11 @@ URLS=()
 FORMAT="markdown"
 COUNTRY=""
 
+while [ $# -gt 0 ]; do
+  case "$1" in
     --format)
       if [ $# -lt 2 ]; then
-        echo "Error: --format requires a value (markdown|html|screenshot)" >&2
+        echo "Error: --format requires a value" >&2
         exit 1
       fi
       FORMAT="$2"
@@ -36,7 +38,7 @@ COUNTRY=""
       ;;
     --country)
       if [ $# -lt 2 ]; then
-        echo "Error: --country requires a country code (CC)" >&2
+        echo "Error: --country requires a country code" >&2
         exit 1
       fi
       COUNTRY="$2"

@@ -47,15 +47,19 @@ if ! $NO_OP && command -v op &>/dev/null && [ -f "$ENV_FILE" ]; then
 fi
 
 # Execute
-set +e
 if $USE_OP; then
-  RESPONSE=$(op run --env-file="$ENV_FILE" -- curl -w '\n%{http_code}' "${CURL_ARGS[@]}" 2>&1)
-  CURL_STATUS=$?
+  if RESPONSE=$(op run --env-file="$ENV_FILE" -- curl -w '\n%{http_code}' "${CURL_ARGS[@]}" 2>&1); then
+    CURL_STATUS=0
+  else
+    CURL_STATUS=$?
+  fi
 else
-  RESPONSE=$(curl -w '\n%{http_code}' "${CURL_ARGS[@]}" 2>&1)
-  CURL_STATUS=$?
+  if RESPONSE=$(curl -w '\n%{http_code}' "${CURL_ARGS[@]}" 2>&1); then
+    CURL_STATUS=0
+  else
+    CURL_STATUS=$?
+  fi
 fi
-set -e
 
 # Split response and status code
 HTTP_CODE=$(echo "$RESPONSE" | tail -1)
@@ -77,10 +81,20 @@ for i in "${!CURL_ARGS[@]}"; do
 done
 [ -z "$URL" ] && URL="${CURL_ARGS[-1]}"
 
-echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"method\":\"$METHOD\",\"url\":\"$URL\",\"status\":$HTTP_CODE}" \
+if [[ "$HTTP_CODE" =~ ^[0-9]{3}$ ]]; then
+  LOG_STATUS=$((10#$HTTP_CODE))
+else
+  LOG_STATUS=null
+fi
+
+echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"method\":\"$METHOD\",\"url\":\"$URL\",\"status\":$LOG_STATUS}" \
   >> "$HISTORY_FILE" 2>/dev/null || true
 
 # Exit with appropriate code
-if [ "${CURL_STATUS:-0}" -ne 0 ] 2>/dev/null || [ "$HTTP_CODE" = "000" ] || [ "$HTTP_CODE" -ge 400 ] 2>/dev/null; then
+if [ "$CURL_STATUS" -ne 0 ] || [ "$HTTP_CODE" = "000" ]; then
+  exit 1
+fi
+
+if [ "$HTTP_CODE" -ge 400 ] 2>/dev/null; then
   exit 1
 fi
