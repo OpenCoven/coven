@@ -76,6 +76,7 @@ def collect_inputs(input_path: Path) -> list[Path]:
     if input_path.exists():
         return [input_path]
     die(f"input not found: {input_path}")
+    return []
 
 
 def process_file(path: Path, *, languages: str, fast: bool, force_ocr: bool, max_pages: int | None, min_text_chars: int) -> list[dict[str, Any]]:
