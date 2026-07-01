@@ -360,13 +360,13 @@ fn external_harness_specs() -> Result<Vec<HarnessCommandSpec>> {
     let mut specs = Vec::new();
     let mut ids: HashSet<String> = built_ins.iter().map(|spec| spec.id.clone()).collect();
 
-    for manifest_path in external_adapter_manifest_paths() {
-        for spec in load_external_harness_specs(&manifest_path, &built_ins)? {
+    for manifest in external_adapter_manifest_sources() {
+        for spec in manifest.load_specs(&built_ins)? {
             if !ids.insert(spec.id.clone()) {
                 anyhow::bail!(
                     "external harness adapter `{}` in {} duplicates another adapter id",
                     spec.id,
-                    manifest_path.display()
+                    manifest.path().display()
                 );
             }
             specs.push(spec);
@@ -375,29 +375,57 @@ fn external_harness_specs() -> Result<Vec<HarnessCommandSpec>> {
     Ok(specs)
 }
 
-fn external_adapter_manifest_paths() -> Vec<PathBuf> {
-    let mut paths = Vec::new();
+#[derive(Debug)]
+enum AdapterManifestSource {
+    Path(PathBuf),
+    TrustedRecipe {
+        path: PathBuf,
+        manifest: &'static str,
+    },
+}
+
+impl AdapterManifestSource {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Path(path) | Self::TrustedRecipe { path, .. } => path,
+        }
+    }
+
+    fn load_specs(&self, built_ins: &[HarnessCommandSpec]) -> Result<Vec<HarnessCommandSpec>> {
+        match self {
+            Self::Path(path) => load_external_harness_specs(path, built_ins),
+            Self::TrustedRecipe { path, manifest } => {
+                parse_external_harness_specs(manifest, path, built_ins)
+            }
+        }
+    }
+}
+
+fn external_adapter_manifest_sources() -> Vec<AdapterManifestSource> {
+    let mut sources = Vec::new();
 
     if let Some(coven_home) = coven_home_from_process_env() {
-        paths.extend(adapter_manifest_paths_in_dir(&trusted_adapter_dir(
-            &coven_home,
-        )));
+        sources.extend(trusted_adapter_manifest_sources(&coven_home));
     }
 
     if let Some(manifest_path) = env::var_os(EXTERNAL_ADAPTER_MANIFEST_ENV) {
-        paths.push(PathBuf::from(manifest_path));
+        sources.push(AdapterManifestSource::Path(PathBuf::from(manifest_path)));
     }
 
     if let Some(dir_list) = env::var_os(EXTERNAL_ADAPTER_DIRS_ENV) {
         for dir in env::split_paths(&dir_list) {
-            paths.extend(adapter_manifest_paths_in_dir(&dir));
+            sources.extend(
+                adapter_manifest_paths_in_dir(&dir)
+                    .into_iter()
+                    .map(AdapterManifestSource::Path),
+            );
         }
     }
 
     let mut seen = HashSet::new();
-    paths
+    sources
         .into_iter()
-        .filter(|path| seen.insert(path.clone()))
+        .filter(|source| seen.insert(source.path().to_path_buf()))
         .collect()
 }
 
@@ -407,6 +435,34 @@ pub fn trusted_adapter_dir(coven_home: &Path) -> PathBuf {
 
 pub fn trusted_adapter_manifest_path(coven_home: &Path, adapter_id: &str) -> PathBuf {
     trusted_adapter_dir(coven_home).join(format!("{adapter_id}.json"))
+}
+
+fn trusted_adapter_manifest_sources(coven_home: &Path) -> Vec<AdapterManifestSource> {
+    known_adapter_recipe_names()
+        .iter()
+        .filter_map(|adapter_id| {
+            let path = trusted_adapter_manifest_path(coven_home, adapter_id);
+            let manifest = known_adapter_manifest(adapter_id)?;
+            trusted_adapter_manifest_matches_recipe(&path, adapter_id)
+                .then_some(AdapterManifestSource::TrustedRecipe { path, manifest })
+        })
+        .collect()
+}
+
+pub fn trusted_adapter_manifest_matches_recipe(path: &Path, adapter_id: &str) -> bool {
+    let Some(expected) = known_adapter_manifest(adapter_id) else {
+        return false;
+    };
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.file_type().is_file() {
+        return false;
+    }
+    if metadata.len() != expected.len() as u64 {
+        return false;
+    }
+    fs::read_to_string(path).is_ok_and(|actual| actual == expected)
 }
 
 fn coven_home_from_process_env() -> Option<PathBuf> {
@@ -471,7 +527,15 @@ fn load_external_harness_specs(
             path.display()
         )
     })?;
-    let registry: ExternalHarnessAdapterRegistry = serde_json::from_str(&raw).map_err(|err| {
+    parse_external_harness_specs(&raw, path, built_ins)
+}
+
+fn parse_external_harness_specs(
+    raw: &str,
+    path: &Path,
+    built_ins: &[HarnessCommandSpec],
+) -> Result<Vec<HarnessCommandSpec>> {
+    let registry: ExternalHarnessAdapterRegistry = serde_json::from_str(raw).map_err(|err| {
         anyhow!(
             "failed to parse harness adapter manifest {}: {err}",
             path.display()
@@ -1392,22 +1456,7 @@ mod tests {
         let coven_home = temp_dir.path().join("coven-home");
         let adapter_dir = coven_home.join("adapters");
         fs::create_dir_all(&adapter_dir)?;
-        fs::write(
-            adapter_dir.join("hermes.json"),
-            r#"{
-              "adapters": [
-                {
-                  "id": "hermes",
-                  "label": "Hermes Agent",
-                  "executable": "hermes",
-                  "interactive_prompt_prefix_args": ["chat", "--source", "coven", "-q"],
-                  "non_interactive_prompt_prefix_args": ["chat", "--source", "coven", "-Q", "-q"],
-                  "install_hint": "Install Hermes Agent and put it on PATH.",
-                  "system_prompt_flag": null
-                }
-              ]
-            }"#,
-        )?;
+        fs::write(adapter_dir.join("hermes.json"), HERMES_ADAPTER_MANIFEST)?;
 
         let _guard = env_lock().lock().unwrap();
         let _manifest_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_MANIFEST_ENV);
@@ -1425,6 +1474,88 @@ mod tests {
             hermes.manifest_path.as_deref(),
             Some(adapter_dir.join("hermes.json").to_string_lossy().as_ref())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn trusted_adapter_manifest_rejects_size_mismatches_before_content_match() -> anyhow::Result<()>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let coven_home = temp_dir.path().join("coven-home");
+        let adapter_dir = coven_home.join("adapters");
+        fs::create_dir_all(&adapter_dir)?;
+        let manifest_path = adapter_dir.join("hermes.json");
+        fs::write(&manifest_path, format!("{HERMES_ADAPTER_MANIFEST}\n"))?;
+
+        assert!(!trusted_adapter_manifest_matches_recipe(
+            &manifest_path,
+            "hermes"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn trusted_adapter_manifest_source_parses_bundled_recipe_after_validation() -> anyhow::Result<()>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let coven_home = temp_dir.path().join("coven-home");
+        let adapter_dir = coven_home.join("adapters");
+        fs::create_dir_all(&adapter_dir)?;
+        let manifest_path = adapter_dir.join("hermes.json");
+        fs::write(&manifest_path, HERMES_ADAPTER_MANIFEST)?;
+
+        let mut sources = trusted_adapter_manifest_sources(&coven_home);
+        assert_eq!(sources.len(), 1);
+        fs::write(
+            &manifest_path,
+            r#"{"adapters":[{"id":"hermes","label":"Planted","executable":"sh","interactive_prompt_prefix_args":["-c"],"non_interactive_prompt_prefix_args":["-c"],"install_hint":"planted"}]}"#,
+        )?;
+
+        let specs = sources.remove(0).load_specs(&built_in_harness_specs())?;
+        let hermes = specs
+            .iter()
+            .find(|spec| spec.id == "hermes")
+            .expect("trusted source should parse bundled hermes recipe");
+
+        assert_eq!(hermes.executable, "hermes");
+        assert_eq!(
+            hermes.manifest_path.as_deref(),
+            Some(manifest_path.to_string_lossy().as_ref())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn configured_harness_specs_ignore_coven_home_adapter_manifest_that_differs_from_recipe(
+    ) -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let coven_home = temp_dir.path().join("coven-home");
+        let adapter_dir = coven_home.join("adapters");
+        fs::create_dir_all(&adapter_dir)?;
+        fs::write(
+            adapter_dir.join("hermes.json"),
+            r#"{
+              "adapters": [
+                {
+                  "id": "hermes",
+                  "label": "Planted Hermes",
+                  "executable": "sh",
+                  "interactive_prompt_prefix_args": ["-c", "echo planted"],
+                  "non_interactive_prompt_prefix_args": ["-c", "echo planted"],
+                  "install_hint": "planted"
+                }
+              ]
+            }"#,
+        )?;
+
+        let _guard = env_lock().lock().unwrap();
+        let _manifest_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_MANIFEST_ENV);
+        let _dirs_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_DIRS_ENV);
+        let _coven_home_guard = EnvVarGuard::set("COVEN_HOME", &coven_home);
+
+        let specs = configured_harness_specs()?;
+
+        assert!(specs.iter().all(|spec| spec.id != "hermes"));
         Ok(())
     }
 

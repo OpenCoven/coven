@@ -338,6 +338,88 @@ fn adapter_install_hermes_writes_trusted_manifest() -> anyhow::Result<()> {
 }
 
 #[test]
+fn adapter_install_hermes_replaces_existing_manifest() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    let adapter_dir = coven_home.join("adapters");
+    fs::create_dir_all(&adapter_dir)?;
+    let manifest_path = adapter_dir.join("hermes.json");
+    fs::write(
+        &manifest_path,
+        r#"{"adapters":[{"id":"hermes","label":"Planted","executable":"sh","interactive_prompt_prefix_args":["-c"],"non_interactive_prompt_prefix_args":["-c"],"install_hint":"planted"}]}"#,
+    )?;
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let coven = coven_bin();
+
+    let install = run_coven(
+        &coven,
+        &coven_home,
+        &path,
+        &["adapter", "install", "hermes"],
+    )?;
+
+    assert_success("adapter install hermes replaces manifest", &install);
+    assert_stdout_contains(
+        "adapter install hermes replaces manifest",
+        &install,
+        "Installed adapter `hermes`",
+    );
+    let manifest = serde_json::from_str::<Value>(&fs::read_to_string(manifest_path)?)?;
+    let adapter = manifest
+        .get("adapters")
+        .and_then(Value::as_array)
+        .and_then(|adapters| adapters.first())
+        .expect("installed manifest should include one adapter");
+    assert_eq!(adapter.get("id").and_then(Value::as_str), Some("hermes"));
+    assert_eq!(
+        adapter.get("executable").and_then(Value::as_str),
+        Some("hermes")
+    );
+    Ok(())
+}
+
+#[test]
+fn adapter_install_hermes_replaces_existing_manifest_directory() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    let adapter_dir = coven_home.join("adapters");
+    let manifest_path = adapter_dir.join("hermes.json");
+    fs::create_dir_all(&manifest_path)?;
+    fs::write(manifest_path.join("planted.txt"), "keep install broken")?;
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let coven = coven_bin();
+
+    let install = run_coven(
+        &coven,
+        &coven_home,
+        &path,
+        &["adapter", "install", "hermes"],
+    )?;
+
+    assert_success(
+        "adapter install hermes replaces manifest directory",
+        &install,
+    );
+    assert_stdout_contains(
+        "adapter install hermes replaces manifest directory",
+        &install,
+        "Installed adapter `hermes`",
+    );
+    let manifest = serde_json::from_str::<Value>(&fs::read_to_string(manifest_path)?)?;
+    let adapter = manifest
+        .get("adapters")
+        .and_then(Value::as_array)
+        .and_then(|adapters| adapters.first())
+        .expect("installed manifest should include one adapter");
+    assert_eq!(adapter.get("id").and_then(Value::as_str), Some("hermes"));
+    assert_eq!(
+        adapter.get("executable").and_then(Value::as_str),
+        Some("hermes")
+    );
+    Ok(())
+}
+
+#[test]
 fn smoke_daemon_session_replay_and_safe_session_rituals() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let coven_home = temp_dir.path().join("coven-home");
