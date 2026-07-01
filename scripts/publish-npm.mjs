@@ -89,7 +89,7 @@ function main() {
 
 function publishPackage(packageName, version, dryRun, cwd) {
   if (!dryRun && packageVersionPublished(packageName, version)) {
-    fail(`${packageName}@${version} is already published to npm. Refusing to publish wrappers that could trust an unverified pre-existing artifact.`);
+    fail(`${packageName}@${version} is already published to npm. Refusing to publish because this package version already exists on npm and could trust an unverified pre-existing artifact.`);
   }
   run('npm', publishArgs(dryRun), {
     cwd,

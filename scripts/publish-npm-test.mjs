@@ -345,7 +345,8 @@ test('publish-npm.mjs fails closed when a package version already exists', () =>
   const script = readFileSync(scriptPath, 'utf8');
 
   assert.match(script, /function publishPackage\(/);
-  assert.match(script, /Refusing to publish wrappers that could trust an unverified pre-existing artifact/);
+  assert.match(script, /Refusing to publish because this package version already exists on npm/);
+  assert.doesNotMatch(script, /Refusing to publish wrappers/);
   assert.match(script, /publishPackage\(target\.packageName/);
   assert.match(script, /publishPackage\(packageName/);
   assert.doesNotMatch(script, /Skipping \$\{packageName\}@\$\{version\}: already published/);
