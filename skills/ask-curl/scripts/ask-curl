@@ -81,6 +81,6 @@ echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"method\":\"$METHOD\",\"url\":
   >> "$HISTORY_FILE" 2>/dev/null || true
 
 # Exit with appropriate code
-if [ "$HTTP_CODE" -ge 400 ] 2>/dev/null; then
+if [ "${CURL_STATUS:-0}" -ne 0 ] 2>/dev/null || [ "$HTTP_CODE" = "000" ] || [ "$HTTP_CODE" -ge 400 ] 2>/dev/null; then
   exit 1
 fi
