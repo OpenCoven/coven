@@ -800,7 +800,8 @@ fn prepend_launch_args(
 /// invoked through `cmd.exe`. cmd.exe interprets metacharacters like
 /// `& | < > ^ % ! "` in arguments even inside double-quoted strings in some
 /// invocation paths. Neutralize them by caret-escaping the dangerous
-/// characters and leave argument-boundary quoting to `std::process::Command`.
+/// characters and wrapping affected arguments in quotes so `.cmd` shims that
+/// re-expand `%*` keep the value as data during a second `cmd.exe` parse.
 ///
 /// On non-Windows platforms this is a no-op: the OS exec model passes
 /// argv entries as null-terminated byte arrays without shell parsing.
@@ -826,13 +827,15 @@ fn escape_cmd_shim_metacharacters(arg: &str) -> String {
         return arg.to_string();
     }
 
-    let mut escaped = String::with_capacity(arg.len() * 2);
+    let mut escaped = String::with_capacity((arg.len() * 2) + 2);
+    escaped.push('"');
     for ch in arg.chars() {
         if CMD_METACHARACTERS.contains(&ch) {
             escaped.push('^');
         }
         escaped.push(ch);
     }
+    escaped.push('"');
     escaped
 }
 
@@ -1157,14 +1160,14 @@ mod tests {
     }
 
     #[test]
-    fn cmd_shim_metacharacters_are_caret_escaped_without_wrapping() {
+    fn cmd_shim_metacharacters_are_caret_escaped_and_wrapped() {
         assert_eq!(escape_cmd_shim_metacharacters("safe prompt"), "safe prompt");
 
         let escaped = escape_cmd_shim_metacharacters(r#"a&b|c<d>e^f%g!h"i"#);
 
-        assert_eq!(escaped, r#"a^&b^|c^<d^>e^^f^%g^!h^"i"#);
-        assert!(!escaped.starts_with('"'));
-        assert!(!escaped.ends_with('"'));
+        assert_eq!(escaped, r#""a^&b^|c^<d^>e^^f^%g^!h^"i""#);
+        assert!(escaped.starts_with('"'));
+        assert!(escaped.ends_with('"'));
     }
 
     #[test]
