@@ -137,6 +137,21 @@ class SecretGuardLockfileTests(unittest.TestCase):
 
         self.assertEqual(hits, [])
 
+    def test_opencoven_repo_relative_paths_do_not_trigger_high_entropy(self) -> None:
+        text = (
+            "Consume `OpenCoven/coven/skills/familiar-board-stewardship/` by symlink.\n"
+            "Canonical source: OpenCoven/coven/docs/familiars/board-stewardship.md"
+        )
+
+        hits = check_secrets.scan_text(text, "docs/familiars/board-stewardship.md")
+
+        self.assertEqual(hits, [])
+
+    def test_repo_relative_path_heuristic_still_rejects_other_mixed_case_tokens(self) -> None:
+        token = "OpenCoven/covenLikeFakePayloadMixedCase1234567890"
+
+        self.assertFalse(check_secrets.is_opencoven_repo_relative_path_token(token))
+
     def test_github_advisory_links_do_not_trigger_high_entropy(self) -> None:
         text = (
             "Resolved advisory "

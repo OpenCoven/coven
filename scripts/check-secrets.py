@@ -106,6 +106,11 @@ def is_public_repo_url_like_token(token: str) -> bool:
     )
 
 
+def is_opencoven_repo_relative_path_token(token: str) -> bool:
+    normalized = token.strip("/")
+    return normalized.startswith("OpenCoven/coven/") and len(normalized.split("/")) >= 4
+
+
 def is_github_advisory_url_like_token(token: str) -> bool:
     normalized = token.strip("/")
     return normalized.startswith("github.com/advisories/GHSA-")
@@ -206,6 +211,7 @@ def scan_text(text: str, path: str) -> list[tuple[str, int, str]]:
             if (
                 is_local_path_like_token(token)
                 or is_public_repo_url_like_token(token)
+                or is_opencoven_repo_relative_path_token(token)
                 or is_github_advisory_url_like_token(token)
                 or is_github_commit_url_like_token(token)
                 or is_github_action_sha_ref_token(token)
