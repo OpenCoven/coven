@@ -283,6 +283,39 @@ fn doctor_reports_no_familiars_when_manifest_absent() -> anyhow::Result<()> {
 }
 
 #[test]
+fn doctor_missing_harness_prints_cross_platform_setup_loop() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    fs::create_dir_all(&coven_home)?;
+    let coven = coven_bin();
+    let empty_path = OsString::new();
+
+    let output = run_coven(&coven, &coven_home, &empty_path, &["doctor"])?;
+
+    assert_success("doctor without harnesses", &output);
+    assert_stdout_contains("doctor without harnesses", &output, "Harnesses:");
+    assert_stdout_contains("doctor without harnesses", &output, "`codex` is missing");
+    assert_stdout_contains("doctor without harnesses", &output, "`claude` is missing");
+    assert_stdout_contains(
+        "doctor without harnesses",
+        &output,
+        "Install and authenticate at least one harness in this same shell.",
+    );
+    assert_stdout_contains(
+        "doctor without harnesses",
+        &output,
+        "If PATH changed, open a new terminal and run `coven doctor` again.",
+    );
+    assert_stdout_contains("doctor without harnesses", &output, "coven daemon start");
+    assert_stdout_contains(
+        "doctor without harnesses",
+        &output,
+        "Install docs: docs/install/index.md",
+    );
+    Ok(())
+}
+
+#[test]
 fn doctor_reports_live_daemon_socket_status() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let coven_home = temp_dir.path().join("coven-home");

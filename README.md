@@ -149,7 +149,7 @@ coven doctor
 | Package                    | Platform                                       |
 | -------------------------- | ---------------------------------------------- |
 | `@opencoven/cli`           | Universal wrapper — auto-selects your platform |
-| `@opencoven/cli-macos`     | macOS (arm64 + x64)                            |
+| `@opencoven/cli-macos`     | macOS Apple Silicon                            |
 | `@opencoven/cli-linux-x64` | Linux x64                                      |
 | `@opencoven/cli-windows`   | Windows x64                                    |
 

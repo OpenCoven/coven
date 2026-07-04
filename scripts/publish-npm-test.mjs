@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { defaultTargetName, isOidcContext, packageVersionPublished, publishArgs, publishEnv, releaseVersion, targetPackageName, validatePublishToken, validatePublishVersion, wrapperPackageDirName, wrapperPackageNameList, wrapperTextForPackage } from './publish-npm.mjs';
+import { defaultTargetName, isMainModule, isOidcContext, packageVersionPublished, publishArgs, publishEnv, releaseVersion, targetPackageName, validatePublishToken, validatePublishVersion, wrapperPackageDirName, wrapperPackageNameList, wrapperTextForPackage } from './publish-npm.mjs';
 
 const OIDC_ENV = {
   ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'fake-oidc-token',
@@ -89,6 +90,24 @@ test('wrapper binary maps windows x64 to windows native package and exe binary',
   assert.match(bin, /process\.platform === 'win32' \? 'coven\.exe' : 'coven'/);
 });
 
+test('install docs do not claim macOS x64 support unless the wrapper maps darwin x64', () => {
+  const binPath = new URL(['..', 'npm', 'coven', 'bin', 'coven.js'].join('/'), import.meta.url);
+  const wrapperBin = readFileSync(binPath, 'utf8');
+  const supportsDarwinX64 = wrapperBin.includes("'darwin-x64'");
+  const docText = [
+    ['..', 'README.md'],
+    ['..', 'docs', 'install', 'index.md'],
+    ['..', 'docs', 'install', 'npm.md'],
+    ['..', 'docs', 'install', 'macos.md']
+  ]
+    .map((parts) => readFileSync(new URL(parts.join('/'), import.meta.url), 'utf8'))
+    .join('\n');
+
+  if (!supportsDarwinX64) {
+    assert.doesNotMatch(docText, /macOS (?:arm64 or )?x64|macOS \(arm64 \+ x64\)|Intel Macs/i);
+  }
+});
+
 test('release workflow builds and dry-runs linux x64 package', () => {
   const workflowPath = new URL(
     ['..', '.github', 'workflows', 'release-npm.yml'].join('/'),
@@ -99,6 +118,18 @@ test('release workflow builds and dry-runs linux x64 package', () => {
   assert.match(workflow, /rust-target: x86_64-unknown-linux-gnu/);
   assert.match(workflow, /node scripts\/publish-npm\.mjs --target=linux-x64 --skip-build --dry-run --skip-wrapper/);
   assert.match(workflow, /node scripts\/publish-npm\.mjs --target=linux-x64 --skip-build --publish --skip-wrapper/);
+});
+
+test('release workflow builds macOS package on arm64 runner', () => {
+  const workflowPath = new URL(
+    ['..', '.github', 'workflows', 'release-npm.yml'].join('/'),
+    import.meta.url
+  );
+  const workflow = readFileSync(workflowPath, 'utf8');
+  assert.match(workflow, /npm-target: macos/);
+  assert.match(workflow, /rust-target: aarch64-apple-darwin/);
+  assert.match(workflow, /runner: macos-26/);
+  assert.doesNotMatch(workflow, /runner: macos-latest/);
 });
 
 test('release workflow builds and dry-runs windows package', () => {
@@ -325,6 +356,22 @@ test('prepublish smoke has explicit dry-run version override and registry failur
 
   assert.match(script, /COVEN_NPM_DRY_RUN_VERSION/);
   assert.match(script, /Could not read current \$\{packageName\} version/);
+});
+
+test('publish-npm entrypoint detection works with filesystem paths', () => {
+  const scriptPath = fileURLToPath(new URL('publish-npm.mjs', import.meta.url));
+  assert.equal(isMainModule(scriptPath, pathToFileURL(scriptPath).href), true);
+  assert.equal(isMainModule(scriptPath, import.meta.url), false);
+});
+
+test('publish-npm uses Windows shell resolution for command shims', () => {
+  const scriptPath = new URL('publish-npm.mjs', import.meta.url);
+  const script = readFileSync(scriptPath, 'utf8');
+
+  assert.match(script, /function spawnOptionsForCommand\(/);
+  assert.match(script, /shell:\s*platform === 'win32'/);
+  assert.match(script, /spawnSync\(command,\s*args,\s*\{\s*\.\.\.spawnOptionsForCommand\(\)/);
+  assert.match(script, /spawnSync\('npm',\s*\['view'[\s\S]*?\.\.\.spawnOptionsForCommand\(\)/);
 });
 
 test('packageVersionPublished returns true when npm view exits 0 (version exists on registry)', () => {

@@ -65,6 +65,38 @@ jobs:
       - run: npm test
         working-directory: packages/channels
 
+  npm-onboarding-smoke:
+    name: npm onboarding smoke (${{ matrix.npm-target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-26
+            npm-target: macos
+            rust-target: aarch64-apple-darwin
+          - os: ubuntu-latest
+            npm-target: linux-x64
+            rust-target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            npm-target: windows
+            rust-target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-target }}
+      - name: Install native link dependencies (Linux only)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
+      - run: cargo build --release --target ${{ matrix.rust-target }}
+      - run: node scripts/test-cli-prepublish.mjs --target=${{ matrix.npm-target }} --skip-build --skip-secrets-scan
+        env:
+          COVEN_NPM_DRY_RUN_VERSION: 999.0.0
+
   cargo-deny:
     name: Dependency audit
     runs-on: ubuntu-latest

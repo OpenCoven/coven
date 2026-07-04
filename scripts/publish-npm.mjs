@@ -2,7 +2,7 @@
 import { spawnSync } from 'node:child_process';
 import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
@@ -34,8 +34,12 @@ const targets = {
   }
 };
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isMainModule()) {
   main();
+}
+
+export function isMainModule(argv1 = process.argv[1], moduleUrl = import.meta.url) {
+  return Boolean(argv1) && moduleUrl === pathToFileURL(argv1).href;
 }
 
 function main() {
@@ -110,6 +114,7 @@ export function packageVersionPublished(packageName, version, runner = npmViewRu
 
 function npmViewRunner(packageName, version) {
   return spawnSync('npm', ['view', `${packageName}@${version}`, 'version'], {
+    ...spawnOptionsForCommand(),
     cwd: repoRoot,
     env: process.env,
     stdio: ['ignore', 'ignore', 'ignore']
@@ -263,6 +268,7 @@ function run(command, args, options = {}) {
   const printable = [command, ...args].join(' ');
   console.log(`$ ${printable}`);
   const result = spawnSync(command, args, {
+    ...spawnOptionsForCommand(),
     cwd: options.cwd ?? repoRoot,
     env: options.env ?? process.env,
     stdio: 'inherit'
@@ -290,6 +296,12 @@ export function publishEnv(dryRun, env = process.env) {
   return {
     ...env,
     NODE_AUTH_TOKEN: authToken
+  };
+}
+
+function spawnOptionsForCommand(platform = process.platform) {
+  return {
+    shell: platform === 'win32'
   };
 }
 

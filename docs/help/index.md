@@ -43,9 +43,10 @@ description: "Help index for Coven: troubleshooting, environment and paths, perm
   </Step>
   <Step title="Bundle and ask">
     ```bash
-    coven diagnostics bundle
+    coven doctor > coven-doctor.txt
+    coven daemon status > coven-daemon-status.txt
     ```
-    Attach the resulting tarball to a [GitHub issue](/help/filing-issues) or share it in [Discord](https://discord.gg/opencoven).
+    Redact local paths or prompts, then attach the files to a [GitHub issue](/help/filing-issues) or share them in [Discord](https://discord.gg/opencoven). See [Diagnostics bundle](/help/diagnostics-bundle).
   </Step>
 </Steps>
 

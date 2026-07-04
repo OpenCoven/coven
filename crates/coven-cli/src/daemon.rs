@@ -769,12 +769,7 @@ pub fn start_background_server(
 ) -> Result<DaemonStatus> {
     let spec = background_server_spec(current_exe, coven_home);
     ensure_private_coven_home(coven_home)?;
-    let child = Command::new(&spec.program)
-        .args(&spec.args)
-        .env("COVEN_HOME", &spec.coven_home)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+    let child = background_server_command(&spec)
         .spawn()
         .with_context(|| format!("failed to start Coven daemon {}", spec.program.display()))?;
     let status = DaemonStatus {
@@ -784,6 +779,35 @@ pub fn start_background_server(
     };
     write_status(coven_home, &status)?;
     Ok(status)
+}
+
+fn background_server_command(spec: &DaemonSpawnSpec) -> Command {
+    let mut command = Command::new(&spec.program);
+    command
+        .args(&spec.args)
+        .env("COVEN_HOME", &spec.coven_home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    configure_background_server_command(&mut command);
+    command
+}
+
+#[cfg(windows)]
+fn configure_background_server_command(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+
+    command.creation_flags(windows_daemon_creation_flags());
+}
+
+#[cfg(not(windows))]
+fn configure_background_server_command(_command: &mut Command) {}
+
+#[cfg(windows)]
+fn windows_daemon_creation_flags() -> u32 {
+    use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
+
+    DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
 }
 
 pub fn ensure_background_server(
@@ -3513,6 +3537,17 @@ mod tests {
         assert_eq!(spec.program, PathBuf::from("/usr/local/bin/coven"));
         assert_eq!(spec.args, vec!["daemon".to_string(), "serve".to_string()]);
         assert_eq!(spec.coven_home, PathBuf::from("/tmp/coven-home"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_background_daemon_spawn_is_detached() {
+        use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
+
+        let flags = windows_daemon_creation_flags();
+
+        assert_ne!(flags & DETACHED_PROCESS, 0);
+        assert_ne!(flags & CREATE_NEW_PROCESS_GROUP, 0);
     }
 
     #[cfg(unix)]

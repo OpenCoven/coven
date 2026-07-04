@@ -123,7 +123,7 @@ jobs:
         include:
           - npm-target: macos
             rust-target: aarch64-apple-darwin
-            runner: macos-latest
+            runner: macos-26
             binary: coven
           - npm-target: linux-x64
             rust-target: x86_64-unknown-linux-gnu

@@ -17,6 +17,8 @@ coven doctor
 
 The wrapper exposes the `coven` command and launches the native Windows binary when the release package includes one for your platform. `coven doctor` is the first verification step: it checks local state and reports whether supported harness CLIs such as Codex or Claude Code are available on `PATH`.
 
+Use native Windows and WSL2 as separate Coven environments. If you install Coven in PowerShell, install the harness CLIs in PowerShell too. If you install Coven inside WSL2, follow [WSL2 install](/install/wsl2) and keep the daemon state inside WSL.
+
 ## First run
 
 From a project directory:
@@ -37,6 +39,20 @@ coven sessions
 
 Install and authenticate at least one harness CLI before expecting `coven run` to launch work. If `coven doctor` reports a missing harness, install that tool, open a new terminal so `PATH` is refreshed, and run `coven doctor` again.
 
+Codex:
+
+```powershell
+npm install -g @openai/codex
+codex login
+```
+
+Claude Code:
+
+```powershell
+npm install -g @anthropic-ai/claude-code
+claude doctor
+```
+
 ## Windows notes
 
 - `coven doctor` should work in PowerShell even when the `HOME` environment variable is absent. Coven resolves its default store from `COVEN_HOME`, `HOME`, `USERPROFILE`, `HOMEDRIVE` + `HOMEPATH`, or the platform home directory.
@@ -49,11 +65,24 @@ coven doctor
 ```
 
 - Run Coven and your harness CLI from the same environment. A harness installed only inside WSL2 is not available to native Windows PowerShell unless you expose it separately.
-- If terminal input behaves oddly, update to the latest wrapper and run `coven tui` again. The Windows TUI filters key-press events so typed characters, arrows, and Enter should be handled once.
+- If terminal input behaves oddly, update the wrapper and run `coven tui` again. The Windows TUI filters key-press events so typed characters, arrows, and Enter should be handled once.
+
+## Verification loop
+
+```powershell
+coven --version
+coven doctor
+coven daemon restart
+coven daemon status
+cd C:\path\to\project
+coven run codex "describe this repo"
+coven sessions
+```
 
 ## Related
 
 - [Get started with Coven](/GETTING-STARTED)
+- [Install overview](/install/index)
 - [Coven TUI](/start/coven-tui)
 - [Troubleshooting](/TROUBLESHOOTING)
 - [CLI reference](/reference/cli)
