@@ -21,6 +21,9 @@ description: "Familiars are OpenCoven's product layer above the Coven runtime: p
   <Card title="Roles" href="/familiars/roles" icon="users">
     The roles a familiar can take inside a workflow.
   </Card>
+  <Card title="Board stewardship" href="/familiars/board-stewardship" icon="clipboard-list">
+    How familiar-owned work stays current across runtimes.
+  </Card>
 </Columns>
 
 ## Familiar vs. harness
@@ -73,6 +76,9 @@ The familiar identity outlives any single session. Coven only requires that **ea
   </Card>
   <Card title="Parallel lanes" href="/familiars/parallel-lanes" icon="columns">
     Specialist lanes that work the same task in parallel.
+  </Card>
+  <Card title="Board stewardship" href="/familiars/board-stewardship" icon="clipboard-list">
+    Runtime-portable task state for familiar work.
   </Card>
 </Columns>
 

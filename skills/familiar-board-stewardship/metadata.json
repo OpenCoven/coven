@@ -1,0 +1,8 @@
+{
+  "name": "familiar-board-stewardship",
+  "description": "Runtime-portable standard for familiars to keep Coven board cards current, routed, and evidence-backed.",
+  "version": "0.1.0",
+  "author": "OpenCoven Team",
+  "category": "operations",
+  "tags": ["familiars", "board", "tasks", "handoff", "operations"]
+}

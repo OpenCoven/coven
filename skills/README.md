@@ -14,6 +14,7 @@ Canonical Coven-wide skills live here. Each skill is a directory with a `SKILL.m
 |-------|---------|
 | `coven-board-entry` | Create a new entry on the Coven task board programmatically |
 | `coven-task-manager` | Keep Coven task boards fresh with scheduled stale/blocked/review task hygiene |
+| `familiar-board-stewardship` | Keep familiar-owned Coven board cards current, routed, and evidence-backed |
 | `opencoven-design` | OpenCoven design system and visual language reference |
 | `higgsfield` | Runtime-portable image and video generation via Higgsfield API (curl + jq only) |
 
