@@ -1,0 +1,46 @@
+# PATENTS
+
+## Patent Non-Assertion
+
+OpenCoven is MIT licensed. The maintainers of this project have not filed and do not intend to file patents on the architectural patterns, protocols, or mechanisms described in this repository.
+
+**Architectural concepts originating in this repository include, but are not limited to:**
+
+- The familiar identity model: a named, role-scoped agent persona resolved from a configuration manifest and attached to a session
+- The agent spawn harness: a structured dispatch pattern that validates and routes process execution through a defined set of primitives
+- The multi-agent orchestration substrate: composable, purpose-scoped agents ("familiars") coordinating through structured routing with shared session context
+- The session memory and continuity substrate (OpenTrust): durable, portable agent memory and session state with provenance tracking
+- The graded approval tier model: auto → familiar-review → human-review → human-required escalation for agent actions affecting protected resources
+
+**First publication dates:**
+
+| Concept | First committed | Repository |
+|---|---|---|
+| Familiar identity model | 2026-04-27 | github.com/OpenCoven/coven |
+| Agent spawn harness | 2026-04-27 | github.com/OpenCoven/coven |
+| Multi-agent familiar substrate | 2026-04-27 | github.com/OpenCoven/coven |
+| Graded approval tier model | 2026-06-19 | The Familiar Contract spec |
+
+These dates are verifiable from public GitHub commit history and repository creation records.
+
+## Non-Assertion Pledge
+
+The OpenCoven maintainers pledge not to assert any patent claims — now held or later acquired — against any person or organization that uses, implements, or builds upon the architectural patterns, protocols, or mechanisms described in this repository or its documentation, provided that use is consistent with the MIT License terms.
+
+## For Contributors
+
+By contributing to this repository, contributors agree that:
+
+1. They own the intellectual property they contribute, or have the right to contribute it
+2. They will not assert patent claims against this project or its users arising from their contributions
+3. Their contributions are made under the MIT License
+
+## Notice to Third Parties
+
+The architectural concepts documented in this repository and its commit history constitute prior art as of their respective commit dates. Any patent application filed after these dates that claims these concepts or their direct derivatives without acknowledgment of this prior art is incomplete.
+
+If you are aware of a patent application that may conflict with this prior art, please open an issue or contact the maintainers directly.
+
+---
+
+*This file is not legal advice. For legal questions regarding patents and open source, consult a qualified attorney.*
