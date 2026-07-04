@@ -108,7 +108,19 @@ def is_public_repo_url_like_token(token: str) -> bool:
 
 def is_opencoven_repo_relative_path_token(token: str) -> bool:
     normalized = token.strip("/")
-    return normalized.startswith("OpenCoven/coven/") and len(normalized.split("/")) >= 4
+    if not normalized.startswith("OpenCoven/coven/"):
+        return False
+    # Keep this allowlist tight: only permit path-ish characters (no `+`/`@`) and
+    # reject mixed-case-within-a-segment / extremely long segments that look token-like.
+    if not re.fullmatch(r"OpenCoven/coven/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+){1,}", normalized):
+        return False
+    for part in normalized.split("/")[2:]:
+        if len(part) > 64:
+            return False
+        letters = "".join(ch for ch in part if ch.isalpha())
+        if letters and not (letters.islower() or letters.isupper()):
+            return False
+    return True
 
 
 def is_github_advisory_url_like_token(token: str) -> bool:
