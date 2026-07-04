@@ -121,7 +121,10 @@ Response:
   "generatedAt": "2026-07-04T00:00:00Z",
   "expiresAt": "2026-07-11T00:00:00Z",
   "staleAfter": "2026-07-06T00:00:00Z",
-  "sourceHubId": "hub_01J...",
+  "sourceHub": {
+    "hubId": "hub_01J...",
+    "displayName": "Coven hub"
+  },
   "sourceRevision": {
     "memoryRevision": "mem_01J...",
     "loopRevision": "loop_01J..."
