@@ -108,8 +108,7 @@ Request:
   "familiarId": "sage",
   "workspaceId": "workspace_01J...",
   "expiresInSeconds": 604800,
-  "staleAfterSeconds": 172800,
-  "includeContext": ["memory", "workspace", "policy"]
+  "staleAfterSeconds": 172800
 }
 ```
 
