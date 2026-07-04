@@ -527,9 +527,21 @@ fn generate_travel_profile(coven_home: &Path, body: Option<&str>) -> Result<ApiR
     let profile_dir = coven_home.join("travel").join("profiles");
     std::fs::create_dir_all(&profile_dir)
         .with_context(|| format!("failed to create {}", profile_dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&profile_dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to protect {}", profile_dir.display()))?;
+    }
     let profile_path = profile_dir.join(format!("{profile_id}.json.gz"));
     std::fs::write(&profile_path, &compressed)
         .with_context(|| format!("failed to write {}", profile_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&profile_path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to protect {}", profile_path.display()))?;
+    }
     let mut file_permissions = std::fs::metadata(&profile_path)
         .with_context(|| format!("failed to inspect {}", profile_path.display()))?
         .permissions();
