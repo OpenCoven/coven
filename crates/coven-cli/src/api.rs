@@ -1,9 +1,12 @@
-use std::{borrow::Cow, path::Path};
+use std::{borrow::Cow, io::Write, path::Path};
 
 use anyhow::{Context, Result};
-use chrono::{SecondsFormat, Utc};
+use base64::Engine;
+use chrono::{Duration, SecondsFormat, Utc};
+use flate2::{write::GzEncoder, Compression};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
@@ -25,6 +28,8 @@ pub const SUPPORTED_API_VERSIONS: [&str; 1] = [COVEN_API_VERSION];
 pub struct HealthCapabilities {
     pub sessions: bool,
     pub events: bool,
+    pub travel: bool,
+    pub scheduler: bool,
     pub event_cursor: String,
     pub structured_errors: bool,
 }
@@ -119,6 +124,8 @@ pub fn health_response(daemon: Option<DaemonStatus>) -> HealthResponse {
         capabilities: HealthCapabilities {
             sessions: true,
             events: true,
+            travel: true,
+            scheduler: true,
             event_cursor: "sequence".to_string(),
             structured_errors: true,
         },
@@ -321,6 +328,25 @@ pub fn handle_request_with_runtime(
         ("GET", "/research") => {
             json_response(200, &crate::cockpit_sources::read_research(coven_home)?)
         }
+        ("POST", "/travel/profiles") => generate_travel_profile(coven_home, body),
+        ("POST", "/travel/deltas") => {
+            let q = query.unwrap_or_default();
+            upload_travel_delta(coven_home, body, q)
+        }
+        ("GET", "/travel/state") => {
+            let q = query.unwrap_or_default();
+            travel_state(coven_home, q)
+        }
+        ("POST", "/scheduler/decisions") => scheduler_decision(coven_home, body),
+        ("POST", "/scheduler/redispatch") => scheduler_redispatch(coven_home, body),
+        ("GET", path) if path.starts_with("/scheduler/decisions/") => {
+            let decision_id = path.trim_start_matches("/scheduler/decisions/");
+            get_scheduler_decision(coven_home, decision_id)
+        }
+        ("GET", path) if path.starts_with("/scheduler/loops/") => {
+            let loop_id = path.trim_start_matches("/scheduler/loops/");
+            get_scheduler_loop_state(coven_home, loop_id)
+        }
         ("GET", "/sessions") => {
             let conn = store::open_store(&store_path(coven_home))?;
             let sessions = store::list_sessions(&conn)?;
@@ -401,6 +427,848 @@ fn normalize_api_route(route: &str) -> ApiRoute<'_> {
 
 fn store_path(coven_home: &Path) -> std::path::PathBuf {
     coven_home.join("coven.sqlite3")
+}
+
+fn generate_travel_profile(coven_home: &Path, body: Option<&str>) -> Result<ApiResponse> {
+    let payload = match parse_body(body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return api_error(400, "invalid_request", &error.to_string(), None);
+        }
+    };
+    let Some(familiar_id) = payload.get("familiarId").and_then(Value::as_str) else {
+        return api_error(400, "invalid_request", "familiarId is required.", None);
+    };
+    if familiar_id.trim().is_empty() {
+        return api_error(400, "invalid_request", "familiarId is required.", None);
+    }
+    let workspace_id = payload
+        .get("workspaceId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("default");
+    let expires_in_seconds = payload
+        .get("expiresInSeconds")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+        .unwrap_or(7 * 24 * 60 * 60);
+    let stale_after_seconds = payload
+        .get("staleAfterSeconds")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+        .unwrap_or(2 * 24 * 60 * 60)
+        .min(expires_in_seconds);
+
+    let conn = store::open_store(&store_path(coven_home))?;
+    let source_hub_id = store::get_or_insert_store_meta(
+        &conn,
+        "travel_source_hub_id",
+        &format!("hub_{}", Uuid::new_v4()),
+    )?;
+
+    let now = Utc::now();
+    let generated_at = now.to_rfc3339_opts(SecondsFormat::Nanos, true);
+    let expires_at =
+        (now + Duration::seconds(expires_in_seconds)).to_rfc3339_opts(SecondsFormat::Nanos, true);
+    let stale_after =
+        (now + Duration::seconds(stale_after_seconds)).to_rfc3339_opts(SecondsFormat::Nanos, true);
+    let profile_id = format!("travel_{}", Uuid::new_v4());
+    let source_revision = json!({
+        "memoryRevision": format!("mem_{}", Uuid::new_v4()),
+        "loopRevision": format!("loop_{}", Uuid::new_v4()),
+    });
+    let permissions = json!({
+        "mode": "travel-read-only",
+        "allowedLocalAgents": ["lightweight"],
+        "allowMemoryOverwrite": false,
+        "allowHeavyweightLocalWork": false,
+    });
+    let scope = json!({
+        "familiarId": familiar_id,
+        "workspaceId": workspace_id,
+    });
+    let source_hub = json!({
+        "hubId": source_hub_id,
+        "displayName": "Coven hub",
+    });
+    let memory_context: Vec<_> = crate::cockpit_sources::scan_memory(coven_home)?
+        .into_iter()
+        .filter(|memory| memory.familiar_id == familiar_id)
+        .collect();
+    let profile_payload = json!({
+        "version": "0.1",
+        "profileId": profile_id,
+        "generatedAt": generated_at,
+        "expiresAt": expires_at,
+        "staleAfter": stale_after,
+        "sourceHub": source_hub,
+        "scope": scope,
+        "sourceRevision": source_revision,
+        "permissions": permissions,
+        "payload": {
+            "memoryContext": memory_context,
+            "workspaceContext": [],
+            "policyContext": [],
+        },
+    });
+    let profile_bytes =
+        serde_json::to_vec(&profile_payload).context("failed to serialize travel profile")?;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(&profile_bytes)
+        .context("failed to compress travel profile")?;
+    let compressed = encoder
+        .finish()
+        .context("failed to finish travel profile")?;
+    let profile_blob = base64::engine::general_purpose::STANDARD.encode(&compressed);
+    let mut hasher = Sha256::new();
+    hasher.update(&compressed);
+    let content_hash = format!("sha256:{:x}", hasher.finalize());
+    let profile_dir = coven_home.join("travel").join("profiles");
+    std::fs::create_dir_all(&profile_dir)
+        .with_context(|| format!("failed to create {}", profile_dir.display()))?;
+    let profile_path = profile_dir.join(format!("{profile_id}.json.gz"));
+    std::fs::write(&profile_path, &compressed)
+        .with_context(|| format!("failed to write {}", profile_path.display()))?;
+    let mut file_permissions = std::fs::metadata(&profile_path)
+        .with_context(|| format!("failed to inspect {}", profile_path.display()))?
+        .permissions();
+    file_permissions.set_readonly(true);
+    std::fs::set_permissions(&profile_path, file_permissions)
+        .with_context(|| format!("failed to mark {} read-only", profile_path.display()))?;
+
+    store::insert_travel_profile(
+        &conn,
+        &store::TravelProfileRecord {
+            id: profile_id.clone(),
+            familiar_id: familiar_id.to_string(),
+            workspace_id: workspace_id.to_string(),
+            version: "0.1".to_string(),
+            generated_at: generated_at.clone(),
+            expires_at: expires_at.clone(),
+            stale_after: stale_after.clone(),
+            source_hub_id: source_hub_id.clone(),
+            source_revision_json: source_revision.to_string(),
+            permissions_json: permissions.to_string(),
+            payload_json: profile_payload["payload"].to_string(),
+            encoding: "gzip+base64".to_string(),
+            content_hash: content_hash.clone(),
+            profile_blob: profile_blob.clone(),
+            created_at: generated_at.clone(),
+        },
+    )?;
+
+    json_response(
+        201,
+        &json!({
+            "profileId": profile_id,
+            "version": "0.1",
+            "generatedAt": generated_at,
+            "expiresAt": expires_at,
+            "staleAfter": stale_after,
+            "sourceHub": source_hub,
+            "scope": scope,
+            "sourceRevision": source_revision,
+            "permissions": permissions,
+            "encoding": "gzip+base64",
+            "contentHash": content_hash,
+            "profileBlob": profile_blob,
+        }),
+    )
+}
+
+fn upload_travel_delta(coven_home: &Path, body: Option<&str>, query: &str) -> Result<ApiResponse> {
+    let payload = match parse_body(body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return api_error(400, "invalid_request", &error.to_string(), None);
+        }
+    };
+    let Some(profile_id) = payload.get("profileId").and_then(Value::as_str) else {
+        return api_error(400, "invalid_request", "profileId is required.", None);
+    };
+    let Some(source_hub_id) = payload.get("sourceHubId").and_then(Value::as_str) else {
+        return api_error(400, "invalid_request", "sourceHubId is required.", None);
+    };
+    let Some(client_id) = payload.get("clientId").and_then(Value::as_str) else {
+        return api_error(400, "invalid_request", "clientId is required.", None);
+    };
+
+    let conn = store::open_store(&store_path(coven_home))?;
+    let Some(profile) = store::get_travel_profile(&conn, profile_id)? else {
+        return api_error(
+            404,
+            "travel_profile_not_found",
+            "Travel profile was not found.",
+            Some(json!({ "profileId": profile_id })),
+        );
+    };
+    if profile.source_hub_id != source_hub_id {
+        return api_error(
+            409,
+            "source_hub_mismatch",
+            "Offline delta source hub does not match the travel profile.",
+            Some(json!({
+                "profileId": profile_id,
+                "expectedSourceHubId": profile.source_hub_id,
+                "sourceHubId": source_hub_id,
+            })),
+        );
+    }
+    if profile_freshness(&profile) == "expired" {
+        return api_error(
+            409,
+            "travel_profile_expired",
+            "Travel profile has expired and cannot accept offline deltas.",
+            Some(json!({
+                "profileId": profile_id,
+                "expiresAt": profile.expires_at,
+            })),
+        );
+    }
+
+    let accepted_events = payload
+        .get("events")
+        .and_then(Value::as_array)
+        .map(|events| events.len() as i64)
+        .unwrap_or(0);
+    let accepted_artifacts = payload
+        .get("artifacts")
+        .and_then(Value::as_array)
+        .map(|artifacts| artifacts.len() as i64)
+        .unwrap_or(0);
+    let memory_review_state = if payload
+        .get("proposedMemoryAdditions")
+        .and_then(Value::as_array)
+        .is_some_and(|items| !items.is_empty())
+    {
+        "queued"
+    } else {
+        "none"
+    };
+    let state = match query_param(query, "state") {
+        Some("handoff_pending") => "handoff_pending",
+        Some("syncing_delta") => "syncing_delta",
+        Some("hub_resumed") => "hub_resumed",
+        Some(other) => {
+            return api_error(
+                400,
+                "invalid_request",
+                "travel delta state must be `handoff_pending`, `syncing_delta`, or `hub_resumed`.",
+                Some(json!({ "state": other })),
+            );
+        }
+        None if query_param(query, "defer") == Some("1") => "handoff_pending",
+        None => "hub_resumed",
+    };
+    let now = current_timestamp();
+    let delta_id = format!("delta_{}", Uuid::new_v4());
+    let reconciliation_session_id = format!("travel-{delta_id}");
+    store::insert_session(
+        &conn,
+        &store::SessionRecord {
+            id: reconciliation_session_id.clone(),
+            project_root: coven_home.to_string_lossy().into_owned(),
+            harness: "travel".to_string(),
+            title: format!("Travel delta from {client_id}"),
+            status: "completed".to_string(),
+            exit_code: Some(0),
+            archived_at: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            conversation_id: Some(client_id.to_string()),
+            familiar_id: Some(profile.familiar_id.clone()),
+            labels: vec!["travel".to_string(), "offline-delta".to_string()],
+            visibility: "private".to_string(),
+        },
+    )?;
+    if let Some(events) = payload.get("events").and_then(Value::as_array) {
+        for event in events {
+            insert_event(
+                &conn,
+                coven_home,
+                &reconciliation_session_id,
+                "travel.offline_event",
+                event.clone(),
+            )?;
+        }
+    }
+    if let Some(artifacts) = payload.get("artifacts").and_then(Value::as_array) {
+        for artifact in artifacts {
+            insert_event(
+                &conn,
+                coven_home,
+                &reconciliation_session_id,
+                "travel.offline_artifact",
+                artifact.clone(),
+            )?;
+        }
+    }
+    store::insert_travel_delta(
+        &conn,
+        &store::TravelDeltaRecord {
+            id: delta_id.clone(),
+            profile_id: profile_id.to_string(),
+            source_hub_id: source_hub_id.to_string(),
+            client_id: client_id.to_string(),
+            state: state.to_string(),
+            raw_delta_json: payload.to_string(),
+            accepted_events,
+            accepted_artifacts,
+            memory_review_state: memory_review_state.to_string(),
+            canonical_memory_overwrite_applied: false,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )?;
+
+    json_response(
+        202,
+        &json!({
+            "deltaId": delta_id,
+            "state": state,
+            "acceptedEvents": accepted_events,
+            "acceptedArtifacts": accepted_artifacts,
+            "memoryReviewState": memory_review_state,
+            "canonicalMemoryOverwriteApplied": false,
+            "reconciliationSessionId": reconciliation_session_id,
+            "hubRevision": {
+                "memoryRevision": format!("mem_{}", Uuid::new_v4()),
+                "loopRevision": format!("loop_{}", Uuid::new_v4()),
+            },
+        }),
+    )
+}
+
+fn travel_state(coven_home: &Path, query: &str) -> Result<ApiResponse> {
+    let Some(client_id) = query_param(query, "clientId") else {
+        return api_error(
+            400,
+            "invalid_request",
+            "clientId query parameter is required.",
+            None,
+        );
+    };
+    let conn = store::open_store(&store_path(coven_home))?;
+    let latest = store::latest_travel_delta_for_client(&conn, client_id)?;
+    let requested_profile = match query_param(query, "profileId") {
+        Some(profile_id) => match store::get_travel_profile(&conn, profile_id)? {
+            Some(profile) => Some(profile),
+            None => {
+                return api_error(
+                    404,
+                    "travel_profile_not_found",
+                    "Travel profile was not found.",
+                    Some(json!({ "profileId": profile_id })),
+                );
+            }
+        },
+        None => None,
+    };
+    let valid_states = [
+        "hub_active",
+        "travel_local",
+        "travel_stale",
+        "handoff_pending",
+        "syncing_delta",
+        "hub_resumed",
+    ];
+    match latest {
+        Some(delta) => {
+            let profile = match store::get_travel_profile(&conn, &delta.profile_id)? {
+                Some(profile) => Some(profile),
+                None => requested_profile,
+            };
+            let freshness = profile.as_ref().map(profile_freshness).unwrap_or("unknown");
+            let pending_delta_bytes =
+                if delta.state == "handoff_pending" || delta.state == "syncing_delta" {
+                    delta.raw_delta_json.len()
+                } else {
+                    0
+                };
+            json_response(
+                200,
+                &json!({
+                    "state": delta.state,
+                    "profileId": delta.profile_id,
+                    "pendingDeltaBytes": pending_delta_bytes,
+                    "lastSyncError": null,
+                    "hubReachable": true,
+                    "profileFreshness": freshness,
+                    "travelExecutionAllowed": freshness != "expired",
+                    "validStates": valid_states,
+                }),
+            )
+        }
+        None => {
+            if let Some(profile) = requested_profile {
+                let freshness = profile_freshness(&profile);
+                let state = match freshness {
+                    "fresh" => "travel_local",
+                    "stale" | "expired" => "travel_stale",
+                    _ => "travel_local",
+                };
+                json_response(
+                    200,
+                    &json!({
+                        "state": state,
+                        "profileId": profile.id,
+                        "pendingDeltaBytes": 0,
+                        "lastSyncError": null,
+                        "hubReachable": false,
+                        "profileFreshness": freshness,
+                        "travelExecutionAllowed": freshness != "expired",
+                        "validStates": valid_states,
+                    }),
+                )
+            } else {
+                json_response(
+                    200,
+                    &json!({
+                        "state": "hub_active",
+                        "profileId": null,
+                        "pendingDeltaBytes": 0,
+                        "lastSyncError": null,
+                        "hubReachable": true,
+                        "profileFreshness": "none",
+                        "travelExecutionAllowed": true,
+                        "validStates": valid_states,
+                    }),
+                )
+            }
+        }
+    }
+}
+
+fn profile_freshness(profile: &store::TravelProfileRecord) -> &'static str {
+    if timestamp_is_past_or_now(&profile.expires_at) {
+        "expired"
+    } else if timestamp_is_past_or_now(&profile.stale_after) {
+        "stale"
+    } else {
+        "fresh"
+    }
+}
+
+fn timestamp_is_past_or_now(timestamp: &str) -> bool {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|dt| dt.with_timezone(&Utc) <= Utc::now())
+        .unwrap_or(true)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SchedulerDecisionRequest {
+    job_id: String,
+    #[serde(default)]
+    required_capabilities: Vec<String>,
+    #[serde(default)]
+    task_weight: Option<String>,
+    #[serde(default)]
+    travel_state: Option<String>,
+    #[serde(default)]
+    allow_heavyweight_local_work: bool,
+    #[serde(default)]
+    nodes: Vec<SchedulerNodeInput>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SchedulerNodeInput {
+    node_id: String,
+    role: String,
+    #[serde(default)]
+    available: bool,
+    #[serde(default)]
+    capabilities: Vec<String>,
+    #[serde(default)]
+    queue_pressure: i64,
+    #[serde(default)]
+    battery_percent: Option<i64>,
+    #[serde(default)]
+    power_source: Option<String>,
+    #[serde(default)]
+    queued_job_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SchedulerRedispatchRequest {
+    loop_id: String,
+    job_id: String,
+    current_node_id: String,
+    #[serde(default)]
+    required_capabilities: Vec<String>,
+    #[serde(default)]
+    loop_resumable: bool,
+    #[serde(default)]
+    nodes: Vec<SchedulerNodeInput>,
+}
+
+fn scheduler_decision(coven_home: &Path, body: Option<&str>) -> Result<ApiResponse> {
+    let payload = match parse_body(body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return api_error(400, "invalid_request", &error.to_string(), None);
+        }
+    };
+    let request: SchedulerDecisionRequest = match serde_json::from_value(payload) {
+        Ok(request) => request,
+        Err(error) => {
+            return api_error(400, "invalid_request", &error.to_string(), None);
+        }
+    };
+    if request.job_id.trim().is_empty() {
+        return api_error(400, "invalid_request", "jobId is required.", None);
+    }
+    if request.nodes.is_empty() {
+        return api_error(
+            409,
+            "no_scheduler_target",
+            "No scheduler nodes were supplied.",
+            Some(json!({ "jobId": request.job_id })),
+        );
+    }
+
+    let heavy_travel_local = request.task_weight.as_deref() == Some("heavyweight")
+        && matches!(
+            request.travel_state.as_deref(),
+            Some("travel_local") | Some("travel_stale")
+        )
+        && !request.allow_heavyweight_local_work;
+    let battery_blocked_any = request.nodes.iter().any(|node| {
+        node.available
+            && node_supports_capabilities(node, &request.required_capabilities)
+            && travel_battery_blocks_laptop_local(node, request.travel_state.as_deref())
+    });
+    let mut candidates: Vec<&SchedulerNodeInput> = request
+        .nodes
+        .iter()
+        .filter(|node| node.available)
+        .filter(|node| node_supports_capabilities(node, &request.required_capabilities))
+        .filter(|node| !(heavy_travel_local && node.role == "laptop_local"))
+        .filter(|node| !travel_battery_blocks_laptop_local(node, request.travel_state.as_deref()))
+        .collect();
+    candidates.sort_by(|left, right| {
+        left.queue_pressure
+            .cmp(&right.queue_pressure)
+            .then_with(|| scheduler_role_rank(&left.role).cmp(&scheduler_role_rank(&right.role)))
+            .then_with(|| left.node_id.cmp(&right.node_id))
+    });
+    let Some(target_node) = candidates.first().copied() else {
+        return api_error(
+            409,
+            "no_scheduler_target",
+            "No available scheduler node matches the requested capabilities and policy.",
+            Some(json!({
+                "jobId": request.job_id,
+                "requiredCapabilities": request.required_capabilities,
+                "travelState": request.travel_state.unwrap_or_else(|| "hub_active".to_string()),
+                "batteryAware": battery_blocked_any,
+            })),
+        );
+    };
+
+    let decision_id = format!("sched_{}", Uuid::new_v4());
+    let target = json!({
+        "role": target_node.role,
+        "nodeId": target_node.node_id,
+    });
+    let travel_state = request
+        .travel_state
+        .clone()
+        .unwrap_or_else(|| "hub_active".to_string());
+    let inputs = json!({
+        "requiredCapabilities": request.required_capabilities,
+        "queuePressure": queue_pressure_label(target_node.queue_pressure),
+        "travelState": travel_state,
+        "taskWeight": request.task_weight.unwrap_or_else(|| "normal".to_string()),
+    });
+    let reason = format!(
+        "{} has required capability set and {} queue pressure",
+        target_node.role,
+        queue_pressure_label(target_node.queue_pressure)
+    );
+    let now = current_timestamp();
+    let record = store::SchedulerDecisionRecord {
+        id: decision_id,
+        job_id: request.job_id,
+        target_role: target_node.role.clone(),
+        target_node_id: Some(target_node.node_id.clone()),
+        target_json: target.to_string(),
+        reason,
+        inputs_json: inputs.to_string(),
+        created_at: now,
+    };
+    let conn = store::open_store(&store_path(coven_home))?;
+    store::insert_scheduler_decision(&conn, &record)?;
+    let response = scheduler_decision_response(&record)?;
+    json_response(201, &response)
+}
+
+fn get_scheduler_decision(coven_home: &Path, decision_id: &str) -> Result<ApiResponse> {
+    let conn = store::open_store(&store_path(coven_home))?;
+    match store::get_scheduler_decision(&conn, decision_id)? {
+        Some(record) => json_response(200, &scheduler_decision_response(&record)?),
+        None => api_error(
+            404,
+            "scheduler_decision_not_found",
+            "Scheduler decision was not found.",
+            Some(json!({ "decisionId": decision_id })),
+        ),
+    }
+}
+
+fn scheduler_redispatch(coven_home: &Path, body: Option<&str>) -> Result<ApiResponse> {
+    let payload = match parse_body(body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return api_error(400, "invalid_request", &error.to_string(), None);
+        }
+    };
+    let request: SchedulerRedispatchRequest = match serde_json::from_value(payload) {
+        Ok(request) => request,
+        Err(error) => {
+            return api_error(400, "invalid_request", &error.to_string(), None);
+        }
+    };
+    if request.loop_id.trim().is_empty() {
+        return api_error(400, "invalid_request", "loopId is required.", None);
+    }
+    if request.job_id.trim().is_empty() {
+        return api_error(400, "invalid_request", "jobId is required.", None);
+    }
+    let Some(current_node) = request
+        .nodes
+        .iter()
+        .find(|node| node.node_id == request.current_node_id)
+    else {
+        return api_error(
+            400,
+            "invalid_request",
+            "currentNodeId must refer to a supplied node.",
+            Some(json!({ "currentNodeId": request.current_node_id })),
+        );
+    };
+    let preserved_job_ids = if current_node.queued_job_ids.is_empty() {
+        vec![request.job_id.clone()]
+    } else {
+        current_node.queued_job_ids.clone()
+    };
+    let node_availability: Vec<Value> = request
+        .nodes
+        .iter()
+        .map(|node| {
+            json!({
+                "nodeId": node.node_id,
+                "role": node.role,
+                "available": node.available,
+                "queuePressure": queue_pressure_label(node.queue_pressure),
+            })
+        })
+        .collect();
+    let mut candidates: Vec<&SchedulerNodeInput> = request
+        .nodes
+        .iter()
+        .filter(|node| node.node_id != request.current_node_id)
+        .filter(|node| node.available)
+        .filter(|node| node_supports_capabilities(node, &request.required_capabilities))
+        .collect();
+    candidates.sort_by(|left, right| {
+        left.queue_pressure
+            .cmp(&right.queue_pressure)
+            .then_with(|| scheduler_role_rank(&left.role).cmp(&scheduler_role_rank(&right.role)))
+            .then_with(|| left.node_id.cmp(&right.node_id))
+    });
+    let target_node = candidates
+        .first()
+        .copied()
+        .filter(|_| request.loop_resumable);
+    let (state, target, reason) = match target_node {
+        Some(node) => (
+            "redispatched",
+            json!({
+                "role": node.role,
+                "nodeId": node.node_id,
+            }),
+            format!(
+                "{} went offline; redispatched resumable loop to {}",
+                request.current_node_id, node.node_id
+            ),
+        ),
+        None => (
+            "paused",
+            json!({
+                "role": "paused",
+                "nodeId": null,
+            }),
+            format!(
+                "{} went offline; preserved subqueue and paused loop",
+                request.current_node_id
+            ),
+        ),
+    };
+    let inputs = json!({
+        "requiredCapabilities": request.required_capabilities,
+        "failedNodeId": request.current_node_id,
+        "loopResumable": request.loop_resumable,
+        "nodeAvailability": node_availability,
+    });
+    let now = current_timestamp();
+    let decision_id = format!("sched_{}", Uuid::new_v4());
+    let record = store::SchedulerDecisionRecord {
+        id: decision_id.clone(),
+        job_id: request.job_id.clone(),
+        target_role: target["role"].as_str().unwrap_or("unknown").to_string(),
+        target_node_id: target["nodeId"].as_str().map(str::to_string),
+        target_json: target.to_string(),
+        reason: reason.clone(),
+        inputs_json: inputs.to_string(),
+        created_at: now.clone(),
+    };
+    let conn = store::open_store(&store_path(coven_home))?;
+    store::insert_scheduler_decision(&conn, &record)?;
+    let preserved_job_ids_json =
+        serde_json::to_string(&preserved_job_ids).context("failed to serialize preserved queue")?;
+    store::upsert_executor_queue(
+        &conn,
+        &store::ExecutorQueueRecord {
+            node_id: request.current_node_id.clone(),
+            job_ids_json: preserved_job_ids_json,
+            updated_at: now.clone(),
+        },
+    )?;
+    let node_availability_json = serde_json::to_string(&node_availability)
+        .context("failed to serialize node availability")?;
+    store::upsert_scheduler_loop_state(
+        &conn,
+        &store::SchedulerLoopStateRecord {
+            loop_id: request.loop_id.clone(),
+            job_id: request.job_id.clone(),
+            state: state.to_string(),
+            decision_id: decision_id.clone(),
+            target_json: target.to_string(),
+            preserved_subqueue_node_id: request.current_node_id.clone(),
+            node_availability_json,
+            reason: reason.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )?;
+    json_response(
+        202,
+        &json!({
+            "decisionId": decision_id,
+            "state": state,
+            "loopId": request.loop_id,
+            "jobId": request.job_id,
+            "target": target,
+            "reason": reason,
+            "preservedSubqueue": {
+                "nodeId": request.current_node_id,
+                "jobIds": preserved_job_ids,
+            },
+            "nodeAvailability": node_availability,
+            "createdAt": now,
+        }),
+    )
+}
+
+fn get_scheduler_loop_state(coven_home: &Path, loop_id: &str) -> Result<ApiResponse> {
+    let conn = store::open_store(&store_path(coven_home))?;
+    let Some(record) = store::get_scheduler_loop_state(&conn, loop_id)? else {
+        return api_error(
+            404,
+            "scheduler_loop_not_found",
+            "Scheduler loop state was not found.",
+            Some(json!({ "loopId": loop_id })),
+        );
+    };
+    let target: Value =
+        serde_json::from_str(&record.target_json).context("failed to parse scheduler target")?;
+    let node_availability: Value = serde_json::from_str(&record.node_availability_json)
+        .context("failed to parse scheduler node availability")?;
+    let queue = store::get_executor_queue(&conn, &record.preserved_subqueue_node_id)?;
+    let job_ids: Value = match queue {
+        Some(queue) => serde_json::from_str(&queue.job_ids_json)
+            .context("failed to parse executor queue job ids")?,
+        None => json!([]),
+    };
+    json_response(
+        200,
+        &json!({
+            "decisionId": record.decision_id,
+            "state": record.state,
+            "loopId": record.loop_id,
+            "jobId": record.job_id,
+            "target": target,
+            "reason": record.reason,
+            "preservedSubqueue": {
+                "nodeId": record.preserved_subqueue_node_id,
+                "jobIds": job_ids,
+            },
+            "nodeAvailability": node_availability,
+            "createdAt": record.created_at,
+            "updatedAt": record.updated_at,
+        }),
+    )
+}
+
+fn scheduler_decision_response(record: &store::SchedulerDecisionRecord) -> Result<Value> {
+    let target: Value =
+        serde_json::from_str(&record.target_json).context("failed to parse scheduler target")?;
+    let inputs: Value =
+        serde_json::from_str(&record.inputs_json).context("failed to parse scheduler inputs")?;
+    Ok(json!({
+        "decisionId": record.id,
+        "jobId": record.job_id,
+        "target": target,
+        "reason": record.reason,
+        "inputs": inputs,
+        "createdAt": record.created_at,
+    }))
+}
+
+fn scheduler_role_rank(role: &str) -> i32 {
+    match role {
+        "compute_executor" => 0,
+        "stationary_executor" => 1,
+        "hub" => 2,
+        "laptop_local" => 3,
+        _ => 4,
+    }
+}
+
+fn node_supports_capabilities(node: &SchedulerNodeInput, required_capabilities: &[String]) -> bool {
+    required_capabilities.iter().all(|required| {
+        node.capabilities
+            .iter()
+            .any(|capability| capability == required)
+    })
+}
+
+fn travel_battery_blocks_laptop_local(
+    node: &SchedulerNodeInput,
+    travel_state: Option<&str>,
+) -> bool {
+    if node.role != "laptop_local" {
+        return false;
+    }
+    if !matches!(travel_state, Some("travel_local") | Some("travel_stale")) {
+        return false;
+    }
+    if node.power_source.as_deref() != Some("battery") {
+        return false;
+    }
+    node.battery_percent.is_some_and(|percent| percent <= 15)
+}
+
+fn queue_pressure_label(queue_pressure: i64) -> &'static str {
+    match queue_pressure {
+        i64::MIN..=2 => "low",
+        3..=6 => "medium",
+        _ => "high",
+    }
 }
 
 fn launch_session(
@@ -1233,6 +2101,8 @@ mod tests {
         assert_eq!(response.coven_version, COVEN_VERSION);
         assert!(response.capabilities.sessions);
         assert!(response.capabilities.events);
+        assert!(response.capabilities.travel);
+        assert!(response.capabilities.scheduler);
         assert_eq!(response.capabilities.event_cursor, "sequence");
         assert!(response.capabilities.structured_errors);
         assert_eq!(response.daemon, None);
@@ -1259,6 +2129,8 @@ mod tests {
         assert!(response.body.contains(r#""apiVersion":"coven.daemon.v1""#));
         assert!(response.body.contains(r#""pid":12345"#));
         assert!(response.body.contains(r#""sessions":true"#));
+        assert!(response.body.contains(r#""travel":true"#));
+        assert!(response.body.contains(r#""scheduler":true"#));
         assert!(response.body.contains(r#""structuredErrors":true"#));
         Ok(())
     }
@@ -1275,6 +2147,740 @@ mod tests {
         assert!(response.body.contains(r#""capabilities""#));
         assert!(response.body.contains(r#""eventCursor":"sequence""#));
         assert!(response.body.contains(r#""ok":true"#));
+        Ok(())
+    }
+
+    #[test]
+    fn travel_profile_generation_returns_compressed_read_only_profile_metadata(
+    ) -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/travel/profiles",
+            temp_dir.path(),
+            None,
+            Some(
+                r#"{
+                    "familiarId":"sage",
+                    "workspaceId":"workspace-1",
+                    "expiresInSeconds":604800,
+                    "staleAfterSeconds":172800,
+                    "includeContext":["memory","workspace","policy"]
+                }"#,
+            ),
+        )?;
+
+        assert_eq!(response.status, 201);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["version"], "0.1");
+        assert!(body["profileId"].as_str().unwrap().starts_with("travel_"));
+        assert_eq!(body["scope"]["familiarId"], "sage");
+        assert_eq!(body["scope"]["workspaceId"], "workspace-1");
+        assert_eq!(body["permissions"]["mode"], "travel-read-only");
+        assert_eq!(body["permissions"]["allowMemoryOverwrite"], false);
+        assert_eq!(body["permissions"]["allowHeavyweightLocalWork"], false);
+        assert_eq!(body["encoding"], "gzip+base64");
+        assert!(body["profileBlob"].as_str().unwrap().len() > 16);
+        assert!(body["contentHash"].as_str().unwrap().starts_with("sha256:"));
+        assert!(body["generatedAt"].as_str().unwrap().contains('T'));
+        assert!(body["sourceHub"]["hubId"]
+            .as_str()
+            .unwrap()
+            .starts_with("hub_"));
+        assert!(body["expiresAt"].as_str().unwrap() > body["generatedAt"].as_str().unwrap());
+        assert!(body["staleAfter"].as_str().unwrap() > body["generatedAt"].as_str().unwrap());
+        Ok(())
+    }
+
+    #[test]
+    fn travel_profile_generation_reuses_stable_source_hub_identity() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+
+        let first = handle_request_with_body(
+            "POST",
+            "/api/v1/travel/profiles",
+            temp_dir.path(),
+            None,
+            Some(r#"{"familiarId":"sage","workspaceId":"workspace-1"}"#),
+        )?;
+        let second = handle_request_with_body(
+            "POST",
+            "/api/v1/travel/profiles",
+            temp_dir.path(),
+            None,
+            Some(r#"{"familiarId":"sage","workspaceId":"workspace-1"}"#),
+        )?;
+
+        let first: serde_json::Value = serde_json::from_str(&first.body)?;
+        let second: serde_json::Value = serde_json::from_str(&second.body)?;
+        assert_eq!(first["sourceHub"]["hubId"], second["sourceHub"]["hubId"]);
+        assert_ne!(first["profileId"], second["profileId"]);
+        Ok(())
+    }
+
+    #[test]
+    fn travel_profile_generation_embeds_familiar_memory_context_and_readonly_artifact(
+    ) -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let memory_dir = temp_dir.path().join("memory").join("sage");
+        std::fs::create_dir_all(&memory_dir)?;
+        std::fs::write(
+            memory_dir.join("field-notes.md"),
+            "# Field notes\n\nSage remembers the travel-mode acceptance criteria.",
+        )?;
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/travel/profiles",
+            temp_dir.path(),
+            None,
+            Some(r#"{"familiarId":"sage","workspaceId":"workspace-1"}"#),
+        )?;
+
+        assert_eq!(response.status, 201);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        let profile_id = body["profileId"].as_str().unwrap();
+        let blob = body["profileBlob"].as_str().unwrap();
+        let compressed = base64::engine::general_purpose::STANDARD.decode(blob)?;
+        let mut decoder = flate2::read::GzDecoder::new(&compressed[..]);
+        let mut decoded = String::new();
+        std::io::Read::read_to_string(&mut decoder, &mut decoded)?;
+        let profile: serde_json::Value = serde_json::from_str(&decoded)?;
+        assert_eq!(
+            profile["payload"]["memoryContext"][0]["path"],
+            "sage/field-notes.md"
+        );
+        assert_eq!(
+            profile["payload"]["memoryContext"][0]["excerpt"],
+            "Sage remembers the travel-mode acceptance criteria."
+        );
+
+        let artifact = temp_dir
+            .path()
+            .join("travel")
+            .join("profiles")
+            .join(format!("{profile_id}.json.gz"));
+        assert!(artifact.exists(), "missing {}", artifact.display());
+        assert!(
+            artifact.metadata()?.permissions().readonly(),
+            "travel profile artifact should be read-only"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn travel_delta_upload_appends_results_without_overwriting_canonical_memory(
+    ) -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let profile_response = handle_request_with_body(
+            "POST",
+            "/api/v1/travel/profiles",
+            temp_dir.path(),
+            None,
+            Some(r#"{"familiarId":"sage","workspaceId":"workspace-1"}"#),
+        )?;
+        let profile: serde_json::Value = serde_json::from_str(&profile_response.body)?;
+        let profile_id = profile["profileId"].as_str().unwrap();
+        let source_hub_id = profile["sourceHub"]["hubId"].as_str().unwrap();
+        let memory_revision = profile["sourceRevision"]["memoryRevision"]
+            .as_str()
+            .unwrap();
+        let loop_revision = profile["sourceRevision"]["loopRevision"].as_str().unwrap();
+        let delta_body = serde_json::json!({
+            "profileId": profile_id,
+            "sourceHubId": source_hub_id,
+            "sourceRevision": {
+                "memoryRevision": memory_revision,
+                "loopRevision": loop_revision
+            },
+            "clientId": "laptop-1",
+            "events": [{"id":"event-1","kind":"assistant","text":"offline result"}],
+            "artifacts": [{"id":"artifact-1","kind":"summary"}],
+            "proposedMemoryAdditions": [{"path":"MEMORY.md","text":"append this"}],
+            "canonicalMemoryOverwrite": {"path":"MEMORY.md","text":"replace everything"}
+        });
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/travel/deltas",
+            temp_dir.path(),
+            None,
+            Some(&delta_body.to_string()),
+        )?;
+
+        assert_eq!(response.status, 202);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert!(body["deltaId"].as_str().unwrap().starts_with("delta_"));
+        assert_eq!(body["state"], "hub_resumed");
+        assert_eq!(body["acceptedEvents"], 1);
+        assert_eq!(body["acceptedArtifacts"], 1);
+        assert_eq!(body["memoryReviewState"], "queued");
+        assert_eq!(body["canonicalMemoryOverwriteApplied"], false);
+        assert!(body["hubRevision"]["memoryRevision"]
+            .as_str()
+            .unwrap()
+            .starts_with("mem_"));
+        Ok(())
+    }
+
+    #[test]
+    fn travel_delta_upload_rejects_expired_profiles() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let profile_response = handle_request_with_body(
+            "POST",
+            "/api/v1/travel/profiles",
+            temp_dir.path(),
+            None,
+            Some(r#"{"familiarId":"sage","workspaceId":"workspace-1"}"#),
+        )?;
+        let profile: serde_json::Value = serde_json::from_str(&profile_response.body)?;
+        let profile_id = profile["profileId"].as_str().unwrap();
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        conn.execute(
+            "UPDATE travel_profiles SET expires_at = '2020-01-01T00:00:00Z' WHERE id = ?1",
+            [profile_id],
+        )?;
+        drop(conn);
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/travel/deltas",
+            temp_dir.path(),
+            None,
+            Some(
+                &serde_json::json!({
+                    "profileId": profile_id,
+                    "sourceHubId": profile["sourceHub"]["hubId"],
+                    "clientId": "laptop-1",
+                    "events": [{"id":"event-1","kind":"assistant","text":"offline result"}]
+                })
+                .to_string(),
+            ),
+        )?;
+
+        assert_eq!(response.status, 409);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "travel_profile_expired");
+        Ok(())
+    }
+
+    #[test]
+    fn travel_state_reports_stale_profile_before_handoff() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let profile_response = handle_request_with_body(
+            "POST",
+            "/api/v1/travel/profiles",
+            temp_dir.path(),
+            None,
+            Some(r#"{"familiarId":"sage","workspaceId":"workspace-1"}"#),
+        )?;
+        let profile: serde_json::Value = serde_json::from_str(&profile_response.body)?;
+        let profile_id = profile["profileId"].as_str().unwrap();
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        conn.execute(
+            "UPDATE travel_profiles SET stale_after = '2020-01-01T00:00:00Z' WHERE id = ?1",
+            [profile_id],
+        )?;
+        drop(conn);
+
+        let response = handle_request(
+            "GET",
+            &format!("/api/v1/travel/state?clientId=laptop-1&profileId={profile_id}"),
+            temp_dir.path(),
+            None,
+        )?;
+
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["state"], "travel_stale");
+        assert_eq!(body["profileId"], profile_id);
+        assert_eq!(body["profileFreshness"], "stale");
+        assert_eq!(body["hubReachable"], false);
+        Ok(())
+    }
+
+    #[test]
+    fn travel_state_refuses_local_execution_for_expired_profile() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let profile_response = handle_request_with_body(
+            "POST",
+            "/api/v1/travel/profiles",
+            temp_dir.path(),
+            None,
+            Some(r#"{"familiarId":"sage","workspaceId":"workspace-1"}"#),
+        )?;
+        let profile: serde_json::Value = serde_json::from_str(&profile_response.body)?;
+        let profile_id = profile["profileId"].as_str().unwrap();
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        conn.execute(
+            "UPDATE travel_profiles SET expires_at = '2020-01-01T00:00:00Z' WHERE id = ?1",
+            [profile_id],
+        )?;
+        drop(conn);
+
+        let response = handle_request(
+            "GET",
+            &format!("/api/v1/travel/state?clientId=laptop-1&profileId={profile_id}"),
+            temp_dir.path(),
+            None,
+        )?;
+
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["state"], "travel_stale");
+        assert_eq!(body["profileFreshness"], "expired");
+        assert_eq!(body["travelExecutionAllowed"], false);
+        Ok(())
+    }
+
+    #[test]
+    fn travel_delta_upload_appends_offline_events_to_canonical_event_log() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let profile_response = handle_request_with_body(
+            "POST",
+            "/api/v1/travel/profiles",
+            temp_dir.path(),
+            None,
+            Some(r#"{"familiarId":"sage","workspaceId":"workspace-1"}"#),
+        )?;
+        let profile: serde_json::Value = serde_json::from_str(&profile_response.body)?;
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/travel/deltas",
+            temp_dir.path(),
+            None,
+            Some(
+                &serde_json::json!({
+                    "profileId": profile["profileId"],
+                    "sourceHubId": profile["sourceHub"]["hubId"],
+                    "clientId": "laptop-1",
+                    "events": [
+                        {"id":"local-event-1","kind":"assistant","text":"offline result"}
+                    ]
+                })
+                .to_string(),
+            ),
+        )?;
+
+        assert_eq!(response.status, 202);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        let session_id = body["reconciliationSessionId"].as_str().unwrap();
+        let events = handle_request(
+            "GET",
+            &format!("/api/v1/events?sessionId={session_id}"),
+            temp_dir.path(),
+            None,
+        )?;
+        assert_eq!(events.status, 200);
+        let events_body: serde_json::Value = serde_json::from_str(&events.body)?;
+        assert_eq!(events_body["events"][0]["kind"], "travel.offline_event");
+        assert!(events_body["events"][0]["payload_json"]
+            .as_str()
+            .unwrap()
+            .contains("offline result"));
+        Ok(())
+    }
+
+    #[test]
+    fn travel_state_exposes_handoff_states_for_clients() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+
+        let initial = handle_request(
+            "GET",
+            "/api/v1/travel/state?clientId=laptop-1",
+            temp_dir.path(),
+            None,
+        )?;
+
+        assert_eq!(initial.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&initial.body)?;
+        assert_eq!(body["state"], "hub_active");
+        assert_eq!(body["hubReachable"], true);
+        assert_eq!(body["pendingDeltaBytes"], 0);
+
+        let profile_response = handle_request_with_body(
+            "POST",
+            "/api/v1/travel/profiles",
+            temp_dir.path(),
+            None,
+            Some(r#"{"familiarId":"sage","workspaceId":"workspace-1"}"#),
+        )?;
+        let profile: serde_json::Value = serde_json::from_str(&profile_response.body)?;
+        let pending_delta = serde_json::json!({
+            "profileId": profile["profileId"],
+            "sourceHubId": profile["sourceHub"]["hubId"],
+            "sourceRevision": profile["sourceRevision"],
+            "clientId": "laptop-1",
+            "events": [{"id":"event-1","kind":"assistant","text":"offline result"}]
+        });
+        let _ = handle_request_with_body(
+            "POST",
+            "/api/v1/travel/deltas?defer=1",
+            temp_dir.path(),
+            None,
+            Some(&pending_delta.to_string()),
+        )?;
+
+        let pending = handle_request(
+            "GET",
+            "/api/v1/travel/state?clientId=laptop-1",
+            temp_dir.path(),
+            None,
+        )?;
+
+        assert_eq!(pending.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&pending.body)?;
+        assert_eq!(body["state"], "handoff_pending");
+        assert_eq!(body["profileId"], profile["profileId"]);
+        assert!(body["pendingDeltaBytes"].as_i64().unwrap() > 0);
+        assert_eq!(body["profileFreshness"], "fresh");
+        Ok(())
+    }
+
+    #[test]
+    fn travel_failure_simulation_reconnect_walks_handoff_sync_and_resume_states(
+    ) -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let profile_response = handle_request_with_body(
+            "POST",
+            "/api/v1/travel/profiles",
+            temp_dir.path(),
+            None,
+            Some(r#"{"familiarId":"sage","workspaceId":"workspace-1"}"#),
+        )?;
+        let profile: serde_json::Value = serde_json::from_str(&profile_response.body)?;
+        let profile_id = profile["profileId"].as_str().unwrap();
+
+        let local = handle_request(
+            "GET",
+            &format!("/api/v1/travel/state?clientId=laptop-1&profileId={profile_id}"),
+            temp_dir.path(),
+            None,
+        )?;
+        let local_body: serde_json::Value = serde_json::from_str(&local.body)?;
+        assert_eq!(local_body["state"], "travel_local");
+        assert_eq!(local_body["hubReachable"], false);
+
+        let delta = serde_json::json!({
+            "profileId": profile["profileId"],
+            "sourceHubId": profile["sourceHub"]["hubId"],
+            "sourceRevision": profile["sourceRevision"],
+            "clientId": "laptop-1",
+            "events": [{"id":"event-1","kind":"assistant","text":"offline result"}]
+        });
+        let handoff = handle_request_with_body(
+            "POST",
+            "/api/v1/travel/deltas?state=handoff_pending",
+            temp_dir.path(),
+            None,
+            Some(&delta.to_string()),
+        )?;
+        assert_eq!(handoff.status, 202);
+        let handoff_body: serde_json::Value = serde_json::from_str(&handoff.body)?;
+        assert_eq!(handoff_body["state"], "handoff_pending");
+
+        let syncing = handle_request_with_body(
+            "POST",
+            "/api/v1/travel/deltas?state=syncing_delta",
+            temp_dir.path(),
+            None,
+            Some(&delta.to_string()),
+        )?;
+        assert_eq!(syncing.status, 202);
+        let syncing_body: serde_json::Value = serde_json::from_str(&syncing.body)?;
+        assert_eq!(syncing_body["state"], "syncing_delta");
+
+        let syncing_state = handle_request(
+            "GET",
+            "/api/v1/travel/state?clientId=laptop-1",
+            temp_dir.path(),
+            None,
+        )?;
+        let syncing_state_body: serde_json::Value = serde_json::from_str(&syncing_state.body)?;
+        assert_eq!(syncing_state_body["state"], "syncing_delta");
+        assert_eq!(syncing_state_body["hubReachable"], true);
+
+        let resumed = handle_request_with_body(
+            "POST",
+            "/api/v1/travel/deltas",
+            temp_dir.path(),
+            None,
+            Some(&delta.to_string()),
+        )?;
+        assert_eq!(resumed.status, 202);
+        let resumed_body: serde_json::Value = serde_json::from_str(&resumed.body)?;
+        assert_eq!(resumed_body["state"], "hub_resumed");
+        Ok(())
+    }
+
+    #[test]
+    fn scheduler_decision_selects_available_executor_by_capability_and_queue_pressure(
+    ) -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let request = serde_json::json!({
+            "jobId": "job-gpu-loop",
+            "requiredCapabilities": ["gpu", "long-running-loop"],
+            "taskWeight": "heavyweight",
+            "travelState": "hub_active",
+            "nodes": [
+                {
+                    "nodeId": "node-stationary",
+                    "role": "stationary_executor",
+                    "available": true,
+                    "capabilities": ["shell"],
+                    "queuePressure": 0
+                },
+                {
+                    "nodeId": "node-compute-busy",
+                    "role": "compute_executor",
+                    "available": true,
+                    "capabilities": ["gpu", "long-running-loop"],
+                    "queuePressure": 8
+                },
+                {
+                    "nodeId": "node-compute-idle",
+                    "role": "compute_executor",
+                    "available": true,
+                    "capabilities": ["gpu", "long-running-loop"],
+                    "queuePressure": 1
+                }
+            ]
+        });
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/scheduler/decisions",
+            temp_dir.path(),
+            None,
+            Some(&request.to_string()),
+        )?;
+
+        assert_eq!(response.status, 201);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert!(body["decisionId"].as_str().unwrap().starts_with("sched_"));
+        assert_eq!(body["jobId"], "job-gpu-loop");
+        assert_eq!(body["target"]["role"], "compute_executor");
+        assert_eq!(body["target"]["nodeId"], "node-compute-idle");
+        assert!(body["reason"]
+            .as_str()
+            .unwrap()
+            .contains("required capability"));
+        assert_eq!(
+            body["inputs"]["requiredCapabilities"],
+            serde_json::json!(["gpu", "long-running-loop"])
+        );
+        assert_eq!(body["inputs"]["queuePressure"], "low");
+        assert_eq!(body["inputs"]["travelState"], "hub_active");
+
+        let persisted = handle_request(
+            "GET",
+            &format!(
+                "/api/v1/scheduler/decisions/{}",
+                body["decisionId"].as_str().unwrap()
+            ),
+            temp_dir.path(),
+            None,
+        )?;
+        assert_eq!(persisted.status, 200);
+        assert_eq!(persisted.body, response.body);
+        Ok(())
+    }
+
+    #[test]
+    fn scheduler_decision_rejects_laptop_local_work_when_travel_battery_is_low(
+    ) -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let request = serde_json::json!({
+            "jobId": "job-local-notes",
+            "requiredCapabilities": ["shell"],
+            "taskWeight": "lightweight",
+            "travelState": "travel_local",
+            "nodes": [
+                {
+                    "nodeId": "laptop-travel",
+                    "role": "laptop_local",
+                    "available": true,
+                    "capabilities": ["shell"],
+                    "queuePressure": 0,
+                    "batteryPercent": 9,
+                    "powerSource": "battery"
+                }
+            ]
+        });
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/scheduler/decisions",
+            temp_dir.path(),
+            None,
+            Some(&request.to_string()),
+        )?;
+
+        assert_eq!(response.status, 409);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "no_scheduler_target");
+        assert_eq!(body["error"]["details"]["travelState"], "travel_local");
+        assert_eq!(body["error"]["details"]["batteryAware"], true);
+        Ok(())
+    }
+
+    #[test]
+    fn scheduler_failure_simulation_redispatches_when_compute_executor_goes_offline_mid_loop(
+    ) -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let request = serde_json::json!({
+            "loopId": "loop-gpu",
+            "jobId": "job-gpu-loop",
+            "currentNodeId": "compute-primary",
+            "requiredCapabilities": ["gpu", "long-running-loop"],
+            "loopResumable": true,
+            "nodes": [
+                {
+                    "nodeId": "compute-primary",
+                    "role": "compute_executor",
+                    "available": false,
+                    "capabilities": ["gpu", "long-running-loop"],
+                    "queuePressure": 3,
+                    "queuedJobIds": ["job-gpu-loop"]
+                },
+                {
+                    "nodeId": "compute-fallback",
+                    "role": "compute_executor",
+                    "available": true,
+                    "capabilities": ["gpu", "long-running-loop"],
+                    "queuePressure": 1,
+                    "queuedJobIds": []
+                }
+            ]
+        });
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/scheduler/redispatch",
+            temp_dir.path(),
+            None,
+            Some(&request.to_string()),
+        )?;
+
+        assert_eq!(response.status, 202);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["state"], "redispatched");
+        assert_eq!(body["loopId"], "loop-gpu");
+        assert_eq!(body["target"]["nodeId"], "compute-fallback");
+        assert_eq!(body["preservedSubqueue"]["nodeId"], "compute-primary");
+        assert_eq!(
+            body["preservedSubqueue"]["jobIds"],
+            serde_json::json!(["job-gpu-loop"])
+        );
+        assert!(body["reason"].as_str().unwrap().contains("offline"));
+        assert!(body["decisionId"].as_str().unwrap().starts_with("sched_"));
+        Ok(())
+    }
+
+    #[test]
+    fn scheduler_failure_simulation_pauses_when_stationary_executor_goes_offline_without_alternate(
+    ) -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let request = serde_json::json!({
+            "loopId": "loop-shell",
+            "jobId": "job-shell-loop",
+            "currentNodeId": "stationary-primary",
+            "requiredCapabilities": ["shell"],
+            "loopResumable": false,
+            "nodes": [
+                {
+                    "nodeId": "stationary-primary",
+                    "role": "stationary_executor",
+                    "available": false,
+                    "capabilities": ["shell"],
+                    "queuePressure": 2,
+                    "queuedJobIds": ["job-shell-loop"]
+                }
+            ]
+        });
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/scheduler/redispatch",
+            temp_dir.path(),
+            None,
+            Some(&request.to_string()),
+        )?;
+
+        assert_eq!(response.status, 202);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["state"], "paused");
+        assert_eq!(body["loopId"], "loop-shell");
+        assert_eq!(body["target"]["role"], "paused");
+        assert_eq!(body["nodeAvailability"][0]["nodeId"], "stationary-primary");
+        assert_eq!(body["nodeAvailability"][0]["available"], false);
+        assert_eq!(body["preservedSubqueue"]["nodeId"], "stationary-primary");
+        assert_eq!(
+            body["preservedSubqueue"]["jobIds"],
+            serde_json::json!(["job-shell-loop"])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn scheduler_failure_simulation_persists_loop_state_for_restart_recovery() -> anyhow::Result<()>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let request = serde_json::json!({
+            "loopId": "loop-persistent",
+            "jobId": "job-persistent-loop",
+            "currentNodeId": "compute-primary",
+            "requiredCapabilities": ["gpu"],
+            "loopResumable": true,
+            "nodes": [
+                {
+                    "nodeId": "compute-primary",
+                    "role": "compute_executor",
+                    "available": false,
+                    "capabilities": ["gpu"],
+                    "queuePressure": 4,
+                    "queuedJobIds": ["job-persistent-loop", "job-followup"]
+                },
+                {
+                    "nodeId": "compute-fallback",
+                    "role": "compute_executor",
+                    "available": true,
+                    "capabilities": ["gpu"],
+                    "queuePressure": 0,
+                    "queuedJobIds": []
+                }
+            ]
+        });
+        let redispatch = handle_request_with_body(
+            "POST",
+            "/api/v1/scheduler/redispatch",
+            temp_dir.path(),
+            None,
+            Some(&request.to_string()),
+        )?;
+        assert_eq!(redispatch.status, 202);
+
+        let recovered = handle_request(
+            "GET",
+            "/api/v1/scheduler/loops/loop-persistent",
+            temp_dir.path(),
+            None,
+        )?;
+
+        assert_eq!(recovered.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&recovered.body)?;
+        assert_eq!(body["loopId"], "loop-persistent");
+        assert_eq!(body["state"], "redispatched");
+        assert_eq!(body["jobId"], "job-persistent-loop");
+        assert!(body["decisionId"].as_str().unwrap().starts_with("sched_"));
+        assert_eq!(body["target"]["nodeId"], "compute-fallback");
+        assert_eq!(body["preservedSubqueue"]["nodeId"], "compute-primary");
+        assert_eq!(
+            body["preservedSubqueue"]["jobIds"],
+            serde_json::json!(["job-persistent-loop", "job-followup"])
+        );
+        assert_eq!(body["nodeAvailability"][0]["available"], false);
         Ok(())
     }
 
@@ -1297,6 +2903,8 @@ mod tests {
 
         assert_eq!(response.status, 200);
         assert!(response.body.contains(r#""id":"coven.sessions""#));
+        assert!(response.body.contains(r#""id":"coven.travel""#));
+        assert!(response.body.contains(r#""id":"coven.scheduler""#));
         assert!(response.body.contains(r#""id":"coven.control.actions""#));
         assert!(response.body.contains(r#""id":"desktop.automation""#));
         assert!(response.body.contains(r#""policy":"requiresApproval""#));

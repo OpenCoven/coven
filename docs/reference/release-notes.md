@@ -6,6 +6,17 @@ read_when:
 title: "Coven changelog and release notes"
 ---
 
+## Week of July 4, 2026
+
+### New features
+
+- **Travel mode foundations (v0.0.51).** The daemon now exposes `/api/v1/travel/profiles`, `/api/v1/travel/deltas`, and `/api/v1/travel/state` so laptop/offline clients can receive a gzip+base64 read-only profile, append offline results back to the hub, and surface handoff states without overwriting canonical memory. The profile artifact is written under `<covenHome>/travel/profiles/` and marked read-only. See [API contract](/API-CONTRACT) and `specs/coven-multi-host-daemon/`.
+- **Multi-host scheduler recovery routes (v0.0.51).** Added persisted scheduler decisions and redispatch state through `/api/v1/scheduler/decisions`, `/api/v1/scheduler/decisions/:id`, `/api/v1/scheduler/redispatch`, and `/api/v1/scheduler/loops/:loopId`. The scheduler avoids heavyweight laptop-local work in travel mode, blocks low-battery laptop-local routing, preserves failed executor subqueues, and can recover loop state after daemon restart. See [API contract](/API-CONTRACT).
+
+### Updates
+
+- **Multi-host daemon specs.** Added PRODUCT and TECH specs for travel profiles, offline deltas, scheduler roles, redispatch, failure handling, and the issue mapping for the multi-host daemon track.
+
 ## Week of June 24, 2026
 
 ### New features

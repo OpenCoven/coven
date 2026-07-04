@@ -301,20 +301,27 @@ The daemon exposes a versioned HTTP API over a Unix socket. The current public c
 
 ### Endpoint reference
 
-| Endpoint                      | Method | Purpose                                                     |
-| ----------------------------- | ------ | ----------------------------------------------------------- |
-| `/api/v1/health`              | `GET`  | Daemon health, API version, and capability catalog          |
-| `/api/v1/api-version`         | `GET`  | Active and supported API versions                           |
-| `/api/v1/capabilities`        | `GET`  | Machine-readable capability catalog for clients             |
-| `/api/v1/sessions`            | `GET`  | List sessions                                               |
-| `/api/v1/sessions`            | `POST` | Launch a session                                            |
-| `/api/v1/sessions/:id`        | `GET`  | Fetch one session                                           |
-| `/api/v1/events`              | `GET`  | Read session events (supports `afterSeq` cursor pagination) |
-| `/api/v1/sessions/:id/events` | `GET`  | Session-scoped events alias                                 |
-| `/api/v1/sessions/:id/log`    | `GET`  | Redacted log preview for a session                          |
-| `/api/v1/sessions/:id/input`  | `POST` | Forward input to a live session                             |
-| `/api/v1/sessions/:id/kill`   | `POST` | Kill a live session                                         |
-| `/api/v1/actions`             | `POST` | Route a control-plane action (advanced clients)             |
+| Endpoint                                 | Method | Purpose                                                     |
+| ---------------------------------------- | ------ | ----------------------------------------------------------- |
+| `/api/v1/health`                         | `GET`  | Daemon health, API version, and capability catalog          |
+| `/api/v1/api-version`                    | `GET`  | Active and supported API versions                           |
+| `/api/v1/capabilities`                   | `GET`  | Machine-readable capability catalog for clients             |
+| `/api/v1/sessions`                       | `GET`  | List sessions                                               |
+| `/api/v1/sessions`                       | `POST` | Launch a session                                            |
+| `/api/v1/sessions/:id`                   | `GET`  | Fetch one session                                           |
+| `/api/v1/events`                         | `GET`  | Read session events (supports `afterSeq` cursor pagination) |
+| `/api/v1/sessions/:id/events`            | `GET`  | Session-scoped events alias                                 |
+| `/api/v1/sessions/:id/log`               | `GET`  | Redacted log preview for a session                          |
+| `/api/v1/sessions/:id/input`             | `POST` | Forward input to a live session                             |
+| `/api/v1/sessions/:id/kill`              | `POST` | Kill a live session                                         |
+| `/api/v1/actions`                        | `POST` | Route a control-plane action (advanced clients)             |
+| `/api/v1/travel/profiles`                | `POST` | Generate a read-only travel profile for offline laptop work |
+| `/api/v1/travel/deltas`                  | `POST` | Upload offline travel results for hub reconciliation        |
+| `/api/v1/travel/state`                   | `GET`  | Read hub/travel handoff state for a client                  |
+| `/api/v1/scheduler/decisions`            | `POST` | Choose a node for a multi-host job                          |
+| `/api/v1/scheduler/decisions/:id`        | `GET`  | Fetch a persisted scheduler decision                        |
+| `/api/v1/scheduler/redispatch`           | `POST` | Redispatch or pause a loop after executor failure           |
+| `/api/v1/scheduler/loops/:loopId`        | `GET`  | Recover persisted scheduler loop state                      |
 
 ### Recommended client handshake
 
@@ -335,6 +342,8 @@ Example response:
   "capabilities": {
     "sessions": true,
     "events": true,
+    "travel": true,
+    "scheduler": true,
     "eventCursor": "sequence",
     "structuredErrors": true
   },
