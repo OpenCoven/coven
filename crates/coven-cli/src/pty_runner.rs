@@ -1086,7 +1086,7 @@ exit 0
 
         assert_eq!(command.program(), "claude");
         #[cfg(windows)]
-        assert_eq!(command.args(), &["explain ^&^& exit"]);
+        assert_eq!(command.args(), &["\"explain ^&^& exit\""]);
         #[cfg(not(windows))]
         assert_eq!(command.args(), &["explain && exit"]);
         assert_eq!(command.cwd(), cwd);

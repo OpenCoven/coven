@@ -785,7 +785,12 @@ fn run_doctor() -> Result<()> {
         println!("  coven run {default} \"explain this repo in 5 bullets\"");
         println!("  coven sessions");
     } else {
-        println!("  Install or authenticate Codex/Claude Code, then run `coven doctor` again.");
+        println!("  Install and authenticate at least one harness in this same shell.");
+        println!("  Codex: npm install -g @openai/codex && codex login");
+        println!("  Claude Code: npm install -g @anthropic-ai/claude-code && claude doctor");
+        println!("  If PATH changed, open a new terminal and run `coven doctor` again.");
+        println!("  Then run: coven daemon start");
+        println!("  Install docs: docs/install/index.md");
     }
     Ok(())
 }
