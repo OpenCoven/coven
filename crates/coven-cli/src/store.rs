@@ -62,6 +62,74 @@ pub struct EventRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TravelProfileRecord {
+    pub id: String,
+    pub familiar_id: String,
+    pub workspace_id: String,
+    pub version: String,
+    pub generated_at: String,
+    pub expires_at: String,
+    pub stale_after: String,
+    pub source_hub_id: String,
+    pub source_revision_json: String,
+    pub permissions_json: String,
+    pub payload_json: String,
+    pub encoding: String,
+    pub content_hash: String,
+    pub profile_blob: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TravelDeltaRecord {
+    pub id: String,
+    pub profile_id: String,
+    pub source_hub_id: String,
+    pub client_id: String,
+    pub state: String,
+    pub raw_delta_json: String,
+    pub accepted_events: i64,
+    pub accepted_artifacts: i64,
+    pub memory_review_state: String,
+    pub canonical_memory_overwrite_applied: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchedulerDecisionRecord {
+    pub id: String,
+    pub job_id: String,
+    pub target_role: String,
+    pub target_node_id: Option<String>,
+    pub target_json: String,
+    pub reason: String,
+    pub inputs_json: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchedulerLoopStateRecord {
+    pub loop_id: String,
+    pub job_id: String,
+    pub state: String,
+    pub decision_id: String,
+    pub target_json: String,
+    pub preserved_subqueue_node_id: String,
+    pub node_availability_json: String,
+    pub reason: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutorQueueRecord {
+    pub node_id: String,
+    pub job_ids_json: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositoryRecord {
     pub id: String,
     pub path: String,
@@ -175,6 +243,83 @@ pub fn open_store(path: &Path) -> Result<Connection> {
             key TEXT PRIMARY KEY NOT NULL,
             value TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS travel_profiles (
+            id TEXT PRIMARY KEY NOT NULL,
+            familiar_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            version TEXT NOT NULL,
+            generated_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            stale_after TEXT NOT NULL,
+            source_hub_id TEXT NOT NULL,
+            source_revision_json TEXT NOT NULL,
+            permissions_json TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            encoding TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            profile_blob TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_travel_profiles_scope
+            ON travel_profiles(familiar_id, workspace_id, generated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS travel_deltas (
+            id TEXT PRIMARY KEY NOT NULL,
+            profile_id TEXT NOT NULL,
+            source_hub_id TEXT NOT NULL,
+            client_id TEXT NOT NULL,
+            state TEXT NOT NULL,
+            raw_delta_json TEXT NOT NULL,
+            accepted_events INTEGER NOT NULL,
+            accepted_artifacts INTEGER NOT NULL,
+            memory_review_state TEXT NOT NULL,
+            canonical_memory_overwrite_applied INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (profile_id) REFERENCES travel_profiles(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_travel_deltas_client
+            ON travel_deltas(client_id, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS scheduler_decisions (
+            id TEXT PRIMARY KEY NOT NULL,
+            job_id TEXT NOT NULL,
+            target_role TEXT NOT NULL,
+            target_node_id TEXT,
+            target_json TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            inputs_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_scheduler_decisions_job
+            ON scheduler_decisions(job_id, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS executor_queue (
+            node_id TEXT PRIMARY KEY NOT NULL,
+            job_ids_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS loop_state (
+            loop_id TEXT PRIMARY KEY NOT NULL,
+            job_id TEXT NOT NULL,
+            state TEXT NOT NULL,
+            decision_id TEXT NOT NULL,
+            target_json TEXT NOT NULL,
+            preserved_subqueue_node_id TEXT NOT NULL,
+            node_availability_json TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (decision_id) REFERENCES scheduler_decisions(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_loop_state_job
+            ON loop_state(job_id, updated_at DESC);
 
         CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
             payload_json,
@@ -544,6 +689,381 @@ pub fn repositories_table_exists(conn: &Connection) -> Result<bool> {
         .context("failed to inspect repositories schema")?;
 
     Ok(exists)
+}
+
+pub fn get_or_insert_store_meta(
+    conn: &Connection,
+    key: &str,
+    default_value: &str,
+) -> Result<String> {
+    conn.execute(
+        "INSERT OR IGNORE INTO store_meta(key, value) VALUES(?1, ?2)",
+        params![key, default_value],
+    )
+    .with_context(|| format!("failed to initialize store_meta key {key}"))?;
+    conn.query_row(
+        "SELECT value FROM store_meta WHERE key = ?1",
+        params![key],
+        |row| row.get(0),
+    )
+    .with_context(|| format!("failed to read store_meta key {key}"))
+}
+
+pub fn insert_travel_profile(conn: &Connection, record: &TravelProfileRecord) -> Result<()> {
+    conn.execute(
+        "INSERT INTO travel_profiles (
+            id,
+            familiar_id,
+            workspace_id,
+            version,
+            generated_at,
+            expires_at,
+            stale_after,
+            source_hub_id,
+            source_revision_json,
+            permissions_json,
+            payload_json,
+            encoding,
+            content_hash,
+            profile_blob,
+            created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        params![
+            &record.id,
+            &record.familiar_id,
+            &record.workspace_id,
+            &record.version,
+            &record.generated_at,
+            &record.expires_at,
+            &record.stale_after,
+            &record.source_hub_id,
+            &record.source_revision_json,
+            &record.permissions_json,
+            &record.payload_json,
+            &record.encoding,
+            &record.content_hash,
+            &record.profile_blob,
+            &record.created_at,
+        ],
+    )
+    .with_context(|| format!("failed to insert travel profile {}", record.id))?;
+    Ok(())
+}
+
+pub fn get_travel_profile(conn: &Connection, id: &str) -> Result<Option<TravelProfileRecord>> {
+    conn.query_row(
+        "SELECT
+            id,
+            familiar_id,
+            workspace_id,
+            version,
+            generated_at,
+            expires_at,
+            stale_after,
+            source_hub_id,
+            source_revision_json,
+            permissions_json,
+            payload_json,
+            encoding,
+            content_hash,
+            profile_blob,
+            created_at
+         FROM travel_profiles
+         WHERE id = ?1
+         LIMIT 1",
+        params![id],
+        travel_profile_from_row,
+    )
+    .optional()
+    .with_context(|| format!("failed to read travel profile {id}"))
+}
+
+fn travel_profile_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TravelProfileRecord> {
+    Ok(TravelProfileRecord {
+        id: row.get(0)?,
+        familiar_id: row.get(1)?,
+        workspace_id: row.get(2)?,
+        version: row.get(3)?,
+        generated_at: row.get(4)?,
+        expires_at: row.get(5)?,
+        stale_after: row.get(6)?,
+        source_hub_id: row.get(7)?,
+        source_revision_json: row.get(8)?,
+        permissions_json: row.get(9)?,
+        payload_json: row.get(10)?,
+        encoding: row.get(11)?,
+        content_hash: row.get(12)?,
+        profile_blob: row.get(13)?,
+        created_at: row.get(14)?,
+    })
+}
+
+pub fn insert_travel_delta(conn: &Connection, record: &TravelDeltaRecord) -> Result<()> {
+    conn.execute(
+        "INSERT INTO travel_deltas (
+            id,
+            profile_id,
+            source_hub_id,
+            client_id,
+            state,
+            raw_delta_json,
+            accepted_events,
+            accepted_artifacts,
+            memory_review_state,
+            canonical_memory_overwrite_applied,
+            created_at,
+            updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            &record.id,
+            &record.profile_id,
+            &record.source_hub_id,
+            &record.client_id,
+            &record.state,
+            &record.raw_delta_json,
+            record.accepted_events,
+            record.accepted_artifacts,
+            &record.memory_review_state,
+            if record.canonical_memory_overwrite_applied {
+                1
+            } else {
+                0
+            },
+            &record.created_at,
+            &record.updated_at,
+        ],
+    )
+    .with_context(|| format!("failed to insert travel delta {}", record.id))?;
+    Ok(())
+}
+
+pub fn latest_travel_delta_for_client(
+    conn: &Connection,
+    client_id: &str,
+) -> Result<Option<TravelDeltaRecord>> {
+    conn.query_row(
+        "SELECT
+            id,
+            profile_id,
+            source_hub_id,
+            client_id,
+            state,
+            raw_delta_json,
+            accepted_events,
+            accepted_artifacts,
+            memory_review_state,
+            canonical_memory_overwrite_applied,
+            created_at,
+            updated_at
+         FROM travel_deltas
+         WHERE client_id = ?1
+         ORDER BY updated_at DESC, id DESC
+         LIMIT 1",
+        params![client_id],
+        travel_delta_from_row,
+    )
+    .optional()
+    .with_context(|| format!("failed to read latest travel delta for client {client_id}"))
+}
+
+fn travel_delta_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TravelDeltaRecord> {
+    let overwrite_applied: i64 = row.get(9)?;
+    Ok(TravelDeltaRecord {
+        id: row.get(0)?,
+        profile_id: row.get(1)?,
+        source_hub_id: row.get(2)?,
+        client_id: row.get(3)?,
+        state: row.get(4)?,
+        raw_delta_json: row.get(5)?,
+        accepted_events: row.get(6)?,
+        accepted_artifacts: row.get(7)?,
+        memory_review_state: row.get(8)?,
+        canonical_memory_overwrite_applied: overwrite_applied != 0,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
+    })
+}
+
+pub fn insert_scheduler_decision(
+    conn: &Connection,
+    record: &SchedulerDecisionRecord,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO scheduler_decisions (
+            id,
+            job_id,
+            target_role,
+            target_node_id,
+            target_json,
+            reason,
+            inputs_json,
+            created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            &record.id,
+            &record.job_id,
+            &record.target_role,
+            &record.target_node_id,
+            &record.target_json,
+            &record.reason,
+            &record.inputs_json,
+            &record.created_at,
+        ],
+    )
+    .with_context(|| format!("failed to insert scheduler decision {}", record.id))?;
+    Ok(())
+}
+
+pub fn get_scheduler_decision(
+    conn: &Connection,
+    id: &str,
+) -> Result<Option<SchedulerDecisionRecord>> {
+    conn.query_row(
+        "SELECT
+            id,
+            job_id,
+            target_role,
+            target_node_id,
+            target_json,
+            reason,
+            inputs_json,
+            created_at
+         FROM scheduler_decisions
+         WHERE id = ?1
+         LIMIT 1",
+        params![id],
+        |row| {
+            Ok(SchedulerDecisionRecord {
+                id: row.get(0)?,
+                job_id: row.get(1)?,
+                target_role: row.get(2)?,
+                target_node_id: row.get(3)?,
+                target_json: row.get(4)?,
+                reason: row.get(5)?,
+                inputs_json: row.get(6)?,
+                created_at: row.get(7)?,
+            })
+        },
+    )
+    .optional()
+    .with_context(|| format!("failed to read scheduler decision {id}"))
+}
+
+pub fn upsert_executor_queue(conn: &Connection, record: &ExecutorQueueRecord) -> Result<()> {
+    conn.execute(
+        "INSERT INTO executor_queue (
+            node_id,
+            job_ids_json,
+            updated_at
+        ) VALUES (?1, ?2, ?3)
+        ON CONFLICT(node_id) DO UPDATE SET
+            job_ids_json = excluded.job_ids_json,
+            updated_at = excluded.updated_at",
+        params![&record.node_id, &record.job_ids_json, &record.updated_at],
+    )
+    .with_context(|| format!("failed to upsert executor queue {}", record.node_id))?;
+    Ok(())
+}
+
+pub fn get_executor_queue(conn: &Connection, node_id: &str) -> Result<Option<ExecutorQueueRecord>> {
+    conn.query_row(
+        "SELECT node_id, job_ids_json, updated_at
+         FROM executor_queue
+         WHERE node_id = ?1
+         LIMIT 1",
+        params![node_id],
+        |row| {
+            Ok(ExecutorQueueRecord {
+                node_id: row.get(0)?,
+                job_ids_json: row.get(1)?,
+                updated_at: row.get(2)?,
+            })
+        },
+    )
+    .optional()
+    .with_context(|| format!("failed to read executor queue {node_id}"))
+}
+
+pub fn upsert_scheduler_loop_state(
+    conn: &Connection,
+    record: &SchedulerLoopStateRecord,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO loop_state (
+            loop_id,
+            job_id,
+            state,
+            decision_id,
+            target_json,
+            preserved_subqueue_node_id,
+            node_availability_json,
+            reason,
+            created_at,
+            updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        ON CONFLICT(loop_id) DO UPDATE SET
+            job_id = excluded.job_id,
+            state = excluded.state,
+            decision_id = excluded.decision_id,
+            target_json = excluded.target_json,
+            preserved_subqueue_node_id = excluded.preserved_subqueue_node_id,
+            node_availability_json = excluded.node_availability_json,
+            reason = excluded.reason,
+            updated_at = excluded.updated_at",
+        params![
+            &record.loop_id,
+            &record.job_id,
+            &record.state,
+            &record.decision_id,
+            &record.target_json,
+            &record.preserved_subqueue_node_id,
+            &record.node_availability_json,
+            &record.reason,
+            &record.created_at,
+            &record.updated_at,
+        ],
+    )
+    .with_context(|| format!("failed to upsert loop state {}", record.loop_id))?;
+    Ok(())
+}
+
+pub fn get_scheduler_loop_state(
+    conn: &Connection,
+    loop_id: &str,
+) -> Result<Option<SchedulerLoopStateRecord>> {
+    conn.query_row(
+        "SELECT
+            loop_id,
+            job_id,
+            state,
+            decision_id,
+            target_json,
+            preserved_subqueue_node_id,
+            node_availability_json,
+            reason,
+            created_at,
+            updated_at
+         FROM loop_state
+         WHERE loop_id = ?1
+         LIMIT 1",
+        params![loop_id],
+        |row| {
+            Ok(SchedulerLoopStateRecord {
+                loop_id: row.get(0)?,
+                job_id: row.get(1)?,
+                state: row.get(2)?,
+                decision_id: row.get(3)?,
+                target_json: row.get(4)?,
+                preserved_subqueue_node_id: row.get(5)?,
+                node_availability_json: row.get(6)?,
+                reason: row.get(7)?,
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
+            })
+        },
+    )
+    .optional()
+    .with_context(|| format!("failed to read loop state {loop_id}"))
 }
 
 pub fn insert_session(conn: &Connection, record: &SessionRecord) -> Result<()> {

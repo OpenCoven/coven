@@ -76,6 +76,22 @@ pub fn capabilities() -> CapabilityCatalog {
                 actions: vec![],
             },
             Capability {
+                id: "coven.travel",
+                label: "Travel profiles and offline delta reconciliation",
+                adapter: "coven-daemon",
+                status: CapabilityStatus::Available,
+                policy: CapabilityPolicy::Allow,
+                actions: vec![],
+            },
+            Capability {
+                id: "coven.scheduler",
+                label: "Multi-host scheduler decisions and recovery",
+                adapter: "coven-daemon",
+                status: CapabilityStatus::Available,
+                policy: CapabilityPolicy::Allow,
+                actions: vec![],
+            },
+            Capability {
                 id: "coven.control.actions",
                 label: "Coven control-plane action router",
                 adapter: "coven-daemon",

@@ -563,11 +563,13 @@ name = "coven-cli"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chacha20poly1305",
  "chrono",
  "clap",
  "crossterm",
  "dirs-next",
+ "flate2",
  "globset",
  "interprocess",
  "json5",
@@ -578,6 +580,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sysinfo",
  "tempfile",
  "textwrap",

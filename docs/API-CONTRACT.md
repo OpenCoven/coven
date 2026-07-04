@@ -33,6 +33,8 @@ The Coven daemon socket API is a public compatibility boundary for comux and ext
   "capabilities": {
     "sessions": true,
     "events": true,
+    "travel": true,
+    "scheduler": true,
     "eventCursor": "sequence",
     "structuredErrors": true
   },
@@ -52,6 +54,8 @@ If the daemon metadata is unavailable, `daemon` may be `null`.
 |-------------------|---------|-------------------------------------------------------------------|
 | `sessions`        | boolean | Sessions API (`/sessions`, `/sessions/:id`) is available.        |
 | `events`          | boolean | Events API (`/events`) is available.                             |
+| `travel`          | boolean | Travel profile, delta, and state APIs are available.             |
+| `scheduler`       | boolean | Scheduler decision and recovery APIs are available.              |
 | `eventCursor`     | string  | Cursor type supported; `"sequence"` means `afterSeq` is stable.  |
 | `structuredErrors`| boolean | All errors use the `{ error: { code, message, details } }` shape.|
 
@@ -114,6 +118,12 @@ All API errors use the following stable envelope. Clients must branch on `error.
 | `raw_artifacts_disabled` | 403       | Raw artifact retrieval was requested without explicit raw artifact persistence enabled. |
 | `raw_artifact_requires_raw_flag` | 400 | Raw artifact retrieval omitted the required `raw=1` query flag. |
 | `artifact_not_found`   | 404         | Sensitive artifact id does not exist for the session. |
+| `travel_profile_not_found` | 404     | Travel profile id does not exist.                |
+| `travel_profile_expired` | 409       | Travel profile is expired and cannot accept deltas. |
+| `source_hub_mismatch`  | 409         | Delta source hub does not match the travel profile source hub. |
+| `no_scheduler_target`  | 409         | No available scheduler node matches the requested capabilities and policy. |
+| `scheduler_decision_not_found` | 404 | Scheduler decision id does not exist.            |
+| `scheduler_loop_not_found` | 404     | Scheduler loop state does not exist.             |
 
 ## Capability catalog shape (`v1`)
 
@@ -129,6 +139,22 @@ All API errors use the following stable envelope. Clients must branch on `error.
       "status": "available",
       "policy": "allow",
       "actions": ["coven.capabilities.refresh"]
+    },
+    {
+      "id": "coven.travel",
+      "label": "Travel profiles and offline delta reconciliation",
+      "adapter": "coven-daemon",
+      "status": "available",
+      "policy": "allow",
+      "actions": []
+    },
+    {
+      "id": "coven.scheduler",
+      "label": "Multi-host scheduler decisions and recovery",
+      "adapter": "coven-daemon",
+      "status": "available",
+      "policy": "allow",
+      "actions": []
     },
     {
       "id": "desktop.automation",
@@ -175,7 +201,7 @@ Immediately completed safe actions return `200`:
     "action": "coven.capabilities.refresh",
     "origin": "external-client",
     "intentId": "intent-1",
-    "payload": { "capabilities": 3 }
+    "payload": { "capabilities": 5 }
   }
 }
 ```
@@ -267,6 +293,260 @@ Endpoints that return this shape:
   }
 ]
 ```
+
+## Travel mode profile and delta shapes (`v1`)
+
+Travel mode lets a same-user local client export a bounded, read-only working profile for laptop/offline work and later reconcile appended results back into the hub store. It is additive to sessions/events: uploaded offline events are persisted as ordinary redacted event-log entries on a reconciliation session.
+
+### `POST /api/v1/travel/profiles`
+
+Request:
+
+```json
+{
+  "familiarId": "sage",
+  "workspaceId": "workspace-1",
+  "expiresInSeconds": 604800,
+  "staleAfterSeconds": 172800
+}
+```
+
+`familiarId` is required. `workspaceId` defaults to `"default"`. Expiry values must be positive when supplied; defaults are 7 days for `expiresInSeconds` and 2 days for `staleAfterSeconds`, capped at the expiry.
+
+Response `201`:
+
+```json
+{
+  "profileId": "travel_...",
+  "version": "0.1",
+  "generatedAt": "2026-07-04T12:00:00Z",
+  "expiresAt": "2026-07-11T12:00:00Z",
+  "staleAfter": "2026-07-06T12:00:00Z",
+  "sourceHub": {
+    "hubId": "hub_...",
+    "displayName": "Coven hub"
+  },
+  "scope": {
+    "familiarId": "sage",
+    "workspaceId": "workspace-1"
+  },
+  "sourceRevision": {
+    "memoryRevision": "mem_...",
+    "loopRevision": "loop_..."
+  },
+  "permissions": {
+    "mode": "travel-read-only",
+    "allowedLocalAgents": ["lightweight"],
+    "allowMemoryOverwrite": false,
+    "allowHeavyweightLocalWork": false
+  },
+  "encoding": "gzip+base64",
+  "contentHash": "sha256:...",
+  "profileBlob": "..."
+}
+```
+
+The daemon also writes a gzip profile artifact under `<covenHome>/travel/profiles/` and marks it read-only. The profile payload may include familiar memory context for the requested familiar; clients must treat it as a snapshot, not a write target.
+
+### `POST /api/v1/travel/deltas`
+
+Request:
+
+```json
+{
+  "profileId": "travel_...",
+  "sourceHubId": "hub_...",
+  "sourceRevision": {
+    "memoryRevision": "mem_...",
+    "loopRevision": "loop_..."
+  },
+  "clientId": "laptop-1",
+  "events": [
+    { "id": "local-event-1", "kind": "assistant", "text": "offline result" }
+  ],
+  "artifacts": [
+    { "id": "artifact-1", "kind": "summary" }
+  ],
+  "proposedMemoryAdditions": [
+    { "path": "MEMORY.md", "text": "append this" }
+  ]
+}
+```
+
+`profileId`, `sourceHubId`, and `clientId` are required. Query `state` may be `handoff_pending`, `syncing_delta`, or `hub_resumed`; omitted state defaults to `hub_resumed`. Query `defer=1` is a compatibility alias for `state=handoff_pending`.
+
+Response `202`:
+
+```json
+{
+  "deltaId": "delta_...",
+  "state": "hub_resumed",
+  "acceptedEvents": 1,
+  "acceptedArtifacts": 1,
+  "memoryReviewState": "queued",
+  "canonicalMemoryOverwriteApplied": false,
+  "reconciliationSessionId": "travel-delta_...",
+  "hubRevision": {
+    "memoryRevision": "mem_...",
+    "loopRevision": "loop_..."
+  }
+}
+```
+
+The daemon appends offline events as `travel.offline_event` and offline artifacts as `travel.offline_artifact` entries on the reconciliation session. Proposed memory additions are queued for review; canonical memory overwrite is never applied by this endpoint.
+
+### `GET /api/v1/travel/state`
+
+Query parameters:
+
+| Parameter   | Required | Description                                      |
+|-------------|----------|--------------------------------------------------|
+| `clientId`  | Yes      | Client whose latest travel delta state is read. |
+| `profileId` | No      | Profile to evaluate before any delta exists.    |
+
+Response `200`:
+
+```json
+{
+  "state": "travel_local",
+  "profileId": "travel_...",
+  "pendingDeltaBytes": 0,
+  "lastSyncError": null,
+  "hubReachable": false,
+  "profileFreshness": "fresh",
+  "travelExecutionAllowed": true,
+  "validStates": [
+    "hub_active",
+    "travel_local",
+    "travel_stale",
+    "handoff_pending",
+    "syncing_delta",
+    "hub_resumed"
+  ]
+}
+```
+
+`profileFreshness` is `fresh`, `stale`, `expired`, `none`, or `unknown`. Expired profiles return `travelExecutionAllowed: false`; local clients should fail closed when that flag is false.
+
+## Scheduler decision and recovery shapes (`v1`)
+
+The scheduler routes multi-host work across local laptop, stationary, hub, and compute executor roles. Decisions are stored so clients can inspect prior routing and recover loop state after daemon restart.
+
+### `POST /api/v1/scheduler/decisions`
+
+Request:
+
+```json
+{
+  "jobId": "job-gpu-loop",
+  "requiredCapabilities": ["gpu", "long-running-loop"],
+  "taskWeight": "heavyweight",
+  "travelState": "hub_active",
+  "allowHeavyweightLocalWork": false,
+  "nodes": [
+    {
+      "nodeId": "node-compute-idle",
+      "role": "compute_executor",
+      "available": true,
+      "capabilities": ["gpu", "long-running-loop"],
+      "queuePressure": 1
+    }
+  ]
+}
+```
+
+Response `201`:
+
+```json
+{
+  "decisionId": "sched_...",
+  "jobId": "job-gpu-loop",
+  "target": {
+    "role": "compute_executor",
+    "nodeId": "node-compute-idle"
+  },
+  "reason": "compute_executor has required capability set and low queue pressure",
+  "inputs": {
+    "requiredCapabilities": ["gpu", "long-running-loop"],
+    "queuePressure": "low",
+    "travelState": "hub_active",
+    "taskWeight": "heavyweight"
+  },
+  "createdAt": "2026-07-04T12:00:00Z"
+}
+```
+
+The daemon filters unavailable nodes, required capability misses, low-battery `laptop_local` nodes during travel, and heavyweight laptop-local work while `travelState` is `travel_local` or `travel_stale` unless explicitly allowed.
+
+### `GET /api/v1/scheduler/decisions/:id`
+
+Returns the same shape as `POST /api/v1/scheduler/decisions` for a persisted decision, or `404 scheduler_decision_not_found`.
+
+### `POST /api/v1/scheduler/redispatch`
+
+Request:
+
+```json
+{
+  "loopId": "loop-gpu",
+  "jobId": "job-gpu-loop",
+  "currentNodeId": "compute-primary",
+  "requiredCapabilities": ["gpu", "long-running-loop"],
+  "loopResumable": true,
+  "nodes": [
+    {
+      "nodeId": "compute-primary",
+      "role": "compute_executor",
+      "available": false,
+      "capabilities": ["gpu", "long-running-loop"],
+      "queuePressure": 3,
+      "queuedJobIds": ["job-gpu-loop"]
+    },
+    {
+      "nodeId": "compute-fallback",
+      "role": "compute_executor",
+      "available": true,
+      "capabilities": ["gpu", "long-running-loop"],
+      "queuePressure": 1
+    }
+  ]
+}
+```
+
+Response `202`:
+
+```json
+{
+  "decisionId": "sched_...",
+  "state": "redispatched",
+  "loopId": "loop-gpu",
+  "jobId": "job-gpu-loop",
+  "target": {
+    "role": "compute_executor",
+    "nodeId": "compute-fallback"
+  },
+  "reason": "compute-primary went offline; redispatched resumable loop to compute-fallback",
+  "preservedSubqueue": {
+    "nodeId": "compute-primary",
+    "jobIds": ["job-gpu-loop"]
+  },
+  "nodeAvailability": [
+    {
+      "nodeId": "compute-primary",
+      "role": "compute_executor",
+      "available": false,
+      "queuePressure": "medium"
+    }
+  ],
+  "createdAt": "2026-07-04T12:00:00Z"
+}
+```
+
+If the loop is not resumable or no alternate node matches, `state` is `paused` and `target` is `{ "role": "paused", "nodeId": null }`. In both cases, the failed node subqueue is preserved.
+
+### `GET /api/v1/scheduler/loops/:loopId`
+
+Returns the persisted redispatch/pause state with the same fields as `POST /api/v1/scheduler/redispatch`, plus `updatedAt`, or `404 scheduler_loop_not_found`.
 
 ## Raw artifact access (`v1`)
 
@@ -375,4 +655,4 @@ Shared non-success responses use the structured error envelope:
 
 ## Scope boundary
 
-The `coven.daemon.v1` contract covers daemon health, capability discovery, action routing, sessions, events, live input, and live kill. Do not treat future orchestration, handoff, or task-routing route names as reserved API until they are implemented and documented in this file.
+The `coven.daemon.v1` contract covers daemon health, capability discovery, action routing, sessions, events, live input, live kill, travel-mode profile/delta reconciliation, and scheduler decision/recovery routes. Do not treat route names outside this document as reserved API until they are implemented and documented here.
