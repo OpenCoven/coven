@@ -1,10 +1,9 @@
 # Contributing to OpenCoven / Coven
 
-> **⚠️ Contribution Status — Updated June 2026**
+> **Contribution Status — Updated July 2026**
 >
-> **Independence Day PR Event:** external Pull Requests open starting **Saturday, July 4, 2026**.
-> Until then, we are accepting Issues and Bug Reports only.
-> If you have a fix or feature in mind, open an issue to track it and bring the PR when the event opens.
+> External Pull Requests are open. Please start from an issue for larger changes
+> and include the readiness packet requested by the PR template.
 
 Coven is built as a small, boring Rust authority layer with TypeScript integration packages around it. The development loop should keep that boundary clear.
 

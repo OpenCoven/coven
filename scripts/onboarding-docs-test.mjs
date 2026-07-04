@@ -17,6 +17,65 @@ const criticalDocs = [
   'docs/daemon/health.md'
 ];
 
+const sessionCommandDocs = [
+  {
+    path: 'docs/reference/cli-sessions.md',
+    command: 'coven sessions',
+    required: ['--plain', '--json', '--all', '--manage', 'coven sessions search']
+  },
+  {
+    path: 'docs/reference/cli-attach.md',
+    command: 'coven attach',
+    required: ['Replay', 'live session', 'forwards input', 'non-interactive']
+  },
+  {
+    path: 'docs/reference/cli-archive.md',
+    command: 'coven archive',
+    required: ['non-running', 'preserves', 'coven sessions --all', 'coven summon']
+  },
+  {
+    path: 'docs/reference/cli-summon.md',
+    command: 'coven summon',
+    required: ['archived session', 'clears archived_at', 'coven attach', 'replay']
+  },
+  {
+    path: 'docs/reference/cli-sacrifice.md',
+    command: 'coven sacrifice',
+    required: ['--yes', 'permanently delete', 'non-running', 'event log']
+  }
+];
+
+const platformDocs = [
+  {
+    path: 'docs/platforms/macos.md',
+    required: ['npm install -g @opencoven/cli', 'Apple Silicon', 'launchd', 'COVEN_HOME']
+  },
+  {
+    path: 'docs/platforms/linux.md',
+    required: ['glibc', 'systemd', 'COVEN_HOME', 'coven daemon status']
+  },
+  {
+    path: 'docs/platforms/windows.md',
+    required: ['PowerShell', 'WSL2', 'COVEN_HOME', 'coven doctor']
+  },
+  {
+    path: 'docs/platforms/wsl2.md',
+    required: ['Linux filesystem', '/mnt/c', 'COVEN_HOME', 'coven daemon start']
+  },
+  {
+    path: 'docs/platforms/headless.md',
+    required: ['SSH', 'same user', 'COVEN_HOME', 'coven attach']
+  },
+  {
+    path: 'docs/platforms/cloud-vm.md',
+    required: ['systemd', 'SSH', 'COVEN_HOME', 'do not expose']
+  },
+  {
+    path: 'docs/platforms/raspberry-pi.md',
+    required: ['64-bit', 'source', 'systemd', 'persistent']
+  }
+];
+
 function readRepoFile(path) {
   return readFileSync(new URL(`../${path}`, import.meta.url), 'utf8');
 }
@@ -43,6 +102,37 @@ test('install docs link COVEN_HOME users to the daemon state guide', () => {
   }
 
   assert.match(readRepoFile('docs/install/index.md'), /\/daemon\/coven-home\b/);
+});
+
+test('session command reference docs are actionable after onboarding', () => {
+  for (const { path, command, required } of sessionCommandDocs) {
+    const text = readRepoFile(path);
+    assert.doesNotMatch(text, /^Stub -- fill in\.?$/m, `${path} must not be a stub`);
+    assert.doesNotMatch(text, /^Stub . fill in\.?$/m, `${path} must not be a stub`);
+    assert.match(text, new RegExp(command.replace(' ', '\\s+'), 'i'), `${path} must name ${command}`);
+    assert.match(text, /## Usage/, `${path} must include usage`);
+    assert.match(text, /## Related/, `${path} must link next steps`);
+    assert.ok(text.length > 900, `${path} must include practical command guidance`);
+    for (const phrase of required) {
+      assert.match(text, new RegExp(phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'), `${path} must mention ${phrase}`);
+    }
+  }
+});
+
+test('platform docs route users to the right install and operating model', () => {
+  for (const { path, required } of platformDocs) {
+    const text = readRepoFile(path);
+    assert.doesNotMatch(text, /^Stub -- fill in\.?$/m, `${path} must not be a stub`);
+    assert.doesNotMatch(text, /^Stub . fill in\.?$/m, `${path} must not be a stub`);
+    assert.match(text, /## Install path/, `${path} must identify the install path`);
+    assert.match(text, /## Verify/, `${path} must include verification commands`);
+    assert.match(text, /coven doctor/, `${path} must include doctor`);
+    assert.match(text, /coven sessions/, `${path} must include the after-onboarding session check`);
+    assert.ok(text.length > 850, `${path} must include practical platform guidance`);
+    for (const phrase of required) {
+      assert.match(text, new RegExp(phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'), `${path} must mention ${phrase}`);
+    }
+  }
 });
 
 test('ci runs npm onboarding smoke on every published platform', () => {
@@ -80,7 +170,9 @@ test('npm onboarding smoke launches Windows cmd shims through a shell', () => {
 test('npm onboarding smoke verifies first-run missing-harness guidance deterministically', () => {
   const script = readRepoFile('scripts/test-cli-prepublish.mjs');
   assert.match(script, /function firstRunSmokePath\(/);
-  assert.match(script, /PATH:\s*firstRunSmokePath\(wrapperBin\)/);
+  assert.match(script, /PATH:\s*firstRunSmokePath\(wrapperBin,\s*tempDir\)/);
+  assert.match(script, /node-shim-bin/);
+  assert.doesNotMatch(script, /path\.dirname\(process\.execPath\)/);
   assert.match(script, /Install and authenticate at least one harness in this same shell/);
   assert.match(script, /npm install -g @openai\/codex && codex login/);
   assert.match(script, /npm install -g @anthropic-ai\/claude-code && claude doctor/);

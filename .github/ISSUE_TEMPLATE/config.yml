@@ -1,5 +1,5 @@
 blank_issues_enabled: true
 contact_links:
-  - name: "⚠️ PRs not accepted until July 2026"
+  - name: "OpenCoven contribution guide"
     url: https://github.com/OpenCoven/coven/blob/main/CONTRIBUTING.md
-    about: "We are only accepting Issues and Bug Reports right now. Please read CONTRIBUTING.md before opening a PR."
+    about: "Read the contribution guide before opening larger issues or pull requests."

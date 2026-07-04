@@ -43,12 +43,12 @@
     },
     {
       "name": "codeflow-maintainer",
-      "description": "OpenClaw maintainer PR workflow modes and skills. Maps to openclaw/maintainers PR_WORKFLOW.md phases (review-pr → prepare-pr → merge-pr). Provides structured modes with allowed/blocked actions, focus areas, checkpoint questions, and agent prompt injection for each phase.",
+      "description": "OpenClaw-only maintainer PR workflow modes and skills. For OpenCoven/coven PR creation, redirect to skills/pr-agent, the Coven PR Readiness Agent.",
       "source": "openclaw-workspace",
       "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/codeflow-maintainer",
       "targetPath": "skills/codeflow-maintainer",
-      "migrationStatus": "copied-from-openclaw-workspace",
-      "managedBySync": true
+      "migrationStatus": "represented-by-existing-coven-skill",
+      "managedBySync": false
     },
     {
       "name": "codex-session-manager",
@@ -259,12 +259,12 @@
     },
     {
       "name": "openclaw-dev",
-      "description": "OpenClaw Dev Agent — docs-aware development assistant for the OpenClaw ecosystem. Handles PR workflows (review → prepare → merge), issue triage, docs sync, release prep, and architecture review. Grounded in live OpenClaw documentation and the official maintainer workflow from openclaw/maintainers.",
+      "description": "OpenClaw Dev Agent — OpenClaw-only docs-aware development assistant. For OpenCoven/coven PR creation, redirect to skills/pr-agent, the Coven PR Readiness Agent.",
       "source": "openclaw-workspace",
       "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/openclaw-dev",
       "targetPath": "skills/openclaw-dev",
-      "migrationStatus": "copied-from-openclaw-workspace",
-      "managedBySync": true
+      "migrationStatus": "represented-by-existing-coven-skill",
+      "managedBySync": false
     },
     {
       "name": "openclaw-trust",
@@ -295,12 +295,12 @@
     },
     {
       "name": "pr-agent",
-      "description": "OpenClaw PR Agent orchestrator. Coordinates the three-phase maintainer workflow (review-pr → prepare-pr → merge-pr) with strict adherence to PR_WORKFLOW.md. Enforces quality bars, checkpoint questions, and safe mode transitions.",
+      "description": "Coven PR Readiness Agent for assembling agent-ready OpenCoven pull requests.",
       "source": "openclaw-workspace",
       "sourcePath": "${OPENCLAW_SKILLS_DIR:-~/.openclaw/workspace/skills}/pr-agent",
       "targetPath": "skills/pr-agent",
-      "migrationStatus": "copied-from-openclaw-workspace",
-      "managedBySync": true
+      "migrationStatus": "represented-by-existing-coven-skill",
+      "managedBySync": false
     },
     {
       "name": "project-manager",

@@ -1,10 +1,8 @@
 ---
 name: codeflow-maintainer
 description: >
-  OpenClaw maintainer PR workflow modes and skills. Maps to openclaw/maintainers
-  PR_WORKFLOW.md phases (review-pr → prepare-pr → merge-pr). Provides structured
-  modes with allowed/blocked actions, focus areas, checkpoint questions, and
-  agent prompt injection for each phase.
+  OpenClaw-only maintainer PR workflow modes and skills. For OpenCoven/coven PR
+  creation, redirect to skills/pr-agent, the Coven PR Readiness Agent.
 version: 1.0.0
 tags: [github, pr, workflow, maintainer, code-review, openclaw]
 inheritable: true
@@ -16,7 +14,9 @@ inheritable: true
 
 **PR_WORKFLOW.md:** https://github.com/openclaw/maintainers/blob/main/.agents/skills/PR_WORKFLOW.md
 
-This skill implements the workflow defined in `openclaw/maintainers`. All modes, checkpoints, and quality bars derive from that document.
+This skill is OpenClaw-only. It implements the workflow defined in
+`openclaw/maintainers` for OpenClaw repositories. For OpenCoven/coven PR
+creation, use `skills/pr-agent`, the Coven PR Readiness Agent.
 
 ## Working Rule
 
@@ -153,9 +153,8 @@ Triage → Review → Prepare → Merge → Post-Merge
 
 For concrete workflow execution, see the **pr-agent** skill:
 
-- **Location:** `~/.openclaw/workspace/skills/pr-agent/`
-- **Purpose:** Orchestrates the three-phase workflow with script-first execution
-- **Source:** https://github.com/openclaw/maintainers/tree/main/.agents/skills/pr-agent
+- **OpenClaw:** use the OpenClaw maintainer skill bundle.
+- **OpenCoven/coven:** use `skills/pr-agent`, the Coven PR Readiness Agent.
 
 The pr-agent skill provides:
 - Automatic artifact validation (`.local/*.json`, `.local/*.md`)

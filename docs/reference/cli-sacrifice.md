@@ -6,4 +6,45 @@ title: "coven sacrifice"
 description: "Reference for coven sacrifice: the destructive ritual that removes a session record and its events. Refuses live sessions and requires --yes."
 ---
 
-Stub — fill in.
+## Usage
+
+```bash
+coven sacrifice <session-id> --yes
+```
+
+Sacrifice is the permanent delete command for a non-running session and its
+event log. It is intentionally explicit so a copied session id is not enough to
+delete history by accident.
+
+## Safety rules
+
+`coven sacrifice` requires `--yes`. Without it, the command fails and tells you
+to rerun with confirmation.
+
+The command also refuses live sessions:
+
+```text
+session `<session-id>` is still running; do not sacrifice live work
+```
+
+Use `coven attach <session-id>` or `coven daemon status` first if you are not
+sure whether the harness is still running.
+
+## What gets deleted
+
+Sacrifice deletes the session row from the local store. Session events are
+removed with it, so replay, search, and archive recovery no longer work for that
+session.
+
+Use archive instead when you only want to clean up the active list:
+
+```bash
+coven archive <session-id>
+```
+
+## Related
+
+- [Session lifecycle](/SESSION-LIFECYCLE)
+- [Sessions](/reference/cli-sessions)
+- [Attach](/reference/cli-attach)
+- [Archive](/reference/cli-archive)

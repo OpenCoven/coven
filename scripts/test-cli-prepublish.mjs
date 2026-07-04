@@ -3,7 +3,7 @@
 //
 // What it does:
 //   1. Verifies prerequisites (node, npm, cargo).
-//   2. Runs the secrets scan, onboarding guardrails, and publish-npm.mjs unit tests.
+//   2. Runs the secrets scan, onboarding, PR readiness, and publish guardrails.
 //   3. Stages the dist tree by running publish-npm.mjs in --dry-run mode
 //      (which also runs `cargo build --release --target <rust-target>` unless
 //      --skip-build is passed) and lets `npm publish --dry-run` validate the
@@ -31,7 +31,7 @@
 // Exit code is non-zero on the first failing step.
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -93,8 +93,13 @@ if (!skipSecretsScan) {
   });
 }
 
-step('onboarding and publish guardrails', () => {
-  run('node', ['--test', 'scripts/onboarding-docs-test.mjs', 'scripts/publish-npm-test.mjs']);
+step('onboarding, PR readiness, and publish guardrails', () => {
+  run('node', [
+    '--test',
+    'scripts/onboarding-docs-test.mjs',
+    'scripts/pr-readiness-test.mjs',
+    'scripts/publish-npm-test.mjs'
+  ]);
 });
 
 if (withCargoGates) {
@@ -174,7 +179,7 @@ step(`install wrapper + native package in a temp project (${targetName})`, () =>
   const smokeEnv = {
     ...process.env,
     COVEN_HOME: path.join(tempDir, 'coven-home'),
-    PATH: firstRunSmokePath(wrapperBin)
+    PATH: firstRunSmokePath(wrapperBin, tempDir)
   };
   mkdirSync(smokeEnv.COVEN_HOME, { recursive: true });
 
@@ -396,11 +401,19 @@ function spawnOptionsForCommand(options = {}, platform = process.platform) {
   };
 }
 
-function firstRunSmokePath(wrapperBin) {
-  return [
-    path.dirname(wrapperBin),
-    path.dirname(process.execPath)
-  ].join(path.delimiter);
+function firstRunSmokePath(wrapperBin, tempProjectDir) {
+  const nodeShimDir = path.join(tempProjectDir, 'node-shim-bin');
+  mkdirSync(nodeShimDir, { recursive: true });
+
+  if (process.platform === 'win32') {
+    writeFileSync(path.join(nodeShimDir, 'node.cmd'), `@"${process.execPath}" %*\r\n`);
+  } else {
+    const nodeShim = path.join(nodeShimDir, 'node');
+    writeFileSync(nodeShim, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} "$@"\n`);
+    chmodSync(nodeShim, 0o755);
+  }
+
+  return [path.dirname(wrapperBin), nodeShimDir].join(path.delimiter);
 }
 
 function fail(message) {

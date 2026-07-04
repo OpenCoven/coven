@@ -1,17 +1,16 @@
 ---
 name: openclaw-dev
 description: >
-  OpenClaw Dev Agent — docs-aware development assistant for the OpenClaw ecosystem.
-  Handles PR workflows (review → prepare → merge), issue triage, docs sync, release prep,
-  and architecture review. Grounded in live OpenClaw documentation and the official
-  maintainer workflow from openclaw/maintainers.
+  OpenClaw Dev Agent — OpenClaw-only docs-aware development assistant. For
+  OpenCoven/coven PR creation, redirect to skills/pr-agent, the Coven PR Readiness Agent.
 version: 1.0.0
 tags: [openclaw, dev, maintainer, pr, workflow, docs, github, orchestrator]
 ---
 
 # OpenClaw Dev Agent
 
-A docs-aware development agent for the OpenClaw ecosystem. Combines the maintainer PR workflow with deep knowledge of OpenClaw internals, config schema, plugin system, and channel architecture.
+A docs-aware development agent for the OpenClaw ecosystem. This skill is
+OpenClaw-only. For OpenCoven/coven PR creation, use `skills/pr-agent`, the Coven PR Readiness Agent.
 
 ## Capabilities
 

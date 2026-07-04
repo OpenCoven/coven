@@ -1,15 +1,30 @@
-> **⚠️ PRs are not being accepted until July 2026.**
-> Please close this PR and open an Issue instead. PRs opened before July 2026 will be closed without review.
-> See [CONTRIBUTING.md](../CONTRIBUTING.md) for details.
+## Context
 
-## Description
+- Summary:
+- Files changed:
+- Closes #
 
-<!-- What does this PR do? -->
+## Implementation
 
-## Linked Issue
+- Approach:
+- User-visible behavior:
+- Compatibility notes:
 
-Closes #
+## Verification
 
-## Testing
+- [ ] `cargo fmt --check`
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
+- [ ] `cargo test --workspace --locked`
+- [ ] `python3 scripts/check-secrets.py`
+- [ ] Additional manual checks:
 
-<!-- How was this tested? -->
+## Risk and Rollback
+
+- Risk level:
+- Rollback plan:
+
+## Agent Handoff
+
+- Current state:
+- Follow-ups:
+- Known gaps:
