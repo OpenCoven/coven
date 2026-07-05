@@ -15,6 +15,7 @@ title: "Coven changelog and release notes"
 
 ### Updates
 
+- **CLI-login-only model selection (v0.0.53).** The model-selection docs now expose only the supported Codex CLI and Claude Code login paths. Provider/API-key option pages for OpenAI, Anthropic, Google, and local-model backends were removed from the selectable `/models` surface so clients and users are routed through `codex login` or `claude doctor` instead of raw provider credentials. See [Model selection](/models).
 - **Multi-host daemon specs.** Added PRODUCT and TECH specs for travel profiles, offline deltas, scheduler roles, redispatch, failure handling, and the issue mapping for the multi-host daemon track.
 
 ## Week of June 24, 2026

@@ -6,6 +6,12 @@ read_when:
 title: "Changelog y notas de release de Coven"
 ---
 
+## Semana del 4 de julio de 2026
+
+### Actualizaciones
+
+- **Selección de modelo sólo por login de CLI (v0.0.53).** La documentación de selección de modelo ahora muestra únicamente las rutas soportadas de Codex CLI y Claude Code. Se quitaron de la superficie seleccionable `/models` las páginas de opciones por proveedor/API key para OpenAI, Anthropic, Google y backends de modelos locales, de modo que clientes y usuarios vayan por `codex login` o `claude doctor` en lugar de credenciales crudas de proveedor. Consulta [Model selection](/models).
+
 ## Semana del 24 de junio de 2026
 
 ### Nuevas funcionalidades
