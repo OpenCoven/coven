@@ -18,7 +18,7 @@ coven daemon status
 | Command | Action |
 | --- | --- |
 | `coven daemon start` | Start the daemon if it is not already running. Reuses a verified live daemon. |
-| `coven daemon status` | Print stopped/running/stale status, pid, socket path, and health flag. |
+| `coven daemon status` | Print stopped/running/stale status, pid, socket path, and health flag. `--json` prints the same fields as one JSON document (`status`, `ok`, `pid`, `socket`, `started_at`). |
 | `coven daemon restart` | Stop the current daemon if present, then start a daemon with the current binary. |
 | `coven daemon stop` | Stop the daemon for the active `COVEN_HOME`. |
 | `coven daemon serve` | Hidden foreground server entrypoint used by the background launcher and supervisors. |

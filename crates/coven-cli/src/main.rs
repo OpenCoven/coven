@@ -211,6 +211,12 @@ enum Command {
         branch: Option<String>,
         #[arg(long, conflicts_with_all = ["doctor", "prune_merged", "prune_stale"], help = "List worktrees with claim and dirty state")]
         list: bool,
+        #[arg(
+            long,
+            requires = "list",
+            help = "Print worktrees as JSON (machine-readable; requires --list)"
+        )]
+        json: bool,
         #[arg(long, conflicts_with_all = ["list", "prune_merged", "prune_stale"], help = "Report protocol layout and hook issues (exits 1 when issues are found)")]
         doctor: bool,
         #[arg(long, conflicts_with_all = ["list", "doctor", "prune_stale"], help = "Remove clean worktrees whose branches are merged into the primary branch")]
@@ -344,7 +350,10 @@ enum DaemonCommand {
     #[command(about = "Restart the background daemon")]
     Restart,
     #[command(about = "Show whether the daemon is running")]
-    Status,
+    Status {
+        #[arg(long, help = "Print daemon status as JSON (machine-readable)")]
+        json: bool,
+    },
     #[command(about = "Stop the background daemon")]
     Stop,
     #[command(hide = true)]
@@ -405,7 +414,10 @@ enum ClaimCommand {
         branch: String,
     },
     #[command(about = "Show active and expired claims for this repository")]
-    Status,
+    Status {
+        #[arg(long, help = "Print claims as JSON (machine-readable)")]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -500,12 +512,14 @@ fn run_cli(cli: Cli) -> Result<()> {
         Some(Command::Wt {
             branch,
             list,
+            json,
             doctor,
             prune_merged,
             prune_stale,
         }) => parallel_protocol::run_wt_command(
             branch.as_deref(),
             list,
+            json,
             doctor,
             prune_merged,
             prune_stale,
@@ -515,7 +529,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             ClaimCommand::Release { branch } => parallel_protocol::claim_release(&branch),
             ClaimCommand::Heartbeat { branch } => parallel_protocol::claim_heartbeat(&branch),
             ClaimCommand::Canary { branch } => parallel_protocol::claim_canary(&branch),
-            ClaimCommand::Status => parallel_protocol::claim_status(),
+            ClaimCommand::Status { json } => parallel_protocol::claim_status(json),
         },
         Some(Command::Hooks { command }) => match command {
             HooksCommand::Install => parallel_protocol::hooks_install(),
@@ -1516,25 +1530,33 @@ fn run_daemon_command(command: DaemonCommand) -> Result<()> {
                 );
             }
         }
-        DaemonCommand::Status => match daemon::background_server_status(&home)? {
-            Some(daemon::DaemonStatusState::Running(status)) => {
-                let health = api::health_response(Some(status.clone()));
-                println!(
-                    "coven daemon status=running ok={} pid={} socket={}",
-                    health.ok, status.pid, status.socket
-                );
+        DaemonCommand::Status { json } => {
+            let state = daemon::background_server_status(&home)?;
+            if json {
+                println!("{}", render_daemon_status_json(state.as_ref())?);
+            } else {
+                match &state {
+                    Some(daemon::DaemonStatusState::Running(status)) => {
+                        let health = api::health_response(Some(status.clone()));
+                        println!(
+                            "coven daemon status=running ok={} pid={} socket={}",
+                            health.ok, status.pid, status.socket
+                        );
+                    }
+                    Some(daemon::DaemonStatusState::Stale(status)) => println!(
+                        "coven daemon status=stale ok=false pid={} socket={}",
+                        status.pid, status.socket
+                    ),
+                    None => println!("coven daemon status=stopped"),
+                }
             }
-            Some(daemon::DaemonStatusState::Stale(status)) => println!(
-                "coven daemon status=stale ok=false pid={} socket={}",
-                status.pid, status.socket
-            ),
-            None => {
-                println!("coven daemon status=stopped");
+            if state.is_none() {
+                // Hint goes to stderr so `--json` stdout stays parseable.
                 eprintln!(
                     "start it with `coven daemon start` (optional — `coven run` works without it)"
                 );
             }
-        },
+        }
         DaemonCommand::Stop => {
             if daemon::stop_background_server(&home)? {
                 println!("coven daemon status=stopped");
@@ -1561,6 +1583,38 @@ fn run_daemon_command(command: DaemonCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Machine-readable form of `coven daemon status`. Field names are stable
+/// snake_case; `pid`, `socket`, and `started_at` are null when stopped.
+fn render_daemon_status_json(state: Option<&daemon::DaemonStatusState>) -> Result<String> {
+    let value = match state {
+        Some(daemon::DaemonStatusState::Running(status)) => {
+            let health = api::health_response(Some(status.clone()));
+            serde_json::json!({
+                "status": "running",
+                "ok": health.ok,
+                "pid": status.pid,
+                "socket": status.socket,
+                "started_at": status.started_at,
+            })
+        }
+        Some(daemon::DaemonStatusState::Stale(status)) => serde_json::json!({
+            "status": "stale",
+            "ok": false,
+            "pid": status.pid,
+            "socket": status.socket,
+            "started_at": status.started_at,
+        }),
+        None => serde_json::json!({
+            "status": "stopped",
+            "ok": false,
+            "pid": null,
+            "socket": null,
+            "started_at": null,
+        }),
+    };
+    serde_json::to_string_pretty(&value).context("failed to serialize daemon status as JSON")
 }
 
 fn harness_launch_mode_for_stdio() -> harness::HarnessLaunchMode {
@@ -3732,5 +3786,49 @@ mod tests {
             ),
             Some(shim)
         );
+    }
+
+    fn sample_daemon_status() -> daemon::DaemonStatus {
+        daemon::DaemonStatus {
+            pid: 4242,
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            socket: "/tmp/coven.sock".to_string(),
+        }
+    }
+
+    #[test]
+    fn daemon_status_json_reports_running_daemon() {
+        let state = daemon::DaemonStatusState::Running(sample_daemon_status());
+        let body = render_daemon_status_json(Some(&state)).expect("render");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+
+        assert_eq!(value["status"], "running");
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["pid"], 4242);
+        assert_eq!(value["socket"], "/tmp/coven.sock");
+        assert_eq!(value["started_at"], "2026-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn daemon_status_json_reports_stale_daemon() {
+        let state = daemon::DaemonStatusState::Stale(sample_daemon_status());
+        let body = render_daemon_status_json(Some(&state)).expect("render");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+
+        assert_eq!(value["status"], "stale");
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["pid"], 4242);
+    }
+
+    #[test]
+    fn daemon_status_json_reports_stopped_daemon_with_null_fields() {
+        let body = render_daemon_status_json(None).expect("render");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+
+        assert_eq!(value["status"], "stopped");
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["pid"], serde_json::Value::Null);
+        assert_eq!(value["socket"], serde_json::Value::Null);
+        assert_eq!(value["started_at"], serde_json::Value::Null);
     }
 }

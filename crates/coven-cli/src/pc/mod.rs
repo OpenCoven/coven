@@ -20,9 +20,14 @@ pub enum PcCommand {
         n: usize,
         #[arg(long, help = "Include full command-line arguments")]
         verbose: bool,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
     },
     #[command(about = "Disk usage breakdown")]
-    Disk,
+    Disk {
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
     #[command(about = "Kill a process by PID (requires --confirm)")]
     Kill {
         #[arg(help = "Process ID to terminate")]
@@ -62,18 +67,25 @@ pub fn run_pc_command(command: Option<PcCommand>) -> Result<()> {
             };
             display::print_status(&snap, &fmt);
         }
-        Some(PcCommand::Top { n, verbose }) => {
+        Some(PcCommand::Top { n, verbose, json }) => {
             let snap = diagnostics::snapshot(verbose)?;
-            let fmt = if verbose {
+            let fmt = if json {
+                OutputFormat::Json
+            } else if verbose {
                 OutputFormat::Verbose
             } else {
                 OutputFormat::Compact
             };
             display::print_top(&snap, n, &fmt);
         }
-        Some(PcCommand::Disk) => {
+        Some(PcCommand::Disk { json }) => {
             let snap = diagnostics::snapshot(false)?;
-            display::print_disk_usage(&snap);
+            let fmt = if json {
+                OutputFormat::Json
+            } else {
+                OutputFormat::Compact
+            };
+            display::print_disk_usage(&snap, &fmt);
         }
         Some(PcCommand::Kill { pid, confirm }) => {
             relief::kill_by_pid(pid, confirm)?;
