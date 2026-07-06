@@ -189,7 +189,18 @@ step(`install wrapper + native package in a temp project (${targetName})`, () =>
   }
   console.log(`coven --version => ${versionOutput.stdout.trim()}`);
 
-  const doctorOutput = runCapture(wrapperBin, ['doctor'], { env: smokeEnv });
+  // A bare runner has no harness installed, so doctor correctly reports a
+  // blocking problem and exits 1. The smoke asserts the first-run report,
+  // not a provisioned environment.
+  const doctorOutput = runCapture(wrapperBin, ['doctor'], {
+    env: smokeEnv,
+    allowedExitCodes: [1]
+  });
+  if (doctorOutput.status !== 1) {
+    fail(
+      `\`coven doctor\` on a bare runner should exit 1 (no harness available); got ${doctorOutput.status}\nstdout:\n${doctorOutput.stdout}\nstderr:\n${doctorOutput.stderr}`
+    );
+  }
   if (!doctorOutput.stdout.includes('Coven doctor')) {
     fail(
       `\`coven doctor\` did not print the expected banner.\nstdout:\n${doctorOutput.stdout}\nstderr:\n${doctorOutput.stderr}`
@@ -198,13 +209,14 @@ step(`install wrapper + native package in a temp project (${targetName})`, () =>
   for (const expected of [
     'Install and authenticate at least one harness in this same shell',
     'npm install -g @openai/codex && codex login',
-    'npm install -g @anthropic-ai/claude-code && claude doctor'
+    'npm install -g @anthropic-ai/claude-code && claude doctor',
+    'Doctor found problems; review the failing checks above.'
   ]) {
     if (!doctorOutput.stdout.includes(expected)) {
       fail(`\`coven doctor\` missing first-run setup guidance "${expected}".\nstdout:\n${doctorOutput.stdout}\nstderr:\n${doctorOutput.stderr}`);
     }
   }
-  console.log('coven doctor first-run setup guidance present');
+  console.log('coven doctor first-run setup guidance present (exit 1 on bare runner)');
 
   const helpOutput = runCapture(wrapperBin, ['--help'], { env: smokeEnv });
   if (helpOutput.status !== 0) {
@@ -377,7 +389,7 @@ function runCapture(command, commandArgs, options = {}) {
   if (result.error) {
     fail(`${printable} failed: ${result.error.message}`);
   }
-  if (result.status !== 0) {
+  if (result.status !== 0 && !(options.allowedExitCodes ?? []).includes(result.status)) {
     fail(`${printable} exited with ${result.status}\nstderr:\n${result.stderr}`);
   }
   return result;
