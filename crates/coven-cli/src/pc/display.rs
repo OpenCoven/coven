@@ -110,17 +110,57 @@ fn print_proc(p: &ProcessInfo, format: &OutputFormat) {
 }
 
 pub fn print_top(snap: &SystemSnapshot, n: usize, format: &OutputFormat) {
+    if matches!(format, OutputFormat::Json) {
+        println!("{}", format_top_json(snap, n));
+        return;
+    }
     println!("── Top {} Processes (by CPU) ────────────────", n);
     for proc in snap.processes.iter().take(n) {
         print_proc(proc, format);
     }
 }
 
-pub fn print_disk_usage(snap: &SystemSnapshot) {
+fn format_top_json(snap: &SystemSnapshot, n: usize) -> String {
+    let value = json!({
+        "processes": snap.processes.iter().take(n).map(|p| {
+            let mut entry = json!({
+                "pid": p.pid,
+                "name": p.name,
+                "cpu_pct": p.cpu_pct,
+                "memory_mb": p.memory_mb,
+            });
+            if let Some(argv) = &p.argv {
+                entry["argv"] = json!(argv);
+            }
+            entry
+        }).collect::<Vec<_>>(),
+    });
+    serde_json::to_string_pretty(&value).expect("process list JSON serialization cannot fail")
+}
+
+pub fn print_disk_usage(snap: &SystemSnapshot, format: &OutputFormat) {
+    if matches!(format, OutputFormat::Json) {
+        println!("{}", format_disk_json(snap));
+        return;
+    }
     println!("── Disk Usage ──────────────────────────────");
     for disk in &snap.disks {
         print_disk(disk);
     }
+}
+
+fn format_disk_json(snap: &SystemSnapshot) -> String {
+    let value = json!({
+        "disks": snap.disks.iter().map(|d| {
+            json!({
+                "mount": d.mount,
+                "total_gb": d.total_gb,
+                "available_gb": d.available_gb,
+                "used_pct": d.used_pct,
+            })
+        }).collect::<Vec<_>>(),
+    });
+    serde_json::to_string_pretty(&value).expect("disk list JSON serialization cannot fail")
 }
 
 fn format_json(snap: &SystemSnapshot) -> String {
@@ -202,6 +242,47 @@ mod tests {
         assert_eq!(value["cpu_usage_pct"], 12.5);
         assert_eq!(value["processes"][0]["name"], "proc \"quoted\"\u{7}");
         assert_eq!(value["disks"][0]["mount"], "/Volumes/name \"quoted\"\u{7}");
+    }
+
+    #[test]
+    fn top_json_serializes_processes_with_optional_argv() {
+        let mut snap = sample_snapshot();
+        snap.processes[0].argv = Some(vec!["proc".to_string(), "--flag".to_string()]);
+        let body = format_top_json(&snap, 10);
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+
+        assert_eq!(value["processes"][0]["pid"], 42);
+        assert_eq!(value["processes"][0]["argv"][1], "--flag");
+
+        snap.processes[0].argv = None;
+        let body = format_top_json(&snap, 10);
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert!(value["processes"][0].get("argv").is_none());
+    }
+
+    #[test]
+    fn top_json_honors_the_requested_count() {
+        let mut snap = sample_snapshot();
+        let second = ProcessInfo {
+            pid: 43,
+            name: "other".to_string(),
+            cpu_pct: 1.0,
+            memory_mb: 32,
+            argv: None,
+        };
+        snap.processes.push(second);
+        let body = format_top_json(&snap, 1);
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(value["processes"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn disk_json_serializes_all_disks() {
+        let body = format_disk_json(&sample_snapshot());
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+
+        assert_eq!(value["disks"][0]["mount"], "/Volumes/name \"quoted\"\u{7}");
+        assert_eq!(value["disks"][0]["used_pct"], 60.0);
     }
 
     #[test]

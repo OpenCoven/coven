@@ -25,6 +25,25 @@ fn wt_creates_sibling_worktree_and_lists_protocol_state() -> anyhow::Result<()> 
     assert_success("coven wt --list", &list);
     assert_stdout_contains("coven wt --list", &list, "feature/demo");
     assert_stdout_contains("coven wt --list", &list, "feature-demo");
+
+    let json_list = repo.coven(["wt", "--list", "--json"])?;
+    assert_success("coven wt --list --json", &json_list);
+    let entries: serde_json::Value =
+        serde_json::from_slice(&json_list.stdout).expect("wt --list --json emits valid JSON");
+    let entry = entries
+        .as_array()
+        .expect("wt --list --json emits an array")
+        .iter()
+        .find(|entry| entry["branch"] == "feature/demo")
+        .expect("listing includes the created worktree");
+    assert_eq!(entry["dirty"], false);
+    assert_eq!(entry["claim"], serde_json::Value::Null);
+    assert!(
+        entry["path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("feature-demo")),
+        "worktree path should be reported: {entry}"
+    );
     Ok(())
 }
 
@@ -50,6 +69,27 @@ fn claim_acquire_blocks_other_agent_until_release() -> anyhow::Result<()> {
     assert_success("claim status", &status);
     assert_stdout_contains("claim status", &status, "feature/demo");
     assert_stdout_contains("claim status", &status, "cody");
+    // Human expiry renders as an RFC 3339 UTC date, not raw epoch seconds.
+    assert!(
+        String::from_utf8_lossy(&status.stdout)
+            .lines()
+            .any(|line| line.contains("cody") && line.ends_with('Z') && line.contains('T')),
+        "claim status should render the expiry as a date:\n{}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+
+    let json_status = repo.coven(["claim", "status", "--json"])?;
+    assert_success("claim status --json", &json_status);
+    let claims: serde_json::Value =
+        serde_json::from_slice(&json_status.stdout).expect("claim status --json emits valid JSON");
+    let claim = &claims.as_array().expect("claims array")[0];
+    assert_eq!(claim["branch"], "feature/demo");
+    assert_eq!(claim["agent"], "cody");
+    assert_eq!(claim["state"], "active");
+    assert!(
+        claim["expires_at"].is_u64() && claim["acquired_at"].is_u64(),
+        "JSON timestamps stay epoch seconds: {claim}"
+    );
 
     let released = repo.coven_with_env(
         ["claim", "release", "feature/demo"],

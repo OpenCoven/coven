@@ -65,10 +65,11 @@ environment where the daemon/session starts.
 ## Daemon status
 
 `doctor` summarizes daemon state, but use the daemon command for scriptable
-status:
+status (`--json` for structured output):
 
 ```sh
 coven daemon status
+coven daemon status --json
 ```
 
 Typical output:

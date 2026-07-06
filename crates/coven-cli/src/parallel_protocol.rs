@@ -36,11 +36,12 @@ pub(crate) fn run_wt_command(
     doctor: bool,
     prune_merged: bool,
     prune_stale: Option<u64>,
+    json: bool,
 ) -> Result<()> {
     let repo = Repo::discover()?;
     match (branch, list, doctor, prune_merged, prune_stale) {
         (Some(branch), false, false, false, None) => wt_enter_or_create(&repo, branch),
-        (None, true, false, false, None) => wt_list(&repo),
+        (None, true, false, false, None) => wt_list(&repo, json),
         (None, false, true, false, None) => wt_doctor(&repo),
         (None, false, false, true, None) => wt_prune_merged(&repo),
         (None, false, false, false, Some(days)) => wt_prune_stale(&repo, days),
@@ -63,7 +64,7 @@ pub(crate) fn claim_acquire(branch: &str) -> Result<()> {
                 "{} is already claimed by {} until {}",
                 branch,
                 existing.agent_id,
-                existing.expires_at
+                format_epoch(existing.expires_at)
             );
         }
     }
@@ -76,7 +77,10 @@ pub(crate) fn claim_acquire(branch: &str) -> Result<()> {
         head: current_head().ok(),
     };
     write_claim(&repo, &claim)?;
-    println!("claimed {branch} for {agent_id} until {}", claim.expires_at);
+    println!(
+        "claimed {branch} for {agent_id} until {}",
+        format_epoch(claim.expires_at)
+    );
     Ok(())
 }
 
@@ -125,7 +129,7 @@ pub(crate) fn claim_heartbeat(branch: &str) -> Result<()> {
     write_claim(&repo, &claim)?;
     println!(
         "heartbeat {branch} for {agent_id} until {}",
-        claim.expires_at
+        format_epoch(claim.expires_at)
     );
     Ok(())
 }
@@ -140,19 +144,42 @@ pub(crate) fn claim_canary(branch: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn claim_status() -> Result<()> {
+pub(crate) fn claim_status(json: bool) -> Result<()> {
     let repo = Repo::discover()?;
     let claims_dir = repo.common_dir.join("agent-claims");
-    if !claims_dir.exists() {
-        println!("No claims.");
+    let now = unix_now();
+    let mut claims = if claims_dir.exists() {
+        fs::read_dir(&claims_dir)?
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| read_claim_file(&entry.path()).ok().flatten())
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    claims.sort_by(|a, b| a.branch.cmp(&b.branch));
+
+    if json {
+        // Timestamps stay epoch seconds on the JSON path; the human table
+        // below renders them as dates.
+        let entries = claims
+            .iter()
+            .map(|claim| {
+                serde_json::json!({
+                    "branch": claim.branch,
+                    "agent": claim.agent_id,
+                    "state": if claim.is_active(now) { "active" } else { "expired" },
+                    "acquired_at": claim.acquired_at,
+                    "expires_at": claim.expires_at,
+                })
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::Value::Array(entries))?
+        );
         return Ok(());
     }
-    let now = unix_now();
-    let mut claims = fs::read_dir(&claims_dir)?
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| read_claim_file(&entry.path()).ok().flatten())
-        .collect::<Vec<_>>();
-    claims.sort_by(|a, b| a.branch.cmp(&b.branch));
+
     if claims.is_empty() {
         println!("No claims.");
         return Ok(());
@@ -166,10 +193,21 @@ pub(crate) fn claim_status() -> Result<()> {
         };
         println!(
             "{:<32} {:<20} {:<10} {}",
-            claim.branch, claim.agent_id, state, claim.expires_at
+            claim.branch,
+            claim.agent_id,
+            state,
+            format_epoch(claim.expires_at)
         );
     }
     Ok(())
+}
+
+/// Render an epoch-seconds timestamp as an RFC 3339 UTC date for human
+/// output. The JSON paths keep raw epoch values.
+fn format_epoch(secs: u64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(secs as i64, 0)
+        .map(|date| date.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| secs.to_string())
 }
 
 pub(crate) fn hooks_install() -> Result<()> {
@@ -219,8 +257,29 @@ fn wt_enter_or_create(repo: &Repo, branch: &str) -> Result<()> {
     Ok(())
 }
 
-fn wt_list(repo: &Repo) -> Result<()> {
+fn wt_list(repo: &Repo, json: bool) -> Result<()> {
     let worktrees = list_worktrees()?;
+    if json {
+        let mut entries = Vec::with_capacity(worktrees.len());
+        for worktree in &worktrees {
+            entries.push(serde_json::json!({
+                "branch": worktree.branch,
+                "dirty": worktree_dirty(&worktree.path)?,
+                "claim": worktree
+                    .branch
+                    .as_deref()
+                    .and_then(|branch| read_claim(repo, branch).ok().flatten())
+                    .filter(|claim| claim.is_active(unix_now()))
+                    .map(|claim| claim.agent_id),
+                "path": worktree.path.to_string_lossy(),
+            }));
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::Value::Array(entries))?
+        );
+        return Ok(());
+    }
     println!("{:<32} {:<8} {:<20} path", "branch", "dirty", "claim");
     for worktree in worktrees {
         let branch = worktree.branch.as_deref().unwrap_or("(detached)");
@@ -721,3 +780,14 @@ if [ "$consume_intent" = "1" ]; then
   rm -f "$intent_file"
 fi
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::format_epoch;
+
+    #[test]
+    fn format_epoch_renders_rfc3339_utc() {
+        assert_eq!(format_epoch(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format_epoch(1_782_432_000), "2026-06-26T00:00:00Z");
+    }
+}

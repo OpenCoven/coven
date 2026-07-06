@@ -98,16 +98,19 @@ flowchart TB
 | `coven sessions` | `--plain`, `--json`, `--all`, `--manage` |
 | `coven sacrifice` | `--yes` (required) |
 | `coven logs prune` | `--dry-run`, `--raw-days <N>`, `--event-days <N>` |
-| `coven wt` | `--list`, `--doctor`, `--prune-merged`, `--prune-stale <DAYS>` |
+| `coven wt` | `--list [--json]`, `--doctor`, `--prune-merged`, `--prune-stale <DAYS>` |
+| `coven claim status` | `--json` |
+| `coven daemon status` | `--json` |
 | `coven pc kill` | `--confirm` (required) |
 | `coven pc cache clear` | `--confirm` (required) |
-| `coven pc top` | `--n <N>`, `--verbose` |
+| `coven pc top` | `--n <N>`, `--verbose`, `--json` |
+| `coven pc disk` | `--json` |
 | `coven pc status` | `--json` |
 
 ## Flag conventions
 
 - **Project-scoped commands** accept `--cwd <path>` for a launch directory inside the project root.
-- **Machine-readable output** is per-command today: `coven sessions` accepts `--plain` and `--json`; `coven sessions search`, `coven adapter list`, and `coven pc status` accept `--json`. Other tabular commands (`wt --list`, `claim status`, `daemon status`, `pc top`, `pc disk`) print human tables only.
+- **Machine-readable output** is per-command today: `coven sessions` accepts `--plain` and `--json`; `coven sessions search`, `coven adapter list`, `coven daemon status`, `coven wt --list`, `coven claim status`, `coven pc status`, `coven pc top`, and `coven pc disk` accept `--json`. Timestamps in JSON output stay epoch seconds; human tables render them as RFC 3339 dates.
 - **Session id arguments** (`attach`, `summon`, `archive`, `sacrifice`, `kill`) accept a unique prefix of the id.
 - **Destructive commands** require `--yes` (or `--confirm` for `coven pc` relief).
 - **Daemon-touching commands** print install/repair hints when the socket is missing.

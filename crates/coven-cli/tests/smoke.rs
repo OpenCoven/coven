@@ -142,6 +142,36 @@ fn daemon_start_is_idempotent_when_daemon_is_already_running() -> anyhow::Result
         second_pid, first_pid,
         "daemon start should reuse the verified running daemon instead of spawning another serve process"
     );
+
+    let status = run_coven(&coven, &coven_home, &path, &["daemon", "status", "--json"])?;
+    assert_success("daemon status --json while running", &status);
+    let status: Value = serde_json::from_slice(&status.stdout)
+        .expect("daemon status --json emits valid JSON on stdout");
+    assert_eq!(status["status"], "running");
+    assert_eq!(status["ok"], true);
+    assert_eq!(status["pid"].as_u64(), Some(first_pid));
+    assert!(status["socket"].is_string());
+    Ok(())
+}
+
+#[test]
+fn daemon_status_json_reports_stopped() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    fs::create_dir_all(&coven_home)?;
+
+    let output = run_coven(
+        &coven_bin(),
+        &coven_home,
+        &std::env::var_os("PATH").unwrap_or_default(),
+        &["daemon", "status", "--json"],
+    )?;
+
+    assert_success("daemon status --json stopped", &output);
+    let status: Value = serde_json::from_slice(&output.stdout)
+        .expect("daemon status --json emits valid JSON on stdout");
+    assert_eq!(status["status"], "stopped");
+    assert_eq!(status["ok"], false);
     Ok(())
 }
 
@@ -381,10 +411,16 @@ fn adapter_install_hermes_writes_trusted_manifest() -> anyhow::Result<()> {
     );
     assert!(coven_home.join("adapters").join("hermes.json").exists());
 
-    let doctor = run_coven(&coven, &coven_home, &path, &["adapter", "doctor", "hermes"])?;
+    // Diagnose against an empty PATH so the outcome doesn't depend on
+    // whether a real `hermes` happens to be installed on this machine:
+    // unavailable → exit 1, with the diagnosis output still rendered in full.
+    let doctor = run_coven(
+        &coven,
+        &coven_home,
+        &OsString::new(),
+        &["adapter", "doctor", "hermes"],
+    )?;
 
-    // The hermes executable is not installed, so adapter doctor reports it
-    // and exits 1 (the diagnosis output still renders in full).
     assert_failure("adapter doctor hermes", &doctor);
     assert_stdout_contains("adapter doctor hermes", &doctor, "Hermes Agent");
     assert_stdout_contains("adapter doctor hermes", &doctor, "manifest:");
