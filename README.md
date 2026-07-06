@@ -168,16 +168,20 @@ cargo run -p coven-cli -- doctor
 
 ## Quick Start
 
-### Option A — Interactive menu (recommended for new users)
+### Option A — Interactive UI (recommended for new users)
 
 ```bash
 cd /path/to/your/project
 coven
 # or explicitly:
-coven tui
+coven chat
 ```
 
-The menu opens with a **Start here** guide, checks your local setup, and shows the safest first command to try. Type a task directly (e.g., `fix the failing tests`) or use slash commands like `/run codex fix the failing tests`. Press `h` or type `/help` for examples.
+Bare `coven` opens the interactive Coven UI, which is provided by the separate
+[`coven-code`](https://github.com/OpenCoven/coven-code) front-end (`npm install -g
+@opencoven/coven-code`). If it isn't installed, `coven` prints the install
+command. You can also pass a task directly — `coven "fix the failing tests"` —
+and Coven will show a plan card and run it in a recorded session.
 
 ### Option B — Direct commands
 
@@ -218,11 +222,22 @@ Choose a repo, choose a harness, get a verified patch.
 
 ### Core commands
 
-| Command        | Action                                                |
-| -------------- | ----------------------------------------------------- |
-| `coven`        | Open the beginner-friendly interactive menu           |
-| `coven tui`    | Explicitly open the slash-command TUI                 |
-| `coven doctor` | Detect supported harness CLIs and print install hints |
+| Command          | Action                                                          |
+| ---------------- | --------------------------------------------------------------- |
+| `coven`          | Open the interactive Coven UI (requires `coven-code`)           |
+| `coven "<task>"` | Plan and run a free-text task in a recorded session (Cast flow) |
+| `coven chat`     | Explicitly open the interactive Coven UI                        |
+| `coven tui`      | Same as `coven chat`                                            |
+| `coven doctor`   | Detect supported harness CLIs and print install hints           |
+
+### Harness adapters
+
+| Command                       | Action                                        |
+| ----------------------------- | --------------------------------------------- |
+| `coven adapter list`          | List configured harness adapters              |
+| `coven adapter list --json`   | Adapter reports as JSON                       |
+| `coven adapter doctor [id]`   | Diagnose all adapters, or one adapter id      |
+| `coven adapter install <id>`  | Install a trusted local adapter recipe        |
 
 ### Daemon lifecycle
 
@@ -263,6 +278,9 @@ Choose a repo, choose a harness, get a verified patch.
 | `coven archive <session-id>`                   | Hide a non-running session while preserving its events           |
 | `coven sacrifice <session-id> --yes`           | Permanently delete a non-running session and its events          |
 
+> `attach`, `summon`, `archive`, and `sacrifice` accept a unique prefix of the
+> session id (e.g. `coven attach 9099`), so you don't have to paste full UUIDs.
+
 > **Session rituals are intentionally explicit.** Archive is reversible and keeps the full event ledger. Summon brings an archived session back. Sacrifice is destructive, refuses live sessions, and requires `--yes` so beginners don't delete work by accident.
 
 | Ritual        | Reversible? | Works on             | Description                                                  |
@@ -285,6 +303,18 @@ Choose a repo, choose a harness, get a verified patch.
 | `coven pc cache clear --confirm` | Clear `~/Library/Caches` and `/Library/Caches` (requires `--confirm`) |
 
 > All read operations are side-effect-free. Write operations (kill, cache clear) require `--confirm` and cannot be bypassed. Termination is SIGTERM only — no SIGKILL.
+
+### Parallel work protocol (worktrees, claims, hooks)
+
+| Command                     | Action                                                        |
+| --------------------------- | ------------------------------------------------------------- |
+| `coven wt <branch>`         | Create or enter a worktree in the sibling `<repo>.wt` dir     |
+| `coven wt --list`           | List worktrees with claim and dirty state                     |
+| `coven wt --doctor`         | Report protocol layout and hook issues                        |
+| `coven wt --prune-merged`   | Remove clean worktrees whose branches are merged              |
+| `coven claim acquire <b>`   | Claim a branch for the current agent (TTL-bounded)            |
+| `coven claim status`        | Show active and expired claims for this repository            |
+| `coven hooks install`       | Install the protocol's pre-commit and pre-push git hooks      |
 
 ### Other
 
@@ -669,7 +699,7 @@ coven doctor
 | Daemon won't start                          | Run `coven daemon restart`; check `$COVEN_HOME` ownership and permissions              |
 | Session browser shows a table, not a UI     | Terminal isn't interactive; use `coven sessions --manage` to force the browser         |
 | `cwd` rejected at launch                    | The working directory resolves outside the project root; use a path inside it          |
-| Stale "running" sessions after daemon crash | Run `coven sessions --all`; archive or sacrifice orphaned records                      |
+| Stale "running" sessions after daemon crash | Run `coven daemon restart` to mark dead sessions `orphaned`, then archive or sacrifice them via `coven sessions --all` |
 | Sessions feel slow / daemon sluggish        | Run `coven pc status` to check system pressure; `coven pc top --n 10` for CPU culprits |
 | `coven attach` won't accept input           | The session is not live; attach replays logs for completed or archived sessions        |
 | Secret scan fails                           | Remove the secret from your working tree; rotate it if it entered git history          |

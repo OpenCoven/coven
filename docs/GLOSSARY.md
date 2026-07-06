@@ -51,6 +51,12 @@ Hide a non-running session from the active list while preserving its record and 
 
 A discoverable daemon or adapter feature returned by `GET /api/v1/capabilities`.
 
+## Cast
+
+Coven's plan-then-run flow for free-text tasks. `coven "<task>"` parses the
+task into an intent, shows a plan card (spell, harness, risk), gates anything
+destructive behind confirmation, then runs it in a recorded session.
+
 ## CastCodes
 
 The local-first AI coding workspace powered by Coven. CastCodes is the primary public proof surface: the product users open to run visible lanes, inspect work, review diffs, verify changes, and decide what lands.
@@ -91,6 +97,13 @@ The local Rust process that owns live session state and the socket API.
 
 An append-only record for session output, exit, or metadata.
 
+## Familiar
+
+A named agent identity with a role and memory, declared in
+`~/.coven/familiars.toml`. `coven run <harness> --familiar <id>` injects the
+familiar's identity preamble into the session; `coven doctor` lists configured
+familiars and their memory freshness.
+
 ## Harness
 
 A supported coding-agent CLI that Coven can launch and supervise.
@@ -119,6 +132,12 @@ The default `coven` and `coven tui` interface. Accepts free-form task text or sl
 
 Write-side operations in `coven pc` that mutate system state (process termination, cache deletion). Always require an explicit `--confirm` flag.
 
+## Ritual
+
+Any of the explicit session lifecycle verbs: Archive, Summon, Sacrifice, and
+Rejoin (reattach). See each entry for what it does and whether it is
+reversible.
+
 ## Sacrifice
 
 Permanently delete a non-running session and its events.
@@ -130,6 +149,11 @@ A Coven-owned record of one harness run.
 ## Socket API
 
 The local HTTP-over-Unix-socket API exposed by the daemon.
+
+## Spell
+
+The free-text task a user gives Cast (e.g. `coven "fix the failing tests"`).
+The Cast plan card shows the spell alongside the chosen harness and risk level.
 
 ## Summon
 

@@ -105,7 +105,8 @@ flowchart TB
 ## Flag conventions
 
 - **Project-scoped commands** accept `--cwd <path>` for a launch directory inside the project root.
-- **Pipe-friendly commands** accept `--plain` for tables and `--json` for machine output.
+- **Machine-readable output** is per-command today: `coven sessions` accepts `--plain` and `--json`; `coven sessions search`, `coven adapter list`, and `coven pc status` accept `--json`. Other tabular commands (`wt --list`, `claim status`, `daemon status`, `pc top`, `pc disk`) print human tables only.
+- **Session id arguments** (`attach`, `summon`, `archive`, `sacrifice`) accept a unique prefix of the id.
 - **Destructive commands** require `--yes` (or `--confirm` for `coven pc` relief).
 - **Daemon-touching commands** print install/repair hints when the socket is missing.
 
