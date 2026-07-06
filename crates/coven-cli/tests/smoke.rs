@@ -250,7 +250,11 @@ role = "Voice, Social, and Presence Familiar"
 description = "Keeps the coven sociable."
 "#,
     )?;
-    let path = std::env::var_os("PATH").unwrap_or_default();
+    let fake_bin = temp_dir.path().join("bin");
+    fs::create_dir_all(&fake_bin)?;
+    write_fake_codex(&fake_bin)?;
+    write_fake_coven_code(&fake_bin)?;
+    let path = prepend_path(&fake_bin);
     let coven = coven_bin();
 
     let output = run_coven(&coven, &coven_home, &path, &["doctor"])?;
@@ -271,7 +275,11 @@ fn doctor_reports_no_familiars_when_manifest_absent() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let coven_home = temp_dir.path().join("coven-home");
     fs::create_dir_all(&coven_home)?;
-    let path = std::env::var_os("PATH").unwrap_or_default();
+    let fake_bin = temp_dir.path().join("bin");
+    fs::create_dir_all(&fake_bin)?;
+    write_fake_codex(&fake_bin)?;
+    write_fake_coven_code(&fake_bin)?;
+    let path = prepend_path(&fake_bin);
     let coven = coven_bin();
 
     let output = run_coven(&coven, &coven_home, &path, &["doctor"])?;
@@ -292,7 +300,14 @@ fn doctor_missing_harness_prints_cross_platform_setup_loop() -> anyhow::Result<(
 
     let output = run_coven(&coven, &coven_home, &empty_path, &["doctor"])?;
 
-    assert_success("doctor without harnesses", &output);
+    // No harness available is a blocking problem: doctor must exit 1 so
+    // scripts can gate on it, while still printing the full setup loop.
+    assert_failure("doctor without harnesses", &output);
+    assert_stdout_contains(
+        "doctor without harnesses",
+        &output,
+        "Doctor found problems; review the failing checks above.",
+    );
     assert_stdout_contains("doctor without harnesses", &output, "Harnesses:");
     assert_stdout_contains("doctor without harnesses", &output, "`codex` is missing");
     assert_stdout_contains("doctor without harnesses", &output, "`claude` is missing");
@@ -319,7 +334,11 @@ fn doctor_missing_harness_prints_cross_platform_setup_loop() -> anyhow::Result<(
 fn doctor_reports_live_daemon_socket_status() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let coven_home = temp_dir.path().join("coven-home");
-    let path = std::env::var_os("PATH").unwrap_or_default();
+    let fake_bin = temp_dir.path().join("bin");
+    fs::create_dir_all(&fake_bin)?;
+    write_fake_codex(&fake_bin)?;
+    write_fake_coven_code(&fake_bin)?;
+    let path = prepend_path(&fake_bin);
     let coven = coven_bin();
     let _daemon_guard = DaemonGuard {
         coven: coven.clone(),
@@ -364,9 +383,16 @@ fn adapter_install_hermes_writes_trusted_manifest() -> anyhow::Result<()> {
 
     let doctor = run_coven(&coven, &coven_home, &path, &["adapter", "doctor", "hermes"])?;
 
-    assert_success("adapter doctor hermes", &doctor);
+    // The hermes executable is not installed, so adapter doctor reports it
+    // and exits 1 (the diagnosis output still renders in full).
+    assert_failure("adapter doctor hermes", &doctor);
     assert_stdout_contains("adapter doctor hermes", &doctor, "Hermes Agent");
     assert_stdout_contains("adapter doctor hermes", &doctor, "manifest:");
+    assert_stdout_contains(
+        "adapter doctor hermes",
+        &doctor,
+        "Adapter doctor found unavailable adapters",
+    );
     Ok(())
 }
 
@@ -529,14 +555,15 @@ fn smoke_daemon_session_replay_and_safe_session_rituals() -> anyhow::Result<()> 
     )?;
     wait_for_event_text(&coven_home, &kill_session, "fake codex ready for kill")?;
 
-    let (kill_status, kill_body) = unix_http_request(
-        &coven_home,
-        "POST",
-        &format!("/sessions/{kill_session}/kill"),
-        None,
-    )?;
-    assert_eq!(kill_status, 202, "unexpected kill response: {kill_body}");
+    let kill = run_coven(&coven, &coven_home, &path, &["kill", &kill_session])?;
+    assert_success("kill", &kill);
+    assert_stdout_contains("kill", &kill, "killed session");
     wait_for_session_status(&coven_home, &kill_session, "killed")?;
+
+    // A second kill must refuse: the session is no longer running.
+    let rekill = run_coven(&coven, &coven_home, &path, &["kill", &kill_session])?;
+    assert_failure("rekill refused", &rekill);
+    assert_stderr_contains("rekill refused", &rekill, "is not running");
 
     let archive = run_coven(&coven, &coven_home, &path, &["archive", &kill_session])?;
     assert_success("archive", &archive);
@@ -649,6 +676,24 @@ fn assert_success(label: &str, output: &Output) {
     );
 }
 
+fn assert_failure(label: &str, output: &Output) {
+    assert!(
+        !output.status.success(),
+        "{label} unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn assert_stderr_contains(label: &str, output: &Output, needle: &str) {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(needle),
+        "{label} stderr did not contain {needle:?}\nstdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
 fn assert_stdout_contains(label: &str, output: &Output, needle: &str) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -680,6 +725,9 @@ fn write_fake_codex(fake_bin: &Path) -> anyhow::Result<()> {
     fs::write(
         &codex,
         r#"#!/bin/sh
+# Consume the options terminator like the real CLI: coven passes prompts
+# behind `--` so dash-prefixed prompts stay positional.
+if [ "$1" = "--" ]; then shift; fi
 if [ "$*" = "hold-for-kill" ]; then
   printf 'fake codex ready for kill\n'
   exec sleep 300
@@ -690,6 +738,17 @@ printf 'fake codex complete: %s\n' "$*"
     let mut permissions = fs::metadata(&codex)?.permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&codex, permissions)?;
+    Ok(())
+}
+
+/// Doctor exits 1 when coven-code is missing, so doctor tests that expect a
+/// healthy environment plant a fake alongside the fake harness.
+fn write_fake_coven_code(fake_bin: &Path) -> anyhow::Result<()> {
+    let coven_code = fake_bin.join("coven-code");
+    fs::write(&coven_code, "#!/bin/sh\nexit 0\n")?;
+    let mut permissions = fs::metadata(&coven_code)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&coven_code, permissions)?;
     Ok(())
 }
 

@@ -252,24 +252,33 @@ fn wt_doctor(repo: &Repo) -> Result<()> {
     println!("repo: {}", repo.root.display());
     println!("worktree root: {}", worktree_root(repo)?.display());
     println!("claims: {}", repo.common_dir.join("agent-claims").display());
+    let mut hooks_missing = false;
     for hook in ["pre-commit", "pre-push"] {
         let path = repo.common_dir.join("hooks").join(hook);
-        let status = if hook_is_managed(&path)? {
-            "OK"
-        } else {
-            "missing"
-        };
+        let managed = hook_is_managed(&path)?;
+        if !managed {
+            hooks_missing = true;
+        }
+        let status = if managed { "OK" } else { "missing" };
         println!("hook {hook}: {status}");
     }
+    if hooks_missing {
+        println!("install the managed hooks with `coven hooks install`");
+    }
+    let mut layout_ok = true;
     for worktree in list_worktrees()? {
         let expected_root = worktree_root(repo)?;
         if worktree.path != repo.root && !worktree.path.starts_with(&expected_root) {
+            layout_ok = false;
             println!(
                 "layout warning: {} is outside {}",
                 worktree.path.display(),
                 expected_root.display()
             );
         }
+    }
+    if hooks_missing || !layout_ok {
+        crate::exit_checks_failed();
     }
     Ok(())
 }
