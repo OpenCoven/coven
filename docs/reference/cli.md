@@ -21,6 +21,7 @@ flowchart TB
   Root --> Summon["summon"]
   Root --> Archive["archive"]
   Root --> Sacrifice["sacrifice"]
+  Root --> Kill["kill"]
   Root --> Patch["patch"]
   Root --> Logs["logs"]
   Root --> Wt["wt"]
@@ -71,7 +72,7 @@ flowchart TB
 |---|---|
 | `coven` | Open the beginner-friendly interactive menu. |
 | `coven tui` | Explicitly open the slash-command TUI. |
-| `coven doctor` | Detect supported harness CLIs and print install hints. |
+| `coven doctor` | Check local setup; exits 1 when a blocking problem is found. |
 | `coven daemon start/status/restart/stop` | Manage the local daemon. |
 | `coven run <harness> <prompt>` | Launch a project-scoped harness session. Current harness ids: `codex`, `claude`. |
 | `coven sessions` | Open the session browser; supports `--plain`, `--json`, `--all`, and `--manage`. |
@@ -79,6 +80,7 @@ flowchart TB
 | `coven summon <session-id>` | Restore an archived session, then replay/follow it. |
 | `coven archive <session-id>` | Hide a non-running session while preserving events. |
 | `coven sacrifice <session-id> --yes` | Permanently delete a non-running session. |
+| `coven kill <session-id>` | Kill a running session's process; keeps the event log. |
 | `coven patch openclaw <prompt>` | Local OpenClaw rescue loop. Does not commit or push. |
 | `coven logs prune` | Prune expired encrypted raw artifacts and old redacted event logs. |
 | `coven wt <branch>` | Create or enter a sibling `<repo>.wt/<branch-slug>` git worktree. |
@@ -106,7 +108,7 @@ flowchart TB
 
 - **Project-scoped commands** accept `--cwd <path>` for a launch directory inside the project root.
 - **Machine-readable output** is per-command today: `coven sessions` accepts `--plain` and `--json`; `coven sessions search`, `coven adapter list`, and `coven pc status` accept `--json`. Other tabular commands (`wt --list`, `claim status`, `daemon status`, `pc top`, `pc disk`) print human tables only.
-- **Session id arguments** (`attach`, `summon`, `archive`, `sacrifice`) accept a unique prefix of the id.
+- **Session id arguments** (`attach`, `summon`, `archive`, `sacrifice`, `kill`) accept a unique prefix of the id.
 - **Destructive commands** require `--yes` (or `--confirm` for `coven pc` relief).
 - **Daemon-touching commands** print install/repair hints when the socket is missing.
 

@@ -73,7 +73,9 @@ enum Command {
     Chat,
     #[command(about = "Open the interactive Coven UI (same as `coven chat`)")]
     Tui,
-    #[command(about = "Check local setup and print next steps")]
+    #[command(
+        about = "Check local setup and print next steps (exits 1 when a blocking problem is found)"
+    )]
     Doctor,
     #[command(
         name = "adapter",
@@ -209,7 +211,7 @@ enum Command {
         branch: Option<String>,
         #[arg(long, conflicts_with_all = ["doctor", "prune_merged", "prune_stale"], help = "List worktrees with claim and dirty state")]
         list: bool,
-        #[arg(long, conflicts_with_all = ["list", "prune_merged", "prune_stale"], help = "Report protocol layout and hook issues")]
+        #[arg(long, conflicts_with_all = ["list", "prune_merged", "prune_stale"], help = "Report protocol layout and hook issues (exits 1 when issues are found)")]
         doctor: bool,
         #[arg(long, conflicts_with_all = ["list", "doctor", "prune_stale"], help = "Remove clean worktrees whose branches are merged into the primary branch")]
         prune_merged: bool,
@@ -251,6 +253,11 @@ enum Command {
         session_id: String,
         #[arg(long, help = "Confirm permanent deletion")]
         yes: bool,
+    },
+    #[command(about = "Kill a running session's process (its event log is kept)")]
+    Kill {
+        #[arg(help = "Session id, or a unique prefix of one (list ids with `coven sessions`)")]
+        session_id: String,
     },
     #[command(about = "Guided repair flow for a registered repo")]
     Patch {
@@ -308,7 +315,9 @@ enum AdapterCommand {
         #[arg(long, help = "Print adapter reports as JSON")]
         json: bool,
     },
-    #[command(about = "Diagnose all adapters, or one adapter id")]
+    #[command(
+        about = "Diagnose all adapters, or one adapter id (exits 1 if any listed adapter is unavailable)"
+    )]
     Doctor {
         #[arg(help = "Adapter id to diagnose")]
         adapter: Option<String>,
@@ -515,6 +524,7 @@ fn run_cli(cli: Cli) -> Result<()> {
         Some(Command::Summon { session_id }) => summon_session_command(&session_id),
         Some(Command::Archive { session_id }) => archive_session_command(&session_id),
         Some(Command::Sacrifice { session_id, yes }) => sacrifice_session_command(&session_id, yes),
+        Some(Command::Kill { session_id }) => kill_session_command(&session_id),
         Some(Command::Patch {
             name,
             issue,
@@ -845,8 +855,14 @@ fn interactive_shell_route(
     }
 }
 
+/// Exits 1 when a blocking problem is found (stale daemon, broken registered
+/// repo, no harness available, missing coven-code) so scripts can gate on
+/// `coven doctor && …`. Individual missing harnesses print `[!!]` but don't
+/// fail the check while another harness is available — one working harness
+/// makes coven usable.
 fn run_doctor() -> Result<()> {
     let home = coven_home_dir()?;
+    let mut healthy = true;
     println!("Coven doctor");
     println!("Store: {}", home.display());
     match std::env::current_dir()
@@ -867,6 +883,7 @@ fn run_doctor() -> Result<()> {
             );
         }
         Some(daemon::DaemonStatusState::Stale(status)) => {
+            healthy = false;
             println!(
                 "  status=stale ok=false pid={} socket={}",
                 status.pid, status.socket
@@ -880,6 +897,9 @@ fn run_doctor() -> Result<()> {
         println!("\nRepos ({}):", repos_config::config_path(&home).display());
         for (name, path) in repos_config.entries() {
             let ok = path.is_dir() && path.join(".git").exists();
+            if !ok {
+                healthy = false;
+            }
             let marker = if ok { "OK" } else { "!!" };
             println!("  [{marker}] {name:<16} {}", path.display());
         }
@@ -904,11 +924,15 @@ fn run_doctor() -> Result<()> {
             println!("       {}", harness.install_hint);
         }
     }
+    if !harnesses.iter().any(|harness| harness.available) {
+        healthy = false;
+    }
 
     println!("\nInteractive UI:");
     match coven_code_binary() {
         Some(path) => println!("  [OK] coven-code found at {}", path.display()),
         None => {
+            healthy = false;
             println!("  [!!] coven-code is missing — `coven` and `coven chat` need it");
             for line in coven_code_install_instructions(target_shell()).lines() {
                 println!("     {line}");
@@ -931,6 +955,10 @@ fn run_doctor() -> Result<()> {
         println!(
             "  Install docs: https://github.com/OpenCoven/coven/blob/main/docs/install/index.md"
         );
+    }
+    if !healthy {
+        println!("\nDoctor found problems; review the failing checks above.");
+        exit_checks_failed();
     }
     Ok(())
 }
@@ -1047,7 +1075,7 @@ fn run_adapter_doctor(adapter: Option<&str>) -> Result<()> {
     }
 
     println!("Coven adapter doctor");
-    for harness in filtered {
+    for harness in &filtered {
         let marker = if harness.available { "OK" } else { "!!" };
         let status = if harness.available {
             "ready"
@@ -1064,6 +1092,10 @@ fn run_adapter_doctor(adapter: Option<&str>) -> Result<()> {
         if !harness.available {
             println!("       {}", harness.install_hint);
         }
+    }
+    if filtered.iter().any(|harness| !harness.available) {
+        println!("\nAdapter doctor found unavailable adapters; see the [!!] lines above.");
+        exit_checks_failed();
     }
     Ok(())
 }
@@ -1556,6 +1588,16 @@ fn should_synthesize_stream_user_event(
     harness_id: &str,
 ) -> bool {
     stream_json && !expanded_prompt.is_empty() && (detach || harness_id != "claude")
+}
+
+/// Doctor-style commands print their findings and exit 1 directly so scripts
+/// can gate on them (`coven doctor && …`); routing an Err through anyhow
+/// would append a redundant `Error:` line after output that already explains
+/// the failure.
+pub(crate) fn exit_checks_failed() -> ! {
+    let _ = io::stdout().flush();
+    let _ = io::stderr().flush();
+    std::process::exit(1);
 }
 
 /// Exit with the failed session's exit code so scripts can gate on
@@ -2052,7 +2094,7 @@ fn archive_session_command(session_id: &str) -> Result<()> {
     let session_id = session.id.as_str();
     if session.status == RUNNING_SESSION_STATUS {
         anyhow::bail!(
-            "session `{session_id}` is still running; stop it before archiving ({STALE_RUNNING_HINT})"
+            "session `{session_id}` is still running; kill it first with `coven kill {session_id}` ({STALE_RUNNING_HINT})"
         );
     }
     if session.archived_at.is_some() {
@@ -2104,7 +2146,7 @@ fn sacrifice_session_command(session_id: &str, yes: bool) -> Result<()> {
     let session_id = session.id.as_str();
     if session.status == RUNNING_SESSION_STATUS {
         anyhow::bail!(
-            "session `{session_id}` is still running; do not sacrifice live work ({STALE_RUNNING_HINT})"
+            "session `{session_id}` is still running; do not sacrifice live work — kill it first with `coven kill {session_id}` ({STALE_RUNNING_HINT})"
         );
     }
     confirm_sacrifice(session_id, yes)?;
@@ -2122,6 +2164,52 @@ fn confirm_sacrifice(session_id: &str, yes: bool) -> Result<()> {
             "sacrifice permanently deletes session `{session_id}` and its events; rerun with --yes to confirm"
         )
     }
+}
+
+/// Kill a running session's harness process through the daemon (which owns
+/// the PTY), then let the daemon record the `killed` status and kill event.
+/// Store-only verbs like archive/sacrifice can't do this: killing needs the
+/// live runtime.
+fn kill_session_command(session_id: &str) -> Result<()> {
+    let home = coven_home_dir()?;
+    let conn = store::open_store(&home.join(STORE_FILE_NAME))?;
+    let session = resolve_session_ref(&conn, session_id)?;
+    let session_id = session.id.as_str();
+    if session.status != RUNNING_SESSION_STATUS {
+        anyhow::bail!(
+            "session `{session_id}` is not running (status: {}); only running sessions can be killed",
+            session.status
+        );
+    }
+
+    post_session_kill(&home, session_id)?;
+    println!("killed session {session_id}");
+    println!(
+        "Its event log is kept; archive it with `coven archive {session_id}` once you are done with it."
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn post_session_kill(coven_home: &Path, session_id: &str) -> Result<()> {
+    let status = post_daemon_request(coven_home, &format!("/sessions/{session_id}/kill"), "{}")
+        .with_context(|| format!("failed to reach the Coven daemon; {}", STALE_RUNNING_HINT))?;
+    match status {
+        200..=299 => Ok(()),
+        // The store said running but the daemon has no live process: the
+        // status is stale (process died externally, or the daemon restarted
+        // without recovering it).
+        409 => anyhow::bail!(
+            "the daemon has no live process for session `{session_id}`; {}",
+            STALE_RUNNING_HINT
+        ),
+        status => anyhow::bail!("Coven daemon rejected the kill with HTTP {status}"),
+    }
+}
+
+#[cfg(not(unix))]
+fn post_session_kill(_coven_home: &Path, _session_id: &str) -> Result<()> {
+    anyhow::bail!("`coven kill` is only implemented on Unix-like systems for now")
 }
 
 fn attach_session(session_id: &str) -> Result<()> {
@@ -2216,12 +2304,29 @@ fn maybe_spawn_input_forwarder(coven_home: PathBuf, session_id: String) {
 
 #[cfg(unix)]
 fn send_session_input(coven_home: &Path, session_id: &str, data: &str) -> Result<()> {
+    let body = serde_json::json!({ "data": data }).to_string();
+    let status = post_daemon_request(coven_home, &format!("/sessions/{session_id}/input"), &body)?;
+    if (200..300).contains(&status) {
+        Ok(())
+    } else {
+        anyhow::bail!("Coven daemon rejected input with HTTP {status}")
+    }
+}
+
+#[cfg(not(unix))]
+fn send_session_input(_coven_home: &Path, _session_id: &str, _data: &str) -> Result<()> {
+    anyhow::bail!("Coven attach input forwarding is only implemented on Unix-like systems for now")
+}
+
+/// POST a JSON body to the daemon's Unix-socket HTTP API and return the
+/// response status code. Callers map status codes to their own error copy.
+#[cfg(unix)]
+fn post_daemon_request(coven_home: &Path, path: &str, body: &str) -> Result<u16> {
     use std::os::unix::net::UnixStream;
 
     let socket = daemon::daemon_socket_path(coven_home);
-    let body = serde_json::json!({ "data": data }).to_string();
     let request = format!(
-        "POST /sessions/{session_id}/input HTTP/1.1\r\nHost: coven\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        "POST {path} HTTP/1.1\r\nHost: coven\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
         body.len(),
         body
     );
@@ -2233,35 +2338,25 @@ fn send_session_input(coven_home: &Path, session_id: &str, data: &str) -> Result
     })?;
     stream
         .write_all(request.as_bytes())
-        .context("failed to write Coven input request")?;
+        .context("failed to write Coven daemon request")?;
     stream
         .shutdown(std::net::Shutdown::Write)
-        .context("failed to finish Coven input request")?;
+        .context("failed to finish Coven daemon request")?;
     let mut response = String::new();
     stream
         .read_to_string(&mut response)
-        .context("failed to read Coven input response")?;
-    ensure_successful_http_response(&response)
-}
-
-#[cfg(not(unix))]
-fn send_session_input(_coven_home: &Path, _session_id: &str, _data: &str) -> Result<()> {
-    anyhow::bail!("Coven attach input forwarding is only implemented on Unix-like systems for now")
+        .context("failed to read Coven daemon response")?;
+    parse_http_status(&response)
 }
 
 #[cfg(unix)]
-fn ensure_successful_http_response(response: &str) -> Result<()> {
-    let status = response
+fn parse_http_status(response: &str) -> Result<u16> {
+    response
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|status| status.parse::<u16>().ok())
-        .context("invalid Coven daemon response")?;
-    if (200..300).contains(&status) {
-        Ok(())
-    } else {
-        anyhow::bail!("Coven daemon rejected input with HTTP {status}")
-    }
+        .context("invalid Coven daemon response")
 }
 
 fn selected_available_harness(harness_id: &str) -> Result<harness::HarnessSummary> {
@@ -3281,9 +3376,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn successful_http_response_accepts_2xx_only() {
-        assert!(ensure_successful_http_response("HTTP/1.1 202 Accepted\r\n\r\n{}").is_ok());
-        assert!(ensure_successful_http_response("HTTP/1.1 409 Conflict\r\n\r\n{}").is_err());
+    fn daemon_response_status_line_parses_to_code() {
+        assert_eq!(
+            parse_http_status("HTTP/1.1 202 Accepted\r\n\r\n{}").ok(),
+            Some(202)
+        );
+        assert_eq!(
+            parse_http_status("HTTP/1.1 409 Conflict\r\n\r\n{}").ok(),
+            Some(409)
+        );
+        assert!(parse_http_status("garbage").is_err());
     }
 
     #[test]

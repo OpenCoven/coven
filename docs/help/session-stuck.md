@@ -49,6 +49,16 @@ coven sessions --plain --all
 
 ## Safe cleanup choices
 
+Kill stops a running session's harness process while keeping its event log:
+
+```sh
+coven kill <session-id>
+```
+
+If kill reports the session is not live even though `coven sessions` says
+`running`, the process died externally; `coven daemon restart` marks it
+orphaned.
+
 Archive hides a completed session without deleting events:
 
 ```sh

@@ -225,6 +225,9 @@ fn stream_claude_with_program_and_permission_bypass<W: Write>(
     } else {
         args.extend(["--session-id".to_string(), session_id.to_string()]);
     }
+    // `--` keeps a user prompt starting with `-` from parsing as claude flags
+    // (same shield as `HarnessCommandSpec::prompt_args`).
+    args.push("--".to_string());
     args.push(prompt.to_string());
     let args = crate::harness::sanitize_argv_for_platform(args);
 
@@ -673,7 +676,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(command.program(), "codex");
-        assert_eq!(command.args(), &["hello; rm -rf /"]);
+        assert_eq!(command.args(), &["--", "hello; rm -rf /"]);
         assert_eq!(command.cwd(), cwd);
     }
 
@@ -749,7 +752,7 @@ exit 7
         // which is the bug this commit fixes.
         assert_eq!(
             std::fs::read_to_string(temp_dir.path().join("args.txt"))?,
-            "-p\n--output-format\nstream-json\n--verbose\n--session-id\nsession-123\nhello prompt\n"
+            "-p\n--output-format\nstream-json\n--verbose\n--session-id\nsession-123\n--\nhello prompt\n"
         );
         assert_eq!(
             String::from_utf8(out)?,
@@ -795,7 +798,7 @@ exit 0
 
         assert_eq!(
             std::fs::read_to_string(temp_dir.path().join("args.txt"))?,
-            "-p\n--input-format\nstream-json\n--output-format\nstream-json\n--verbose\n--session-id\nsession-456\nhello prompt\n"
+            "-p\n--input-format\nstream-json\n--output-format\nstream-json\n--verbose\n--session-id\nsession-456\n--\nhello prompt\n"
         );
         Ok(())
     }
@@ -835,7 +838,7 @@ exit 0
 
         assert_eq!(
             std::fs::read_to_string(temp_dir.path().join("args.txt"))?,
-            "-p\n--permission-mode\nbypassPermissions\n--output-format\nstream-json\n--verbose\n--session-id\nsession-456\nhello prompt\n"
+            "-p\n--permission-mode\nbypassPermissions\n--output-format\nstream-json\n--verbose\n--session-id\nsession-456\n--\nhello prompt\n"
         );
         Ok(())
     }
@@ -878,7 +881,7 @@ exit 0
 
         assert_eq!(
             std::fs::read_to_string(temp_dir.path().join("args.txt"))?,
-            "-p\n--output-format\nstream-json\n--verbose\n--resume\nsession-789\nhello again\n"
+            "-p\n--output-format\nstream-json\n--verbose\n--resume\nsession-789\n--\nhello again\n"
         );
         Ok(())
     }
@@ -921,7 +924,7 @@ exit 0
 
         assert_eq!(
             std::fs::read_to_string(temp_dir.path().join("args.txt"))?,
-            "-p\n--model\nclaude-sonnet-4\n--output-format\nstream-json\n--verbose\n--session-id\nsession-123\nhello prompt\n"
+            "-p\n--model\nclaude-sonnet-4\n--output-format\nstream-json\n--verbose\n--session-id\nsession-123\n--\nhello prompt\n"
         );
         Ok(())
     }
@@ -963,7 +966,7 @@ exit 0
 
         assert_eq!(
             std::fs::read_to_string(temp_dir.path().join("args.txt"))?,
-            "-p\n--effort\nhigh\n--output-format\nstream-json\n--verbose\n--session-id\nsession-123\nhello prompt\n"
+            "-p\n--effort\nhigh\n--output-format\nstream-json\n--verbose\n--session-id\nsession-123\n--\nhello prompt\n"
         );
         Ok(())
     }
@@ -1086,9 +1089,9 @@ exit 0
 
         assert_eq!(command.program(), "claude");
         #[cfg(windows)]
-        assert_eq!(command.args(), &["\"explain ^&^& exit\""]);
+        assert_eq!(command.args(), &["--", "\"explain ^&^& exit\""]);
         #[cfg(not(windows))]
-        assert_eq!(command.args(), &["explain && exit"]);
+        assert_eq!(command.args(), &["--", "explain && exit"]);
         assert_eq!(command.cwd(), cwd);
     }
 }

@@ -17,8 +17,8 @@ of the active list without deleting their history.
 
 ## Behavior
 
-`coven archive` refuses a running session. Stop or let the harness finish before
-archiving.
+`coven archive` refuses a running session. Kill it first with
+`coven kill <session-id>`, or let the harness finish before archiving.
 
 For a non-running session, archive sets the session's `archived_at` timestamp and
 preserves the session record plus append-only event log. The session disappears
