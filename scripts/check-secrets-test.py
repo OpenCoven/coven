@@ -311,6 +311,59 @@ class SecretGuardLockfileTests(unittest.TestCase):
 
         self.assertEqual(hits, [])
 
+    def test_macos_launchagent_paths_do_not_trigger_high_entropy(self) -> None:
+        # launchd/service docs reference `~/Library/LaunchAgents/<label>.plist`
+        # paths; the reverse-DNS plist filename pushes the token over the
+        # entropy threshold but it is never a credential.
+        text = "\n".join(
+            [
+                "`~/Library/LaunchAgents/dev.opencoven.hub.plist`:",
+                'launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/dev.opencoven.hub.plist',
+                "sudo cp hub.plist /Users/coven/Library/LaunchAgents/dev.opencoven.hub.plist",
+            ]
+        )
+
+        hits = check_secrets.scan_text(text, "docs/HUB-OPERATIONS.md")
+
+        self.assertEqual(hits, [])
+
+    def test_apple_plist_dtd_url_does_not_trigger_high_entropy(self) -> None:
+        # Every plist XML doctype embeds the public Apple DTD system
+        # identifier; it is boilerplate, not a secret.
+        text = '  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+
+        hits = check_secrets.scan_text(text, "docs/HUB-OPERATIONS.md")
+
+        self.assertEqual(hits, [])
+
+    def test_macos_library_path_heuristic_stays_narrow(self) -> None:
+        # Only the closed set of well-known Library subdirectories is
+        # accepted, and token-like blobs inside a path segment must still
+        # trip the entropy rule via the segment-length cap.
+        self.assertTrue(
+            check_secrets.is_macos_library_path_token(
+                "Library/LaunchDaemons/dev.opencoven.hub.plist"
+            )
+        )
+        self.assertFalse(
+            check_secrets.is_macos_library_path_token(
+                "Library/SecretsVault/dev.opencoven.hub.plist"
+            )
+        )
+        self.assertFalse(
+            check_secrets.is_macos_library_path_token(
+                "Library/LaunchAgents/" + "Qz7" * 30 + ".plist"
+            )
+        )
+        self.assertFalse(
+            check_secrets.is_apple_dtd_url_token(
+                "www.apple.com/DTDs/" + "Qz7" * 30 + ".dtd"
+            )
+        )
+        self.assertFalse(
+            check_secrets.is_apple_dtd_url_token("www.evil.example/DTDs/PropertyList-1.0.dtd")
+        )
+
     def test_identifier_heuristic_rejects_pure_digit_segment_tokens(self) -> None:
         # A token whose every segment is pure digits has no name shape; the
         # entropy rule must still see it, even though it splits cleanly.

@@ -148,6 +148,38 @@ def is_github_action_sha_ref_token(token: str) -> bool:
     return bool(_GITHUB_ACTION_SHA_REF.match(token))
 
 
+_MACOS_LIBRARY_PATH_TOKEN = re.compile(
+    r"(?:Users/[A-Za-z0-9_.-]+/)?Library/"
+    r"(?:LaunchAgents|LaunchDaemons|Preferences|Caches|Logs)"
+    r"(?:/[A-Za-z0-9_.-]+)+"
+)
+
+
+def is_macos_library_path_token(token: str) -> bool:
+    """Whether `token` is a macOS `Library/...` well-known path such as
+    ``Library/LaunchAgents/dev.opencoven.hub.plist``. These show up in
+    launchd/service documentation and are never credentials, but reverse-DNS
+    plist names push the token over the entropy threshold. The subdirectory
+    list is a closed set and every segment is capped so a token-like blob
+    appended to a path still trips the entropy rule.
+    """
+    if not _MACOS_LIBRARY_PATH_TOKEN.fullmatch(token):
+        return False
+    return all(len(part) <= 64 for part in token.split("/"))
+
+
+_APPLE_DTD_URL_TOKEN = re.compile(r"www\.apple\.com/DTDs/[A-Za-z0-9_.-]{1,64}\.dtd")
+
+
+def is_apple_dtd_url_token(token: str) -> bool:
+    """Whether `token` is the Apple property-list DTD system identifier
+    (``www.apple.com/DTDs/PropertyList-1.0.dtd``) that appears in every plist
+    XML doctype. It is public boilerplate, not a secret, but the mixed-case
+    host/path combination exceeds the entropy threshold.
+    """
+    return bool(_APPLE_DTD_URL_TOKEN.fullmatch(token))
+
+
 def is_known_fake_private_key_fixture(line: str) -> bool:
     return (
         "-----BEGIN PRIVATE KEY-----" in line
@@ -227,6 +259,8 @@ def scan_text(text: str, path: str) -> list[tuple[str, int, str]]:
                 or is_github_advisory_url_like_token(token)
                 or is_github_commit_url_like_token(token)
                 or is_github_action_sha_ref_token(token)
+                or is_macos_library_path_token(token)
+                or is_apple_dtd_url_token(token)
                 or is_programming_identifier_token(token)
             ):
                 continue
