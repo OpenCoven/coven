@@ -35,6 +35,7 @@ The Coven daemon socket API is a public compatibility boundary for comux and ext
     "events": true,
     "travel": true,
     "scheduler": true,
+    "hub": true,
     "eventCursor": "sequence",
     "structuredErrors": true
   },
@@ -42,11 +43,17 @@ The Coven daemon socket API is a public compatibility boundary for comux and ext
     "pid": 12345,
     "startedAt": "2026-05-09T06:43:00Z",
     "socket": "/Users/alice/.coven/coven.sock"
+  },
+  "hub": {
+    "role": "hub",
+    "hubId": "hub_01J...",
+    "nodesTotal": 2,
+    "nodesAvailable": 1
   }
 }
 ```
 
-If the daemon metadata is unavailable, `daemon` may be `null`.
+If the daemon metadata is unavailable, `daemon` may be `null`. The `hub` block reports the daemon's control-plane role and node availability summary; full node detail lives at `GET /api/v1/hub/status`.
 
 ### Capability fields
 
@@ -56,6 +63,7 @@ If the daemon metadata is unavailable, `daemon` may be `null`.
 | `events`          | boolean | Events API (`/events`) is available.                             |
 | `travel`          | boolean | Travel profile, delta, and state APIs are available.             |
 | `scheduler`       | boolean | Scheduler decision and recovery APIs are available.              |
+| `hub`             | boolean | Hub control-plane APIs (node registry, routing, queues) are available. |
 | `eventCursor`     | string  | Cursor type supported; `"sequence"` means `afterSeq` is stable.  |
 | `structuredErrors`| boolean | All errors use the `{ error: { code, message, details } }` shape.|
 
@@ -124,6 +132,13 @@ All API errors use the following stable envelope. Clients must branch on `error.
 | `no_scheduler_target`  | 409         | No available scheduler node matches the requested capabilities and policy. |
 | `scheduler_decision_not_found` | 404 | Scheduler decision id does not exist.            |
 | `scheduler_loop_not_found` | 404     | Scheduler loop state does not exist.             |
+| `node_not_found`       | 404         | Node id does not exist in the hub registry.      |
+| `node_unavailable`     | 409         | Requested assignment target node is not available. |
+| `node_missing_capabilities` | 409    | Requested assignment target node lacks required capabilities. |
+| `job_not_found`        | 404         | Job id does not exist in the hub queue.          |
+| `job_already_queued`   | 409         | A job with the same id already exists in the global queue. |
+| `job_not_assignable`   | 409         | Job has already reached a terminal state.        |
+| `no_available_node`    | 409         | No available registered node satisfies the job's required capabilities. |
 
 ## Capability catalog shape (`v1`)
 
@@ -547,6 +562,150 @@ If the loop is not resumable or no alternate node matches, `state` is `paused` a
 ### `GET /api/v1/scheduler/loops/:loopId`
 
 Returns the persisted redispatch/pause state with the same fields as `POST /api/v1/scheduler/redispatch`, plus `updatedAt`, or `404 scheduler_loop_not_found`.
+
+## Hub control-plane shapes (`v1`)
+
+The hub control plane is the durable multi-host state described in `specs/coven-multi-host-daemon`: a persistent node registry, a routing table, a global job queue, and per-executor subqueues. All hub state persists in the daemon SQLite store and reloads after a daemon restart. Unlike the `POST /api/v1/scheduler/decisions` route (which evaluates a caller-supplied node snapshot), hub job assignment routes against the persistent registry.
+
+### `POST /api/v1/hub/nodes`
+
+Registers a node or re-registers an existing one (updating role, transport, capabilities, and availability). Returns `201` for a new node and `200` for a re-registration.
+
+Request:
+
+```json
+{
+  "nodeId": "compute-primary",
+  "role": "compute_executor",
+  "transport": "ssh",
+  "capabilities": ["gpu", "long-running-loop"],
+  "available": true
+}
+```
+
+Response:
+
+```json
+{
+  "nodeId": "compute-primary",
+  "role": "compute_executor",
+  "transport": "ssh",
+  "capabilities": ["gpu", "long-running-loop"],
+  "available": true,
+  "queuePressure": 0,
+  "lastHealthAt": "2026-07-06T12:00:00Z",
+  "registeredAt": "2026-07-06T12:00:00Z",
+  "updatedAt": "2026-07-06T12:00:00Z"
+}
+```
+
+`transport` defaults to `"ssh"`. `queuePressure` is hub-computed from the node's persistent subqueue and cannot be set by the caller.
+
+### `GET /api/v1/hub/nodes` and `GET /api/v1/hub/nodes/:nodeId`
+
+List all registered nodes (`{ "nodes": [ ... ] }`) or fetch one node record. Unknown ids return `404 node_not_found`.
+
+### `POST /api/v1/hub/nodes/:nodeId/health`
+
+Records an executor health report and updates `lastHealthAt`:
+
+```json
+{
+  "available": false,
+  "capabilities": ["gpu", "long-running-loop"]
+}
+```
+
+Availability transitions move the node's jobs between `assigned` and `held` without removing them from the node's persistent subqueue:
+
+- `available: false` — every `assigned` job on the node becomes `held`; the subqueue and loop ids are preserved.
+- `available: true` — every `held` job on the node returns to `assigned`.
+
+Response:
+
+```json
+{
+  "node": { "nodeId": "compute-primary", "available": false, "queuePressure": 1 },
+  "heldSubqueue": { "nodeId": "compute-primary", "jobIds": ["job_01J..."] },
+  "transitionedJobs": { "from": "assigned", "to": "held", "jobIds": ["job_01J..."] }
+}
+```
+
+### `POST /api/v1/hub/jobs`
+
+Enqueues a job on the persistent global queue with state `queued`. `jobId` is optional (the hub generates `job_<uuid>` when omitted). Duplicate ids return `409 job_already_queued`.
+
+```json
+{
+  "jobId": "job_01J...",
+  "requiredCapabilities": ["gpu"],
+  "priority": 5,
+  "loopId": "loop_01J...",
+  "payload": { "kind": "loop-run" }
+}
+```
+
+Job states: `queued`, `assigned`, `held`, and the terminal states `completed`, `failed`, `cancelled`.
+
+### `GET /api/v1/hub/jobs?state=...` and `GET /api/v1/hub/jobs/:jobId`
+
+List queued jobs (optionally filtered by `state`, ordered by priority then age) or fetch one job. The single-job response includes the job's routing-table entry under `route` (or `null` when unrouted).
+
+### `POST /api/v1/hub/jobs/:jobId/assign`
+
+Assigns the job to an executor from the persistent node registry. With an empty body, the hub picks the best available node by capability match, then lowest queue pressure, then role rank (`compute_executor` before `stationary_executor` before `hub` before `laptop_local`). Passing `{ "nodeId": "..." }` forces a specific registered node (`409 node_unavailable` / `409 node_missing_capabilities` when it cannot take the job).
+
+On success the hub persists, in one pass:
+
+- the job's state (`assigned`) and `assignedNodeId`;
+- a routing-table entry mapping the job to the node;
+- a scheduler decision record (readable at `GET /api/v1/scheduler/decisions/:id`); and
+- the target node's rebuilt subqueue and queue pressure.
+
+If no registered node qualifies, the call returns `409 no_available_node` and the job stays `queued`.
+
+### `POST /api/v1/hub/jobs/:jobId/complete`
+
+Marks a job terminal (`{ "state": "completed" | "failed" | "cancelled" }`, defaulting to `completed`), removes it from its executor subqueue, and refreshes the node's queue pressure. Terminal jobs cannot be reassigned (`409 job_not_assignable`).
+
+### `GET /api/v1/hub/routing`
+
+Returns the persistent routing table:
+
+```json
+{
+  "routes": [
+    {
+      "jobId": "job_01J...",
+      "nodeId": "compute-primary",
+      "decisionId": "sched_01J...",
+      "reason": "compute-primary selected from hub registry by capability match and queue pressure",
+      "createdAt": "2026-07-06T12:00:00Z",
+      "updatedAt": "2026-07-06T12:00:00Z"
+    }
+  ]
+}
+```
+
+### `GET /api/v1/hub/status`
+
+Returns the hub role, identity, node availability, and queue depths:
+
+```json
+{
+  "role": "hub",
+  "hubId": "hub_01J...",
+  "nodes": [ { "nodeId": "compute-primary", "available": true, "queuePressure": 1 } ],
+  "nodesTotal": 1,
+  "nodesAvailable": 1,
+  "globalQueue": { "queued": 0, "assigned": 1, "held": 0, "total": 1 },
+  "executorQueues": [ { "nodeId": "compute-primary", "jobIds": ["job_01J..."], "updatedAt": "2026-07-06T12:00:00Z" } ]
+}
+```
+
+`hubId` is the same stable identity embedded as `sourceHub.hubId` in generated travel profiles.
+
+Restart and supervision guidance for hub daemons lives in [`HUB-OPERATIONS.md`](HUB-OPERATIONS.md).
 
 ## Raw artifact access (`v1`)
 

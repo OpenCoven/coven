@@ -30,8 +30,18 @@ pub struct HealthCapabilities {
     pub events: bool,
     pub travel: bool,
     pub scheduler: bool,
+    pub hub: bool,
     pub event_cursor: String,
     pub structured_errors: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HubHealth {
+    pub role: String,
+    pub hub_id: String,
+    pub nodes_total: usize,
+    pub nodes_available: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +52,10 @@ pub struct HealthResponse {
     pub coven_version: String,
     pub capabilities: HealthCapabilities,
     pub daemon: Option<DaemonStatus>,
+    /// Hub control-plane summary (role + node availability). `None` when the
+    /// response is built without store access (e.g. CLI status printing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub: Option<HubHealth>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,11 +140,21 @@ pub fn health_response(daemon: Option<DaemonStatus>) -> HealthResponse {
             events: true,
             travel: true,
             scheduler: true,
+            hub: true,
             event_cursor: "sequence".to_string(),
             structured_errors: true,
         },
         daemon,
+        hub: None,
     }
+}
+
+fn health_response_with_hub(coven_home: &Path, daemon: Option<DaemonStatus>) -> HealthResponse {
+    let mut response = health_response(daemon);
+    if let Ok(summary) = crate::hub::hub_health_summary(coven_home) {
+        response.hub = serde_json::from_value(summary).ok();
+    }
+    response
 }
 
 #[allow(dead_code)]
@@ -187,7 +211,7 @@ pub fn handle_request_with_runtime(
                 "supportedApiVersions": SUPPORTED_API_VERSIONS,
             }),
         ),
-        ("GET", "/health") => json_response(200, &health_response(daemon)),
+        ("GET", "/health") => json_response(200, &health_response_with_hub(coven_home, daemon)),
         ("GET", "/capabilities") => json_response(200, &control_plane::capabilities()),
         ("GET", "/overview") => overview_response(coven_home),
         ("POST", "/actions") => {
@@ -339,6 +363,41 @@ pub fn handle_request_with_runtime(
         }
         ("POST", "/scheduler/decisions") => scheduler_decision(coven_home, body),
         ("POST", "/scheduler/redispatch") => scheduler_redispatch(coven_home, body),
+        ("GET", "/hub/status") => crate::hub::hub_status(coven_home),
+        ("POST", "/hub/nodes") => crate::hub::register_node(coven_home, body),
+        ("GET", "/hub/nodes") => crate::hub::list_nodes(coven_home),
+        ("POST", path) if path.starts_with("/hub/nodes/") && path.ends_with("/health") => {
+            let node_id = path
+                .trim_start_matches("/hub/nodes/")
+                .trim_end_matches("/health");
+            crate::hub::report_node_health(coven_home, node_id, body)
+        }
+        ("GET", path) if path.starts_with("/hub/nodes/") => {
+            let node_id = path.trim_start_matches("/hub/nodes/");
+            crate::hub::get_node(coven_home, node_id)
+        }
+        ("POST", "/hub/jobs") => crate::hub::enqueue_job(coven_home, body),
+        ("GET", "/hub/jobs") => {
+            let q = query.unwrap_or_default();
+            crate::hub::list_jobs(coven_home, q)
+        }
+        ("POST", path) if path.starts_with("/hub/jobs/") && path.ends_with("/assign") => {
+            let job_id = path
+                .trim_start_matches("/hub/jobs/")
+                .trim_end_matches("/assign");
+            crate::hub::assign_job(coven_home, job_id, body)
+        }
+        ("POST", path) if path.starts_with("/hub/jobs/") && path.ends_with("/complete") => {
+            let job_id = path
+                .trim_start_matches("/hub/jobs/")
+                .trim_end_matches("/complete");
+            crate::hub::complete_job(coven_home, job_id, body)
+        }
+        ("GET", path) if path.starts_with("/hub/jobs/") => {
+            let job_id = path.trim_start_matches("/hub/jobs/");
+            crate::hub::get_job(coven_home, job_id)
+        }
+        ("GET", "/hub/routing") => crate::hub::list_routing_table(coven_home),
         ("GET", path) if path.starts_with("/scheduler/decisions/") => {
             let decision_id = path.trim_start_matches("/scheduler/decisions/");
             get_scheduler_decision(coven_home, decision_id)
@@ -2045,7 +2104,7 @@ fn update_familiar_icon(
     }
 }
 
-fn parse_body(body: Option<&str>) -> Result<Value> {
+pub(crate) fn parse_body(body: Option<&str>) -> Result<Value> {
     match body.filter(|body| !body.trim().is_empty()) {
         Some(body) => serde_json::from_str(body).context("failed to parse request body"),
         None => Ok(json!({})),
@@ -2059,7 +2118,7 @@ fn split_path_query(path: &str) -> (&str, Option<&str>) {
     }
 }
 
-fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+pub(crate) fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
     query.split('&').find_map(|part| {
         let (candidate, value) = part.split_once('=')?;
         (candidate == key).then_some(value)
@@ -2076,7 +2135,7 @@ pub(crate) fn current_timestamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
 
-fn api_error(
+pub(crate) fn api_error(
     status: u16,
     code: &str,
     message: &str,
@@ -2092,7 +2151,7 @@ fn api_error(
     json_response(status, &json!({ "error": error }))
 }
 
-fn json_response<T: Serialize>(status: u16, body: &T) -> Result<ApiResponse> {
+pub(crate) fn json_response<T: Serialize>(status: u16, body: &T) -> Result<ApiResponse> {
     Ok(ApiResponse {
         status,
         content_type: "application/json",
@@ -2115,9 +2174,11 @@ mod tests {
         assert!(response.capabilities.events);
         assert!(response.capabilities.travel);
         assert!(response.capabilities.scheduler);
+        assert!(response.capabilities.hub);
         assert_eq!(response.capabilities.event_cursor, "sequence");
         assert!(response.capabilities.structured_errors);
         assert_eq!(response.daemon, None);
+        assert_eq!(response.hub, None);
     }
 
     #[test]
@@ -2143,6 +2204,8 @@ mod tests {
         assert!(response.body.contains(r#""sessions":true"#));
         assert!(response.body.contains(r#""travel":true"#));
         assert!(response.body.contains(r#""scheduler":true"#));
+        assert!(response.body.contains(r#""hub":true"#));
+        assert!(response.body.contains(r#""role":"hub""#));
         assert!(response.body.contains(r#""structuredErrors":true"#));
         Ok(())
     }

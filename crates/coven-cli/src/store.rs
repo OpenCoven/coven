@@ -130,6 +130,42 @@ pub struct ExecutorQueueRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeRecord {
+    pub node_id: String,
+    pub role: String,
+    pub transport: String,
+    pub capabilities_json: String,
+    pub available: bool,
+    pub queue_pressure: i64,
+    pub last_health_at: String,
+    pub registered_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubJobRecord {
+    pub job_id: String,
+    pub state: String,
+    pub priority: i64,
+    pub required_capabilities_json: String,
+    pub assigned_node_id: Option<String>,
+    pub loop_id: Option<String>,
+    pub payload_json: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteRecord {
+    pub job_id: String,
+    pub node_id: String,
+    pub decision_id: Option<String>,
+    pub reason: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositoryRecord {
     pub id: String,
     pub path: String,
@@ -303,6 +339,51 @@ pub fn open_store(path: &Path) -> Result<Connection> {
             job_ids_json TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS node_registry (
+            node_id TEXT PRIMARY KEY NOT NULL,
+            role TEXT NOT NULL,
+            transport TEXT NOT NULL,
+            capabilities_json TEXT NOT NULL,
+            available INTEGER NOT NULL DEFAULT 0,
+            queue_pressure INTEGER NOT NULL DEFAULT 0,
+            last_health_at TEXT NOT NULL,
+            registered_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_node_registry_available
+            ON node_registry(available, queue_pressure);
+
+        CREATE TABLE IF NOT EXISTS hub_jobs (
+            job_id TEXT PRIMARY KEY NOT NULL,
+            state TEXT NOT NULL,
+            priority INTEGER NOT NULL DEFAULT 0,
+            required_capabilities_json TEXT NOT NULL,
+            assigned_node_id TEXT,
+            loop_id TEXT,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_hub_jobs_state
+            ON hub_jobs(state, priority DESC, created_at);
+
+        CREATE INDEX IF NOT EXISTS idx_hub_jobs_assigned_node
+            ON hub_jobs(assigned_node_id, state);
+
+        CREATE TABLE IF NOT EXISTS routing_table (
+            job_id TEXT PRIMARY KEY NOT NULL,
+            node_id TEXT NOT NULL,
+            decision_id TEXT,
+            reason TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_routing_table_node
+            ON routing_table(node_id, updated_at DESC);
 
         CREATE TABLE IF NOT EXISTS loop_state (
             loop_id TEXT PRIMARY KEY NOT NULL,
@@ -982,6 +1063,316 @@ pub fn get_executor_queue(conn: &Connection, node_id: &str) -> Result<Option<Exe
     )
     .optional()
     .with_context(|| format!("failed to read executor queue {node_id}"))
+}
+
+pub fn list_executor_queues(conn: &Connection) -> Result<Vec<ExecutorQueueRecord>> {
+    let mut statement = conn
+        .prepare(
+            "SELECT node_id, job_ids_json, updated_at
+             FROM executor_queue
+             ORDER BY node_id",
+        )
+        .context("failed to prepare executor queue list")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(ExecutorQueueRecord {
+                node_id: row.get(0)?,
+                job_ids_json: row.get(1)?,
+                updated_at: row.get(2)?,
+            })
+        })
+        .context("failed to list executor queues")?;
+    let mut records = Vec::new();
+    for row in rows {
+        records.push(row.context("failed to read executor queue row")?);
+    }
+    Ok(records)
+}
+
+pub fn upsert_node(conn: &Connection, record: &NodeRecord) -> Result<()> {
+    conn.execute(
+        "INSERT INTO node_registry (
+            node_id,
+            role,
+            transport,
+            capabilities_json,
+            available,
+            queue_pressure,
+            last_health_at,
+            registered_at,
+            updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        ON CONFLICT(node_id) DO UPDATE SET
+            role = excluded.role,
+            transport = excluded.transport,
+            capabilities_json = excluded.capabilities_json,
+            available = excluded.available,
+            queue_pressure = excluded.queue_pressure,
+            last_health_at = excluded.last_health_at,
+            updated_at = excluded.updated_at",
+        params![
+            &record.node_id,
+            &record.role,
+            &record.transport,
+            &record.capabilities_json,
+            if record.available { 1 } else { 0 },
+            record.queue_pressure,
+            &record.last_health_at,
+            &record.registered_at,
+            &record.updated_at,
+        ],
+    )
+    .with_context(|| format!("failed to upsert node {}", record.node_id))?;
+    Ok(())
+}
+
+fn node_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRecord> {
+    let available: i64 = row.get(4)?;
+    Ok(NodeRecord {
+        node_id: row.get(0)?,
+        role: row.get(1)?,
+        transport: row.get(2)?,
+        capabilities_json: row.get(3)?,
+        available: available != 0,
+        queue_pressure: row.get(5)?,
+        last_health_at: row.get(6)?,
+        registered_at: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
+}
+
+const NODE_COLUMNS: &str = "node_id, role, transport, capabilities_json, available, \
+     queue_pressure, last_health_at, registered_at, updated_at";
+
+pub fn get_node(conn: &Connection, node_id: &str) -> Result<Option<NodeRecord>> {
+    conn.query_row(
+        &format!("SELECT {NODE_COLUMNS} FROM node_registry WHERE node_id = ?1 LIMIT 1"),
+        params![node_id],
+        node_from_row,
+    )
+    .optional()
+    .with_context(|| format!("failed to read node {node_id}"))
+}
+
+pub fn list_nodes(conn: &Connection) -> Result<Vec<NodeRecord>> {
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT {NODE_COLUMNS} FROM node_registry ORDER BY node_id"
+        ))
+        .context("failed to prepare node registry list")?;
+    let rows = statement
+        .query_map([], node_from_row)
+        .context("failed to list node registry")?;
+    let mut records = Vec::new();
+    for row in rows {
+        records.push(row.context("failed to read node registry row")?);
+    }
+    Ok(records)
+}
+
+pub fn upsert_hub_job(conn: &Connection, record: &HubJobRecord) -> Result<()> {
+    conn.execute(
+        "INSERT INTO hub_jobs (
+            job_id,
+            state,
+            priority,
+            required_capabilities_json,
+            assigned_node_id,
+            loop_id,
+            payload_json,
+            created_at,
+            updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        ON CONFLICT(job_id) DO UPDATE SET
+            state = excluded.state,
+            priority = excluded.priority,
+            required_capabilities_json = excluded.required_capabilities_json,
+            assigned_node_id = excluded.assigned_node_id,
+            loop_id = excluded.loop_id,
+            payload_json = excluded.payload_json,
+            updated_at = excluded.updated_at",
+        params![
+            &record.job_id,
+            &record.state,
+            record.priority,
+            &record.required_capabilities_json,
+            &record.assigned_node_id,
+            &record.loop_id,
+            &record.payload_json,
+            &record.created_at,
+            &record.updated_at,
+        ],
+    )
+    .with_context(|| format!("failed to upsert hub job {}", record.job_id))?;
+    Ok(())
+}
+
+fn hub_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HubJobRecord> {
+    Ok(HubJobRecord {
+        job_id: row.get(0)?,
+        state: row.get(1)?,
+        priority: row.get(2)?,
+        required_capabilities_json: row.get(3)?,
+        assigned_node_id: row.get(4)?,
+        loop_id: row.get(5)?,
+        payload_json: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
+}
+
+const HUB_JOB_COLUMNS: &str = "job_id, state, priority, required_capabilities_json, \
+     assigned_node_id, loop_id, payload_json, created_at, updated_at";
+
+pub fn get_hub_job(conn: &Connection, job_id: &str) -> Result<Option<HubJobRecord>> {
+    conn.query_row(
+        &format!("SELECT {HUB_JOB_COLUMNS} FROM hub_jobs WHERE job_id = ?1 LIMIT 1"),
+        params![job_id],
+        hub_job_from_row,
+    )
+    .optional()
+    .with_context(|| format!("failed to read hub job {job_id}"))
+}
+
+pub fn list_hub_jobs(conn: &Connection, state: Option<&str>) -> Result<Vec<HubJobRecord>> {
+    let mut records = Vec::new();
+    match state {
+        Some(state) => {
+            let mut statement = conn
+                .prepare(&format!(
+                    "SELECT {HUB_JOB_COLUMNS} FROM hub_jobs
+                     WHERE state = ?1
+                     ORDER BY priority DESC, created_at, job_id"
+                ))
+                .context("failed to prepare hub job list")?;
+            let rows = statement
+                .query_map(params![state], hub_job_from_row)
+                .context("failed to list hub jobs")?;
+            for row in rows {
+                records.push(row.context("failed to read hub job row")?);
+            }
+        }
+        None => {
+            let mut statement = conn
+                .prepare(&format!(
+                    "SELECT {HUB_JOB_COLUMNS} FROM hub_jobs
+                     ORDER BY priority DESC, created_at, job_id"
+                ))
+                .context("failed to prepare hub job list")?;
+            let rows = statement
+                .query_map([], hub_job_from_row)
+                .context("failed to list hub jobs")?;
+            for row in rows {
+                records.push(row.context("failed to read hub job row")?);
+            }
+        }
+    }
+    Ok(records)
+}
+
+pub fn list_hub_jobs_for_node(conn: &Connection, node_id: &str) -> Result<Vec<HubJobRecord>> {
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT {HUB_JOB_COLUMNS} FROM hub_jobs
+             WHERE assigned_node_id = ?1
+             ORDER BY priority DESC, created_at, job_id"
+        ))
+        .context("failed to prepare hub job node list")?;
+    let rows = statement
+        .query_map(params![node_id], hub_job_from_row)
+        .context("failed to list hub jobs for node")?;
+    let mut records = Vec::new();
+    for row in rows {
+        records.push(row.context("failed to read hub job row")?);
+    }
+    Ok(records)
+}
+
+pub fn update_hub_job_state(
+    conn: &Connection,
+    job_id: &str,
+    state: &str,
+    assigned_node_id: Option<&str>,
+    updated_at: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE hub_jobs
+         SET state = ?2, assigned_node_id = ?3, updated_at = ?4
+         WHERE job_id = ?1",
+        params![job_id, state, assigned_node_id, updated_at],
+    )
+    .with_context(|| format!("failed to update hub job {job_id}"))?;
+    Ok(())
+}
+
+pub fn upsert_route(conn: &Connection, record: &RouteRecord) -> Result<()> {
+    conn.execute(
+        "INSERT INTO routing_table (
+            job_id,
+            node_id,
+            decision_id,
+            reason,
+            created_at,
+            updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        ON CONFLICT(job_id) DO UPDATE SET
+            node_id = excluded.node_id,
+            decision_id = excluded.decision_id,
+            reason = excluded.reason,
+            updated_at = excluded.updated_at",
+        params![
+            &record.job_id,
+            &record.node_id,
+            &record.decision_id,
+            &record.reason,
+            &record.created_at,
+            &record.updated_at,
+        ],
+    )
+    .with_context(|| format!("failed to upsert route for job {}", record.job_id))?;
+    Ok(())
+}
+
+fn route_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouteRecord> {
+    Ok(RouteRecord {
+        job_id: row.get(0)?,
+        node_id: row.get(1)?,
+        decision_id: row.get(2)?,
+        reason: row.get(3)?,
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+    })
+}
+
+pub fn get_route(conn: &Connection, job_id: &str) -> Result<Option<RouteRecord>> {
+    conn.query_row(
+        "SELECT job_id, node_id, decision_id, reason, created_at, updated_at
+         FROM routing_table
+         WHERE job_id = ?1
+         LIMIT 1",
+        params![job_id],
+        route_from_row,
+    )
+    .optional()
+    .with_context(|| format!("failed to read route for job {job_id}"))
+}
+
+pub fn list_routes(conn: &Connection) -> Result<Vec<RouteRecord>> {
+    let mut statement = conn
+        .prepare(
+            "SELECT job_id, node_id, decision_id, reason, created_at, updated_at
+             FROM routing_table
+             ORDER BY updated_at DESC, job_id",
+        )
+        .context("failed to prepare routing table list")?;
+    let rows = statement
+        .query_map([], route_from_row)
+        .context("failed to list routing table")?;
+    let mut records = Vec::new();
+    for row in rows {
+        records.push(row.context("failed to read routing table row")?);
+    }
+    Ok(records)
 }
 
 pub fn upsert_scheduler_loop_state(

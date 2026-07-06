@@ -51,6 +51,19 @@ Versioned clients should use the `/api/v1` prefix:
 | `GET /api/v1/sessions/:id/log` | Read bounded redacted log previews |
 | `POST /api/v1/sessions/:id/input` | Forward input to a live session |
 | `POST /api/v1/sessions/:id/kill` | Kill a live session |
+| `GET /api/v1/hub/status` | Read hub role, node availability, and queue depths |
+| `POST /api/v1/hub/nodes` | Register or re-register an executor node |
+| `GET /api/v1/hub/nodes` | List registered nodes |
+| `GET /api/v1/hub/nodes/:id` | Fetch one registered node |
+| `POST /api/v1/hub/nodes/:id/health` | Record an executor health report (holds/resumes its subqueue) |
+| `POST /api/v1/hub/jobs` | Enqueue a job on the persistent global queue |
+| `GET /api/v1/hub/jobs?state=...` | List queued jobs |
+| `GET /api/v1/hub/jobs/:id` | Fetch one job with its routing entry |
+| `POST /api/v1/hub/jobs/:id/assign` | Assign a job to an executor from the node registry |
+| `POST /api/v1/hub/jobs/:id/complete` | Mark a job completed/failed/cancelled |
+| `GET /api/v1/hub/routing` | Read the persistent routing table |
+
+Full request/response shapes for the hub control plane (node registry, routing table, global and per-executor queues) live in [`API-CONTRACT.md`](API-CONTRACT.md); hub restart and supervision guidance lives in [`HUB-OPERATIONS.md`](HUB-OPERATIONS.md).
 
 Unversioned routes currently remain as legacy aliases during the early MVP window, but new clients should not rely on them.
 
@@ -72,6 +85,9 @@ Event payloads returned by `/events`, `/sessions/:id/events`, and `/sessions/:id
   "capabilities": {
     "sessions": true,
     "events": true,
+    "travel": true,
+    "scheduler": true,
+    "hub": true,
     "eventCursor": "sequence",
     "structuredErrors": true
   },
@@ -79,11 +95,17 @@ Event payloads returned by `/events`, `/sessions/:id/events`, and `/sessions/:id
     "pid": 12345,
     "startedAt": "2026-05-09T12:00:00Z",
     "socket": "/Users/example/.coven/coven.sock"
+  },
+  "hub": {
+    "role": "hub",
+    "hubId": "hub_01J...",
+    "nodesTotal": 2,
+    "nodesAvailable": 1
   }
 }
 ```
 
-When no daemon metadata is available, `daemon` is `null`.
+When no daemon metadata is available, `daemon` is `null`. The `hub` block summarizes the daemon's control-plane role and node availability; full node and queue detail lives at `GET /api/v1/hub/status`.
 
 ## Control-plane capabilities
 

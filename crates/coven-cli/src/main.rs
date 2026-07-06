@@ -22,6 +22,7 @@ mod encrypted_artifacts;
 mod eval_loop;
 mod familiar_identity;
 mod harness;
+mod hub;
 mod openclaw_repo;
 mod parallel_protocol;
 mod patch;
