@@ -72,7 +72,7 @@ pub(crate) fn plan_spell(raw: &str) -> Result<CastPlan> {
 }
 
 /// Resolve Cast's safe default harness from the host's installed adapters.
-/// Codex wins; Claude is the fallback; otherwise `None`.
+/// Codex wins; Claude is the fallback; OpenCode is the tertiary fallback; otherwise `None`.
 pub(crate) fn default_harness() -> Option<CastHarness> {
     let harnesses = harness::built_in_harnesses();
     if harnesses.iter().any(|h| h.id == "codex" && h.available) {
@@ -80,6 +80,9 @@ pub(crate) fn default_harness() -> Option<CastHarness> {
     }
     if harnesses.iter().any(|h| h.id == "claude" && h.available) {
         return Some(CastHarness::Claude);
+    }
+    if harnesses.iter().any(|h| h.id == "opencode" && h.available) {
+        return Some(CastHarness::Opencode);
     }
     None
 }

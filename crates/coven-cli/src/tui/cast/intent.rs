@@ -12,6 +12,7 @@ use anyhow::{anyhow, Result};
 pub(crate) enum CastHarness {
     Codex,
     Claude,
+    Opencode,
 }
 
 impl CastHarness {
@@ -19,6 +20,7 @@ impl CastHarness {
         match self {
             CastHarness::Codex => "codex",
             CastHarness::Claude => "claude",
+            CastHarness::Opencode => "opencode",
         }
     }
 
@@ -26,6 +28,7 @@ impl CastHarness {
         match self {
             CastHarness::Codex => "Codex",
             CastHarness::Claude => "Claude Code",
+            CastHarness::Opencode => "OpenCode",
         }
     }
 
@@ -33,6 +36,7 @@ impl CastHarness {
         match token.to_ascii_lowercase().as_str() {
             "codex" => Some(CastHarness::Codex),
             "claude" | "claude-code" | "claudecode" => Some(CastHarness::Claude),
+            "opencode" => Some(CastHarness::Opencode),
             _ => None,
         }
     }
@@ -142,6 +146,7 @@ fn parse_slash_command(input: &str) -> Result<Option<CastIntent>> {
         "/run" => parse_run_slash(rest)?,
         "/codex" => parse_harness_slash(CastHarness::Codex, rest)?,
         "/claude" => parse_harness_slash(CastHarness::Claude, rest)?,
+        "/opencode" => parse_harness_slash(CastHarness::Opencode, rest)?,
         "/attach" => session_id_intent(rest, "/attach", |session_id| CastIntent::AttachSession {
             session_id,
         })?,

@@ -416,6 +416,20 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
                 read_only: "plan".to_string(),
             }),
         },
+        HarnessCommandSpec {
+            id: "opencode".to_string(),
+            label: "OpenCode".to_string(),
+            executable: "opencode".to_string(),
+            interactive_prompt_prefix_args: Vec::new(),
+            non_interactive_prompt_prefix_args: vec!["run".to_string()],
+            install_hint: "Install OpenCode with `curl -fsSL https://opencode.ai/install | bash`, then ensure `opencode` resolves on PATH. Verify with `opencode --version`.".to_string(),
+            source: "bundled".to_string(),
+            manifest_path: None,
+            system_prompt_flag: None,
+            model_flag: Some("--model".to_string()),
+            model_arg_template: None,
+            sandbox: None,
+        },
     ]
 }
 
@@ -585,6 +599,7 @@ fn adapter_manifest_paths_in_dir(dir: &Path) -> Vec<PathBuf> {
 pub fn known_adapter_manifest(adapter_id: &str) -> Option<&'static str> {
     match adapter_id {
         "hermes" => Some(HERMES_ADAPTER_MANIFEST),
+        "opencode" => Some(OPENCODE_ADAPTER_MANIFEST),
         _ => None,
     }
 }
@@ -604,8 +619,24 @@ const HERMES_ADAPTER_MANIFEST: &str = r#"{
 }
 "#;
 
+const OPENCODE_ADAPTER_MANIFEST: &str = r#"{
+  "adapters": [
+    {
+      "id": "opencode",
+      "label": "OpenCode",
+      "executable": "opencode",
+      "interactive_prompt_prefix_args": [],
+      "non_interactive_prompt_prefix_args": ["run"],
+      "install_hint": "Install OpenCode with `curl -fsSL https://opencode.ai/install | bash`, then ensure `opencode` resolves on PATH. Verify with `opencode --version`.",
+      "system_prompt_flag": null,
+      "model_flag": "--model"
+    }
+  ]
+}
+"#;
+
 pub fn known_adapter_recipe_names() -> &'static [&'static str] {
-    &["hermes"]
+    &["hermes", "opencode"]
 }
 
 fn load_external_harness_specs(

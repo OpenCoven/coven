@@ -1283,11 +1283,13 @@ impl App {
         let home = std::env::var("HOME")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
-        for (harness_id, label) in &[("codex", "Codex"), ("claude", "Claude")] {
+        for (harness_id, label) in &[("codex", "Codex"), ("claude", "Claude"), ("opencode", "OpenCode")] {
             let m = if *harness_id == "codex" {
                 crate::capabilities::scan_codex_capabilities(&home)
-            } else {
+            } else if *harness_id == "claude" {
                 crate::capabilities::scan_claude_capabilities(&home)
+            } else {
+                crate::capabilities::scan_opencode_capabilities(&home)
             };
             let instr = if m.global_instructions.present {
                 "✓"

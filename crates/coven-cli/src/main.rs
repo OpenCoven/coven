@@ -1172,6 +1172,7 @@ fn default_harness_id() -> Option<String> {
         .iter()
         .find(|h| h.id == "codex" && h.available)
         .or_else(|| harnesses.iter().find(|h| h.id == "claude" && h.available))
+        .or_else(|| harnesses.iter().find(|h| h.id == "opencode" && h.available))
         .map(|h| h.id.clone())
 }
 

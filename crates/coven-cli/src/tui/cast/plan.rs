@@ -213,7 +213,7 @@ fn quest_plan(
             "Each phase delegates to {} unless you override the sub-prompt",
             plan_harness.harness.label()
         ),
-        None => "No harness ready — run `coven doctor` to install Codex or Claude Code".to_string(),
+        None => "No harness ready — run `coven doctor` to install Codex, Claude Code, or OpenCode".to_string(),
     };
     let steps = vec![
         CastStep::new(CastStepKind::Inform, "design — scope the work"),
@@ -254,7 +254,7 @@ fn natural_spell_plan(
                 plan_harness.harness.label()
             ),
             None => {
-                "No harness ready — run `coven doctor` to install Codex or Claude Code".to_string()
+                "No harness ready — run `coven doctor` to install Codex, Claude Code, or OpenCode".to_string()
             }
         },
     )];
@@ -366,7 +366,7 @@ fn familiar_spell_plan(
                 plan_harness.harness.label()
             ),
             None => {
-                "No harness ready — run `coven doctor` to install Codex or Claude Code".to_string()
+                "No harness ready — run `coven doctor` to install Codex, Claude Code, or OpenCode".to_string()
             }
         },
     )];
