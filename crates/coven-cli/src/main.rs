@@ -1982,12 +1982,43 @@ fn run_session(
         &selected_harness.id,
         &effective_prompt,
         &cwd,
-        harness_launch_mode_for_stdio(),
+        if stream_json {
+            // stream-json is a machine protocol: always launch the harness
+            // one-shot/non-interactive, even when stdio happens to be a
+            // terminal. The claude pass-through above does the same (`-p`);
+            // launching a TUI here would leave the harness waiting on
+            // keystrokes for a screen that is never rendered.
+            harness::HarnessLaunchMode::NonInteractive
+        } else {
+            harness_launch_mode_for_stdio()
+        },
         conversation_hint.as_ref(),
         familiar_for_args,
         launch_options,
     )?;
-    match pty_runner::run_attached(&command) {
+    // Non-stream harnesses run on a PTY. In stream-json mode, mirroring the
+    // raw PTY bytes to stdout would interleave ANSI escapes / prompts /
+    // partial lines with the JSONL frames and corrupt the stream for every
+    // consumer (#307), so the PTY is captured instead and each chunk is
+    // wrapped in an `output` event. Emit failures inside the callback are
+    // ignored (the consumer may have closed the pipe mid-run); the `result`
+    // emission below surfaces a dead stdout as an error.
+    let attached = if stream_json {
+        let output_session_id = record.id.clone();
+        pty_runner::run_attached_captured(
+            &command,
+            Box::new(move |chunk| {
+                let _ =
+                    emit_stream_event(&stream_json::Event::Output(stream_json::HarnessOutput {
+                        text: String::from_utf8_lossy(&chunk).into_owned(),
+                        session_id: output_session_id.clone(),
+                    }));
+            }),
+        )
+    } else {
+        pty_runner::run_attached(&command)
+    };
+    match attached {
         Ok(result) => {
             store::update_session_status(
                 &conn,
