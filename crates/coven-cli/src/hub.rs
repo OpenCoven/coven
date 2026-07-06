@@ -117,6 +117,61 @@ fn sync_executor_queue(conn: &Connection, node_id: &str, now: &str) -> Result<Ve
     Ok(job_ids)
 }
 
+/// Bring the hub's persistent job, routing-table, and subqueue state in line
+/// with a scheduler redispatch outcome. Returns `false` when the job is not
+/// tracked in the hub's global queue (snapshot-only simulation flows), in
+/// which case nothing is touched.
+pub(crate) fn apply_redispatch_outcome(
+    conn: &Connection,
+    job_id: &str,
+    target_node_id: Option<&str>,
+    decision_id: &str,
+    reason: &str,
+    now: &str,
+) -> Result<bool> {
+    let Some(job) = store::get_hub_job(conn, job_id)? else {
+        return Ok(false);
+    };
+    if TERMINAL_JOB_STATES.contains(&job.state.as_str()) {
+        return Ok(false);
+    }
+    let previous_node_id = job.assigned_node_id.clone();
+    match target_node_id {
+        Some(target) => {
+            store::update_hub_job_state(conn, job_id, JOB_STATE_ASSIGNED, Some(target), now)?;
+            store::upsert_route(
+                conn,
+                &store::RouteRecord {
+                    job_id: job_id.to_string(),
+                    node_id: target.to_string(),
+                    decision_id: Some(decision_id.to_string()),
+                    reason: reason.to_string(),
+                    created_at: now.to_string(),
+                    updated_at: now.to_string(),
+                },
+            )?;
+            sync_executor_queue(conn, target, now)?;
+            if let Some(previous) = previous_node_id.filter(|previous| previous != target) {
+                sync_executor_queue(conn, &previous, now)?;
+            }
+        }
+        None => {
+            // Paused: hold the job on its current node without losing state.
+            store::update_hub_job_state(
+                conn,
+                job_id,
+                JOB_STATE_HELD,
+                previous_node_id.as_deref(),
+                now,
+            )?;
+            if let Some(previous) = previous_node_id {
+                sync_executor_queue(conn, &previous, now)?;
+            }
+        }
+    }
+    Ok(true)
+}
+
 pub fn hub_health_summary(coven_home: &Path) -> Result<Value> {
     let conn = store::open_store(&store_path(coven_home))?;
     let nodes = store::list_nodes(&conn)?;
@@ -1569,6 +1624,161 @@ exit 2
         assert_eq!(poll["heldSubqueue"]["jobIds"][0], "job_held_by_poll");
         let (_, job) = get(&temp, "/api/v1/hub/jobs/job_held_by_poll")?;
         assert_eq!(job["state"], "held");
+        Ok(())
+    }
+    #[test]
+    fn scheduler_decision_falls_back_to_hub_registry_when_nodes_omitted() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+
+        // Empty registry and no snapshot: fail closed.
+        let (status, body) = post(
+            &temp,
+            "/api/v1/scheduler/decisions",
+            r#"{"jobId":"job_reg","requiredCapabilities":["gpu"]}"#,
+        )?;
+        assert_eq!(status, 409);
+        assert_eq!(body["error"]["code"], "no_scheduler_target");
+
+        register_gpu_node(&temp, "node_gpu")?;
+        let (status, body) = post(
+            &temp,
+            "/api/v1/scheduler/decisions",
+            r#"{"jobId":"job_reg","requiredCapabilities":["gpu"]}"#,
+        )?;
+        assert_eq!(status, 201);
+        assert_eq!(body["target"]["nodeId"], "node_gpu");
+        assert_eq!(body["inputs"]["nodesSource"], "hub_registry");
+        Ok(())
+    }
+
+    #[test]
+    fn redispatch_uses_hub_registry_and_syncs_hub_job_state() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        register_gpu_node(&temp, "node_primary")?;
+        post(
+            &temp,
+            "/api/v1/hub/jobs",
+            r#"{"jobId":"job_move","requiredCapabilities":["gpu"],"loopId":"loop_move"}"#,
+        )?;
+        let (status, _) = post(&temp, "/api/v1/hub/jobs/job_move/assign", "{}")?;
+        assert_eq!(status, 200);
+
+        // Primary goes offline (job held), fallback joins the registry.
+        post(
+            &temp,
+            "/api/v1/hub/nodes/node_primary/health",
+            r#"{"available":false}"#,
+        )?;
+        register_gpu_node(&temp, "node_fallback")?;
+
+        // No `nodes` snapshot: candidates come from the persistent registry.
+        let (status, body) = post(
+            &temp,
+            "/api/v1/scheduler/redispatch",
+            r#"{
+                "loopId":"loop_move",
+                "jobId":"job_move",
+                "currentNodeId":"node_primary",
+                "requiredCapabilities":["gpu"],
+                "loopResumable":true
+            }"#,
+        )?;
+        assert_eq!(status, 202);
+        assert_eq!(body["state"], "redispatched");
+        assert_eq!(body["target"]["nodeId"], "node_fallback");
+        assert_eq!(body["hubJobSynced"], true);
+        assert_eq!(body["inputs"].get("nodesSource"), None); // inputs not echoed here
+
+        // The hub's persistent job, routing, and subqueue state follow the
+        // redispatch decision.
+        let (_, job) = get(&temp, "/api/v1/hub/jobs/job_move")?;
+        assert_eq!(job["state"], "assigned");
+        assert_eq!(job["assignedNodeId"], "node_fallback");
+        assert_eq!(job["route"]["nodeId"], "node_fallback");
+        let (_, hub) = get(&temp, "/api/v1/hub/status")?;
+        let queues = hub["executorQueues"].as_array().unwrap();
+        let queue_for = |node: &str| {
+            queues
+                .iter()
+                .find(|queue| queue["nodeId"] == node)
+                .map(|queue| queue["jobIds"].clone())
+        };
+        assert_eq!(queue_for("node_fallback").unwrap()[0], "job_move");
+        assert_eq!(
+            queue_for("node_primary").unwrap().as_array().unwrap().len(),
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn redispatch_pause_holds_hub_job_without_losing_state() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        register_gpu_node(&temp, "node_primary")?;
+        post(
+            &temp,
+            "/api/v1/hub/jobs",
+            r#"{"jobId":"job_stuck","requiredCapabilities":["gpu"],"loopId":"loop_stuck"}"#,
+        )?;
+        post(&temp, "/api/v1/hub/jobs/job_stuck/assign", "{}")?;
+        post(
+            &temp,
+            "/api/v1/hub/nodes/node_primary/health",
+            r#"{"available":false}"#,
+        )?;
+
+        // No alternate registry node: the loop pauses, and the hub job is
+        // held on its node instead of being dropped.
+        let (status, body) = post(
+            &temp,
+            "/api/v1/scheduler/redispatch",
+            r#"{
+                "loopId":"loop_stuck",
+                "jobId":"job_stuck",
+                "currentNodeId":"node_primary",
+                "requiredCapabilities":["gpu"],
+                "loopResumable":true
+            }"#,
+        )?;
+        assert_eq!(status, 202);
+        assert_eq!(body["state"], "paused");
+        assert_eq!(body["hubJobSynced"], true);
+        assert_eq!(body["preservedSubqueue"]["jobIds"][0], "job_stuck");
+
+        let (_, job) = get(&temp, "/api/v1/hub/jobs/job_stuck")?;
+        assert_eq!(job["state"], "held");
+        assert_eq!(job["assignedNodeId"], "node_primary");
+        Ok(())
+    }
+
+    #[test]
+    fn redispatch_with_snapshot_nodes_reports_untracked_jobs_as_unsynced() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        // Snapshot-only simulation flow (#270 fixtures): job is not in the
+        // hub global queue, so no hub state is touched.
+        let (status, body) = post(
+            &temp,
+            "/api/v1/scheduler/redispatch",
+            r#"{
+                "loopId":"loop_sim",
+                "jobId":"job_sim",
+                "currentNodeId":"node_primary",
+                "requiredCapabilities":["gpu"],
+                "loopResumable":true,
+                "nodes":[
+                    {"nodeId":"node_primary","role":"compute_executor","available":false,
+                     "capabilities":["gpu"],"queuePressure":3,"queuedJobIds":["job_sim"]},
+                    {"nodeId":"node_fallback","role":"compute_executor","available":true,
+                     "capabilities":["gpu"],"queuePressure":1,"queuedJobIds":[]}
+                ]
+            }"#,
+        )?;
+        assert_eq!(status, 202);
+        assert_eq!(body["state"], "redispatched");
+        assert_eq!(body["target"]["nodeId"], "node_fallback");
+        assert_eq!(body["hubJobSynced"], false);
+        let (_, jobs) = get(&temp, "/api/v1/hub/jobs")?;
+        assert_eq!(jobs["jobs"].as_array().unwrap().len(), 0);
         Ok(())
     }
 }
