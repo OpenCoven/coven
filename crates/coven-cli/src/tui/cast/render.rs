@@ -367,11 +367,13 @@ fn plan_footer_hint(plan: &CastPlan) -> &'static str {
     use crate::tui::cast::intent::CastIntent;
 
     if matches!(plan.intent, CastIntent::SacrificeSession { .. }) {
-        return "type sacrifice to confirm · esc cancels";
+        return "type sacrifice to confirm · anything else cancels";
     }
     match plan.risk() {
-        CastRisk::Safe => "press enter to cast · esc cancels",
-        CastRisk::Confirm => "review the risk note · y/N to confirm · esc cancels",
+        // Safe plans proceed without a keypress (the gate only stops
+        // Confirm-risk plans), so don't promise an Enter that is never read.
+        CastRisk::Safe => "casting now · Ctrl+C interrupts",
+        CastRisk::Confirm => "review the risk note · y/N to confirm",
         CastRisk::Reject => "Cast will not run this · type to reframe",
     }
 }

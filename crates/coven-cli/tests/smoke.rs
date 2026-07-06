@@ -310,7 +310,7 @@ fn doctor_missing_harness_prints_cross_platform_setup_loop() -> anyhow::Result<(
     assert_stdout_contains(
         "doctor without harnesses",
         &output,
-        "Install docs: docs/install/index.md",
+        "Install docs: https://github.com/OpenCoven/coven/blob/main/docs/install/index.md",
     );
     Ok(())
 }

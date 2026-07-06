@@ -50,7 +50,7 @@ const DEFAULT_TITLE_CHARS: usize = 48;
 #[command(version = env!("COVEN_VERSION_DESC"))]
 #[command(about = "Run project-scoped coding agents without memorizing harness commands")]
 #[command(
-    long_about = "Coven runs Codex, Claude Code, and future harnesses inside a local, project-scoped session ledger. Run `coven` with no arguments for a beginner-friendly menu."
+    long_about = "Coven runs Codex, Claude Code, and future harnesses inside a local, project-scoped session ledger. Run `coven` with no arguments to open the interactive Coven UI (requires the coven-code front-end), or pass a free-text task to plan and run it directly."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -60,16 +60,16 @@ struct Cli {
         num_args = 0..,
         trailing_var_arg = true,
         allow_hyphen_values = true,
-        help = "Task to run through Cast when no subcommand is provided"
+        help = "Free-text task to cast when no subcommand is given: Coven plans it, asks you to confirm, then runs it in a session"
     )]
     prompt: Vec<String>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    #[command(about = "Interactive chat with Coven agents")]
+    #[command(about = "Open the interactive Coven UI (requires coven-code)")]
     Chat,
-    #[command(about = "Open the slash-command TUI")]
+    #[command(about = "Open the interactive Coven UI (same as `coven chat`)")]
     Tui,
     #[command(about = "Check local setup and print next steps")]
     Doctor,
@@ -97,7 +97,11 @@ enum Command {
         cwd: Option<PathBuf>,
         #[arg(long, help = "Readable title for `coven sessions`")]
         title: Option<String>,
-        #[arg(long, help = "Create the session record without launching the harness")]
+        #[arg(
+            long,
+            conflicts_with = "continue_session",
+            help = "Create the session record without launching the harness"
+        )]
         detach: bool,
         #[arg(
             long = "continue",
@@ -124,13 +128,13 @@ enum Command {
         #[arg(
             long,
             value_name = "ID",
-            help = "Familiar id to inject as identity context (e.g. charm). \nThe harness-agnostic identity preamble is injected via each harness's \npreferred mechanism (--system-prompt flag or prompt prefix)."
+            help = "Familiar id to inject as identity context (e.g. charm). The identity preamble is injected via each harness's preferred mechanism (--system-prompt flag or prompt prefix)."
         )]
         familiar: Option<String>,
         #[arg(
             long,
             value_name = "ID",
-            help = "Model to run the harness on. Accepts a namespaced id (e.g. \nopenai/gpt-5.5, anthropic/claude-...); Coven strips the provider/ \nprefix and forwards the bare id to the harness's native model flag \n(codex/claude --model). Adapters that declare no model mechanism warn \nand continue. Echoed back in the stream-json system.init `model` field."
+            help = "Model to run the harness on. Accepts a namespaced id (e.g. openai/gpt-5.5, anthropic/claude-...); Coven strips the provider/ prefix and forwards the bare id to the harness's native model flag (codex/claude --model). Adapters that declare no model mechanism warn and continue. Echoed back in the stream-json system.init `model` field."
         )]
         model: Option<String>,
         #[arg(
@@ -164,7 +168,7 @@ enum Command {
         )]
         stream_json_input: bool,
     },
-    #[command(about = "List or search recent Coven sessions")]
+    #[command(about = "List or search recent Coven sessions", alias = "session")]
     Sessions {
         #[command(subcommand)]
         command: Option<SessionsCommand>,
@@ -174,7 +178,7 @@ enum Command {
         manage: bool,
         #[arg(long, conflicts_with_all = ["manage", "json"], help = "Print a plain table instead of the session browser")]
         plain: bool,
-        #[arg(long, conflicts_with_all = ["manage", "plain"], help = "Print sessions as JSON for clients such as comux")]
+        #[arg(long, conflicts_with_all = ["manage", "plain"], help = "Print sessions as JSON (machine-readable)")]
         json: bool,
     },
     #[command(about = "Manage local log retention")]
@@ -182,7 +186,11 @@ enum Command {
         #[command(subcommand)]
         command: LogsCommand,
     },
-    #[command(about = "Create, list, diagnose, and prune Coven worktrees")]
+    #[command(
+        about = "Create, list, diagnose, and prune Coven worktrees",
+        alias = "worktree",
+        alias = "worktrees"
+    )]
     Wt {
         #[arg(
             help = "Branch to create or enter in the sibling <repo>.wt directory",
@@ -210,13 +218,27 @@ enum Command {
         command: HooksCommand,
     },
     #[command(about = "Replay/follow a session and forward input to live daemon sessions")]
-    Attach { session_id: String },
+    Attach {
+        #[arg(help = "Session id, or a unique prefix of one (list ids with `coven sessions`)")]
+        session_id: String,
+    },
     #[command(about = "Summon an archived session back, then replay/follow it")]
-    Summon { session_id: String },
+    Summon {
+        #[arg(
+            help = "Session id, or a unique prefix of one (list ids with `coven sessions --all`)"
+        )]
+        session_id: String,
+    },
     #[command(about = "Archive a completed session without deleting its events")]
-    Archive { session_id: String },
+    Archive {
+        #[arg(help = "Session id, or a unique prefix of one (list ids with `coven sessions`)")]
+        session_id: String,
+    },
     #[command(about = "Permanently delete a non-running session and its events")]
     Sacrifice {
+        #[arg(
+            help = "Session id, or a unique prefix of one (list ids with `coven sessions --all`)"
+        )]
         session_id: String,
         #[arg(long, help = "Confirm permanent deletion")]
         yes: bool,
@@ -233,14 +255,23 @@ enum Command {
         harness: Option<String>,
         #[arg(
             long,
-            help = "Verification profile: auto, pnpm-check, targeted-test, diff-only"
+            value_name = "PROFILE",
+            value_parser = ["auto", "pnpm-check", "targeted-test", "diff-only"],
+            help = "Verification profile to run after the harness finishes"
         )]
         verify: Option<String>,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Never prompt; requires issue text and --harness, and fails instead of asking"
+        )]
         non_interactive: bool,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Print the plan and repair brief without launching the harness"
+        )]
         dry_run: bool,
-        #[arg(long)]
+        // Accepted for compatibility; patch sessions are always kept today.
+        #[arg(long, hide = true)]
         keep_session: bool,
     },
     #[command(about = "Diagnose and relieve macOS system pressure")]
@@ -254,9 +285,9 @@ enum Command {
 enum SessionsCommand {
     #[command(about = "Full-text search session event payloads")]
     Search {
-        #[arg(help = "FTS5 query (e.g. `phoenix OR rises`)")]
+        #[arg(help = "Full-text query (FTS5 syntax, e.g. `phoenix OR rises`)")]
         query: String,
-        #[arg(long, help = "Print SearchHit JSON for clients")]
+        #[arg(long, help = "Print search hits as JSON (machine-readable)")]
         json: bool,
     },
 }
@@ -282,9 +313,13 @@ enum AdapterCommand {
 
 #[derive(Subcommand, Debug)]
 enum DaemonCommand {
+    #[command(about = "Start the background daemon that hosts live sessions")]
     Start,
+    #[command(about = "Restart the background daemon")]
     Restart,
+    #[command(about = "Show whether the daemon is running")]
     Status,
+    #[command(about = "Stop the background daemon")]
     Stop,
     #[command(hide = true)]
     Serve {
@@ -486,8 +521,72 @@ fn run_cli(cli: Cli) -> Result<()> {
 }
 
 fn run_bare_prompt(prompt: &[String]) -> Result<()> {
+    // The bare-prompt catch-all swallows anything clap doesn't recognize, so
+    // it has to do its own front-door validation: reject stray flags, catch
+    // near-miss subcommand typos, and refuse to launch a harness when nobody
+    // is at the terminal to confirm or cancel the cast.
+    if let Some(first) = prompt.first() {
+        if first.starts_with('-') {
+            anyhow::bail!(
+                "unrecognized flag `{first}`; run `coven --help` to see available flags and commands"
+            );
+        }
+    }
+    if let [token] = prompt {
+        if let Some(suggestion) = near_miss_subcommand(token) {
+            anyhow::bail!(
+                "unrecognized subcommand `{token}`; did you mean `coven {suggestion}`? \
+                 (to run `{token}` as a task instead, use `coven run <harness> \"{token}\"`)"
+            );
+        }
+    }
+    if !io::stdin().is_terminal() {
+        anyhow::bail!(
+            "refusing to cast without an interactive terminal to confirm the plan; \
+             use `coven run <harness> \"<task>\"` for scripted runs"
+        );
+    }
     let prompt = joined_prompt(prompt)?;
     tui::shell::run_cast_spell(&prompt)
+}
+
+/// Suggest a subcommand (or alias) within a small edit distance of the given
+/// word. Guards the bare-prompt catch-all: without this, `coven sesions`
+/// would be cast as an AI task instead of surfacing a typo.
+fn near_miss_subcommand(word: &str) -> Option<String> {
+    use clap::CommandFactory;
+    let needle = word.to_ascii_lowercase();
+    let mut best: Option<(usize, String)> = None;
+    for subcommand in Cli::command().get_subcommands() {
+        let names = std::iter::once(subcommand.get_name().to_string())
+            .chain(subcommand.get_all_aliases().map(str::to_string));
+        for name in names {
+            let threshold = if name.len() <= 4 { 1 } else { 2 };
+            let distance = edit_distance(&needle, &name);
+            if distance > 0
+                && distance <= threshold
+                && best.as_ref().is_none_or(|(d, _)| distance < *d)
+            {
+                best = Some((distance, name));
+            }
+        }
+    }
+    best.map(|(_, name)| name)
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    for (i, &ca) in a.iter().enumerate() {
+        let mut current = vec![i + 1];
+        for (j, &cb) in b.iter().enumerate() {
+            let substitution = previous[j] + usize::from(ca != cb);
+            current.push(substitution.min(previous[j + 1] + 1).min(current[j] + 1));
+        }
+        previous = current;
+    }
+    previous[b.len()]
 }
 
 fn run_sessions_search(query: &str, json: bool) -> Result<()> {
@@ -530,6 +629,13 @@ fn run_shared_interactive_shell() -> Result<()> {
             InteractiveShellRoute::Chat => tui::chat::run_chat(),
             InteractiveShellRoute::PlainCast => tui::shell::run(),
         };
+    }
+
+    if !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
+        anyhow::bail!(
+            "the interactive Coven UI needs a real terminal (stdin/stdout are not TTYs).\n\
+             Try instead: coven doctor · coven sessions --plain · coven run <harness> \"<task>\""
+        );
     }
 
     match coven_code_binary() {
@@ -704,7 +810,8 @@ fn try_delegate_to_coven_code(binary: &Path) -> Result<()> {
         let status = command
             .status()
             .map_err(|e| anyhow!("failed to launch coven-code: {e}"))?;
-        std::process::exit(status.code().unwrap_or(0));
+        // A signal-terminated child has no code; treat it as failure.
+        std::process::exit(status.code().unwrap_or(1));
     }
 }
 
@@ -771,10 +878,23 @@ fn run_doctor() -> Result<()> {
         let marker = if harness.available { "OK" } else { "!!" };
         println!(
             "  [{marker}] {:<18} `{}` is {status} ({})",
-            harness.label, harness.executable, harness.source
+            harness.label,
+            harness.executable,
+            adapter_source_label(&harness.source)
         );
         if !harness.available {
             println!("       {}", harness.install_hint);
+        }
+    }
+
+    println!("\nInteractive UI:");
+    match coven_code_binary() {
+        Some(path) => println!("  [OK] coven-code found at {}", path.display()),
+        None => {
+            println!("  [!!] coven-code is missing — `coven` and `coven chat` need it");
+            for line in coven_code_install_instructions(target_shell()).lines() {
+                println!("     {line}");
+            }
         }
     }
 
@@ -790,9 +910,21 @@ fn run_doctor() -> Result<()> {
         println!("  Claude Code: npm install -g @anthropic-ai/claude-code && claude doctor");
         println!("  If PATH changed, open a new terminal and run `coven doctor` again.");
         println!("  Then run: coven daemon start");
-        println!("  Install docs: docs/install/index.md");
+        println!(
+            "  Install docs: https://github.com/OpenCoven/coven/blob/main/docs/install/index.md"
+        );
     }
     Ok(())
+}
+
+/// Human label for an adapter spec's `source` field. The raw value ("bundled")
+/// reads as a contradiction next to a missing executable ("missing (bundled)").
+fn adapter_source_label(source: &str) -> &str {
+    if source == "bundled" {
+        "built-in adapter"
+    } else {
+        source
+    }
 }
 
 /// Surface the configured familiars so operators can confirm which identities
@@ -868,7 +1000,11 @@ fn run_adapter_list(json: bool) -> Result<()> {
             .unwrap_or_default();
         println!(
             "  {:<18} {:<10} `{}` {}{}",
-            harness.id, availability, harness.executable, harness.source, manifest
+            harness.id,
+            availability,
+            harness.executable,
+            adapter_source_label(&harness.source),
+            manifest
         );
     }
     Ok(())
@@ -1324,7 +1460,12 @@ fn run_daemon_command(command: DaemonCommand) -> Result<()> {
                 "coven daemon status=stale ok=false pid={} socket={}",
                 status.pid, status.socket
             ),
-            None => println!("coven daemon status=stopped"),
+            None => {
+                println!("coven daemon status=stopped");
+                eprintln!(
+                    "start it with `coven daemon start` (optional — `coven run` works without it)"
+                );
+            }
         },
         DaemonCommand::Stop => {
             if daemon::stop_background_server(&home)? {
@@ -1379,6 +1520,18 @@ fn should_synthesize_stream_user_event(
     harness_id: &str,
 ) -> bool {
     stream_json && !expanded_prompt.is_empty() && (detach || harness_id != "claude")
+}
+
+/// Exit with the failed session's exit code so scripts can gate on
+/// `coven run ... && next-step`. The ledger has already recorded the failure
+/// and, on stream paths, the JSONL result event has already been emitted.
+fn exit_with_session_code(exit_code: i32, stream_json: bool) -> ! {
+    if !stream_json {
+        eprintln!("session failed (exit code {exit_code})");
+    }
+    let _ = io::stdout().flush();
+    let _ = io::stderr().flush();
+    std::process::exit(exit_code);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1713,6 +1866,9 @@ fn run_session(
             let archived_at = current_timestamp();
             store::archive_session(&conn, &record.id, &archived_at)?;
         }
+        if is_error {
+            exit_with_session_code(exit_code, true);
+        }
         return Ok(());
     }
 
@@ -1784,6 +1940,9 @@ fn run_session(
                     println!("\nArchived session {} at {archived_at}", record.id);
                 }
             }
+            if let Some(code) = result.exit_code.filter(|code| *code != 0) {
+                exit_with_session_code(code, stream_json);
+            }
             Ok(())
         }
         Err(error) => {
@@ -1809,14 +1968,60 @@ fn run_session(
     }
 }
 
+/// Resolve a full session id or a unique id prefix to a session record.
+/// Exact matches win; otherwise a single prefix match is accepted, an
+/// ambiguous prefix lists the candidates, and a miss points at `coven
+/// sessions` so the user can find a real id.
+fn resolve_session_ref(
+    conn: &rusqlite::Connection,
+    reference: &str,
+) -> Result<store::SessionRecord> {
+    if let Some(session) = store::get_session(conn, reference)? {
+        return Ok(session);
+    }
+    if !reference.is_empty() {
+        let matches: Vec<store::SessionRecord> = store::list_sessions_including_archived(conn)?
+            .into_iter()
+            .filter(|session| session.id.starts_with(reference))
+            .collect();
+        match matches.len() {
+            0 => {}
+            1 => return Ok(matches.into_iter().next().expect("one match")),
+            _ => {
+                let ids: Vec<String> = matches
+                    .iter()
+                    .take(5)
+                    .map(|session| session.id.clone())
+                    .collect();
+                anyhow::bail!(
+                    "session id prefix `{reference}` is ambiguous; it matches: {}",
+                    ids.join(", ")
+                );
+            }
+        }
+    }
+    anyhow::bail!("session `{reference}` not found; run `coven sessions --all` to list session ids")
+}
+
+/// Remedy line for the archive/sacrifice "still running" refusals: a session
+/// whose process died externally keeps status=running until daemon startup
+/// recovery marks it orphaned.
+const STALE_RUNNING_HINT: &str =
+    "if its process is already gone, run `coven daemon restart` to mark it orphaned, then retry";
+
 fn archive_session_command(session_id: &str) -> Result<()> {
     let store_path = coven_store_path()?;
     let conn = store::open_store(&store_path)?;
-    let Some(session) = store::get_session(&conn, session_id)? else {
-        anyhow::bail!("session `{session_id}` not found");
-    };
+    let session = resolve_session_ref(&conn, session_id)?;
+    let session_id = session.id.as_str();
     if session.status == RUNNING_SESSION_STATUS {
-        anyhow::bail!("session `{session_id}` is still running; stop it before archiving");
+        anyhow::bail!(
+            "session `{session_id}` is still running; stop it before archiving ({STALE_RUNNING_HINT})"
+        );
+    }
+    if session.archived_at.is_some() {
+        println!("session was already archived; nothing to do");
+        return Ok(());
     }
 
     store::archive_session(&conn, session_id, &current_timestamp())?;
@@ -1839,14 +2044,13 @@ fn summon_session_command(session_id: &str) -> Result<()> {
 pub(crate) fn summon_only_command(session_id: &str) -> Result<store::SessionRecord> {
     let store_path = coven_store_path()?;
     let conn = store::open_store(&store_path)?;
-    let Some(session) = store::get_session(&conn, session_id)? else {
-        anyhow::bail!("session `{session_id}` not found");
-    };
+    let session = resolve_session_ref(&conn, session_id)?;
+    let session_id = session.id.clone();
 
     if session.archived_at.is_some() {
-        store::summon_session(&conn, session_id, &current_timestamp())?;
+        store::summon_session(&conn, &session_id, &current_timestamp())?;
         eprintln!("summoned session from the archive");
-        let Some(session) = store::get_session(&conn, session_id)? else {
+        let Some(session) = store::get_session(&conn, &session_id)? else {
             anyhow::bail!("session `{session_id}` not found");
         };
         return Ok(session);
@@ -1856,15 +2060,18 @@ pub(crate) fn summon_only_command(session_id: &str) -> Result<store::SessionReco
 }
 
 fn sacrifice_session_command(session_id: &str, yes: bool) -> Result<()> {
-    confirm_sacrifice(session_id, yes)?;
     let store_path = coven_store_path()?;
     let conn = store::open_store(&store_path)?;
-    let Some(session) = store::get_session(&conn, session_id)? else {
-        anyhow::bail!("session `{session_id}` not found");
-    };
+    // Resolve before asking for confirmation so a typo'd id fails immediately
+    // instead of after the user has already agreed to a permanent delete.
+    let session = resolve_session_ref(&conn, session_id)?;
+    let session_id = session.id.as_str();
     if session.status == RUNNING_SESSION_STATUS {
-        anyhow::bail!("session `{session_id}` is still running; do not sacrifice live work");
+        anyhow::bail!(
+            "session `{session_id}` is still running; do not sacrifice live work ({STALE_RUNNING_HINT})"
+        );
     }
+    confirm_sacrifice(session_id, yes)?;
 
     store::sacrifice_session(&conn, session_id)?;
     println!("sacrificed session; its event log was permanently deleted");
@@ -1885,14 +2092,21 @@ fn attach_session(session_id: &str) -> Result<()> {
     let home = coven_home_dir()?;
     let store_path = home.join(STORE_FILE_NAME);
     let conn = store::open_store(&store_path)?;
-    let Some(session) = store::get_session(&conn, session_id)? else {
-        anyhow::bail!("session `{session_id}` not found");
-    };
+    let session = resolve_session_ref(&conn, session_id)?;
+    let session_id = session.id.as_str();
 
     eprintln!(
-        "attached to session status={} harness={} title={} ",
-        session.status, session.harness, session.title
+        "attached to session {} ({}, \"{}\", status: {})",
+        session_id, session.harness, session.title, session.status
     );
+    if session.status == RUNNING_SESSION_STATUS {
+        eprintln!("following live output; Ctrl+C detaches (the session keeps running)");
+    } else {
+        eprintln!(
+            "session is not running; replaying its recorded output (resume it with `coven run {} --continue {}`)",
+            session.harness, session_id
+        );
+    }
 
     maybe_spawn_input_forwarder(home.clone(), session_id.to_string());
 
@@ -2200,6 +2414,69 @@ mod tests {
         )];
         let browser_frame = tui::sessions::render_browser_frame_plain_for_test(&sessions, 0, 0);
         assert!(browser_frame.contains("Session browser"));
+    }
+
+    #[test]
+    fn near_miss_subcommand_catches_common_typos() {
+        assert_eq!(near_miss_subcommand("sesions").as_deref(), Some("sessions"));
+        assert_eq!(near_miss_subcommand("sessons").as_deref(), Some("sessions"));
+        assert_eq!(near_miss_subcommand("docter").as_deref(), Some("doctor"));
+        assert_eq!(near_miss_subcommand("attch").as_deref(), Some("attach"));
+    }
+
+    #[test]
+    fn near_miss_subcommand_ignores_ordinary_prompts() {
+        assert_eq!(near_miss_subcommand("refactor"), None);
+        assert_eq!(near_miss_subcommand("hello"), None);
+        assert_eq!(near_miss_subcommand("explain"), None);
+    }
+
+    #[test]
+    fn edit_distance_matches_expected_values() {
+        assert_eq!(edit_distance("sessions", "sessions"), 0);
+        assert_eq!(edit_distance("sesions", "sessions"), 1);
+        assert_eq!(edit_distance("", "run"), 3);
+        assert_eq!(edit_distance("chat", "wt"), 3);
+    }
+
+    #[test]
+    fn resolve_session_ref_accepts_unique_prefix_and_rejects_ambiguity() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = store::open_store(&temp_dir.path().join("store.sqlite3"))?;
+        let mut record = store::SessionRecord {
+            id: "aaaa1111-0000-0000-0000-000000000000".to_string(),
+            project_root: "/tmp/project".to_string(),
+            harness: "codex".to_string(),
+            title: "first".to_string(),
+            status: "completed".to_string(),
+            exit_code: Some(0),
+            archived_at: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            conversation_id: None,
+            familiar_id: None,
+            labels: Vec::new(),
+            visibility: "private".to_string(),
+        };
+        store::insert_session(&conn, &record)?;
+        record.id = "aaab2222-0000-0000-0000-000000000000".to_string();
+        record.title = "second".to_string();
+        store::insert_session(&conn, &record)?;
+
+        // Unique prefix resolves; exact id resolves; ambiguous and unknown fail.
+        assert_eq!(
+            resolve_session_ref(&conn, "aaaa")?.id,
+            "aaaa1111-0000-0000-0000-000000000000"
+        );
+        assert_eq!(
+            resolve_session_ref(&conn, "aaab2222-0000-0000-0000-000000000000")?.id,
+            "aaab2222-0000-0000-0000-000000000000"
+        );
+        let ambiguous = resolve_session_ref(&conn, "aaa").unwrap_err();
+        assert!(ambiguous.to_string().contains("ambiguous"));
+        let missing = resolve_session_ref(&conn, "zzzz").unwrap_err();
+        assert!(missing.to_string().contains("coven sessions --all"));
+        Ok(())
     }
 
     #[test]

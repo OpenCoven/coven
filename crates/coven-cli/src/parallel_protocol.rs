@@ -44,10 +44,11 @@ pub(crate) fn run_wt_command(
         (None, false, true, false, None) => wt_doctor(&repo),
         (None, false, false, true, None) => wt_prune_merged(&repo),
         (None, false, false, false, Some(days)) => wt_prune_stale(&repo, days),
-        (None, false, false, false, None) => {
-            println!("Usage: coven wt <branch> | --list | --doctor | --prune-merged | --prune-stale DAYS");
-            Ok(())
-        }
+        // Unreachable today (clap requires one action), but fail loudly if
+        // that constraint ever loosens instead of printing usage with exit 0.
+        (None, false, false, false, None) => anyhow::bail!(
+            "usage: coven wt <branch> | --list | --doctor | --prune-merged | --prune-stale DAYS"
+        ),
         _ => anyhow::bail!("choose exactly one `coven wt` action"),
     }
 }
@@ -440,6 +441,14 @@ impl Claim {
 
 impl Repo {
     fn discover() -> Result<Self> {
+        if !git_success(["rev-parse", "--is-inside-work-tree"]) {
+            let cwd = std::env::current_dir()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|_| "<unknown>".to_string());
+            anyhow::bail!(
+                "this command needs a git repository; run it inside one (current directory: {cwd})"
+            );
+        }
         let root = PathBuf::from(git_stdout(["rev-parse", "--show-toplevel"])?.trim());
         let common = PathBuf::from(git_stdout(["rev-parse", "--git-common-dir"])?.trim());
         let common_dir = if common.is_absolute() {
@@ -519,8 +528,8 @@ fn git_stdout<const N: usize>(args: [&str; N]) -> Result<String> {
     if !output.status.success() {
         anyhow::bail!(
             "git failed: {}\n{}",
-            String::from_utf8_lossy(&output.stderr),
-            String::from_utf8_lossy(&output.stdout)
+            String::from_utf8_lossy(&output.stderr).trim_end(),
+            String::from_utf8_lossy(&output.stdout).trim_end()
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
@@ -543,8 +552,8 @@ fn run_git<const N: usize, const M: usize>(args: [&str; N], path_args: [&Path; M
     if !output.status.success() {
         anyhow::bail!(
             "git failed: {}\n{}",
-            String::from_utf8_lossy(&output.stderr),
-            String::from_utf8_lossy(&output.stdout)
+            String::from_utf8_lossy(&output.stderr).trim_end(),
+            String::from_utf8_lossy(&output.stdout).trim_end()
         );
     }
     Ok(())

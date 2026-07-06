@@ -126,17 +126,20 @@ fn list_sessions_plain(include_archived: bool) -> Result<()> {
         } else {
             println!("No active Coven sessions yet.");
         }
-        println!("Start or inspect with:");
-        println!("  coven doctor");
-        println!("  coven run codex \"explain this repo in 5 bullets\"");
-        println!("  coven sessions --all");
+        // Hints go to stderr so `coven sessions --plain | ...` stays a clean table.
+        eprintln!("Start or inspect with:");
+        eprintln!("  coven doctor");
+        if let Some(harness) = crate::default_harness_id() {
+            eprintln!("  coven run {harness} \"explain this repo in 5 bullets\"");
+        }
+        eprintln!("  coven sessions --all");
     } else {
         println!(
             "{:<id_width$} {:<10} {:<8} {:<8} TITLE",
             "SESSION",
             "STATUS",
             "HARNESS",
-            "RITUAL",
+            "STATE",
             id_width = PLAIN_SESSION_ID_COLUMN_WIDTH
         );
         println!(
@@ -144,18 +147,19 @@ fn list_sessions_plain(include_archived: bool) -> Result<()> {
             "-------",
             "------",
             "-------",
-            "------",
+            "-----",
             id_width = PLAIN_SESSION_ID_COLUMN_WIDTH
         );
         for session in sessions {
             println!("{}", format_session_line(&session));
         }
-        println!("\nRituals:");
-        println!(
+        // Cheat-sheet goes to stderr so the stdout table stays parseable.
+        eprintln!("\nRituals:");
+        eprintln!(
             "  coven summon <session-id>       # restore archived session, then replay/follow"
         );
-        println!("  coven archive <session-id>      # hide from active list, keep events");
-        println!("  coven sacrifice <session-id> --yes  # permanently delete non-running session");
+        eprintln!("  coven archive <session-id>      # hide from active list, keep events");
+        eprintln!("  coven sacrifice <session-id> --yes  # permanently delete non-running session");
     }
 
     Ok(())
