@@ -31,6 +31,7 @@ pub struct HealthCapabilities {
     pub travel: bool,
     pub scheduler: bool,
     pub hub: bool,
+    pub executor_dispatch: bool,
     pub event_cursor: String,
     pub structured_errors: bool,
 }
@@ -141,6 +142,7 @@ pub fn health_response(daemon: Option<DaemonStatus>) -> HealthResponse {
             travel: true,
             scheduler: true,
             hub: true,
+            executor_dispatch: true,
             event_cursor: "sequence".to_string(),
             structured_errors: true,
         },
@@ -371,6 +373,22 @@ pub fn handle_request_with_runtime(
                 .trim_start_matches("/hub/nodes/")
                 .trim_end_matches("/health");
             crate::hub::report_node_health(coven_home, node_id, body)
+        }
+        ("POST", path) if path.starts_with("/hub/nodes/") && path.ends_with("/poll") => {
+            let node_id = path
+                .trim_start_matches("/hub/nodes/")
+                .trim_end_matches("/poll");
+            crate::hub::poll_node(coven_home, node_id)
+        }
+        ("POST", path) if path.starts_with("/hub/nodes/") && path.ends_with("/dispatch") => {
+            let node_id = path
+                .trim_start_matches("/hub/nodes/")
+                .trim_end_matches("/dispatch");
+            crate::hub::dispatch_to_node(coven_home, node_id, body)
+        }
+        ("GET", path) if path.starts_with("/hub/dispatches/") => {
+            let job_id = path.trim_start_matches("/hub/dispatches/");
+            crate::hub::get_dispatch(coven_home, job_id)
         }
         ("GET", path) if path.starts_with("/hub/nodes/") => {
             let node_id = path.trim_start_matches("/hub/nodes/");
@@ -2175,6 +2193,7 @@ mod tests {
         assert!(response.capabilities.travel);
         assert!(response.capabilities.scheduler);
         assert!(response.capabilities.hub);
+        assert!(response.capabilities.executor_dispatch);
         assert_eq!(response.capabilities.event_cursor, "sequence");
         assert!(response.capabilities.structured_errors);
         assert_eq!(response.daemon, None);
@@ -2205,6 +2224,7 @@ mod tests {
         assert!(response.body.contains(r#""travel":true"#));
         assert!(response.body.contains(r#""scheduler":true"#));
         assert!(response.body.contains(r#""hub":true"#));
+        assert!(response.body.contains(r#""executorDispatch":true"#));
         assert!(response.body.contains(r#""role":"hub""#));
         assert!(response.body.contains(r#""structuredErrors":true"#));
         Ok(())

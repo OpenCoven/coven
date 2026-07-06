@@ -2,7 +2,7 @@
 
 **Status:** Draft v0.1 - 2026-07-04
 **Owner:** Coven runtime - Coven Cave
-**Tracks:** GitHub issues #264, #265, #268, #269, #270
+**Tracks:** GitHub issues #264, #265, #267, #268, #269, #270
 
 ## Design constraints
 
@@ -223,6 +223,110 @@ Valid states:
 - `handoff_pending`
 - `syncing_delta`
 - `hub_resumed`
+
+## Executor protocol and SSH dispatcher
+
+The stateless executor protocol is versioned as `coven.executor.v1` and is
+shared by stationary and compute executor roles. The hub is the only side
+that initiates contact:
+
+- The hub polls availability by running `coven executor probe` on the node
+  over an outbound transport. Executors never push registration or
+  heartbeats to the hub.
+- The hub dispatches work by running `coven executor run-job` and sending
+  the job spec on stdin.
+- Transports are hub-owned: `ssh` (batch mode, `StrictHostKeyChecking=yes`,
+  outbound only) or `local` (private-network/same-host process launch).
+  The raw daemon socket is never exposed.
+
+### Probe envelope (`coven executor probe`)
+
+```json
+{
+  "protocolVersion": "coven.executor.v1",
+  "role": "compute_executor",
+  "capabilities": ["shell", "gpu"],
+  "available": true,
+  "queuePressure": 0,
+  "covenVersion": "0.0.0",
+  "probedAt": "2026-07-06T00:00:00Z"
+}
+```
+
+Both executor roles share this envelope; they differ only in the role and
+capabilities they advertise (configured in `<covenHome>/executor.json`).
+
+### Job spec (stdin of `coven executor run-job`)
+
+```json
+{
+  "protocolVersion": "coven.executor.v1",
+  "jobId": "job_01J...",
+  "hubId": "hub_01J...",
+  "requiredCapabilities": ["gpu"],
+  "command": ["sh", "-c", "…"],
+  "cwd": "/work/checkout",
+  "env": {"KEY": "value"},
+  "stdin": "optional payload",
+  "timeoutSeconds": 300,
+  "context": {"workspaceId": "workspace_01J..."}
+}
+```
+
+The job spec carries everything the executor needs (argv, cwd, env, stdin
+payload, and opaque hub-provided context), so the node runs it without
+local durable authority. `run-job` reads no hub-authoritative state.
+
+### Result envelope (stdout of `coven executor run-job`)
+
+```json
+{
+  "protocolVersion": "coven.executor.v1",
+  "jobId": "job_01J...",
+  "status": "completed",
+  "exitCode": 0,
+  "stdout": "…",
+  "stderr": "…",
+  "startedAt": "2026-07-06T00:00:00Z",
+  "finishedAt": "2026-07-06T00:00:05Z",
+  "durationMs": 5000,
+  "error": null
+}
+```
+
+`status` is one of `completed`, `failed`, `timeout`, `rejected`, or
+`transport_error` (the last is synthesized by the hub-side dispatcher when
+the node is unreachable or replies with a malformed envelope, so callers
+always see one shape).
+
+### Hub routes
+
+- `GET /api/v1/hub/nodes` — registry with capability metadata and last-known
+  availability.
+- `POST /api/v1/hub/nodes` — operator registers/updates a node (role,
+  capabilities, and the structured `transportConfig` dispatch link).
+  Live availability is earned through hub-initiated polls.
+- `POST /api/v1/hub/nodes/:nodeId/poll` — hub polls the executor outbound and
+  records capabilities, availability, and last error; availability
+  transitions hold/resume the node's persistent subqueue.
+- `POST /api/v1/hub/nodes/:nodeId/dispatch` — hub dispatches a job outbound,
+  persists the dispatch record plus normalized envelope, treats the
+  attempt as an availability observation, and advances a matching
+  hub-queue job from the envelope.
+- `GET /api/v1/hub/dispatches/:jobId` — durable dispatch record (job spec,
+  envelope, status).
+
+Acceptance coverage for #267:
+
+- hub dispatches jobs outbound over SSH/private network;
+- hub polls executor availability; executors never push to the hub;
+- job specs carry full context so executor nodes need no local durable
+  authority;
+- executors return stdout/stderr/result metadata in a normalized envelope;
+- the hub records executor capability metadata and last-known
+  availability; and
+- stationary and compute roles share the base protocol while advertising
+  different capabilities.
 
 ## Scheduler
 
@@ -472,7 +576,8 @@ Hard requirements:
 ## Implementation order
 
 1. Land this spec (#265).
-2. Add hub-owned travel profile generation and offline delta reconciliation APIs (#268).
-3. Add scheduler decision model and debug output (#269).
-4. Add failure simulations and release gates (#270).
-5. Wire Cave UI to explicit travel/handoff/scheduler state.
+2. Add the stateless executor protocol and hub-owned SSH dispatcher (#267).
+3. Add hub-owned travel profile generation and offline delta reconciliation APIs (#268).
+4. Add scheduler decision model and debug output (#269).
+5. Add failure simulations and release gates (#270).
+6. Wire Cave UI to explicit travel/handoff/scheduler state.

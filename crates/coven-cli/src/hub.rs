@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::{
     api::{api_error, current_timestamp, json_response, parse_body, ApiResponse},
-    store,
+    executor_node, store,
 };
 
 /// Store-meta key shared with travel profile generation so the hub identity
@@ -45,14 +45,21 @@ fn parse_capabilities(json_text: &str) -> Vec<String> {
 }
 
 fn node_response(node: &store::NodeRecord) -> Value {
+    let transport_config: Value = node
+        .transport_config_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or(Value::Null);
     json!({
         "nodeId": node.node_id,
         "role": node.role,
         "transport": node.transport,
+        "transportConfig": transport_config,
         "capabilities": parse_capabilities(&node.capabilities_json),
         "available": node.available,
         "queuePressure": node.queue_pressure,
         "lastHealthAt": node.last_health_at,
+        "lastError": node.last_error,
         "registeredAt": node.registered_at,
         "updatedAt": node.updated_at,
     })
@@ -166,6 +173,10 @@ struct RegisterNodeRequest {
     role: String,
     #[serde(default)]
     transport: Option<String>,
+    /// Structured hub-outbound dispatch config. Required before the hub can
+    /// poll or dispatch to this node over SSH/private network.
+    #[serde(default)]
+    transport_config: Option<executor_node::TransportConfig>,
     #[serde(default)]
     capabilities: Vec<String>,
     #[serde(default = "default_true")]
@@ -196,6 +207,24 @@ pub fn register_node(coven_home: &Path, body: Option<&str>) -> Result<ApiRespons
     let existing = store::get_node(&conn, &request.node_id)?;
     let capabilities_json = serde_json::to_string(&request.capabilities)
         .context("failed to serialize node capabilities")?;
+    let transport_config_json = match &request.transport_config {
+        Some(config) => {
+            if let Err(error) = executor_node::build_transport(config) {
+                return api_error(
+                    400,
+                    "invalid_request",
+                    &format!("transportConfig is invalid: {error}"),
+                    None,
+                );
+            }
+            Some(serde_json::to_string(config).context("failed to serialize transport config")?)
+        }
+        // Preserve a previously registered dispatch config when the
+        // re-registration omits it.
+        None => existing
+            .as_ref()
+            .and_then(|node| node.transport_config_json.clone()),
+    };
     let record = store::NodeRecord {
         node_id: request.node_id.clone(),
         role: request.role,
@@ -203,6 +232,7 @@ pub fn register_node(coven_home: &Path, body: Option<&str>) -> Result<ApiRespons
             .transport
             .filter(|transport| !transport.trim().is_empty())
             .unwrap_or_else(|| "ssh".to_string()),
+        transport_config_json,
         capabilities_json,
         available: request.available,
         queue_pressure: existing
@@ -210,6 +240,7 @@ pub fn register_node(coven_home: &Path, body: Option<&str>) -> Result<ApiRespons
             .map(|node| node.queue_pressure)
             .unwrap_or(0),
         last_health_at: now.clone(),
+        last_error: None,
         registered_at: existing
             .as_ref()
             .map(|node| node.registered_at.clone())
@@ -288,18 +319,8 @@ pub fn report_node_health(
     }
     store::upsert_node(&conn, &node)?;
 
-    let (from_state, to_state) = if request.available {
-        (JOB_STATE_HELD, JOB_STATE_ASSIGNED)
-    } else {
-        (JOB_STATE_ASSIGNED, JOB_STATE_HELD)
-    };
-    let mut transitioned = Vec::new();
-    for job in store::list_hub_jobs_for_node(&conn, node_id)? {
-        if job.state == from_state {
-            store::update_hub_job_state(&conn, &job.job_id, to_state, Some(node_id), &now)?;
-            transitioned.push(job.job_id);
-        }
-    }
+    let (from_state, to_state, transitioned) =
+        transition_jobs_for_availability(&conn, node_id, request.available, &now)?;
     let held_job_ids = sync_executor_queue(&conn, node_id, &now)?;
     let node =
         store::get_node(&conn, node_id)?.context("node disappeared while reporting health")?;
@@ -316,6 +337,349 @@ pub fn report_node_health(
                 "to": to_state,
                 "jobIds": transitioned,
             },
+        }),
+    )
+}
+
+/// Move a node's jobs between `assigned` and `held` when its availability
+/// changes. Jobs are never dropped: an unavailable node's work is held on
+/// the hub until the node recovers or the scheduler redispatches it.
+fn transition_jobs_for_availability(
+    conn: &rusqlite::Connection,
+    node_id: &str,
+    available: bool,
+    now: &str,
+) -> Result<(&'static str, &'static str, Vec<String>)> {
+    let (from_state, to_state) = if available {
+        (JOB_STATE_HELD, JOB_STATE_ASSIGNED)
+    } else {
+        (JOB_STATE_ASSIGNED, JOB_STATE_HELD)
+    };
+    let mut transitioned = Vec::new();
+    for job in store::list_hub_jobs_for_node(conn, node_id)? {
+        if job.state == from_state {
+            store::update_hub_job_state(conn, &job.job_id, to_state, Some(node_id), now)?;
+            transitioned.push(job.job_id);
+        }
+    }
+    Ok((from_state, to_state, transitioned))
+}
+
+/// Hub-initiated availability poll (#267): connect outbound to the executor
+/// over its registered transport, run `coven executor probe`, and record the
+/// advertised role/capabilities plus last-known availability. Executors never
+/// push health to the hub — this poll (and dispatch) is how the registry
+/// learns about them. Poll failures are recorded, never fatal.
+pub fn poll_node(coven_home: &Path, node_id: &str) -> Result<ApiResponse> {
+    let conn = store::open_store(&store_path(coven_home))?;
+    let Some(mut node) = store::get_node(&conn, node_id)? else {
+        return api_error(
+            404,
+            "node_not_found",
+            "Node was not found in the hub registry.",
+            Some(json!({ "nodeId": node_id })),
+        );
+    };
+    let transport = match build_node_transport(&node) {
+        Ok(transport) => transport,
+        Err(response) => return response,
+    };
+    let now = current_timestamp();
+    node.last_health_at = now.clone();
+    node.updated_at = now.clone();
+
+    let poll_result = executor_node::poll_executor(transport.as_ref()).and_then(|probe| {
+        if probe.role != node.role {
+            anyhow::bail!(
+                "executor advertised role {} but is registered as {}",
+                probe.role,
+                node.role
+            );
+        }
+        Ok(probe)
+    });
+    match poll_result {
+        Ok(probe) => {
+            node.capabilities_json = serde_json::to_string(&probe.capabilities)
+                .context("failed to serialize probed capabilities")?;
+            node.available = probe.available;
+            node.last_error = None;
+            store::upsert_node(&conn, &node)?;
+            transition_jobs_for_availability(&conn, node_id, probe.available, &now)?;
+            let held_job_ids = sync_executor_queue(&conn, node_id, &now)?;
+            let node = store::get_node(&conn, node_id)?.context("node disappeared during poll")?;
+            json_response(
+                200,
+                &json!({
+                    "nodeId": node.node_id,
+                    "ok": true,
+                    "probe": probe,
+                    "heldSubqueue": {
+                        "nodeId": node_id,
+                        "jobIds": held_job_ids,
+                    },
+                    "node": node_response(&node),
+                }),
+            )
+        }
+        Err(error) => {
+            node.available = false;
+            node.last_error = Some(format!("{error:#}"));
+            store::upsert_node(&conn, &node)?;
+            transition_jobs_for_availability(&conn, node_id, false, &now)?;
+            let held_job_ids = sync_executor_queue(&conn, node_id, &now)?;
+            let node = store::get_node(&conn, node_id)?.context("node disappeared during poll")?;
+            json_response(
+                200,
+                &json!({
+                    "nodeId": node.node_id,
+                    "ok": false,
+                    "error": format!("{error:#}"),
+                    "heldSubqueue": {
+                        "nodeId": node_id,
+                        "jobIds": held_job_ids,
+                    },
+                    "node": node_response(&node),
+                }),
+            )
+        }
+    }
+}
+
+fn build_node_transport(
+    node: &store::NodeRecord,
+) -> std::result::Result<Box<dyn executor_node::ExecutorTransport>, Result<ApiResponse>> {
+    let Some(raw) = node.transport_config_json.as_deref() else {
+        return Err(api_error(
+            409,
+            "node_transport_not_configured",
+            "Node has no dispatch transport configured; re-register it with a transportConfig.",
+            Some(json!({ "nodeId": node.node_id })),
+        ));
+    };
+    let config: executor_node::TransportConfig = match serde_json::from_str(raw) {
+        Ok(config) => config,
+        Err(error) => {
+            return Err(api_error(
+                500,
+                "node_transport_invalid",
+                &format!("Stored transport config could not be parsed: {error}"),
+                Some(json!({ "nodeId": node.node_id })),
+            ));
+        }
+    };
+    match executor_node::build_transport(&config) {
+        Ok(transport) => Ok(transport),
+        Err(error) => Err(api_error(
+            500,
+            "node_transport_invalid",
+            &format!("Stored transport config could not be used: {error}"),
+            Some(json!({ "nodeId": node.node_id })),
+        )),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DispatchJobRequest {
+    #[serde(default)]
+    job_id: Option<String>,
+    command: Vec<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    env: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    stdin: Option<String>,
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
+    #[serde(default)]
+    required_capabilities: Vec<String>,
+    #[serde(default)]
+    context: Option<Value>,
+}
+
+/// Hub-outbound job dispatch (#267). The job spec sent to the executor
+/// carries the full context (argv, cwd, env, stdin, opaque context blob) so
+/// the stateless node needs no local durable authority; the executor's
+/// normalized result envelope is persisted with the dispatch record. When
+/// `jobId` names a queued hub job, its state is advanced from the envelope.
+pub fn dispatch_to_node(
+    coven_home: &Path,
+    node_id: &str,
+    body: Option<&str>,
+) -> Result<ApiResponse> {
+    let payload = match parse_body(body) {
+        Ok(payload) => payload,
+        Err(error) => return api_error(400, "invalid_request", &error.to_string(), None),
+    };
+    let request: DispatchJobRequest = match serde_json::from_value(payload) {
+        Ok(request) => request,
+        Err(error) => return api_error(400, "invalid_request", &error.to_string(), None),
+    };
+    if request.command.is_empty() {
+        return api_error(400, "invalid_request", "command must not be empty.", None);
+    }
+    let conn = store::open_store(&store_path(coven_home))?;
+    let Some(mut node) = store::get_node(&conn, node_id)? else {
+        return api_error(
+            404,
+            "node_not_found",
+            "Node was not found in the hub registry.",
+            Some(json!({ "nodeId": node_id })),
+        );
+    };
+    let known_capabilities = parse_capabilities(&node.capabilities_json);
+    let missing: Vec<&String> = request
+        .required_capabilities
+        .iter()
+        .filter(|required| !known_capabilities.contains(required))
+        .collect();
+    if !missing.is_empty() {
+        return api_error(
+            409,
+            "executor_capability_mismatch",
+            "Executor node does not advertise the required capabilities.",
+            Some(json!({
+                "nodeId": node_id,
+                "requiredCapabilities": request.required_capabilities,
+                "knownCapabilities": known_capabilities,
+                "missingCapabilities": missing,
+            })),
+        );
+    }
+    let transport = match build_node_transport(&node) {
+        Ok(transport) => transport,
+        Err(response) => return response,
+    };
+    let job_id = request
+        .job_id
+        .filter(|job_id| !job_id.trim().is_empty())
+        .unwrap_or_else(|| format!("job_{}", Uuid::new_v4()));
+    let job = executor_node::ExecutorJob {
+        protocol_version: executor_node::EXECUTOR_PROTOCOL_VERSION.to_string(),
+        job_id: job_id.clone(),
+        hub_id: Some(hub_id(&conn)?),
+        required_capabilities: request.required_capabilities,
+        command: request.command,
+        cwd: request.cwd,
+        env: request.env,
+        stdin: request.stdin,
+        timeout_seconds: request.timeout_seconds,
+        context: request.context,
+    };
+    let job_json = serde_json::to_string(&job).context("failed to serialize job spec")?;
+    let now = current_timestamp();
+    // Persist before dispatching so a hub crash mid-dispatch leaves evidence.
+    store::upsert_executor_dispatch(
+        &conn,
+        &store::ExecutorDispatchRecord {
+            job_id: job_id.clone(),
+            node_id: node_id.to_string(),
+            status: "dispatched".to_string(),
+            job_json: job_json.clone(),
+            envelope_json: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )?;
+
+    let envelope = executor_node::dispatch_job(transport.as_ref(), &job);
+    let envelope_json =
+        serde_json::to_string(&envelope).context("failed to serialize result envelope")?;
+    let finished = current_timestamp();
+    store::upsert_executor_dispatch(
+        &conn,
+        &store::ExecutorDispatchRecord {
+            job_id: job_id.clone(),
+            node_id: node_id.to_string(),
+            status: envelope.status.clone(),
+            job_json,
+            envelope_json: Some(envelope_json),
+            created_at: now.clone(),
+            updated_at: finished.clone(),
+        },
+    )?;
+
+    // Advance a matching hub-queue job from the envelope. A transport error
+    // leaves the job assigned/held so no work is lost.
+    if store::get_hub_job(&conn, &job_id)?.is_some() {
+        let hub_state = match envelope.status.as_str() {
+            executor_node::RESULT_STATUS_COMPLETED => Some("completed"),
+            executor_node::RESULT_STATUS_FAILED
+            | executor_node::RESULT_STATUS_TIMEOUT
+            | executor_node::RESULT_STATUS_REJECTED => Some("failed"),
+            _ => None,
+        };
+        if let Some(state) = hub_state {
+            store::update_hub_job_state(&conn, &job_id, state, Some(node_id), &finished)?;
+        }
+    }
+
+    // A dispatch doubles as an availability observation.
+    let unreachable = envelope.status == executor_node::RESULT_STATUS_TRANSPORT_ERROR;
+    node.available = !unreachable;
+    node.last_health_at = finished.clone();
+    node.last_error = if unreachable {
+        envelope.error.clone()
+    } else {
+        None
+    };
+    node.updated_at = finished.clone();
+    store::upsert_node(&conn, &node)?;
+    transition_jobs_for_availability(&conn, node_id, !unreachable, &finished)?;
+    sync_executor_queue(&conn, node_id, &finished)?;
+
+    if unreachable {
+        return api_error(
+            502,
+            "executor_unreachable",
+            "Executor node could not be reached or returned an invalid envelope.",
+            Some(json!({
+                "nodeId": node_id,
+                "jobId": job_id,
+                "envelope": envelope,
+            })),
+        );
+    }
+    json_response(
+        200,
+        &json!({
+            "jobId": job_id,
+            "nodeId": node_id,
+            "createdAt": now,
+            "envelope": envelope,
+        }),
+    )
+}
+
+pub fn get_dispatch(coven_home: &Path, job_id: &str) -> Result<ApiResponse> {
+    let conn = store::open_store(&store_path(coven_home))?;
+    let Some(record) = store::get_executor_dispatch(&conn, job_id)? else {
+        return api_error(
+            404,
+            "executor_job_not_found",
+            "Executor job dispatch record was not found.",
+            Some(json!({ "jobId": job_id })),
+        );
+    };
+    let job: Value = serde_json::from_str(&record.job_json).context("failed to parse job spec")?;
+    let envelope: Value = match &record.envelope_json {
+        Some(envelope_json) => {
+            serde_json::from_str(envelope_json).context("failed to parse result envelope")?
+        }
+        None => Value::Null,
+    };
+    json_response(
+        200,
+        &json!({
+            "jobId": record.job_id,
+            "nodeId": record.node_id,
+            "status": record.status,
+            "job": job,
+            "envelope": envelope,
+            "createdAt": record.created_at,
+            "updatedAt": record.updated_at,
         }),
     )
 }
@@ -854,6 +1218,357 @@ mod tests {
         let (status, body) = post(&temp, "/api/v1/hub/jobs/job_done/assign", "{}")?;
         assert_eq!(status, 409);
         assert_eq!(body["error"]["code"], "job_not_assignable");
+        Ok(())
+    }
+
+    fn register_dispatchable_node(
+        temp: &tempfile::TempDir,
+        node_id: &str,
+        role: &str,
+        program: &str,
+        capabilities: &str,
+    ) -> anyhow::Result<(u16, serde_json::Value)> {
+        post(
+            temp,
+            "/api/v1/hub/nodes",
+            &format!(
+                r#"{{
+                    "nodeId":"{node_id}",
+                    "role":"{role}",
+                    "transport":"local",
+                    "transportConfig":{{"kind":"local","program":"{program}"}},
+                    "capabilities":{capabilities}
+                }}"#
+            ),
+        )
+    }
+
+    #[test]
+    fn node_registration_validates_and_exposes_the_dispatch_transport() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+
+        let (status, node) = register_dispatchable_node(
+            &temp,
+            "node_stationary",
+            "stationary_executor",
+            "/usr/local/bin/coven",
+            r#"["shell"]"#,
+        )?;
+        assert_eq!(status, 201);
+        assert_eq!(node["transportConfig"]["kind"], "local");
+        assert_eq!(node["lastError"], serde_json::Value::Null);
+
+        // An SSH config shaped like an option injection must be rejected.
+        let (status, body) = post(
+            &temp,
+            "/api/v1/hub/nodes",
+            r#"{
+                "nodeId":"node_evil",
+                "role":"stationary_executor",
+                "transportConfig":{"kind":"ssh","host":"-oProxyCommand=evil"}
+            }"#,
+        )?;
+        assert_eq!(status, 400);
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("transportConfig is invalid"));
+
+        // Re-registering without a transportConfig preserves the stored one.
+        let (status, node) = post(
+            &temp,
+            "/api/v1/hub/nodes",
+            r#"{"nodeId":"node_stationary","role":"stationary_executor","capabilities":["shell","browser"]}"#,
+        )?;
+        assert_eq!(status, 200);
+        assert_eq!(node["transportConfig"]["kind"], "local");
+        Ok(())
+    }
+
+    #[test]
+    fn poll_requires_a_configured_dispatch_transport() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        register_gpu_node(&temp, "node_gpu")?;
+
+        let (status, body) = post(&temp, "/api/v1/hub/nodes/node_gpu/poll", "{}")?;
+
+        assert_eq!(status, 409);
+        assert_eq!(body["error"]["code"], "node_transport_not_configured");
+        Ok(())
+    }
+
+    #[test]
+    fn poll_records_last_known_unavailability_when_executor_is_unreachable() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        register_dispatchable_node(
+            &temp,
+            "node_gone",
+            "stationary_executor",
+            "/definitely/not/a/real/coven-executor-binary",
+            r#"["shell"]"#,
+        )?;
+
+        let (status, body) = post(&temp, "/api/v1/hub/nodes/node_gone/poll", "{}")?;
+
+        assert_eq!(status, 200);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["node"]["available"], false);
+        assert!(!body["node"]["lastError"].as_str().unwrap().is_empty());
+        assert!(body["node"]["lastHealthAt"].as_str().unwrap().contains('T'));
+        Ok(())
+    }
+
+    #[test]
+    fn poll_and_dispatch_return_404_for_unregistered_nodes() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+
+        let (status, body) = post(&temp, "/api/v1/hub/nodes/node_missing/poll", "{}")?;
+        assert_eq!(status, 404);
+        assert_eq!(body["error"]["code"], "node_not_found");
+
+        let (status, body) = post(
+            &temp,
+            "/api/v1/hub/nodes/node_missing/dispatch",
+            r#"{"command":["echo","hi"]}"#,
+        )?;
+        assert_eq!(status, 404);
+        assert_eq!(body["error"]["code"], "node_not_found");
+
+        let (status, body) = get(&temp, "/api/v1/hub/dispatches/job_missing")?;
+        assert_eq!(status, 404);
+        assert_eq!(body["error"]["code"], "executor_job_not_found");
+        Ok(())
+    }
+
+    #[test]
+    fn dispatch_rejects_jobs_whose_capabilities_the_node_does_not_advertise() -> anyhow::Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        register_dispatchable_node(
+            &temp,
+            "node_stationary",
+            "stationary_executor",
+            "/usr/local/bin/coven",
+            r#"["shell"]"#,
+        )?;
+
+        let (status, body) = post(
+            &temp,
+            "/api/v1/hub/nodes/node_stationary/dispatch",
+            r#"{"command":["train"],"requiredCapabilities":["gpu"]}"#,
+        )?;
+
+        assert_eq!(status, 409);
+        assert_eq!(body["error"]["code"], "executor_capability_mismatch");
+        assert_eq!(body["error"]["details"]["missingCapabilities"][0], "gpu");
+        Ok(())
+    }
+
+    #[test]
+    fn dispatch_marks_node_unreachable_on_transport_failure_and_keeps_the_record(
+    ) -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        register_dispatchable_node(
+            &temp,
+            "node_gone",
+            "compute_executor",
+            "/definitely/not/a/real/coven-executor-binary",
+            r#"["shell"]"#,
+        )?;
+
+        let (status, body) = post(
+            &temp,
+            "/api/v1/hub/nodes/node_gone/dispatch",
+            r#"{"jobId":"job_lost","command":["echo","hi"]}"#,
+        )?;
+        assert_eq!(status, 502);
+        assert_eq!(body["error"]["code"], "executor_unreachable");
+        assert_eq!(
+            body["error"]["details"]["envelope"]["status"],
+            "transport_error"
+        );
+
+        // The dispatch record persists even when the transport failed.
+        let (status, job) = get(&temp, "/api/v1/hub/dispatches/job_lost")?;
+        assert_eq!(status, 200);
+        assert_eq!(job["status"], "transport_error");
+        assert_eq!(job["nodeId"], "node_gone");
+
+        let (_, node) = get(&temp, "/api/v1/hub/nodes/node_gone")?;
+        assert_eq!(node["available"], false);
+        assert!(!node["lastError"].as_str().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn write_fake_executor_script(dir: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = dir.join("fake-executor");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+if [ "$1" = "executor" ] && [ "$2" = "probe" ]; then
+  printf '{"protocolVersion":"coven.executor.v1","role":"compute_executor","capabilities":["shell","gpu"],"available":true,"queuePressure":1,"covenVersion":"0.0.0","probedAt":"2026-07-06T00:00:00Z"}\n'
+  exit 0
+fi
+if [ "$1" = "executor" ] && [ "$2" = "run-job" ]; then
+  job=$(cat)
+  id=$(printf '%s' "$job" | sed -n 's/.*"jobId":"\([^"]*\)".*/\1/p')
+  printf '{"protocolVersion":"coven.executor.v1","jobId":"%s","status":"completed","exitCode":0,"stdout":"remote job output","stderr":"","startedAt":"2026-07-06T00:00:00Z","finishedAt":"2026-07-06T00:00:01Z","durationMs":1000,"error":null}\n' "$id"
+  exit 0
+fi
+exit 2
+"#,
+        )?;
+        let mut permissions = std::fs::metadata(&script)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions)?;
+        Ok(script)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hub_polls_and_dispatches_outbound_and_records_executor_state() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let script = write_fake_executor_script(temp.path())?;
+        register_dispatchable_node(
+            &temp,
+            "node_compute",
+            "compute_executor",
+            &script.to_string_lossy(),
+            r#"["shell"]"#,
+        )?;
+
+        // Hub-initiated poll refreshes capability metadata and availability.
+        let (status, poll) = post(&temp, "/api/v1/hub/nodes/node_compute/poll", "{}")?;
+        assert_eq!(status, 200);
+        assert_eq!(poll["ok"], true);
+        assert_eq!(poll["probe"]["role"], "compute_executor");
+        assert_eq!(poll["node"]["available"], true);
+        assert_eq!(
+            poll["node"]["capabilities"],
+            serde_json::json!(["shell", "gpu"])
+        );
+        assert_eq!(poll["node"]["lastError"], serde_json::Value::Null);
+
+        // Outbound dispatch returns the executor's normalized envelope and
+        // persists the dispatch record with the full-context job spec.
+        let (status, dispatch) = post(
+            &temp,
+            "/api/v1/hub/nodes/node_compute/dispatch",
+            r#"{
+                "command":["echo","hello"],
+                "requiredCapabilities":["gpu"],
+                "context":{"workspaceId":"workspace-1"}
+            }"#,
+        )?;
+        assert_eq!(status, 200);
+        let job_id = dispatch["jobId"].as_str().unwrap().to_string();
+        assert!(job_id.starts_with("job_"));
+        assert_eq!(dispatch["envelope"]["status"], "completed");
+        assert_eq!(dispatch["envelope"]["jobId"], job_id.as_str());
+        assert_eq!(dispatch["envelope"]["exitCode"], 0);
+        assert_eq!(dispatch["envelope"]["stdout"], "remote job output");
+
+        let (status, job) = get(&temp, &format!("/api/v1/hub/dispatches/{job_id}"))?;
+        assert_eq!(status, 200);
+        assert_eq!(job["status"], "completed");
+        assert_eq!(job["job"]["protocolVersion"], "coven.executor.v1");
+        assert!(job["job"]["hubId"].as_str().unwrap().starts_with("hub_"));
+        assert_eq!(job["job"]["context"]["workspaceId"], "workspace-1");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatch_advances_a_matching_hub_queue_job_from_the_envelope() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let script = write_fake_executor_script(temp.path())?;
+        register_dispatchable_node(
+            &temp,
+            "node_compute",
+            "compute_executor",
+            &script.to_string_lossy(),
+            r#"["gpu","long-running-loop"]"#,
+        )?;
+        post(
+            &temp,
+            "/api/v1/hub/jobs",
+            r#"{"jobId":"job_queue_1","requiredCapabilities":["gpu"]}"#,
+        )?;
+        post(&temp, "/api/v1/hub/jobs/job_queue_1/assign", "{}")?;
+
+        let (status, dispatch) = post(
+            &temp,
+            "/api/v1/hub/nodes/node_compute/dispatch",
+            r#"{"jobId":"job_queue_1","command":["echo","work"],"requiredCapabilities":["gpu"]}"#,
+        )?;
+        assert_eq!(status, 200);
+        assert_eq!(dispatch["envelope"]["status"], "completed");
+
+        // The hub-queue job advanced to completed and left the subqueue.
+        let (_, job) = get(&temp, "/api/v1/hub/jobs/job_queue_1")?;
+        assert_eq!(job["state"], "completed");
+        let (_, node) = get(&temp, "/api/v1/hub/nodes/node_compute")?;
+        assert_eq!(node["queuePressure"], 0);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn poll_fails_closed_when_executor_advertises_a_mismatched_role() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let script = write_fake_executor_script(temp.path())?;
+        // Register the fake compute executor as stationary.
+        register_dispatchable_node(
+            &temp,
+            "node_mislabeled",
+            "stationary_executor",
+            &script.to_string_lossy(),
+            r#"["shell"]"#,
+        )?;
+
+        let (status, poll) = post(&temp, "/api/v1/hub/nodes/node_mislabeled/poll", "{}")?;
+
+        assert_eq!(status, 200);
+        assert_eq!(poll["ok"], false);
+        assert_eq!(poll["node"]["available"], false);
+        assert!(poll["node"]["lastError"]
+            .as_str()
+            .unwrap()
+            .contains("advertised role"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn poll_going_unavailable_holds_the_executor_subqueue() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let script = write_fake_executor_script(temp.path())?;
+        register_dispatchable_node(
+            &temp,
+            "node_compute",
+            "compute_executor",
+            &script.to_string_lossy(),
+            r#"["gpu","long-running-loop"]"#,
+        )?;
+        post(
+            &temp,
+            "/api/v1/hub/jobs",
+            r#"{"jobId":"job_held_by_poll","requiredCapabilities":["gpu"]}"#,
+        )?;
+        post(&temp, "/api/v1/hub/jobs/job_held_by_poll/assign", "{}")?;
+
+        // Break the transport, then poll: the node goes unavailable and its
+        // assigned job is held on the hub without being dropped.
+        std::fs::remove_file(&script)?;
+        let (status, poll) = post(&temp, "/api/v1/hub/nodes/node_compute/poll", "{}")?;
+        assert_eq!(status, 200);
+        assert_eq!(poll["ok"], false);
+        assert_eq!(poll["heldSubqueue"]["jobIds"][0], "job_held_by_poll");
+        let (_, job) = get(&temp, "/api/v1/hub/jobs/job_held_by_poll")?;
+        assert_eq!(job["state"], "held");
         Ok(())
     }
 }

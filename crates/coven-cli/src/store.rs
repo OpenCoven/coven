@@ -134,11 +134,27 @@ pub struct NodeRecord {
     pub node_id: String,
     pub role: String,
     pub transport: String,
+    /// Structured hub-outbound dispatch config (`executor_node::TransportConfig`
+    /// JSON). `None` means the node cannot be polled/dispatched yet.
+    pub transport_config_json: Option<String>,
     pub capabilities_json: String,
     pub available: bool,
     pub queue_pressure: i64,
     pub last_health_at: String,
+    /// Last hub-initiated poll/dispatch failure, cleared on success.
+    pub last_error: Option<String>,
     pub registered_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutorDispatchRecord {
+    pub job_id: String,
+    pub node_id: String,
+    pub status: String,
+    pub job_json: String,
+    pub envelope_json: Option<String>,
+    pub created_at: String,
     pub updated_at: String,
 }
 
@@ -344,16 +360,31 @@ pub fn open_store(path: &Path) -> Result<Connection> {
             node_id TEXT PRIMARY KEY NOT NULL,
             role TEXT NOT NULL,
             transport TEXT NOT NULL,
+            transport_config_json TEXT,
             capabilities_json TEXT NOT NULL,
             available INTEGER NOT NULL DEFAULT 0,
             queue_pressure INTEGER NOT NULL DEFAULT 0,
             last_health_at TEXT NOT NULL,
+            last_error TEXT,
             registered_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
 
         CREATE INDEX IF NOT EXISTS idx_node_registry_available
             ON node_registry(available, queue_pressure);
+
+        CREATE TABLE IF NOT EXISTS executor_dispatches (
+            job_id TEXT PRIMARY KEY NOT NULL,
+            node_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            job_json TEXT NOT NULL,
+            envelope_json TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_executor_dispatches_node
+            ON executor_dispatches(node_id, updated_at DESC);
 
         CREATE TABLE IF NOT EXISTS hub_jobs (
             job_id TEXT PRIMARY KEY NOT NULL,
@@ -431,6 +462,7 @@ pub fn open_store(path: &Path) -> Result<Connection> {
     ensure_labels_column(&conn)?;
     ensure_visibility_column(&conn)?;
     ensure_familiar_id_column(&conn)?;
+    ensure_node_registry_dispatch_columns(&conn)?;
 
     backfill_events_fts_if_needed(&conn)?;
 
@@ -704,6 +736,24 @@ fn ensure_familiar_id_column(conn: &Connection) -> Result<()> {
         [],
     )
     .context("failed to create sessions.familiar_id index")?;
+    Ok(())
+}
+
+/// Stores created at the initial node_registry schema (#266) predate the
+/// hub-outbound dispatch columns (#267); add them idempotently.
+fn ensure_node_registry_dispatch_columns(conn: &Connection) -> Result<()> {
+    ensure_column(
+        conn,
+        "node_registry",
+        "transport_config_json",
+        "ALTER TABLE node_registry ADD COLUMN transport_config_json TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "node_registry",
+        "last_error",
+        "ALTER TABLE node_registry ADD COLUMN last_error TEXT",
+    )?;
     Ok(())
 }
 
@@ -1095,29 +1145,35 @@ pub fn upsert_node(conn: &Connection, record: &NodeRecord) -> Result<()> {
             node_id,
             role,
             transport,
+            transport_config_json,
             capabilities_json,
             available,
             queue_pressure,
             last_health_at,
+            last_error,
             registered_at,
             updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
         ON CONFLICT(node_id) DO UPDATE SET
             role = excluded.role,
             transport = excluded.transport,
+            transport_config_json = excluded.transport_config_json,
             capabilities_json = excluded.capabilities_json,
             available = excluded.available,
             queue_pressure = excluded.queue_pressure,
             last_health_at = excluded.last_health_at,
+            last_error = excluded.last_error,
             updated_at = excluded.updated_at",
         params![
             &record.node_id,
             &record.role,
             &record.transport,
+            &record.transport_config_json,
             &record.capabilities_json,
             if record.available { 1 } else { 0 },
             record.queue_pressure,
             &record.last_health_at,
+            &record.last_error,
             &record.registered_at,
             &record.updated_at,
         ],
@@ -1127,22 +1183,24 @@ pub fn upsert_node(conn: &Connection, record: &NodeRecord) -> Result<()> {
 }
 
 fn node_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRecord> {
-    let available: i64 = row.get(4)?;
+    let available: i64 = row.get(5)?;
     Ok(NodeRecord {
         node_id: row.get(0)?,
         role: row.get(1)?,
         transport: row.get(2)?,
-        capabilities_json: row.get(3)?,
+        transport_config_json: row.get(3)?,
+        capabilities_json: row.get(4)?,
         available: available != 0,
-        queue_pressure: row.get(5)?,
-        last_health_at: row.get(6)?,
-        registered_at: row.get(7)?,
-        updated_at: row.get(8)?,
+        queue_pressure: row.get(6)?,
+        last_health_at: row.get(7)?,
+        last_error: row.get(8)?,
+        registered_at: row.get(9)?,
+        updated_at: row.get(10)?,
     })
 }
 
-const NODE_COLUMNS: &str = "node_id, role, transport, capabilities_json, available, \
-     queue_pressure, last_health_at, registered_at, updated_at";
+const NODE_COLUMNS: &str = "node_id, role, transport, transport_config_json, capabilities_json, \
+     available, queue_pressure, last_health_at, last_error, registered_at, updated_at";
 
 pub fn get_node(conn: &Connection, node_id: &str) -> Result<Option<NodeRecord>> {
     conn.query_row(
@@ -1168,6 +1226,63 @@ pub fn list_nodes(conn: &Connection) -> Result<Vec<NodeRecord>> {
         records.push(row.context("failed to read node registry row")?);
     }
     Ok(records)
+}
+
+pub fn upsert_executor_dispatch(conn: &Connection, record: &ExecutorDispatchRecord) -> Result<()> {
+    conn.execute(
+        "INSERT INTO executor_dispatches (
+            job_id,
+            node_id,
+            status,
+            job_json,
+            envelope_json,
+            created_at,
+            updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        ON CONFLICT(job_id) DO UPDATE SET
+            node_id = excluded.node_id,
+            status = excluded.status,
+            job_json = excluded.job_json,
+            envelope_json = excluded.envelope_json,
+            updated_at = excluded.updated_at",
+        params![
+            &record.job_id,
+            &record.node_id,
+            &record.status,
+            &record.job_json,
+            &record.envelope_json,
+            &record.created_at,
+            &record.updated_at,
+        ],
+    )
+    .with_context(|| format!("failed to upsert executor dispatch {}", record.job_id))?;
+    Ok(())
+}
+
+pub fn get_executor_dispatch(
+    conn: &Connection,
+    job_id: &str,
+) -> Result<Option<ExecutorDispatchRecord>> {
+    conn.query_row(
+        "SELECT job_id, node_id, status, job_json, envelope_json, created_at, updated_at
+         FROM executor_dispatches
+         WHERE job_id = ?1
+         LIMIT 1",
+        params![job_id],
+        |row| {
+            Ok(ExecutorDispatchRecord {
+                job_id: row.get(0)?,
+                node_id: row.get(1)?,
+                status: row.get(2)?,
+                job_json: row.get(3)?,
+                envelope_json: row.get(4)?,
+                created_at: row.get(5)?,
+                updated_at: row.get(6)?,
+            })
+        },
+    )
+    .optional()
+    .with_context(|| format!("failed to read executor dispatch {job_id}"))
 }
 
 pub fn upsert_hub_job(conn: &Connection, record: &HubJobRecord) -> Result<()> {
@@ -2109,6 +2224,72 @@ mod tests {
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "session-1");
+        Ok(())
+    }
+
+    #[test]
+    fn node_dispatch_transport_and_last_error_persist_across_reopen() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let path = temp_dir.path().join("coven.db");
+        let conn = open_store(&path)?;
+        let node = NodeRecord {
+            node_id: "node-gpu".to_string(),
+            role: "compute_executor".to_string(),
+            transport: "ssh".to_string(),
+            transport_config_json: Some(r#"{"kind":"ssh","host":"executor.internal"}"#.to_string()),
+            capabilities_json: r#"["shell","gpu"]"#.to_string(),
+            available: false,
+            queue_pressure: 0,
+            last_health_at: "2026-07-06T00:00:00Z".to_string(),
+            last_error: Some("connection refused".to_string()),
+            registered_at: "2026-07-06T00:00:00Z".to_string(),
+            updated_at: "2026-07-06T00:00:00Z".to_string(),
+        };
+        upsert_node(&conn, &node)?;
+        drop(conn);
+
+        let reopened = open_store(&path)?;
+        let record = get_node(&reopened, "node-gpu")?.expect("node persists");
+        assert_eq!(
+            record.transport_config_json.as_deref(),
+            Some(r#"{"kind":"ssh","host":"executor.internal"}"#)
+        );
+        assert_eq!(record.last_error.as_deref(), Some("connection refused"));
+        Ok(())
+    }
+
+    #[test]
+    fn executor_dispatch_records_persist_envelopes_across_reopen() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let path = temp_dir.path().join("coven.db");
+        let conn = open_store(&path)?;
+        let dispatched = ExecutorDispatchRecord {
+            job_id: "job-1".to_string(),
+            node_id: "node-gpu".to_string(),
+            status: "dispatched".to_string(),
+            job_json: r#"{"jobId":"job-1"}"#.to_string(),
+            envelope_json: None,
+            created_at: "2026-07-06T00:00:00Z".to_string(),
+            updated_at: "2026-07-06T00:00:00Z".to_string(),
+        };
+        upsert_executor_dispatch(&conn, &dispatched)?;
+
+        let mut completed = dispatched.clone();
+        completed.status = "completed".to_string();
+        completed.envelope_json = Some(r#"{"status":"completed"}"#.to_string());
+        completed.updated_at = "2026-07-06T00:01:00Z".to_string();
+        upsert_executor_dispatch(&conn, &completed)?;
+        drop(conn);
+
+        let reopened = open_store(&path)?;
+        let record = get_executor_dispatch(&reopened, "job-1")?.expect("dispatch persists");
+        assert_eq!(record.status, "completed");
+        assert_eq!(
+            record.envelope_json.as_deref(),
+            Some(r#"{"status":"completed"}"#)
+        );
+        assert_eq!(record.created_at, "2026-07-06T00:00:00Z");
+        assert!(get_executor_dispatch(&reopened, "job-missing")?.is_none());
         Ok(())
     }
 

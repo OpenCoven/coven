@@ -20,6 +20,7 @@ mod coven_calls;
 mod daemon;
 mod encrypted_artifacts;
 mod eval_loop;
+mod executor_node;
 mod familiar_identity;
 mod harness;
 mod hub;
@@ -87,6 +88,13 @@ enum Command {
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
+    },
+    #[command(
+        about = "Stateless executor-node protocol commands (hub-dispatched over SSH/private network)"
+    )]
+    Executor {
+        #[command(subcommand)]
+        command: ExecutorCommand,
     },
     #[command(about = "Launch a project-scoped harness session")]
     Run {
@@ -313,6 +321,14 @@ enum AdapterCommand {
 }
 
 #[derive(Subcommand, Debug)]
+enum ExecutorCommand {
+    #[command(about = "Print this node's executor availability envelope as JSON")]
+    Probe,
+    #[command(about = "Run one hub-dispatched job from a JSON spec on stdin")]
+    RunJob,
+}
+
+#[derive(Subcommand, Debug)]
 enum DaemonCommand {
     #[command(about = "Start the background daemon that hosts live sessions")]
     Start,
@@ -422,6 +438,7 @@ fn run_cli(cli: Cli) -> Result<()> {
         Some(Command::Doctor) => run_doctor(),
         Some(Command::Adapter { command }) => run_adapter_command(command),
         Some(Command::Daemon { command }) => run_daemon_command(command),
+        Some(Command::Executor { command }) => run_executor_command(command),
         Some(Command::Run {
             harness,
             prompt,
@@ -1417,6 +1434,24 @@ fn prune_logs_command(dry_run: bool, raw_days: Option<u64>, event_days: Option<u
         "logs pruned rawArtifacts={raw_pruned} events={events_pruned} rawCutoff={raw_cutoff} eventCutoff={event_cutoff}"
     );
     Ok(())
+}
+
+fn run_executor_command(command: ExecutorCommand) -> Result<()> {
+    match command {
+        ExecutorCommand::Probe => {
+            let home = coven_home_dir()?;
+            let probe = executor_node::build_probe(&home)?;
+            println!("{}", serde_json::to_string(&probe)?);
+            Ok(())
+        }
+        ExecutorCommand::RunJob => {
+            let payload =
+                io::read_to_string(io::stdin()).context("failed to read job spec from stdin")?;
+            let envelope = executor_node::run_job_from_stdin_payload(&payload);
+            println!("{}", serde_json::to_string(&envelope)?);
+            Ok(())
+        }
+    }
 }
 
 fn run_daemon_command(command: DaemonCommand) -> Result<()> {

@@ -2,7 +2,7 @@
 
 **Status:** Draft v0.1 - 2026-07-04
 **Owner:** Coven runtime - Coven Cave
-**Tracks:** GitHub issues #264, #265, #268, #269, #270
+**Tracks:** GitHub issues #264, #265, #267, #268, #269, #270
 
 ## Problem
 
@@ -221,6 +221,7 @@ The current local daemon model remains valid for single-machine use, but these c
 
 - #264 tracks the epic.
 - #265 is satisfied by this product/technical spec pair.
+- #267 implements the stateless executor protocol and SSH dispatcher.
 - #268 implements travel profile and reconcile APIs.
 - #269 implements scheduler intelligence and loop redispatch.
 - #270 implements failure simulations and release gates.

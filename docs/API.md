@@ -56,6 +56,9 @@ Versioned clients should use the `/api/v1` prefix:
 | `GET /api/v1/hub/nodes` | List registered nodes |
 | `GET /api/v1/hub/nodes/:id` | Fetch one registered node |
 | `POST /api/v1/hub/nodes/:id/health` | Record an executor health report (holds/resumes its subqueue) |
+| `POST /api/v1/hub/nodes/:id/poll` | Poll executor availability outbound over its dispatch transport |
+| `POST /api/v1/hub/nodes/:id/dispatch` | Dispatch a job outbound to a stateless executor |
+| `GET /api/v1/hub/dispatches/:jobId` | Fetch a persisted dispatch record (job spec + result envelope) |
 | `POST /api/v1/hub/jobs` | Enqueue a job on the persistent global queue |
 | `GET /api/v1/hub/jobs?state=...` | List queued jobs |
 | `GET /api/v1/hub/jobs/:id` | Fetch one job with its routing entry |

@@ -36,6 +36,7 @@ The Coven daemon socket API is a public compatibility boundary for comux and ext
     "travel": true,
     "scheduler": true,
     "hub": true,
+    "executorDispatch": true,
     "eventCursor": "sequence",
     "structuredErrors": true
   },
@@ -64,6 +65,7 @@ If the daemon metadata is unavailable, `daemon` may be `null`. The `hub` block r
 | `travel`          | boolean | Travel profile, delta, and state APIs are available.             |
 | `scheduler`       | boolean | Scheduler decision and recovery APIs are available.              |
 | `hub`             | boolean | Hub control-plane APIs (node registry, routing, queues) are available. |
+| `executorDispatch`| boolean | Hub-outbound executor poll/dispatch APIs are available.          |
 | `eventCursor`     | string  | Cursor type supported; `"sequence"` means `afterSeq` is stable.  |
 | `structuredErrors`| boolean | All errors use the `{ error: { code, message, details } }` shape.|
 
@@ -578,6 +580,13 @@ Request:
   "nodeId": "compute-primary",
   "role": "compute_executor",
   "transport": "ssh",
+  "transportConfig": {
+    "kind": "ssh",
+    "host": "compute-primary.internal",
+    "user": "coven",
+    "port": 22,
+    "identityFile": "/home/coven/.ssh/id_ed25519"
+  },
   "capabilities": ["gpu", "long-running-loop"],
   "available": true
 }
@@ -590,16 +599,18 @@ Response:
   "nodeId": "compute-primary",
   "role": "compute_executor",
   "transport": "ssh",
+  "transportConfig": { "kind": "ssh", "host": "compute-primary.internal", "user": "coven", "port": 22, "identityFile": "/home/coven/.ssh/id_ed25519" },
   "capabilities": ["gpu", "long-running-loop"],
   "available": true,
   "queuePressure": 0,
   "lastHealthAt": "2026-07-06T12:00:00Z",
+  "lastError": null,
   "registeredAt": "2026-07-06T12:00:00Z",
   "updatedAt": "2026-07-06T12:00:00Z"
 }
 ```
 
-`transport` defaults to `"ssh"`. `queuePressure` is hub-computed from the node's persistent subqueue and cannot be set by the caller.
+`transport` defaults to `"ssh"`. `queuePressure` is hub-computed from the node's persistent subqueue and cannot be set by the caller. `transportConfig` is the structured hub-outbound dispatch link (`kind: "ssh"` or `kind: "local"` for private-network/same-host process dispatch); it is validated at registration, required before the hub can poll or dispatch to the node, and preserved when a re-registration omits it.
 
 ### `GET /api/v1/hub/nodes` and `GET /api/v1/hub/nodes/:nodeId`
 
@@ -630,6 +641,79 @@ Response:
   "transitionedJobs": { "from": "assigned", "to": "held", "jobIds": ["job_01J..."] }
 }
 ```
+
+### `POST /api/v1/hub/nodes/:nodeId/poll`
+
+Hub-initiated availability poll for the stateless executor protocol (`coven.executor.v1`). The hub connects **outbound** over the node's registered `transportConfig` (SSH batch mode with pinned host keys, or a local/private-network process launch), runs `coven executor probe`, and records the advertised capabilities plus last-known availability. Executors never push registration or heartbeats to the hub.
+
+The response always returns `200` with the poll outcome; failures are recorded on the node (`available: false`, `lastError`), never fatal:
+
+```json
+{
+  "nodeId": "compute-primary",
+  "ok": true,
+  "probe": {
+    "protocolVersion": "coven.executor.v1",
+    "role": "compute_executor",
+    "capabilities": ["shell", "gpu"],
+    "available": true,
+    "queuePressure": 0,
+    "covenVersion": "0.0.0",
+    "probedAt": "2026-07-06T12:00:00Z"
+  },
+  "heldSubqueue": { "nodeId": "compute-primary", "jobIds": [] },
+  "node": { "nodeId": "compute-primary", "available": true }
+}
+```
+
+Availability transitions from a poll move the node's jobs between `assigned` and `held` exactly like a health report. A probe that advertises a role different from the registered one fails closed (`ok: false`, node unavailable). Nodes registered without a `transportConfig` return `409 node_transport_not_configured`.
+
+### `POST /api/v1/hub/nodes/:nodeId/dispatch`
+
+Hub-outbound job dispatch. The hub sends a full-context job spec (argv, cwd, env, stdin payload, timeout, opaque `context` blob) to `coven executor run-job` on the node, so the stateless executor needs no local durable authority.
+
+Request:
+
+```json
+{
+  "jobId": "job_01J...",
+  "command": ["sh", "-c", "…"],
+  "cwd": "/work/checkout",
+  "env": { "KEY": "value" },
+  "stdin": "optional payload",
+  "timeoutSeconds": 300,
+  "requiredCapabilities": ["gpu"],
+  "context": { "workspaceId": "workspace_01J..." }
+}
+```
+
+`jobId` is optional (the hub generates `job_<uuid>` when omitted). Required capabilities are checked against the node's last-known capability metadata (`409 executor_capability_mismatch`). The executor replies with a normalized result envelope, persisted with the dispatch record:
+
+```json
+{
+  "jobId": "job_01J...",
+  "nodeId": "compute-primary",
+  "createdAt": "2026-07-06T12:00:00Z",
+  "envelope": {
+    "protocolVersion": "coven.executor.v1",
+    "jobId": "job_01J...",
+    "status": "completed",
+    "exitCode": 0,
+    "stdout": "…",
+    "stderr": "…",
+    "startedAt": "2026-07-06T12:00:00Z",
+    "finishedAt": "2026-07-06T12:00:05Z",
+    "durationMs": 5000,
+    "error": null
+  }
+}
+```
+
+Envelope `status` is one of `completed`, `failed`, `timeout`, `rejected`, or `transport_error` (synthesized by the hub-side dispatcher when the node is unreachable or replies with a malformed envelope, returned as `502 executor_unreachable` with the envelope in `details`). A dispatch doubles as an availability observation, and when `jobId` names a job on the hub queue, that job's state advances from the envelope (`completed`, or `failed` for `failed`/`timeout`/`rejected`); a transport error leaves the queued job held so no work is lost.
+
+### `GET /api/v1/hub/dispatches/:jobId`
+
+Returns the persisted dispatch record — full job spec, normalized result envelope (or `null` while in flight), status, node id, and timestamps — or `404 executor_job_not_found`.
 
 ### `POST /api/v1/hub/jobs`
 
