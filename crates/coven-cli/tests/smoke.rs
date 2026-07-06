@@ -360,6 +360,71 @@ fn doctor_reports_live_daemon_socket_status() -> anyhow::Result<()> {
 }
 
 #[test]
+fn stream_json_on_non_claude_harness_keeps_stdout_jsonl_only() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    fs::create_dir_all(&coven_home)?;
+    let fake_bin = temp_dir.path().join("bin");
+    fs::create_dir_all(&fake_bin)?;
+    write_fake_codex(&fake_bin)?;
+    let path = prepend_path(&fake_bin);
+    let coven = coven_bin();
+
+    let output = run_coven(
+        &coven,
+        &coven_home,
+        &path,
+        &["run", "codex", "--stream-json", "hello stream"],
+    )?;
+
+    assert_success("stream-json codex run", &output);
+
+    // The core #307 contract: every stdout line is a JSON frame — no raw
+    // harness bytes interleaved.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let frames: Vec<Value> = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str(line).unwrap_or_else(|error| {
+                panic!(
+                    "non-JSON line on stream-json stdout: {line:?} ({error})\nfull stdout:\n{stdout}"
+                )
+            })
+        })
+        .collect();
+
+    assert_eq!(
+        frames
+            .first()
+            .map(|f| (f["type"].clone(), f["subtype"].clone())),
+        Some(("system".into(), "init".into())),
+        "first frame must be system/init: {frames:?}"
+    );
+    let user = frames
+        .iter()
+        .find(|f| f["type"] == "user")
+        .expect("stream must contain the synthesized user frame");
+    assert_eq!(user["message"]["content"][0]["text"], "hello stream");
+    let assistant = frames
+        .iter()
+        .find(|f| f["type"] == "assistant")
+        .expect("captured harness output must surface as an assistant frame");
+    let assistant_text = assistant["message"]["content"][0]["text"]
+        .as_str()
+        .expect("assistant frame carries text content");
+    assert!(
+        assistant_text.contains("fake codex complete"),
+        "assistant frame should carry the harness output; got {assistant_text:?}"
+    );
+    let last = frames.last().expect("stream must end with a result frame");
+    assert_eq!(last["type"], "result");
+    assert_eq!(last["subtype"], "success");
+    assert_eq!(last["is_error"], false);
+    Ok(())
+}
+
+#[test]
 fn adapter_install_hermes_writes_trusted_manifest() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let coven_home = temp_dir.path().join("coven-home");
@@ -381,10 +446,16 @@ fn adapter_install_hermes_writes_trusted_manifest() -> anyhow::Result<()> {
     );
     assert!(coven_home.join("adapters").join("hermes.json").exists());
 
-    let doctor = run_coven(&coven, &coven_home, &path, &["adapter", "doctor", "hermes"])?;
+    // Diagnose against an empty PATH so the outcome doesn't depend on
+    // whether a real `hermes` happens to be installed on this machine:
+    // unavailable → exit 1, with the diagnosis output still rendered in full.
+    let doctor = run_coven(
+        &coven,
+        &coven_home,
+        &OsString::new(),
+        &["adapter", "doctor", "hermes"],
+    )?;
 
-    // The hermes executable is not installed, so adapter doctor reports it
-    // and exits 1 (the diagnosis output still renders in full).
     assert_failure("adapter doctor hermes", &doctor);
     assert_stdout_contains("adapter doctor hermes", &doctor, "Hermes Agent");
     assert_stdout_contains("adapter doctor hermes", &doctor, "manifest:");

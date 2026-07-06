@@ -1978,16 +1978,42 @@ fn run_session(
         .as_ref()
         .filter(|s| s.system_prompt_flag.is_some())
         .and(familiar_ctx.as_ref());
+    // Stream mode's stdout contract is JSONL-only, so it always launches the
+    // one-shot non-interactive entrypoint regardless of TTY detection — an
+    // interactive TUI behind a JSONL pipe would be garbage either way.
+    let launch_mode = if stream_json {
+        harness::HarnessLaunchMode::NonInteractive
+    } else {
+        harness_launch_mode_for_stdio()
+    };
     let command = pty_runner::build_harness_command_with_conversation(
         &selected_harness.id,
         &effective_prompt,
         &cwd,
-        harness_launch_mode_for_stdio(),
+        launch_mode,
         conversation_hint.as_ref(),
         familiar_for_args,
         launch_options,
     )?;
-    match pty_runner::run_attached(&command) {
+    // Stream mode captures the harness instead of attaching it to the PTY:
+    // raw harness bytes on stdout would interleave with the JSONL frames and
+    // corrupt the stream for every consumer (#307). The captured text is
+    // re-emitted below as an `assistant` frame.
+    let (run_result, captured_output) = if stream_json {
+        match pty_runner::run_captured(&command) {
+            Ok(captured) => (
+                Ok(pty_runner::PtyRunResult {
+                    status: captured.status,
+                    exit_code: captured.exit_code,
+                }),
+                Some(captured.output),
+            ),
+            Err(error) => (Err(error), None),
+        }
+    } else {
+        (pty_runner::run_attached(&command), None)
+    };
+    match run_result {
         Ok(result) => {
             store::update_session_status(
                 &conn,
@@ -1997,6 +2023,18 @@ fn run_session(
                 &current_timestamp(),
             )?;
             if stream_json {
+                if let Some(text) = captured_output.filter(|text| !text.trim().is_empty()) {
+                    emit_stream_event(&stream_json::Event::Assistant(
+                        stream_json::AssistantMessage {
+                            message: stream_json::MessageBody {
+                                role: "assistant".into(),
+                                content: vec![stream_json::ContentBlock::Text { text }],
+                            },
+                            session_id: record.id.clone(),
+                            stop_reason: None,
+                        },
+                    ))?;
+                }
                 let is_error = result.exit_code.is_some_and(|c| c != 0);
                 emit_stream_event(&stream_json::Event::Result(stream_json::RunResult {
                     subtype: if is_error {

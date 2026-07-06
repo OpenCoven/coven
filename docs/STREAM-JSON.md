@@ -21,7 +21,11 @@ Code work unchanged against Coven CLI.
 {"type":"user","message":{"role":"user","content":[{"type":"text","text":"..."}]},"session_id":"...","parent_tool_use_id":null}
 ```
 
-### `assistant` - emitted by stream-capable harnesses (claude)
+### `assistant` - harness output
+
+Stream-capable harnesses (claude) emit these incrementally; non-stream
+harnesses produce one `assistant` event carrying their captured text output
+(see "Harness behavior" below).
 
 ```json
 {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"..."}]},"session_id":"...","stop_reason":"end_turn"}
@@ -64,11 +68,12 @@ non-stream harnesses the flag is accepted but no stdin forwarding occurs.
   on this path; claude emits its own when it processes the prompt.
 
 - **codex** and other non-stream harnesses: Coven synthesizes
-  `system.init` + `user` + `result`. The harness's text output is not
-  exposed as `assistant` events in this mode (use `coven attach <id>` for
-  streamed text). In practice `--stream-json` for codex is most useful with
-  `--detach`, which records the session without launching the harness and
-  emits init+user+result immediately.
+  `system.init` + `user`, runs the harness fully captured — no PTY, so raw
+  harness bytes never interleave with the JSONL stream — and emits the
+  collected text output as a single `assistant` event before the closing
+  `result`. Harness stderr is forwarded to Coven's stderr, out of band of
+  the stream. `--detach` still records the session without launching the
+  harness and emits init+user+result immediately.
 
 ## Stability
 

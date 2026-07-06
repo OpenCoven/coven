@@ -101,6 +101,59 @@ pub fn run_attached(command: &HarnessCommand) -> Result<PtyRunResult> {
     run_attached_with_pty_system(command, pty_system.as_ref())
 }
 
+/// Result of a fully captured (no-PTY) one-shot harness run. Stream-json
+/// callers wrap `output` into JSONL events; this function writes nothing to
+/// the parent's stdout.
+pub struct CapturedRunResult {
+    pub status: &'static str,
+    pub exit_code: Option<i32>,
+    pub output: String,
+}
+
+/// Run `command` to completion with stdout captured and stdin closed. Used
+/// by `coven run --stream-json` on harnesses without a native stream-json
+/// mode: the documented stdout contract is JSONL-only, so harness output
+/// must never reach stdout directly. No PTY is allocated — the harness sees
+/// plain pipes (the non-interactive entrypoints already disable color), so
+/// the capture stays free of ANSI echo. Captured stderr is forwarded to the
+/// parent's stderr — out of band of the stream contract — so auth/setup
+/// errors stay visible.
+pub fn run_captured(command: &HarnessCommand) -> Result<CapturedRunResult> {
+    let output = std::process::Command::new(&command.program)
+        .args(&command.args)
+        .current_dir(&command.cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to spawn harness `{}` in captured mode",
+                command.program
+            )
+        })?;
+
+    if !output.stderr.is_empty() {
+        let mut stderr = io::stderr().lock();
+        let _ = stderr.write_all(&output.stderr);
+        let _ = stderr.flush();
+    }
+
+    // A signal-killed child reports no code; map it to exit 1 so the result
+    // event and script gating register the failure.
+    let exit_code = Some(output.status.code().unwrap_or(1));
+    let status = if output.status.success() {
+        "completed"
+    } else {
+        "failed"
+    };
+    Ok(CapturedRunResult {
+        status,
+        exit_code,
+        output: String::from_utf8_lossy(&output.stdout).into_owned(),
+    })
+}
+
 /// Run `claude` in its native stream-JSON mode, framed by the caller (which
 /// emits Coven's own `system.init` / `result` around the call).
 ///
