@@ -487,13 +487,16 @@ Response `201`:
     "requiredCapabilities": ["gpu", "long-running-loop"],
     "queuePressure": "low",
     "travelState": "hub_active",
-    "taskWeight": "heavyweight"
+    "taskWeight": "heavyweight",
+    "nodesSource": "request_snapshot"
   },
   "createdAt": "2026-07-04T12:00:00Z"
 }
 ```
 
 The daemon filters unavailable nodes, required capability misses, low-battery `laptop_local` nodes during travel, and heavyweight laptop-local work while `travelState` is `travel_local` or `travel_stale` unless explicitly allowed.
+
+`nodes` is optional. When it is omitted or empty, candidates are loaded from the persistent hub node registry instead (`inputs.nodesSource` is `"hub_registry"`); supplying a `nodes` snapshot keeps the request fully deterministic for failure simulations. An empty snapshot with an empty registry returns `409 no_scheduler_target`.
 
 ### `GET /api/v1/scheduler/decisions/:id`
 
@@ -555,11 +558,21 @@ Response `202`:
       "queuePressure": "medium"
     }
   ],
+  "hubJobSynced": true,
   "createdAt": "2026-07-04T12:00:00Z"
 }
 ```
 
 If the loop is not resumable or no alternate node matches, `state` is `paused` and `target` is `{ "role": "paused", "nodeId": null }`. In both cases, the failed node subqueue is preserved.
+
+`nodes` is optional. When omitted or empty, both the failed node and the redispatch candidates are resolved from the persistent hub node registry, with subqueue contents taken from the persistent per-executor queues (`inputs.nodesSource` on the persisted decision is `"hub_registry"`). If `currentNodeId` is not in the registry either, the call fails with `400 invalid_request`.
+
+`hubJobSynced` reports whether the job is tracked in the hub's persistent global queue. When `true`, the redispatch also updated hub state so the outcome is visible at `GET /api/v1/hub/jobs/:jobId` and `GET /api/v1/hub/status`:
+
+- `redispatched` — the job becomes `assigned` to the new node, the routing table points at it, and both nodes' subqueues are rebuilt.
+- `paused` — the job becomes `held` on its current node without leaving that node's subqueue.
+
+Snapshot-only jobs (not enqueued via `POST /api/v1/hub/jobs`) leave hub state untouched (`hubJobSynced: false`), which keeps deterministic failure-simulation fixtures independent of the registry.
 
 ### `GET /api/v1/scheduler/loops/:loopId`
 
@@ -567,7 +580,7 @@ Returns the persisted redispatch/pause state with the same fields as `POST /api/
 
 ## Hub control-plane shapes (`v1`)
 
-The hub control plane is the durable multi-host state described in `specs/coven-multi-host-daemon`: a persistent node registry, a routing table, a global job queue, and per-executor subqueues. All hub state persists in the daemon SQLite store and reloads after a daemon restart. Unlike the `POST /api/v1/scheduler/decisions` route (which evaluates a caller-supplied node snapshot), hub job assignment routes against the persistent registry.
+The hub control plane is the durable multi-host state described in `specs/coven-multi-host-daemon`: a persistent node registry, a routing table, a global job queue, and per-executor subqueues. All hub state persists in the daemon SQLite store and reloads after a daemon restart. Hub job assignment routes against the persistent registry; the `POST /api/v1/scheduler/*` routes also fall back to the registry whenever a request omits its `nodes` snapshot.
 
 ### `POST /api/v1/hub/nodes`
 

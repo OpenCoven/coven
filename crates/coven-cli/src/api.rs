@@ -994,6 +994,42 @@ struct SchedulerRedispatchRequest {
     nodes: Vec<SchedulerNodeInput>,
 }
 
+/// Load scheduler candidates from the persistent hub node registry (#301).
+/// Used when a scheduler request omits its `nodes` snapshot, so ad-hoc
+/// snapshots and hub-registered nodes share one source of truth. Subqueue
+/// contents come from the persistent per-executor queues.
+fn scheduler_nodes_from_registry(conn: &rusqlite::Connection) -> Result<Vec<SchedulerNodeInput>> {
+    let queued_by_node: std::collections::HashMap<String, Vec<String>> =
+        store::list_executor_queues(conn)?
+            .into_iter()
+            .map(|queue| {
+                let job_ids: Vec<String> =
+                    serde_json::from_str(&queue.job_ids_json).unwrap_or_default();
+                (queue.node_id, job_ids)
+            })
+            .collect();
+    Ok(store::list_nodes(conn)?
+        .into_iter()
+        .map(|node| {
+            let capabilities: Vec<String> =
+                serde_json::from_str(&node.capabilities_json).unwrap_or_default();
+            SchedulerNodeInput {
+                queued_job_ids: queued_by_node
+                    .get(&node.node_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                node_id: node.node_id,
+                role: node.role,
+                available: node.available,
+                capabilities,
+                queue_pressure: node.queue_pressure,
+                battery_percent: None,
+                power_source: None,
+            }
+        })
+        .collect())
+}
+
 fn scheduler_decision(coven_home: &Path, body: Option<&str>) -> Result<ApiResponse> {
     let payload = match parse_body(body) {
         Ok(payload) => payload,
@@ -1001,7 +1037,7 @@ fn scheduler_decision(coven_home: &Path, body: Option<&str>) -> Result<ApiRespon
             return api_error(400, "invalid_request", &error.to_string(), None);
         }
     };
-    let request: SchedulerDecisionRequest = match serde_json::from_value(payload) {
+    let mut request: SchedulerDecisionRequest = match serde_json::from_value(payload) {
         Ok(request) => request,
         Err(error) => {
             return api_error(400, "invalid_request", &error.to_string(), None);
@@ -1010,12 +1046,19 @@ fn scheduler_decision(coven_home: &Path, body: Option<&str>) -> Result<ApiRespon
     if request.job_id.trim().is_empty() {
         return api_error(400, "invalid_request", "jobId is required.", None);
     }
+    let conn = store::open_store(&store_path(coven_home))?;
+    let nodes_source = if request.nodes.is_empty() {
+        request.nodes = scheduler_nodes_from_registry(&conn)?;
+        "hub_registry"
+    } else {
+        "request_snapshot"
+    };
     if request.nodes.is_empty() {
         return api_error(
             409,
             "no_scheduler_target",
-            "No scheduler nodes were supplied.",
-            Some(json!({ "jobId": request.job_id })),
+            "No scheduler nodes were supplied and the hub node registry is empty.",
+            Some(json!({ "jobId": request.job_id, "nodesSource": nodes_source })),
         );
     }
 
@@ -1072,6 +1115,7 @@ fn scheduler_decision(coven_home: &Path, body: Option<&str>) -> Result<ApiRespon
         "queuePressure": queue_pressure_label(target_node.queue_pressure),
         "travelState": travel_state,
         "taskWeight": request.task_weight.unwrap_or_else(|| "normal".to_string()),
+        "nodesSource": nodes_source,
     });
     let reason = format!(
         "{} has required capability set and {} queue pressure",
@@ -1089,7 +1133,6 @@ fn scheduler_decision(coven_home: &Path, body: Option<&str>) -> Result<ApiRespon
         inputs_json: inputs.to_string(),
         created_at: now,
     };
-    let conn = store::open_store(&store_path(coven_home))?;
     store::insert_scheduler_decision(&conn, &record)?;
     let response = scheduler_decision_response(&record)?;
     json_response(201, &response)
@@ -1115,7 +1158,7 @@ fn scheduler_redispatch(coven_home: &Path, body: Option<&str>) -> Result<ApiResp
             return api_error(400, "invalid_request", &error.to_string(), None);
         }
     };
-    let request: SchedulerRedispatchRequest = match serde_json::from_value(payload) {
+    let mut request: SchedulerRedispatchRequest = match serde_json::from_value(payload) {
         Ok(request) => request,
         Err(error) => {
             return api_error(400, "invalid_request", &error.to_string(), None);
@@ -1127,6 +1170,13 @@ fn scheduler_redispatch(coven_home: &Path, body: Option<&str>) -> Result<ApiResp
     if request.job_id.trim().is_empty() {
         return api_error(400, "invalid_request", "jobId is required.", None);
     }
+    let conn = store::open_store(&store_path(coven_home))?;
+    let nodes_source = if request.nodes.is_empty() {
+        request.nodes = scheduler_nodes_from_registry(&conn)?;
+        "hub_registry"
+    } else {
+        "request_snapshot"
+    };
     let Some(current_node) = request
         .nodes
         .iter()
@@ -1135,8 +1185,15 @@ fn scheduler_redispatch(coven_home: &Path, body: Option<&str>) -> Result<ApiResp
         return api_error(
             400,
             "invalid_request",
-            "currentNodeId must refer to a supplied node.",
-            Some(json!({ "currentNodeId": request.current_node_id })),
+            if nodes_source == "hub_registry" {
+                "currentNodeId must refer to a node in the hub registry."
+            } else {
+                "currentNodeId must refer to a supplied node."
+            },
+            Some(json!({
+                "currentNodeId": request.current_node_id,
+                "nodesSource": nodes_source,
+            })),
         );
     };
     let preserved_job_ids = if current_node.queued_job_ids.is_empty() {
@@ -1202,6 +1259,7 @@ fn scheduler_redispatch(coven_home: &Path, body: Option<&str>) -> Result<ApiResp
         "failedNodeId": request.current_node_id,
         "loopResumable": request.loop_resumable,
         "nodeAvailability": node_availability,
+        "nodesSource": nodes_source,
     });
     let now = current_timestamp();
     let decision_id = format!("sched_{}", Uuid::new_v4());
@@ -1215,7 +1273,6 @@ fn scheduler_redispatch(coven_home: &Path, body: Option<&str>) -> Result<ApiResp
         inputs_json: inputs.to_string(),
         created_at: now.clone(),
     };
-    let conn = store::open_store(&store_path(coven_home))?;
     store::insert_scheduler_decision(&conn, &record)?;
     let preserved_job_ids_json =
         serde_json::to_string(&preserved_job_ids).context("failed to serialize preserved queue")?;
@@ -1244,6 +1301,17 @@ fn scheduler_redispatch(coven_home: &Path, body: Option<&str>) -> Result<ApiResp
             updated_at: now.clone(),
         },
     )?;
+    // When the job is tracked in the hub's persistent global queue, keep the
+    // hub job, routing table, and executor subqueues consistent with this
+    // redispatch decision (#301).
+    let hub_job_synced = crate::hub::apply_redispatch_outcome(
+        &conn,
+        &request.job_id,
+        target["nodeId"].as_str(),
+        &decision_id,
+        &reason,
+        &now,
+    )?;
     json_response(
         202,
         &json!({
@@ -1258,6 +1326,7 @@ fn scheduler_redispatch(coven_home: &Path, body: Option<&str>) -> Result<ApiResp
                 "jobIds": preserved_job_ids,
             },
             "nodeAvailability": node_availability,
+            "hubJobSynced": hub_job_synced,
             "createdAt": now,
         }),
     )
