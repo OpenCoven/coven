@@ -1862,13 +1862,7 @@ pub fn search_events(conn: &Connection, query: &str) -> Result<Vec<SearchHit>> {
 }
 
 pub fn vacuum_store_path(path: &Path) -> Result<StoreVacuumReport> {
-    let conn = Connection::open(path)
-        .with_context(|| format!("failed to open Coven store at {}", path.display()))?;
-    conn.execute_batch(
-        "PRAGMA busy_timeout = 5000;
-         PRAGMA foreign_keys = ON;",
-    )
-    .context("failed to configure Coven store vacuum")?;
+    let conn = open_store(path)?;
 
     let event_index_rebuilt = sqlite_object_exists(&conn, "table", "events_fts")?;
     if event_index_rebuilt {
