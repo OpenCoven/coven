@@ -211,6 +211,13 @@ pub struct SearchHit {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoreVacuumReport {
+    pub event_index_rebuilt: bool,
+    pub integrity_check: Vec<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct EventsQueryOptions {
     pub after_seq: Option<i64>,
@@ -1854,6 +1861,55 @@ pub fn search_events(conn: &Connection, query: &str) -> Result<Vec<SearchHit>> {
     Ok(out)
 }
 
+pub fn vacuum_store_path(path: &Path) -> Result<StoreVacuumReport> {
+    let conn = Connection::open(path)
+        .with_context(|| format!("failed to open Coven store at {}", path.display()))?;
+    conn.execute_batch(
+        "PRAGMA busy_timeout = 5000;
+         PRAGMA foreign_keys = ON;",
+    )
+    .context("failed to configure Coven store vacuum")?;
+
+    let event_index_rebuilt = sqlite_object_exists(&conn, "table", "events_fts")?;
+    if event_index_rebuilt {
+        conn.execute("INSERT INTO events_fts(events_fts) VALUES('rebuild')", [])
+            .context("failed to rebuild events_fts")?;
+    }
+
+    conn.execute_batch("PRAGMA optimize; VACUUM;")
+        .context("failed to vacuum Coven store")?;
+    let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    let integrity_check = pragma_integrity_check(&conn)?;
+
+    Ok(StoreVacuumReport {
+        event_index_rebuilt,
+        integrity_check,
+    })
+}
+
+fn sqlite_object_exists(conn: &Connection, object_type: &str, name: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2
+        )",
+        params![object_type, name],
+        |row| row.get::<_, bool>(0),
+    )
+    .with_context(|| format!("failed to inspect sqlite object {name}"))
+}
+
+fn pragma_integrity_check(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare("PRAGMA integrity_check")
+        .context("failed to prepare integrity_check")?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .context("failed to run integrity_check")?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to read integrity_check")?;
+    Ok(rows)
+}
+
 pub fn insert_event(conn: &Connection, record: &EventRecord) -> Result<()> {
     let config = PrivacyConfig::default();
     let redacted_payload = privacy::redact_payload_json_with_config(&record.payload_json, &config);
@@ -3222,6 +3278,38 @@ mod tests {
             )
             .optional()?;
         assert_eq!(complete, None);
+        Ok(())
+    }
+
+    #[test]
+    fn vacuum_rebuilds_stale_event_fts_index() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("test.sqlite3");
+        let conn = open_store(&path)?;
+        conn.execute(
+            "INSERT INTO sessions(id, project_root, harness, title, status, created_at, updated_at)
+             VALUES('s1', '/tmp', 'codex', 't', 'created', '2026-01-01', '2026-01-01')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO events(id, session_id, kind, payload_json, created_at)
+             VALUES('e1', 's1', 'stdout', '{\"text\":\"phoenix rises\"}', '2026-01-01')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO events_fts(events_fts) VALUES('delete-all')",
+            [],
+        )?;
+        assert!(search_events(&conn, "phoenix")?.is_empty());
+        drop(conn);
+
+        let report = vacuum_store_path(&path)?;
+
+        assert!(report.event_index_rebuilt);
+        let conn = open_store(&path)?;
+        let hits = search_events(&conn, "phoenix")?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].event_id, "e1");
         Ok(())
     }
 

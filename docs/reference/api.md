@@ -45,6 +45,7 @@ flowchart LR
 | POST | `/api/v1/sessions/:id/input` | Forward input to a live session. | `{ data }` | `{ ok, accepted }` | `400 invalid_request` (malformed body / missing or non-string `data`), `404 session_not_found`, `409 session_not_live`, `500 send_input_failed` |
 | POST | `/api/v1/sessions/:id/kill` | Kill a live session. | — | `{ ok, accepted }` | `404 session_not_found`, `409 session_not_live`, `500 kill_failed` |
 | GET | `/api/v1/events` | Read paginated redacted session events. | — (`?sessionId`, `?afterSeq`, `?afterEventId`, `?limit`) | `{ events, nextCursor, hasMore }` | `400 invalid_request` |
+| POST | `/api/v1/store/vacuum` | Rebuild the event FTS index and compact the SQLite store. | — | `{ ok, eventIndexRebuilt, integrityCheck }` | `500` for SQLite repair failures |
 
 All error responses use the structured envelope documented in [API contract](/API-CONTRACT#structured-error-envelope).
 

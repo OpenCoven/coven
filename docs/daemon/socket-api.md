@@ -53,6 +53,7 @@ Negotiate against `apiVersion` and `capabilities` before depending on session or
 | `GET /api/v1/events?sessionId=...` | Read session events. |
 | `POST /api/v1/sessions/:id/input` | Forward input to a live session. |
 | `POST /api/v1/sessions/:id/kill` | Kill a live session. |
+| `POST /api/v1/store/vacuum` | Rebuild the event FTS index and compact the SQLite store. |
 
 Detailed shapes live in the [API reference](/reference/api).
 

@@ -211,6 +211,8 @@ enum Command {
         #[command(subcommand)]
         command: LogsCommand,
     },
+    #[command(about = "Repair and compact the local Coven session store")]
+    Vacuum,
     #[command(
         about = "Create, list, diagnose, and prune Coven worktrees",
         alias = "worktree",
@@ -540,6 +542,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             None => tui::sessions::run_command(all, manage, plain, json),
         },
         Some(Command::Logs { command }) => run_logs_command(command),
+        Some(Command::Vacuum) => run_vacuum_command(),
         Some(Command::Wt {
             branch,
             list,
@@ -1529,6 +1532,22 @@ fn run_executor_command(command: ExecutorCommand) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn run_vacuum_command() -> Result<()> {
+    let store_path = coven_store_path()?;
+    let report = store::vacuum_store_path(&store_path)?;
+    let integrity = if report.integrity_check.iter().any(|line| line != "ok") {
+        report.integrity_check.join("; ")
+    } else {
+        "ok".to_string()
+    };
+    println!(
+        "vacuumed store={} eventIndexRebuilt={} integrity={integrity}",
+        store_path.display(),
+        report.event_index_rebuilt
+    );
+    Ok(())
 }
 
 fn run_daemon_command(command: DaemonCommand) -> Result<()> {
@@ -3357,6 +3376,9 @@ mod tests {
             }
             other => panic!("expected sacrifice command, got {other:?}"),
         }
+
+        let vacuum = Cli::parse_from(["coven", "vacuum"]);
+        assert!(matches!(vacuum.command, Some(Command::Vacuum)));
     }
 
     #[test]

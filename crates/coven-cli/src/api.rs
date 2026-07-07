@@ -354,6 +354,7 @@ pub fn handle_request_with_runtime(
         ("GET", "/research") => {
             json_response(200, &crate::cockpit_sources::read_research(coven_home)?)
         }
+        ("POST", "/store/vacuum") => vacuum_store(coven_home),
         ("POST", "/travel/profiles") => generate_travel_profile(coven_home, body),
         ("POST", "/travel/deltas") => {
             let q = query.unwrap_or_default();
@@ -504,6 +505,18 @@ fn normalize_api_route(route: &str) -> ApiRoute<'_> {
 
 fn store_path(coven_home: &Path) -> std::path::PathBuf {
     coven_home.join("coven.sqlite3")
+}
+
+fn vacuum_store(coven_home: &Path) -> Result<ApiResponse> {
+    let report = store::vacuum_store_path(&store_path(coven_home))?;
+    json_response(
+        200,
+        &json!({
+            "ok": true,
+            "eventIndexRebuilt": report.event_index_rebuilt,
+            "integrityCheck": report.integrity_check,
+        }),
+    )
 }
 
 fn generate_travel_profile(coven_home: &Path, body: Option<&str>) -> Result<ApiResponse> {
@@ -3047,6 +3060,54 @@ mod tests {
             serde_json::json!(["job-persistent-loop", "job-followup"])
         );
         assert_eq!(body["nodeAvailability"][0]["available"], false);
+        Ok(())
+    }
+
+    #[test]
+    fn routes_store_vacuum_request_to_repair_response() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let home = temp_dir.path();
+        let conn = store::open_store(&store_path(home))?;
+        store::insert_session(
+            &conn,
+            &store::SessionRecord {
+                id: "session-1".into(),
+                project_root: "/repo".into(),
+                harness: "codex".into(),
+                title: "demo".into(),
+                status: "completed".into(),
+                exit_code: Some(0),
+                archived_at: Some("2026-01-01T00:00:00Z".into()),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+                conversation_id: None,
+                familiar_id: None,
+                labels: Vec::new(),
+                visibility: "private".to_string(),
+            },
+        )?;
+        store::insert_json_event(
+            &conn,
+            "session-1",
+            "output",
+            &json!({"text": "phoenix rises"}),
+            "2026-01-01T00:00:01Z",
+        )?;
+        conn.execute(
+            "INSERT INTO events_fts(events_fts) VALUES('delete-all')",
+            [],
+        )?;
+        assert!(store::search_events(&conn, "phoenix")?.is_empty());
+        drop(conn);
+
+        let response = handle_request("POST", "/api/v1/store/vacuum", home, None)?;
+
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["eventIndexRebuilt"], true);
+        let conn = store::open_store(&store_path(home))?;
+        assert_eq!(store::search_events(&conn, "phoenix")?.len(), 1);
         Ok(())
     }
 

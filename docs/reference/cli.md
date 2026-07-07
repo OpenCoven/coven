@@ -24,6 +24,7 @@ flowchart TB
   Root --> Kill["kill"]
   Root --> Patch["patch"]
   Root --> Logs["logs"]
+  Root --> Vacuum["vacuum"]
   Root --> Wt["wt"]
   Root --> Claim["claim"]
   Root --> Hooks["hooks"]
@@ -84,6 +85,7 @@ flowchart TB
 | `coven kill <session-id>` | Kill a running session's process; keeps the event log. |
 | `coven patch openclaw <prompt>` | Local OpenClaw rescue loop. Does not commit or push. |
 | `coven logs prune` | Prune expired encrypted raw artifacts and old redacted event logs. |
+| `coven vacuum` | Rebuild the session event FTS index, compact the SQLite store, and print integrity status. |
 | `coven wt <branch>` | Create or enter a sibling `<repo>.wt/<branch-slug>` git worktree. |
 | `coven wt --list/--doctor/--prune-merged/--prune-stale DAYS` | Inspect and clean Coven protocol worktrees. |
 | `coven claim acquire/release/heartbeat/canary <branch>` | Manage TTL-bounded branch ownership for the current agent. |
@@ -147,6 +149,13 @@ Supported shells: `bash`, `zsh`, `fish`, `elvish`, `powershell`.
 - Redacted operational event logs default to 30 days.
 - `--dry-run` prints counts only.
 - `--raw-days <N>` and `--event-days <N>` override the configured retention for one run.
+
+## Store repair
+
+`coven vacuum` is a local housekeeping command for the session ledger. It rebuilds the
+`events_fts` index, runs SQLite `VACUUM`, truncates the WAL when possible, and prints
+the final integrity check. Use it before retrying `coven sacrifice <id> --yes` when
+SQLite reports a malformed event index.
 
 ## Parallel Work Protocol
 
