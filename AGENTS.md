@@ -16,8 +16,41 @@ Coven is a small, boring **Rust authority layer** with TypeScript integration
 packages around it. The development loop must keep that boundary clear: core
 logic stays in Rust; the npm packages are thin integration surface.
 
+## Claim your work first — parallel sessions duplicate otherwise
+
+Multiple agent sessions (Codex, Claude Code, familiars) frequently run against
+**the same checkout at once**, each in its own worktree. Worktrees keep git
+operations from racing, but they do **not** stop two sessions from independently
+building the *same issue* — which has happened repeatedly, producing duplicate
+PRs that a session then has to close. Before you touch code:
+
+1. **Check what's already taken.** Duplication hides behind divergent branch
+   names — one issue once spawned `fix/output-polish`, `fix/311-output-polish`,
+   *and* `fix/output-polish-311` — so branch names alone won't tell you. Check
+   both the shared claim registry and open PRs:
+   ```sh
+   coven claim status          # active claims, shared across every worktree of this repo
+   gh pr list --state open     # is there already a PR for this issue?
+   ```
+   If the issue is claimed or already has a PR, pick different work or coordinate.
+
+2. **Claim it with a shared, issue-keyed token** — not your working branch name,
+   which no other session can predict:
+   ```sh
+   coven claim acquire issue-<N>     # e.g. issue-311; a TTL-bounded lock
+   ```
+   Claims live in the repo's shared `--git-common-dir/agent-claims/`, so every
+   worktree and session sees them. For long tasks, extend the TTL with
+   `coven claim heartbeat issue-<N>`.
+
+3. **Release when your PR merges or you stop:** `coven claim release issue-<N>`.
+
+This step is cheap and it is the single thing that prevents duplicate-PR churn.
+
 ## Branch & PR workflow (all agents)
 
+- **Claim the issue first** (see above) — `coven claim status` + `gh pr list`
+  before starting, then `coven claim acquire issue-<N>`.
 - **Never push to `main`.** Every change lands via a PR with green CI. Branch
   from current `origin/main`.
 - **Fresh branch per task.** If multiple sessions may touch this repo, work in a
