@@ -650,10 +650,18 @@ fn run_attached_with_pty_system(
         stdout.flush()
     });
 
-    thread::spawn(move || {
-        let mut stdin = io::stdin().lock();
-        let _ = io::copy(&mut stdin, &mut writer);
-    });
+    // Only forward stdin to the PTY when it is an interactive terminal. A
+    // one-shot `coven run` gets its prompt from argv, so a piped or
+    // redirected stdin carries nothing the harness needs — and copying it
+    // into the PTY makes the line discipline echo the EOF as a visible `^D`
+    // in the captured output. Interactive sessions still need the forward so
+    // the user can type.
+    if io::stdin().is_terminal() {
+        thread::spawn(move || {
+            let mut stdin = io::stdin().lock();
+            let _ = io::copy(&mut stdin, &mut writer);
+        });
+    }
 
     let exit_status = child.wait().context("failed to wait for harness process")?;
     let _ = output_thread.join();

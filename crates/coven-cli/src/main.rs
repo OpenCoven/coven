@@ -467,8 +467,33 @@ fn main() -> Result<()> {
         "never" => theme::ColorChoice::Never,
         _ => theme::ColorChoice::Auto,
     });
-    run_cli(cli)
+    if let Err(error) = run_cli(cli) {
+        // A user-initiated cancellation is a neutral outcome, not a failure:
+        // print it in plain voice (no `Error:` prefix) but keep a nonzero
+        // exit so scripts can still branch on it.
+        if let Some(cancelled) = error.downcast_ref::<Cancelled>() {
+            eprintln!("{}", cancelled.0);
+            std::process::exit(1);
+        }
+        eprintln!("Error: {error:#}");
+        std::process::exit(1);
+    }
+    Ok(())
 }
+
+/// A user chose to stop (answered "no" at a confirmation, aborted a flow).
+/// `main` prints its message without the `Error:` prefix so a deliberate
+/// cancel doesn't read as a crash; the exit code stays nonzero.
+#[derive(Debug)]
+struct Cancelled(String);
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Cancelled {}
 
 fn run_cli(cli: Cli) -> Result<()> {
     if cli.command.is_none() && !cli.prompt.is_empty() {
@@ -1263,12 +1288,12 @@ fn run_patch(
     if request.git_state.is_dirty() && !request.non_interactive {
         println!("\nExisting changes were detected. Coven will not stash or overwrite them.");
         if !confirm_yes("Continue and ask the harness to preserve existing changes? [y/N] ")? {
-            anyhow::bail!("cancelled before harness launch");
+            return Err(Cancelled("Cancelled. The harness was not launched.".to_string()).into());
         }
     }
 
     if !request.non_interactive && !confirm_yes("Launch the harness now? [y/N] ")? {
-        anyhow::bail!("cancelled before harness launch");
+        return Err(Cancelled("Cancelled. The harness was not launched.".to_string()).into());
     }
 
     let session_id = launch_patch_session(&request)?;
@@ -2393,7 +2418,7 @@ fn printable_event_text(event: &store::EventRecord) -> Option<String> {
             let exit_code = payload
                 .get("exitCode")
                 .and_then(serde_json::Value::as_i64)
-                .map(|code| format!(" exitCode={code}"))
+                .map(|code| format!(" (exit code {code})"))
                 .unwrap_or_default();
             Some(format!("\n[coven session {status}{exit_code}]\n"))
         }
@@ -3474,6 +3499,22 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_error_downcasts_and_keeps_its_message() {
+        // `main` relies on downcasting through anyhow to pick the neutral
+        // voice for a user cancel; guard that path and the message.
+        let err: anyhow::Error =
+            Cancelled("Cancelled. The harness was not launched.".to_string()).into();
+        let cancelled = err
+            .downcast_ref::<Cancelled>()
+            .expect("Cancelled must survive the anyhow round-trip");
+        assert_eq!(cancelled.0, "Cancelled. The harness was not launched.");
+        assert_eq!(
+            cancelled.to_string(),
+            "Cancelled. The harness was not launched."
+        );
+    }
+
+    #[test]
     fn printable_event_text_formats_exit_payload() {
         let event = store::EventRecord {
             seq: 0,
@@ -3486,7 +3527,7 @@ mod tests {
 
         assert_eq!(
             printable_event_text(&event).as_deref(),
-            Some("\n[coven session completed exitCode=0]\n")
+            Some("\n[coven session completed (exit code 0)]\n")
         );
     }
 

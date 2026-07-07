@@ -597,6 +597,46 @@ fn color_flag_parses_and_rejects_unknown_values() -> anyhow::Result<()> {
 }
 
 #[test]
+fn piped_run_output_has_no_eof_control_artifact() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    fs::create_dir_all(&coven_home)?;
+    let project = temp_dir.path().join("project");
+    fs::create_dir_all(&project)?;
+    let fake_bin = temp_dir.path().join("bin");
+    fs::create_dir_all(&fake_bin)?;
+    write_fake_codex(&fake_bin)?;
+    let path = prepend_path(&fake_bin);
+
+    // stdin is /dev/null (a pipe/redirect, not a TTY): a one-shot run reads
+    // its prompt from argv, so nothing should be forwarded into the PTY and
+    // the line discipline must not echo an EOF as a visible `^D`.
+    let output = Command::new(coven_bin())
+        .args(["run", "codex", "hello polish"])
+        .env("COVEN_HOME", &coven_home)
+        .env("PATH", &path)
+        .current_dir(&project)
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert_success("piped run", &output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("fake codex complete"),
+        "harness output should reach stdout: {stdout:?}"
+    );
+    assert!(
+        !output.stdout.contains(&0x04),
+        "piped run stdout must not contain a raw EOT (^D) byte: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("^D"),
+        "piped run stdout must not contain a visible ^D artifact: {stdout:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn adapter_install_hermes_writes_trusted_manifest() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let coven_home = temp_dir.path().join("coven-home");
@@ -800,7 +840,7 @@ fn smoke_daemon_session_replay_and_safe_session_rituals() -> anyhow::Result<()> 
     assert_stdout_contains(
         "attach replay",
         &attach,
-        "[coven session completed exitCode=0]",
+        "[coven session completed (exit code 0)]",
     );
 
     let kill_session = launch_daemon_session(
