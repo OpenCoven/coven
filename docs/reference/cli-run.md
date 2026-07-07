@@ -29,7 +29,7 @@ coven run <harness> <prompt> [flags]
 | `--visibility <private\|workspace\|shared>` | Set session visibility metadata. |
 | `--archive` | Archive the session after the run completes. |
 | `--familiar <id>` | Inject familiar identity context. |
-| `--stream-json` | Emit Coven JSONL events on stdout. |
+| `--stream-json` | Emit Coven JSONL events on stdout. stdout carries only JSONL for every harness: non-stream harnesses (codex, external adapters) have their raw PTY output wrapped in `output` events. See `docs/STREAM-JSON.md`. |
 | `--stream-json-input` | With `--stream-json`, read JSONL user messages from stdin for Claude stream mode. |
 
 Examples:
