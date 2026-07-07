@@ -600,7 +600,9 @@ fn generate_travel_profile(coven_home: &Path, body: Option<&str>) -> Result<ApiR
     let profile_blob = base64::engine::general_purpose::STANDARD.encode(&compressed);
     let mut hasher = Sha256::new();
     hasher.update(&compressed);
-    let content_hash = format!("sha256:{:x}", hasher.finalize());
+    let digest = hasher.finalize();
+    let hex_digest: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    let content_hash = format!("sha256:{hex_digest}");
     let profile_dir = coven_home.join("travel").join("profiles");
     std::fs::create_dir_all(&profile_dir)
         .with_context(|| format!("failed to create {}", profile_dir.display()))?;
