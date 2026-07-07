@@ -83,6 +83,10 @@ pub(super) struct App {
     pub(super) input_mode: InputMode,
     pub(super) agent_select_index: usize,
     pub(super) show_help: bool,
+    /// Vertical scroll offset (in lines) for the help overlay so its full
+    /// key/command list stays reachable on short terminals. Clamped to the
+    /// content during render.
+    pub(super) help_scroll: u16,
     pub(super) spinner_frame: usize,
     pub(super) is_responding: bool,
     pub(super) last_tick: Instant,
@@ -306,6 +310,7 @@ impl App {
             input_mode: InputMode::Normal,
             agent_select_index: 0,
             show_help: false,
+            help_scroll: 0,
             spinner_frame: 0,
             is_responding: false,
             last_tick: Instant::now(),
@@ -662,7 +667,7 @@ impl App {
 
         match cmd.as_str() {
             "/help" | "/h" => {
-                self.show_help = !self.show_help;
+                self.toggle_help();
                 SlashCommandResult::Handled
             }
             "/clear" | "/cls" => {
@@ -723,7 +728,7 @@ impl App {
                 SlashCommandResult::Handled
             }
             "/palette" | "/commands" => {
-                self.show_help = !self.show_help;
+                self.toggle_help();
                 SlashCommandResult::Handled
             }
             "/stream" | "/streaming" => {
@@ -843,9 +848,13 @@ impl App {
             CastIntent::SacrificeSession { session_id } => self.sacrifice_session(&session_id),
             CastIntent::Doctor => self.push_doctor_summary(),
             CastIntent::DaemonStatus => self.push_daemon_status_summary(),
-            CastIntent::Help => self.show_help = true,
+            CastIntent::Help => {
+                self.show_help = true;
+                self.help_scroll = 0;
+            }
             CastIntent::StartHere | CastIntent::OpenTui => {
                 self.show_help = true;
+                self.help_scroll = 0;
                 self.push_system_message(
                     "Command discovery is open. Type a task, /run <harness> <task>, /sessions, or /help.",
                 );
@@ -888,11 +897,39 @@ impl App {
         SlashCommandResult::Handled
     }
 
-    /// Handle a Ctrl+C press. The first press clears modal/composer state and
-    /// arms an exit confirmation; a second press inside [`INTERRUPT_REARM_WINDOW`]
-    /// returns [`InterruptOutcome::Quit`] so the caller can break out.
+    /// Toggle the help overlay, resetting its scroll so it always opens at the
+    /// top of the command list.
+    pub(super) fn toggle_help(&mut self) {
+        self.show_help = !self.show_help;
+        self.help_scroll = 0;
+    }
+
+    /// Handle a Ctrl+C press.
+    ///
+    /// A non-empty composer draft is the least-destructive thing to cancel, so
+    /// the first Ctrl+C only clears the draft and stops there — a stray ^C
+    /// while typing never tears down a running session or exits. It also does
+    /// not arm the exit window, so the ladder restarts cleanly from the empty
+    /// draft.
+    ///
+    /// With an empty draft the press escalates: it cancels any modal state,
+    /// interrupts the active session, and arms an exit confirmation. A second
+    /// empty-draft press inside [`INTERRUPT_REARM_WINDOW`] returns
+    /// [`InterruptOutcome::Quit`] so the caller can break out.
     pub(super) fn handle_interrupt(&mut self) -> InterruptOutcome {
         let now = Instant::now();
+
+        // Draft first: clearing it protects live work and does not arm exit.
+        if !self.input.is_empty() {
+            self.input.clear();
+            self.cursor_pos = 0;
+            self.slash_suggestion_index = 0;
+            self.slash_popup_dismissed = false;
+            self.last_interrupt_at = None;
+            self.push_system_message("Draft cleared. Ctrl+C again to interrupt or exit.");
+            return InterruptOutcome::Cancelled;
+        }
+
         if self
             .last_interrupt_at
             .is_some_and(|t| now.duration_since(t) <= INTERRUPT_REARM_WINDOW)
@@ -900,18 +937,15 @@ impl App {
             return InterruptOutcome::Quit;
         }
 
-        // First press: cancel everything cancellable, then arm exit.
+        // Empty draft: cancel everything cancellable, then arm exit.
         let had_pending = self.cancel_pending_cast_confirmation();
-        let had_input = !self.input.is_empty();
         let interrupted_session = self.interrupt_active_session();
-        self.input.clear();
-        self.cursor_pos = 0;
         self.slash_suggestion_index = 0;
         self.slash_popup_dismissed = false;
 
         let advisory = if interrupted_session {
             "Interrupt sent. Press Ctrl+C again to exit."
-        } else if had_pending || had_input {
+        } else if had_pending {
             "Cleared. Press Ctrl+C again to exit."
         } else {
             "Press Ctrl+C again to exit."
@@ -1158,8 +1192,51 @@ impl App {
         }
     }
 
+    /// Resolve a full session id or a unique id *prefix* to a session record.
+    ///
+    /// Mirrors the CLI's `resolve_session_ref` (session-ref rituals, #297): an
+    /// exact id wins, a single prefix match is accepted, an ambiguous prefix
+    /// lists the candidates, and a miss reports not-found. This keeps `/attach`
+    /// able to consume the short ids the `/sessions` overlay renders.
+    fn resolve_session_reference(
+        &mut self,
+        reference: &str,
+    ) -> Result<store::SessionRecord, String> {
+        // Exact id: trust the daemon directly so ids that aren't in the last
+        // listing (e.g. just launched) still attach without a round-trip.
+        if let Ok(session) = self.client.get_session(reference) {
+            return Ok(session);
+        }
+        if reference.is_empty() {
+            return Err("Usage: /attach <session-id>".to_string());
+        }
+        let sessions = self
+            .client
+            .list_sessions()
+            .map_err(|error| error.to_string())?;
+        let mut matches = sessions
+            .into_iter()
+            .filter(|session| session.id.starts_with(reference));
+        let Some(first) = matches.next() else {
+            return Err(format!(
+                "session `{reference}` not found; open /sessions to list ids"
+            ));
+        };
+        let rest: Vec<store::SessionRecord> = matches.collect();
+        if rest.is_empty() {
+            return Ok(first);
+        }
+        let ids: Vec<String> = std::iter::once(first.id.clone())
+            .chain(rest.iter().take(4).map(|session| session.id.clone()))
+            .collect();
+        Err(format!(
+            "session id prefix `{reference}` is ambiguous; it matches: {}",
+            ids.join(", ")
+        ))
+    }
+
     pub(super) fn attach_session(&mut self, session_id: &str) {
-        match self.client.get_session(session_id) {
+        match self.resolve_session_reference(session_id) {
             Ok(session) => {
                 self.active_session_id = Some(session.id.clone());
                 self.active_session_harness = Some(session.harness.clone());
@@ -5178,21 +5255,51 @@ mod tests {
     }
 
     #[test]
-    fn handle_interrupt_first_press_clears_input_and_arms_exit_advisory() {
+    fn first_ctrl_c_with_draft_clears_it_without_arming_exit() {
         let client = RecordingChatClient::default();
         let (mut app, _) = app_with_client(client);
         app.input = "in-flight prompt".to_string();
         app.cursor_pos = app.input.len();
 
-        let outcome = app.handle_interrupt();
-
-        assert_eq!(outcome, InterruptOutcome::Cancelled);
+        // First press with a non-empty draft only clears the draft.
+        assert_eq!(app.handle_interrupt(), InterruptOutcome::Cancelled);
         assert!(app.input.is_empty());
         assert_eq!(app.cursor_pos, 0);
         assert!(app
             .messages
             .iter()
-            .any(|message| message.content.contains("Press Ctrl+C again to exit")));
+            .any(|message| message.content.contains("Draft cleared")));
+
+        // The draft-clear did NOT arm exit: the next (empty-draft) press
+        // escalates by arming, and only the one after that quits — so a stray
+        // ^C while typing can never fall straight through to an exit.
+        assert_eq!(app.handle_interrupt(), InterruptOutcome::Cancelled);
+        assert_eq!(app.handle_interrupt(), InterruptOutcome::Quit);
+    }
+
+    #[test]
+    fn first_ctrl_c_with_draft_does_not_kill_running_session() {
+        let session = test_session("abc-123", "codex", "task", "running");
+        let client = RecordingChatClient::with_session(session.clone());
+        let calls = client.calls.clone();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some(session.id.clone());
+        app.input = "wait, don't kill it".to_string();
+        app.cursor_pos = app.input.len();
+
+        assert_eq!(app.handle_interrupt(), InterruptOutcome::Cancelled);
+
+        assert!(app.input.is_empty(), "draft should be cleared");
+        assert_eq!(
+            app.active_session_id.as_deref(),
+            Some("abc-123"),
+            "clearing a draft must leave the running session attached",
+        );
+        let recorded = calls.borrow().clone();
+        assert!(
+            !recorded.iter().any(|call| call == "kill:abc-123"),
+            "draft-clear must not tear down live work, got: {recorded:?}",
+        );
     }
 
     #[test]
@@ -5248,6 +5355,54 @@ mod tests {
             recorded.iter().any(|call| call == "kill:xyz-9"),
             "expected kill call from Esc-style interrupt, got: {recorded:?}",
         );
+    }
+
+    #[test]
+    fn attach_resolves_unique_session_id_prefix() {
+        // A full session id longer than the /sessions overlay's 12-char id
+        // column: the overlay shows only the first 12 chars, so `/attach`
+        // must resolve that prefix back to the full id.
+        let full = "abcd1234-0000-0000-0000-000000000000";
+        let session = test_session(full, "codex", "task", "running");
+        let client = RecordingChatClient::with_session(session);
+        let (mut app, _) = app_with_client(client);
+
+        // Mirrors the overlay's `session_id_prefix(id, 12)` display budget.
+        let shown = &full[..12];
+        assert_eq!(shown, "abcd1234-000");
+
+        app.attach_session(shown);
+
+        assert_eq!(
+            app.active_session_id.as_deref(),
+            Some(full),
+            "a displayed id prefix must attach to the full session",
+        );
+        assert!(app
+            .messages
+            .iter()
+            .any(|message| message.content.contains("Attached to daemon session")));
+    }
+
+    #[test]
+    fn attach_reports_ambiguous_session_id_prefix_without_attaching() {
+        let first = test_session("dupe-1111-aaaa", "codex", "task-a", "running");
+        let second = test_session("dupe-2222-bbbb", "claude", "task-b", "running");
+        let client = RecordingChatClient::with_session(first);
+        client.sessions.borrow_mut().push(second);
+        let (mut app, _) = app_with_client(client);
+
+        // "dupe-" prefixes both sessions: no exact id, ambiguous prefix.
+        app.attach_session("dupe-");
+
+        assert!(
+            app.active_session_id.is_none(),
+            "an ambiguous prefix must not attach anything",
+        );
+        assert!(app
+            .messages
+            .iter()
+            .any(|message| message.content.contains("ambiguous")));
     }
 
     #[test]
