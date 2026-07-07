@@ -420,7 +420,7 @@ fn dispatch_cast_plan(plan: CastPlan) -> Result<()> {
             }
         }
         CastIntent::DaemonStatus => {
-            run_daemon_command(DaemonCommand::Status)?;
+            run_daemon_command(DaemonCommand::Status { json: false })?;
             CastOutcome {
                 request: request_text,
                 launched: Some("Coven daemon status".to_string()),
@@ -1624,7 +1624,7 @@ fn run_magical_tui_action(action: MagicalTuiAction) -> Result<()> {
         MagicalTuiAction::Help => run_tui_help(),
         MagicalTuiAction::OpenTui => run(),
         MagicalTuiAction::Doctor => run_doctor(),
-        MagicalTuiAction::DaemonStatus => run_daemon_command(DaemonCommand::Status),
+        MagicalTuiAction::DaemonStatus => run_daemon_command(DaemonCommand::Status { json: false }),
         MagicalTuiAction::RunHarness => run_guided_harness_session(),
         MagicalTuiAction::PatchOpenClaw => {
             run_patch(None, vec![], None, None, None, false, false, true)

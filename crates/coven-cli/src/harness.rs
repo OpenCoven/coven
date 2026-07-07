@@ -301,10 +301,13 @@ impl HarnessCommandSpec {
             HarnessLaunchMode::Stream => &self.non_interactive_prompt_prefix_args,
         };
 
+        // The prompt is user data: a prompt starting with `-` must reach the
+        // harness as the positional argument, not be parsed as flags, so it
+        // always rides behind an options terminator.
         prefix_args
             .iter()
             .cloned()
-            .chain(std::iter::once(prompt.to_string()))
+            .chain(["--".to_string(), prompt.to_string()])
             .collect()
     }
 }
@@ -908,8 +911,10 @@ pub fn command_parts_for_harness_with_conversation(
                 &model_args,
                 &sandbox_args,
                 &launch_option_args,
+                // `--` before the prompt for the same reason as `prompt_args`:
+                // user data must not parse as harness flags.
                 args.into_iter()
-                    .chain(std::iter::once(effective_prompt))
+                    .chain(["--".to_string(), effective_prompt])
                     .collect(),
             ));
             return Ok((program, with_claude_permission_flags(harness_id, args)));
@@ -1389,11 +1394,17 @@ mod tests {
     fn command_parts_for_known_harnesses_append_interactive_prompt() -> anyhow::Result<()> {
         assert_eq!(
             command_parts_for_harness("codex", "fix tests", HarnessLaunchMode::Interactive)?,
-            ("codex".to_string(), vec!["fix tests".to_string()])
+            (
+                "codex".to_string(),
+                vec!["--".to_string(), "fix tests".to_string()]
+            )
         );
         assert_eq!(
             command_parts_for_harness("claude", "polish ui", HarnessLaunchMode::Interactive)?,
-            ("claude".to_string(), vec!["polish ui".to_string()])
+            (
+                "claude".to_string(),
+                vec!["--".to_string(), "polish ui".to_string()]
+            )
         );
         Ok(())
     }
@@ -1409,6 +1420,7 @@ mod tests {
                     "--skip-git-repo-check".to_string(),
                     "--color".to_string(),
                     "never".to_string(),
+                    "--".to_string(),
                     "fix tests".to_string(),
                 ]
             )
@@ -1417,9 +1429,37 @@ mod tests {
             command_parts_for_harness("claude", "polish ui", HarnessLaunchMode::NonInteractive)?,
             (
                 "claude".to_string(),
-                vec!["--print".to_string(), "polish ui".to_string()]
+                vec![
+                    "--print".to_string(),
+                    "--".to_string(),
+                    "polish ui".to_string()
+                ]
             )
         );
+        Ok(())
+    }
+
+    #[test]
+    fn dash_prefixed_prompts_stay_positional_behind_double_dash() -> anyhow::Result<()> {
+        // A prompt starting with `-` must never parse as harness flags.
+        for mode in [
+            HarnessLaunchMode::Interactive,
+            HarnessLaunchMode::NonInteractive,
+        ] {
+            for harness in ["codex", "claude"] {
+                let (_, args) = command_parts_for_harness(harness, "--version; rm -rf /", mode)?;
+                let separator = args
+                    .iter()
+                    .position(|a| a == "--")
+                    .expect("args must contain the options terminator");
+                assert_eq!(args[separator + 1], "--version; rm -rf /");
+                assert_eq!(
+                    args.len(),
+                    separator + 2,
+                    "prompt must be the final argv entry"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1442,11 +1482,16 @@ mod tests {
 
         assert_eq!(
             spec.prompt_args("hello", HarnessLaunchMode::Interactive),
-            vec!["chat".to_string(), "hello".to_string()]
+            vec!["chat".to_string(), "--".to_string(), "hello".to_string()]
         );
         assert_eq!(
             spec.prompt_args("hello", HarnessLaunchMode::NonInteractive),
-            vec!["exec".to_string(), "-q".to_string(), "hello".to_string()]
+            vec![
+                "exec".to_string(),
+                "-q".to_string(),
+                "--".to_string(),
+                "hello".to_string()
+            ]
         );
     }
 
@@ -1515,6 +1560,7 @@ mod tests {
                     "coven".to_string(),
                     "-Q".to_string(),
                     "-q".to_string(),
+                    "--".to_string(),
                     "audit repo".to_string(),
                 ]
             )
@@ -1811,6 +1857,7 @@ mod tests {
                     "--print".to_string(),
                     "--session-id".to_string(),
                     "abc-123".to_string(),
+                    "--".to_string(),
                     "hello".to_string(),
                 ]
             )
@@ -1839,6 +1886,7 @@ mod tests {
                     "--print".to_string(),
                     "--resume".to_string(),
                     "abc-123".to_string(),
+                    "--".to_string(),
                     "follow up".to_string(),
                 ]
             )
@@ -1861,7 +1909,10 @@ mod tests {
         );
         assert_eq!(
             parts.unwrap(),
-            ("claude".to_string(), vec!["hello".to_string()])
+            (
+                "claude".to_string(),
+                vec!["--".to_string(), "hello".to_string()]
+            )
         );
         Ok(())
     }
@@ -1889,6 +1940,7 @@ mod tests {
                     "--skip-git-repo-check".to_string(),
                     "--color".to_string(),
                     "never".to_string(),
+                    "--".to_string(),
                     "fix tests".to_string(),
                 ]
             )
@@ -1920,6 +1972,7 @@ mod tests {
                     "never".to_string(),
                     "resume".to_string(),
                     "019e5998-7130-7872-8d96-a6b67c5b6406".to_string(),
+                    "--".to_string(),
                     "follow up".to_string(),
                 ]
             )
@@ -2041,6 +2094,7 @@ mod tests {
                 "--skip-git-repo-check".to_string(),
                 "--color".to_string(),
                 "never".to_string(),
+                "--".to_string(),
                 "fix tests".to_string(),
             ]
         );
@@ -2070,6 +2124,7 @@ mod tests {
                 "--model".to_string(),
                 "claude-sonnet-4".to_string(),
                 "--print".to_string(),
+                "--".to_string(),
                 "hi".to_string(),
             ]
         );
@@ -2095,6 +2150,7 @@ mod tests {
                 "--effort".to_string(),
                 "high".to_string(),
                 "--print".to_string(),
+                "--".to_string(),
                 "hi".to_string(),
             ]
         );
@@ -2302,6 +2358,7 @@ mod tests {
                 "--permission-mode".to_string(),
                 "bypassPermissions".to_string(),
                 "--print".to_string(),
+                "--".to_string(),
                 "hi".to_string(),
             ]
         );
@@ -2369,6 +2426,7 @@ mod tests {
                     "-c".to_string(),
                     "model=gpt-5.5".to_string(),
                     "run".to_string(),
+                    "--".to_string(),
                     "do it".to_string(),
                 ]
             )
@@ -2423,7 +2481,7 @@ mod tests {
             parts?,
             (
                 "plainadapter".to_string(),
-                vec!["run".to_string(), "do it".to_string()]
+                vec!["run".to_string(), "--".to_string(), "do it".to_string()]
             )
         );
         Ok(())

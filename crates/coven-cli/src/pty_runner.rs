@@ -101,6 +101,55 @@ pub fn run_attached(command: &HarnessCommand) -> Result<PtyRunResult> {
     run_attached_with_pty_system(command, pty_system.as_ref())
 }
 
+/// Run `command` on a PTY like `run_attached`, but capture the PTY output
+/// instead of mirroring the raw bytes to stdout. Each captured chunk is
+/// handed to `on_output` in order and is guaranteed valid UTF-8 (codepoints
+/// split across reads are reassembled by `drain_detached_output`).
+///
+/// This is the `--stream-json` path for harnesses without a native
+/// stream-json protocol (codex, external adapters): stdout must stay
+/// JSONL-only, so the raw PTY output (ANSI escapes, prompts, partial lines)
+/// is wrapped into `output` events by the caller rather than interleaving
+/// with the frames (#307). Stdin is still forwarded to the PTY, matching
+/// `run_attached`; raw terminal mode is never enabled because nothing is
+/// echoed back to the caller's terminal.
+pub fn run_attached_captured(
+    command: &HarnessCommand,
+    mut on_output: Box<dyn FnMut(Vec<u8>) + Send + 'static>,
+) -> Result<PtyRunResult> {
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(terminal_size())
+        .context("failed to open PTY")?;
+    let mut child = pair
+        .slave
+        .spawn_command(command.to_command_builder())
+        .with_context(|| format!("failed to spawn harness `{}`", command.program()))?;
+
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .context("failed to clone PTY reader")?;
+    let mut writer = pair
+        .master
+        .take_writer()
+        .context("failed to open PTY writer")?;
+
+    thread::spawn(move || {
+        let mut stdin = io::stdin().lock();
+        let _ = io::copy(&mut stdin, &mut writer);
+    });
+
+    // Drain on this thread until the child closes its end of the PTY; EOF
+    // (or EIO on Linux) arrives when the child exits, so the wait below
+    // returns promptly.
+    drain_detached_output(&mut reader, Some(&mut on_output));
+
+    Ok(wait_for_child(&mut child))
+}
+
 /// Run `claude` in its native stream-JSON mode, framed by the caller (which
 /// emits Coven's own `system.init` / `result` around the call).
 ///
@@ -225,6 +274,9 @@ fn stream_claude_with_program_and_permission_bypass<W: Write>(
     } else {
         args.extend(["--session-id".to_string(), session_id.to_string()]);
     }
+    // `--` keeps a user prompt starting with `-` from parsing as claude flags
+    // (same shield as `HarnessCommandSpec::prompt_args`).
+    args.push("--".to_string());
     args.push(prompt.to_string());
     let args = crate::harness::sanitize_argv_for_platform(args);
 
@@ -673,7 +725,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(command.program(), "codex");
-        assert_eq!(command.args(), &["hello; rm -rf /"]);
+        assert_eq!(command.args(), &["--", "hello; rm -rf /"]);
         assert_eq!(command.cwd(), cwd);
     }
 
@@ -749,7 +801,7 @@ exit 7
         // which is the bug this commit fixes.
         assert_eq!(
             std::fs::read_to_string(temp_dir.path().join("args.txt"))?,
-            "-p\n--output-format\nstream-json\n--verbose\n--session-id\nsession-123\nhello prompt\n"
+            "-p\n--output-format\nstream-json\n--verbose\n--session-id\nsession-123\n--\nhello prompt\n"
         );
         assert_eq!(
             String::from_utf8(out)?,
@@ -795,7 +847,7 @@ exit 0
 
         assert_eq!(
             std::fs::read_to_string(temp_dir.path().join("args.txt"))?,
-            "-p\n--input-format\nstream-json\n--output-format\nstream-json\n--verbose\n--session-id\nsession-456\nhello prompt\n"
+            "-p\n--input-format\nstream-json\n--output-format\nstream-json\n--verbose\n--session-id\nsession-456\n--\nhello prompt\n"
         );
         Ok(())
     }
@@ -835,7 +887,7 @@ exit 0
 
         assert_eq!(
             std::fs::read_to_string(temp_dir.path().join("args.txt"))?,
-            "-p\n--permission-mode\nbypassPermissions\n--output-format\nstream-json\n--verbose\n--session-id\nsession-456\nhello prompt\n"
+            "-p\n--permission-mode\nbypassPermissions\n--output-format\nstream-json\n--verbose\n--session-id\nsession-456\n--\nhello prompt\n"
         );
         Ok(())
     }
@@ -878,7 +930,7 @@ exit 0
 
         assert_eq!(
             std::fs::read_to_string(temp_dir.path().join("args.txt"))?,
-            "-p\n--output-format\nstream-json\n--verbose\n--resume\nsession-789\nhello again\n"
+            "-p\n--output-format\nstream-json\n--verbose\n--resume\nsession-789\n--\nhello again\n"
         );
         Ok(())
     }
@@ -921,7 +973,7 @@ exit 0
 
         assert_eq!(
             std::fs::read_to_string(temp_dir.path().join("args.txt"))?,
-            "-p\n--model\nclaude-sonnet-4\n--output-format\nstream-json\n--verbose\n--session-id\nsession-123\nhello prompt\n"
+            "-p\n--model\nclaude-sonnet-4\n--output-format\nstream-json\n--verbose\n--session-id\nsession-123\n--\nhello prompt\n"
         );
         Ok(())
     }
@@ -963,7 +1015,7 @@ exit 0
 
         assert_eq!(
             std::fs::read_to_string(temp_dir.path().join("args.txt"))?,
-            "-p\n--effort\nhigh\n--output-format\nstream-json\n--verbose\n--session-id\nsession-123\nhello prompt\n"
+            "-p\n--effort\nhigh\n--output-format\nstream-json\n--verbose\n--session-id\nsession-123\n--\nhello prompt\n"
         );
         Ok(())
     }
@@ -1086,9 +1138,9 @@ exit 0
 
         assert_eq!(command.program(), "claude");
         #[cfg(windows)]
-        assert_eq!(command.args(), &["\"explain ^&^& exit\""]);
+        assert_eq!(command.args(), &["--", "\"explain ^&^& exit\""]);
         #[cfg(not(windows))]
-        assert_eq!(command.args(), &["explain && exit"]);
+        assert_eq!(command.args(), &["--", "explain && exit"]);
         assert_eq!(command.cwd(), cwd);
     }
 }
