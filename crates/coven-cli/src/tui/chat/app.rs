@@ -900,19 +900,21 @@ impl App {
             return InterruptOutcome::Quit;
         }
 
-        // First press: cancel everything cancellable, then arm exit.
-        let had_pending = self.cancel_pending_cast_confirmation();
-        let had_input = !self.input.is_empty();
-        let interrupted_session = self.interrupt_active_session();
-        self.input.clear();
-        self.cursor_pos = 0;
-        self.slash_suggestion_index = 0;
-        self.slash_popup_dismissed = false;
-
-        let advisory = if interrupted_session {
-            "Interrupt sent. Press Ctrl+C again to exit."
-        } else if had_pending || had_input {
+        // First press: clear the most transient state and stop there, so a
+        // Ctrl+C meant to discard a draft or a Cast prompt never tears down
+        // live work. Only when there is nothing composed to clear does the
+        // first press interrupt the running session. Priority: pending Cast
+        // confirmation → draft input → active session.
+        let advisory = if self.cancel_pending_cast_confirmation() {
             "Cleared. Press Ctrl+C again to exit."
+        } else if !self.input.is_empty() {
+            self.input.clear();
+            self.cursor_pos = 0;
+            self.slash_suggestion_index = 0;
+            self.slash_popup_dismissed = false;
+            "Cleared. Press Ctrl+C again to exit."
+        } else if self.interrupt_active_session() {
+            "Interrupt sent. Press Ctrl+C again to exit."
         } else {
             "Press Ctrl+C again to exit."
         };
@@ -1158,8 +1160,39 @@ impl App {
         }
     }
 
+    /// Resolve a session reference to a full id. Accepts an exact id or a
+    /// unique prefix of one among the loaded sessions (the `/sessions` overlay
+    /// shows 8-char prefixes), mirroring the CLI ritual verbs. Returns the
+    /// input unchanged when nothing matches so the daemon lookup produces the
+    /// authoritative error, or when a prefix is ambiguous (reported here).
+    fn resolve_session_reference(&mut self, reference: &str) -> Option<String> {
+        if self.sessions.iter().any(|s| s.id == reference) {
+            return Some(reference.to_string());
+        }
+        let matches: Vec<&str> = self
+            .sessions
+            .iter()
+            .filter(|s| s.id.starts_with(reference))
+            .map(|s| s.id.as_str())
+            .collect();
+        match matches.as_slice() {
+            [only] => Some((*only).to_string()),
+            [] => Some(reference.to_string()),
+            many => {
+                self.push_system_message(&format!(
+                    "Session id prefix `{reference}` is ambiguous ({} matches); use more characters.",
+                    many.len()
+                ));
+                None
+            }
+        }
+    }
+
     pub(super) fn attach_session(&mut self, session_id: &str) {
-        match self.client.get_session(session_id) {
+        let Some(session_id) = self.resolve_session_reference(session_id) else {
+            return;
+        };
+        match self.client.get_session(&session_id) {
             Ok(session) => {
                 self.active_session_id = Some(session.id.clone());
                 self.active_session_harness = Some(session.harness.clone());
@@ -2636,6 +2669,25 @@ mod tests {
         assert!(!frame.contains("/trace"), "dead command leaked:\n{frame}");
         assert!(!frame.contains("/mem"), "dead command leaked:\n{frame}");
         assert!(!frame.contains("/debug"), "dead command leaked:\n{frame}");
+    }
+
+    #[test]
+    fn help_overlay_shows_the_full_keys_section_on_a_tall_terminal() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.show_help = true;
+
+        // Tall enough to hold every section: the Keys bindings at the very
+        // bottom must not clip (they did under the old fixed height cap).
+        let frame = render_app_plain(&mut app, 90, 42);
+
+        assert!(frame.contains("Keys"), "Keys header missing:\n{frame}");
+        assert!(frame.contains("Ctrl+L"), "Ctrl+L binding clipped:\n{frame}");
+        assert!(frame.contains("Ctrl+D"), "Ctrl+D binding clipped:\n{frame}");
+        assert!(
+            frame.contains("Exit Coven chat"),
+            "last Keys row clipped:\n{frame}"
+        );
     }
 
     #[test]
@@ -4619,6 +4671,54 @@ mod tests {
     }
 
     #[test]
+    fn attach_resolves_a_unique_id_prefix_from_the_overlay() {
+        let full_id = "9099a1b2-3c4d-5e6f-7a8b-9c0d1e2f3a4b";
+        let client =
+            RecordingChatClient::with_session(test_session(full_id, "codex", "Live", "running"));
+        let (mut app, mirror) = app_with_client(client);
+        // The `/sessions` overlay lists an 8-char prefix; attaching by that
+        // prefix must resolve to the full session id.
+        app.sessions = vec![test_session(full_id, "codex", "Live", "running")];
+
+        app.handle_slash_command("/attach 9099a1b2");
+
+        assert_eq!(app.active_session_id(), Some(full_id));
+        assert!(
+            mirror
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call == &format!("get:{full_id}")),
+            "attach should look the full id up, not the prefix: {:?}",
+            mirror.calls.borrow()
+        );
+    }
+
+    #[test]
+    fn attach_reports_an_ambiguous_prefix_without_attaching() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.sessions = vec![
+            test_session("abc11111-0000", "codex", "One", "running"),
+            test_session("abc22222-0000", "codex", "Two", "running"),
+        ];
+
+        app.handle_slash_command("/attach abc");
+
+        assert_eq!(app.active_session_id(), None);
+        assert!(
+            app.messages
+                .iter()
+                .any(|message| message.content.contains("ambiguous")),
+            "ambiguous prefix should be reported: {:?}",
+            app.messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn chat_output_events_are_terminal_sanitized_and_coalesced() {
         let client = RecordingChatClient::with_session(test_session(
             "session-1",
@@ -5193,6 +5293,66 @@ mod tests {
             .messages
             .iter()
             .any(|message| message.content.contains("Press Ctrl+C again to exit")));
+    }
+
+    #[test]
+    fn handle_interrupt_with_draft_clears_it_without_killing_the_session() {
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "codex",
+            "Live work",
+            "running",
+        ));
+        let (mut app, mirror) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.input = "half-typed message".to_string();
+        app.cursor_pos = app.input.len();
+
+        let outcome = app.handle_interrupt();
+
+        assert_eq!(outcome, InterruptOutcome::Cancelled);
+        // The draft is discarded...
+        assert!(app.input.is_empty());
+        assert_eq!(app.cursor_pos, 0);
+        // ...but the live session is untouched: no kill was sent and it is
+        // still the active session.
+        assert!(
+            !mirror
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call.starts_with("kill:")),
+            "clearing a draft must not kill the live session: {:?}",
+            mirror.calls.borrow()
+        );
+        assert_eq!(app.active_session_id.as_deref(), Some("session-1"));
+    }
+
+    #[test]
+    fn handle_interrupt_without_draft_interrupts_the_active_session() {
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "codex",
+            "Live work",
+            "running",
+        ));
+        let (mut app, mirror) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+
+        let outcome = app.handle_interrupt();
+
+        assert_eq!(outcome, InterruptOutcome::Cancelled);
+        // With nothing composed to clear, the first press interrupts the
+        // running session.
+        assert!(
+            mirror
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call == "kill:session-1"),
+            "with no draft, Ctrl+C should interrupt the session: {:?}",
+            mirror.calls.borrow()
+        );
     }
 
     #[test]

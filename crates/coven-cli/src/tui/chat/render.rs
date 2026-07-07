@@ -687,17 +687,12 @@ fn hint_bar_spans<'a>(app: &App) -> Vec<Span<'a>> {
 }
 
 fn render_help_overlay(f: &mut Frame, area: Rect) {
-    let overlay_width = 60u16.min(area.width.saturating_sub(4));
-    // Fits Basics(5) + Agents(2) + System(2) + Sessions(4) + Output(3) +
-    // Keys(6) plus section headers and separators. Clamps to the
-    // terminal so very short windows still render something useful even if
-    // the bottom rows clip.
-    let overlay_height = 34u16.min(area.height.saturating_sub(4));
-    let x = (area.width.saturating_sub(overlay_width)) / 2;
-    let y = (area.height.saturating_sub(overlay_height)) / 2;
-    let popup_area = Rect::new(x, y, overlay_width, overlay_height);
-
-    f.render_widget(Clear, popup_area);
+    // Wide enough that the longest `command  description` row (~67 cols) does
+    // not wrap: an accurate one-row-per-entry layout is what lets the
+    // content-based height below show every section without clipping. On a
+    // terminal narrower than this the overlay clamps and rows may wrap, but
+    // the height still uses all available rows.
+    let overlay_width = 76u16.min(area.width.saturating_sub(4));
 
     let help_items = vec![
         (
@@ -770,6 +765,17 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
         }
         lines.push(Line::from(""));
     }
+
+    // Size the overlay to the content (+2 for the top/bottom border) so the
+    // Keys section at the bottom is never clipped on a terminal tall enough
+    // to hold it. Only genuinely short windows fall back to clamping.
+    let desired_height = lines.len() as u16 + 2;
+    let overlay_height = desired_height.min(area.height.saturating_sub(2));
+    let x = (area.width.saturating_sub(overlay_width)) / 2;
+    let y = (area.height.saturating_sub(overlay_height)) / 2;
+    let popup_area = Rect::new(x, y, overlay_width, overlay_height);
+
+    f.render_widget(Clear, popup_area);
 
     let help_block = Block::default()
         .title(Span::styled(
@@ -926,7 +932,10 @@ fn render_session_overlay(f: &mut Frame, app: &App, area: Rect) {
                 Span::styled(format!(" {:<7} ", rep.harness), theme::ratatui_style(DIM)),
                 Span::styled(turn_badge, theme::ratatui_style(DIM)),
                 Span::styled(
-                    truncate_for_width(&rep.id, 12),
+                    // Show a clean id prefix (no ellipsis) so what's on screen
+                    // is a valid, copy-pasteable argument for `/attach`, which
+                    // resolves unique prefixes.
+                    attachable_id_prefix(&rep.id),
                     theme::ratatui_style(PRIMARY),
                 ),
                 Span::styled("  ", theme::ratatui_style(DIM)),
@@ -1126,6 +1135,13 @@ fn cursor_line_col(input: &str, cursor_pos: usize) -> (usize, usize) {
 
 fn input_line_count(input: &str) -> usize {
     input.bytes().filter(|byte| *byte == b'\n').count() + 1
+}
+
+/// The first 8 characters of a session id — long enough to be unique across a
+/// user's session list in practice, short enough to fit the overlay column,
+/// and (unlike an ellipsis-truncated id) a valid prefix `/attach` can resolve.
+fn attachable_id_prefix(id: &str) -> String {
+    id.chars().take(8).collect()
 }
 
 fn truncate_for_width(value: &str, max_width: usize) -> String {
@@ -1700,6 +1716,19 @@ mod tests {
         let wide = truncate_for_width("表表abc", 4);
         assert!(UnicodeWidthStr::width(wide.as_str()) <= 4);
         assert!(wide.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn attachable_id_prefix_is_a_clean_eight_char_prefix() {
+        // A clean prefix (no ellipsis) that is a valid `/attach` argument.
+        assert_eq!(
+            attachable_id_prefix("9099a1b2-3c4d-5e6f-7a8b-9c0d1e2f3a4b"),
+            "9099a1b2"
+        );
+        // Shorter-than-8 ids pass through unchanged.
+        assert_eq!(attachable_id_prefix("abc"), "abc");
+        // No ellipsis is ever appended.
+        assert!(!attachable_id_prefix("9099a1b2-3c4d").contains('\u{2026}'));
     }
 
     #[test]
