@@ -110,17 +110,58 @@ fn print_proc(p: &ProcessInfo, format: &OutputFormat) {
 }
 
 pub fn print_top(snap: &SystemSnapshot, n: usize, format: &OutputFormat) {
+    if matches!(format, OutputFormat::Json) {
+        println!("{}", format_top_json(snap, n));
+        return;
+    }
     println!("── Top {} Processes (by CPU) ────────────────", n);
     for proc in snap.processes.iter().take(n) {
         print_proc(proc, format);
     }
 }
 
-pub fn print_disk_usage(snap: &SystemSnapshot) {
+pub fn print_disk_usage(snap: &SystemSnapshot, format: &OutputFormat) {
+    if matches!(format, OutputFormat::Json) {
+        println!("{}", format_disk_json(snap));
+        return;
+    }
     println!("── Disk Usage ──────────────────────────────");
     for disk in &snap.disks {
         print_disk(disk);
     }
+}
+
+fn format_top_json(snap: &SystemSnapshot, n: usize) -> String {
+    let value = json!({
+        "processes": snap.processes.iter().take(n).map(|p| {
+            let mut process = json!({
+                "pid": p.pid,
+                "name": p.name,
+                "cpu_pct": p.cpu_pct,
+                "memory_mb": p.memory_mb,
+            });
+            // argv is only captured when --verbose requested it.
+            if let Some(argv) = &p.argv {
+                process["argv"] = json!(argv);
+            }
+            process
+        }).collect::<Vec<_>>(),
+    });
+    serde_json::to_string_pretty(&value).expect("process list JSON serialization cannot fail")
+}
+
+fn format_disk_json(snap: &SystemSnapshot) -> String {
+    let value = json!({
+        "disks": snap.disks.iter().map(|d| {
+            json!({
+                "mount": d.mount,
+                "total_gb": d.total_gb,
+                "available_gb": d.available_gb,
+                "used_pct": d.used_pct,
+            })
+        }).collect::<Vec<_>>(),
+    });
+    serde_json::to_string_pretty(&value).expect("disk list JSON serialization cannot fail")
 }
 
 fn format_json(snap: &SystemSnapshot) -> String {
@@ -212,5 +253,61 @@ mod tests {
         assert!(!body.contains('🟢'));
         assert!(!body.contains('🟡'));
         assert!(!body.contains('🔴'));
+    }
+
+    #[test]
+    fn top_json_serializes_processes_with_expected_keys() {
+        let body = format_top_json(&sample_snapshot(), 10);
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+
+        let processes = value["processes"].as_array().expect("processes array");
+        assert_eq!(processes.len(), 1);
+        assert_eq!(processes[0]["pid"], 42);
+        assert_eq!(processes[0]["name"], "proc \"quoted\"\u{7}");
+        assert_eq!(processes[0]["cpu_pct"], 3.5);
+        assert_eq!(processes[0]["memory_mb"], 64);
+        // argv was not captured (non-verbose snapshot), so the key is absent.
+        assert!(processes[0].get("argv").is_none());
+    }
+
+    #[test]
+    fn top_json_respects_process_limit_and_includes_argv_when_captured() {
+        let mut snap = sample_snapshot();
+        snap.processes = vec![
+            ProcessInfo {
+                pid: 1,
+                name: "one".to_string(),
+                cpu_pct: 9.0,
+                memory_mb: 10,
+                argv: Some(vec!["one".to_string(), "--flag".to_string()]),
+            },
+            ProcessInfo {
+                pid: 2,
+                name: "two".to_string(),
+                cpu_pct: 1.0,
+                memory_mb: 5,
+                argv: None,
+            },
+        ];
+
+        let body = format_top_json(&snap, 1);
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+
+        let processes = value["processes"].as_array().expect("processes array");
+        assert_eq!(processes.len(), 1);
+        assert_eq!(processes[0]["argv"], serde_json::json!(["one", "--flag"]));
+    }
+
+    #[test]
+    fn disk_json_serializes_disks_with_expected_keys() {
+        let body = format_disk_json(&sample_snapshot());
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+
+        let disks = value["disks"].as_array().expect("disks array");
+        assert_eq!(disks.len(), 1);
+        assert_eq!(disks[0]["mount"], "/Volumes/name \"quoted\"\u{7}");
+        assert_eq!(disks[0]["total_gb"], 100.0);
+        assert_eq!(disks[0]["available_gb"], 40.0);
+        assert_eq!(disks[0]["used_pct"], 60.0);
     }
 }
