@@ -61,6 +61,22 @@ pub(super) fn run_event_loop(
                         match key.code {
                             KeyCode::Esc | KeyCode::Char('q') => {
                                 app.show_help = false;
+                                app.help_scroll = 0;
+                            }
+                            // Scroll the overlay so the full binding list is
+                            // reachable on short terminals. Over-scroll is
+                            // clamped to the content during render.
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                app.help_scroll = app.help_scroll.saturating_sub(1);
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                app.help_scroll = app.help_scroll.saturating_add(1);
+                            }
+                            KeyCode::PageUp => {
+                                app.help_scroll = app.help_scroll.saturating_sub(10);
+                            }
+                            KeyCode::PageDown => {
+                                app.help_scroll = app.help_scroll.saturating_add(10);
                             }
                             _ => {}
                         }
@@ -108,7 +124,7 @@ pub(super) fn run_event_loop(
                             return Ok(());
                         }
                         KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.show_help = !app.show_help;
+                            app.toggle_help();
                         }
                         // Ctrl+L = clear the visible transcript, the standard
                         // shell/Claude-Code muscle-memory keybind.

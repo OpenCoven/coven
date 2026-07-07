@@ -60,7 +60,7 @@ pub(super) fn render_ui(f: &mut Frame, app: &mut App) {
     }
 
     if app.show_help {
-        render_help_overlay(f, area);
+        render_help_overlay(f, app, area);
     }
 
     if app.input_mode == InputMode::AgentSelect {
@@ -686,19 +686,7 @@ fn hint_bar_spans<'a>(app: &App) -> Vec<Span<'a>> {
     ]
 }
 
-fn render_help_overlay(f: &mut Frame, area: Rect) {
-    let overlay_width = 60u16.min(area.width.saturating_sub(4));
-    // Fits Basics(5) + Agents(2) + System(2) + Sessions(4) + Output(3) +
-    // Keys(6) plus section headers and separators. Clamps to the
-    // terminal so very short windows still render something useful even if
-    // the bottom rows clip.
-    let overlay_height = 34u16.min(area.height.saturating_sub(4));
-    let x = (area.width.saturating_sub(overlay_width)) / 2;
-    let y = (area.height.saturating_sub(overlay_height)) / 2;
-    let popup_area = Rect::new(x, y, overlay_width, overlay_height);
-
-    f.render_widget(Clear, popup_area);
-
+fn render_help_overlay(f: &mut Frame, app: &mut App, area: Rect) {
     let help_items = vec![
         (
             "Basics",
@@ -747,7 +735,7 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
                 ("Tab", "Complete the highlighted slash suggestion"),
                 ("Up / Down", "Browse history or the slash popup"),
                 ("Esc", "Cancel popup, input, or running session"),
-                ("Ctrl+C", "Cancel; press twice within 2s to exit"),
+                ("Ctrl+C", "Clear draft; else cancel, twice to exit"),
                 ("Ctrl+L", "Clear the visible transcript"),
                 ("Ctrl+D", "Exit Coven chat"),
             ],
@@ -771,6 +759,27 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
         lines.push(Line::from(""));
     }
 
+    // Size the overlay to its content so the whole list — including the Keys
+    // section that used to clip — shows on a tall terminal. 72 cols keeps the
+    // widest "cmd  description" row on one line (no wrap), so the logical line
+    // count matches display rows and the scroll math stays exact.
+    let overlay_width = 72u16.min(area.width.saturating_sub(4)).max(1);
+    let content_len = lines.len() as u16;
+    let max_overlay_height = area.height.saturating_sub(2).max(3);
+    let overlay_height = (content_len + 2).min(max_overlay_height);
+    let x = (area.width.saturating_sub(overlay_width)) / 2;
+    let y = (area.height.saturating_sub(overlay_height)) / 2;
+    let popup_area = Rect::new(x, y, overlay_width, overlay_height);
+
+    // When the terminal is too short for the full list, let Up/Down/PageUp/
+    // PageDown scroll it. Clamp the offset to the last page so over-scroll
+    // can't push the content entirely out of view.
+    let inner_height = overlay_height.saturating_sub(2);
+    let max_scroll = content_len.saturating_sub(inner_height);
+    app.help_scroll = app.help_scroll.min(max_scroll);
+
+    f.render_widget(Clear, popup_area);
+
     let help_block = Block::default()
         .title(Span::styled(
             " \u{2731} Coven Commands ",
@@ -783,7 +792,8 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
 
     let help_widget = Paragraph::new(Text::from(lines))
         .block(help_block)
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: false })
+        .scroll((app.help_scroll, 0));
 
     f.render_widget(help_widget, popup_area);
 }
@@ -926,7 +936,7 @@ fn render_session_overlay(f: &mut Frame, app: &App, area: Rect) {
                 Span::styled(format!(" {:<7} ", rep.harness), theme::ratatui_style(DIM)),
                 Span::styled(turn_badge, theme::ratatui_style(DIM)),
                 Span::styled(
-                    truncate_for_width(&rep.id, 12),
+                    session_id_prefix(&rep.id, 12),
                     theme::ratatui_style(PRIMARY),
                 ),
                 Span::styled("  ", theme::ratatui_style(DIM)),
@@ -1126,6 +1136,19 @@ fn cursor_line_col(input: &str, cursor_pos: usize) -> (usize, usize) {
 
 fn input_line_count(input: &str) -> usize {
     input.bytes().filter(|byte| *byte == b'\n').count() + 1
+}
+
+/// Render a session id as a short but still-attachable prefix. Unlike
+/// [`truncate_for_width`], this never appends an ellipsis: what's shown is a
+/// literal id prefix the user can type into `/attach`, which resolves unique
+/// prefixes the same way the CLI session-ref rituals do (#297). Session ids are
+/// ASCII UUIDs, so a `max_chars` character budget equals the display width.
+fn session_id_prefix(id: &str, max_chars: usize) -> String {
+    if id.chars().count() <= max_chars {
+        id.to_string()
+    } else {
+        id.chars().take(max_chars).collect()
+    }
 }
 
 fn truncate_for_width(value: &str, max_width: usize) -> String {
@@ -1700,6 +1723,79 @@ mod tests {
         let wide = truncate_for_width("表表abc", 4);
         assert!(UnicodeWidthStr::width(wide.as_str()) <= 4);
         assert!(wide.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn session_id_prefix_returns_clean_attachable_prefix() {
+        let id = "abcd1234-0000-0000-0000-000000000000";
+        let shown = session_id_prefix(id, 12);
+
+        assert_eq!(shown, "abcd1234-000");
+        // No ellipsis: the shown text is a literal, typeable prefix of the id
+        // (unlike `truncate_for_width`, which appends '…').
+        assert!(!shown.contains('\u{2026}'));
+        assert!(id.starts_with(&shown));
+        // Short ids pass through untouched.
+        assert_eq!(session_id_prefix("short", 12), "short");
+    }
+
+    /// Render the chat with the help overlay open at a given size / scroll and
+    /// return the flattened buffer text.
+    fn help_overlay_plain(width: u16, height: u16, scroll: u16) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let agents = vec![crate::tui::chat::app::AgentInfo {
+            id: "codex".to_string(),
+            label: "codex".to_string(),
+            harness: "codex".to_string(),
+            available: true,
+        }];
+        let mut app = App::new_with_state(
+            agents,
+            Some(0),
+            Box::<crate::tui::chat::client::DaemonChatClient>::default(),
+            None,
+        );
+        app.show_help = true;
+        app.help_scroll = scroll;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+        terminal
+            .draw(|frame| render_ui(frame, &mut app))
+            .expect("render help overlay");
+        buffer_to_plain_text(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn help_overlay_shows_every_key_binding_on_a_tall_terminal() {
+        // A tall terminal sizes the overlay to its content, so nothing in the
+        // Keys section clips — the previous hard-coded height cut it off.
+        let frame = help_overlay_plain(80, 44, 0);
+
+        assert!(frame.contains("Basics"));
+        assert!(frame.contains("Keys"));
+        assert!(
+            frame.contains("Ctrl+D"),
+            "the last Keys binding must be visible: {frame}"
+        );
+        assert!(frame.contains("Complete the highlighted slash suggestion"));
+    }
+
+    #[test]
+    fn help_overlay_scroll_reveals_bindings_clipped_on_a_short_terminal() {
+        // Too short for the full list: the Keys section clips at the top.
+        let top = help_overlay_plain(80, 16, 0);
+        assert!(
+            !top.contains("Ctrl+D"),
+            "Keys section should be below the fold at scroll 0: {top}"
+        );
+
+        // Over-scrolling is clamped to the last page, which brings the tail —
+        // including the final Ctrl+D binding — into view.
+        let bottom = help_overlay_plain(80, 16, u16::MAX);
+        assert!(
+            bottom.contains("Ctrl+D"),
+            "scrolling should reveal the clipped bindings: {bottom}"
+        );
     }
 
     #[test]
