@@ -39,7 +39,7 @@ fn daemon_status_clears_stale_metadata_when_daemon_is_gone() -> anyhow::Result<(
     assert_stdout_contains(
         "daemon status with stale metadata",
         &output,
-        "status=stopped",
+        "Coven daemon: not running",
     );
     assert!(
         !coven_home.join("daemon.json").exists(),
@@ -66,7 +66,7 @@ fn daemon_status_clears_corrupt_metadata_when_daemon_is_gone() -> anyhow::Result
     assert_stdout_contains(
         "daemon status with corrupt metadata",
         &output,
-        "status=stopped",
+        "Coven daemon: not running",
     );
     assert!(
         !coven_home.join("daemon.json").exists(),
@@ -105,7 +105,7 @@ fn daemon_status_recovers_corrupt_metadata_from_live_daemon_health() -> anyhow::
     assert_stdout_contains(
         "daemon status with live corrupt metadata",
         &output,
-        "status=running",
+        "Coven daemon: running",
     );
     let recovered = fs::read_to_string(&status_path)?;
     let recovered: Value = serde_json::from_str(&recovered)?;
@@ -532,8 +532,8 @@ fn doctor_reports_live_daemon_socket_status() -> anyhow::Result<()> {
 
     assert_success("doctor with live daemon", &output);
     assert_stdout_contains("doctor with live daemon", &output, "Daemon:");
-    assert_stdout_contains("doctor with live daemon", &output, "status=running");
-    assert_stdout_contains("doctor with live daemon", &output, "socket=");
+    assert_stdout_contains("doctor with live daemon", &output, "Running (pid ");
+    assert_stdout_contains("doctor with live daemon", &output, ", socket ");
     Ok(())
 }
 
@@ -781,13 +781,13 @@ fn smoke_daemon_session_replay_and_safe_session_rituals() -> anyhow::Result<()> 
 
     let start = run_coven(&coven, &coven_home, &path, &["daemon", "start"])?;
     assert_success("daemon start", &start);
-    assert_stdout_contains("daemon start", &start, "status=running");
+    assert_stdout_contains("daemon start", &start, "Coven daemon: running");
 
     wait_for_daemon_health(&coven_home)?;
 
     let status = run_coven(&coven, &coven_home, &path, &["daemon", "status"])?;
     assert_success("daemon status", &status);
-    assert_stdout_contains("daemon status", &status, "status=running");
+    assert_stdout_contains("daemon status", &status, "Coven daemon: running");
 
     let status_json = run_coven(&coven, &coven_home, &path, &["daemon", "status", "--json"])?;
     assert_success("daemon status --json", &status_json);
@@ -819,7 +819,7 @@ fn smoke_daemon_session_replay_and_safe_session_rituals() -> anyhow::Result<()> 
 
     let restart = run_coven(&coven, &coven_home, &path, &["daemon", "restart"])?;
     assert_success("daemon restart", &restart);
-    assert_stdout_contains("daemon restart", &restart, "status=restarted");
+    assert_stdout_contains("daemon restart", &restart, "Coven daemon: restarted");
     wait_for_daemon_health(&coven_home)?;
 
     let restarted_status = run_coven(&coven, &coven_home, &path, &["daemon", "status"])?;
@@ -827,7 +827,7 @@ fn smoke_daemon_session_replay_and_safe_session_rituals() -> anyhow::Result<()> 
     assert_stdout_contains(
         "daemon restarted status",
         &restarted_status,
-        "status=running",
+        "Coven daemon: running",
     );
 
     let attach = run_coven(&coven, &coven_home, &path, &["attach", &replay_session])?;
@@ -908,11 +908,15 @@ fn smoke_daemon_session_replay_and_safe_session_rituals() -> anyhow::Result<()> 
 
     let stop = run_coven(&coven, &coven_home, &path, &["daemon", "stop"])?;
     assert_success("daemon stop", &stop);
-    assert_stdout_contains("daemon stop", &stop, "status=stopped");
+    assert_stdout_contains("daemon stop", &stop, "Coven daemon: stopped");
 
     let stopped = run_coven(&coven, &coven_home, &path, &["daemon", "status"])?;
     assert_success("daemon stopped status", &stopped);
-    assert_stdout_contains("daemon stopped status", &stopped, "status=stopped");
+    assert_stdout_contains(
+        "daemon stopped status",
+        &stopped,
+        "Coven daemon: not running",
+    );
 
     Ok(())
 }

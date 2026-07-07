@@ -946,20 +946,15 @@ fn run_doctor() -> Result<()> {
     println!("\nDaemon:");
     match daemon::background_server_status(&home)? {
         Some(daemon::DaemonStatusState::Running(status)) => {
-            let health = api::health_response(Some(status.clone()));
-            println!(
-                "  status=running ok={} pid={} socket={}",
-                health.ok, status.pid, status.socket
-            );
+            // `ok` is always true for a live daemon, so the prose "Running"
+            // already conveys it; the `--json` path keeps the field.
+            println!("  Running (pid {}, socket {})", status.pid, status.socket);
         }
         Some(daemon::DaemonStatusState::Stale(status)) => {
             healthy = false;
-            println!(
-                "  status=stale ok=false pid={} socket={}",
-                status.pid, status.socket
-            );
+            println!("  Stale (pid {}, socket {})", status.pid, status.socket);
         }
-        None => println!("  status=stopped"),
+        None => println!("  Not running"),
     }
 
     let repos_config = repos_config::load_with_settings(&home, settings::cached())?;
@@ -1565,7 +1560,7 @@ fn run_daemon_command(command: DaemonCommand) -> Result<()> {
             let status =
                 daemon::ensure_background_server(&home, &current_exe, current_timestamp())?;
             println!(
-                "coven daemon status=running pid={} socket={}",
+                "Coven daemon: running (pid {}, socket {})",
                 status.pid, status.socket
             );
         }
@@ -1576,12 +1571,12 @@ fn run_daemon_command(command: DaemonCommand) -> Result<()> {
                 daemon::restart_background_server(&home, &current_exe, current_timestamp())?;
             if was_running {
                 println!(
-                    "coven daemon status=restarted pid={} socket={}",
+                    "Coven daemon: restarted (pid {}, socket {})",
                     status.pid, status.socket
                 );
             } else {
                 println!(
-                    "coven daemon status=running pid={} socket={}",
+                    "Coven daemon: running (pid {}, socket {})",
                     status.pid, status.socket
                 );
             }
@@ -1593,17 +1588,16 @@ fn run_daemon_command(command: DaemonCommand) -> Result<()> {
             } else {
                 match &state {
                     Some(daemon::DaemonStatusState::Running(status)) => {
-                        let health = api::health_response(Some(status.clone()));
                         println!(
-                            "coven daemon status=running ok={} pid={} socket={}",
-                            health.ok, status.pid, status.socket
+                            "Coven daemon: running (pid {}, socket {})",
+                            status.pid, status.socket
                         );
                     }
                     Some(daemon::DaemonStatusState::Stale(status)) => println!(
-                        "coven daemon status=stale ok=false pid={} socket={}",
+                        "Coven daemon: stale (pid {}, socket {})",
                         status.pid, status.socket
                     ),
-                    None => println!("coven daemon status=stopped"),
+                    None => println!("Coven daemon: not running"),
                 }
             }
             if state.is_none() {
@@ -1615,9 +1609,9 @@ fn run_daemon_command(command: DaemonCommand) -> Result<()> {
         }
         DaemonCommand::Stop => {
             if daemon::stop_background_server(&home)? {
-                println!("coven daemon status=stopped");
+                println!("Coven daemon: stopped");
             } else {
-                println!("coven daemon was not running");
+                println!("Coven daemon: was not running");
             }
         }
         DaemonCommand::Serve { tcp } => {
