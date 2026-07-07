@@ -508,15 +508,26 @@ fn store_path(coven_home: &Path) -> std::path::PathBuf {
 }
 
 fn vacuum_store(coven_home: &Path) -> Result<ApiResponse> {
-    let report = store::vacuum_store_path(&store_path(coven_home))?;
-    json_response(
-        200,
-        &json!({
-            "ok": true,
-            "eventIndexRebuilt": report.event_index_rebuilt,
-            "integrityCheck": report.integrity_check,
-        }),
-    )
+    let store_path = store_path(coven_home);
+    match store::vacuum_store_path(&store_path) {
+        Ok(report) => json_response(
+            200,
+            &json!({
+                "ok": true,
+                "eventIndexRebuilt": report.event_index_rebuilt,
+                "integrityCheck": report.integrity_check,
+            }),
+        ),
+        Err(error) => api_error(
+            500,
+            "store_vacuum_failed",
+            "Failed to vacuum Coven store.",
+            Some(json!({
+                "storePath": store_path.display().to_string(),
+                "error": error.to_string(),
+            })),
+        ),
+    }
 }
 
 fn generate_travel_profile(coven_home: &Path, body: Option<&str>) -> Result<ApiResponse> {
