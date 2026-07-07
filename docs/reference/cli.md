@@ -21,6 +21,7 @@ flowchart TB
   Root --> Summon["summon"]
   Root --> Archive["archive"]
   Root --> Sacrifice["sacrifice"]
+  Root --> Kill["kill"]
   Root --> Patch["patch"]
   Root --> Logs["logs"]
   Root --> Wt["wt"]
@@ -29,7 +30,7 @@ flowchart TB
   Root --> Pc["pc (macOS-first)"]
 
   Daemon --> DStart["start"]
-  Daemon --> DStatus["status"]
+  Daemon --> DStatus["status [--json]"]
   Daemon --> DRestart["restart"]
   Daemon --> DStop["stop"]
 
@@ -46,7 +47,7 @@ flowchart TB
   Logs --> LPrune["prune [--dry-run]"]
 
   Wt --> WtBranch["&lt;branch&gt;"]
-  Wt --> WtList["--list"]
+  Wt --> WtList["--list [--json]"]
   Wt --> WtDoctor["--doctor"]
   Wt --> WtPrune["--prune-merged / --prune-stale DAYS"]
 
@@ -54,13 +55,13 @@ flowchart TB
   Claim --> CRelease["release &lt;branch&gt;"]
   Claim --> CHeartbeat["heartbeat &lt;branch&gt;"]
   Claim --> CCanary["canary &lt;branch&gt;"]
-  Claim --> CStatus["status"]
+  Claim --> CStatus["status [--json]"]
 
   Hooks --> HInstall["install"]
 
   Pc --> PcStatus["status [--json]"]
-  Pc --> PcTop["top --n N"]
-  Pc --> PcDisk["disk"]
+  Pc --> PcTop["top --n N [--json]"]
+  Pc --> PcDisk["disk [--json]"]
   Pc --> PcKill["kill &lt;pid&gt; --confirm"]
   Pc --> PcCache["cache clear --confirm"]
 ```
@@ -71,7 +72,7 @@ flowchart TB
 |---|---|
 | `coven` | Open the beginner-friendly interactive menu. |
 | `coven tui` | Explicitly open the slash-command TUI. |
-| `coven doctor` | Detect supported harness CLIs and print install hints. |
+| `coven doctor` | Check local setup; exits 1 when a blocking problem is found. |
 | `coven daemon start/status/restart/stop` | Manage the local daemon. |
 | `coven run <harness> <prompt>` | Launch a project-scoped harness session. Current harness ids: `codex`, `claude`. |
 | `coven sessions` | Open the session browser; supports `--plain`, `--json`, `--all`, and `--manage`. |
@@ -79,6 +80,7 @@ flowchart TB
 | `coven summon <session-id>` | Restore an archived session, then replay/follow it. |
 | `coven archive <session-id>` | Hide a non-running session while preserving events. |
 | `coven sacrifice <session-id> --yes` | Permanently delete a non-running session. |
+| `coven kill <session-id>` | Kill a running session's process; keeps the event log. |
 | `coven patch openclaw <prompt>` | Local OpenClaw rescue loop. Does not commit or push. |
 | `coven logs prune` | Prune expired encrypted raw artifacts and old redacted event logs. |
 | `coven wt <branch>` | Create or enter a sibling `<repo>.wt/<branch-slug>` git worktree. |
@@ -93,20 +95,24 @@ flowchart TB
 | Command | Flags |
 |---|---|
 | `coven run` | `--cwd <path>`, `--title <text>`, `--detach`, `--model <id>`, `--think`, `--speed fast\|balanced\|thorough` |
+| `coven daemon status` | `--json` |
 | `coven sessions` | `--plain`, `--json`, `--all`, `--manage` |
 | `coven sacrifice` | `--yes` (required) |
 | `coven logs prune` | `--dry-run`, `--raw-days <N>`, `--event-days <N>` |
-| `coven wt` | `--list`, `--doctor`, `--prune-merged`, `--prune-stale <DAYS>` |
+| `coven wt` | `--list`, `--json` (with `--list`), `--doctor`, `--prune-merged`, `--prune-stale <DAYS>` |
+| `coven claim status` | `--json` |
 | `coven pc kill` | `--confirm` (required) |
 | `coven pc cache clear` | `--confirm` (required) |
-| `coven pc top` | `--n <N>`, `--verbose` |
+| `coven pc top` | `--n <N>`, `--verbose`, `--json` |
+| `coven pc disk` | `--json` |
 | `coven pc status` | `--json` |
 
 ## Flag conventions
 
 - **Project-scoped commands** accept `--cwd <path>` for a launch directory inside the project root.
-- **Machine-readable output** is per-command today: `coven sessions` accepts `--plain` and `--json`; `coven sessions search`, `coven adapter list`, and `coven pc status` accept `--json`. Other tabular commands (`wt --list`, `claim status`, `daemon status`, `pc top`, `pc disk`) print human tables only.
-- **Session id arguments** (`attach`, `summon`, `archive`, `sacrifice`) accept a unique prefix of the id.
+- **Machine-readable output** is per-command today: `coven sessions` accepts `--plain` and `--json`; `coven sessions search`, `coven adapter list`, `coven daemon status`, `coven wt --list`, `coven claim status`, `coven pc status`, `coven pc top`, and `coven pc disk` accept `--json`. With `--json`, stdout carries only the JSON document; hints go to stderr.
+- **Timestamps**: `coven claim status` prints RFC 3339 UTC timestamps in the human table; its JSON form keeps the raw epoch seconds (`acquired_at`, `expires_at`) alongside `*_rfc3339` renderings.
+- **Session id arguments** (`attach`, `summon`, `archive`, `sacrifice`, `kill`) accept a unique prefix of the id.
 - **Destructive commands** require `--yes` (or `--confirm` for `coven pc` relief).
 - **Daemon-touching commands** print install/repair hints when the socket is missing.
 

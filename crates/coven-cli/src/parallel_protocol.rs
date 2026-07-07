@@ -5,6 +5,7 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
+use chrono::{DateTime, SecondsFormat};
 const CLAIM_TTL_SECONDS: u64 = 60 * 60;
 const DEFAULT_PRIMARY_BRANCH: &str = "main";
 const MANAGED_HOOK_MARKER: &str = "Coven Parallel Work Protocol managed hook";
@@ -30,9 +31,18 @@ struct Worktree {
     branch: Option<String>,
 }
 
+#[derive(Debug)]
+struct WorktreeRow {
+    branch: Option<String>,
+    dirty: bool,
+    claimed_by: Option<String>,
+    path: PathBuf,
+}
+
 pub(crate) fn run_wt_command(
     branch: Option<&str>,
     list: bool,
+    json: bool,
     doctor: bool,
     prune_merged: bool,
     prune_stale: Option<u64>,
@@ -40,7 +50,7 @@ pub(crate) fn run_wt_command(
     let repo = Repo::discover()?;
     match (branch, list, doctor, prune_merged, prune_stale) {
         (Some(branch), false, false, false, None) => wt_enter_or_create(&repo, branch),
-        (None, true, false, false, None) => wt_list(&repo),
+        (None, true, false, false, None) => wt_list(&repo, json),
         (None, false, true, false, None) => wt_doctor(&repo),
         (None, false, false, true, None) => wt_prune_merged(&repo),
         (None, false, false, false, Some(days)) => wt_prune_stale(&repo, days),
@@ -140,36 +150,78 @@ pub(crate) fn claim_canary(branch: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn claim_status() -> Result<()> {
+pub(crate) fn claim_status(json: bool) -> Result<()> {
     let repo = Repo::discover()?;
     let claims_dir = repo.common_dir.join("agent-claims");
-    if !claims_dir.exists() {
-        println!("No claims.");
+    let now = unix_now();
+    let mut claims = if claims_dir.exists() {
+        fs::read_dir(&claims_dir)?
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| read_claim_file(&entry.path()).ok().flatten())
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    claims.sort_by(|a, b| a.branch.cmp(&b.branch));
+    if json {
+        println!("{}", render_claim_status_json(&claims, now)?);
         return Ok(());
     }
-    let now = unix_now();
-    let mut claims = fs::read_dir(&claims_dir)?
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| read_claim_file(&entry.path()).ok().flatten())
-        .collect::<Vec<_>>();
-    claims.sort_by(|a, b| a.branch.cmp(&b.branch));
     if claims.is_empty() {
         println!("No claims.");
         return Ok(());
     }
     println!("{:<32} {:<20} {:<10} expires", "branch", "agent", "state");
     for claim in claims {
-        let state = if claim.is_active(now) {
-            "active"
-        } else {
-            "expired"
-        };
-        println!(
-            "{:<32} {:<20} {:<10} {}",
-            claim.branch, claim.agent_id, state, claim.expires_at
-        );
+        println!("{}", format_claim_status_row(&claim, now));
     }
     Ok(())
+}
+
+fn format_claim_status_row(claim: &Claim, now: u64) -> String {
+    let state = if claim.is_active(now) {
+        "active"
+    } else {
+        "expired"
+    };
+    format!(
+        "{:<32} {:<20} {:<10} {}",
+        claim.branch,
+        claim.agent_id,
+        state,
+        format_epoch_utc(claim.expires_at)
+    )
+}
+
+fn render_claim_status_json(claims: &[Claim], now: u64) -> Result<String> {
+    let value = serde_json::json!({
+        "claims": claims
+            .iter()
+            .map(|claim| {
+                serde_json::json!({
+                    "branch": claim.branch,
+                    "agent_id": claim.agent_id,
+                    "state": if claim.is_active(now) { "active" } else { "expired" },
+                    "acquired_at": claim.acquired_at,
+                    "acquired_at_rfc3339": format_epoch_utc(claim.acquired_at),
+                    "expires_at": claim.expires_at,
+                    "expires_at_rfc3339": format_epoch_utc(claim.expires_at),
+                    "head": claim.head,
+                })
+            })
+            .collect::<Vec<_>>(),
+    });
+    serde_json::to_string_pretty(&value).context("failed to serialize claims as JSON")
+}
+
+/// Render an epoch-seconds timestamp as RFC 3339 UTC (e.g. `2026-01-01T00:00:00Z`).
+/// Falls back to the raw epoch value if it does not fit a chrono timestamp.
+fn format_epoch_utc(epoch_seconds: u64) -> String {
+    i64::try_from(epoch_seconds)
+        .ok()
+        .and_then(|seconds| DateTime::from_timestamp(seconds, 0))
+        .map(|timestamp| timestamp.to_rfc3339_opts(SecondsFormat::Secs, true))
+        .unwrap_or_else(|| epoch_seconds.to_string())
 }
 
 pub(crate) fn hooks_install() -> Result<()> {
@@ -219,32 +271,56 @@ fn wt_enter_or_create(repo: &Repo, branch: &str) -> Result<()> {
     Ok(())
 }
 
-fn wt_list(repo: &Repo) -> Result<()> {
-    let worktrees = list_worktrees()?;
-    println!("{:<32} {:<8} {:<20} path", "branch", "dirty", "claim");
-    for worktree in worktrees {
-        let branch = worktree.branch.as_deref().unwrap_or("(detached)");
-        let dirty = if worktree_dirty(&worktree.path)? {
-            "dirty"
-        } else {
-            "clean"
-        };
-        let claim = worktree
+fn wt_list(repo: &Repo, json: bool) -> Result<()> {
+    let now = unix_now();
+    let mut rows = Vec::new();
+    for worktree in list_worktrees()? {
+        let dirty = worktree_dirty(&worktree.path)?;
+        let claimed_by = worktree
             .branch
             .as_deref()
             .and_then(|branch| read_claim(repo, branch).ok().flatten())
-            .filter(|claim| claim.is_active(unix_now()))
-            .map(|claim| claim.agent_id)
-            .unwrap_or_else(|| "-".to_string());
+            .filter(|claim| claim.is_active(now))
+            .map(|claim| claim.agent_id);
+        rows.push(WorktreeRow {
+            branch: worktree.branch,
+            dirty,
+            claimed_by,
+            path: worktree.path,
+        });
+    }
+    if json {
+        println!("{}", render_wt_list_json(&rows)?);
+        return Ok(());
+    }
+    println!("{:<32} {:<8} {:<20} path", "branch", "dirty", "claim");
+    for row in rows {
         println!(
             "{:<32} {:<8} {:<20} {}",
-            branch,
-            dirty,
-            claim,
-            worktree.path.display()
+            row.branch.as_deref().unwrap_or("(detached)"),
+            if row.dirty { "dirty" } else { "clean" },
+            row.claimed_by.as_deref().unwrap_or("-"),
+            row.path.display()
         );
     }
     Ok(())
+}
+
+fn render_wt_list_json(rows: &[WorktreeRow]) -> Result<String> {
+    let value = serde_json::json!({
+        "worktrees": rows
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "branch": row.branch,
+                    "dirty": row.dirty,
+                    "claimed_by": row.claimed_by,
+                    "path": row.path.to_string_lossy(),
+                })
+            })
+            .collect::<Vec<_>>(),
+    });
+    serde_json::to_string_pretty(&value).context("failed to serialize worktrees as JSON")
 }
 
 fn wt_doctor(repo: &Repo) -> Result<()> {
@@ -252,24 +328,33 @@ fn wt_doctor(repo: &Repo) -> Result<()> {
     println!("repo: {}", repo.root.display());
     println!("worktree root: {}", worktree_root(repo)?.display());
     println!("claims: {}", repo.common_dir.join("agent-claims").display());
+    let mut hooks_missing = false;
     for hook in ["pre-commit", "pre-push"] {
         let path = repo.common_dir.join("hooks").join(hook);
-        let status = if hook_is_managed(&path)? {
-            "OK"
-        } else {
-            "missing"
-        };
+        let managed = hook_is_managed(&path)?;
+        if !managed {
+            hooks_missing = true;
+        }
+        let status = if managed { "OK" } else { "missing" };
         println!("hook {hook}: {status}");
     }
+    if hooks_missing {
+        println!("install the managed hooks with `coven hooks install`");
+    }
+    let mut layout_ok = true;
     for worktree in list_worktrees()? {
         let expected_root = worktree_root(repo)?;
         if worktree.path != repo.root && !worktree.path.starts_with(&expected_root) {
+            layout_ok = false;
             println!(
                 "layout warning: {} is outside {}",
                 worktree.path.display(),
                 expected_root.display()
             );
         }
+    }
+    if hooks_missing || !layout_ok {
+        crate::exit_checks_failed();
     }
     Ok(())
 }
@@ -712,3 +797,104 @@ if [ "$consume_intent" = "1" ]; then
   rm -f "$intent_file"
 fi
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 2026-01-01T00:00:00Z
+    const NEW_YEAR_2026_EPOCH: u64 = 1_767_225_600;
+
+    fn sample_claim() -> Claim {
+        Claim {
+            branch: "feat/sample".to_string(),
+            agent_id: "agent-a".to_string(),
+            acquired_at: NEW_YEAR_2026_EPOCH,
+            expires_at: NEW_YEAR_2026_EPOCH + 3600,
+            head: Some("abc123".to_string()),
+        }
+    }
+
+    #[test]
+    fn format_epoch_utc_renders_rfc3339() {
+        assert_eq!(
+            format_epoch_utc(NEW_YEAR_2026_EPOCH),
+            "2026-01-01T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn claim_status_row_renders_human_readable_expiry() {
+        let claim = sample_claim();
+        let row = format_claim_status_row(&claim, NEW_YEAR_2026_EPOCH);
+
+        assert!(row.contains("feat/sample"));
+        assert!(row.contains("agent-a"));
+        assert!(row.contains("active"));
+        assert!(row.contains("2026-01-01T01:00:00Z"));
+        assert!(!row.contains(&claim.expires_at.to_string()));
+    }
+
+    #[test]
+    fn claim_status_row_reports_expired_claims() {
+        let claim = sample_claim();
+        let row = format_claim_status_row(&claim, claim.expires_at + 1);
+
+        assert!(row.contains("expired"));
+    }
+
+    #[test]
+    fn claim_status_json_includes_epoch_and_rfc3339_fields() {
+        let claims = vec![sample_claim()];
+        let body = render_claim_status_json(&claims, NEW_YEAR_2026_EPOCH).expect("render");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+
+        let claim = &value["claims"][0];
+        assert_eq!(claim["branch"], "feat/sample");
+        assert_eq!(claim["agent_id"], "agent-a");
+        assert_eq!(claim["state"], "active");
+        assert_eq!(claim["acquired_at"], NEW_YEAR_2026_EPOCH);
+        assert_eq!(claim["acquired_at_rfc3339"], "2026-01-01T00:00:00Z");
+        assert_eq!(claim["expires_at"], NEW_YEAR_2026_EPOCH + 3600);
+        assert_eq!(claim["expires_at_rfc3339"], "2026-01-01T01:00:00Z");
+        assert_eq!(claim["head"], "abc123");
+    }
+
+    #[test]
+    fn claim_status_json_renders_empty_claims_list() {
+        let body = render_claim_status_json(&[], NEW_YEAR_2026_EPOCH).expect("render");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+
+        assert_eq!(value["claims"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn wt_list_json_includes_expected_fields() {
+        let rows = vec![
+            WorktreeRow {
+                branch: Some("feat/sample".to_string()),
+                dirty: true,
+                claimed_by: Some("agent-a".to_string()),
+                path: PathBuf::from("/tmp/repo.wt/feat-sample"),
+            },
+            WorktreeRow {
+                branch: None,
+                dirty: false,
+                claimed_by: None,
+                path: PathBuf::from("/tmp/repo"),
+            },
+        ];
+        let body = render_wt_list_json(&rows).expect("render");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+
+        let worktrees = value["worktrees"].as_array().expect("worktrees array");
+        assert_eq!(worktrees.len(), 2);
+        assert_eq!(worktrees[0]["branch"], "feat/sample");
+        assert_eq!(worktrees[0]["dirty"], true);
+        assert_eq!(worktrees[0]["claimed_by"], "agent-a");
+        assert_eq!(worktrees[0]["path"], "/tmp/repo.wt/feat-sample");
+        assert_eq!(worktrees[1]["branch"], serde_json::Value::Null);
+        assert_eq!(worktrees[1]["dirty"], false);
+        assert_eq!(worktrees[1]["claimed_by"], serde_json::Value::Null);
+    }
+}

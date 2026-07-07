@@ -19,6 +19,9 @@ Rituals are Coven's human-friendly session-management verbs. Ritual names are pr
   <Card title="Sacrifice" href="/rituals/sacrifice" icon="flame">
     Permanently delete a non-running session and its events.
   </Card>
+  <Card title="Kill" href="/reference/cli-kill" icon="octagon-x">
+    Stop a running session's process. Events preserved.
+  </Card>
 </Columns>
 
 ## Why ritual names?
@@ -38,12 +41,14 @@ Plain `delete` would invite muscle-memory mistakes. Plain `hide` would lose the 
 | Archive | yes, refuses live | yes, via summon | no |
 | Summon | n/a | n/a | no |
 | Sacrifice | yes, refuses live | **no** | requires `--yes` |
+| Kill | only acts on live | events preserved | no |
 
-The session browser surfaces every ritual as a labeled action. The CLI exposes them as explicit verbs (`coven archive <id>`, `coven summon <id>`, `coven sacrifice <id> --yes`).
+The session browser surfaces every ritual as a labeled action. The CLI exposes them as explicit verbs (`coven archive <id>`, `coven summon <id>`, `coven sacrifice <id> --yes`, `coven kill <id>`).
 
 ## Related
 
 - [Session lifecycle](/sessions/lifecycle)
+- [CLI: coven kill](/reference/cli-kill)
 - [CLI: coven archive](/reference/cli-archive)
 - [CLI: coven summon](/reference/cli-summon)
 - [CLI: coven sacrifice](/reference/cli-sacrifice)

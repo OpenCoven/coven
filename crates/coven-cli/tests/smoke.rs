@@ -236,6 +236,184 @@ fn daemon_serve_refuses_to_take_over_a_healthy_socket() -> anyhow::Result<()> {
 }
 
 #[test]
+fn daemon_status_json_reports_stopped_daemon_on_pure_stdout() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    fs::create_dir_all(&coven_home)?;
+
+    let output = run_coven(
+        &coven_bin(),
+        &coven_home,
+        &std::env::var_os("PATH").unwrap_or_default(),
+        &["daemon", "status", "--json"],
+    )?;
+
+    assert_success("daemon status --json when stopped", &output);
+    // Parsing the entire stdout proves it carries only the JSON document.
+    let value = parse_stdout_json("daemon status --json when stopped", &output)?;
+    assert_eq!(value.get("status").and_then(Value::as_str), Some("stopped"));
+    assert_eq!(value.get("ok").and_then(Value::as_bool), Some(false));
+    assert!(value.get("pid").is_some_and(Value::is_null));
+    assert!(value.get("socket").is_some_and(Value::is_null));
+    assert!(value.get("started_at").is_some_and(Value::is_null));
+    // The human hint stays on stderr so stdout remains parseable.
+    assert_stderr_contains(
+        "daemon status --json when stopped",
+        &output,
+        "coven daemon start",
+    );
+    Ok(())
+}
+
+#[test]
+fn wt_list_and_claim_status_emit_machine_readable_json() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    fs::create_dir_all(&coven_home)?;
+    let repo = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo)?;
+    init_git_repo(&repo)?;
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let coven = coven_bin();
+    let agent_env = [("COVEN_AGENT_ID", "smoke-agent")];
+
+    let acquire = run_coven_in(
+        &coven,
+        &coven_home,
+        &path,
+        &repo,
+        &agent_env,
+        &["claim", "acquire", "smoke-branch"],
+    )?;
+    assert_success("claim acquire", &acquire);
+
+    let status_json = run_coven_in(
+        &coven,
+        &coven_home,
+        &path,
+        &repo,
+        &agent_env,
+        &["claim", "status", "--json"],
+    )?;
+    assert_success("claim status --json", &status_json);
+    let value = parse_stdout_json("claim status --json", &status_json)?;
+    let claims = value
+        .get("claims")
+        .and_then(Value::as_array)
+        .expect("claim status JSON should include a claims array");
+    assert_eq!(claims.len(), 1);
+    let claim = &claims[0];
+    assert_eq!(
+        claim.get("branch").and_then(Value::as_str),
+        Some("smoke-branch")
+    );
+    assert_eq!(
+        claim.get("agent_id").and_then(Value::as_str),
+        Some("smoke-agent")
+    );
+    assert_eq!(claim.get("state").and_then(Value::as_str), Some("active"));
+    assert!(
+        claim.get("acquired_at").and_then(Value::as_u64).is_some(),
+        "claims JSON should keep the raw epoch value"
+    );
+    assert!(claim.get("expires_at").and_then(Value::as_u64).is_some());
+    let expires_rfc3339 = claim
+        .get("expires_at_rfc3339")
+        .and_then(Value::as_str)
+        .expect("claims JSON should include an RFC 3339 expiry")
+        .to_string();
+    assert!(
+        expires_rfc3339.contains('T') && expires_rfc3339.ends_with('Z'),
+        "expected RFC 3339 UTC expiry, got {expires_rfc3339:?}"
+    );
+
+    // The human table renders the same expiry as a readable timestamp, not
+    // raw epoch seconds.
+    let status_human = run_coven_in(
+        &coven,
+        &coven_home,
+        &path,
+        &repo,
+        &agent_env,
+        &["claim", "status"],
+    )?;
+    assert_success("claim status", &status_human);
+    assert_stdout_contains("claim status", &status_human, &expires_rfc3339);
+    let raw_epoch = claim
+        .get("expires_at")
+        .and_then(Value::as_u64)
+        .expect("expires_at epoch")
+        .to_string();
+    assert_stdout_not_contains("claim status", &status_human, &raw_epoch);
+
+    let wt_json = run_coven_in(
+        &coven,
+        &coven_home,
+        &path,
+        &repo,
+        &agent_env,
+        &["wt", "--list", "--json"],
+    )?;
+    assert_success("wt --list --json", &wt_json);
+    let value = parse_stdout_json("wt --list --json", &wt_json)?;
+    let worktrees = value
+        .get("worktrees")
+        .and_then(Value::as_array)
+        .expect("wt --list JSON should include a worktrees array");
+    assert!(!worktrees.is_empty(), "primary worktree should be listed");
+    let worktree = &worktrees[0];
+    assert!(worktree.get("branch").and_then(Value::as_str).is_some());
+    assert!(worktree.get("dirty").and_then(Value::as_bool).is_some());
+    assert!(worktree.get("claimed_by").is_some());
+    assert!(worktree.get("path").and_then(Value::as_str).is_some());
+    Ok(())
+}
+
+#[test]
+fn pc_top_and_disk_emit_machine_readable_json() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    fs::create_dir_all(&coven_home)?;
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let coven = coven_bin();
+
+    let top = run_coven(
+        &coven,
+        &coven_home,
+        &path,
+        &["pc", "top", "--n", "3", "--json"],
+    )?;
+    assert_success("pc top --json", &top);
+    let value = parse_stdout_json("pc top --json", &top)?;
+    let processes = value
+        .get("processes")
+        .and_then(Value::as_array)
+        .expect("pc top JSON should include a processes array");
+    assert!(processes.len() <= 3, "--n should cap the process list");
+    if let Some(process) = processes.first() {
+        assert!(process.get("pid").and_then(Value::as_u64).is_some());
+        assert!(process.get("name").and_then(Value::as_str).is_some());
+        assert!(process.get("cpu_pct").and_then(Value::as_f64).is_some());
+        assert!(process.get("memory_mb").and_then(Value::as_u64).is_some());
+    }
+
+    let disk = run_coven(&coven, &coven_home, &path, &["pc", "disk", "--json"])?;
+    assert_success("pc disk --json", &disk);
+    let value = parse_stdout_json("pc disk --json", &disk)?;
+    let disks = value
+        .get("disks")
+        .and_then(Value::as_array)
+        .expect("pc disk JSON should include a disks array");
+    if let Some(disk) = disks.first() {
+        assert!(disk.get("mount").and_then(Value::as_str).is_some());
+        assert!(disk.get("total_gb").and_then(Value::as_f64).is_some());
+        assert!(disk.get("available_gb").and_then(Value::as_f64).is_some());
+        assert!(disk.get("used_pct").and_then(Value::as_f64).is_some());
+    }
+    Ok(())
+}
+
+#[test]
 fn doctor_lists_configured_familiars() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let coven_home = temp_dir.path().join("coven-home");
@@ -250,7 +428,11 @@ role = "Voice, Social, and Presence Familiar"
 description = "Keeps the coven sociable."
 "#,
     )?;
-    let path = std::env::var_os("PATH").unwrap_or_default();
+    let fake_bin = temp_dir.path().join("bin");
+    fs::create_dir_all(&fake_bin)?;
+    write_fake_codex(&fake_bin)?;
+    write_fake_coven_code(&fake_bin)?;
+    let path = prepend_path(&fake_bin);
     let coven = coven_bin();
 
     let output = run_coven(&coven, &coven_home, &path, &["doctor"])?;
@@ -271,7 +453,11 @@ fn doctor_reports_no_familiars_when_manifest_absent() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let coven_home = temp_dir.path().join("coven-home");
     fs::create_dir_all(&coven_home)?;
-    let path = std::env::var_os("PATH").unwrap_or_default();
+    let fake_bin = temp_dir.path().join("bin");
+    fs::create_dir_all(&fake_bin)?;
+    write_fake_codex(&fake_bin)?;
+    write_fake_coven_code(&fake_bin)?;
+    let path = prepend_path(&fake_bin);
     let coven = coven_bin();
 
     let output = run_coven(&coven, &coven_home, &path, &["doctor"])?;
@@ -292,7 +478,14 @@ fn doctor_missing_harness_prints_cross_platform_setup_loop() -> anyhow::Result<(
 
     let output = run_coven(&coven, &coven_home, &empty_path, &["doctor"])?;
 
-    assert_success("doctor without harnesses", &output);
+    // No harness available is a blocking problem: doctor must exit 1 so
+    // scripts can gate on it, while still printing the full setup loop.
+    assert_failure("doctor without harnesses", &output);
+    assert_stdout_contains(
+        "doctor without harnesses",
+        &output,
+        "Doctor found problems; review the failing checks above.",
+    );
     assert_stdout_contains("doctor without harnesses", &output, "Harnesses:");
     assert_stdout_contains("doctor without harnesses", &output, "`codex` is missing");
     assert_stdout_contains("doctor without harnesses", &output, "`claude` is missing");
@@ -319,7 +512,11 @@ fn doctor_missing_harness_prints_cross_platform_setup_loop() -> anyhow::Result<(
 fn doctor_reports_live_daemon_socket_status() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let coven_home = temp_dir.path().join("coven-home");
-    let path = std::env::var_os("PATH").unwrap_or_default();
+    let fake_bin = temp_dir.path().join("bin");
+    fs::create_dir_all(&fake_bin)?;
+    write_fake_codex(&fake_bin)?;
+    write_fake_coven_code(&fake_bin)?;
+    let path = prepend_path(&fake_bin);
     let coven = coven_bin();
     let _daemon_guard = DaemonGuard {
         coven: coven.clone(),
@@ -364,9 +561,16 @@ fn adapter_install_hermes_writes_trusted_manifest() -> anyhow::Result<()> {
 
     let doctor = run_coven(&coven, &coven_home, &path, &["adapter", "doctor", "hermes"])?;
 
-    assert_success("adapter doctor hermes", &doctor);
+    // The hermes executable is not installed, so adapter doctor reports it
+    // and exits 1 (the diagnosis output still renders in full).
+    assert_failure("adapter doctor hermes", &doctor);
     assert_stdout_contains("adapter doctor hermes", &doctor, "Hermes Agent");
     assert_stdout_contains("adapter doctor hermes", &doctor, "manifest:");
+    assert_stdout_contains(
+        "adapter doctor hermes",
+        &doctor,
+        "Adapter doctor found unavailable adapters",
+    );
     Ok(())
 }
 
@@ -480,6 +684,20 @@ fn smoke_daemon_session_replay_and_safe_session_rituals() -> anyhow::Result<()> 
     assert_success("daemon status", &status);
     assert_stdout_contains("daemon status", &status, "status=running");
 
+    let status_json = run_coven(&coven, &coven_home, &path, &["daemon", "status", "--json"])?;
+    assert_success("daemon status --json", &status_json);
+    let status_value = parse_stdout_json("daemon status --json", &status_json)?;
+    assert_eq!(
+        status_value.get("status").and_then(Value::as_str),
+        Some("running")
+    );
+    assert!(status_value.get("pid").and_then(Value::as_u64).is_some());
+    assert!(status_value.get("socket").and_then(Value::as_str).is_some());
+    assert!(status_value
+        .get("started_at")
+        .and_then(Value::as_str)
+        .is_some());
+
     let replay_session = launch_daemon_session(
         &coven_home,
         &project_root,
@@ -529,14 +747,15 @@ fn smoke_daemon_session_replay_and_safe_session_rituals() -> anyhow::Result<()> 
     )?;
     wait_for_event_text(&coven_home, &kill_session, "fake codex ready for kill")?;
 
-    let (kill_status, kill_body) = unix_http_request(
-        &coven_home,
-        "POST",
-        &format!("/sessions/{kill_session}/kill"),
-        None,
-    )?;
-    assert_eq!(kill_status, 202, "unexpected kill response: {kill_body}");
+    let kill = run_coven(&coven, &coven_home, &path, &["kill", &kill_session])?;
+    assert_success("kill", &kill);
+    assert_stdout_contains("kill", &kill, "killed session");
     wait_for_session_status(&coven_home, &kill_session, "killed")?;
+
+    // A second kill must refuse: the session is no longer running.
+    let rekill = run_coven(&coven, &coven_home, &path, &["kill", &kill_session])?;
+    assert_failure("rekill refused", &rekill);
+    assert_stderr_contains("rekill refused", &rekill, "is not running");
 
     let archive = run_coven(&coven, &coven_home, &path, &["archive", &kill_session])?;
     assert_success("archive", &archive);
@@ -639,6 +858,66 @@ fn run_coven(
         .map_err(Into::into)
 }
 
+/// Like `run_coven`, but runs from `cwd` with extra env vars — for commands
+/// that discover a git repository from the working directory.
+fn run_coven_in(
+    coven: &Path,
+    coven_home: &Path,
+    path: &OsString,
+    cwd: &Path,
+    envs: &[(&str, &str)],
+    args: &[&str],
+) -> anyhow::Result<Output> {
+    let mut command = Command::new(coven);
+    command
+        .args(args)
+        .env("COVEN_HOME", coven_home)
+        .env("PATH", path)
+        .current_dir(cwd);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    command.output().map_err(Into::into)
+}
+
+/// Parse a command's entire stdout as one JSON document. Fails when anything
+/// besides the JSON document landed on stdout.
+fn parse_stdout_json(label: &str, output: &Output) -> anyhow::Result<Value> {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(stdout.trim()).map_err(|error| {
+        anyhow::anyhow!(
+            "{label} stdout was not a single JSON document: {error}\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
+}
+
+fn init_git_repo(repo: &Path) -> anyhow::Result<()> {
+    let git = |args: &[&str]| -> anyhow::Result<()> {
+        let output = Command::new("git").args(args).current_dir(repo).output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "git {args:?} failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    };
+    git(&["init", "--initial-branch=main"])?;
+    git(&[
+        "-c",
+        "user.name=Coven Smoke",
+        "-c",
+        "user.email=smoke@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "init",
+    ])?;
+    Ok(())
+}
+
 fn assert_success(label: &str, output: &Output) {
     assert!(
         output.status.success(),
@@ -646,6 +925,24 @@ fn assert_success(label: &str, output: &Output) {
         output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn assert_failure(label: &str, output: &Output) {
+    assert!(
+        !output.status.success(),
+        "{label} unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn assert_stderr_contains(label: &str, output: &Output, needle: &str) {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(needle),
+        "{label} stderr did not contain {needle:?}\nstdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&output.stdout)
     );
 }
 
@@ -680,6 +977,9 @@ fn write_fake_codex(fake_bin: &Path) -> anyhow::Result<()> {
     fs::write(
         &codex,
         r#"#!/bin/sh
+# Consume the options terminator like the real CLI: coven passes prompts
+# behind `--` so dash-prefixed prompts stay positional.
+if [ "$1" = "--" ]; then shift; fi
 if [ "$*" = "hold-for-kill" ]; then
   printf 'fake codex ready for kill\n'
   exec sleep 300
@@ -690,6 +990,17 @@ printf 'fake codex complete: %s\n' "$*"
     let mut permissions = fs::metadata(&codex)?.permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&codex, permissions)?;
+    Ok(())
+}
+
+/// Doctor exits 1 when coven-code is missing, so doctor tests that expect a
+/// healthy environment plant a fake alongside the fake harness.
+fn write_fake_coven_code(fake_bin: &Path) -> anyhow::Result<()> {
+    let coven_code = fake_bin.join("coven-code");
+    fs::write(&coven_code, "#!/bin/sh\nexit 0\n")?;
+    let mut permissions = fs::metadata(&coven_code)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&coven_code, permissions)?;
     Ok(())
 }
 

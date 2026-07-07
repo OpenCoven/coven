@@ -93,6 +93,19 @@ coven daemon start
 
 ## Exit behavior
 
-`coven doctor` should exit successfully when it can inspect the environment,
-even if it reports missing harnesses or a stopped daemon. Treat the printed
-status as the diagnostic result.
+`coven doctor` exits `0` when the environment can run Coven end to end, so
+scripts can gate on it (`coven doctor && …`). It exits `1` when it finds a
+blocking problem:
+
+- no supported harness is available on `PATH`
+- the daemon is stale (`running` and `stopped` are both healthy states)
+- a registered repo entry points at a missing or non-git path
+- `coven-code` is missing
+
+A missing harness prints a `[!!]` line with an install hint but does not fail
+the check while another harness is available — one working harness makes Coven
+usable.
+
+`coven adapter doctor` is stricter about its own subject: it exits `1` if any
+listed adapter is unavailable. `coven wt --doctor` exits `1` when managed hooks
+are missing or a worktree sits outside the protocol layout.

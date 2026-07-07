@@ -21,6 +21,7 @@ pub enum Event {
     User(UserMessage),
     Assistant(AssistantMessage),
     ToolResult(ToolResult),
+    Output(HarnessOutput),
     Result(RunResult),
 }
 
@@ -90,6 +91,21 @@ pub struct ToolResult {
     pub tool_use_id: String,
     pub content: Vec<ContentBlock>,
     pub is_error: bool,
+    pub session_id: String,
+}
+
+/// Raw output captured from a harness that has no native stream-json
+/// protocol (codex, external adapters). In `--stream-json` mode those
+/// harnesses run on a PTY; every captured chunk is wrapped in one `output`
+/// frame so stdout stays JSONL-only instead of interleaving raw PTY bytes
+/// with the stream (#307). `text` is the raw PTY text: it may contain ANSI
+/// escape sequences, carriage returns, and partial lines, and chunk
+/// boundaries follow PTY reads rather than line breaks. Each chunk is
+/// guaranteed valid UTF-8 (codepoints split across reads are reassembled
+/// before wrapping).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HarnessOutput {
+    pub text: String,
     pub session_id: String,
 }
 
@@ -259,6 +275,35 @@ mod tests {
         });
         let mut buf = Vec::new();
         emit_event(&mut buf, &event).unwrap();
+        let mut reader = Cursor::new(buf);
+        let decoded = read_event(&mut reader).unwrap().unwrap();
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn output_event_wire_shape_and_round_trip() {
+        // Raw PTY text keeps ANSI escapes / carriage returns / partial JSON
+        // verbatim inside the JSON string; the frame itself stays one valid
+        // JSONL line (#307).
+        let event = Event::Output(HarnessOutput {
+            text: "\u{1b}[1;32mbanner\u{1b}[0m\r\n{\"not\":\"terminated".into(),
+            session_id: "s1".into(),
+        });
+        let mut buf = Vec::new();
+        emit_event(&mut buf, &event).unwrap();
+        let line = String::from_utf8(buf.clone()).unwrap();
+        assert_eq!(
+            line.matches('\n').count(),
+            1,
+            "one frame must serialize to exactly one line: {line:?}"
+        );
+        let v: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(v["type"], "output");
+        assert_eq!(
+            v["text"],
+            "\u{1b}[1;32mbanner\u{1b}[0m\r\n{\"not\":\"terminated"
+        );
+        assert_eq!(v["session_id"], "s1");
         let mut reader = Cursor::new(buf);
         let decoded = read_event(&mut reader).unwrap().unwrap();
         assert_eq!(decoded, event);
