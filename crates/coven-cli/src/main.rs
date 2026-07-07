@@ -922,19 +922,27 @@ fn run_doctor() -> Result<()> {
     match daemon::background_server_status(&home)? {
         Some(daemon::DaemonStatusState::Running(status)) => {
             let health = api::health_response(Some(status.clone()));
-            println!(
-                "  status=running ok={} pid={} socket={}",
-                health.ok, status.pid, status.socket
-            );
+            if health.ok {
+                println!(
+                    "  [OK] running — pid {}, socket {}",
+                    status.pid, status.socket
+                );
+            } else {
+                println!(
+                    "  [!!] running but failing health checks — pid {}, socket {}",
+                    status.pid, status.socket
+                );
+            }
         }
         Some(daemon::DaemonStatusState::Stale(status)) => {
             healthy = false;
             println!(
-                "  status=stale ok=false pid={} socket={}",
+                "  [!!] stale — pid {} no longer looks healthy (socket {})",
                 status.pid, status.socket
             );
+            println!("       Recover with `coven daemon restart`.");
         }
-        None => println!("  status=stopped"),
+        None => println!("  [OK] stopped — optional; start with `coven daemon start`"),
     }
 
     let repos_config = repos_config::load_with_settings(&home, settings::cached())?;
@@ -1263,12 +1271,12 @@ fn run_patch(
     if request.git_state.is_dirty() && !request.non_interactive {
         println!("\nExisting changes were detected. Coven will not stash or overwrite them.");
         if !confirm_yes("Continue and ask the harness to preserve existing changes? [y/N] ")? {
-            anyhow::bail!("cancelled before harness launch");
+            exit_patch_cancelled();
         }
     }
 
     if !request.non_interactive && !confirm_yes("Launch the harness now? [y/N] ")? {
-        anyhow::bail!("cancelled before harness launch");
+        exit_patch_cancelled();
     }
 
     let session_id = launch_patch_session(&request)?;
@@ -1386,6 +1394,15 @@ fn confirm_yes(prompt: &str) -> Result<bool> {
     Ok(matches!(line.trim(), "y" | "Y" | "yes" | "YES" | "Yes"))
 }
 
+/// The user declined a `coven patch` confirmation prompt. That's a neutral
+/// outcome, not a failure — report it in "cancelled" voice instead of the
+/// `Error:` prefix an `anyhow::bail!` would earn, but keep the exit code
+/// nonzero so scripts chaining on `patch` still see it didn't run.
+fn exit_patch_cancelled() -> ! {
+    println!("Cancelled. Nothing was launched.");
+    std::process::exit(1);
+}
+
 fn choose_default_harness() -> Result<patch::HarnessId> {
     let harnesses = harness::built_in_harnesses();
     if harnesses.iter().any(|h| h.id == "codex" && h.available) {
@@ -1500,7 +1517,9 @@ fn prune_logs_command(dry_run: bool, raw_days: Option<u64>, event_days: Option<u
 
     if dry_run {
         println!(
-            "logs prune dryRun=true rawArtifacts={raw_count} events={event_count} rawDays={raw_days} eventDays={event_days}"
+            "Dry run: would prune {} and {} (raw artifacts kept {raw_days} days, events kept {event_days} days). Nothing was deleted.",
+            count_noun(u64::try_from(raw_count).unwrap_or_default(), "raw artifact"),
+            count_noun(u64::try_from(event_count).unwrap_or_default(), "event"),
         );
         return Ok(());
     }
@@ -1508,9 +1527,24 @@ fn prune_logs_command(dry_run: bool, raw_days: Option<u64>, event_days: Option<u
     let raw_pruned = store::prune_sensitive_artifacts(&conn, &now, &raw_cutoff)?;
     let events_pruned = store::prune_events_older_than(&conn, &event_cutoff)?;
     println!(
-        "logs pruned rawArtifacts={raw_pruned} events={events_pruned} rawCutoff={raw_cutoff} eventCutoff={event_cutoff}"
+        "Pruned {} (older than {raw_cutoff}) and {} (older than {event_cutoff}).",
+        count_noun(
+            u64::try_from(raw_pruned).unwrap_or_default(),
+            "raw artifact"
+        ),
+        count_noun(u64::try_from(events_pruned).unwrap_or_default(), "event"),
     );
     Ok(())
+}
+
+/// `3 events`, `1 raw artifact` — count + noun with naive pluralization,
+/// for human status lines.
+fn count_noun(count: u64, noun: &str) -> String {
+    if count == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
 }
 
 fn run_executor_command(command: ExecutorCommand) -> Result<()> {
@@ -2661,6 +2695,13 @@ mod tests {
         )];
         let browser_frame = tui::sessions::render_browser_frame_plain_for_test(&sessions, 0, 0);
         assert!(browser_frame.contains("Session browser"));
+    }
+
+    #[test]
+    fn count_noun_pluralizes_for_human_status_lines() {
+        assert_eq!(count_noun(0, "event"), "0 events");
+        assert_eq!(count_noun(1, "raw artifact"), "1 raw artifact");
+        assert_eq!(count_noun(3, "event"), "3 events");
     }
 
     #[test]

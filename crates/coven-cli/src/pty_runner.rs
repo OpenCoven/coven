@@ -633,6 +633,16 @@ fn run_attached_with_pty_system(
 
     drop(pair.slave);
 
+    // When stdin is a pipe rather than a terminal, nobody is typing at the
+    // PTY — but the PTY line discipline still starts in canonical echo
+    // mode, so every byte we forward gets echoed back into the harness
+    // output. That includes the trailing newline + EOT that portable-pty
+    // writes when the master writer drops, which surfaced as a stray `^D`
+    // artifact on piped `coven run`. Turn echo off for the piped case.
+    if !io::stdin().is_terminal() {
+        disable_pty_echo(pair.master.as_ref());
+    }
+
     let mut reader = pair
         .master
         .try_clone_reader()
@@ -669,6 +679,28 @@ fn run_attached_with_pty_system(
         exit_code: Some(exit_code),
     })
 }
+
+/// Clear the ECHO flag on the PTY's line discipline. Best-effort: if the
+/// termios calls fail (or the platform can't expose the master fd) the run
+/// proceeds with echo on, which is the old behavior.
+#[cfg(unix)]
+fn disable_pty_echo(master: &dyn portable_pty::MasterPty) {
+    let Some(fd) = master.as_raw_fd() else {
+        return;
+    };
+    unsafe {
+        let mut termios = std::mem::MaybeUninit::<libc::termios>::zeroed().assume_init();
+        if libc::tcgetattr(fd, &mut termios) == 0 {
+            termios.c_lflag &= !libc::ECHO;
+            let _ = libc::tcsetattr(fd, libc::TCSANOW, &termios);
+        }
+    }
+}
+
+/// ConPTY has no termios-style echo to clear; the `^D` artifact is a Unix
+/// line-discipline behavior, so this is a no-op on Windows.
+#[cfg(not(unix))]
+fn disable_pty_echo(_master: &dyn portable_pty::MasterPty) {}
 
 struct RawModeGuard {
     enabled: bool,
@@ -743,6 +775,61 @@ mod tests {
         session.input.write_all(b"hello detached pty\n")?;
         session.input.flush()?;
         session.killer.kill()?;
+        Ok(())
+    }
+
+    /// Regression test for the `^D` artifact on piped `coven run`: with PTY
+    /// echo disabled, neither the forwarded input nor the newline + EOT that
+    /// portable-pty writes on master-writer drop may leak back into the
+    /// harness output stream.
+    #[cfg(unix)]
+    #[test]
+    fn disable_pty_echo_suppresses_input_and_eot_echo() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let pty_system = native_pty_system();
+        let pair = pty_system.openpty(terminal_size())?;
+        let mut builder = CommandBuilder::new("cat");
+        builder.cwd(temp_dir.path().as_os_str());
+        let mut child = pair.slave.spawn_command(builder)?;
+        drop(pair.slave);
+
+        disable_pty_echo(pair.master.as_ref());
+
+        let mut reader = pair.master.try_clone_reader()?;
+        let output_thread = thread::spawn(move || {
+            let mut output = Vec::new();
+            let _ = reader.read_to_end(&mut output);
+            output
+        });
+
+        let mut writer = pair.master.take_writer()?;
+        writer.write_all(b"hi from a pipe\n")?;
+        writer.flush()?;
+        // Dropping the writer makes portable-pty send `\n` + VEOF, which
+        // tells `cat` to exit — and is exactly the byte pair that used to
+        // be echoed back as a stray `^D`.
+        drop(writer);
+
+        let _ = child.wait()?;
+        drop(pair.master);
+        let output = output_thread
+            .join()
+            .unwrap_or_else(|_| panic!("PTY reader thread panicked"));
+        let output = String::from_utf8_lossy(&output);
+
+        assert!(
+            output.contains("hi from a pipe"),
+            "cat's own stdout must still come through, got: {output:?}"
+        );
+        assert!(
+            !output.contains('\u{4}'),
+            "raw EOT byte leaked into PTY output: {output:?}"
+        );
+        assert_eq!(
+            output.matches("hi from a pipe").count(),
+            1,
+            "input must not be echoed a second time by the PTY: {output:?}"
+        );
         Ok(())
     }
 

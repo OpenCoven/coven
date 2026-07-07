@@ -532,8 +532,8 @@ fn doctor_reports_live_daemon_socket_status() -> anyhow::Result<()> {
 
     assert_success("doctor with live daemon", &output);
     assert_stdout_contains("doctor with live daemon", &output, "Daemon:");
-    assert_stdout_contains("doctor with live daemon", &output, "status=running");
-    assert_stdout_contains("doctor with live daemon", &output, "socket=");
+    assert_stdout_contains("doctor with live daemon", &output, "[OK] running — pid ");
+    assert_stdout_contains("doctor with live daemon", &output, ", socket ");
     Ok(())
 }
 
