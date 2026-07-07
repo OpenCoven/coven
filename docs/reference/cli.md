@@ -28,6 +28,7 @@ flowchart TB
   Root --> Claim["claim"]
   Root --> Hooks["hooks"]
   Root --> Pc["pc (macOS-first)"]
+  Root --> Completions["completions"]
 
   Daemon --> DStart["start"]
   Daemon --> DStatus["status [--json]"]
@@ -89,6 +90,7 @@ flowchart TB
 | `coven claim status` | Print branch claims from the current repository. |
 | `coven hooks install` | Install local protocol hooks that block unsafe commits and protected pushes. |
 | `coven pc` | macOS-first diagnostics and explicit `--confirm` relief operations. |
+| `coven completions <shell>` | Print shell completions for bash, zsh, fish, elvish, or powershell. |
 
 ## Common flags by command
 
@@ -106,6 +108,27 @@ flowchart TB
 | `coven pc top` | `--n <N>`, `--verbose`, `--json` |
 | `coven pc disk` | `--json` |
 | `coven pc status` | `--json` |
+
+## Global flags
+
+- **`--color <auto|always|never>`** controls ANSI color on every command. `auto` (the default) honors the environment: `NO_COLOR` disables color, `CLICOLOR_FORCE` forces it on even through a pipe, and otherwise color is emitted only to a TTY with a color-capable `TERM`. `--color=always` overrides all of that (useful when piping into a pager like `less -R`); `--color=never` forces plain text (useful for deterministic CI logs). The flag outranks the environment variables when both are set.
+
+## Shell completions
+
+Generate completions for your shell and source them:
+
+```sh
+# zsh (add to a directory on $fpath, e.g. ~/.zfunc)
+coven completions zsh > ~/.zfunc/_coven
+
+# bash
+coven completions bash > ~/.local/share/bash-completion/completions/coven
+
+# fish
+coven completions fish > ~/.config/fish/completions/coven.fish
+```
+
+Supported shells: `bash`, `zsh`, `fish`, `elvish`, `powershell`.
 
 ## Flag conventions
 

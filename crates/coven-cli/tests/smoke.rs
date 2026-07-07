@@ -538,6 +538,65 @@ fn doctor_reports_live_daemon_socket_status() -> anyhow::Result<()> {
 }
 
 #[test]
+fn completions_generate_for_supported_shells() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    fs::create_dir_all(&coven_home)?;
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let coven = coven_bin();
+
+    let zsh = run_coven(&coven, &coven_home, &path, &["completions", "zsh"])?;
+    assert_success("completions zsh", &zsh);
+    assert_stdout_contains("completions zsh", &zsh, "#compdef coven");
+
+    let bash = run_coven(&coven, &coven_home, &path, &["completions", "bash"])?;
+    assert_success("completions bash", &bash);
+    assert_stdout_contains("completions bash", &bash, "complete");
+
+    let bogus = run_coven(&coven, &coven_home, &path, &["completions", "tcsh"])?;
+    assert_failure("completions tcsh", &bogus);
+    Ok(())
+}
+
+#[test]
+fn color_flag_parses_and_rejects_unknown_values() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    fs::create_dir_all(&coven_home)?;
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let coven = coven_bin();
+
+    // Global flag composes with subcommands without disturbing them.
+    let sessions = run_coven(
+        &coven,
+        &coven_home,
+        &path,
+        &["sessions", "--color", "never", "--plain"],
+    )?;
+    assert_success("sessions --color never", &sessions);
+
+    // Root-level placement parses as the declared flag, not as a prompt —
+    // the front-door catch-all must not swallow it.
+    let root = run_coven(
+        &coven,
+        &coven_home,
+        &path,
+        &["--color", "never", "sessions", "--plain"],
+    )?;
+    assert_success("--color before subcommand", &root);
+
+    let bogus = run_coven(
+        &coven,
+        &coven_home,
+        &path,
+        &["sessions", "--color", "sometimes"],
+    )?;
+    assert_failure("--color rejects unknown value", &bogus);
+    assert_stderr_contains("--color rejects unknown value", &bogus, "sometimes");
+    Ok(())
+}
+
+#[test]
 fn adapter_install_hermes_writes_trusted_manifest() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let coven_home = temp_dir.path().join("coven-home");
@@ -559,10 +618,16 @@ fn adapter_install_hermes_writes_trusted_manifest() -> anyhow::Result<()> {
     );
     assert!(coven_home.join("adapters").join("hermes.json").exists());
 
-    let doctor = run_coven(&coven, &coven_home, &path, &["adapter", "doctor", "hermes"])?;
+    // Diagnose against an empty PATH so the outcome doesn't depend on
+    // whether a real `hermes` happens to be installed on this machine:
+    // unavailable → exit 1, with the diagnosis output still rendered in full.
+    let doctor = run_coven(
+        &coven,
+        &coven_home,
+        &OsString::new(),
+        &["adapter", "doctor", "hermes"],
+    )?;
 
-    // The hermes executable is not installed, so adapter doctor reports it
-    // and exits 1 (the diagnosis output still renders in full).
     assert_failure("adapter doctor hermes", &doctor);
     assert_stdout_contains("adapter doctor hermes", &doctor, "Hermes Agent");
     assert_stdout_contains("adapter doctor hermes", &doctor, "manifest:");

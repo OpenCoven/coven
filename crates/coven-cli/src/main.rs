@@ -58,6 +58,15 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
     #[arg(
+        long,
+        global = true,
+        value_name = "WHEN",
+        value_parser = ["auto", "always", "never"],
+        default_value = "auto",
+        help = "Control ANSI color output; auto honors NO_COLOR and CLICOLOR_FORCE"
+    )]
+    color: String,
+    #[arg(
         value_name = "PROMPT",
         num_args = 0..,
         trailing_var_arg = true,
@@ -77,6 +86,11 @@ enum Command {
         about = "Check local setup and print next steps (exits 1 when a blocking problem is found)"
     )]
     Doctor,
+    #[command(about = "Generate shell completions (bash, zsh, fish, elvish, powershell)")]
+    Completions {
+        #[arg(help = "Shell to generate completions for")]
+        shell: clap_complete::Shell,
+    },
     #[command(
         name = "adapter",
         alias = "adapters",
@@ -446,6 +460,13 @@ fn main() -> Result<()> {
     settings::init_cached(loaded);
 
     let cli = Cli::parse();
+    // Resolve --color before anything renders: theme::mode() caches on
+    // first use, so the override must be recorded ahead of any output.
+    theme::set_color_choice(match cli.color.as_str() {
+        "always" => theme::ColorChoice::Always,
+        "never" => theme::ColorChoice::Never,
+        _ => theme::ColorChoice::Auto,
+    });
     run_cli(cli)
 }
 
@@ -457,6 +478,16 @@ fn run_cli(cli: Cli) -> Result<()> {
     match cli.command {
         None | Some(Command::Chat) | Some(Command::Tui) => run_shared_interactive_shell(),
         Some(Command::Doctor) => run_doctor(),
+        Some(Command::Completions { shell }) => {
+            use clap::CommandFactory;
+            clap_complete::generate(
+                shell,
+                &mut Cli::command(),
+                "coven",
+                &mut io::stdout().lock(),
+            );
+            Ok(())
+        }
         Some(Command::Adapter { command }) => run_adapter_command(command),
         Some(Command::Daemon { command }) => run_daemon_command(command),
         Some(Command::Executor { command }) => run_executor_command(command),
