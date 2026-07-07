@@ -1546,6 +1546,31 @@ pub fn bind_tcp_listener<A: ToSocketAddrs>(addr: A) -> Result<TcpListener> {
     Ok(listener)
 }
 
+/// True when a per-connection error is just the client hanging up mid-exchange
+/// — a disconnected browser SSE stream, an abandoned poll, a proxy that timed
+/// out — rather than a genuine server-side fault. These are routine under
+/// Coven's SSE + polling load and must not spam the daemon log or
+/// `daemon-recovery.log`; see the accept-loop notes on "broken pipe" pile-ups.
+///
+/// Walks the whole `anyhow` chain because the response-write path wraps the
+/// underlying `io::Error` in `.context(...)`, so the disconnect kind is not at
+/// the head of the chain.
+fn is_client_disconnect(error: &anyhow::Error) -> bool {
+    use std::io::ErrorKind;
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                ErrorKind::BrokenPipe
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::UnexpectedEof
+                    | ErrorKind::WriteZero
+            )
+        })
+    })
+}
+
 #[cfg(unix)]
 pub fn serve_next_tcp_connection(
     listener: &TcpListener,
@@ -1886,8 +1911,12 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
                     Some(tcp_status.clone()),
                     tcp_runtime.as_ref(),
                 ) {
-                    eprintln!("coven daemon: TCP connection error: {error:#}");
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    // A client hanging up mid-response is expected under SSE +
+                    // polling load; don't log it or throttle the accept loop.
+                    if !is_client_disconnect(&error) {
+                        eprintln!("coven daemon: TCP connection error: {error:#}");
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
                 }
             })
             .context("failed to spawn TCP API thread")?;
@@ -1927,11 +1956,13 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
             if let Err(error) =
                 serve_accepted_connection(stream, coven_home, conn_status, runtime.as_ref())
             {
-                eprintln!("coven daemon: unix connection error: {error:#}");
-                append_daemon_recovery_log(
-                    coven_home,
-                    &format!("unix connection error: {error:#}"),
-                );
+                if !is_client_disconnect(&error) {
+                    eprintln!("coven daemon: unix connection error: {error:#}");
+                    append_daemon_recovery_log(
+                        coven_home,
+                        &format!("unix connection error: {error:#}"),
+                    );
+                }
             }
             continue;
         }
@@ -1949,11 +1980,13 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
                     conn_status,
                     conn_runtime.as_ref(),
                 ) {
-                    eprintln!("coven daemon: unix connection error: {error:#}");
-                    append_daemon_recovery_log(
-                        &conn_home,
-                        &format!("unix connection error: {error:#}"),
-                    );
+                    if !is_client_disconnect(&error) {
+                        eprintln!("coven daemon: unix connection error: {error:#}");
+                        append_daemon_recovery_log(
+                            &conn_home,
+                            &format!("unix connection error: {error:#}"),
+                        );
+                    }
                 }
                 conn_inflight.fetch_sub(1, Ordering::Relaxed);
             });
@@ -2299,7 +2332,9 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
             Some(MAX_SOCKET_BODY_BYTES),
             false,
         ) {
-            eprintln!("coven daemon: pipe connection error: {error:#}");
+            if !is_client_disconnect(&error) {
+                eprintln!("coven daemon: pipe connection error: {error:#}");
+            }
         }
     }
     Ok(())
@@ -2308,6 +2343,42 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_client_disconnect_detects_wrapped_broken_pipe() {
+        // The response-write path wraps the io error in `.context(...)`, so the
+        // disconnect kind sits below the head of the chain — the classifier must
+        // still find it.
+        let io = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
+        let wrapped = anyhow::Error::new(io).context("failed to write HTTP response");
+        assert!(is_client_disconnect(&wrapped));
+
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::WriteZero,
+        ] {
+            let err = anyhow::Error::new(std::io::Error::new(kind, "peer gone"));
+            assert!(is_client_disconnect(&err), "{kind:?} should be benign");
+        }
+    }
+
+    #[test]
+    fn is_client_disconnect_ignores_real_faults() {
+        // A genuine server-side error must still be logged.
+        let logic = anyhow::anyhow!("live session registry lock poisoned");
+        assert!(!is_client_disconnect(&logic));
+
+        // A non-disconnect io error (e.g. timeout while the peer is alive) is not
+        // classified as a benign hang-up — keep those visible.
+        let timed_out = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "read timed out",
+        ))
+        .context("handling request");
+        assert!(!is_client_disconnect(&timed_out));
+    }
 
     #[cfg(unix)]
     #[test]
