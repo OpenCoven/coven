@@ -17,7 +17,7 @@ coven doctor
 coven daemon status
 ```
 
-`status=stopped` is not an error. Start it:
+`Coven daemon: not running` is not an error. Start it:
 
 ```sh
 coven daemon start
@@ -35,7 +35,7 @@ coven daemon restart
 coven daemon status
 ```
 
-If `status=running ok=true` appears, continue with:
+If `Coven daemon: running (pid …, socket …)` appears, continue with:
 
 ```sh
 coven run codex "say hello from Coven"

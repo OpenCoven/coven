@@ -176,8 +176,9 @@ test('npm onboarding smoke exercises daemon lifecycle with isolated state', () =
   assert.match(script, /\['daemon',\s*'status'\]/);
   assert.match(script, /\['daemon',\s*'stop'\]/);
   assert.match(script, /\['sessions',\s*'--plain'\]/);
-  assert.match(script, /status=running/);
-  assert.match(script, /ok=true/);
+  assert.match(script, /Coven daemon: running/);
+  assert.match(script, /\['daemon',\s*'status',\s*'--json'\]/);
+  assert.match(script, /statusJson\.ok !== true/);
 });
 
 test('npm onboarding smoke launches Windows cmd shims through a shell', () => {

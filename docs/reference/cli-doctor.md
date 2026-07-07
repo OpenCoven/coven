@@ -68,22 +68,22 @@ environment where the daemon/session starts.
 status:
 
 ```sh
-coven daemon status
+coven daemon status --json
 ```
 
-Typical output:
+Typical human output from `coven daemon status`:
 
 ```text
-coven daemon status=running ok=true pid=12345 socket=/home/alex/.coven/coven.sock
+Coven daemon: running (pid 12345, socket /home/alex/.coven/coven.sock)
 ```
 
-`status=stopped` means no background daemon is running yet. Start it with:
+`not running` means no background daemon is running yet. Start it with:
 
 ```sh
 coven daemon start
 ```
 
-`status=stale` means metadata exists for a process/socket that no longer looks
+`stale` means metadata exists for a process/socket that no longer looks
 healthy. Try:
 
 ```sh
