@@ -230,13 +230,26 @@ step(`install wrapper + native package in a temp project (${targetName})`, () =>
   try {
     const startOutput = runDaemonStart(wrapperBin, smokeEnv);
     daemonStarted = true;
-    if (startOutput && !startOutput.stdout.includes('status=running')) {
-      fail(`\`coven daemon start\` did not report status=running.\nstdout:\n${startOutput.stdout}\nstderr:\n${startOutput.stderr}`);
+    if (startOutput && !startOutput.stdout.includes('Coven daemon: running')) {
+      fail(`\`coven daemon start\` did not report a running daemon.\nstdout:\n${startOutput.stdout}\nstderr:\n${startOutput.stderr}`);
     }
 
     const statusOutput = runCapture(wrapperBin, ['daemon', 'status'], { env: smokeEnv });
-    if (!statusOutput.stdout.includes('status=running') || !statusOutput.stdout.includes('ok=true')) {
-      fail(`\`coven daemon status\` did not report a healthy running daemon.\nstdout:\n${statusOutput.stdout}\nstderr:\n${statusOutput.stderr}`);
+    if (!statusOutput.stdout.includes('Coven daemon: running')) {
+      fail(`\`coven daemon status\` did not report a running daemon.\nstdout:\n${statusOutput.stdout}\nstderr:\n${statusOutput.stderr}`);
+    }
+
+    // Health check goes through the machine surface: `--json` carries the
+    // `ok` flag that the human prose line intentionally no longer prints.
+    const statusJsonOutput = runCapture(wrapperBin, ['daemon', 'status', '--json'], { env: smokeEnv });
+    let statusJson;
+    try {
+      statusJson = JSON.parse(statusJsonOutput.stdout);
+    } catch {
+      fail(`\`coven daemon status --json\` did not print valid JSON.\nstdout:\n${statusJsonOutput.stdout}\nstderr:\n${statusJsonOutput.stderr}`);
+    }
+    if (statusJson.status !== 'running' || statusJson.ok !== true) {
+      fail(`\`coven daemon status --json\` did not report a healthy running daemon.\nstdout:\n${statusJsonOutput.stdout}\nstderr:\n${statusJsonOutput.stderr}`);
     }
 
     const sessionsOutput = runCapture(wrapperBin, ['sessions', '--plain'], { env: smokeEnv });

@@ -34,10 +34,12 @@ coven daemon status
 Expected running output:
 
 ```text
-coven daemon status=running ok=true pid=12345 socket=/home/alex/.coven/coven.sock
+Coven daemon: running (pid 12345, socket /home/alex/.coven/coven.sock)
 ```
 
-`ok=true` means the daemon health endpoint responded through the local socket.
+For scripts, `coven daemon status --json` prints the same state as JSON with an
+`ok` field that reports whether the daemon health endpoint responded through
+the local socket.
 
 ## Restart after upgrades
 
@@ -90,8 +92,8 @@ to verify the supervised daemon.
 
 ## Troubleshooting
 
-- `status=stopped`: run `coven daemon start`.
-- `status=stale`: run `coven daemon stop`, then `coven daemon start`.
+- `not running`: run `coven daemon start`.
+- `stale`: run `coven daemon stop`, then `coven daemon start`.
 - Permission errors: verify the daemon user owns `COVEN_HOME`.
 - Version drift: run `coven --version`, then `coven daemon restart`.
 

@@ -18,19 +18,20 @@ coven daemon status
 Typical healthy output:
 
 ```text
-coven daemon status=running ok=true pid=12345 socket=/home/alex/.coven/coven.sock
+Coven daemon: running (pid 12345, socket /home/alex/.coven/coven.sock)
 ```
 
 `running` means Coven found daemon metadata and verified the process/socket.
-`ok=true` means the daemon health response succeeded.
+For scripts, `coven daemon status --json` adds an `ok` field that reports
+whether the daemon health response succeeded.
 
 ## Status values
 
 | Status | Meaning | Next step |
 | --- | --- | --- |
-| `status=stopped` | No daemon metadata is present. | Run `coven daemon start`. |
-| `status=running ok=true` | The daemon is reachable. | Run `coven doctor` or start a session. |
-| `status=stale ok=false` | Metadata exists, but the daemon no longer looks healthy. | Run `coven daemon stop`, then `coven daemon start`. |
+| `not running` | No daemon metadata is present. | Run `coven daemon start`. |
+| `running` | The daemon is reachable. | Run `coven doctor` or start a session. |
+| `stale` | Metadata exists, but the daemon no longer looks healthy. | Run `coven daemon stop`, then `coven daemon start`. |
 
 ## First-run health check
 
