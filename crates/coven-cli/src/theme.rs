@@ -198,35 +198,85 @@ pub enum TerminalMode {
     NoColor,
 }
 
+/// Resolved value of the global `--color` flag. `Auto` defers to the env
+/// conventions (NO_COLOR, CLICOLOR_FORCE, tty + TERM detection); `Always`
+/// and `Never` override all of them.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum ColorChoice {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+static COLOR_CHOICE: OnceLock<ColorChoice> = OnceLock::new();
+
+/// Record the `--color` flag. Must run before the first render — `mode()`
+/// caches on first use, so set this right after clap parsing. First call
+/// wins; later calls are ignored.
+pub fn set_color_choice(choice: ColorChoice) {
+    let _ = COLOR_CHOICE.set(choice);
+}
+
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct EnvInputs<'a> {
     pub no_color: Option<&'a str>,
+    pub clicolor_force: Option<&'a str>,
     pub colorterm: Option<&'a str>,
     pub term: Option<&'a str>,
     pub stdout_is_tty: bool,
 }
 
-pub(crate) fn detect_mode_from(e: EnvInputs<'_>) -> TerminalMode {
-    // 1. NO_COLOR set to non-empty value always wins (per no-color.org;
-    //    empty-string treated as unset per supports-color convention).
+pub(crate) fn detect_mode_from(choice: ColorChoice, e: EnvInputs<'_>) -> TerminalMode {
+    // 0. The explicit --color flag outranks every env convention.
+    match choice {
+        ColorChoice::Never => return TerminalMode::NoColor,
+        ColorChoice::Always => return forced_mode(e),
+        ColorChoice::Auto => {}
+    }
+    // 1. NO_COLOR set to non-empty value wins among the env conventions
+    //    (per no-color.org; empty-string treated as unset per
+    //    supports-color convention).
     if e.no_color.map(|v| !v.is_empty()).unwrap_or(false) {
         return TerminalMode::NoColor;
     }
-    // 2. Piped/redirected stdout — never emit escapes.
+    // 2. CLICOLOR_FORCE set to anything but "" or "0" forces escapes even
+    //    when stdout is piped (https://bixense.com/clicolors/).
+    if e.clicolor_force
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
+    {
+        return forced_mode(e);
+    }
+    // 3. Piped/redirected stdout — never emit escapes.
     if !e.stdout_is_tty {
         return TerminalMode::NoColor;
     }
-    // 3. Explicit truecolor declaration.
+    // 4. Explicit truecolor declaration.
     match e.colorterm {
         Some("truecolor") | Some("24bit") => return TerminalMode::TrueColor,
         _ => {}
     }
-    // 4. TERM-based fallback.
+    // 5. TERM-based fallback.
     match e.term {
         Some(t) if t.ends_with("-direct") => TerminalMode::TrueColor,
         Some(t) if t.ends_with("-256color") => TerminalMode::Indexed256,
         Some("dumb") | None => TerminalMode::NoColor,
         Some(_) => TerminalMode::Indexed256,
+    }
+}
+
+/// Mode when color is forced (`--color=always` or CLICOLOR_FORCE): honor a
+/// declared truecolor terminal, otherwise fall back to indexed 256 — piped
+/// output has no tty to probe, and forcing means the caller wants escapes.
+fn forced_mode(e: EnvInputs<'_>) -> TerminalMode {
+    match e.colorterm {
+        Some("truecolor") | Some("24bit") => return TerminalMode::TrueColor,
+        _ => {}
+    }
+    match e.term {
+        Some(t) if t.ends_with("-direct") => TerminalMode::TrueColor,
+        _ => TerminalMode::Indexed256,
     }
 }
 
@@ -242,14 +292,19 @@ pub fn mode() -> TerminalMode {
 fn detect_mode() -> TerminalMode {
     use std::io::IsTerminal;
     let no_color = std::env::var("NO_COLOR").ok();
+    let clicolor_force = std::env::var("CLICOLOR_FORCE").ok();
     let colorterm = std::env::var("COLORTERM").ok();
     let term = std::env::var("TERM").ok();
-    detect_mode_from(EnvInputs {
-        no_color: no_color.as_deref(),
-        colorterm: colorterm.as_deref(),
-        term: term.as_deref(),
-        stdout_is_tty: std::io::stdout().is_terminal(),
-    })
+    detect_mode_from(
+        COLOR_CHOICE.get().copied().unwrap_or_default(),
+        EnvInputs {
+            no_color: no_color.as_deref(),
+            clicolor_force: clicolor_force.as_deref(),
+            colorterm: colorterm.as_deref(),
+            term: term.as_deref(),
+            stdout_is_tty: std::io::stdout().is_terminal(),
+        },
+    )
 }
 
 // ── 256-color downgrade ──
@@ -783,6 +838,7 @@ mod tests {
             (
                 EnvInputs {
                     no_color: Some("1"),
+                    clicolor_force: None,
                     colorterm: Some("truecolor"),
                     term: Some("xterm-256color"),
                     stdout_is_tty: true,
@@ -793,6 +849,7 @@ mod tests {
             (
                 EnvInputs {
                     no_color: Some(""),
+                    clicolor_force: None,
                     colorterm: Some("truecolor"),
                     term: Some("xterm-256color"),
                     stdout_is_tty: true,
@@ -803,6 +860,7 @@ mod tests {
             (
                 EnvInputs {
                     no_color: None,
+                    clicolor_force: None,
                     colorterm: Some("truecolor"),
                     term: Some("xterm-256color"),
                     stdout_is_tty: true,
@@ -813,6 +871,7 @@ mod tests {
             (
                 EnvInputs {
                     no_color: None,
+                    clicolor_force: None,
                     colorterm: Some("24bit"),
                     term: Some("xterm-256color"),
                     stdout_is_tty: true,
@@ -823,6 +882,7 @@ mod tests {
             (
                 EnvInputs {
                     no_color: None,
+                    clicolor_force: None,
                     colorterm: None,
                     term: Some("xterm-direct"),
                     stdout_is_tty: true,
@@ -833,6 +893,7 @@ mod tests {
             (
                 EnvInputs {
                     no_color: None,
+                    clicolor_force: None,
                     colorterm: None,
                     term: Some("xterm-256color"),
                     stdout_is_tty: true,
@@ -843,6 +904,7 @@ mod tests {
             (
                 EnvInputs {
                     no_color: None,
+                    clicolor_force: None,
                     colorterm: None,
                     term: Some("xterm"),
                     stdout_is_tty: true,
@@ -853,6 +915,7 @@ mod tests {
             (
                 EnvInputs {
                     no_color: None,
+                    clicolor_force: None,
                     colorterm: None,
                     term: Some("dumb"),
                     stdout_is_tty: true,
@@ -863,6 +926,7 @@ mod tests {
             (
                 EnvInputs {
                     no_color: None,
+                    clicolor_force: None,
                     colorterm: None,
                     term: None,
                     stdout_is_tty: true,
@@ -873,6 +937,7 @@ mod tests {
             (
                 EnvInputs {
                     no_color: None,
+                    clicolor_force: None,
                     colorterm: Some("truecolor"),
                     term: Some("xterm-256color"),
                     stdout_is_tty: false,
@@ -882,6 +947,7 @@ mod tests {
             (
                 EnvInputs {
                     no_color: Some("1"),
+                    clicolor_force: None,
                     colorterm: None,
                     term: None,
                     stdout_is_tty: false,
@@ -890,8 +956,79 @@ mod tests {
             ),
         ];
         for (i, (inputs, expected)) in cases.iter().enumerate() {
-            assert_eq!(detect_mode_from(*inputs), *expected, "row {i}: {inputs:?}",);
+            assert_eq!(
+                detect_mode_from(ColorChoice::Auto, *inputs),
+                *expected,
+                "row {i}: {inputs:?}",
+            );
         }
+    }
+
+    #[test]
+    fn clicolor_force_overrides_piped_stdout_but_not_no_color() {
+        use TerminalMode::*;
+        let piped_truecolor = EnvInputs {
+            no_color: None,
+            clicolor_force: Some("1"),
+            colorterm: Some("truecolor"),
+            term: None,
+            stdout_is_tty: false,
+        };
+        assert_eq!(
+            detect_mode_from(ColorChoice::Auto, piped_truecolor),
+            TrueColor
+        );
+
+        let piped_plain = EnvInputs {
+            no_color: None,
+            clicolor_force: Some("1"),
+            colorterm: None,
+            term: None,
+            stdout_is_tty: false,
+        };
+        // Forcing with no terminal declaration falls back to indexed 256.
+        assert_eq!(detect_mode_from(ColorChoice::Auto, piped_plain), Indexed256);
+
+        // "0" and "" mean unset per the CLICOLOR convention.
+        for off in ["0", ""] {
+            let inputs = EnvInputs {
+                clicolor_force: Some(off),
+                ..piped_plain
+            };
+            assert_eq!(detect_mode_from(ColorChoice::Auto, inputs), NoColor);
+        }
+
+        // NO_COLOR still wins over CLICOLOR_FORCE.
+        let conflicted = EnvInputs {
+            no_color: Some("1"),
+            ..piped_truecolor
+        };
+        assert_eq!(detect_mode_from(ColorChoice::Auto, conflicted), NoColor);
+    }
+
+    #[test]
+    fn color_flag_outranks_every_env_convention() {
+        use TerminalMode::*;
+        let colorful_tty = EnvInputs {
+            no_color: None,
+            clicolor_force: None,
+            colorterm: Some("truecolor"),
+            term: Some("xterm-256color"),
+            stdout_is_tty: true,
+        };
+        assert_eq!(detect_mode_from(ColorChoice::Never, colorful_tty), NoColor);
+
+        let no_color_piped = EnvInputs {
+            no_color: Some("1"),
+            clicolor_force: None,
+            colorterm: Some("truecolor"),
+            term: None,
+            stdout_is_tty: false,
+        };
+        assert_eq!(
+            detect_mode_from(ColorChoice::Always, no_color_piped),
+            TrueColor
+        );
     }
 
     #[test]
