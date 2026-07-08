@@ -18,14 +18,19 @@
 //! 3. **Identity coherence validation** — Tier 0/1 modifications must pass the
 //!    familiar's probe set. *(Requires model/regression infrastructure; not
 //!    implemented in this module — see [`Verdict::RequiresCoherenceReview`].)*
-//! 4. **Audit logging** — all Tier 0/1 modifications are recorded to an
-//!    append-only log. *(Requires store wiring; follow-up.)*
+//! 4. **Audit logging** — modifications are recorded to an append-only log.
+//!    [`Ward::apply`] emits a tamper-evident [`AuditRecord`] (before/after
+//!    SHA-256 content hashes) for every Tier 2 write; persisting those records
+//!    to the daemon's store is a follow-up.
 //!
 //! This module implements the two **deterministic** gates — 1 and 2 — which are
 //! the load-bearing structural checks. It has no dependency on the language
 //! model, and every decision it makes is a pure function of the declared
-//! surface and the proposal. Gates 3 and 4 are surfaced as verdicts to be
-//! discharged by later stages of the pipeline.
+//! surface and the proposal. [`Ward::apply`] is the **fail-closed enforcement
+//! boundary**: it routes every write through Gates 1–2, refuses or holds the
+//! whole proposal as a unit if any target is blocked or needs coherence review,
+//! and only then writes — emitting Gate 4 audit records. Gate 3 (coherence)
+//! remains deferred: a change that needs it is *held*, never written.
 //!
 //! ## Fail-closed posture
 //!
@@ -296,6 +301,118 @@ impl Outcome {
     }
 }
 
+/// A single file write the Ward is asked to apply.
+///
+/// The caller supplies the desired end state (full contents), not a patch: a
+/// patch parser would be additional attack surface *inside* the security
+/// boundary, and full-content writes make the diff a pure function of on-disk
+/// state and the proposal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileEdit {
+    /// Home-relative target, forward slashes.
+    pub target: String,
+    /// The full contents the file should have after the apply.
+    pub new_contents: Vec<u8>,
+}
+
+impl FileEdit {
+    /// A write of `new_contents` to the home-relative `target`.
+    pub fn new(target: impl Into<String>, new_contents: impl Into<Vec<u8>>) -> Self {
+        Self {
+            target: target.into(),
+            new_contents: new_contents.into(),
+        }
+    }
+}
+
+/// What the Ward did — or refused to do — with one edit in an apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Disposition {
+    /// Written to disk. The edit cleared every applicable gate (Tier 2/3).
+    Applied,
+    /// Not written. The proposal requires Gate 3 coherence review — it targets
+    /// Tier 1, or a Tier 0 path authorized by Gate 1 but not yet
+    /// coherence-cleared. The whole proposal is held until review.
+    HeldForCoherence,
+    /// Not written. Some target in the proposal was Blocked (Gate 1/2), so the
+    /// proposal is refused as a unit.
+    Refused,
+}
+
+/// A Gate 4 audit record for a change the Ward wrote.
+///
+/// The before/after content hashes make the record tamper-evident. (The spec
+/// leaves the canonical hash open: BLAKE3 is the eventual recommendation;
+/// SHA-256 is used here as the documented fallback.)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditRecord {
+    /// The target as supplied in the edit.
+    pub target: String,
+    /// The home-relative path actually written (Gate 2 output).
+    pub resolved: String,
+    /// Tier of the written path.
+    pub tier: Tier,
+    /// SHA-256 (hex) of the prior contents, or `None` if the file was created.
+    pub prev_sha256: Option<String>,
+    /// SHA-256 (hex) of the written contents.
+    pub next_sha256: String,
+    /// Number of bytes written.
+    pub bytes_written: usize,
+}
+
+/// The Ward's ruling and action for a single edit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedChange {
+    /// The adjudication that produced this action.
+    pub decision: Decision,
+    /// What the Ward did with the edit.
+    pub disposition: Disposition,
+    /// Present iff the edit was written *and* its tier requires logging
+    /// (Tier 2). Tier 3 (free) writes carry no audit record.
+    pub audit: Option<AuditRecord>,
+}
+
+/// The result of [`Ward::apply`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyReport {
+    /// Per-edit outcomes, in proposal order.
+    pub changes: Vec<AppliedChange>,
+}
+
+impl ApplyReport {
+    /// Whether the proposal was refused as a unit (some target Blocked).
+    /// Nothing was written.
+    pub fn is_refused(&self) -> bool {
+        self.changes
+            .iter()
+            .any(|c| c.disposition == Disposition::Refused)
+    }
+
+    /// Whether the proposal is held pending Gate 3 coherence review. Nothing
+    /// was written.
+    pub fn is_held(&self) -> bool {
+        !self.is_refused()
+            && self
+                .changes
+                .iter()
+                .any(|c| c.disposition == Disposition::HeldForCoherence)
+    }
+
+    /// Whether every edit in the proposal was written.
+    pub fn is_applied(&self) -> bool {
+        !self.changes.is_empty()
+            && self
+                .changes
+                .iter()
+                .all(|c| c.disposition == Disposition::Applied)
+    }
+
+    /// The Gate 4 audit records for the changes that were written.
+    pub fn audit_records(&self) -> impl Iterator<Item = &AuditRecord> {
+        self.changes.iter().filter_map(|c| c.audit.as_ref())
+    }
+}
+
 /// A configured Ward for one familiar home.
 pub struct Ward {
     home: PathBuf,
@@ -463,6 +580,179 @@ impl Ward {
             .map_err(|_| BlockReason::SymlinkEscape)?;
         Ok(to_forward_slashes(rel))
     }
+
+    /// The fail-closed diff/apply boundary — the real security choke point.
+    ///
+    /// Adjudicates `edits` (via [`Ward::evaluate`]) and, only if the whole
+    /// proposal clears every applicable gate, writes them to disk.
+    /// All-or-nothing:
+    ///
+    /// - If any target is **Blocked** (Gate 1/2), the proposal is *refused* as a
+    ///   unit and nothing is written.
+    /// - If any target needs **Gate 3 coherence review** — Tier 1, or a Tier 0
+    ///   change authorized by Gate 1 (Gate 3 is not yet implemented, so an
+    ///   authorized protected change cannot be cleared here) — the proposal is
+    ///   *held* as a unit and nothing is written.
+    /// - Otherwise every edit is Tier 2/3: each is written atomically (staged in
+    ///   the target's directory, then renamed into place) and every Tier 2
+    ///   write emits a Gate 4 [`AuditRecord`].
+    ///
+    /// Because writes are routed through [`Ward::evaluate`] first, Gate 2 path
+    /// confinement applies to the apply too: an edit that resolves out of the
+    /// familiar home (via `..`, symlink, or case collision) is refused before
+    /// any byte is written. Returns `Err` only on an I/O failure *after* the
+    /// gates cleared; a refusal or hold is a normal [`ApplyReport`], not an error.
+    pub fn apply(&self, edits: &[FileEdit], authorization: &Authorization) -> Result<ApplyReport> {
+        let proposal = Proposal {
+            targets: edits.iter().map(|e| e.target.clone()).collect(),
+            authorization: authorization.clone(),
+        };
+        let outcome = self.evaluate(&proposal);
+
+        // Decide the proposal-wide disposition before touching the filesystem.
+        let unit = if outcome.is_blocked() {
+            Disposition::Refused
+        } else if outcome
+            .decisions
+            .iter()
+            .any(|d| requires_coherence(&d.verdict))
+        {
+            Disposition::HeldForCoherence
+        } else {
+            Disposition::Applied
+        };
+
+        // Refused or held: write nothing, report per-target dispositions.
+        if unit != Disposition::Applied {
+            let changes = outcome
+                .decisions
+                .into_iter()
+                .map(|decision| {
+                    let disposition = if decision.verdict.is_blocked() {
+                        Disposition::Refused
+                    } else if requires_coherence(&decision.verdict) {
+                        Disposition::HeldForCoherence
+                    } else {
+                        // A cleared edit bundled with a refused/held one is
+                        // still not written — the proposal is all-or-nothing.
+                        unit
+                    };
+                    AppliedChange {
+                        decision,
+                        disposition,
+                        audit: None,
+                    }
+                })
+                .collect();
+            return Ok(ApplyReport { changes });
+        }
+
+        // Every edit is Tier 2/3 and cleared. Write each atomically.
+        let canonical_home = self
+            .home
+            .canonicalize()
+            .with_context(|| format!("ward home `{}` is not resolvable", self.home.display()))?;
+        let mut changes = Vec::with_capacity(edits.len());
+        for (edit, decision) in edits.iter().zip(outcome.decisions) {
+            let abs = join_resolved(&canonical_home, &decision.resolved);
+            let audit = write_atomic(&abs, &edit.new_contents, &decision)?;
+            changes.push(AppliedChange {
+                decision,
+                disposition: Disposition::Applied,
+                audit,
+            });
+        }
+        Ok(ApplyReport { changes })
+    }
+}
+
+/// Whether a verdict needs Gate 3 coherence review before it can be applied.
+///
+/// This includes Gate-1 authorized Tier 0 changes: Gate 3 is not yet
+/// implemented, so an authorized protected change cannot be cleared for apply
+/// here. Fail-closed — hold rather than write.
+fn requires_coherence(verdict: &Verdict) -> bool {
+    matches!(
+        verdict,
+        Verdict::RequiresCoherenceReview | Verdict::AuthorizedProtectedChange
+    )
+}
+
+/// Join a Gate-2 resolved (home-relative, forward-slashed) path onto the
+/// canonical home to get the absolute path to write.
+fn join_resolved(canonical_home: &Path, resolved: &str) -> PathBuf {
+    let mut path = canonical_home.to_path_buf();
+    for segment in resolved.split('/').filter(|s| !s.is_empty()) {
+        path.push(segment);
+    }
+    path
+}
+
+/// Write `contents` to `path` atomically: stage a sibling file, then rename it
+/// into place (rename is atomic within a filesystem). Returns a Gate 4 audit
+/// record for Tier 2 writes; Tier 3 (free) writes return `None`. Tier 0/1 never
+/// reach this function — they are held or refused upstream.
+fn write_atomic(path: &Path, contents: &[u8], decision: &Decision) -> Result<Option<AuditRecord>> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("target has no parent directory: {}", path.display()))?;
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+
+    let need_audit = decision.tier == Tier::Logged;
+
+    // Capture prior contents for the audit hash (only when we will log).
+    let prev = if need_audit {
+        match std::fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(anyhow!(
+                    "reading prior contents of {}: {err}",
+                    path.display()
+                ))
+            }
+        }
+    } else {
+        None
+    };
+
+    let staged = staged_path(path);
+    std::fs::write(&staged, contents)
+        .with_context(|| format!("staging write to {}", staged.display()))?;
+    std::fs::rename(&staged, path)
+        .with_context(|| format!("committing write to {}", path.display()))?;
+
+    let audit = need_audit.then(|| AuditRecord {
+        target: decision.target.clone(),
+        resolved: decision.resolved.clone(),
+        tier: decision.tier,
+        prev_sha256: prev.as_deref().map(sha256_hex),
+        next_sha256: sha256_hex(contents),
+        bytes_written: contents.len(),
+    });
+    Ok(audit)
+}
+
+/// The sibling staging path for an atomic write (`<name>.ward-staged`).
+fn staged_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".ward-staged");
+    path.with_file_name(name)
+}
+
+/// Lowercase hex SHA-256 of `bytes`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Compile a surface glob. A trailing `/` means "everything under here".
@@ -870,5 +1160,126 @@ tier = 2
         });
         assert!(outcome.is_blocked());
         assert_eq!(outcome.blocked().count(), 1);
+    }
+
+    // ---- apply: the fail-closed diff/apply boundary ----
+
+    #[test]
+    fn apply_writes_free_and_logged_and_audits_only_logged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        let edits = vec![
+            FileEdit::new("scratch/notes.txt", b"scratch".to_vec()),
+            FileEdit::new("memory/log.md", b"entry".to_vec()),
+        ];
+        let report = ward.apply(&edits, &Authorization::unsigned()).unwrap();
+
+        assert!(report.is_applied());
+        assert!(!report.is_refused() && !report.is_held());
+        assert_eq!(
+            fs::read(tmp.path().join("scratch/notes.txt")).unwrap(),
+            b"scratch"
+        );
+        assert_eq!(
+            fs::read(tmp.path().join("memory/log.md")).unwrap(),
+            b"entry"
+        );
+
+        // Only the Tier 2 (memory/) write is audited; Tier 3 (scratch) is not.
+        let audits: Vec<_> = report.audit_records().collect();
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].resolved, "memory/log.md");
+        assert_eq!(audits[0].tier, Tier::Logged);
+        assert_eq!(audits[0].prev_sha256, None);
+        assert_eq!(audits[0].next_sha256, sha256_hex(b"entry"));
+        assert_eq!(audits[0].bytes_written, 5);
+
+        // No staging litter remains after the atomic rename.
+        assert!(!tmp.path().join("memory/log.md.ward-staged").exists());
+    }
+
+    #[test]
+    fn apply_refuses_whole_proposal_if_any_target_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        // A harmless scratch write bundled with an unauthorized Tier 0 change.
+        let edits = vec![
+            FileEdit::new("scratch/ok.txt", b"ok".to_vec()),
+            FileEdit::new("SOUL.md", b"pwned".to_vec()),
+        ];
+        let report = ward.apply(&edits, &Authorization::unsigned()).unwrap();
+
+        assert!(report.is_refused());
+        assert!(!report.is_applied());
+        // Fail-closed: NOTHING is written, not even the harmless scratch edit.
+        assert!(!tmp.path().join("scratch/ok.txt").exists());
+        assert!(!tmp.path().join("SOUL.md").exists());
+    }
+
+    #[test]
+    fn apply_holds_whole_proposal_for_coherence_review() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        // MEMORY.md is Tier 1 (Ward-reviewed) — needs Gate 3.
+        let edits = vec![
+            FileEdit::new("scratch/ok.txt", b"ok".to_vec()),
+            FileEdit::new("MEMORY.md", b"revised".to_vec()),
+        ];
+        let report = ward.apply(&edits, &Authorization::unsigned()).unwrap();
+
+        assert!(report.is_held());
+        assert!(!report.is_refused());
+        assert!(!report.is_applied());
+        // Held as a unit: nothing written.
+        assert!(!tmp.path().join("scratch/ok.txt").exists());
+        assert!(!tmp.path().join("MEMORY.md").exists());
+    }
+
+    #[test]
+    fn authorized_protected_change_is_held_not_applied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        let edits = vec![FileEdit::new("SOUL.md", b"new soul".to_vec())];
+        // Valid Gate 1 signature, but Gate 3 (coherence) is unavailable.
+        let report = ward
+            .apply(&edits, &Authorization::signed_by("SHA256:principal-key"))
+            .unwrap();
+
+        // Fail-closed: authorized, but cannot be coherence-cleared, so held.
+        assert!(report.is_held());
+        assert_eq!(
+            report.changes[0].decision.verdict,
+            Verdict::AuthorizedProtectedChange
+        );
+        assert!(!tmp.path().join("SOUL.md").exists());
+    }
+
+    #[test]
+    fn apply_confines_writes_within_home_gate2() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        // Escapes the home; Gate 2 must refuse before any write.
+        let edits = vec![FileEdit::new("../escape.txt", b"x".to_vec())];
+        let report = ward.apply(&edits, &Authorization::unsigned()).unwrap();
+
+        assert!(report.is_refused());
+        assert!(!tmp.path().parent().unwrap().join("escape.txt").exists());
+    }
+
+    #[test]
+    fn apply_overwrites_existing_and_hashes_prior_contents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::create_dir_all(tmp.path().join("memory")).unwrap();
+        fs::write(tmp.path().join("memory/log.md"), b"old").unwrap();
+
+        let edits = vec![FileEdit::new("memory/log.md", b"new".to_vec())];
+        let report = ward.apply(&edits, &Authorization::unsigned()).unwrap();
+
+        assert!(report.is_applied());
+        assert_eq!(fs::read(tmp.path().join("memory/log.md")).unwrap(), b"new");
+        let audit = report.audit_records().next().unwrap();
+        assert_eq!(audit.prev_sha256, Some(sha256_hex(b"old")));
+        assert_eq!(audit.next_sha256, sha256_hex(b"new"));
     }
 }
