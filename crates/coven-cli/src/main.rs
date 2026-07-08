@@ -39,6 +39,10 @@ mod stream_json;
 mod theme;
 mod tui;
 mod verification;
+// Ward identity-layer enforcement (Gates 1-2). Not yet wired into the API
+// router or control plane; see ward.rs for the follow-up gates/endpoints.
+#[allow(dead_code)]
+mod ward;
 
 pub(crate) const DEFAULT_COVEN_HOME_DIR: &str = ".coven";
 pub(crate) const STORE_FILE_NAME: &str = "coven.sqlite3";
