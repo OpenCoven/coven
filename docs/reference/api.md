@@ -49,6 +49,10 @@ flowchart LR
 
 All error responses use the structured envelope documented in [API contract](/API-CONTRACT#structured-error-envelope).
 
+`eventIndexRebuilt` reports whether the `events_fts` index was present and rebuilt —
+the rebuild always runs when the index exists, so `true` does not imply the index
+was stale. `false` means the store has no `events_fts` table to rebuild.
+
 ## Always begin with health
 
 ```http

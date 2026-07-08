@@ -154,8 +154,8 @@ Supported shells: `bash`, `zsh`, `fish`, `elvish`, `powershell`.
 
 `coven vacuum` is a local housekeeping command for the session ledger. It rebuilds the
 `events_fts` index, runs SQLite `VACUUM`, truncates the WAL when possible, and prints
-the final integrity check. Use it before retrying `coven sacrifice <id> --yes` when
-SQLite reports a malformed event index.
+the final integrity check as a prose status line. Use it before retrying
+`coven sacrifice <id> --yes` when SQLite reports a malformed event index.
 
 ## Parallel Work Protocol
 
