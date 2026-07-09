@@ -1562,10 +1562,14 @@ fn run_vacuum_command() -> Result<()> {
     } else {
         "ok".to_string()
     };
+    let index = if report.event_index_rebuilt {
+        "event index rebuilt"
+    } else {
+        "no event index to rebuild"
+    };
     println!(
-        "vacuumed store={} eventIndexRebuilt={} integrity={integrity}",
-        store_path.display(),
-        report.event_index_rebuilt
+        "Coven store: vacuumed ({index}, integrity {integrity}, path {})",
+        store_path.display()
     );
     Ok(())
 }
