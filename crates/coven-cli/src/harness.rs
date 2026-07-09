@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
-use coven_runtime_spec::Capabilities;
+use coven_runtime_spec::{Capabilities, SandboxMapping, StreamArgs};
 use serde::{Deserialize, Serialize};
 
 pub const EXTERNAL_ADAPTER_MANIFEST_ENV: &str = "COVEN_HARNESS_ADAPTER_MANIFEST";
@@ -134,14 +134,15 @@ impl<'a> HarnessLaunchOptions<'a> {
     }
 }
 
-/// Declared capabilities for a configured harness id. Built-in harnesses
-/// declare theirs in [`built_in_harness_specs`]; ids that don't match a
-/// built-in (external adapters, unknown ids) get the conservative baseline
-/// (all off), which matches today's behavior — external adapters can't
-/// declare capabilities until the manifest loader learns to read them
-/// (coven-runtimes integration.md, PR 2).
+/// Declared capabilities for a configured harness id, consulting built-ins
+/// and external adapter manifests alike — a manifest that declares
+/// `capabilities.stream` passes the same gates claude does. Unknown ids get
+/// the conservative baseline (all off). Falls back to built-ins only if the
+/// external manifests fail to load (the launch path will surface that error
+/// with full context).
 fn declared_capabilities(harness_id: &str) -> Capabilities {
-    built_in_harness_specs()
+    configured_harness_specs()
+        .unwrap_or_else(|_| built_in_harness_specs())
         .into_iter()
         .find(|spec| spec.id == harness_id)
         .map(|spec| spec.capabilities)
@@ -196,14 +197,19 @@ pub fn harness_supports_speed(harness_id: &str) -> bool {
     declared_capabilities(harness_id).speed
 }
 
-/// How a harness translates a `Permission` into its native sandbox flag.
-/// `flag` is the CLI flag name (e.g. `--sandbox`); `full`/`read_only` are the
-/// values passed for each policy. Mirrors the `model_flag` design.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SandboxMapping {
-    pub flag: String,
-    pub full: String,
-    pub read_only: String,
+// The sandbox/permission mapping is the shared `coven_runtime_spec::SandboxMapping`:
+// either a single `--flag value` pair per policy (codex, claude) or a whole
+// argv list per policy for harnesses whose permission surface is
+// boolean/multi-token flags (e.g. GitHub Copilot CLI's `--allow-all` /
+// `--deny-tool …`).
+impl Permission {
+    /// The shared-spec equivalent, for driving `SandboxMapping::args`.
+    fn to_spec(self) -> coven_runtime_spec::Permission {
+        match self {
+            Permission::Full => coven_runtime_spec::Permission::Full,
+            Permission::ReadOnly => coven_runtime_spec::Permission::ReadOnly,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,10 +245,12 @@ pub struct HarnessCommandSpec {
     /// Behavioral capabilities (stream mode, session pre-assignment, think,
     /// speed). Shared type with the coven-runtimes manifest spec so built-in
     /// harnesses and external adapters declare what they can do through the
-    /// same struct instead of hardcoded harness-id checks. External adapters
-    /// currently get the conservative baseline (all off); reading these from
-    /// the manifest is the follow-up loader change (integration.md, PR 2).
+    /// same struct instead of hardcoded harness-id checks.
     pub capabilities: Capabilities,
+    /// Stream-json launch args (prefix argv plus session pre-assign/resume
+    /// flags). Required when `capabilities.stream`; shared type with the
+    /// coven-runtimes manifest spec.
+    pub stream_args: Option<StreamArgs>,
 }
 
 impl HarnessCommandSpec {
@@ -278,13 +286,7 @@ impl HarnessCommandSpec {
     /// mechanism (caller decides whether to warn).
     pub fn sandbox_args(&self, permission: Permission) -> Vec<String> {
         match &self.sandbox {
-            Some(mapping) => vec![
-                mapping.flag.clone(),
-                match permission {
-                    Permission::Full => mapping.full.clone(),
-                    Permission::ReadOnly => mapping.read_only.clone(),
-                },
-            ],
+            Some(mapping) => mapping.args(permission.to_spec()),
             None => Vec::new(),
         }
     }
@@ -414,7 +416,7 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
             model_arg_template: None,
             // `codex exec --sandbox <mode>`: full → danger-full-access,
             // read-only → read-only. Verified against the installed codex CLI.
-            sandbox: Some(SandboxMapping {
+            sandbox: Some(SandboxMapping::Flag {
                 flag: "--sandbox".to_string(),
                 full: "danger-full-access".to_string(),
                 read_only: "read-only".to_string(),
@@ -423,6 +425,7 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
             // pre-assignment (ids are captured from the first turn's output),
             // no think/speed toggles.
             capabilities: Capabilities::BASELINE,
+            stream_args: None,
         },
         HarnessCommandSpec {
             id: "claude".to_string(),
@@ -439,7 +442,7 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
             model_arg_template: None,
             // `claude --permission-mode <mode>`: full → bypassPermissions,
             // read-only → plan. Verified against the installed claude CLI.
-            sandbox: Some(SandboxMapping {
+            sandbox: Some(SandboxMapping::Flag {
                 flag: "--permission-mode".to_string(),
                 full: "bypassPermissions".to_string(),
                 read_only: "plan".to_string(),
@@ -453,6 +456,21 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
                 think: true,
                 speed: true,
             },
+            // The stream-json launch recipe formerly hardcoded in
+            // `stream_args()`; declared here so built-ins and manifest
+            // adapters travel the same code path.
+            stream_args: Some(StreamArgs {
+                prefix_args: vec![
+                    "--print".to_string(),
+                    "--input-format".to_string(),
+                    "stream-json".to_string(),
+                    "--output-format".to_string(),
+                    "stream-json".to_string(),
+                    "--verbose".to_string(),
+                ],
+                session_id_flag: Some("--session-id".to_string()),
+                resume_flag: Some("--resume".to_string()),
+            }),
         },
     ]
 }
@@ -703,6 +721,17 @@ struct ExternalHarnessAdapterSpec {
     model_flag: Option<String>,
     #[serde(default, alias = "modelArgTemplate")]
     model_arg_template: Option<String>,
+    /// Behavioral capabilities. Omitted fields default to the conservative
+    /// baseline (all off), so legacy adapters deserialize unchanged.
+    #[serde(default)]
+    capabilities: Capabilities,
+    /// Native sandbox/permission mapping (single-flag or argv-list form).
+    /// Omit and `coven run --permission` stays a warned no-op.
+    #[serde(default)]
+    sandbox: Option<SandboxMapping>,
+    /// Stream-json launch args. Required when `capabilities.stream`.
+    #[serde(default, alias = "streamArgs")]
+    stream_args: Option<StreamArgs>,
 }
 
 impl ExternalHarnessAdapterSpec {
@@ -749,6 +778,71 @@ impl ExternalHarnessAdapterSpec {
                 manifest_path.display()
             );
         }
+        // Capability cross-checks, mirroring the shared spec's validation
+        // rules (`coven_runtime_spec::validate_adapter`): a declared
+        // capability must be launchable, and dead config is rejected.
+        match (&self.stream_args, self.capabilities.stream) {
+            (None, true) => anyhow::bail!(
+                "external harness adapter `{id}` in {} declares `capabilities.stream` \
+                 but no `stream_args`",
+                manifest_path.display()
+            ),
+            (Some(_), false) => anyhow::bail!(
+                "external harness adapter `{id}` in {} provides `stream_args` but \
+                 `capabilities.stream` is false (dead config)",
+                manifest_path.display()
+            ),
+            (Some(args), true) if args.prefix_args.iter().all(|t| t.trim().is_empty()) => {
+                anyhow::bail!(
+                    "external harness adapter `{id}` in {} declares stream mode but \
+                     `stream_args.prefix_args` is empty",
+                    manifest_path.display()
+                )
+            }
+            _ => {}
+        }
+        if self.capabilities.preassigned_session_id
+            && self
+                .stream_args
+                .as_ref()
+                .and_then(|args| args.session_id_flag.as_deref())
+                .is_none_or(|flag| flag.trim().is_empty())
+        {
+            anyhow::bail!(
+                "external harness adapter `{id}` in {} declares \
+                 `capabilities.preassigned_session_id` but no `stream_args.session_id_flag`",
+                manifest_path.display()
+            );
+        }
+        match &self.sandbox {
+            Some(SandboxMapping::Flag {
+                flag,
+                full,
+                read_only,
+            }) if flag.trim().is_empty()
+                || full.trim().is_empty()
+                || read_only.trim().is_empty() =>
+            {
+                anyhow::bail!(
+                    "external harness adapter `{id}` in {} has an incomplete sandbox \
+                     mapping (flag/full/read_only must be non-empty)",
+                    manifest_path.display()
+                )
+            }
+            Some(SandboxMapping::Args {
+                full_args,
+                read_only_args,
+            }) if full_args.iter().all(|t| t.trim().is_empty())
+                || read_only_args.iter().all(|t| t.trim().is_empty()) =>
+            {
+                anyhow::bail!(
+                    "external harness adapter `{id}` in {} has an incomplete sandbox \
+                     mapping (full_args/read_only_args need at least one non-empty token)",
+                    manifest_path.display()
+                )
+            }
+            _ => {}
+        }
         Ok(HarnessCommandSpec {
             id,
             label: self.label.trim().to_string(),
@@ -770,12 +864,9 @@ impl ExternalHarnessAdapterSpec {
                 .model_arg_template
                 .map(|tmpl| tmpl.trim().to_string())
                 .filter(|tmpl| !tmpl.is_empty()),
-            // External adapters declare no sandbox mechanism today, so
-            // `coven run --permission` warns and continues for them.
-            sandbox: None,
-            // Conservative baseline (all off) until the loader reads
-            // `capabilities` from the manifest (integration.md, PR 2).
-            capabilities: Capabilities::BASELINE,
+            sandbox: self.sandbox,
+            capabilities: self.capabilities,
+            stream_args: self.stream_args,
         })
     }
 }
@@ -1059,29 +1150,30 @@ fn escape_cmd_shim_metacharacters(arg: &str) -> String {
     escaped
 }
 
+/// Stream-json launch args for a harness, from its declared `stream_args`.
+/// Returns `None` when the harness doesn't declare a stream-json mode so the
+/// caller falls back to non-interactive. The conversation hint maps to the
+/// declared session pre-assign/resume flags; a harness that declares no
+/// `session_id_flag` (auto-generated ids) or no `resume_flag` simply launches
+/// without the corresponding flag and the chat layer captures the id from the
+/// first turn's output instead.
 fn stream_args(spec: &HarnessCommandSpec, hint: Option<&ConversationHint>) -> Option<Vec<String>> {
-    match spec.id.as_str() {
-        "claude" => {
-            let mut args: Vec<String> = vec![
-                "--print".to_string(),
-                "--input-format".to_string(),
-                "stream-json".to_string(),
-                "--output-format".to_string(),
-                "stream-json".to_string(),
-                "--verbose".to_string(),
-            ];
-            if let Some(hint) = hint {
-                let flag = match hint {
-                    ConversationHint::Init { .. } => "--session-id",
-                    ConversationHint::Resume { .. } => "--resume",
-                };
-                args.push(flag.to_string());
-                args.push(hint.id().to_string());
-            }
-            Some(args)
-        }
-        _ => None,
+    if !spec.capabilities.stream {
+        return None;
     }
+    let declared = spec.stream_args.as_ref()?;
+    let mut args: Vec<String> = declared.prefix_args.clone();
+    if let Some(hint) = hint {
+        let flag = match hint {
+            ConversationHint::Init { .. } => declared.session_id_flag.as_deref(),
+            ConversationHint::Resume { .. } => declared.resume_flag.as_deref(),
+        };
+        if let Some(flag) = flag {
+            args.push(flag.to_string());
+            args.push(hint.id().to_string());
+        }
+    }
+    Some(args)
 }
 
 /// Per-harness translation of a `ConversationHint` into CLI args that precede
@@ -1517,6 +1609,7 @@ mod tests {
             model_arg_template: None,
             sandbox: None,
             capabilities: Capabilities::BASELINE,
+            stream_args: None,
         };
 
         assert_eq!(
@@ -1607,6 +1700,189 @@ mod tests {
         assert!(!built_in_harnesses()
             .iter()
             .any(|harness| harness.id == "hermes"));
+        Ok(())
+    }
+
+    /// A streaming manifest adapter used by the capability-loader acceptance
+    /// tests: declares stream mode, session pre-assignment, and a single-flag
+    /// sandbox mapping — everything that used to require `id == "claude"`.
+    const STREAMY_ADAPTER_MANIFEST: &str = r#"{
+      "adapters": [
+        {
+          "id": "streamy",
+          "label": "Streamy",
+          "executable": "streamy",
+          "interactive_prompt_prefix_args": [],
+          "non_interactive_prompt_prefix_args": ["--print"],
+          "install_hint": "Install streamy and add it to PATH.",
+          "capabilities": { "stream": true, "preassigned_session_id": true },
+          "sandbox": { "flag": "--permission-mode", "full": "bypass", "read_only": "plan" },
+          "stream_args": {
+            "prefix_args": ["--print", "--input-format", "stream-json", "--output-format", "stream-json"],
+            "session_id_flag": "--session-id",
+            "resume_flag": "--resume"
+          }
+        }
+      ]
+    }"#;
+
+    /// The acceptance test for the whole coven-runtimes integration
+    /// (integration.md): a manifest that declares `capabilities.stream` +
+    /// `stream_args` is launched in stream mode — with its sandbox mapping
+    /// applied — without any core edit.
+    #[test]
+    fn manifest_streaming_adapter_launches_in_stream_mode() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let manifest = temp_dir.path().join("streamy.json");
+        fs::write(&manifest, STREAMY_ADAPTER_MANIFEST)?;
+
+        let _guard = env_lock().lock().unwrap();
+        let previous = env::var_os(EXTERNAL_ADAPTER_MANIFEST_ENV);
+        env::set_var(EXTERNAL_ADAPTER_MANIFEST_ENV, &manifest);
+        let supports_stream = harness_supports_stream_mode("streamy");
+        let supports_session = harness_supports_preassigned_session_id("streamy");
+        let parts = command_parts_for_harness_with_conversation(
+            "streamy",
+            "hello",
+            HarnessLaunchMode::Stream,
+            Some(&ConversationHint::Init {
+                id: "abc-123".to_string(),
+            }),
+            None,
+            HarnessLaunchOptions {
+                permission: Some(Permission::ReadOnly),
+                ..Default::default()
+            },
+        );
+        restore_adapter_manifest_env(previous);
+
+        assert!(supports_stream, "declared stream capability must gate in");
+        assert!(supports_session);
+        let (program, args) = parts?;
+        assert_eq!(program, "streamy");
+        assert_eq!(
+            args,
+            vec![
+                "--permission-mode".to_string(),
+                "plan".to_string(),
+                "--print".to_string(),
+                "--input-format".to_string(),
+                "stream-json".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--session-id".to_string(),
+                "abc-123".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    /// The argv-list sandbox form (GitHub Copilot CLI shape) maps
+    /// `--permission` through for a manifest adapter.
+    #[test]
+    fn manifest_argv_list_sandbox_maps_permission() -> anyhow::Result<()> {
+        let raw = r#"{
+          "adapters": [
+            {
+              "id": "copi",
+              "label": "Copi",
+              "executable": "copi",
+              "interactive_prompt_prefix_args": ["-i"],
+              "non_interactive_prompt_prefix_args": ["-s", "-p"],
+              "install_hint": "Install copi.",
+              "sandbox": {
+                "full_args": ["--allow-all"],
+                "read_only_args": ["--deny-tool", "write"]
+              }
+            }
+          ]
+        }"#;
+        let specs =
+            parse_external_harness_specs(raw, Path::new("copi.json"), &built_in_harness_specs())?;
+        let copi = &specs[0];
+        assert!(copi.supports_permission());
+        assert_eq!(
+            copi.sandbox_args(Permission::Full),
+            vec!["--allow-all".to_string()]
+        );
+        assert_eq!(
+            copi.sandbox_args(Permission::ReadOnly),
+            vec!["--deny-tool".to_string(), "write".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_capability_cross_checks_reject_undeclarable_configs() {
+        let built_ins = built_in_harness_specs();
+        let cases: &[(&str, &str)] = &[
+            (
+                // stream declared but no launch recipe
+                r#"{"adapters":[{"id":"x","label":"X","executable":"x",
+                    "interactive_prompt_prefix_args":[],
+                    "non_interactive_prompt_prefix_args":["run"],
+                    "install_hint":"hint",
+                    "capabilities":{"stream":true}}]}"#,
+                "declares `capabilities.stream` but no `stream_args`",
+            ),
+            (
+                // stream_args without the capability is dead config
+                r#"{"adapters":[{"id":"x","label":"X","executable":"x",
+                    "interactive_prompt_prefix_args":[],
+                    "non_interactive_prompt_prefix_args":["run"],
+                    "install_hint":"hint",
+                    "stream_args":{"prefix_args":["-p"]}}]}"#,
+                "dead config",
+            ),
+            (
+                // preassigned session id needs a flag to pass it with
+                r#"{"adapters":[{"id":"x","label":"X","executable":"x",
+                    "interactive_prompt_prefix_args":[],
+                    "non_interactive_prompt_prefix_args":["run"],
+                    "install_hint":"hint",
+                    "capabilities":{"stream":true,"preassigned_session_id":true},
+                    "stream_args":{"prefix_args":["-p"]}}]}"#,
+                "no `stream_args.session_id_flag`",
+            ),
+        ];
+        for (raw, expected) in cases {
+            let err = parse_external_harness_specs(raw, Path::new("x.json"), &built_ins)
+                .expect_err("invalid capability config must be rejected");
+            assert!(
+                err.to_string().contains(expected),
+                "expected `{expected}` in: {err:#}"
+            );
+        }
+    }
+
+    /// Claude's stream launch is byte-for-byte what the old hardcoded
+    /// `stream_args()` produced, now read from its declared `stream_args`.
+    #[test]
+    fn claude_stream_launch_args_unchanged_after_declaration() -> anyhow::Result<()> {
+        let (program, args) = command_parts_for_harness_with_conversation(
+            "claude",
+            "hello",
+            HarnessLaunchMode::Stream,
+            Some(&ConversationHint::Init {
+                id: "abc-123".to_string(),
+            }),
+            None,
+            HarnessLaunchOptions::default(),
+        )?;
+        assert_eq!(program, "claude");
+        assert_eq!(
+            args,
+            vec![
+                "--print".to_string(),
+                "--input-format".to_string(),
+                "stream-json".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--verbose".to_string(),
+                "--session-id".to_string(),
+                "abc-123".to_string(),
+            ]
+        );
         Ok(())
     }
 
@@ -2366,6 +2642,7 @@ mod tests {
             model_arg_template: None,
             sandbox: None,
             capabilities: Capabilities::BASELINE,
+            stream_args: None,
         };
         assert!(!spec.supports_permission());
         assert!(spec.sandbox_args(Permission::Full).is_empty());

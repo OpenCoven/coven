@@ -26,8 +26,11 @@ A Coven harness adapter defines:
 - user-facing label;
 - executable name to detect on `PATH`;
 - prompt argument shape for interactive mode;
-- prompt argument shape for non-interactive mode; and
-- install/authentication hint for `coven doctor`.
+- prompt argument shape for non-interactive mode;
+- install/authentication hint for `coven doctor`; and
+- optional **declared behavior**: `capabilities`, `sandbox`, and
+  `stream_args` (the [coven-runtimes](https://github.com/OpenCoven/coven-runtimes)
+  manifest additions — see below).
 
 The current implementation expects the prompt to be the final command argument after any fixed prefix args. Keep that invariant unless the adapter explicitly documents a safer stdin or protocol mode.
 
@@ -71,6 +74,50 @@ coven adapter list --json
 Coven does not auto-discover adapter manifests from `COVEN_HOME`, `~/.coven`, or `$XDG_CONFIG_HOME`. External manifests are trusted code-launch configuration, so operators must opt in with `COVEN_HARNESS_ADAPTER_MANIFEST` or `COVEN_HARNESS_ADAPTER_DIRS`.
 
 The prompt is appended as the final command argument after the configured prefix args. Adapter ids must be lowercase and must not collide with built-in ids. Executables are names only, not shell strings or paths.
+
+### Declared capabilities, sandbox, and stream args
+
+A manifest adapter can additionally declare what it *can do*, using the same
+fields as the [coven-runtimes](https://github.com/OpenCoven/coven-runtimes)
+manifest spec (the manifest shape is a backward-compatible superset — legacy
+adapters deserialize unchanged with everything off):
+
+```json
+{
+  "adapters": [
+    {
+      "id": "example",
+      "label": "Example Harness",
+      "executable": "example",
+      "interactive_prompt_prefix_args": [],
+      "non_interactive_prompt_prefix_args": ["--print"],
+      "install_hint": "Install Example Harness and make sure `example` is on PATH.",
+      "capabilities": { "stream": true, "preassigned_session_id": true },
+      "sandbox": { "flag": "--permission-mode", "full": "bypass-permissions", "read_only": "plan" },
+      "stream_args": {
+        "prefix_args": ["--print", "--input-format", "stream-json", "--output-format", "stream-json"],
+        "session_id_flag": "--session-id",
+        "resume_flag": "--resume"
+      }
+    }
+  ]
+}
+```
+
+- `capabilities.stream` + `stream_args` let the daemon drive the adapter in
+  long-lived stream-json mode, exactly like the bundled Claude adapter (which
+  declares the same fields internally). `stream` requires `stream_args`;
+  `stream_args` without `stream` is rejected as dead config.
+- `capabilities.preassigned_session_id` requires `stream_args.session_id_flag`.
+- `sandbox` maps `coven run --permission <full|read-only>` to the harness's
+  native flags. Two forms: a single `--flag value` pair per policy (shown
+  above), or an argv list per policy for boolean/multi-token permission flags:
+  `{ "full_args": ["--allow-all"], "read_only_args": ["--deny-tool", "write"] }`.
+- Adapters that declare none of this keep today's conservative behavior:
+  one-shot launches only, `--permission` is a warned no-op.
+
+Accepted, conformance-tested manifests for real runtimes live in the
+[coven-runtimes canonical registry](https://github.com/OpenCoven/coven-runtimes).
 
 This manifest path is for explicit integration work. It is not a public support claim for every adapter listed in a maintainer's local manifest.
 
