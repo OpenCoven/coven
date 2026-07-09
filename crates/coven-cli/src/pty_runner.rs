@@ -1014,6 +1014,51 @@ fn codex_event_error_message(event: &serde_json::Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn build_stream_harness_command_with_conversation(
+    harness_id: &str,
+    prompt: &str,
+    cwd: &Path,
+    forward_stdin: bool,
+    conversation: Option<&crate::harness::ConversationHint>,
+    familiar: Option<&crate::harness::FamiliarContext>,
+    options: crate::harness::HarnessLaunchOptions<'_>,
+) -> Result<HarnessCommand> {
+    let (program, args) = crate::harness::command_parts_for_harness_with_conversation(
+        harness_id,
+        "",
+        crate::harness::HarnessLaunchMode::Stream,
+        conversation,
+        familiar,
+        options,
+    )?;
+    let mut args = stream_passthrough_args(args, forward_stdin);
+    args.extend(["--".to_string(), prompt.to_string()]);
+    let args = crate::harness::sanitize_argv_for_platform(args);
+    Ok(HarnessCommand {
+        program,
+        args,
+        cwd: cwd.to_path_buf(),
+        stdin_prompt: None,
+    })
+}
+
+fn stream_passthrough_args(args: Vec<String>, forward_stdin: bool) -> Vec<String> {
+    if forward_stdin {
+        return args;
+    }
+    let mut filtered = Vec::with_capacity(args.len());
+    let mut iter = args.into_iter().peekable();
+    while let Some(arg) = iter.next() {
+        if arg == "--input-format" && iter.peek().is_some_and(|next| next == "stream-json") {
+            let _ = iter.next();
+            continue;
+        }
+        filtered.push(arg);
+    }
+    filtered
+}
+
 pub fn run_attached(command: &HarnessCommand) -> Result<PtyRunResult> {
     let pty_system = native_pty_system();
     run_attached_with_pty_system(command, pty_system.as_ref())
@@ -1181,136 +1226,35 @@ pub fn run_piped_attached_captured(
     })
 }
 
-/// Run `claude` in its native stream-JSON mode, framed by the caller (which
-/// emits Coven's own `system.init` / `result` around the call).
-///
-/// `claude -p --input-format stream-json --output-format stream-json --verbose
-/// --session-id <id> <prompt>` already emits the Coven-compatible JSONL
-/// schema; we just forward each line untouched to `out`.
-///
-/// `is_resume` picks the session flag: `--session-id <id>` only CREATES
-/// sessions — passing an id that already exists fails with "Session ID
-/// <id> is already in use", which made every `coven run --continue` turn
-/// error and lose the conversation. Resumed turns use `--resume <id>`,
-/// which continues the session in place (in `-p` mode the id is kept, so
-/// the Coven session record id stays valid for the next turn).
-///
-/// When `forward_stdin` is true, lines on our stdin are piped to claude's
-/// stdin so callers can feed additional user messages mid-run. Stderr is
-/// inherited so claude's own diagnostics land on the terminal.
-#[allow(clippy::too_many_arguments)]
-pub fn stream_claude<W: Write>(
-    cwd: &Path,
-    session_id: &str,
-    is_resume: bool,
-    prompt: &str,
+/// Run a harness in its native stream-JSON mode, framed by the caller (which
+/// emits Coven's own `system.init` / `result` around the call). The command's
+/// argv is built from the harness declaration (`stream_args`, continuity,
+/// model, sandbox, and identity handling); this runner only spawns it and
+/// forwards each non-empty JSONL line unchanged to `out`.
+pub fn stream_harness<W: Write>(
+    command: &HarnessCommand,
     forward_stdin: bool,
-    system_prompt: Option<&str>,
-    options: crate::harness::HarnessLaunchOptions<'_>,
+    harness_id: &str,
     out: &mut W,
 ) -> Result<i32> {
-    stream_claude_with_program(
-        &crate::harness::spawn_executable_for_platform("claude"),
-        cwd,
-        session_id,
-        is_resume,
-        prompt,
+    stream_harness_with_program(
+        &command.program,
+        &command.cwd,
+        command.args.clone(),
         forward_stdin,
-        system_prompt,
-        options,
+        harness_id,
         out,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn stream_claude_with_program<W: Write>(
+fn stream_harness_with_program<W: Write>(
     program: &str,
     cwd: &Path,
-    session_id: &str,
-    is_resume: bool,
-    prompt: &str,
+    args: Vec<String>,
     forward_stdin: bool,
-    system_prompt: Option<&str>,
-    options: crate::harness::HarnessLaunchOptions<'_>,
+    harness_id: &str,
     out: &mut W,
 ) -> Result<i32> {
-    stream_claude_with_program_and_permission_bypass(
-        program,
-        cwd,
-        session_id,
-        is_resume,
-        prompt,
-        forward_stdin,
-        system_prompt,
-        options,
-        crate::harness::claude_permission_bypass_enabled(),
-        out,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn stream_claude_with_program_and_permission_bypass<W: Write>(
-    program: &str,
-    cwd: &Path,
-    session_id: &str,
-    is_resume: bool,
-    prompt: &str,
-    forward_stdin: bool,
-    system_prompt: Option<&str>,
-    options: crate::harness::HarnessLaunchOptions<'_>,
-    permission_bypass_enabled: bool,
-    out: &mut W,
-) -> Result<i32> {
-    // `--input-format stream-json` makes claude read user messages as JSONL
-    // on stdin and IGNORE the positional <prompt>. We only want that mode
-    // when the caller is feeding stdin (long-lived chat); for one-shot turns
-    // we drop `--input-format stream-json` so the positional prompt is honored.
-    // Without this branch, one-shot turns hang on stdin then exit with no
-    // assistant text — the symptom that surfaces in Cave as
-    // `_The "claude" harness completed but produced no output._`
-    // Strip the `provider/` namespace so claude's `--model` gets a bare id,
-    // matching the non-stream path (`harness::normalize_model_id`).
-    let normalized_model: Option<&str> = options
-        .model
-        .map(str::trim)
-        .filter(|m| !m.is_empty())
-        .map(crate::harness::normalize_model_id);
-
-    let mut args: Vec<String> = vec!["-p".to_string()];
-    if permission_bypass_enabled {
-        args.extend([
-            "--permission-mode".to_string(),
-            "bypassPermissions".to_string(),
-        ]);
-    }
-    if forward_stdin {
-        args.extend(["--input-format".to_string(), "stream-json".to_string()]);
-    }
-    if let Some(sp) = system_prompt {
-        args.extend(["--system-prompt".to_string(), sp.to_string()]);
-    }
-    if let Some(m) = normalized_model {
-        args.extend(["--model".to_string(), m.to_string()]);
-    }
-    if let Some(effort) = options.claude_effort() {
-        args.extend(["--effort".to_string(), effort.to_string()]);
-    }
-    args.extend([
-        "--output-format".to_string(),
-        "stream-json".to_string(),
-        "--verbose".to_string(),
-    ]);
-    if is_resume {
-        args.extend(["--resume".to_string(), session_id.to_string()]);
-    } else {
-        args.extend(["--session-id".to_string(), session_id.to_string()]);
-    }
-    // `--` keeps a user prompt starting with `-` from parsing as claude flags
-    // (same shield as `HarnessCommandSpec::prompt_args`).
-    args.push("--".to_string());
-    args.push(prompt.to_string());
-    let args = crate::harness::sanitize_argv_for_platform(args);
-
     let mut child = std::process::Command::new(program)
         .args(&args)
         .current_dir(cwd)
@@ -1322,13 +1266,12 @@ fn stream_claude_with_program_and_permission_bypass<W: Write>(
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-        .context("failed to spawn claude in stream-json mode")?;
+        .with_context(|| format!("failed to spawn {harness_id} in stream-json mode"))?;
 
     if forward_stdin {
-        let mut child_stdin = child
-            .stdin
-            .take()
-            .expect("stdin requested but child has no piped stdin");
+        let Some(mut child_stdin) = child.stdin.take() else {
+            anyhow::bail!("stdin requested but {harness_id} has no piped stdin");
+        };
         thread::spawn(move || {
             let stdin = io::stdin();
             let mut handle = stdin.lock();
@@ -1348,19 +1291,105 @@ fn stream_claude_with_program_and_permission_bypass<W: Write>(
         });
     }
 
-    let child_stdout = child.stdout.take().expect("stdout was requested as piped");
+    let Some(child_stdout) = child.stdout.take() else {
+        anyhow::bail!("stdout requested but {harness_id} has no piped stdout");
+    };
     let reader = BufReader::new(child_stdout);
     for line in reader.lines() {
-        let line = line.context("reading claude stdout")?;
+        let line = line.with_context(|| format!("reading {harness_id} stdout"))?;
         if line.trim().is_empty() {
             continue;
         }
-        writeln!(out, "{line}").context("forwarding claude stdout")?;
-        out.flush().context("flushing claude stdout")?;
+        writeln!(out, "{line}").with_context(|| format!("forwarding {harness_id} stdout"))?;
+        out.flush()
+            .with_context(|| format!("flushing {harness_id} stdout"))?;
     }
 
-    let status = child.wait().context("waiting on claude")?;
+    let status = child
+        .wait()
+        .with_context(|| format!("waiting on {harness_id}"))?;
     Ok(status.code().unwrap_or(1))
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn stream_harness_with_claude_args<W: Write>(
+    program: &str,
+    cwd: &Path,
+    session_id: &str,
+    is_resume: bool,
+    prompt: &str,
+    forward_stdin: bool,
+    system_prompt: Option<&str>,
+    options: crate::harness::HarnessLaunchOptions<'_>,
+    out: &mut W,
+) -> Result<i32> {
+    stream_harness_with_claude_args_and_permission_bypass(
+        program,
+        cwd,
+        session_id,
+        is_resume,
+        prompt,
+        forward_stdin,
+        system_prompt,
+        options,
+        false,
+        out,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn stream_harness_with_claude_args_and_permission_bypass<W: Write>(
+    program: &str,
+    cwd: &Path,
+    session_id: &str,
+    is_resume: bool,
+    prompt: &str,
+    forward_stdin: bool,
+    system_prompt: Option<&str>,
+    options: crate::harness::HarnessLaunchOptions<'_>,
+    permission_bypass_enabled: bool,
+    out: &mut W,
+) -> Result<i32> {
+    let normalized_model = options
+        .model
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(crate::harness::normalize_model_id);
+
+    let mut args = vec!["-p".to_string()];
+    if permission_bypass_enabled {
+        args.extend([
+            "--permission-mode".to_string(),
+            "bypassPermissions".to_string(),
+        ]);
+    }
+    if forward_stdin {
+        args.extend(["--input-format".to_string(), "stream-json".to_string()]);
+    }
+    if let Some(sp) = system_prompt {
+        args.extend(["--system-prompt".to_string(), sp.to_string()]);
+    }
+    if let Some(model) = normalized_model {
+        args.extend(["--model".to_string(), model.to_string()]);
+    }
+    if let Some(effort) = options.claude_effort() {
+        args.extend(["--effort".to_string(), effort.to_string()]);
+    }
+    args.extend([
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+        "--verbose".to_string(),
+    ]);
+    if is_resume {
+        args.extend(["--resume".to_string(), session_id.to_string()]);
+    } else {
+        args.extend(["--session-id".to_string(), session_id.to_string()]);
+    }
+    args.extend(["--".to_string(), prompt.to_string()]);
+
+    stream_harness_with_program(program, cwd, args, forward_stdin, "claude", out)
 }
 
 #[allow(dead_code)]
@@ -2132,7 +2161,7 @@ exit 0
 
     #[cfg(unix)]
     #[test]
-    fn stream_claude_forwards_jsonl_and_returns_exit_code() -> anyhow::Result<()> {
+    fn stream_harness_claude_forwards_jsonl_and_returns_exit_code() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
         let _guard = fake_claude_spawn_guard();
@@ -2152,7 +2181,7 @@ exit 7
         std::fs::set_permissions(&fake_claude, permissions)?;
 
         let mut out = Vec::new();
-        let code = stream_claude_with_program(
+        let code = stream_harness_with_claude_args(
             fake_claude.to_str().unwrap(),
             temp_dir.path(),
             "session-123",
@@ -2182,7 +2211,76 @@ exit 7
 
     #[cfg(unix)]
     #[test]
-    fn stream_claude_includes_input_format_when_forwarding_stdin() -> anyhow::Result<()> {
+    fn stream_harness_forwards_declared_args_without_claude_rebuild() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = fake_claude_spawn_guard();
+        let temp_dir = tempfile::tempdir()?;
+        let fake_harness = temp_dir.path().join("fake-streamy");
+        std::fs::write(
+            &fake_harness,
+            r#"#!/bin/sh
+printf '%s\n' "$@" > args.txt
+printf '%s\n' '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"streamy"}]},"session_id":"session-123","stop_reason":"end_turn"}'
+exit 0
+"#,
+        )?;
+        let mut permissions = std::fs::metadata(&fake_harness)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_harness, permissions)?;
+
+        let mut out = Vec::new();
+        let code = stream_harness_with_program(
+            fake_harness.to_str().unwrap(),
+            temp_dir.path(),
+            vec![
+                "--jsonl".to_string(),
+                "--resume".to_string(),
+                "session-123".to_string(),
+                "--".to_string(),
+                "hello prompt".to_string(),
+            ],
+            false,
+            "streamy",
+            &mut out,
+        )?;
+
+        assert_eq!(code, 0);
+        assert_eq!(
+            std::fs::read_to_string(temp_dir.path().join("args.txt"))?,
+            "--jsonl\n--resume\nsession-123\n--\nhello prompt\n"
+        );
+        assert_eq!(
+            String::from_utf8(out)?,
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"streamy\"}]},\"session_id\":\"session-123\",\"stop_reason\":\"end_turn\"}\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stream_passthrough_args_drop_stdin_format_for_one_shot_prompt() {
+        let args = vec![
+            "--print".to_string(),
+            "--input-format".to_string(),
+            "stream-json".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+        ];
+
+        assert_eq!(
+            stream_passthrough_args(args.clone(), false),
+            vec![
+                "--print".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+            ]
+        );
+        assert_eq!(stream_passthrough_args(args.clone(), true), args);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stream_harness_claude_includes_input_format_when_forwarding_stdin() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
         let _guard = fake_claude_spawn_guard();
@@ -2200,7 +2298,7 @@ exit 0
         std::fs::set_permissions(&fake_claude, permissions)?;
 
         let mut out = Vec::new();
-        let _code = stream_claude_with_program(
+        let _code = stream_harness_with_claude_args(
             fake_claude.to_str().unwrap(),
             temp_dir.path(),
             "session-456",
@@ -2224,7 +2322,7 @@ exit 0
 
     #[cfg(unix)]
     #[test]
-    fn stream_claude_honors_permission_bypass_opt_in() -> anyhow::Result<()> {
+    fn stream_harness_claude_honors_permission_bypass_opt_in() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
         let _guard = fake_claude_spawn_guard();
@@ -2242,7 +2340,7 @@ exit 0
         std::fs::set_permissions(&fake_claude, permissions)?;
 
         let mut out = Vec::new();
-        let _code = stream_claude_with_program_and_permission_bypass(
+        let _code = stream_harness_with_claude_args_and_permission_bypass(
             fake_claude.to_str().unwrap(),
             temp_dir.path(),
             "session-456",
@@ -2264,7 +2362,7 @@ exit 0
 
     #[cfg(unix)]
     #[test]
-    fn stream_claude_resumes_with_resume_flag_not_session_id() -> anyhow::Result<()> {
+    fn stream_harness_claude_resumes_with_resume_flag_not_session_id() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
         let _guard = fake_claude_spawn_guard();
@@ -2282,7 +2380,7 @@ exit 0
         std::fs::set_permissions(&fake_claude, permissions)?;
 
         let mut out = Vec::new();
-        let _code = stream_claude_with_program(
+        let _code = stream_harness_with_claude_args(
             fake_claude.to_str().unwrap(),
             temp_dir.path(),
             "session-789",
@@ -2307,7 +2405,7 @@ exit 0
 
     #[cfg(unix)]
     #[test]
-    fn stream_claude_forwards_model_with_prefix_stripped() -> anyhow::Result<()> {
+    fn stream_harness_claude_forwards_model_with_prefix_stripped() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
         let _guard = fake_claude_spawn_guard();
@@ -2325,7 +2423,7 @@ exit 0
         std::fs::set_permissions(&fake_claude, permissions)?;
 
         let mut out = Vec::new();
-        let _code = stream_claude_with_program(
+        let _code = stream_harness_with_claude_args(
             fake_claude.to_str().unwrap(),
             temp_dir.path(),
             "session-123",
@@ -2350,7 +2448,7 @@ exit 0
 
     #[cfg(unix)]
     #[test]
-    fn stream_claude_forwards_think_as_effort_high() -> anyhow::Result<()> {
+    fn stream_harness_claude_forwards_think_as_effort_high() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
         let _guard = fake_claude_spawn_guard();
@@ -2368,7 +2466,7 @@ exit 0
         std::fs::set_permissions(&fake_claude, permissions)?;
 
         let mut out = Vec::new();
-        let _code = stream_claude_with_program(
+        let _code = stream_harness_with_claude_args(
             fake_claude.to_str().unwrap(),
             temp_dir.path(),
             "session-123",

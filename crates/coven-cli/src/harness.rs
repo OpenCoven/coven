@@ -19,6 +19,7 @@ pub struct HarnessSummary {
     pub executable: String,
     pub available: bool,
     pub install_hint: String,
+    pub capabilities: Capabilities,
     pub source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest_path: Option<String>,
@@ -251,6 +252,58 @@ pub struct HarnessCommandSpec {
     /// flags). Required when `capabilities.stream`; shared type with the
     /// coven-runtimes manifest spec.
     pub stream_args: Option<StreamArgs>,
+    /// One-shot non-interactive session-continuity args. This mirrors
+    /// `stream_args` for cold-started turns: adapters declare how to initialize
+    /// or resume an upstream conversation without Coven hardcoding ids.
+    pub continuity_args: Option<ContinuityArgs>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContinuityArgs {
+    #[serde(default, alias = "initPrefixArgs")]
+    pub init_prefix_args: Vec<String>,
+    #[serde(default, alias = "resumePrefixArgs")]
+    pub resume_prefix_args: Vec<String>,
+    #[serde(
+        default,
+        alias = "sessionIdFlag",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub session_id_flag: Option<String>,
+    #[serde(default, alias = "resumeFlag", skip_serializing_if = "Option::is_none")]
+    pub resume_flag: Option<String>,
+}
+
+impl ContinuityArgs {
+    fn session_id_flag(&self) -> Option<&str> {
+        self.session_id_flag
+            .as_deref()
+            .map(str::trim)
+            .filter(|flag| !flag.is_empty())
+    }
+
+    fn resume_flag(&self) -> Option<&str> {
+        self.resume_flag
+            .as_deref()
+            .map(str::trim)
+            .filter(|flag| !flag.is_empty())
+    }
+
+    fn has_init_launch(&self) -> bool {
+        self.session_id_flag().is_some()
+            || self
+                .init_prefix_args
+                .iter()
+                .any(|arg| !arg.trim().is_empty())
+    }
+
+    fn has_resume_launch(&self) -> bool {
+        self.resume_flag().is_some()
+            || self
+                .resume_prefix_args
+                .iter()
+                .any(|arg| !arg.trim().is_empty())
+    }
 }
 
 impl HarnessCommandSpec {
@@ -353,6 +406,7 @@ impl HarnessSummary {
             install_hint: spec.install_hint,
             source: spec.source,
             manifest_path: spec.manifest_path,
+            capabilities: spec.capabilities,
         }
     }
 }
@@ -426,6 +480,18 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
             // no think/speed toggles.
             capabilities: Capabilities::BASELINE,
             stream_args: None,
+            continuity_args: Some(ContinuityArgs {
+                init_prefix_args: Vec::new(),
+                resume_prefix_args: vec![
+                    "exec".to_string(),
+                    "--skip-git-repo-check".to_string(),
+                    "--color".to_string(),
+                    "never".to_string(),
+                    "resume".to_string(),
+                ],
+                session_id_flag: None,
+                resume_flag: None,
+            }),
         },
         HarnessCommandSpec {
             id: "claude".to_string(),
@@ -471,6 +537,12 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
                 session_id_flag: Some("--session-id".to_string()),
                 resume_flag: Some("--resume".to_string()),
             }),
+            continuity_args: Some(ContinuityArgs {
+                init_prefix_args: vec!["--print".to_string()],
+                resume_prefix_args: vec!["--print".to_string()],
+                session_id_flag: Some("--session-id".to_string()),
+                resume_flag: Some("--resume".to_string()),
+            }),
         },
         HarnessCommandSpec {
             id: crate::engine::ENGINE_HARNESS_ID.to_string(),
@@ -506,6 +578,12 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
                     "--output-format".to_string(),
                     "stream-json".to_string(),
                 ],
+                session_id_flag: Some("--session-id".to_string()),
+                resume_flag: Some("--resume".to_string()),
+            }),
+            continuity_args: Some(ContinuityArgs {
+                init_prefix_args: vec!["--print".to_string()],
+                resume_prefix_args: vec!["--print".to_string()],
                 session_id_flag: Some("--session-id".to_string()),
                 resume_flag: Some("--resume".to_string()),
             }),
@@ -770,6 +848,9 @@ struct ExternalHarnessAdapterSpec {
     /// Stream-json launch args. Required when `capabilities.stream`.
     #[serde(default, alias = "streamArgs")]
     stream_args: Option<StreamArgs>,
+    /// One-shot non-interactive continuity args.
+    #[serde(default, alias = "continuityArgs")]
+    continuity_args: Option<ContinuityArgs>,
 }
 
 impl ExternalHarnessAdapterSpec {
@@ -839,16 +920,40 @@ impl ExternalHarnessAdapterSpec {
             }
             _ => {}
         }
+        if let Some(args) = &self.continuity_args {
+            if !args.has_init_launch() && !args.has_resume_launch() {
+                anyhow::bail!(
+                    "external harness adapter `{id}` in {} provides `continuity_args` but \
+                     no usable init or resume launch args",
+                    manifest_path.display()
+                );
+            }
+            if args.session_id_flag().is_some() && !self.capabilities.preassigned_session_id {
+                anyhow::bail!(
+                    "external harness adapter `{id}` in {} provides \
+                     `continuity_args.session_id_flag` but \
+                     `capabilities.preassigned_session_id` is false (dead config)",
+                    manifest_path.display()
+                );
+            }
+        }
+        let stream_session_id_flag = self
+            .stream_args
+            .as_ref()
+            .and_then(|args| args.session_id_flag.as_deref())
+            .map(str::trim)
+            .filter(|flag| !flag.is_empty());
+        let continuity_session_id_flag = self
+            .continuity_args
+            .as_ref()
+            .and_then(ContinuityArgs::session_id_flag);
         if self.capabilities.preassigned_session_id
-            && self
-                .stream_args
-                .as_ref()
-                .and_then(|args| args.session_id_flag.as_deref())
-                .is_none_or(|flag| flag.trim().is_empty())
+            && stream_session_id_flag.is_none()
+            && continuity_session_id_flag.is_none()
         {
             anyhow::bail!(
                 "external harness adapter `{id}` in {} declares \
-                 `capabilities.preassigned_session_id` but no `stream_args.session_id_flag`",
+                 `capabilities.preassigned_session_id` but no session id flag",
                 manifest_path.display()
             );
         }
@@ -905,6 +1010,7 @@ impl ExternalHarnessAdapterSpec {
             sandbox: self.sandbox,
             capabilities: self.capabilities,
             stream_args: self.stream_args,
+            continuity_args: self.continuity_args,
         })
     }
 }
@@ -1291,30 +1397,26 @@ fn continuity_args(
     if mode != HarnessLaunchMode::NonInteractive {
         return None;
     }
-    match spec.id.as_str() {
-        id if id == "claude" || id == crate::engine::ENGINE_HARNESS_ID => {
-            let flag = match hint {
-                ConversationHint::Init { .. } => "--session-id",
-                ConversationHint::Resume { .. } => "--resume",
-            };
-            Some(vec![
-                "--print".to_string(),
-                flag.to_string(),
-                hint.id().to_string(),
-            ])
+    let declared = spec.continuity_args.as_ref()?;
+    match hint {
+        ConversationHint::Init { .. } => {
+            let flag = declared.session_id_flag()?;
+            let mut args = declared.init_prefix_args.clone();
+            args.push(flag.to_string());
+            args.push(hint.id().to_string());
+            Some(args)
         }
-        "codex" => match hint {
-            // Codex auto-assigns the session id on the first turn; we capture
-            // it from output and feed it back on subsequent turns.
-            ConversationHint::Init { .. } => None,
-            ConversationHint::Resume { id } => {
-                let mut args: Vec<String> = spec.non_interactive_prompt_prefix_args.to_vec();
-                args.push("resume".to_string());
-                args.push(id.clone());
-                Some(args)
+        ConversationHint::Resume { .. } => {
+            if !declared.has_resume_launch() {
+                return None;
             }
-        },
-        _ => None,
+            let mut args = declared.resume_prefix_args.clone();
+            if let Some(flag) = declared.resume_flag() {
+                args.push(flag.to_string());
+            }
+            args.push(hint.id().to_string());
+            Some(args)
+        }
     }
 }
 
@@ -1799,6 +1901,7 @@ mod tests {
             sandbox: None,
             capabilities: Capabilities::BASELINE,
             stream_args: None,
+            continuity_args: None,
         };
 
         assert_eq!(
@@ -2034,12 +2137,209 @@ mod tests {
                     "install_hint":"hint",
                     "capabilities":{"stream":true,"preassigned_session_id":true},
                     "stream_args":{"prefix_args":["-p"]}}]}"#,
-                "no `stream_args.session_id_flag`",
+                "no session id flag",
             ),
         ];
         for (raw, expected) in cases {
             let err = parse_external_harness_specs(raw, Path::new("x.json"), &built_ins)
                 .expect_err("invalid capability config must be rejected");
+            assert!(
+                err.to_string().contains(expected),
+                "expected `{expected}` in: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_continuity_adapter_uses_declared_noninteractive_args() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let manifest = temp_dir.path().join("continuity.json");
+        fs::write(
+            &manifest,
+            r#"{
+              "adapters": [
+                {
+                  "id": "threaded",
+                  "label": "Threaded",
+                  "executable": "threaded",
+                  "interactive_prompt_prefix_args": [],
+                  "non_interactive_prompt_prefix_args": ["run"],
+                  "install_hint": "Install threaded.",
+                  "capabilities": { "preassigned_session_id": true },
+                  "continuity_args": {
+                    "init_prefix_args": ["run", "--json"],
+                    "resume_prefix_args": ["run", "--json"],
+                    "session_id_flag": "--session",
+                    "resume_flag": "--resume"
+                  }
+                }
+              ]
+            }"#,
+        )?;
+
+        let _guard = env_lock().lock().unwrap();
+        let previous_manifest = env::var_os(EXTERNAL_ADAPTER_MANIFEST_ENV);
+        let previous_dirs = env::var_os(EXTERNAL_ADAPTER_DIRS_ENV);
+        env::set_var(EXTERNAL_ADAPTER_MANIFEST_ENV, &manifest);
+        env::remove_var(EXTERNAL_ADAPTER_DIRS_ENV);
+
+        let init = command_parts_for_harness_with_conversation(
+            "threaded",
+            "hello",
+            HarnessLaunchMode::NonInteractive,
+            Some(&ConversationHint::Init {
+                id: "session-1".to_string(),
+            }),
+            None,
+            HarnessLaunchOptions::default(),
+        );
+        let resume = command_parts_for_harness_with_conversation(
+            "threaded",
+            "again",
+            HarnessLaunchMode::NonInteractive,
+            Some(&ConversationHint::Resume {
+                id: "session-1".to_string(),
+            }),
+            None,
+            HarnessLaunchOptions::default(),
+        );
+
+        restore_adapter_manifest_env(previous_manifest);
+        restore_adapter_dirs_env(previous_dirs);
+
+        assert_eq!(
+            init?,
+            (
+                "threaded".to_string(),
+                vec![
+                    "run".to_string(),
+                    "--json".to_string(),
+                    "--session".to_string(),
+                    "session-1".to_string(),
+                    "--".to_string(),
+                    "hello".to_string(),
+                ]
+            )
+        );
+        assert_eq!(
+            resume?,
+            (
+                "threaded".to_string(),
+                vec![
+                    "run".to_string(),
+                    "--json".to_string(),
+                    "--resume".to_string(),
+                    "session-1".to_string(),
+                    "--".to_string(),
+                    "again".to_string(),
+                ]
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_resume_only_continuity_allows_generated_session_ids() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let manifest = temp_dir.path().join("resume-only.json");
+        fs::write(
+            &manifest,
+            r#"{
+              "adapters": [
+                {
+                  "id": "resume-only",
+                  "label": "Resume Only",
+                  "executable": "resume-only",
+                  "interactive_prompt_prefix_args": [],
+                  "non_interactive_prompt_prefix_args": ["exec"],
+                  "install_hint": "Install resume-only.",
+                  "continuity_args": {
+                    "resume_prefix_args": ["exec", "resume"]
+                  }
+                }
+              ]
+            }"#,
+        )?;
+
+        let _guard = env_lock().lock().unwrap();
+        let previous_manifest = env::var_os(EXTERNAL_ADAPTER_MANIFEST_ENV);
+        let previous_dirs = env::var_os(EXTERNAL_ADAPTER_DIRS_ENV);
+        env::set_var(EXTERNAL_ADAPTER_MANIFEST_ENV, &manifest);
+        env::remove_var(EXTERNAL_ADAPTER_DIRS_ENV);
+
+        let init = command_parts_for_harness_with_conversation(
+            "resume-only",
+            "first",
+            HarnessLaunchMode::NonInteractive,
+            Some(&ConversationHint::Init {
+                id: "ignored".to_string(),
+            }),
+            None,
+            HarnessLaunchOptions::default(),
+        );
+        let resume = command_parts_for_harness_with_conversation(
+            "resume-only",
+            "again",
+            HarnessLaunchMode::NonInteractive,
+            Some(&ConversationHint::Resume {
+                id: "upstream-1".to_string(),
+            }),
+            None,
+            HarnessLaunchOptions::default(),
+        );
+
+        restore_adapter_manifest_env(previous_manifest);
+        restore_adapter_dirs_env(previous_dirs);
+
+        assert_eq!(
+            init?,
+            (
+                "resume-only".to_string(),
+                vec!["exec".to_string(), "--".to_string(), "first".to_string()]
+            )
+        );
+        assert_eq!(
+            resume?,
+            (
+                "resume-only".to_string(),
+                vec![
+                    "exec".to_string(),
+                    "resume".to_string(),
+                    "upstream-1".to_string(),
+                    "--".to_string(),
+                    "again".to_string(),
+                ]
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_continuity_rejects_dead_preassigned_session_config() {
+        let built_ins = built_in_harness_specs();
+        let cases: &[(&str, &str)] = &[
+            (
+                r#"{"adapters":[{"id":"x","label":"X","executable":"x",
+                    "interactive_prompt_prefix_args":[],
+                    "non_interactive_prompt_prefix_args":["run"],
+                    "install_hint":"hint",
+                    "continuity_args":{"init_prefix_args":["run"],"session_id_flag":"--session"}}]}"#,
+                "`continuity_args.session_id_flag` but `capabilities.preassigned_session_id` is false",
+            ),
+            (
+                r#"{"adapters":[{"id":"x","label":"X","executable":"x",
+                    "interactive_prompt_prefix_args":[],
+                    "non_interactive_prompt_prefix_args":["run"],
+                    "install_hint":"hint",
+                    "capabilities":{"preassigned_session_id":true},
+                    "continuity_args":{"init_prefix_args":["run"]}}]}"#,
+                "declares `capabilities.preassigned_session_id` but no session id flag",
+            ),
+        ];
+
+        for (raw, expected) in cases {
+            let err = parse_external_harness_specs(raw, Path::new("x.json"), &built_ins)
+                .expect_err("invalid continuity config must be rejected");
             assert!(
                 err.to_string().contains(expected),
                 "expected `{expected}` in: {err:#}"
@@ -2333,12 +2633,14 @@ mod tests {
             .unwrap();
         assert_eq!(codex.source, "bundled");
         assert!(codex.manifest_path.is_none());
+        assert_eq!(codex.capabilities, Capabilities::BASELINE);
 
         let custom = harnesses
             .iter()
             .find(|harness| harness.id == "solo-codex")
             .unwrap();
         assert_eq!(custom.source, "manifest");
+        assert_eq!(custom.capabilities, Capabilities::BASELINE);
         assert_eq!(
             custom.manifest_path.as_deref(),
             Some(manifest.to_string_lossy().as_ref())
@@ -2691,6 +2993,21 @@ mod tests {
     }
 
     #[test]
+    fn harness_summary_serializes_declared_capabilities() {
+        let harnesses = built_in_harnesses();
+        let json = serde_json::to_value(&harnesses).unwrap();
+
+        assert_eq!(json[0]["id"], "codex");
+        assert_eq!(json[0]["capabilities"]["stream"], false);
+        assert_eq!(json[0]["capabilities"]["preassigned_session_id"], false);
+        assert_eq!(json[1]["id"], "claude");
+        assert_eq!(json[1]["capabilities"]["stream"], true);
+        assert_eq!(json[1]["capabilities"]["preassigned_session_id"], true);
+        assert_eq!(json[1]["capabilities"]["think"], true);
+        assert_eq!(json[1]["capabilities"]["speed"], true);
+    }
+
+    #[test]
     fn codex_forwards_model_before_prompt_with_prefix_stripped() -> anyhow::Result<()> {
         // Spec resolution reads the adapter env vars; hold the shared env
         // lock so a concurrent test's tempdir manifest never vanishes mid-read.
@@ -2983,6 +3300,7 @@ mod tests {
             sandbox: None,
             capabilities: Capabilities::BASELINE,
             stream_args: None,
+            continuity_args: None,
         };
         assert!(!spec.supports_permission());
         assert!(spec.sandbox_args(Permission::Full).is_empty());

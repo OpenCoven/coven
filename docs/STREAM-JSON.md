@@ -2,7 +2,7 @@
 
 `coven run <harness> --stream-json` emits newline-delimited JSON events on
 stdout. With `--stream-json-input`, user messages are read line-by-line from
-stdin as JSON (claude harness only).
+stdin as JSON when the selected harness declares native stream support.
 
 The schema matches `OpenClaw bridge-code`; SDKs that target Coven Code work
 unchanged against Coven CLI. Coven additionally emits the `output` event
@@ -48,7 +48,7 @@ bytes never interleave with the stream. `text` is the raw PTY text: it may
 contain ANSI escape sequences, carriage returns, and partial lines, and
 chunk boundaries follow PTY reads rather than line breaks. Consumers that
 want clean text should concatenate the `text` fields in order and strip
-escapes. Never emitted on the claude pass-through path.
+escapes. Never emitted on the native stream pass-through path.
 
 ### `result` - emitted once at end
 
@@ -73,14 +73,16 @@ Each line is one JSON object with the same shape as the `user` event's
 
 `image` content blocks use `source.type = "path"` (local file) or
 `source.type = "base64"` (inline). `--stream-json-input` requires
-`--stream-json` and is only consumed when the harness is `claude`; for
-non-stream harnesses the flag is accepted but no stdin forwarding occurs.
+`--stream-json` and is only forwarded when the selected harness declares
+`capabilities.stream`; for non-stream harnesses the flag is accepted but no
+stdin forwarding occurs.
 
 ## Harness behavior
 
-- **claude**: passes through claude's native stream-json events, framed by
-  Coven's `system` and `result`. Coven does *not* synthesize a `user` event
-  on this path; claude emits its own when it processes the prompt.
+- **Stream-capable harnesses**: Coven launches the harness with its declared
+  `stream_args` and passes through the harness's native JSONL events, framed by
+  Coven's `system` and `result`. Coven does *not* synthesize a `user` event on
+  this path; the harness emits its own when it processes the prompt.
 
 - **codex**: Coven launches `codex exec --json` as a one-shot, ordinary-pipe
   process and translates completed Codex agent messages into Coven

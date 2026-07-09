@@ -28,8 +28,8 @@ A Coven harness adapter defines:
 - prompt argument shape for interactive mode;
 - prompt argument shape for non-interactive mode;
 - install/authentication hint for `coven doctor`; and
-- optional **declared behavior**: `capabilities`, `sandbox`, and
-  `stream_args` (the [coven-runtimes](https://github.com/OpenCoven/coven-runtimes)
+- optional **declared behavior**: `capabilities`, `sandbox`, `stream_args`,
+  and `continuity_args` (the [coven-runtimes](https://github.com/OpenCoven/coven-runtimes)
   manifest additions — see below).
 
 The current implementation expects the prompt to be the final command argument after any fixed prefix args. Keep that invariant unless the adapter explicitly documents a safer stdin or protocol mode.
@@ -98,6 +98,12 @@ adapters deserialize unchanged with everything off):
         "prefix_args": ["--print", "--input-format", "stream-json", "--output-format", "stream-json"],
         "session_id_flag": "--session-id",
         "resume_flag": "--resume"
+      },
+      "continuity_args": {
+        "init_prefix_args": ["--print"],
+        "resume_prefix_args": ["--print"],
+        "session_id_flag": "--session-id",
+        "resume_flag": "--resume"
       }
     }
   ]
@@ -108,11 +114,19 @@ adapters deserialize unchanged with everything off):
   long-lived stream-json mode, exactly like the bundled Claude adapter (which
   declares the same fields internally). `stream` requires `stream_args`;
   `stream_args` without `stream` is rejected as dead config.
-- `capabilities.preassigned_session_id` requires `stream_args.session_id_flag`.
+- `capabilities.preassigned_session_id` requires a session id flag in either
+  `stream_args` or `continuity_args`.
+- `continuity_args` tells one-shot non-interactive runs how to initialize or
+  resume an upstream conversation. `session_id_flag` is only valid when
+  `capabilities.preassigned_session_id` is true; resume-only adapters can omit
+  it and use `resume_prefix_args` to place the resumed session id as a
+  positional argument.
 - `sandbox` maps `coven run --permission <full|read-only>` to the harness's
   native flags. Two forms: a single `--flag value` pair per policy (shown
   above), or an argv list per policy for boolean/multi-token permission flags:
   `{ "full_args": ["--allow-all"], "read_only_args": ["--deny-tool", "write"] }`.
+- `coven adapter list --json` includes the declared `capabilities` block for
+  every bundled or manifest adapter, using the same field names as manifests.
 - Adapters that declare none of this keep today's conservative behavior:
   one-shot launches only, `--permission` is a warned no-op.
 

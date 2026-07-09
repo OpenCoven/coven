@@ -199,7 +199,7 @@ enum Command {
         #[arg(
             long,
             requires = "stream_json",
-            help = "Read JSONL user messages from stdin (claude harness only; requires --stream-json)"
+            help = "Read JSONL user messages from stdin (stream-capable harnesses only; requires --stream-json)"
         )]
         stream_json_input: bool,
     },
@@ -2148,9 +2148,9 @@ fn should_synthesize_stream_user_event(
     stream_json: bool,
     expanded_prompt: &str,
     detach: bool,
-    harness_id: &str,
+    stream_harness_passthrough: bool,
 ) -> bool {
-    stream_json && !expanded_prompt.is_empty() && (detach || harness_id != "claude")
+    stream_json && !expanded_prompt.is_empty() && (detach || !stream_harness_passthrough)
 }
 
 /// Doctor-style commands print their findings and exit 1 directly so scripts
@@ -2395,13 +2395,14 @@ fn run_session(
 
     // We synthesize the `user` event only on paths where the harness will
     // *not* emit it itself: detach (no harness runs) and codex / generic
-    // non-stream harnesses. The claude pass-through skips this so we don't
-    // duplicate the user message claude echoes through its native protocol.
+    // non-stream harnesses. Native pass-through skips this so we don't
+    // duplicate the user message the harness echoes through its protocol.
+    let stream_harness_passthrough = stream_json && selected_harness.capabilities.stream;
     let synthesize_user_event = should_synthesize_stream_user_event(
         stream_json,
         &expanded_prompt,
         detach,
-        &selected_harness.id,
+        stream_harness_passthrough,
     );
 
     if detach {
@@ -2445,24 +2446,44 @@ fn run_session(
         &current_timestamp(),
     )?;
 
-    // Claude's native long-lived stream-json: pipe its JSONL events through
-    // ours between the init/result frames we already emit. Codex's `--json`
-    // protocol is one-shot and is bridged below after the harness is resolved.
-    if stream_json && selected_harness.id == "claude" {
+    // Native stream-json harnesses pipe their JSONL events through ours between
+    // the init/result frames we already emit. Codex's declared non-stream
+    // JSONL protocol is one-shot and is bridged below after command
+    // construction; other non-stream harnesses take the captured PTY path so
+    // stdout stays JSONL-only.
+    if stream_harness_passthrough {
         let stdout = io::stdout();
         let mut handle = stdout.lock();
-        let claude_system_prompt: Option<String> =
-            familiar_ctx.as_ref().map(|f| f.identity_preamble());
-        let exit_code = pty_runner::stream_claude(
-            &cwd,
-            &record.id,
-            is_resume,
+        let stream_conversation_hint = if is_resume {
+            harness::ConversationHint::Resume {
+                id: record.id.clone(),
+            }
+        } else {
+            harness::ConversationHint::Init {
+                id: record.id.clone(),
+            }
+        };
+        let familiar_for_args = spec
+            .as_ref()
+            .filter(|s| s.system_prompt_flag.is_some())
+            .and(familiar_ctx.as_ref());
+        let command = pty_runner::build_stream_harness_command_with_conversation(
+            &selected_harness.id,
             &effective_prompt,
+            &cwd,
             stream_json_input,
-            claude_system_prompt.as_deref(),
+            Some(&stream_conversation_hint),
+            familiar_for_args,
             launch_options,
-            &mut handle,
         );
+        let exit_code = command.and_then(|command| {
+            pty_runner::stream_harness(
+                &command,
+                stream_json_input,
+                &selected_harness.id,
+                &mut handle,
+            )
+        });
         drop(handle);
         let exit_code = match exit_code {
             Ok(code) => code,
@@ -3360,22 +3381,20 @@ mod tests {
     }
 
     #[test]
-    fn stream_json_user_event_synthesis_skips_live_claude_passthrough() {
+    fn stream_json_user_event_synthesis_skips_live_stream_passthrough() {
         assert!(should_synthesize_stream_user_event(
-            true, "hello", true, "claude"
+            true, "hello", true, false
         ));
         assert!(should_synthesize_stream_user_event(
-            true, "hello", false, "codex"
+            true, "hello", false, false
         ));
         assert!(!should_synthesize_stream_user_event(
-            true, "hello", false, "claude"
+            true, "hello", false, true
         ));
         assert!(!should_synthesize_stream_user_event(
-            false, "hello", false, "codex"
+            false, "hello", false, false
         ));
-        assert!(!should_synthesize_stream_user_event(
-            true, "", true, "codex"
-        ));
+        assert!(!should_synthesize_stream_user_event(true, "", true, false));
     }
 
     #[test]
@@ -4645,6 +4664,7 @@ mod tests {
             executable: id.to_string(),
             available,
             install_hint: String::new(),
+            capabilities: coven_runtime_spec::Capabilities::BASELINE,
             source: "built-in".to_string(),
             manifest_path: None,
         }
@@ -4719,6 +4739,7 @@ mod tests {
             executable: id.to_string(),
             available,
             install_hint: install_hint.to_string(),
+            capabilities: coven_runtime_spec::Capabilities::BASELINE,
             source: "built-in".to_string(),
             manifest_path: None,
         }
