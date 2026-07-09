@@ -105,40 +105,46 @@ Do not use gradients or glows for:
 
 ## Typography
 
-Use the repo typography tokens.
+Coven uses a three-face system: **classical serif for identity, technical sans for reading, purpose-built mono for inspection.** Each face has one job.
 
 ```css
-/* UI / body — Inter is canonical; Geist Sans is fine on Vercel/Next surfaces */
+/* Display / brand — EB Garamond is canonical (headlines, hero, ceremonial only) */
+--oc-font-display: "EB Garamond", "Iowan Old Style", Georgia, "Times New Roman", serif;
+
+/* UI / body — Inter is canonical (everything you read) */
 --oc-font-ui: Inter, "SF Pro Text", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
 
-/* Display — headlines and hero copy only */
---oc-font-display: Satoshi, "Neue Montreal", Geist, Inter, "SF Pro Display", -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
-
-/* Mono — JetBrains Mono is canonical; SF Mono is the Apple fallback */
+/* Mono — JetBrains Mono is canonical (everything you inspect) */
 --oc-font-mono: "JetBrains Mono", "SF Mono", SFMono-Regular, ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
 
---oc-tracking-heading: -0.02em;
---oc-tracking-hero: -0.055em;
---oc-tracking-label: 0.14em;
---oc-line-body: 1.4;
+--oc-tracking-heading: -0.02em;   /* sans headings — tight */
+--oc-tracking-hero: -0.055em;     /* sans hero — very tight */
+--oc-tracking-display: -0.005em;  /* EB Garamond headings — near-zero */
+--oc-tracking-label: 0.14em;      /* uppercase mono badges */
+--oc-line-body: 1.4;              /* sans body */
+--oc-line-prose: 1.55;            /* serif long-form */
 --oc-line-heading: 1.2;
 ```
 
 ### CovenCave Defaults
 
-Cave (`coven-cave`) uses a user-selectable font catalog. The configured defaults:
-- **Sans:** `geist` — `--font-geist-sans`, preloaded, renders immediately
-- **Mono:** `jetbrains-mono` — `--font-jetbrains-mono`, matches DESIGN.md canon
+Cave (`coven-cave`) uses a user-selectable font catalog. The configured defaults follow DESIGN.md canon:
+- **Display (serif):** `eb-garamond` — `--font-eb-garamond`
+- **Sans (UI):** `inter` — `--font-inter`
+- **Mono (code):** `jetbrains-mono` — `--font-jetbrains-mono`
+
+Geist Sans and Geist Mono remain in the selectable catalog as clean alternatives; they are no longer the shipped defaults.
 
 ### Typography Rules
 
-- Use UI font for product surfaces, controls, tables, body text, and docs prose.
-- Use display font for hero headlines and major product headings only.
-- Use mono font for ALL of: commands, session IDs, logs, event streams, diffs, paths, hashes, API payloads, terminal output, and uppercase labels / badges.
+- **Serif is for identity moments only.** Headlines, hero, hero eyebrows, ceremonial sections, marketing spreads, print. Never body copy, never labels, never dense operational UI.
+- **Sans is for everything you read.** Body, chat, prose, controls, tables, docs, forms, chrome.
+- **Mono is for everything you inspect.** Code, terminal, identifiers, uppercase labels, badges, metadata, timestamps, keyboard hints.
+- **Real italics matter.** EB Garamond has a distinctive italic — use it for pull-quotes, kickers, and named entities in lore copy. Do not synthesize italics on a font without a real italic style.
 - JetBrains Mono is the canonical mono face — prefer it over SF Mono, Geist Mono, or system mono on any surface where you control the font.
-- Keep body line height at 1.4 and headings at 1.2.
+- Keep sans body line height at 1.4, serif prose at 1.55, headings at 1.2.
 - Avoid all-caps except for compact labels, badges, and nav group headings.
-- Do not add playful, cursive, serif, or decorative fonts.
+- **Do not add playful, cursive, or novelty fonts.** Rounded display faces (retired: Fredoka) are banned; a serif has replaced them where identity was needed.
 
 ## Spacing And Shape
 

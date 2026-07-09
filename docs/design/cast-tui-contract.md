@@ -47,7 +47,7 @@ The whole product is one frame: black surface, monospace, sparse. Cast Codes sho
 
 ### 2.3 Typography (within a monospace TUI)
 
-The DESIGN.md type stacks (Inter / Satoshi) do not apply inside a terminal — everything is `--oc-font-mono`. What we adapt:
+The DESIGN.md type stacks (Inter for UI, EB Garamond for display) do not apply inside a terminal — everything is `--oc-font-mono`. What we adapt:
 
 - **Headers**: rendered as a single line in `PRIMARY_STRONG` (`#9A8ECD`), Title Case, no decoration. *No* leading sigils, em‑dashes, or `>` glyphs.
 - **Labels**: rendered in `FIELD_LABEL` (`TEXT_MUTED`), lowercase, no colon at the end of the rendered string — the column gap is the separator. Allowed exception: ALL‑CAPS short label chips like `SAFE`, `CONFIRM`, `REJECT`, `LIVE` (semantic only, two‑word max).

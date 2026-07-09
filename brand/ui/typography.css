@@ -1,43 +1,54 @@
-/* OpenCoven typography tokens. Do not bundle commercial fonts without license. */
+/* OpenCoven typography tokens.
+   Do not bundle commercial fonts without license.
+
+   Canon (DESIGN.md §4):
+     - Display face is EB Garamond (classical old-style serif — identity).
+     - UI/body face is Inter (highly legible sans — everything you read).
+     - Mono face is JetBrains Mono (best-in-class dev mono — everything you inspect).
+
+   Cave (Next.js) loads these via next/font/google in src/app/fonts.ts and
+   exposes them through the --font-* cssVars referenced below. Non-Cave
+   surfaces (landing, docs, Grimoire) should self-host the same three
+   families (all free/open-source on Google Fonts) using @font-face and
+   then map them to the same --oc-font-* tokens.
+*/
 :root {
   /* ── UI / body ────────────────────────────────────────────────────────────
-     Inter is the canonical cross-platform choice.
-     Geist is acceptable on Vercel/Next surfaces (e.g. CovenCave) because it
-     is already loaded as the Next.js default and is visually equivalent.
+     Inter is the canonical cross-platform choice — the sans you read.
      Never swap for serif, decorative, or novelty faces. */
   --oc-font-ui:
-    Inter, "SF Pro Text", -apple-system, BlinkMacSystemFont,
-    "Segoe UI", system-ui, sans-serif;
+    var(--font-inter, Inter), "SF Pro Text", -apple-system,
+    BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
 
   /* ── Display / brand ──────────────────────────────────────────────────────
-     Headlines, hero copy, and major product headings only.
-     Satoshi is preferred; Neue Montreal is a close alternative.
-     Do not use display font in dense operational UI. */
+     EB Garamond — headlines, hero copy, ceremonial spreads, marketing.
+     Classical old-style serif; reads as grimoire, not corporate.
+     Iowan Old Style is a very close macOS/iOS system fallback; Georgia
+     is the safe cross-platform net. Do not use display font in dense
+     operational UI. */
   --oc-font-display:
-    Satoshi, "Neue Montreal", Geist,
-    Inter, "SF Pro Display", -apple-system, BlinkMacSystemFont,
-    system-ui, sans-serif;
+    var(--font-eb-garamond, "EB Garamond"),
+    "Iowan Old Style", Georgia, "Times New Roman", serif;
 
   /* ── Mono / code ──────────────────────────────────────────────────────────
      JetBrains Mono is the canonical mono face for OpenCoven.
      Use for: code blocks, terminal output, session IDs, hashes, paths,
      API payloads, event streams, diffs, and ALL uppercase labels / badges.
-     SF Mono is the Apple-platform fallback.
-     Geist Mono is acceptable on Vercel/Next surfaces (e.g. CovenCave)
-     as the preloaded default — switch to JetBrains Mono as the default
-     per the Cave font-catalog (DEFAULT_FONT_ID.mono = "jetbrains-mono"). */
+     SF Mono is the Apple-platform fallback. */
   --oc-font-mono:
-    "JetBrains Mono", "SF Mono", SFMono-Regular,
+    var(--font-jetbrains-mono, "JetBrains Mono"), "SF Mono", SFMono-Regular,
     ui-monospace, Menlo, Monaco, Consolas,
     "Liberation Mono", monospace;
 
   /* ── Tracking ─────────────────────────────────────────────────────────── */
-  --oc-tracking-heading: -0.02em;
-  --oc-tracking-hero:    -0.055em;
-  --oc-tracking-label:    0.14em;   /* uppercase badges, nav group eyebrows */
+  --oc-tracking-heading: -0.02em;   /* sans headings — tight */
+  --oc-tracking-hero:    -0.055em;  /* sans hero — very tight */
+  --oc-tracking-display: -0.005em;  /* EB Garamond headings — near-zero, its proportions already read tight */
+  --oc-tracking-label:    0.14em;   /* uppercase mono badges, nav group eyebrows */
 
   /* ── Line height ──────────────────────────────────────────────────────── */
-  --oc-line-body:    1.4;
+  --oc-line-body:    1.4;   /* sans body */
+  --oc-line-prose:   1.55;  /* long-form serif prose */
   --oc-line-heading: 1.2;
 
   /* ── Weight scale ─────────────────────────────────────────────────────── */
@@ -47,15 +58,19 @@
 /* ── Baseline element bindings ──────────────────────────────────────────── */
 body           { font-family: var(--oc-font-ui); }
 h1, h2, h3,
-.oc-display    { font-family: var(--oc-font-display); letter-spacing: var(--oc-tracking-heading); }
+.oc-display    {
+  font-family: var(--oc-font-display);
+  letter-spacing: var(--oc-tracking-display);
+  font-weight: 600;
+}
 code, pre,
 kbd, samp,
 .oc-mono       { font-family: var(--oc-font-mono); }
 
 /* ── CovenCave defaults (Next.js app) ────────────────────────────────────
    Cave exposes a user-selectable font catalog (src/lib/font-catalog.ts).
-   The configured defaults are:
-     Sans (UI):  Geist  → --font-geist-sans  (preloaded)
-     Mono (code): JetBrains Mono → --font-jetbrains-mono
-   These match DESIGN.md intent: clean neutral sans + best-in-class dev mono.
+   The configured defaults follow DESIGN.md canon:
+     Display: EB Garamond → --font-eb-garamond
+     Sans:    Inter       → --font-inter
+     Mono:    JetBrains   → --font-jetbrains-mono
    Override via Settings → Appearance → Fonts in the Cave UI. */

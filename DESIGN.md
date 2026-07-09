@@ -110,41 +110,53 @@ Do not substitute gradient, mark-only, black-only, monoline, or external avatar 
 
 ## 4. Typography
 
-### Primary Typefaces
+### The Coven Type System
+
+Coven typography is a three-face system: **a classic serif for identity, a technical sans for everything you read, and a purpose-built mono for everything you inspect.** Each face has one job. They never blur.
+
+**Display / Brand (Headlines, Hero, Ceremonial Moments):**
+- **EB Garamond** — canonical. A classical, book-worn old-style serif. Reads as *grimoire*, not corporate. Italics carry real charm for lore-y phrasing. Free on Google Fonts, variable, cheap to ship.
+- Fallback: `"EB Garamond", "Iowan Old Style", Georgia, "Times New Roman", serif`
 
 **UI / Body (Default):**
-- **Inter** — canonical cross-platform choice
-- **Geist Sans** — acceptable on Vercel/Next surfaces (CovenCave default; already preloaded)
-- **SF Pro Text** — Apple-platform fallback
+- **Inter** — canonical. Highly legible at every size, huge weight range, works at 11px labels and 20px prose alike.
+- **SF Pro Text** — Apple-platform fallback (visually equivalent on macOS/iOS)
 - Fallback: system-ui stack
 
-**Display / Brand (Headlines, Hero):**
-- **Satoshi** — preferred; distinctive but technical
-- **Neue Montreal** — alternative, modern, geometric
-- **Geist** — fallback if Satoshi unavailable
-
-**Mono / Code:**
-- **JetBrains Mono** — canonical for all code, terminal output, session IDs, hashes, paths, labels, and badges
+**Mono / Code (Terminal, Identifiers, Metadata):**
+- **JetBrains Mono** — canonical. Best-in-class readability for code, terminal output, session IDs, hashes, paths, API payloads, event streams, diffs, and ALL uppercase labels / badges.
 - **SF Mono** — Apple-platform fallback
-- **Geist Mono** — acceptable on Vercel/Next surfaces (CovenCave preloaded default; swap to JetBrains Mono as user-selectable default)
 
 ### CovenCave Font Defaults
-Cave exposes a user-selectable font catalog (`src/lib/font-catalog.ts`). Configured defaults:
-- **Sans:** `geist` → `--font-geist-sans` (preloaded, renders immediately)
-- **Mono:** `jetbrains-mono` → `--font-jetbrains-mono` (matches DESIGN.md canon)
+Cave exposes a user-selectable font catalog (`src/lib/font-catalog.ts`). Configured defaults follow this canon:
+- **Serif (display):** `eb-garamond` → `--font-eb-garamond` (used for headlines, hero copy, and the home-composer wordmark)
+- **Sans (UI):** `inter` → `--font-inter` (used for body, controls, tables, chat, prose, dense chrome)
+- **Mono (code):** `jetbrains-mono` → `--font-jetbrains-mono` (used for code, terminal, labels, identifiers)
+
+Cave keeps Geist Sans and Geist Mono in the selectable catalog as clean alternatives, but the shipped default now matches the OpenCoven canon end-to-end.
 
 ### Rules
-- **Tight tracking** on headers (letterspacing: -0.02em)
-- **No playful fonts** — maintain authority
-- **Avoid all-caps** except for labels / badges
-- **Line height:** 1.4 for body, 1.2 for headers
-- **Font weights:** Regular (400) for body, Semi-bold (600) for emphasis, Bold (700) for headers
+- **Serif is for identity moments only.** Headlines, hero, hero eyebrows, ceremonial sections, marketing spreads, print. Never body copy, never labels, never dense UI.
+- **Sans is for everything you read.** Body copy, chat, prose, controls, tables, docs, form fields, chrome.
+- **Mono is for everything you inspect.** Code, terminal, identifiers, uppercase labels, badges, metadata, timestamps, keyboard hints.
+- **Tight tracking** on serif and sans headers (letterspacing: -0.02em on sans; serif runs closer to `0` because EB Garamond's proportions already read tight)
+- **Real italics matter.** EB Garamond has a distinctive italic — use it for pull-quotes, kickers, and named entities in lore copy. Do not synthesize italics with `font-style: italic` on a font without a real italic.
+- **No playful fonts.** No rounded display faces (retired: Fredoka), no cursive, no novelty, no decorative sans.
+- **Avoid all-caps** except for compact labels / badges (mono, small, tracked wide).
+- **Line height:** 1.4 for sans body, 1.5–1.6 for serif prose, 1.2 for headings.
+- **Font weights:** Regular (400) for body, Medium (500) for UI emphasis, Semi-bold (600) for section headers, Bold (700) for hero-scale headlines.
 
 ### Implementation Files
 ```
 /brand/ui/
-  └── typography.css    # Font stack, scales, weights
+  └── typography.css    # Font stack, scales, weights (canonical)
+
+# Cave-side runtime bindings
+/src/app/fonts.ts               # next/font/google declarations
+/src/lib/font-catalog.ts        # Selectable catalog + defaults
+/src/styles/home-composer.css   # Home headline uses --font-eb-garamond
 ```
+
 
 ---
 
@@ -190,7 +202,7 @@ OpenCoven UI uses a **field manual aesthetic**: high information density, monosp
 
 ### Typography in UI
 ```
-Display / headlines:  Inter, 800 weight, -0.025em tracking
+Display / headlines:  EB Garamond, 600 weight, -0.005em tracking
 Body copy:            Inter, 400 weight, 1.65 line-height
 Labels / badges:      JetBrains Mono, 700, 0.14–0.18em letter-spacing, uppercase
 Code / terminal:      JetBrains Mono, 400
@@ -213,7 +225,7 @@ Code / terminal:      JetBrains Mono, 400
 ### Hero Section
 - **Background:** `#080808` — pure flat black
 - **No ambient wash divs, no radial halos, no grid overlays**
-- **Headline:** Inter 800, flat `#9A8ECD` span (no gradient clip)
+- **Headline:** EB Garamond 600, flat `#9A8ECD` span (no gradient clip). The serif carries the identity; Inter would read too corporate here.
 - **Kicker:** JetBrains Mono, 10px, 0.18em tracking, prefixed with a 20px violet rule
 - **CTAs:** Sharp corners, monospace labels; primary is solid violet fill
 - **Workspace card:** solid `#0f0f0f` surface, no backdrop-filter, no inner glow
@@ -527,12 +539,15 @@ border: 1px solid rgba(255, 255, 255, 0.08);
 
 ### Using Fonts
 ```css
-/* UI */
-font-family: 'Inter', 'SF Pro', system-ui, sans-serif;
+/* Body / UI */
+font-family: 'Inter', 'SF Pro Text', system-ui, sans-serif;
 
-/* Headers */
-font-family: 'Satoshi', 'Neue Montreal', sans-serif;
-letter-spacing: -0.02em;
+/* Display / Headlines / Hero */
+font-family: 'EB Garamond', 'Iowan Old Style', Georgia, 'Times New Roman', serif;
+letter-spacing: -0.005em;
+
+/* Code / Terminal / Labels */
+font-family: 'JetBrains Mono', 'SF Mono', ui-monospace, Menlo, monospace;
 ```
 
 ### Logo Usage
@@ -551,12 +566,13 @@ letter-spacing: -0.02em;
 
 ## 13. Versioning & Maintenance
 
-**Current Version:** 1.1.0 (2026-05-24)
+**Current Version:** 1.2.0 (2026-07-09)
 
-**Last Reviewed:** 2026-05-24
+**Last Reviewed:** 2026-07-09
 **Reviewed By:** Val + Nova
 
 **Change Log:**
+- **v1.2.0** – Classic Coven type system: **EB Garamond** replaces Satoshi/Neue Montreal as the display face (headlines, hero, ceremonial). **Inter** is the canonical body/UI sans (replaces Geist as the default; Geist remains a Cave-selectable alternative). **JetBrains Mono** stays as the canonical mono. Fredoka is retired from Cave chrome (home-composer headline now serif). Landing hero and Quick-Start rewritten to reflect serif-first identity moments. Rationale: OpenCoven is a coven, not a Vercel demo — the type system should feel like a grimoire.
 - **v1.1.0** – Field manual redesign: no-gradient rule (hard), flat violet `#9A8ECD`, JetBrains Mono for labels, solid surfaces, sharp corners, hover = border-color only. Removed all gradient/glow/glass patterns.
 - **v1.0.0** – Initial production-ready system
 

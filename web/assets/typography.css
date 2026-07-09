@@ -1,16 +1,23 @@
-/* OpenCoven typography tokens. Do not bundle commercial fonts without license. */
+/* OpenCoven typography tokens. Do not bundle commercial fonts without license.
+   Canon (DESIGN.md §4): EB Garamond (display) · Inter (UI) · JetBrains Mono (code). */
 :root {
   --oc-font-ui: Inter, "SF Pro Text", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-  --oc-font-display: Satoshi, "Neue Montreal", Geist, Inter, "SF Pro Display", -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
-  --oc-font-mono: "SF Mono", SFMono-Regular, ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  --oc-font-display: "EB Garamond", "Iowan Old Style", Georgia, "Times New Roman", serif;
+  --oc-font-mono: "JetBrains Mono", "SF Mono", SFMono-Regular, ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
 
   --oc-tracking-heading: -0.02em;
   --oc-tracking-hero: -0.055em;
+  --oc-tracking-display: -0.005em;
   --oc-tracking-label: 0.14em;
   --oc-line-body: 1.4;
+  --oc-line-prose: 1.55;
   --oc-line-heading: 1.2;
 }
 
 body { font-family: var(--oc-font-ui); }
-h1, h2, h3, .oc-display { font-family: var(--oc-font-display); letter-spacing: var(--oc-tracking-heading); }
+h1, h2, h3, .oc-display {
+  font-family: var(--oc-font-display);
+  letter-spacing: var(--oc-tracking-display);
+  font-weight: 600;
+}
 code, pre, kbd, samp, .oc-mono { font-family: var(--oc-font-mono); }

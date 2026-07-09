@@ -50,7 +50,7 @@ description: "Tracks OpenCoven brand adherence across landing, docs, and package
 
 ## Exceptions
 
-1. **Font files are not vendored.** `typography.css` uses local/system font stacks (`Satoshi`, `Neue Montreal`, `Geist`, `Inter`, SF Pro). This avoids licensing mistakes. If OpenCoven wants exact Satoshi rendering in production, add licensed font files under `brand/fonts/` with license notes.
+1. **Font files are not vendored.** `typography.css` uses local/system font stacks (`EB Garamond`, `Inter`, `JetBrains Mono`, SF Pro Text, SF Mono). All three canonical faces are free/open-source on Google Fonts — Cave loads them at runtime via `next/font/google`, and other surfaces should self-host via `@font-face` from those sources. This avoids licensing mistakes while still giving pixel-identical rendering everywhere.
 2. **Landing still has inline page CSS.** It now imports token files and uses `web/brand.css` as the enforcement layer, but a later cleanup should split layout CSS into `web/page.css` for easier review.
 3. **Logo variants are not approved for public surfaces.** Public docs, README, packages, and landing chrome should use the black-background, white-icon logo only.
 4. **OG image uses local generated raster output.** It should be regenerated whenever the logo or primary tagline changes.
