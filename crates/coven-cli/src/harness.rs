@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
+use coven_runtime_spec::Capabilities;
 use serde::{Deserialize, Serialize};
 
 pub const EXTERNAL_ADAPTER_MANIFEST_ENV: &str = "COVEN_HARNESS_ADAPTER_MANIFEST";
@@ -133,12 +134,26 @@ impl<'a> HarnessLaunchOptions<'a> {
     }
 }
 
+/// Declared capabilities for a configured harness id. Built-in harnesses
+/// declare theirs in [`built_in_harness_specs`]; ids that don't match a
+/// built-in (external adapters, unknown ids) get the conservative baseline
+/// (all off), which matches today's behavior — external adapters can't
+/// declare capabilities until the manifest loader learns to read them
+/// (coven-runtimes integration.md, PR 2).
+fn declared_capabilities(harness_id: &str) -> Capabilities {
+    built_in_harness_specs()
+        .into_iter()
+        .find(|spec| spec.id == harness_id)
+        .map(|spec| spec.capabilities)
+        .unwrap_or(Capabilities::BASELINE)
+}
+
 /// Whether the harness CLI has a long-lived JSON-streaming mode the daemon
 /// can keep alive across chat turns. Claude does (`stream-json`); codex
 /// doesn't (only one-shot `codex exec`). Unix kills the stream process tree
 /// with process groups; Windows uses a Job Object owned by the daemon.
 pub fn harness_supports_stream_mode(harness_id: &str) -> bool {
-    harness_id == "claude"
+    declared_capabilities(harness_id).stream
 }
 
 /// Hint passed when a chat turn wants to participate in a multi-turn
@@ -170,15 +185,15 @@ impl ConversationHint {
 /// session ids (e.g. codex) return `false`; the chat app captures the id from
 /// the first turn's output instead. See `docs/chat-persistence.md`.
 pub fn harness_supports_preassigned_session_id(harness_id: &str) -> bool {
-    harness_id == "claude"
+    declared_capabilities(harness_id).preassigned_session_id
 }
 
 pub fn harness_supports_think(harness_id: &str) -> bool {
-    harness_id == "claude"
+    declared_capabilities(harness_id).think
 }
 
 pub fn harness_supports_speed(harness_id: &str) -> bool {
-    harness_id == "claude"
+    declared_capabilities(harness_id).speed
 }
 
 /// How a harness translates a `Permission` into its native sandbox flag.
@@ -221,6 +236,13 @@ pub struct HarnessCommandSpec {
     /// means the harness declares no sandbox mechanism, so `--permission` is a
     /// warned no-op for it (mirrors `model_flag`).
     pub sandbox: Option<SandboxMapping>,
+    /// Behavioral capabilities (stream mode, session pre-assignment, think,
+    /// speed). Shared type with the coven-runtimes manifest spec so built-in
+    /// harnesses and external adapters declare what they can do through the
+    /// same struct instead of hardcoded harness-id checks. External adapters
+    /// currently get the conservative baseline (all off); reading these from
+    /// the manifest is the follow-up loader change (integration.md, PR 2).
+    pub capabilities: Capabilities,
 }
 
 impl HarnessCommandSpec {
@@ -397,6 +419,10 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
                 full: "danger-full-access".to_string(),
                 read_only: "read-only".to_string(),
             }),
+            // One-shot `codex exec` only: no stream-json mode, no session
+            // pre-assignment (ids are captured from the first turn's output),
+            // no think/speed toggles.
+            capabilities: Capabilities::BASELINE,
         },
         HarnessCommandSpec {
             id: "claude".to_string(),
@@ -418,6 +444,15 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
                 full: "bypassPermissions".to_string(),
                 read_only: "plan".to_string(),
             }),
+            // Long-lived stream-json mode, `--session-id`/`--resume`
+            // pre-assignment, and think/speed via `--effort`. These declared
+            // values replace the former `harness_id == "claude"` checks.
+            capabilities: Capabilities {
+                stream: true,
+                preassigned_session_id: true,
+                think: true,
+                speed: true,
+            },
         },
     ]
 }
@@ -738,6 +773,9 @@ impl ExternalHarnessAdapterSpec {
             // External adapters declare no sandbox mechanism today, so
             // `coven run --permission` warns and continues for them.
             sandbox: None,
+            // Conservative baseline (all off) until the loader reads
+            // `capabilities` from the manifest (integration.md, PR 2).
+            capabilities: Capabilities::BASELINE,
         })
     }
 }
@@ -1478,6 +1516,7 @@ mod tests {
             model_flag: None,
             model_arg_template: None,
             sandbox: None,
+            capabilities: Capabilities::BASELINE,
         };
 
         assert_eq!(
@@ -2071,6 +2110,23 @@ mod tests {
         }
     }
 
+    /// The capability model replaces the former `harness_id == "claude"`
+    /// string checks: claude declares everything, codex stays baseline, and
+    /// anything else (external adapters, unknown ids) is baseline until the
+    /// manifest loader learns to read `capabilities` (integration.md, PR 2).
+    #[test]
+    fn built_in_capabilities_match_former_string_checks() {
+        let claude = declared_capabilities("claude");
+        assert!(claude.stream);
+        assert!(claude.preassigned_session_id);
+        assert!(claude.think);
+        assert!(claude.speed);
+
+        assert!(declared_capabilities("codex").is_baseline());
+        assert!(declared_capabilities("hermes").is_baseline());
+        assert!(declared_capabilities("unknown").is_baseline());
+    }
+
     #[test]
     fn codex_forwards_model_before_prompt_with_prefix_stripped() -> anyhow::Result<()> {
         let (program, args) = command_parts_for_harness_with_conversation(
@@ -2309,6 +2365,7 @@ mod tests {
             model_flag: None,
             model_arg_template: None,
             sandbox: None,
+            capabilities: Capabilities::BASELINE,
         };
         assert!(!spec.supports_permission());
         assert!(spec.sandbox_args(Permission::Full).is_empty());

@@ -44,8 +44,10 @@ multiple-versions = "warn"
 wildcards = "deny"
 
 [sources]
-# Only the official crates.io registry is trusted. Reject unknown registries
-# and any git sources (there are none today).
+# Only the official crates.io registry is trusted, plus the first-party
+# OpenCoven runtime-spec crate (pinned to a release tag in Cargo.toml).
+# Reject unknown registries and any other git sources.
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = ["https://github.com/OpenCoven/coven-runtimes"]
