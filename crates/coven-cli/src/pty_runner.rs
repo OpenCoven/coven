@@ -215,6 +215,44 @@ pub fn run_piped_attached(
     })
 }
 
+/// Run a one-shot Windows harness through ordinary pipes while keeping stdout
+/// available for Coven's stream-JSON protocol. Codex writes its labeled
+/// transcript to stderr, so capture that stream and let the caller wrap it in
+/// JSON `output` events; discard Codex's duplicate plain stdout answer.
+#[cfg(windows)]
+pub fn run_piped_attached_captured(
+    command: &HarnessCommand,
+    mut on_output: Box<dyn FnMut(Vec<u8>) + Send + 'static>,
+) -> Result<PtyRunResult> {
+    let mut child = std::process::Command::new(&command.program)
+        .args(&command.args)
+        .current_dir(&command.cwd)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "failed to spawn harness `{}` in captured piped mode",
+                command.program()
+            )
+        })?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .context("captured piped harness did not expose stderr")?;
+    drain_detached_output(&mut stderr, Some(&mut on_output));
+    let status = child.wait().context("failed waiting for piped harness")?;
+    Ok(PtyRunResult {
+        status: if status.success() {
+            "completed"
+        } else {
+            "failed"
+        },
+        exit_code: status.code(),
+    })
+}
+
 /// Run `claude` in its native stream-JSON mode, framed by the caller (which
 /// emits Coven's own `system.init` / `result` around the call).
 ///

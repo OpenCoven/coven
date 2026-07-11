@@ -2180,7 +2180,21 @@ fn run_session(
         run_harness_attached(&command, launch_mode, false)
     };
     #[cfg(windows)]
-    let attached = run_harness_attached(&command, launch_mode, stream_json);
+    let attached = if stream_json {
+        let output_session_id = record.id.clone();
+        pty_runner::run_piped_attached_captured(
+            &command,
+            Box::new(move |chunk| {
+                let _ =
+                    emit_stream_event(&stream_json::Event::Output(stream_json::HarnessOutput {
+                        text: String::from_utf8_lossy(&chunk).into_owned(),
+                        session_id: output_session_id.clone(),
+                    }));
+            }),
+        )
+    } else {
+        run_harness_attached(&command, launch_mode, false)
+    };
 
     match attached {
         Ok(result) => {

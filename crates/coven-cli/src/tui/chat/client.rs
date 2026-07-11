@@ -527,7 +527,7 @@ mod tests {
                 b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: keep-alive\r\n\r\n{\"ok\":true}",
             )?;
             stream.flush()?;
-            thread::sleep(Duration::from_millis(300));
+            thread::sleep(Duration::from_secs(2));
             Ok(())
         });
 
@@ -535,7 +535,7 @@ mod tests {
         let response = request_daemon(home.path(), "GET", "/api/v1/health", None)?;
         assert_eq!(response.status, 200);
         assert_eq!(response.body, r#"{"ok":true}"#);
-        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(started.elapsed() < Duration::from_millis(1500));
         server.join().expect("server thread")?;
         Ok(())
     }

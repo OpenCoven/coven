@@ -1469,11 +1469,7 @@ pub(crate) fn read_windows_pipe_http_response(
     std::thread::Builder::new()
         .name("coven-pipe-response".into())
         .spawn(move || {
-            let result = read_http_response_with_deadline(
-                &mut stream,
-                Duration::from_secs(24 * 60 * 60),
-                max_body_bytes,
-            );
+            let result = read_http_response_with_deadline(&mut stream, timeout, max_body_bytes);
             let _ = tx.send(result);
         })
         .context("failed to spawn Windows pipe response reader")?;
@@ -2440,7 +2436,10 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
         local_socket::{prelude::*, GenericNamespaced, ListenerOptions},
         os::windows::local_socket::ListenerOptionsExt,
     };
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     let _ = tcp_addr; // TCP not wired on Windows in this prototype
 
@@ -2469,6 +2468,8 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
         coven_home.to_path_buf(),
     ));
 
+    const MAX_INFLIGHT: usize = 64;
+    let inflight = Arc::new(AtomicUsize::new(0));
     for conn in listener.incoming() {
         let stream = match conn {
             Ok(s) => s,
@@ -2480,7 +2481,30 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
         let conn_home = coven_home.to_path_buf();
         let conn_status = status.clone();
         let conn_runtime = Arc::clone(&runtime);
-        if let Err(error) = std::thread::Builder::new()
+        if inflight.load(Ordering::Relaxed) >= MAX_INFLIGHT {
+            // Backpressure at capacity by serving on the accept thread rather
+            // than allowing stalled clients to create unbounded OS threads.
+            let _ = stream.set_recv_timeout(Some(SOCKET_IO_TIMEOUT));
+            let _ = stream.set_send_timeout(Some(SOCKET_IO_TIMEOUT));
+            if let Err(error) = handle_http_stream(
+                &stream,
+                &stream,
+                &conn_home,
+                Some(conn_status),
+                conn_runtime.as_ref(),
+                Some(MAX_SOCKET_BODY_BYTES),
+                false,
+            ) {
+                if !is_client_disconnect(&error) {
+                    eprintln!("coven daemon: pipe connection error: {error:#}");
+                }
+            }
+            continue;
+        }
+
+        inflight.fetch_add(1, Ordering::Relaxed);
+        let conn_inflight = Arc::clone(&inflight);
+        let spawn_result = std::thread::Builder::new()
             .name("coven-windows-api".into())
             .spawn(move || {
                 // Bound each transaction and isolate it so a stalled client
@@ -2500,8 +2524,10 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
                         eprintln!("coven daemon: pipe connection error: {error:#}");
                     }
                 }
-            })
-        {
+                conn_inflight.fetch_sub(1, Ordering::Relaxed);
+            });
+        if let Err(error) = spawn_result {
+            inflight.fetch_sub(1, Ordering::Relaxed);
             eprintln!("coven daemon: failed to spawn pipe handler: {error:#}");
         }
     }
