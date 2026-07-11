@@ -1268,9 +1268,28 @@ where
         return None;
     }
 
-    paths.into_iter().find_map(|path| {
-        windows_executable_candidates(&path, executable, extensions.clone())
+    let paths: Vec<PathBuf> = paths.into_iter().collect();
+    if Path::new(executable).extension().is_some() {
+        return paths
             .into_iter()
+            .map(|path| path.join(executable))
+            .find(|candidate| candidate.is_file());
+    }
+
+    // Honor PATHEXT precedence globally. Cave intentionally prepends npm's
+    // shim directory to PATH, but Windows prefers a real .EXE over a later
+    // .CMD entry when PATHEXT lists .EXE first. Searching every extension per
+    // directory inverted that rule and selected codex.cmd, which cannot carry
+    // Cave's large multiline prompt safely through cmd.exe.
+    extensions.into_iter().find_map(|extension| {
+        let normalized = if extension.starts_with('.') {
+            extension
+        } else {
+            format!(".{extension}")
+        };
+        paths
+            .iter()
+            .map(|path| path.join(format!("{executable}{normalized}")))
             .find(|candidate| candidate.is_file())
     })
 }
@@ -1468,6 +1487,33 @@ mod tests {
         .expect("codex.cmd should be selected");
 
         assert_eq!(resolved, temp_dir.path().join("codex.cmd"));
+        Ok(())
+    }
+
+    #[test]
+    fn windows_spawn_resolution_honors_pathext_across_path_directories() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let npm_bin = temp_dir.path().join("npm");
+        let app_bin = temp_dir.path().join("app");
+        fs::create_dir_all(&npm_bin)?;
+        fs::create_dir_all(&app_bin)?;
+        fs::write(npm_bin.join("codex.cmd"), "@echo off\r\n")?;
+        fs::write(app_bin.join("codex.exe"), b"")?;
+
+        let resolved = resolve_executable_in_paths_for_windows(
+            "codex",
+            vec![npm_bin, app_bin.clone()],
+            vec![".EXE".to_string(), ".CMD".to_string()],
+        )
+        .expect("codex.exe should win PATHEXT precedence");
+
+        assert_eq!(
+            resolved.to_string_lossy().to_ascii_lowercase(),
+            app_bin
+                .join("codex.exe")
+                .to_string_lossy()
+                .to_ascii_lowercase()
+        );
         Ok(())
     }
 
