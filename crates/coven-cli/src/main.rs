@@ -1488,7 +1488,7 @@ fn launch_patch_session(request: &patch::PatchRequest) -> Result<String> {
         &selected_harness.id,
         &brief,
         &request.repo.root,
-        harness_launch_mode_for_stdio(),
+        harness_launch_mode_for_stdio(&selected_harness.id),
     )?;
     let result = pty_runner::run_attached(&command)?;
     store::update_session_status(
@@ -1694,8 +1694,29 @@ fn render_daemon_status_json(state: Option<&daemon::DaemonStatusState>) -> Resul
     serde_json::to_string_pretty(&value).context("failed to serialize daemon status as JSON")
 }
 
-fn harness_launch_mode_for_stdio() -> harness::HarnessLaunchMode {
-    if io::stdin().is_terminal() && io::stdout().is_terminal() {
+fn harness_launch_mode_for_stdio(harness_id: &str) -> harness::HarnessLaunchMode {
+    harness_launch_mode(
+        harness_id,
+        io::stdin().is_terminal(),
+        io::stdout().is_terminal(),
+        cfg!(windows),
+    )
+}
+
+fn harness_launch_mode(
+    harness_id: &str,
+    stdin_is_terminal: bool,
+    stdout_is_terminal: bool,
+    is_windows: bool,
+) -> harness::HarnessLaunchMode {
+    // `codex <prompt>` opens the long-lived interactive TUI. Under Coven's
+    // Windows ConPTY bridge that child can remain alive without reliably
+    // rendering or persisting its answer. The one-shot `codex exec` path is
+    // supported already and exits after printing the response, so prefer it
+    // for prompted Windows runs even when Coven itself owns a terminal.
+    if is_windows && harness_id == "codex" {
+        harness::HarnessLaunchMode::NonInteractive
+    } else if stdin_is_terminal && stdout_is_terminal {
         harness::HarnessLaunchMode::Interactive
     } else {
         harness::HarnessLaunchMode::NonInteractive
@@ -2121,7 +2142,7 @@ fn run_session(
             // keystrokes for a screen that is never rendered.
             harness::HarnessLaunchMode::NonInteractive
         } else {
-            harness_launch_mode_for_stdio()
+            harness_launch_mode_for_stdio(&selected_harness.id)
         },
         conversation_hint.as_ref(),
         familiar_for_args,
@@ -2941,6 +2962,30 @@ mod tests {
         assert_eq!(
             interactive_shell_route(Some(&Command::Chat), false, false),
             InteractiveShellRoute::PlainCast
+        );
+    }
+
+    #[test]
+    fn windows_codex_prompt_uses_completing_noninteractive_mode() {
+        assert_eq!(
+            harness_launch_mode("codex", true, true, true),
+            harness::HarnessLaunchMode::NonInteractive
+        );
+    }
+
+    #[test]
+    fn launch_mode_preserves_interactive_claude_and_non_windows_codex() {
+        assert_eq!(
+            harness_launch_mode("claude", true, true, true),
+            harness::HarnessLaunchMode::Interactive
+        );
+        assert_eq!(
+            harness_launch_mode("codex", true, true, false),
+            harness::HarnessLaunchMode::Interactive
+        );
+        assert_eq!(
+            harness_launch_mode("codex", false, true, false),
+            harness::HarnessLaunchMode::NonInteractive
         );
     }
 
