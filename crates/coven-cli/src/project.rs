@@ -1,7 +1,24 @@
 use std::path::{Path, PathBuf};
 
 pub fn canonical_project_root(path: &Path) -> anyhow::Result<PathBuf> {
-    Ok(path.canonicalize()?)
+    Ok(normalize_canonical_path(path.canonicalize()?))
+}
+
+#[cfg(windows)]
+fn normalize_canonical_path(path: PathBuf) -> PathBuf {
+    let value = path.to_string_lossy();
+    if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = value.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    path
+}
+
+#[cfg(not(windows))]
+fn normalize_canonical_path(path: PathBuf) -> PathBuf {
+    path
 }
 
 pub fn resolve_inside_root(root: &Path, cwd: Option<&Path>) -> anyhow::Result<PathBuf> {
@@ -11,7 +28,7 @@ pub fn resolve_inside_root(root: &Path, cwd: Option<&Path>) -> anyhow::Result<Pa
         Some(cwd) => root.join(cwd),
         None => root.clone(),
     };
-    let candidate = candidate.canonicalize()?;
+    let candidate = normalize_canonical_path(candidate.canonicalize()?);
 
     if candidate == root || candidate.starts_with(&root) {
         Ok(candidate)
@@ -33,7 +50,7 @@ mod tests {
 
         let actual = canonical_project_root(&root)?;
 
-        assert_eq!(actual, root.canonicalize()?);
+        assert_eq!(actual, normalize_canonical_path(root.canonicalize()?));
         Ok(())
     }
 
@@ -45,7 +62,7 @@ mod tests {
 
         let actual = resolve_inside_root(&root, None)?;
 
-        assert_eq!(actual, root.canonicalize()?);
+        assert_eq!(actual, normalize_canonical_path(root.canonicalize()?));
         Ok(())
     }
 
@@ -59,7 +76,7 @@ mod tests {
 
         let actual = resolve_inside_root(&root, Some(Path::new("child")))?;
 
-        assert_eq!(actual, child.canonicalize()?);
+        assert_eq!(actual, normalize_canonical_path(child.canonicalize()?));
         Ok(())
     }
 
@@ -99,6 +116,17 @@ mod tests {
             error.to_string().contains("outside the Coven project root"),
             "unexpected error: {error:?}"
         );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_project_root_uses_node_compatible_windows_path() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let actual = canonical_project_root(temp_dir.path())?;
+
+        assert!(!actual.to_string_lossy().starts_with(r"\\?\"));
+        assert!(actual.is_absolute());
         Ok(())
     }
 
