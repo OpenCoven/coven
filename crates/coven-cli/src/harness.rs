@@ -1327,7 +1327,7 @@ fn pathext_extensions() -> Vec<String> {
         .unwrap_or_else(|| vec![".COM".into(), ".EXE".into(), ".BAT".into(), ".CMD".into()])
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn windows_executable_candidates(
     path: &Path,
     executable: &str,

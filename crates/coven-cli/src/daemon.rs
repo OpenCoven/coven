@@ -1494,6 +1494,7 @@ pub(crate) fn read_windows_pipe_http_response(
 /// response. HTTP/1.1 frames the body with Content-Length, so consume exactly
 /// that many bytes. The reader is expected to be nonblocking; WouldBlock is
 /// retried until `timeout` expires.
+#[cfg(any(windows, test))]
 pub(crate) fn read_http_response_with_deadline<R: Read>(
     reader: &mut R,
     timeout: Duration,
@@ -1550,6 +1551,7 @@ pub(crate) fn read_http_response_with_deadline<R: Read>(
     }
 }
 
+#[cfg(any(windows, test))]
 fn response_status(headers: &[u8]) -> Result<u16> {
     let headers =
         std::str::from_utf8(headers).context("daemon HTTP response headers were not UTF-8")?;
@@ -1562,10 +1564,12 @@ fn response_status(headers: &[u8]) -> Result<u16> {
         .context("daemon HTTP response had an invalid status")
 }
 
+#[cfg(any(windows, test))]
 fn find_http_header_end(bytes: &[u8]) -> Option<usize> {
     bytes.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
+#[cfg(any(windows, test))]
 fn response_content_length(headers: &[u8]) -> Result<usize> {
     let headers =
         std::str::from_utf8(headers).context("daemon HTTP response headers were not UTF-8")?;

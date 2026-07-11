@@ -113,6 +113,7 @@ pub fn run_attached(command: &HarnessCommand) -> Result<PtyRunResult> {
 /// with the frames (#307). Stdin is still forwarded to the PTY, matching
 /// `run_attached`; raw terminal mode is never enabled because nothing is
 /// echoed back to the caller's terminal.
+#[cfg(not(windows))]
 pub fn run_attached_captured(
     command: &HarnessCommand,
     mut on_output: Box<dyn FnMut(Vec<u8>) + Send + 'static>,
@@ -154,6 +155,7 @@ pub fn run_attached_captured(
 /// pseudo-terminal. Windows Codex `exec` is reliable in this mode while its
 /// ConPTY child can stall before producing output. Inherited handles preserve
 /// the caller's stdout/stderr stream exactly (including Coven's JSON framing).
+#[cfg(windows)]
 pub fn run_piped_attached(
     command: &HarnessCommand,
     merge_stderr_to_stdout: bool,

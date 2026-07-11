@@ -3341,11 +3341,15 @@ mod tests {
         assert_eq!(runtime.launches.borrow()[0].prompt, "hello coven");
         assert_eq!(
             runtime.launches.borrow()[0].project_root,
-            project_root.canonicalize()?.to_string_lossy()
+            project::canonical_project_root(&project_root)?.to_string_lossy()
         );
         assert_eq!(
             runtime.launches.borrow()[0].cwd,
-            cwd.canonicalize()?.to_string_lossy()
+            project::resolve_inside_root(
+                &project::canonical_project_root(&project_root)?,
+                Some(&cwd)
+            )?
+            .to_string_lossy()
         );
         assert!(list.body.contains(r#""title":"Demo""#));
         Ok(())

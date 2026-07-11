@@ -1733,6 +1733,8 @@ fn run_harness_attached(
     if launch_mode == harness::HarnessLaunchMode::NonInteractive {
         return pty_runner::run_piped_attached(command, stream_json);
     }
+    #[cfg(not(windows))]
+    let _ = (launch_mode, stream_json);
     pty_runner::run_attached(command)
 }
 
@@ -2158,7 +2160,29 @@ fn run_session(
         familiar_for_args,
         launch_options,
     )?;
-    match run_harness_attached(&command, launch_mode, stream_json) {
+    // Preserve the JSONL-only captured-output contract from #315 on
+    // non-Windows platforms. Windows Codex must bypass ConPTY and use the
+    // verified ordinary-pipe path so Cave receives a terminal response.
+    #[cfg(not(windows))]
+    let attached = if stream_json {
+        let output_session_id = record.id.clone();
+        pty_runner::run_attached_captured(
+            &command,
+            Box::new(move |chunk| {
+                let _ =
+                    emit_stream_event(&stream_json::Event::Output(stream_json::HarnessOutput {
+                        text: String::from_utf8_lossy(&chunk).into_owned(),
+                        session_id: output_session_id.clone(),
+                    }));
+            }),
+        )
+    } else {
+        run_harness_attached(&command, launch_mode, false)
+    };
+    #[cfg(windows)]
+    let attached = run_harness_attached(&command, launch_mode, stream_json);
+
+    match attached {
         Ok(result) => {
             store::update_session_status(
                 &conn,
