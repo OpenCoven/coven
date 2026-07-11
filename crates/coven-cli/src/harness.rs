@@ -1498,11 +1498,9 @@ mod tests {
         fs::create_dir_all(&npm_bin)?;
         fs::create_dir_all(&app_bin)?;
         fs::write(npm_bin.join("codex.cmd"), "@echo off\r\n")?;
-        let codex_exe = app_bin.join("codex.exe");
-        fs::write(&codex_exe, b"")?;
-        // The resolver uses the host's executable predicate so this Windows
-        // algorithm test also needs an executable bit on Unix CI.
-        make_executable(&codex_exe)?;
+        // Match the simulated PATHEXT spelling exactly so the Windows
+        // algorithm can be tested on a case-sensitive Unix filesystem.
+        fs::write(app_bin.join("codex.EXE"), b"")?;
 
         let resolved = resolve_executable_in_paths_for_windows(
             "codex",
