@@ -6,10 +6,12 @@
 //! ledger-only mutations.
 
 #[cfg(unix)]
-use std::io::{Read, Write};
+use std::io::Read;
+#[cfg(any(unix, windows))]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use anyhow::anyhow;
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -380,14 +382,65 @@ fn request_daemon(
     parse_http_response(&response)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn request_daemon(
+    coven_home: &Path,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> Result<HttpResponse> {
+    use interprocess::{
+        local_socket::{prelude::*, ConnectOptions, GenericNamespaced},
+        ConnectWaitMode,
+    };
+    use std::time::Duration;
+
+    let body = body.map(|value| value.to_string()).unwrap_or_default();
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: coven\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let pipe_name = daemon::windows_pipe_name(coven_home);
+    let name = pipe_name
+        .clone()
+        .to_ns_name::<GenericNamespaced>()
+        .context("failed to parse Coven daemon pipe name")?;
+    let mut stream = ConnectOptions::new()
+        .name(name)
+        .wait_mode(ConnectWaitMode::Timeout(Duration::from_secs(5)))
+        .connect_sync()
+        .with_context(|| {
+            format!(
+                "failed to connect to Coven daemon pipe {pipe_name}; run `coven daemon start` and retry"
+            )
+        })?;
+    stream
+        .write_all(request.as_bytes())
+        .context("failed to write Coven daemon request")?;
+    stream
+        .flush()
+        .context("failed to flush Coven daemon request")?;
+    let (status, body) = daemon::read_windows_pipe_http_response(
+        stream,
+        Duration::from_secs(5),
+        daemon::MAX_SOCKET_BODY_BYTES,
+    )?;
+    let body = String::from_utf8(body).context("Coven daemon response body was not UTF-8")?;
+    if !(200..300).contains(&status) {
+        return Err(daemon_error(status, &body));
+    }
+    Ok(HttpResponse { status, body })
+}
+
+#[cfg(not(any(unix, windows)))]
 fn request_daemon(
     _coven_home: &Path,
     _method: &str,
     _path: &str,
     _body: Option<Value>,
 ) -> Result<HttpResponse> {
-    anyhow::bail!("Coven daemon chat is only implemented on Unix-like systems for now")
+    anyhow::bail!("Coven daemon chat is not implemented on this platform")
 }
 
 #[cfg(unix)]
@@ -411,7 +464,7 @@ fn parse_http_response(response: &str) -> Result<HttpResponse> {
     })
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn daemon_error(status: u16, body: &str) -> anyhow::Error {
     if let Ok(value) = serde_json::from_str::<Value>(body) {
         if let Some(message) = value
@@ -448,6 +501,44 @@ fn session_title(prompt: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_daemon_client_reads_framed_response_without_waiting_for_pipe_close() -> Result<()> {
+        use interprocess::local_socket::{prelude::*, GenericNamespaced, ListenerOptions};
+        use std::io::{Read, Write};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let home = tempfile::tempdir()?;
+        let name = daemon::windows_pipe_name(home.path())
+            .to_ns_name::<GenericNamespaced>()
+            .context("pipe name")?;
+        let listener = ListenerOptions::new().name(name).create_sync()?;
+        let server = thread::spawn(move || -> Result<()> {
+            let mut stream = listener.incoming().next().context("accept ended")??;
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte)?;
+                request.push(byte[0]);
+            }
+            stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: keep-alive\r\n\r\n{\"ok\":true}",
+            )?;
+            stream.flush()?;
+            thread::sleep(Duration::from_millis(300));
+            Ok(())
+        });
+
+        let started = Instant::now();
+        let response = request_daemon(home.path(), "GET", "/api/v1/health", None)?;
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, r#"{"ok":true}"#);
+        assert!(started.elapsed() < Duration::from_millis(250));
+        server.join().expect("server thread")?;
+        Ok(())
+    }
 
     #[cfg(unix)]
     #[test]

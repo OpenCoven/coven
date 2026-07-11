@@ -281,36 +281,8 @@ impl SessionRuntime for LiveSessionRuntime {
                     launch.harness
                 );
             }
-            let piped = pty_runner::spawn_piped_with_observer(&command, observer)?;
-            #[cfg(windows)]
-            let job_handle = {
-                use windows_sys::Win32::{
-                    Foundation::INVALID_HANDLE_VALUE,
-                    System::{
-                        JobObjects::{AssignProcessToJobObject, CreateJobObjectW},
-                        Threading::{OpenProcess, PROCESS_ALL_ACCESS},
-                    },
-                };
-                // SAFETY: Windows API calls; handles are owned by PipedKiller.
-                unsafe {
-                    let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-                    if job != INVALID_HANDLE_VALUE && job != 0 as _ {
-                        let ph = OpenProcess(PROCESS_ALL_ACCESS, 0, piped.pid);
-                        if ph != INVALID_HANDLE_VALUE && ph != 0 as _ {
-                            AssignProcessToJobObject(job, ph);
-                            windows_sys::Win32::Foundation::CloseHandle(ph);
-                        }
-                        Some(job)
-                    } else {
-                        None
-                    }
-                }
-            };
-            let mut killer_box: Box<dyn RuntimeKiller> = Box::new(PipedKiller {
-                pid: piped.pid,
-                #[cfg(windows)]
-                job_handle,
-            });
+            let piped = pty_runner::spawn_piped_with_observer(&command, observer, true)?;
+            let mut killer_box = piped_killer(piped.pid);
             let mut input = piped.input;
             // Send the launch's prompt as the first stream-json user
             // message so the chat doesn't need a separate send call right
@@ -335,6 +307,23 @@ impl SessionRuntime for LiveSessionRuntime {
                 LiveSessionKind::Stream,
                 input,
                 killer_box,
+            );
+        }
+
+        // ConPTY can terminate one-shot `codex exec` children immediately on
+        // Windows (observed as u32::MAX with no output). These sessions do not
+        // need a terminal: the prompt is already in argv and stdout/stderr are
+        // machine-drained. Ordinary pipes match direct `codex exec`, preserve
+        // output observation, and let the child reach a real exit status.
+        #[cfg(windows)]
+        if launch.launch_mode == crate::harness::HarnessLaunchMode::NonInteractive {
+            let piped = pty_runner::spawn_piped_with_observer(&command, observer, false)?;
+            let killer = piped_killer(piped.pid);
+            return self.register_kind(
+                launch.id.clone(),
+                LiveSessionKind::Pty,
+                piped.input,
+                killer,
             );
         }
 
@@ -421,6 +410,38 @@ impl SessionRuntime for LiveSessionRuntime {
             .map_err(|_| anyhow::anyhow!("live session killer lock poisoned"))?;
         killer.kill()
     }
+}
+
+fn piped_killer(pid: u32) -> Box<dyn RuntimeKiller> {
+    #[cfg(windows)]
+    let job_handle = {
+        use windows_sys::Win32::{
+            Foundation::INVALID_HANDLE_VALUE,
+            System::{
+                JobObjects::{AssignProcessToJobObject, CreateJobObjectW},
+                Threading::{OpenProcess, PROCESS_ALL_ACCESS},
+            },
+        };
+        // SAFETY: Windows API calls; handles are owned by PipedKiller.
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job != INVALID_HANDLE_VALUE && job != 0 as _ {
+                let ph = OpenProcess(PROCESS_ALL_ACCESS, 0, pid);
+                if ph != INVALID_HANDLE_VALUE && ph != 0 as _ {
+                    AssignProcessToJobObject(job, ph);
+                    windows_sys::Win32::Foundation::CloseHandle(ph);
+                }
+                Some(job)
+            } else {
+                None
+            }
+        }
+    };
+    Box::new(PipedKiller {
+        pid,
+        #[cfg(windows)]
+        job_handle,
+    })
 }
 
 /// Wrap raw user text in claude's stream-json user-message envelope and
@@ -1399,13 +1420,20 @@ fn daemon_health_reports_pid_windows(pipe_name: &str, expected_pid: u32) -> Resu
 
 #[cfg(windows)]
 fn daemon_status_from_windows_pipe(pipe_name: &str) -> Result<Option<DaemonStatus>> {
-    use interprocess::local_socket::{prelude::*, GenericNamespaced, Stream};
-    use std::io::{Read, Write};
+    use interprocess::{
+        local_socket::{prelude::*, ConnectOptions, GenericNamespaced},
+        ConnectWaitMode,
+    };
+    use std::io::Write;
 
     let name = pipe_name
         .to_ns_name::<GenericNamespaced>()
         .context("failed to parse pipe name for health check")?;
-    let mut stream = match Stream::connect(name) {
+    let mut stream = match ConnectOptions::new()
+        .name(name)
+        .wait_mode(ConnectWaitMode::Timeout(Duration::from_secs(2)))
+        .connect_sync()
+    {
         Ok(s) => s,
         Err(_) => return Ok(None),
     };
@@ -1415,20 +1443,143 @@ fn daemon_status_from_windows_pipe(pipe_name: &str) -> Result<Option<DaemonStatu
     stream
         .flush()
         .context("failed to flush Windows health request")?;
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .context("failed to read Windows health response")?;
-    let Some((_, body)) = response.split_once("\r\n\r\n") else {
-        return Ok(None);
-    };
+    // Windows named pipes do not support read timeouts in interprocess.
+    // Supervise the blocking framed read from another thread so doctor/status
+    // still return deterministically when a daemon accepts but never replies.
+    // Reading to EOF is incorrect for HTTP and used to hang indefinitely when
+    // the daemon kept the pipe instance alive after writing its response.
+    let (_status, body) =
+        read_windows_pipe_http_response(stream, Duration::from_secs(2), MAX_SOCKET_BODY_BYTES)?;
     let body: DaemonHealthStatus =
-        serde_json::from_str(body).context("failed to parse Windows health response")?;
+        serde_json::from_slice(&body).context("failed to parse Windows health response")?;
     if body.ok {
         Ok(body.daemon)
     } else {
         Ok(None)
     }
+}
+
+#[cfg(windows)]
+pub(crate) fn read_windows_pipe_http_response(
+    mut stream: interprocess::local_socket::Stream,
+    timeout: Duration,
+    max_body_bytes: usize,
+) -> Result<(u16, Vec<u8>)> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("coven-pipe-response".into())
+        .spawn(move || {
+            let result = read_http_response_with_deadline(
+                &mut stream,
+                Duration::from_secs(24 * 60 * 60),
+                max_body_bytes,
+            );
+            let _ = tx.send(result);
+        })
+        .context("failed to spawn Windows pipe response reader")?;
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            anyhow::bail!("timed out reading Coven daemon HTTP response")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            anyhow::bail!("Coven daemon HTTP response reader stopped unexpectedly")
+        }
+    }
+}
+
+/// Read one HTTP response without relying on the peer closing the transport.
+///
+/// Local sockets and especially Windows named pipes may remain open after a
+/// response. HTTP/1.1 frames the body with Content-Length, so consume exactly
+/// that many bytes. The reader is expected to be nonblocking; WouldBlock is
+/// retried until `timeout` expires.
+pub(crate) fn read_http_response_with_deadline<R: Read>(
+    reader: &mut R,
+    timeout: Duration,
+    max_body_bytes: usize,
+) -> Result<(u16, Vec<u8>)> {
+    const MAX_RESPONSE_HEADERS: usize = 64 * 1024;
+
+    let deadline = Instant::now() + timeout;
+    let mut received = Vec::with_capacity(1024);
+    let mut chunk = [0_u8; 4096];
+    let mut framing: Option<(u16, usize, usize)> = None;
+
+    loop {
+        if let Some((status, body_start, content_length)) = framing {
+            if received.len() >= body_start + content_length {
+                return Ok((
+                    status,
+                    received[body_start..body_start + content_length].to_vec(),
+                ));
+            }
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("timed out reading Coven daemon HTTP response");
+        }
+
+        match reader.read(&mut chunk) {
+            Ok(0) => anyhow::bail!(
+                "Coven daemon closed the connection before its HTTP response completed"
+            ),
+            Ok(n) => {
+                received.extend_from_slice(&chunk[..n]);
+                if framing.is_none() {
+                    if received.len() > MAX_RESPONSE_HEADERS {
+                        anyhow::bail!("Coven daemon HTTP response headers exceeded {MAX_RESPONSE_HEADERS} bytes");
+                    }
+                    if let Some(header_end) = find_http_header_end(&received) {
+                        let status = response_status(&received[..header_end])?;
+                        let content_length = response_content_length(&received[..header_end])?;
+                        if content_length > max_body_bytes {
+                            anyhow::bail!(
+                                "Coven daemon HTTP response body exceeded {max_body_bytes} bytes"
+                            );
+                        }
+                        framing = Some((status, header_end + 4, content_length));
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error).context("failed to read Windows health response"),
+        }
+    }
+}
+
+fn response_status(headers: &[u8]) -> Result<u16> {
+    let headers =
+        std::str::from_utf8(headers).context("daemon HTTP response headers were not UTF-8")?;
+    headers
+        .split("\r\n")
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .context("daemon HTTP response omitted its status")?
+        .parse::<u16>()
+        .context("daemon HTTP response had an invalid status")
+}
+
+fn find_http_header_end(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn response_content_length(headers: &[u8]) -> Result<usize> {
+    let headers =
+        std::str::from_utf8(headers).context("daemon HTTP response headers were not UTF-8")?;
+    headers
+        .split("\r\n")
+        .skip(1)
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim())
+        })
+        .context("daemon HTTP response omitted Content-Length")?
+        .parse::<usize>()
+        .context("daemon HTTP response had an invalid Content-Length")
 }
 
 #[cfg(unix)]
@@ -1506,9 +1657,10 @@ pub const MAX_TCP_BODY_BYTES: usize = 1024 * 1024;
 /// memory. 4 MiB is generous for any legitimate request payload.
 pub const MAX_SOCKET_BODY_BYTES: usize = 4 * 1024 * 1024;
 
-/// I/O timeout for Unix socket and Windows named pipe connections.
-/// Prevents a stalled or slow-writing client from holding a handler thread
-/// indefinitely.
+/// I/O timeout for Unix socket connections. The Windows named-pipe backend
+/// does not support transport timeouts; those requests use isolated handler
+/// threads and client-side response deadlines instead.
+#[cfg_attr(windows, allow(dead_code))]
 pub const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[cfg(unix)]
@@ -2274,7 +2426,7 @@ fn owner_only_pipe_security_descriptor(
 }
 
 #[cfg(windows)]
-fn windows_pipe_name(coven_home: &Path) -> String {
+pub(crate) fn windows_pipe_name(coven_home: &Path) -> String {
     daemon_windows_pipe_name(coven_home)
 }
 
@@ -2293,9 +2445,6 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
         started_at: started_at.clone(),
         socket: windows_pipe_name(coven_home),
     };
-    write_status(coven_home, &status)?;
-    recover_orphaned_sessions(coven_home, &started_at)?;
-
     let name = windows_pipe_name(coven_home)
         .to_ns_name::<GenericNamespaced>()
         .context("failed to create named pipe name")?;
@@ -2305,6 +2454,12 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
         .security_descriptor(security_descriptor)
         .create_sync()
         .context("failed to bind Windows named pipe")?;
+
+    // Claim the pipe before mutating shared daemon/session state. A duplicate
+    // daemon must fail at bind without replacing the incumbent's daemon.json
+    // or marking sessions owned by that live daemon orphaned.
+    write_status(coven_home, &status)?;
+    recover_orphaned_sessions(coven_home, &started_at)?;
 
     let runtime = Arc::new(LiveSessionRuntime::with_coven_home(
         coven_home.to_path_buf(),
@@ -2318,23 +2473,32 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
                 continue;
             }
         };
-        // Apply I/O timeouts to prevent stalled clients from blocking the handler.
-        let _ = stream.set_recv_timeout(Some(SOCKET_IO_TIMEOUT));
-        let _ = stream.set_send_timeout(Some(SOCKET_IO_TIMEOUT));
-        // Stream implements Read + Write via shared reference on Windows.
-        // The handler reads the full request before writing, so sharing &stream is safe.
-        if let Err(error) = handle_http_stream(
-            &stream,
-            &stream,
-            coven_home,
-            Some(status.clone()),
-            runtime.as_ref(),
-            Some(MAX_SOCKET_BODY_BYTES),
-            false,
-        ) {
-            if !is_client_disconnect(&error) {
-                eprintln!("coven daemon: pipe connection error: {error:#}");
-            }
+        let conn_home = coven_home.to_path_buf();
+        let conn_status = status.clone();
+        let conn_runtime = Arc::clone(&runtime);
+        if let Err(error) = std::thread::Builder::new()
+            .name("coven-windows-api".into())
+            .spawn(move || {
+                // Bound each transaction and isolate it so a stalled client
+                // cannot block accept or starve Cave's polling requests.
+                let _ = stream.set_recv_timeout(Some(SOCKET_IO_TIMEOUT));
+                let _ = stream.set_send_timeout(Some(SOCKET_IO_TIMEOUT));
+                if let Err(error) = handle_http_stream(
+                    &stream,
+                    &stream,
+                    &conn_home,
+                    Some(conn_status),
+                    conn_runtime.as_ref(),
+                    Some(MAX_SOCKET_BODY_BYTES),
+                    false,
+                ) {
+                    if !is_client_disconnect(&error) {
+                        eprintln!("coven daemon: pipe connection error: {error:#}");
+                    }
+                }
+            })
+        {
+            eprintln!("coven daemon: failed to spawn pipe handler: {error:#}");
         }
     }
     Ok(())
@@ -2364,6 +2528,14 @@ mod tests {
         }
     }
 
+    struct NeverReady;
+
+    impl Read for NeverReady {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+        }
+    }
+
     #[test]
     fn is_client_disconnect_ignores_real_faults() {
         // A genuine server-side error must still be logged.
@@ -2378,6 +2550,30 @@ mod tests {
         ))
         .context("handling request");
         assert!(!is_client_disconnect(&timed_out));
+    }
+
+    #[test]
+    fn http_response_reader_stops_at_content_length_without_eof() -> Result<()> {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: keep-alive\r\n\r\n{\"ok\":true}";
+        let mut reader = std::io::Cursor::new(response);
+
+        let (status, body) =
+            read_http_response_with_deadline(&mut reader, Duration::from_millis(100), 1024)?;
+
+        assert_eq!(status, 200);
+        assert_eq!(body, br#"{"ok":true}"#);
+        Ok(())
+    }
+
+    #[test]
+    fn http_response_reader_times_out_when_peer_never_responds() {
+        let started = Instant::now();
+        let error =
+            read_http_response_with_deadline(&mut NeverReady, Duration::from_millis(30), 1024)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("timed out"), "got: {error:#}");
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[cfg(unix)]
@@ -3863,7 +4059,7 @@ mod tests {
     #[test]
     fn serves_health_over_windows_named_pipe() -> Result<()> {
         use interprocess::local_socket::{prelude::*, GenericNamespaced, ListenerOptions, Stream};
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::thread;
 
         let temp_dir = tempfile::tempdir()?;
@@ -3886,26 +4082,42 @@ mod tests {
         let home = temp_dir.path().to_path_buf();
         let runtime = LiveSessionRuntime::default();
         let server = thread::spawn(move || {
-            let conn = listener.incoming().next().expect("accept").expect("stream");
-            handle_http_stream(&conn, &conn, &home, Some(status), &runtime, None, false)
+            for _ in 0..2 {
+                let conn = listener.incoming().next().expect("accept").expect("stream");
+                handle_http_stream(
+                    &conn,
+                    &conn,
+                    &home,
+                    Some(status.clone()),
+                    &runtime,
+                    None,
+                    false,
+                )?;
+            }
+            Ok::<_, anyhow::Error>(())
         });
 
-        let client_name = pipe_name
-            .to_ns_name::<GenericNamespaced>()
-            .expect("client pipe name");
-        let mut client = Stream::connect(client_name).expect("connect");
-        client
-            .write_all(b"GET /api/v1/health HTTP/1.1\r\nHost: coven\r\n\r\n")
-            .expect("write request");
-        // Flush to ensure the server receives the full request before we start reading.
-        client.flush().expect("flush");
-        let mut response = String::new();
-        client.read_to_string(&mut response).expect("read response");
-
+        for _ in 0..2 {
+            let client_name = pipe_name
+                .clone()
+                .to_ns_name::<GenericNamespaced>()
+                .expect("client pipe name");
+            let mut client = Stream::connect(client_name).expect("connect");
+            client
+                .write_all(b"GET /api/v1/health HTTP/1.1\r\nHost: coven\r\n\r\n")
+                .expect("write request");
+            client.flush().expect("flush");
+            let (status_code, response) = read_windows_pipe_http_response(
+                client,
+                Duration::from_secs(1),
+                MAX_SOCKET_BODY_BYTES,
+            )
+            .expect("read response");
+            assert_eq!(status_code, 200);
+            let response = String::from_utf8(response)?;
+            assert!(response.contains("\"apiVersion\""), "got: {response}");
+        }
         server.join().expect("server thread")?;
-
-        assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
-        assert!(response.contains("\"apiVersion\""), "got: {response}");
         Ok(())
     }
 

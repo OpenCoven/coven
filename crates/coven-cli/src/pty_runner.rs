@@ -360,6 +360,7 @@ pub struct PipedSession {
 pub fn spawn_piped_with_observer(
     command: &HarnessCommand,
     observer: Option<DetachedPtyObserver>,
+    wrap_stderr_as_stream_json: bool,
 ) -> Result<PipedSession> {
     use std::process::Command as StdCommand;
     use std::sync::{Arc, Mutex as StdMutex};
@@ -446,12 +447,16 @@ pub fn spawn_piped_with_observer(
                         _ => &buf[..],
                     };
                     let line = String::from_utf8_lossy(trimmed);
-                    let envelope = serde_json::json!({
-                        "type": "system",
-                        "subtype": "stderr",
-                        "text": line,
-                    });
-                    let mut payload = envelope.to_string();
+                    let mut payload = if wrap_stderr_as_stream_json {
+                        serde_json::json!({
+                            "type": "system",
+                            "subtype": "stderr",
+                            "text": line,
+                        })
+                        .to_string()
+                    } else {
+                        line.into_owned()
+                    };
                     payload.push('\n');
                     if let Ok(mut cb) = stderr_callback.lock() {
                         cb(payload.into_bytes());
