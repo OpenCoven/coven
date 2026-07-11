@@ -150,6 +150,34 @@ pub fn run_attached_captured(
     Ok(wait_for_child(&mut child))
 }
 
+/// Run a one-shot harness directly on inherited stdio without allocating a
+/// pseudo-terminal. Windows Codex `exec` is reliable in this mode while its
+/// ConPTY child can stall before producing output. Inherited handles preserve
+/// the caller's stdout/stderr stream exactly (including Coven's JSON framing).
+pub fn run_piped_attached(command: &HarnessCommand) -> Result<PtyRunResult> {
+    let status = std::process::Command::new(&command.program)
+        .args(&command.args)
+        .current_dir(&command.cwd)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .with_context(|| {
+            format!(
+                "failed to spawn harness `{}` in piped mode",
+                command.program()
+            )
+        })?;
+    Ok(PtyRunResult {
+        status: if status.success() {
+            "completed"
+        } else {
+            "failed"
+        },
+        exit_code: status.code(),
+    })
+}
+
 /// Run `claude` in its native stream-JSON mode, framed by the caller (which
 /// emits Coven's own `system.init` / `result` around the call).
 ///

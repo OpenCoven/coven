@@ -1484,13 +1484,19 @@ fn launch_patch_session(request: &patch::PatchRequest) -> Result<String> {
         None,
         &current_timestamp(),
     )?;
+    let launch_mode = if stream_json {
+        // stream-json is a machine protocol: always launch one-shot.
+        harness::HarnessLaunchMode::NonInteractive
+    } else {
+        harness_launch_mode_for_stdio(&selected_harness.id)
+    };
     let command = pty_runner::build_harness_command(
         &selected_harness.id,
         &brief,
         &request.repo.root,
-        harness_launch_mode_for_stdio(&selected_harness.id),
+        launch_mode,
     )?;
-    let result = pty_runner::run_attached(&command)?;
+    let result = run_harness_attached(&command, launch_mode)?;
     store::update_session_status(
         &conn,
         &record.id,
@@ -1721,6 +1727,17 @@ fn harness_launch_mode(
     } else {
         harness::HarnessLaunchMode::NonInteractive
     }
+}
+
+fn run_harness_attached(
+    command: &pty_runner::HarnessCommand,
+    launch_mode: harness::HarnessLaunchMode,
+) -> Result<pty_runner::PtyRunResult> {
+    #[cfg(windows)]
+    if launch_mode == harness::HarnessLaunchMode::NonInteractive {
+        return pty_runner::run_piped_attached(command);
+    }
+    pty_runner::run_attached(command)
 }
 
 /// Lock stdout, emit one stream-JSON frame, release. Per-frame locking keeps
@@ -2130,20 +2147,12 @@ fn run_session(
         .as_ref()
         .filter(|s| s.system_prompt_flag.is_some())
         .and(familiar_ctx.as_ref());
+    let launch_mode = harness_launch_mode_for_stdio(&selected_harness.id);
     let command = pty_runner::build_harness_command_with_conversation(
         &selected_harness.id,
         &effective_prompt,
         &cwd,
-        if stream_json {
-            // stream-json is a machine protocol: always launch the harness
-            // one-shot/non-interactive, even when stdio happens to be a
-            // terminal. The claude pass-through above does the same (`-p`);
-            // launching a TUI here would leave the harness waiting on
-            // keystrokes for a screen that is never rendered.
-            harness::HarnessLaunchMode::NonInteractive
-        } else {
-            harness_launch_mode_for_stdio(&selected_harness.id)
-        },
+        launch_mode,
         conversation_hint.as_ref(),
         familiar_for_args,
         launch_options,
@@ -2168,7 +2177,7 @@ fn run_session(
             }),
         )
     } else {
-        pty_runner::run_attached(&command)
+        run_harness_attached(&command, launch_mode)
     };
     match attached {
         Ok(result) => {
