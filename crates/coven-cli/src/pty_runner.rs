@@ -154,20 +154,55 @@ pub fn run_attached_captured(
 /// pseudo-terminal. Windows Codex `exec` is reliable in this mode while its
 /// ConPTY child can stall before producing output. Inherited handles preserve
 /// the caller's stdout/stderr stream exactly (including Coven's JSON framing).
-pub fn run_piped_attached(command: &HarnessCommand) -> Result<PtyRunResult> {
-    let status = std::process::Command::new(&command.program)
+pub fn run_piped_attached(
+    command: &HarnessCommand,
+    merge_stderr_to_stdout: bool,
+) -> Result<PtyRunResult> {
+    let mut child = std::process::Command::new(&command.program)
         .args(&command.args)
         .current_dir(&command.cwd)
         .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
+        // In stream mode Codex duplicates its final answer on stdout while
+        // stderr carries the complete labeled transcript that Cave's filter
+        // consumes. Keep only the transcript to avoid rendering it twice.
+        .stdout(if merge_stderr_to_stdout {
+            Stdio::null()
+        } else {
+            Stdio::inherit()
+        })
+        .stderr(if merge_stderr_to_stdout {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        })
+        .spawn()
         .with_context(|| {
             format!(
                 "failed to spawn harness `{}` in piped mode",
                 command.program()
             )
         })?;
+
+    // Codex on Windows writes its complete `exec` transcript (including the
+    // final assistant response) to stderr. `coven run --stream-json` is a
+    // stdout protocol consumed by Cave, so forward that transcript to stdout
+    // for stream clients while continuing to drain it concurrently.
+    let stderr_forwarder = child.stderr.take().map(|mut stderr| {
+        thread::spawn(move || -> io::Result<()> {
+            let stdout = io::stdout();
+            let mut stdout = stdout.lock();
+            io::copy(&mut stderr, &mut stdout)?;
+            stdout.flush()
+        })
+    });
+
+    let status = child.wait().context("failed waiting for piped harness")?;
+    if let Some(forwarder) = stderr_forwarder {
+        forwarder
+            .join()
+            .map_err(|_| anyhow::anyhow!("stderr forwarding thread panicked"))?
+            .context("failed forwarding harness stderr to stdout")?;
+    }
     Ok(PtyRunResult {
         status: if status.success() {
             "completed"

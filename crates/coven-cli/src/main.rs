@@ -1484,19 +1484,14 @@ fn launch_patch_session(request: &patch::PatchRequest) -> Result<String> {
         None,
         &current_timestamp(),
     )?;
-    let launch_mode = if stream_json {
-        // stream-json is a machine protocol: always launch one-shot.
-        harness::HarnessLaunchMode::NonInteractive
-    } else {
-        harness_launch_mode_for_stdio(&selected_harness.id)
-    };
+    let launch_mode = harness_launch_mode_for_stdio(&selected_harness.id);
     let command = pty_runner::build_harness_command(
         &selected_harness.id,
         &brief,
         &request.repo.root,
         launch_mode,
     )?;
-    let result = run_harness_attached(&command, launch_mode)?;
+    let result = run_harness_attached(&command, launch_mode, false)?;
     store::update_session_status(
         &conn,
         &record.id,
@@ -1732,10 +1727,11 @@ fn harness_launch_mode(
 fn run_harness_attached(
     command: &pty_runner::HarnessCommand,
     launch_mode: harness::HarnessLaunchMode,
+    stream_json: bool,
 ) -> Result<pty_runner::PtyRunResult> {
     #[cfg(windows)]
     if launch_mode == harness::HarnessLaunchMode::NonInteractive {
-        return pty_runner::run_piped_attached(command);
+        return pty_runner::run_piped_attached(command, stream_json);
     }
     pty_runner::run_attached(command)
 }
@@ -2147,7 +2143,12 @@ fn run_session(
         .as_ref()
         .filter(|s| s.system_prompt_flag.is_some())
         .and(familiar_ctx.as_ref());
-    let launch_mode = harness_launch_mode_for_stdio(&selected_harness.id);
+    let launch_mode = if stream_json {
+        // stream-json is a machine protocol: always launch one-shot.
+        harness::HarnessLaunchMode::NonInteractive
+    } else {
+        harness_launch_mode_for_stdio(&selected_harness.id)
+    };
     let command = pty_runner::build_harness_command_with_conversation(
         &selected_harness.id,
         &effective_prompt,
@@ -2157,29 +2158,7 @@ fn run_session(
         familiar_for_args,
         launch_options,
     )?;
-    // Non-stream harnesses run on a PTY. In stream-json mode, mirroring the
-    // raw PTY bytes to stdout would interleave ANSI escapes / prompts /
-    // partial lines with the JSONL frames and corrupt the stream for every
-    // consumer (#307), so the PTY is captured instead and each chunk is
-    // wrapped in an `output` event. Emit failures inside the callback are
-    // ignored (the consumer may have closed the pipe mid-run); the `result`
-    // emission below surfaces a dead stdout as an error.
-    let attached = if stream_json {
-        let output_session_id = record.id.clone();
-        pty_runner::run_attached_captured(
-            &command,
-            Box::new(move |chunk| {
-                let _ =
-                    emit_stream_event(&stream_json::Event::Output(stream_json::HarnessOutput {
-                        text: String::from_utf8_lossy(&chunk).into_owned(),
-                        session_id: output_session_id.clone(),
-                    }));
-            }),
-        )
-    } else {
-        run_harness_attached(&command, launch_mode)
-    };
-    match attached {
+    match run_harness_attached(&command, launch_mode, stream_json) {
         Ok(result) => {
             store::update_session_status(
                 &conn,
