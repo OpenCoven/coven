@@ -1498,7 +1498,11 @@ mod tests {
         fs::create_dir_all(&npm_bin)?;
         fs::create_dir_all(&app_bin)?;
         fs::write(npm_bin.join("codex.cmd"), "@echo off\r\n")?;
-        fs::write(app_bin.join("codex.exe"), b"")?;
+        let codex_exe = app_bin.join("codex.exe");
+        fs::write(&codex_exe, b"")?;
+        // The resolver uses the host's executable predicate so this Windows
+        // algorithm test also needs an executable bit on Unix CI.
+        make_executable(&codex_exe)?;
 
         let resolved = resolve_executable_in_paths_for_windows(
             "codex",
