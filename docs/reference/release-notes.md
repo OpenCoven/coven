@@ -18,6 +18,10 @@ title: "Coven changelog and release notes"
 - **CLI-login-only model selection (v0.0.53).** The model-selection docs now expose only the supported Codex CLI and Claude Code login paths. Provider/API-key option pages for OpenAI, Anthropic, Google, and local-model backends were removed from the selectable `/models` surface so clients and users are routed through `codex login` or `claude doctor` instead of raw provider credentials. See [Model selection](/models).
 - **Multi-host daemon specs.** Added PRODUCT and TECH specs for travel profiles, offline deltas, scheduler roles, redispatch, failure handling, and the issue mapping for the multi-host daemon track.
 
+### Bug fixes
+
+- **Windows Codex stream bridge.** `coven run codex --stream-json` now launches `codex exec --json` through ordinary pipes, so npm's `codex.cmd` no longer relies on the headless ConPTY/OpenConsole handoff. Completed Codex messages are normalized into Coven `assistant` events, native thread ids are retained for resume, and timeout, protocol failure, and Unix cancellation are bounded with owned process-tree cleanup instead of leaving a session running forever. Windows uses a Job Object when assignment succeeds and `taskkill /T /F` for Coven-supervised fallback cleanup. See [stream-JSON protocol](/STREAM-JSON) and [Codex harness notes](/harnesses/codex).
+
 ## Week of June 24, 2026
 
 ### New features

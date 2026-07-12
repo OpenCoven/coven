@@ -94,15 +94,16 @@ pub struct ToolResult {
     pub session_id: String,
 }
 
-/// Raw output captured from a harness that has no native stream-json
-/// protocol (codex, external adapters). In `--stream-json` mode those
-/// harnesses run on a PTY; every captured chunk is wrapped in one `output`
-/// frame so stdout stays JSONL-only instead of interleaving raw PTY bytes
-/// with the stream (#307). `text` is the raw PTY text: it may contain ANSI
-/// escape sequences, carriage returns, and partial lines, and chunk
-/// boundaries follow PTY reads rather than line breaks. Each chunk is
-/// guaranteed valid UTF-8 (codepoints split across reads are reassembled
-/// before wrapping).
+/// Raw output captured from an external harness that has no native
+/// machine-readable protocol. In `--stream-json` mode those adapters run on a
+/// PTY; every captured chunk is wrapped in one `output` frame so stdout stays
+/// JSONL-only instead of interleaving raw PTY bytes with the stream (#307).
+/// `text` is the raw PTY text: it may contain ANSI escape sequences,
+/// carriage returns, and partial lines, and chunk boundaries follow PTY reads
+/// rather than line breaks. Each chunk is guaranteed valid UTF-8 (codepoints
+/// split across reads are reassembled before wrapping). Codex is deliberately
+/// not in this category: its `codex exec --json` frames are normalized into
+/// `assistant` events by the dedicated pipe bridge.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HarnessOutput {
     pub text: String,
@@ -116,6 +117,11 @@ pub struct RunResult {
     pub is_error: bool,
     pub num_turns: u32,
     pub session_id: String,
+    /// Harness-native conversation id, when the harness creates one. For
+    /// Codex this is the `thread_id` emitted by `codex exec --json`; it is
+    /// distinct from Coven's stable ledger `session_id` and can be supplied
+    /// back to the harness on a later resume.
+    pub harness_session_id: Option<String>,
     pub error: Option<String>,
 }
 
@@ -177,6 +183,7 @@ mod tests {
             is_error: false,
             num_turns: 1,
             session_id: "s1".into(),
+            harness_session_id: None,
             error: None,
         });
         let mut buf = Vec::new();
@@ -188,6 +195,7 @@ mod tests {
         assert_eq!(v["is_error"], false);
         assert_eq!(v["num_turns"], 1);
         assert_eq!(v["session_id"], "s1");
+        assert!(v.get("harness_session_id").is_some());
         assert!(v.get("error").is_some(), "null error field is preserved");
     }
 
@@ -355,6 +363,7 @@ mod tests {
                 is_error: false,
                 num_turns: 0,
                 session_id: "s1".into(),
+                harness_session_id: None,
                 error: None,
             }),
         )

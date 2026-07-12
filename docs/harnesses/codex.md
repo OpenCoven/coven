@@ -4,11 +4,14 @@ read_when:
   - Setting up Codex for Coven
   - Diagnosing Codex-specific harness failures
 title: "Codex harness"
-description: "Run the OpenAI Codex CLI under Coven supervision with harness id codex, a project-rooted PTY, and the usual session, attach, and ritual flows."
+description: "Run the OpenAI Codex CLI under Coven supervision with harness id codex, project-rooted sessions, and the usual attach and ritual flows."
 ---
 
 
-Codex is OpenAI's coding-agent CLI. Coven wraps it in a project-rooted PTY so launches, attaches, and rituals work the same as for any other harness.
+Codex is OpenAI's coding-agent CLI. Coven uses a project-rooted PTY for
+interactive sessions, and Codex's JSON mode over ordinary pipes for machine
+streaming, so launches, attaches, and rituals work the same as for any other
+harness.
 
 | Field | Value |
 |---|---|
@@ -71,7 +74,9 @@ coven patch openclaw "fix Codex auth profile order after invalidated OAuth token
 |---|---|---|
 | `coven doctor` reports `codex` missing | Codex not on `PATH` | `npm install -g @openai/codex`, then re-run doctor. |
 | Codex prompts for login each run | Stale token | `codex login`. |
-| Session hangs at start | Codex waiting on TTY prompt | Detach with `Ctrl-]`, re-launch with `coven run` directly. |
+| Codex returns `invalid_value` for `reasoning.effort` | An obsolete `model_reasoning_effort` value in `%USERPROFILE%\.codex\config.toml` | Use a currently supported value such as `model_reasoning_effort = "xhigh"` rather than legacy `ultra`/`max`, then retry. Coven never reads or writes Codex credentials. |
+| CovenCave/direct `--stream-json` request hangs on Windows | Older Coven package launches npm's `codex.cmd` through the ConPTY/OpenConsole path | Update Coven to a release containing the piped Codex JSON bridge, then retry. `coven doctor` should still report Codex as ready. |
+| Interactive session waits for input | Codex is waiting on its terminal prompt | Detach with `Ctrl-]`, then re-launch with `coven run` directly. |
 
 ## How Coven supervises Codex
 
@@ -80,7 +85,7 @@ sequenceDiagram
   participant U as User
   participant C as coven CLI
   participant D as Coven daemon
-  participant Cx as Codex PTY
+  participant Cx as Codex process
   participant Op as OpenAI API
 
   U->>C: coven run codex "audit this repo"
@@ -95,7 +100,17 @@ sequenceDiagram
   C-->>U: print session id, switch to attach view
 ```
 
-The dotted line worth noticing: Coven never connects to the OpenAI API itself. The credential path is **Codex CLI ↔ OpenAI**, with Coven only observing the PTY output.
+The dotted line worth noticing: Coven never connects to the OpenAI API itself. The credential path is **Codex CLI ↔ OpenAI**, with Coven only supervising the local Codex process and its output.
+
+For `coven run codex --stream-json`, Coven instead runs `codex exec --json`
+through normal pipes and emits Coven `assistant` / `result` JSONL frames. On
+Windows this keeps the npm `.cmd` shim off ConPTY and supplies multiline
+prompts through stdin safely. The result carries Codex's native thread id as
+`harness_session_id`; Coven keeps that mapping so a later `--continue` can use
+the stable Coven session id. During that one-shot bridge, Unix
+`SIGINT`/`SIGTERM`/`SIGHUP` cancel the owned Codex process group and produce a
+failed terminal result. Windows uses an owned Job Object when assignment is
+available; otherwise Coven's timeout/error cleanup uses `taskkill /T /F`.
 
 
 ## Related

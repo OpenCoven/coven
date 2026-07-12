@@ -1663,6 +1663,30 @@ pub fn update_session_status(
     Ok(())
 }
 
+/// Persist the harness-native id that continues a multi-turn conversation.
+///
+/// Coven's `id` remains the stable ledger/session id exposed to callers.
+/// Harnesses such as Codex mint a different id for their own resume API, so
+/// callers can safely keep passing the Coven id while the runner resolves the
+/// native conversation id internally.
+pub fn update_session_conversation_id(
+    conn: &Connection,
+    session_id: &str,
+    conversation_id: &str,
+    updated_at: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions
+         SET conversation_id = ?2,
+             updated_at = ?3
+         WHERE id = ?1",
+        params![session_id, conversation_id, updated_at],
+    )
+    .with_context(|| format!("failed to update conversation id for session {session_id}"))?;
+
+    Ok(())
+}
+
 pub fn mark_running_sessions_orphaned(conn: &Connection, updated_at: &str) -> Result<usize> {
     let updated = conn
         .execute(
@@ -1690,6 +1714,30 @@ pub fn get_session(conn: &Connection, session_id: &str) -> Result<Option<Session
         .query_row(params![session_id], session_record_from_row)
         .optional()
         .with_context(|| format!("failed to read session {session_id}"))
+}
+
+/// Resolve the most recently updated ledger row for a harness-native
+/// conversation id. This keeps `--continue <Codex thread id>` compatible with
+/// callers that persist the native id instead of Coven's ledger id.
+pub fn get_latest_session_by_conversation_id(
+    conn: &Connection,
+    conversation_id: &str,
+) -> Result<Option<SessionRecord>> {
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT
+                {SESSION_COLUMNS}
+            FROM sessions
+            WHERE conversation_id = ?1
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT 1",
+        ))
+        .context("failed to prepare conversation session lookup query")?;
+
+    statement
+        .query_row(params![conversation_id], session_record_from_row)
+        .optional()
+        .with_context(|| format!("failed to read conversation {conversation_id}"))
 }
 
 pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionRecord>> {
@@ -3143,6 +3191,27 @@ mod tests {
         )?;
         let hit = latest_active_for_project(&conn, "/p")?;
         assert_eq!(hit.as_deref(), Some("newer"));
+        Ok(())
+    }
+
+    #[test]
+    fn native_conversation_id_round_trips_for_resume_lookup() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("test.sqlite3"))?;
+        insert_session(&conn, &session_record("ledger-1", "2026-01-01T00:00:00Z"))?;
+
+        update_session_conversation_id(
+            &conn,
+            "ledger-1",
+            "codex-thread-123",
+            "2026-01-02T00:00:00Z",
+        )?;
+
+        let ledger = get_session(&conn, "ledger-1")?.expect("ledger row should exist");
+        assert_eq!(ledger.conversation_id.as_deref(), Some("codex-thread-123"));
+        let resumed = get_latest_session_by_conversation_id(&conn, "codex-thread-123")?
+            .expect("native thread id should resolve back to the ledger row");
+        assert_eq!(resumed.id, "ledger-1");
         Ok(())
     }
 

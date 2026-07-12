@@ -8,7 +8,7 @@ extend the mechanism to additional harnesses.
 | Harness | Resume support | Mechanism |
 | --- | --- | --- |
 | `claude` | ✅ stream-mode | Long-lived `claude --print --input-format stream-json --output-format stream-json --verbose` daemon process per chat, plus `--session-id <uuid>` on the first turn and `--resume <uuid>` for cross-restart continuation. Turn 1 spawns + sends initial user envelope; turns 2..N pipe a new user envelope into the same stdin (no cold-start). Unix kills the stream process tree with `setsid()` + `kill(-pid, SIGKILL)`; Windows uses a Job Object owned by the daemon. |
-| `codex` | ✅ per-turn | Turn 1 runs plain `codex exec …`; chat captures `session id: <uuid>` from output and feeds it back as `codex exec … resume <uuid> <prompt>` on later turns. Codex has no equivalent of stream-json so each turn cold-starts. |
+| `codex` | ✅ per-turn | Chat runs plain `codex exec …`; it captures `session id: <uuid>` from output and feeds it back as `codex exec … resume <uuid> <prompt>` on later turns. `coven run codex --stream-json` separately uses Codex's one-shot `exec --json` protocol, but Codex has no long-lived stream mode, so each chat turn cold-starts. |
 
 Conversations persist across `coven chat` invocations on a per-project basis:
 on startup the chat seeds its in-memory map from

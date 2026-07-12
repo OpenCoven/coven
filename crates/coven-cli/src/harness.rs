@@ -3,7 +3,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use coven_runtime_spec::{Capabilities, SandboxMapping, StreamArgs};
 use serde::{Deserialize, Serialize};
 
@@ -951,6 +951,41 @@ pub fn command_parts_for_harness_with_conversation(
     familiar: Option<&FamiliarContext>,
     options: HarnessLaunchOptions<'_>,
 ) -> Result<(String, Vec<String>)> {
+    command_parts_for_harness_with_conversation_inner(
+        harness_id, prompt, mode, hint, familiar, options, false,
+    )
+}
+
+/// Build a one-shot Codex command whose `exec` subcommand is explicitly in
+/// its supported JSONL mode. This belongs in command construction, rather
+/// than a later argv scan, so user values such as `--model exec` or a prompt
+/// literally equal to `--json` cannot be mistaken for syntax.
+pub fn command_parts_for_codex_json_with_conversation(
+    harness_id: &str,
+    prompt: &str,
+    mode: HarnessLaunchMode,
+    hint: Option<&ConversationHint>,
+    familiar: Option<&FamiliarContext>,
+    options: HarnessLaunchOptions<'_>,
+) -> Result<(String, Vec<String>)> {
+    if harness_id != "codex" {
+        anyhow::bail!("Codex JSON command construction requested for `{harness_id}`");
+    }
+    command_parts_for_harness_with_conversation_inner(
+        harness_id, prompt, mode, hint, familiar, options, true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn command_parts_for_harness_with_conversation_inner(
+    harness_id: &str,
+    prompt: &str,
+    mode: HarnessLaunchMode,
+    hint: Option<&ConversationHint>,
+    familiar: Option<&FamiliarContext>,
+    options: HarnessLaunchOptions<'_>,
+    codex_json: bool,
+) -> Result<(String, Vec<String>)> {
     let specs = configured_harness_specs()?;
     let configured_ids = specs
         .iter()
@@ -1015,6 +1050,10 @@ pub fn command_parts_for_harness_with_conversation(
             ));
         }
         // Harness doesn't support stream: fall through to non-interactive.
+        let mut args = spec.prompt_args(&effective_prompt, HarnessLaunchMode::NonInteractive);
+        if codex_json {
+            add_codex_exec_json_flag(&spec, &mut args)?;
+        }
         return Ok((
             program,
             with_claude_permission_flags(
@@ -1023,7 +1062,7 @@ pub fn command_parts_for_harness_with_conversation(
                     &model_args,
                     &sandbox_args,
                     &launch_option_args,
-                    spec.prompt_args(&effective_prompt, HarnessLaunchMode::NonInteractive),
+                    args,
                 )),
             ),
         ));
@@ -1031,6 +1070,9 @@ pub fn command_parts_for_harness_with_conversation(
 
     if let Some(hint) = hint {
         if let Some(mut args) = continuity_args(&spec, mode, hint) {
+            if codex_json {
+                add_codex_exec_json_flag(&spec, &mut args)?;
+            }
             // Inject identity via --system-prompt for harnesses that support it.
             if let (Some(flag), Some(f)) = (spec.system_prompt_flag.as_deref(), familiar) {
                 args.insert(0, f.identity_preamble());
@@ -1051,6 +1093,9 @@ pub fn command_parts_for_harness_with_conversation(
     }
 
     let mut args = spec.prompt_args(&effective_prompt, mode);
+    if codex_json {
+        add_codex_exec_json_flag(&spec, &mut args)?;
+    }
     // Inject identity via --system-prompt for harnesses that support it,
     // prepending before the prompt args.
     if let (Some(flag), Some(f)) = (spec.system_prompt_flag.as_deref(), familiar) {
@@ -1069,6 +1114,25 @@ pub fn command_parts_for_harness_with_conversation(
             )),
         ),
     ))
+}
+
+/// Add `--json` directly after Codex's declared `exec` subcommand while the
+/// argument vector still consists only of harness-owned prefix args plus the
+/// final prompt. Launch options are prepended later, and the prompt is behind
+/// `--`, so neither can affect this structural insertion point.
+fn add_codex_exec_json_flag(spec: &HarnessCommandSpec, args: &mut Vec<String>) -> Result<()> {
+    let exec_index = spec
+        .non_interactive_prompt_prefix_args
+        .iter()
+        .position(|arg| arg == "exec")
+        .context("Codex adapter must declare an `exec` non-interactive subcommand")?;
+    if args.get(exec_index).map(String::as_str) != Some("exec") {
+        anyhow::bail!(
+            "Codex adapter's constructed command no longer contains `exec` at its declared position"
+        );
+    }
+    args.insert(exec_index + 1, "--json".to_string());
+    Ok(())
 }
 
 fn launch_option_args(harness_id: &str, options: HarnessLaunchOptions<'_>) -> Vec<String> {
@@ -2482,6 +2546,41 @@ mod tests {
         let model_pos = args.iter().position(|a| a == "--model").unwrap();
         let prompt_pos = args.iter().position(|a| a == "fix tests").unwrap();
         assert!(model_pos < prompt_pos);
+        Ok(())
+    }
+
+    #[test]
+    fn codex_json_mode_inserts_flag_at_the_declared_subcommand_not_user_values(
+    ) -> anyhow::Result<()> {
+        // Both values deliberately look like CLI syntax. The model value comes
+        // before the real `exec` subcommand, while the prompt is protected by
+        // the trailing `--` separator. JSON mode must be constructed from the
+        // harness spec, never by scanning those user-controlled entries.
+        let (_, args) = command_parts_for_codex_json_with_conversation(
+            "codex",
+            "--json",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            None,
+            HarnessLaunchOptions {
+                model: Some("openai/exec"),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(
+            args,
+            vec![
+                "--model".to_string(),
+                "exec".to_string(),
+                "exec".to_string(),
+                "--json".to_string(),
+                "--skip-git-repo-check".to_string(),
+                "--color".to_string(),
+                "never".to_string(),
+                "--".to_string(),
+                "--json".to_string(),
+            ]
+        );
         Ok(())
     }
 

@@ -1932,9 +1932,10 @@ fn run_session(
 
     let (record, is_resume) = if let Some(ref id) = resumed_id {
         // Verify the session exists; reuse its row.
-        let existing = store::list_sessions_including_archived(&conn)?
-            .into_iter()
-            .find(|s| &s.id == id);
+        let existing = match store::get_session(&conn, id)? {
+            Some(record) => Some(record),
+            None => store::get_latest_session_by_conversation_id(&conn, id)?,
+        };
         match existing {
             Some(mut r) => {
                 // Mutate updated_at to now; keep labels/visibility/title from the original.
@@ -2031,6 +2032,7 @@ fn run_session(
                 is_error: false,
                 num_turns: 1,
                 session_id: record.id.clone(),
+                harness_session_id: None,
                 error: None,
             }))?;
         }
@@ -2045,10 +2047,9 @@ fn run_session(
         &current_timestamp(),
     )?;
 
-    // Claude's native stream-json: pipe its JSONL events through ours
-    // between the init/result frames we already emit. The codex / generic
-    // path below cannot do this because codex doesn't speak stream-json, so we
-    // branch here after resolving the harness to claude.
+    // Claude's native long-lived stream-json: pipe its JSONL events through
+    // ours between the init/result frames we already emit. Codex's `--json`
+    // protocol is one-shot and is bridged below after the harness is resolved.
     if stream_json && selected_harness.id == "claude" {
         let stdout = io::stdout();
         let mut handle = stdout.lock();
@@ -2081,6 +2082,7 @@ fn run_session(
                     is_error: true,
                     num_turns: 1,
                     session_id: record.id.clone(),
+                    harness_session_id: None,
                     error: Some(format!("{error:#}")),
                 }))?;
                 return Err(error);
@@ -2105,6 +2107,7 @@ fn run_session(
             is_error,
             num_turns: 1,
             session_id: record.id.clone(),
+            harness_session_id: None,
             error: None,
         }))?;
         if archive {
@@ -2131,9 +2134,20 @@ fn run_session(
     }
 
     let conversation_hint = if is_resume {
-        Some(harness::ConversationHint::Resume {
-            id: record.id.clone(),
-        })
+        // Cave historically resumes through Coven's stable ledger id. Codex
+        // requires its own thread id, which we capture from `thread.started`
+        // and persist on the ledger row after the first turn. Accepting either
+        // form above keeps existing clients compatible while direct callers
+        // may pass the native thread id too.
+        let resume_id = if selected_harness.id == "codex" {
+            record
+                .conversation_id
+                .clone()
+                .unwrap_or_else(|| record.id.clone())
+        } else {
+            record.id.clone()
+        };
+        Some(harness::ConversationHint::Resume { id: resume_id })
     } else {
         None
     };
@@ -2151,15 +2165,113 @@ fn run_session(
     } else {
         harness_launch_mode_for_stdio(&selected_harness.id)
     };
-    let command = pty_runner::build_harness_command_with_conversation(
-        &selected_harness.id,
-        &effective_prompt,
-        &cwd,
-        launch_mode,
-        conversation_hint.as_ref(),
-        familiar_for_args,
-        launch_options,
-    )?;
+    let command = if stream_json && selected_harness.id == "codex" {
+        pty_runner::build_codex_json_harness_command_with_conversation(
+            &selected_harness.id,
+            &effective_prompt,
+            &cwd,
+            launch_mode,
+            conversation_hint.as_ref(),
+            familiar_for_args,
+            launch_options,
+        )?
+    } else {
+        pty_runner::build_harness_command_with_conversation(
+            &selected_harness.id,
+            &effective_prompt,
+            &cwd,
+            launch_mode,
+            conversation_hint.as_ref(),
+            familiar_for_args,
+            launch_options,
+        )?
+    };
+    if stream_json && selected_harness.id == "codex" {
+        let output_session_id = record.id.clone();
+        let outcome = pty_runner::stream_codex_json(&command, move |text| {
+            emit_stream_event(&stream_json::Event::Assistant(
+                stream_json::AssistantMessage {
+                    message: stream_json::MessageBody {
+                        role: "assistant".into(),
+                        content: vec![stream_json::ContentBlock::Text {
+                            text: text.to_string(),
+                        }],
+                    },
+                    session_id: output_session_id.clone(),
+                    stop_reason: Some("end_turn".into()),
+                },
+            ))
+        });
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                store::update_session_status(
+                    &conn,
+                    &record.id,
+                    FAILED_SESSION_STATUS,
+                    None,
+                    &current_timestamp(),
+                )?;
+                emit_stream_event(&stream_json::Event::Result(stream_json::RunResult {
+                    subtype: "error_during_execution".into(),
+                    duration_ms: stream_started.elapsed().as_millis() as u64,
+                    is_error: true,
+                    num_turns: 1,
+                    session_id: record.id.clone(),
+                    harness_session_id: None,
+                    error: Some(format!("{error:#}")),
+                }))?;
+                return Err(error);
+            }
+        };
+        if let Some(thread_id) = outcome.harness_session_id.as_deref() {
+            store::update_session_conversation_id(
+                &conn,
+                &record.id,
+                thread_id,
+                &current_timestamp(),
+            )?;
+        }
+        let is_error =
+            outcome.error.is_some() || outcome.process.exit_code.is_some_and(|code| code != 0);
+        store::update_session_status(
+            &conn,
+            &record.id,
+            if is_error {
+                FAILED_SESSION_STATUS
+            } else {
+                outcome.process.status
+            },
+            outcome.process.exit_code,
+            &current_timestamp(),
+        )?;
+        emit_stream_event(&stream_json::Event::Result(stream_json::RunResult {
+            subtype: if is_error {
+                "error_during_execution".into()
+            } else {
+                "success".into()
+            },
+            duration_ms: stream_started.elapsed().as_millis() as u64,
+            is_error,
+            num_turns: 1,
+            session_id: record.id.clone(),
+            harness_session_id: outcome.harness_session_id.clone(),
+            error: outcome.error.clone(),
+        }))?;
+        if archive {
+            let archived_at = current_timestamp();
+            store::archive_session(&conn, &record.id, &archived_at)?;
+        }
+        if is_error {
+            let exit_code = outcome
+                .process
+                .exit_code
+                .filter(|code| *code != 0)
+                .unwrap_or(1);
+            exit_with_session_code(exit_code, true);
+        }
+        return Ok(());
+    }
     // Preserve the JSONL-only captured-output contract from #315 on
     // non-Windows platforms. Windows Codex must bypass ConPTY and use the
     // verified ordinary-pipe path so Cave receives a terminal response.
@@ -2217,6 +2329,7 @@ fn run_session(
                     is_error,
                     num_turns: 1,
                     session_id: record.id.clone(),
+                    harness_session_id: None,
                     error: None,
                 }))?;
             }
@@ -2247,6 +2360,7 @@ fn run_session(
                     is_error: true,
                     num_turns: 1,
                     session_id: record.id.clone(),
+                    harness_session_id: None,
                     error: Some(format!("{error:#}")),
                 }))?;
             }
