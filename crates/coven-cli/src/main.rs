@@ -20,6 +20,7 @@ mod coven_calls;
 mod daemon;
 mod encrypted_artifacts;
 mod engine;
+mod engine_install;
 mod eval_loop;
 mod executor_node;
 mod familiar_identity;
@@ -104,6 +105,11 @@ enum Command {
     Adapter {
         #[command(subcommand)]
         command: AdapterCommand,
+    },
+    #[command(about = "Manage the Coven engine (the interactive agent runtime)")]
+    Engine {
+        #[command(subcommand)]
+        command: EngineCommand,
     },
     #[command(about = "Manage the local Coven daemon")]
     Daemon {
@@ -392,6 +398,24 @@ enum DaemonCommand {
 }
 
 #[derive(Subcommand, Debug)]
+enum EngineCommand {
+    #[command(about = "Show resolved engine path, source, version, and pin state")]
+    Status {
+        #[arg(long, help = "Emit JSON")]
+        json: bool,
+    },
+    #[command(about = "Download and install the pinned engine into ~/.coven/engine")]
+    Install {
+        #[arg(long, help = "Install a specific version instead of the default")]
+        version: Option<String>,
+        #[arg(long, help = "Reinstall even if already present")]
+        force: bool,
+    },
+    #[command(about = "Print the engine binary path coven will use (exit 1 if none)")]
+    Which,
+}
+
+#[derive(Subcommand, Debug)]
 enum LogsCommand {
     #[command(about = "Prune expired raw artifacts and old redacted event logs")]
     Prune {
@@ -521,6 +545,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             Ok(())
         }
         Some(Command::Adapter { command }) => run_adapter_command(command),
+        Some(Command::Engine { command }) => run_engine_command(command),
         Some(Command::Daemon { command }) => run_daemon_command(command),
         Some(Command::Executor { command }) => run_executor_command(command),
         Some(Command::Run {
@@ -1545,6 +1570,88 @@ fn run_vacuum_command() -> Result<()> {
         store_path.display()
     );
     Ok(())
+}
+
+fn run_engine_command(command: EngineCommand) -> Result<()> {
+    match command {
+        EngineCommand::Status { json } => engine_status(json),
+        EngineCommand::Install { version, force } => {
+            let version =
+                version.unwrap_or_else(|| engine_install::DEFAULT_ENGINE_VERSION.to_string());
+            // Task 2.1 will thread the pinned checksum here; None = dev mode.
+            let (path, outcome) = engine_install::install(&version, None, force)?;
+            match outcome {
+                engine_install::InstallOutcome::Installed => {
+                    println!("Installed Coven engine {version} at {}", path.display());
+                }
+                engine_install::InstallOutcome::AlreadyPresent => {
+                    println!(
+                        "Coven engine {version} already present at {} (use --force to reinstall)",
+                        path.display()
+                    );
+                }
+            }
+            Ok(())
+        }
+        EngineCommand::Which => match engine::resolve() {
+            Some(resolved) => {
+                println!("{}", resolved.path.display());
+                Ok(())
+            }
+            None => {
+                std::process::exit(1);
+            }
+        },
+    }
+}
+
+fn engine_source_label(source: &engine::EngineSource) -> &'static str {
+    match source {
+        engine::EngineSource::EnvOverride => "COVEN_ENGINE_BIN override",
+        engine::EngineSource::Managed => "managed (~/.coven/engine)",
+        engine::EngineSource::PathLookup => "PATH",
+        engine::EngineSource::LegacyHome => "legacy (~/.coven-code/bin)",
+    }
+}
+
+fn engine_status(json: bool) -> Result<()> {
+    match engine::resolve() {
+        Some(resolved) => {
+            let version = engine::engine_version(&resolved.path).ok();
+            let version_str = version
+                .map(|(a, b, c)| format!("{a}.{b}.{c}"))
+                .unwrap_or_else(|| "unknown".to_string());
+            if json {
+                let obj = serde_json::json!({
+                    "installed": true,
+                    "path": resolved.path.display().to_string(),
+                    "source": engine_source_label(&resolved.source),
+                    "version": version_str,
+                    "pin": serde_json::Value::Null, // Task 2.1
+                });
+                println!("{}", serde_json::to_string_pretty(&obj)?);
+            } else {
+                println!("Coven engine");
+                println!("  Path:    {}", resolved.path.display());
+                println!("  Source:  {}", engine_source_label(&resolved.source));
+                println!("  Version: {version_str}");
+                println!("  Pin:     none (dev)"); // Task 2.1 fills this in
+            }
+            Ok(())
+        }
+        None => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({"installed": false}))?
+                );
+            } else {
+                println!("Coven engine: not installed");
+                println!("  Run: coven engine install");
+            }
+            Ok(())
+        }
+    }
 }
 
 fn run_daemon_command(command: DaemonCommand) -> Result<()> {
