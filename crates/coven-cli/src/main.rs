@@ -19,6 +19,7 @@ mod control_plane;
 mod coven_calls;
 mod daemon;
 mod encrypted_artifacts;
+mod engine;
 mod eval_loop;
 mod executor_node;
 mod familiar_identity;
