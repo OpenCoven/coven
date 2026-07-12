@@ -328,6 +328,30 @@ enum Command {
         #[command(subcommand)]
         command: Option<pc::PcCommand>,
     },
+    #[command(
+        about = "Manage model provider credentials (Anthropic, Codex) — runs in the Coven engine"
+    )]
+    Auth {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<OsString>,
+    },
+    #[command(about = "List available models — runs in the Coven engine")]
+    Models {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<OsString>,
+    },
+    #[command(
+        about = "Start the Agent Client Protocol server (stdio JSON-RPC) — runs in the Coven engine"
+    )]
+    Acp {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<OsString>,
+    },
+    #[command(about = "Run any Coven engine subcommand directly (escape hatch)")]
+    Code {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<OsString>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -648,6 +672,10 @@ fn run_cli(cli: Cli) -> Result<()> {
             keep_session,
         ),
         Some(Command::Pc { command }) => pc::run_pc_command(command),
+        Some(Command::Auth { args }) => run_engine_passthrough(Some("auth"), &args),
+        Some(Command::Models { args }) => run_engine_passthrough(Some("models"), &args),
+        Some(Command::Acp { args }) => run_engine_passthrough(Some("acp"), &args),
+        Some(Command::Code { args }) => run_engine_passthrough(None, &args),
     }
 }
 
@@ -911,6 +939,49 @@ fn coven_code_binary() -> Option<PathBuf> {
     engine::resolve().map(|resolved| resolved.path)
 }
 
+/// Build a `Command` for the engine binary with the standard parent-context
+/// env. Callers add their own args.
+fn engine_command(binary: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new(binary);
+    command.env("COVEN_PARENT", "coven");
+    // Forward COVEN_HOME only when explicitly set; otherwise the engine derives
+    // the same default from HOME/USERPROFILE that coven would.
+    if let Some(home) = std::env::var_os("COVEN_HOME") {
+        command.env("COVEN_HOME", home);
+    }
+    command
+}
+
+/// Run the engine command, replacing this process on unix (exec) or spawning
+/// and propagating the exit code elsewhere. Returns only on failure.
+fn exec_engine(mut command: std::process::Command) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = command.exec();
+        Err(anyhow!("failed to exec coven-code: {err}"))
+    }
+    #[cfg(not(unix))]
+    {
+        let status = command
+            .status()
+            .map_err(|e| anyhow!("failed to launch coven-code: {e}"))?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
+/// Exec the engine with an optional fixed leading subcommand plus user args.
+/// Used for curated passthroughs (auth/models/acp) and the raw `code` hatch.
+fn run_engine_passthrough(lead: Option<&str>, args: &[OsString]) -> Result<()> {
+    let engine = engine::require()?;
+    let mut command = engine_command(&engine.path);
+    if let Some(lead) = lead {
+        command.arg(lead);
+    }
+    command.args(args);
+    exec_engine(command)
+}
+
 /// Exec `coven-code` in place of the current process. Returns only on failure;
 /// on success the child takes over this PID and stdio.
 fn try_delegate_to_coven_code(binary: &Path) -> Result<()> {
@@ -929,7 +1000,7 @@ fn try_delegate_to_coven_code(binary: &Path) -> Result<()> {
         Err(_) => {}
     }
 
-    let mut command = std::process::Command::new(binary);
+    let mut command = engine_command(binary);
     // Pass through every flag the user supplied to `coven`/`coven tui` so
     // any future coven-code substrate flags work end-to-end. We strip argv[0]
     // and the optional leading `tui` subcommand because coven-code expects
@@ -942,29 +1013,7 @@ fn try_delegate_to_coven_code(binary: &Path) -> Result<()> {
         args.remove(0);
     }
     command.args(args);
-    command.env("COVEN_PARENT", "coven");
-    // Forward COVEN_HOME only when explicitly set; otherwise the engine derives
-    // the same default from HOME/USERPROFILE that coven would.
-    if let Some(home) = std::env::var_os("COVEN_HOME") {
-        command.env("COVEN_HOME", home);
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        let err = command.exec();
-        // exec only returns on failure.
-        Err(anyhow!("failed to exec coven-code: {err}"))
-    }
-
-    #[cfg(not(unix))]
-    {
-        let status = command
-            .status()
-            .map_err(|e| anyhow!("failed to launch coven-code: {e}"))?;
-        // A signal-terminated child has no code; treat it as failure.
-        std::process::exit(status.code().unwrap_or(1));
-    }
+    exec_engine(command)
 }
 
 fn interactive_shell_route(
@@ -4138,5 +4187,27 @@ mod tests {
         assert!(!should_offer_auto_install(false, true, false, false)); // piped stdout
         assert!(!should_offer_auto_install(true, true, true, false)); // already installed
         assert!(!should_offer_auto_install(false, true, true, true)); // opt-out
+    }
+
+    #[test]
+    fn passthrough_subcommands_are_registered_and_unique() {
+        // Drives off the real Cli definition so it can't silently rot as commands
+        // are added. clap guarantees subcommand-name uniqueness at construction
+        // (Cli::command() would panic on a duplicate), so asserting each passthrough
+        // resolves to exactly one registered subcommand catches an accidental
+        // rename or a collision with a future coven-owned command.
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let names: Vec<String> = cmd
+            .get_subcommands()
+            .map(|s| s.get_name().to_string())
+            .collect();
+        for passthrough in ["auth", "models", "acp", "code"] {
+            assert_eq!(
+                names.iter().filter(|n| n.as_str() == passthrough).count(),
+                1,
+                "passthrough `{passthrough}` must be exactly one registered subcommand"
+            );
+        }
     }
 }
