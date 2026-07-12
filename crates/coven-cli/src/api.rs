@@ -241,6 +241,14 @@ pub fn handle_request_with_runtime(
                 .trim_end_matches("/icon");
             update_familiar_icon(coven_home, id, body)
         }
+        // The Ward-enforced write path into a familiar home. Every write is
+        // adjudicated by `ward::Ward::apply` (Gates 1–2, fail-closed, audited).
+        ("POST", path) if path.starts_with("/familiars/") && path.ends_with("/edits") => {
+            let id = path
+                .trim_start_matches("/familiars/")
+                .trim_end_matches("/edits");
+            apply_familiar_edits(coven_home, id, body)
+        }
         ("GET", "/skills") => json_response(200, &crate::cockpit_sources::scan_skills(coven_home)?),
         ("GET", p) if p.starts_with("/skills/eval-loop/") && !p.ends_with("/run") => {
             let familiar_id = p.trim_start_matches("/skills/eval-loop/");
@@ -2215,6 +2223,182 @@ fn update_familiar_icon(
             Some(json!({ "id": familiar_id })),
         ),
     }
+}
+
+/// `POST /familiars/{id}/edits` — the Ward-enforced write path into a familiar
+/// home.
+///
+/// The daemon is the sole write authority for familiar homes it manages, and
+/// this endpoint is deliberately the *only* daemon surface that writes
+/// arbitrary files there: every edit is adjudicated by [`crate::ward::Ward::apply`],
+/// the fail-closed Gates 1–2 + Gate 4 audit boundary. Fail-closed extends to
+/// configuration: a familiar without a `ward.toml` in its workspace cannot be
+/// written through this endpoint at all.
+///
+/// Request body:
+///
+/// ```json
+/// {
+///   "edits": [{ "target": "notes/today.md", "contents": "..." }],
+///   "principalKeyFingerprint": "optional-signing-key-fingerprint"
+/// }
+/// ```
+///
+/// Responses: `200` applied (with Gate 4 audit records), `202` held for
+/// Gate 3 coherence review (nothing written), `403` refused (nothing
+/// written), `409` no ward.toml.
+fn apply_familiar_edits(
+    coven_home: &Path,
+    familiar_id: &str,
+    body: Option<&str>,
+) -> Result<ApiResponse> {
+    use crate::ward;
+
+    if familiar_id.is_empty() || familiar_id.contains('/') {
+        return api_error(
+            400,
+            "invalid_request",
+            "Familiar id is required and must not contain '/'.",
+            None,
+        );
+    }
+    if crate::familiar_identity::resolve(coven_home, familiar_id)?.is_none() {
+        return api_error(
+            404,
+            "familiar_not_found",
+            "No familiar with that id is declared in familiars.toml.",
+            Some(json!({ "id": familiar_id })),
+        );
+    }
+    let payload = match parse_body(body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return api_error(400, "invalid_request", &error.to_string(), None);
+        }
+    };
+
+    let Some(raw_edits) = payload.get("edits").and_then(Value::as_array) else {
+        return api_error(
+            400,
+            "invalid_request",
+            "Field `edits` must be an array of { target, contents } objects.",
+            None,
+        );
+    };
+    if raw_edits.is_empty() {
+        return api_error(
+            400,
+            "invalid_request",
+            "Field `edits` must not be empty.",
+            None,
+        );
+    }
+    let mut edits = Vec::with_capacity(raw_edits.len());
+    for (index, edit) in raw_edits.iter().enumerate() {
+        let (Some(target), Some(contents)) = (
+            edit.get("target").and_then(Value::as_str),
+            edit.get("contents").and_then(Value::as_str),
+        ) else {
+            return api_error(
+                400,
+                "invalid_request",
+                "Each edit must carry string `target` and `contents` fields.",
+                Some(json!({ "index": index })),
+            );
+        };
+        edits.push(ward::FileEdit::new(target, contents.to_owned()));
+    }
+
+    let authorization = match payload.get("principalKeyFingerprint") {
+        None | Some(Value::Null) => ward::Authorization::unsigned(),
+        Some(Value::String(fingerprint)) => ward::Authorization::signed_by(fingerprint.clone()),
+        Some(_) => {
+            return api_error(
+                400,
+                "invalid_request",
+                "Field `principalKeyFingerprint` must be a string or null.",
+                None,
+            );
+        }
+    };
+
+    let workspace = crate::cockpit_sources::familiar_workspace(coven_home, familiar_id);
+    let config = match ward::WardConfig::load(&workspace) {
+        Ok(Some(config)) => config,
+        Ok(None) => {
+            return api_error(
+                409,
+                "ward_not_configured",
+                "This familiar has no ward.toml; the daemon refuses unwarded writes \
+                 into a familiar home. Declare the familiar's surface in ward.toml first.",
+                Some(json!({
+                    "id": familiar_id,
+                    "workspace": workspace.display().to_string(),
+                })),
+            );
+        }
+        Err(error) => {
+            return api_error(500, "ward_config_invalid", &format!("{error:#}"), None);
+        }
+    };
+    let ward = match ward::Ward::new(&workspace, config) {
+        Ok(ward) => ward,
+        Err(error) => {
+            return api_error(500, "ward_config_invalid", &format!("{error:#}"), None);
+        }
+    };
+
+    let report = ward.apply(&edits, &authorization)?;
+    let changes: Vec<Value> = report.changes.iter().map(ward_change_json).collect();
+    if report.is_refused() {
+        return api_error(
+            403,
+            "ward_refused",
+            "The Ward refused the proposal; nothing was written.",
+            Some(json!({ "changes": changes })),
+        );
+    }
+    if report.is_held() {
+        return json_response(
+            202,
+            &json!({ "ok": true, "disposition": "held", "changes": changes }),
+        );
+    }
+    json_response(
+        200,
+        &json!({ "ok": true, "disposition": "applied", "changes": changes }),
+    )
+}
+
+/// Serialize one Ward per-edit outcome for the `/familiars/{id}/edits` response.
+fn ward_change_json(change: &crate::ward::AppliedChange) -> Value {
+    use crate::ward::{Disposition, Verdict};
+
+    let disposition = match change.disposition {
+        Disposition::Applied => "applied",
+        Disposition::HeldForCoherence => "held",
+        Disposition::Refused => "refused",
+    };
+    let verdict = match &change.decision.verdict {
+        Verdict::Allow => json!({ "kind": "allow" }),
+        Verdict::AllowWithLog => json!({ "kind": "allowWithLog" }),
+        Verdict::RequiresCoherenceReview => json!({ "kind": "requiresCoherenceReview" }),
+        Verdict::AuthorizedProtectedChange => json!({ "kind": "authorizedProtectedChange" }),
+        Verdict::Blocked { reason } => {
+            json!({ "kind": "blocked", "reason": reason.to_string() })
+        }
+    };
+    let mut value = json!({
+        "target": change.decision.target,
+        "resolved": change.decision.resolved,
+        "tier": u8::from(change.decision.tier),
+        "verdict": verdict,
+        "disposition": disposition,
+    });
+    if let Some(audit) = &change.audit {
+        value["audit"] = serde_json::to_value(audit).unwrap_or(Value::Null);
+    }
+    value
 }
 
 pub(crate) fn parse_body(body: Option<&str>) -> Result<Value> {
@@ -5203,6 +5387,222 @@ icon = "ph:leaf-fill"
         assert_eq!(response.status, 200);
         let body: serde_json::Value = serde_json::from_str(&response.body)?;
         assert_eq!(body["action"], "cleared");
+        Ok(())
+    }
+
+    // ---- POST /api/v1/familiars/{id}/edits (Ward write path) -------------
+
+    /// Seed a warded sage: familiars.toml plus a workspace carrying a
+    /// ward.toml with SOUL.md protected (tier 0), reviewed/ tier 1, and the
+    /// default tier 2 everywhere else. Returns the workspace path.
+    fn seed_warded_familiar(home: &Path) -> Result<std::path::PathBuf> {
+        seed_familiars_toml(home)?;
+        let workspace = home.join("familiars").join("sage");
+        std::fs::create_dir_all(&workspace)?;
+        std::fs::write(workspace.join("SOUL.md"), "# Sage\n")?;
+        std::fs::write(
+            workspace.join("ward.toml"),
+            r#"principal_key_fingerprint = "fpr-val"
+protected_surface = ["SOUL.md"]
+
+[[surface]]
+path = "SOUL.md"
+tier = 0
+
+[[surface]]
+path = "reviewed/"
+tier = 1
+"#,
+        )?;
+        Ok(workspace)
+    }
+
+    fn post_edits(home: &Path, body: &str) -> Result<ApiResponse> {
+        handle_request_with_body(
+            "POST",
+            "/api/v1/familiars/sage/edits",
+            home,
+            None,
+            Some(body),
+        )
+    }
+
+    #[test]
+    fn post_familiar_edits_applies_and_audits_tier2_write() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"notes/today.md","contents":"hello ward"}]}"#,
+        )?;
+
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["disposition"], "applied");
+        assert_eq!(body["changes"][0]["tier"], 2);
+        assert_eq!(body["changes"][0]["disposition"], "applied");
+        // Gate 4: a tier-2 write must carry a tamper-evident audit record.
+        assert!(
+            body["changes"][0]["audit"]["nextSha256"].is_string(),
+            "expected audit record, got {}",
+            body["changes"][0]
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("notes/today.md"))?,
+            "hello ward"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_refuses_traversal_and_writes_nothing() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+
+        // All-or-nothing: a clean tier-2 edit bundled with a traversal escape
+        // must not be written either.
+        let response = post_edits(
+            home,
+            r#"{"edits":[
+                {"target":"notes/ok.md","contents":"fine"},
+                {"target":"../escape.md","contents":"nope"}
+            ]}"#,
+        )?;
+
+        assert_eq!(response.status, 403, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "ward_refused");
+        assert!(!workspace.join("notes/ok.md").exists());
+        assert!(!home.join("familiars/escape.md").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_refuses_unsigned_protected_write() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"SOUL.md","contents":"new identity"}]}"#,
+        )?;
+
+        assert_eq!(response.status, 403, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "ward_refused");
+        assert_eq!(
+            body["error"]["details"]["changes"][0]["verdict"]["kind"],
+            "blocked"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("SOUL.md"))?,
+            "# Sage\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_holds_authorized_protected_write() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+
+        // Gate 1 passes, but Gate 3 (coherence) is unimplemented: held, not
+        // written — fail-closed.
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"SOUL.md","contents":"new identity"}],
+                "principalKeyFingerprint":"fpr-val"}"#,
+        )?;
+
+        assert_eq!(response.status, 202, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["disposition"], "held");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("SOUL.md"))?,
+            "# Sage\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_holds_tier1_write() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"reviewed/skill.md","contents":"tweak"}]}"#,
+        )?;
+
+        assert_eq!(response.status, 202, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["disposition"], "held");
+        assert_eq!(
+            body["changes"][0]["verdict"]["kind"],
+            "requiresCoherenceReview"
+        );
+        assert!(!workspace.join("reviewed/skill.md").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_fails_closed_without_ward_toml() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_familiars_toml(home)?;
+        let workspace = home.join("familiars").join("sage");
+        std::fs::create_dir_all(&workspace)?;
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"notes/today.md","contents":"hello"}]}"#,
+        )?;
+
+        assert_eq!(response.status, 409, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "ward_not_configured");
+        assert!(!workspace.join("notes/today.md").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_returns_404_for_unknown_familiar() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_familiars_toml(home)?;
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/familiars/ghost/edits",
+            home,
+            None,
+            Some(r#"{"edits":[{"target":"x.md","contents":"y"}]}"#),
+        )?;
+
+        assert_eq!(response.status, 404, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "familiar_not_found");
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_rejects_missing_edits_field() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_warded_familiar(home)?;
+
+        let response = post_edits(home, r#"{"nope":true}"#)?;
+
+        assert_eq!(response.status, 400, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "invalid_request");
         Ok(())
     }
 

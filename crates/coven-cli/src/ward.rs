@@ -132,7 +132,29 @@ fn default_unmatched_tier() -> Tier {
     Tier::Logged
 }
 
+/// Conventional name of the Ward configuration file inside a familiar home.
+pub const WARD_CONFIG_FILE: &str = "ward.toml";
+
 impl WardConfig {
+    /// Load the Ward configuration from `<home>/ward.toml`.
+    ///
+    /// Returns `Ok(None)` when the file does not exist (the familiar has no
+    /// declared Ward). A present-but-invalid file is an error, never silently
+    /// ignored: a malformed Ward must not degrade into "no Ward".
+    pub fn load(home: &Path) -> Result<Option<Self>> {
+        let path = home.join(WARD_CONFIG_FILE);
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(anyhow!("reading ward config {}: {err}", path.display()));
+            }
+        };
+        Self::from_toml_str(&raw)
+            .with_context(|| format!("invalid ward config at {}", path.display()))
+            .map(Some)
+    }
+
     /// Parse a `ward.toml` document.
     pub fn from_toml_str(input: &str) -> Result<Self> {
         let config: WardConfig = toml::from_str(input).context("failed to parse ward.toml")?;
@@ -345,6 +367,7 @@ pub enum Disposition {
 /// leaves the canonical hash open: BLAKE3 is the eventual recommendation;
 /// SHA-256 is used here as the documented fallback.)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AuditRecord {
     /// The target as supplied in the edit.
     pub target: String,
