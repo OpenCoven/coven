@@ -177,6 +177,16 @@ desktop/apps -> Coven -> chat/intake client UI updates
 - Session browser actions surface readable choices: **Rejoin**, **View Log**, **Summon**, **Archive**, and **Sacrifice**.
 - `coven attach|summon|archive|sacrifice <session-id>` remain explicit lower-level verbs for scripts and copy/paste workflows.
 
+## Managed engine
+
+Coven drives `coven-code` as a separately-installed engine process — it is
+never linked or imported as a library. The process boundary is also the license
+boundary (coven: MIT; coven-code: GPL-3.0). The exact CLI flags, environment
+variables, stream-json events, and exit codes that constitute the integration
+surface are specified in [`docs/ENGINE-CONTRACT.md`](ENGINE-CONTRACT.md);
+any breaking change to that surface requires a coordinated version bump in both
+repositories.
+
 ## Distribution snapshot
 
 The npm wrapper packages are live for early adopters:
