@@ -1676,6 +1676,30 @@ pub fn mark_running_sessions_orphaned(conn: &Connection, updated_at: &str) -> Re
     Ok(updated)
 }
 
+/// Companion reaper to [`mark_running_sessions_orphaned`]: `coven run`
+/// inserts the session row as `created` and only flips it to `running`
+/// right before launching the harness. A run process that dies between
+/// those two writes (fork exhaustion, missing adapter, crash) leaves a row
+/// no process owns, so only age can prove it dead. Rows created before the
+/// cutoff become `failed`; newer rows stay untouched so a slow-but-live
+/// launch is never clobbered.
+pub fn mark_stale_created_sessions_failed(
+    conn: &Connection,
+    created_before: &str,
+    updated_at: &str,
+) -> Result<usize> {
+    let updated = conn
+        .execute(
+            "UPDATE sessions
+             SET status = 'failed',
+                 updated_at = ?2
+             WHERE status = 'created' AND created_at < ?1",
+            params![created_before, updated_at],
+        )
+        .context("failed to mark stale created sessions failed")?;
+    Ok(updated)
+}
+
 pub fn get_session(conn: &Connection, session_id: &str) -> Result<Option<SessionRecord>> {
     let mut statement = conn
         .prepare(&format!(
@@ -2532,6 +2556,38 @@ mod tests {
         assert_eq!(running.status, "orphaned");
         assert_eq!(running.updated_at, "2026-04-27T07:00:00Z");
         assert_eq!(killed.status, "killed");
+        Ok(())
+    }
+
+    #[test]
+    fn marks_only_stale_created_sessions_failed() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+        let mut stale = session_record("stale-created", "2026-04-27T06:00:00Z");
+        stale.status = "created".to_string();
+        let mut fresh = session_record("fresh-created", "2026-04-27T06:55:00Z");
+        fresh.status = "created".to_string();
+        let mut running = session_record("running", "2026-04-27T06:00:00Z");
+        running.status = "running".to_string();
+        insert_session(&conn, &stale)?;
+        insert_session(&conn, &fresh)?;
+        insert_session(&conn, &running)?;
+
+        // Cutoff falls between the stale and fresh rows' created_at, so only
+        // the stale row is provably dead.
+        let updated = mark_stale_created_sessions_failed(
+            &conn,
+            "2026-04-27T06:50:00Z",
+            "2026-04-27T07:00:00Z",
+        )?;
+        let sessions = list_sessions(&conn)?;
+        let by_id = |id: &str| sessions.iter().find(|session| session.id == id).unwrap();
+
+        assert_eq!(updated, 1);
+        assert_eq!(by_id("stale-created").status, "failed");
+        assert_eq!(by_id("stale-created").updated_at, "2026-04-27T07:00:00Z");
+        assert_eq!(by_id("fresh-created").status, "created");
+        assert_eq!(by_id("running").status, "running");
         Ok(())
     }
 

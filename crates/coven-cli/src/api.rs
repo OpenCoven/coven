@@ -427,6 +427,7 @@ pub fn handle_request_with_runtime(
         }
         ("GET", "/sessions") => {
             let conn = store::open_store(&store_path(coven_home))?;
+            reap_stale_created_sessions_throttled(&conn);
             let sessions = store::list_sessions(&conn)?;
             json_response(200, &sessions)
         }
@@ -2246,6 +2247,37 @@ fn session_action_id<'a>(path: &'a str, suffix: &str) -> &'a str {
 
 pub(crate) fn current_timestamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)
+}
+
+/// The daemon has no periodic maintenance loop, so the sessions list — the
+/// endpoint Cave polls constantly — doubles as the reap tick for rows a dead
+/// `coven run` stranded in `created` (#342). Throttled so back-to-back polls
+/// don't each pay a write, and best-effort: a failed repair never fails the
+/// read it piggybacks on. Startup recovery covers daemons nobody lists.
+const STALE_CREATED_REAP_INTERVAL_SECS: u64 = 60;
+
+fn reap_stale_created_sessions_throttled(conn: &rusqlite::Connection) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_REAP_EPOCH_SECS: AtomicU64 = AtomicU64::new(0);
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let last = LAST_REAP_EPOCH_SECS.load(Ordering::Relaxed);
+    if now_secs.saturating_sub(last) < STALE_CREATED_REAP_INTERVAL_SECS {
+        return;
+    }
+    if LAST_REAP_EPOCH_SECS
+        .compare_exchange(last, now_secs, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        // Another connection claimed this tick.
+        return;
+    }
+    let cutoff = (Utc::now() - Duration::seconds(crate::daemon::STALE_CREATED_TTL_SECS))
+        .to_rfc3339_opts(SecondsFormat::Nanos, true);
+    let _ = store::mark_stale_created_sessions_failed(conn, &cutoff, &current_timestamp());
 }
 
 pub(crate) fn api_error(

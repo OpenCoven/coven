@@ -986,6 +986,23 @@ pub fn recover_orphaned_sessions(coven_home: &Path, updated_at: &str) -> Result<
     crate::store::mark_running_sessions_orphaned(&conn, updated_at)
 }
 
+/// TTL before a `created` row with no live owner is declared dead (#342).
+/// Generous on purpose: `coven run` writes the store directly, so a launch
+/// can be legitimately mid-registration while the daemon boots or serves —
+/// a blanket sweep would clobber it, an age check cannot.
+pub const STALE_CREATED_TTL_SECS: i64 = 600;
+
+/// Companion to [`recover_orphaned_sessions`] for the other unowned state:
+/// rows a dead `coven run` left in `created` (registered, never launched —
+/// fork exhaustion, missing adapter, crash). Nothing owns such a row, so no
+/// exit path will ever fail it; only age proves it dead.
+pub fn recover_stale_created_sessions(coven_home: &Path, updated_at: &str) -> Result<usize> {
+    let conn = crate::store::open_store(&coven_home.join("coven.sqlite3"))?;
+    let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(STALE_CREATED_TTL_SECS))
+        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    crate::store::mark_stale_created_sessions_failed(&conn, &cutoff, updated_at)
+}
+
 pub fn write_status(coven_home: &Path, status: &DaemonStatus) -> Result<()> {
     ensure_private_coven_home(coven_home)?;
     let json = serde_json::to_string_pretty(status).context("failed to serialize daemon status")?;
@@ -2041,6 +2058,7 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
         ),
     );
     recover_orphaned_sessions(coven_home, &started_at)?;
+    recover_stale_created_sessions(coven_home, &started_at)?;
     let runtime = Arc::new(LiveSessionRuntime::with_coven_home(
         coven_home.to_path_buf(),
     ));
@@ -3213,6 +3231,36 @@ mod tests {
         assert_eq!(updated, 1);
         assert_eq!(session_status(&sessions, "running"), "orphaned");
         assert_eq!(session_status(&sessions, "killed"), "killed");
+        Ok(())
+    }
+
+    #[test]
+    fn recovers_stale_created_sessions_as_failed() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = crate::store::open_store(&temp_dir.path().join("coven.sqlite3"))?;
+        // Helper's fixed 2026-04-27 created_at sits far past the TTL → stale.
+        let mut stale = session_record("stale-created");
+        stale.status = "created".to_string();
+        // A row registered "just now" is inside the TTL and must survive —
+        // its `coven run` may still be launching.
+        let mut fresh = session_record("fresh-created");
+        fresh.status = "created".to_string();
+        fresh.created_at = crate::api::current_timestamp();
+        let mut completed = session_record("completed");
+        completed.status = "completed".to_string();
+        crate::store::insert_session(&conn, &stale)?;
+        crate::store::insert_session(&conn, &fresh)?;
+        crate::store::insert_session(&conn, &completed)?;
+        drop(conn);
+
+        let updated = recover_stale_created_sessions(temp_dir.path(), "2026-04-27T08:00:00Z")?;
+        let conn = crate::store::open_store(&temp_dir.path().join("coven.sqlite3"))?;
+        let sessions = crate::store::list_sessions(&conn)?;
+
+        assert_eq!(updated, 1);
+        assert_eq!(session_status(&sessions, "stale-created"), "failed");
+        assert_eq!(session_status(&sessions, "fresh-created"), "created");
+        assert_eq!(session_status(&sessions, "completed"), "completed");
         Ok(())
     }
 
