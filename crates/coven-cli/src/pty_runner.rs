@@ -140,6 +140,7 @@ fn move_windows_codex_prompt_to_stdin(
     Some(prompt.as_bytes().to_vec())
 }
 
+#[cfg(windows)]
 fn write_stdin_prompt(child: &mut std::process::Child, prompt: Option<&[u8]>) -> Result<()> {
     let Some(prompt) = prompt else {
         return Ok(());
