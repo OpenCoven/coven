@@ -1096,12 +1096,39 @@ fn run_doctor() -> Result<()> {
         healthy = false;
     }
 
-    println!("\nInteractive UI:");
-    match coven_code_binary() {
-        Some(path) => println!("  [OK] coven-code found at {}", path.display()),
+    println!("\nEngine:");
+    match engine::resolve() {
+        Some(resolved) => {
+            println!(
+                "  [OK] {} ({})",
+                resolved.path.display(),
+                engine_source_label(&resolved.source)
+            );
+            match engine::engine_version(&resolved.path) {
+                Ok(version) => {
+                    let (a, b, c) = version;
+                    let (min_a, min_b, min_c) = engine::MIN_ENGINE_VERSION;
+                    if engine::version_meets_minimum(version) {
+                        println!("       version {a}.{b}.{c} (minimum {min_a}.{min_b}.{min_c})");
+                    } else {
+                        healthy = false;
+                        println!(
+                            "  [!!] version {a}.{b}.{c} is older than the minimum {min_a}.{min_b}.{min_c} — run: coven engine install"
+                        );
+                    }
+                }
+                Err(_) => println!("       version: unknown (could not run the engine)"),
+            }
+            println!("       pin: none (dev)"); // Task 2.1 fills this from engine.lock
+            match engine_auth_summary(&resolved.path) {
+                Some(true) => println!("       auth: logged in"),
+                Some(false) => println!("       auth: not logged in — run `coven auth login`"),
+                None => println!("       auth: check skipped"),
+            }
+        }
         None => {
             healthy = false;
-            println!("  [!!] coven-code is missing — `coven` and `coven chat` need it");
+            println!("  [!!] the Coven engine is missing — `coven` and `coven chat` need it");
             for line in coven_code_install_instructions(target_shell()).lines() {
                 println!("     {line}");
             }
@@ -1715,6 +1742,46 @@ fn engine_source_label(source: &engine::EngineSource) -> &'static str {
         engine::EngineSource::PathLookup => "PATH",
         engine::EngineSource::LegacyHome => "legacy (~/.coven-code/bin)",
     }
+}
+
+/// Query the engine's auth state via `auth status --json`, bounded to ~5s so a
+/// hung engine never hangs `coven doctor`. Returns `Some(logged_in)` on a clean
+/// parse, or `None` if the check couldn't be completed (spawn/timeout/parse
+/// failure) — the caller treats `None` as a skipped, non-blocking check.
+fn engine_auth_summary(binary: &Path) -> Option<bool> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let mut child = std::process::Command::new(binary)
+        .args(["auth", "status", "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return None,
+        }
+    }
+
+    // `auth status --json` output is a few hundred bytes — far under the pipe
+    // buffer — so reading after exit cannot deadlock.
+    let mut buf = String::new();
+    child.stdout.take()?.read_to_string(&mut buf).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&buf).ok()?;
+    json.get("loggedIn")?.as_bool()
 }
 
 fn engine_status(json: bool) -> Result<()> {
