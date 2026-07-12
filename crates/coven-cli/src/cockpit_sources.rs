@@ -56,6 +56,9 @@ struct FamiliarEntry {
     /// treat anything else as an emoji literal.
     icon: Option<String>,
     role: String,
+    // Older CovenCave versions omitted this field for blank descriptions.
+    // Keep those registries readable while preserving a stable string in the API.
+    #[serde(default)]
     description: String,
     pronouns: Option<String>,
     active_channel: Option<String>,
@@ -544,6 +547,40 @@ description = "Builds and debugs."
         // No `icon` field set in this fixture — must round-trip as None.
         assert!(out[0].icon.is_none());
         assert!(out[1].icon.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn read_familiars_defaults_legacy_missing_descriptions() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        fs::write(
+            temp.path().join(FAMILIARS_CONFIG_FILE),
+            r#"
+[[familiar]]
+id = "ash"
+display_name = "Ash"
+emoji = "ph:flask-fill"
+role = "Familiar"
+harness = "codex"
+model = "openai/gpt-5.5"
+
+[[familiar]]
+id = "briar"
+display_name = "Briar"
+emoji = "ph:code-fill"
+role = "Familiar"
+harness = "codex"
+model = "openai/gpt-5.5"
+"#,
+        )?;
+
+        let familiars = read_familiars(temp.path())?;
+
+        assert_eq!(familiars.len(), 2);
+        assert_eq!(familiars[0].id, "ash");
+        assert_eq!(familiars[0].description, "");
+        assert_eq!(familiars[1].id, "briar");
+        assert_eq!(familiars[1].description, "");
         Ok(())
     }
 

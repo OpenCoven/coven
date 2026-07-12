@@ -2193,14 +2193,25 @@ where
     }
     let body = read_http_body(&mut reader, headers.content_length)?;
     let (method, path) = parse_request_line(&request_line)?;
-    let response = crate::api::handle_request_with_runtime(
+    let response = match crate::api::handle_request_with_runtime(
         method,
         path,
         coven_home,
         status,
         body.as_deref(),
         runtime,
-    )?;
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("coven daemon: API request failed: {error:#}");
+            crate::api::api_error(
+                500,
+                "internal_error",
+                "The daemon could not process the request.",
+                None,
+            )?
+        }
+    };
     let reason = http_reason_phrase(response.status);
     let http = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -2940,6 +2951,51 @@ mod tests {
         let response = String::from_utf8(output).expect("utf8");
         assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
         assert!(response.contains("\"apiVersion\""), "got: {response}");
+    }
+
+    #[test]
+    fn handle_http_stream_returns_json_error_for_malformed_familiar_registry() -> Result<()> {
+        use crate::api::NoopSessionRuntime;
+        use std::io::Cursor;
+
+        let temp = tempfile::tempdir()?;
+        std::fs::write(temp.path().join("familiars.toml"), "[[familiar]\n")?;
+        let request = b"GET /api/v1/familiars HTTP/1.1\r\nHost: coven\r\n\r\n";
+        let mut stream = Cursor::new(Vec::from(&request[..]));
+        let mut output = Vec::new();
+
+        handle_http_stream(
+            &mut stream,
+            &mut output,
+            temp.path(),
+            None,
+            &NoopSessionRuntime,
+            None,
+            false,
+        )?;
+
+        let response = String::from_utf8(output)?;
+        let (headers, body) = response
+            .split_once("\r\n\r\n")
+            .expect("HTTP response must include a body");
+        assert!(
+            headers.starts_with("HTTP/1.1 500 Internal Server Error"),
+            "got: {response}"
+        );
+        assert!(
+            headers.contains("Content-Type: application/json"),
+            "got: {response}"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body)?,
+            serde_json::json!({
+                "error": {
+                    "code": "internal_error",
+                    "message": "The daemon could not process the request.",
+                }
+            })
+        );
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -4150,6 +4206,147 @@ mod tests {
             assert!(response.contains("\"apiVersion\""), "got: {response}");
         }
         server.join().expect("server thread")?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn malformed_familiar_registry_returns_json_error_over_windows_named_pipe() -> Result<()> {
+        use interprocess::local_socket::{prelude::*, GenericNamespaced, ListenerOptions, Stream};
+        use std::io::Write;
+        use std::thread;
+
+        let temp_dir = tempfile::tempdir()?;
+        std::fs::write(temp_dir.path().join("familiars.toml"), "[[familiar]\n")?;
+        let pipe_name = windows_pipe_name(temp_dir.path());
+        let name = pipe_name
+            .clone()
+            .to_ns_name::<GenericNamespaced>()
+            .expect("pipe name");
+        let listener = ListenerOptions::new()
+            .name(name)
+            .create_sync()
+            .expect("bind pipe");
+        let home = temp_dir.path().to_path_buf();
+        let runtime = LiveSessionRuntime::default();
+        let server = thread::spawn(move || {
+            let conn = listener.incoming().next().expect("accept").expect("stream");
+            handle_http_stream(&conn, &conn, &home, None, &runtime, None, false)
+        });
+
+        let client_name = pipe_name
+            .to_ns_name::<GenericNamespaced>()
+            .expect("client pipe name");
+        let mut client = Stream::connect(client_name).expect("connect");
+        client
+            .write_all(b"GET /api/v1/familiars HTTP/1.1\r\nHost: coven\r\n\r\n")
+            .expect("write request");
+        client.flush().expect("flush");
+        let (status, response) =
+            read_windows_pipe_http_response(client, Duration::from_secs(5), MAX_SOCKET_BODY_BYTES)?;
+
+        server.join().expect("server thread")?;
+        assert_eq!(status, 500);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&response)?,
+            serde_json::json!({
+                "error": {
+                    "code": "internal_error",
+                    "message": "The daemon could not process the request.",
+                }
+            })
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_familiar_registry_returns_roster_over_windows_named_pipe() -> Result<()> {
+        use interprocess::local_socket::{prelude::*, GenericNamespaced, ListenerOptions, Stream};
+        use std::io::Write;
+        use std::thread;
+
+        let temp_dir = tempfile::tempdir()?;
+        std::fs::write(
+            temp_dir.path().join("familiars.toml"),
+            r#"
+[[familiar]]
+id = "ash"
+display_name = "Ash"
+emoji = "ph:flask-fill"
+role = "Familiar"
+harness = "codex"
+model = "openai/gpt-5.5"
+
+[[familiar]]
+id = "briar"
+display_name = "Briar"
+emoji = "ph:code-fill"
+role = "Familiar"
+harness = "codex"
+model = "openai/gpt-5.5"
+"#,
+        )?;
+
+        let pipe_name = windows_pipe_name(temp_dir.path());
+        let name = pipe_name
+            .clone()
+            .to_ns_name::<GenericNamespaced>()
+            .expect("pipe name");
+        let listener = ListenerOptions::new()
+            .name(name)
+            .create_sync()
+            .expect("bind pipe");
+        let home = temp_dir.path().to_path_buf();
+        let runtime = LiveSessionRuntime::default();
+        let server = thread::spawn(move || {
+            let conn = listener.incoming().next().expect("accept").expect("stream");
+            handle_http_stream(&conn, &conn, &home, None, &runtime, None, false)
+        });
+
+        let client_name = pipe_name
+            .to_ns_name::<GenericNamespaced>()
+            .expect("client pipe name");
+        let mut client = Stream::connect(client_name).expect("connect");
+        client
+            .write_all(b"GET /api/v1/familiars HTTP/1.1\r\nHost: coven\r\n\r\n")
+            .expect("write request");
+        client.flush().expect("flush");
+        let (status, response) =
+            read_windows_pipe_http_response(client, Duration::from_secs(5), MAX_SOCKET_BODY_BYTES)?;
+
+        server.join().expect("server thread")?;
+        assert_eq!(status, 200);
+        let familiars: serde_json::Value = serde_json::from_slice(&response)?;
+        assert_eq!(
+            familiars,
+            serde_json::json!([
+                {
+                    "id": "ash",
+                    "name": "ash",
+                    "display_name": "Ash",
+                    "emoji": "ph:flask-fill",
+                    "role": "Familiar",
+                    "description": "",
+                    "status": "offline",
+                    "last_seen": "—",
+                    "active_sessions": 0,
+                    "memory_freshness": "—",
+                },
+                {
+                    "id": "briar",
+                    "name": "briar",
+                    "display_name": "Briar",
+                    "emoji": "ph:code-fill",
+                    "role": "Familiar",
+                    "description": "",
+                    "status": "offline",
+                    "last_seen": "—",
+                    "active_sessions": 0,
+                    "memory_freshness": "—",
+                },
+            ])
+        );
         Ok(())
     }
 
