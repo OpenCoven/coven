@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 #[cfg(unix)]
 use std::io::Read;
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -771,8 +771,8 @@ fn target_shell() -> TargetShell {
 
 fn missing_coven_code_error_message(shell: TargetShell) -> String {
     format!(
-        "coven-code is required for the interactive Coven UI but was not found on PATH \
-         or under ~/.coven-code/bin.\n\n\
+        "The Coven engine is required for the interactive Coven UI but was not found on PATH, \
+         under ~/.coven/engine, or ~/.coven-code/bin.\n\n\
          Install it with:\n\
          {install}\n\n\
          If you need the legacy slash shell temporarily, run:\n\
@@ -800,10 +800,10 @@ fn legacy_tui_warning_message(shell: TargetShell) -> String {
 fn coven_code_install_instructions(shell: TargetShell) -> &'static str {
     match shell {
         TargetShell::Posix => {
-            "  npm install -g @opencoven/coven-code\n  curl -fsSL https://github.com/OpenCoven/coven-code/releases/latest/download/install.sh | bash"
+            "  coven engine install\n  (manual: curl -fsSL https://github.com/OpenCoven/coven-code/releases/latest/download/install.sh | bash)"
         }
         TargetShell::PowerShell => {
-            "  npm install -g @opencoven/coven-code\n  irm https://github.com/OpenCoven/coven-code/releases/latest/download/install.ps1 | iex"
+            "  coven engine install\n  (manual: irm https://github.com/OpenCoven/coven-code/releases/latest/download/install.ps1 | iex)"
         }
     }
 }
@@ -826,69 +826,30 @@ fn legacy_tui_opted_in() -> bool {
     )
 }
 
-/// Locate the `coven-code` binary on PATH or in `~/.coven-code/bin/`.
+/// Locate the engine binary via the managed-engine resolver.
+/// Kept as a thin shim so existing call sites don't churn.
 fn coven_code_binary() -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH");
-    let home = dirs_next::home_dir();
-    coven_code_binary_from(path_var.as_deref(), home.as_deref())
-}
-
-fn coven_code_binary_from(path_var: Option<&OsStr>, home: Option<&Path>) -> Option<PathBuf> {
-    let names: &[&str] = if cfg!(windows) {
-        &["coven-code.exe", "coven-code.cmd", "coven-code.bat"]
-    } else {
-        &["coven-code"]
-    };
-    coven_code_binary_from_names(path_var, home, names)
-}
-
-fn coven_code_binary_from_names(
-    path_var: Option<&OsStr>,
-    home: Option<&Path>,
-    names: &[&str],
-) -> Option<PathBuf> {
-    if let Some(path_var) = path_var {
-        for dir in std::env::split_paths(path_var) {
-            for name in names {
-                let candidate = dir.join(name);
-                if is_executable_file(&candidate) {
-                    return Some(candidate);
-                }
-            }
-        }
-    }
-    if let Some(home) = home {
-        let bin_dir = home.join(".coven-code").join("bin");
-        for name in names {
-            let candidate = bin_dir.join(name);
-            if is_executable_file(&candidate) {
-                return Some(candidate);
-            }
-        }
-    }
-    None
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    if !path.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path)
-            .map(|m| m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
+    engine::resolve().map(|resolved| resolved.path)
 }
 
 /// Exec `coven-code` in place of the current process. Returns only on failure;
 /// on success the child takes over this PID and stdio.
 fn try_delegate_to_coven_code(binary: &Path) -> Result<()> {
+    // Refuse engines older than the minimum the contract requires.
+    match engine::engine_version(binary) {
+        Ok(version) if !engine::version_meets_minimum(version) => {
+            return Err(anyhow!(engine::engine_too_old_message(
+                binary,
+                version,
+                engine::MIN_ENGINE_VERSION
+            )));
+        }
+        Ok(_) => {}
+        // If we can't read the version, don't block launch — proceed and let the
+        // engine speak for itself. (A pin-drift warning is added in Task 2.1.)
+        Err(_) => {}
+    }
+
     let mut command = std::process::Command::new(binary);
     // Pass through every flag the user supplied to `coven`/`coven tui` so
     // any future coven-code substrate flags work end-to-end. We strip argv[0]
@@ -902,6 +863,12 @@ fn try_delegate_to_coven_code(binary: &Path) -> Result<()> {
         args.remove(0);
     }
     command.args(args);
+    command.env("COVEN_PARENT", "coven");
+    // Forward COVEN_HOME only when explicitly set; otherwise the engine derives
+    // the same default from HOME/USERPROFILE that coven would.
+    if let Some(home) = std::env::var_os("COVEN_HOME") {
+        command.env("COVEN_HOME", home);
+    }
 
     #[cfg(unix)]
     {
@@ -2702,6 +2669,7 @@ mod tests {
         MagicalTuiMove, MagicalTuiRequest, MAGICAL_TUI_MAX_INNER_WIDTH,
     };
     use crossterm::event::KeyEventKind;
+    use std::ffi::OsStr;
     use std::sync::{Mutex, OnceLock};
 
     fn env_lock() -> &'static Mutex<()> {
@@ -3938,11 +3906,11 @@ mod tests {
 
     #[test]
     fn missing_coven_code_error_includes_install_instructions() {
-        // The error message is the primary onboarding surface when coven-code
-        // is absent, so it must list at least one concrete install path and
-        // mention the legacy escape hatch.
+        // The error message is the primary onboarding surface when the engine
+        // is absent, so it must lead with the unified command and mention the
+        // fallback script and the legacy escape hatch.
         let msg = missing_coven_code_error_message(TargetShell::Posix);
-        assert!(msg.contains("npm install -g @opencoven/coven-code"));
+        assert!(msg.contains("coven engine install"));
         assert!(msg.contains("install.sh"));
         assert!(msg.contains("COVEN_LEGACY_TUI=1"));
     }
@@ -3951,40 +3919,11 @@ mod tests {
     fn missing_coven_code_error_includes_windows_powershell_instructions() {
         let msg = missing_coven_code_error_message(TargetShell::PowerShell);
 
+        assert!(msg.contains("coven engine install"));
         assert!(msg.contains("irm https://github.com/OpenCoven/coven-code/releases/latest/download/install.ps1 | iex"));
         assert!(msg.contains("$env:COVEN_LEGACY_TUI = \"1\""));
         assert!(msg.contains("Remove-Item Env:COVEN_LEGACY_TUI"));
         assert!(!msg.contains("install.sh | bash"));
-    }
-
-    #[test]
-    fn coven_code_binary_lookup_returns_none_for_empty_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert!(coven_code_binary_from(Some(OsStr::new("")), Some(tmp.path())).is_none());
-    }
-
-    #[test]
-    fn coven_code_binary_lookup_finds_windows_npm_cmd_shim() {
-        let tmp = tempfile::tempdir().unwrap();
-        let shim = tmp.path().join("coven-code.cmd");
-        std::fs::write(&shim, "@echo off\r\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = std::fs::metadata(&shim).unwrap().permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&shim, permissions).unwrap();
-        }
-        let path_var = std::env::join_paths([tmp.path()]).unwrap();
-
-        assert_eq!(
-            coven_code_binary_from_names(
-                Some(path_var.as_os_str()),
-                None,
-                &["coven-code.exe", "coven-code.cmd", "coven-code.bat"]
-            ),
-            Some(shim)
-        );
     }
 
     fn sample_daemon_status() -> daemon::DaemonStatus {

@@ -15,8 +15,6 @@ pub const ENGINE_BIN_NAME: &str = "coven-code.exe";
 pub const ENGINE_BIN_NAME: &str = "coven-code";
 
 /// Oldest engine this coven build can drive (contract v1 surfaces).
-// used by Task 1.2+
-#[allow(dead_code)]
 pub const MIN_ENGINE_VERSION: (u64, u64, u64) = (0, 6, 1);
 
 #[derive(Debug)]
@@ -27,7 +25,7 @@ pub enum EngineSource {
     LegacyHome,  // ~/.coven-code/bin/ (pre-unification installs)
 }
 
-// used by Task 1.2+
+// used by Task 1.3+
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct ResolvedEngine {
@@ -117,7 +115,7 @@ pub fn resolve_from(
 }
 
 /// Resolve or produce the single actionable "engine missing" error.
-// used by Task 1.2+
+// used by Task 1.3+
 #[allow(dead_code)]
 pub fn require() -> Result<ResolvedEngine> {
     resolve().ok_or_else(|| {
@@ -128,8 +126,6 @@ pub fn require() -> Result<ResolvedEngine> {
     })
 }
 
-// used by Task 1.2+
-#[allow(dead_code)]
 pub fn engine_version(binary: &Path) -> Result<(u64, u64, u64)> {
     let out = Command::new(binary)
         .arg("--version")
@@ -163,10 +159,28 @@ pub fn parse_version_output(text: &str) -> Option<(u64, u64, u64)> {
     Some((major, minor, patch))
 }
 
-// used by Task 1.2+
-#[allow(dead_code)]
 pub fn version_meets_minimum(v: (u64, u64, u64)) -> bool {
     v >= MIN_ENGINE_VERSION
+}
+
+/// Human-readable error when the resolved engine is older than the minimum.
+/// Pure (no I/O) so it can be unit-tested; used by the delegation handshake.
+pub fn engine_too_old_message(
+    binary: &Path,
+    actual: (u64, u64, u64),
+    min: (u64, u64, u64),
+) -> String {
+    format!(
+        "The Coven engine at {} is version {}.{}.{}, older than the minimum \
+         {}.{}.{} this coven build requires.\n\n  Run: coven engine install",
+        binary.display(),
+        actual.0,
+        actual.1,
+        actual.2,
+        min.0,
+        min.1,
+        min.2,
+    )
 }
 
 /// Returns the list of candidate binary names to look up, in priority order.
@@ -277,6 +291,28 @@ mod tests {
         touch_exec(&legacy);
         let r = resolve_from(Some(not_exec.as_os_str()), None, Some(home.path())).unwrap();
         assert!(matches!(r.source, EngineSource::LegacyHome));
+    }
+
+    #[test]
+    fn path_lookup_finds_windows_cmd_shim_name() {
+        // The resolver's PathLookup must honor every platform bin-name, mirroring
+        // the npm .cmd shim discovery the old main.rs helper covered.
+        let names = engine_bin_names();
+        if cfg!(windows) {
+            assert!(names.contains(&"coven-code.cmd"));
+        } else {
+            assert_eq!(names, &["coven-code"]);
+        }
+    }
+
+    #[test]
+    fn engine_too_old_message_names_version_and_install_command() {
+        let msg =
+            engine_too_old_message(std::path::Path::new("/x/coven-code"), (0, 5, 9), (0, 6, 1));
+        assert!(msg.contains("0.5.9"));
+        assert!(msg.contains("0.6.1"));
+        assert!(msg.contains("coven engine install"));
+        assert!(msg.contains("/x/coven-code"));
     }
 
     #[test]
