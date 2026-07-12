@@ -25,8 +25,6 @@ pub enum EngineSource {
     LegacyHome,  // ~/.coven-code/bin/ (pre-unification installs)
 }
 
-// used by Task 1.3+
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct ResolvedEngine {
     pub path: PathBuf,
@@ -115,8 +113,6 @@ pub fn resolve_from(
 }
 
 /// Resolve or produce the single actionable "engine missing" error.
-// used by Task 1.3+
-#[allow(dead_code)]
 pub fn require() -> Result<ResolvedEngine> {
     resolve().ok_or_else(|| {
         anyhow!(

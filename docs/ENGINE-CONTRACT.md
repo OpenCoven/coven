@@ -55,8 +55,10 @@ version.
 ## Environment
 
 - `COVEN_PARENT=coven`        set by coven on every delegated invocation
-- `COVEN_HOME`                coven state root, forwarded when set
-- `COVEN_DAEMON_SOCKET`       daemon UDS path, forwarded when the daemon is up
+- `COVEN_HOME`                coven state root, actively forwarded when set
+- `COVEN_DAEMON_SOCKET`       daemon UDS path; inherited through the environment
+                              (coven does not clear env), reserved for the
+                              Phase 3 daemon-session notifier
 - `COVEN_CODE_*`              engine-owned namespace; coven never overrides
 
 ## Stream-json events (subset coven parses)
