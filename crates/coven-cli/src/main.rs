@@ -771,7 +771,61 @@ fn run_shared_interactive_shell() -> Result<()> {
 
     match coven_code_binary() {
         Some(binary) => try_delegate_to_coven_code(&binary),
-        None => Err(missing_coven_code_error()),
+        None => {
+            let offer = should_offer_auto_install(
+                false,
+                io::stdin().is_terminal(),
+                io::stdout().is_terminal(),
+                auto_install_opted_out(),
+            );
+            if offer {
+                match prompt_and_install_engine()? {
+                    Some(path) => try_delegate_to_coven_code(&path),
+                    None => Err(missing_coven_code_error()),
+                }
+            } else {
+                Err(missing_coven_code_error())
+            }
+        }
+    }
+}
+
+/// Whether to offer auto-installing the engine. Interactive only, and never
+/// when an engine is already present or the user opted out.
+fn should_offer_auto_install(
+    engine_present: bool,
+    stdin_tty: bool,
+    stdout_tty: bool,
+    opt_out: bool,
+) -> bool {
+    !engine_present && stdin_tty && stdout_tty && !opt_out
+}
+
+/// `COVEN_NO_AUTO_INSTALL=1` (or `=true`) disables the first-run install prompt
+/// (used by CI and non-interactive automation).
+fn auto_install_opted_out() -> bool {
+    matches!(
+        std::env::var("COVEN_NO_AUTO_INSTALL").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
+/// Ask the user (on a known-TTY) whether to install the engine now. Returns
+/// the installed binary path on yes, `None` if the user declined. Propagates
+/// install errors.
+fn prompt_and_install_engine() -> Result<Option<PathBuf>> {
+    eprintln!("The Coven engine is required for the interactive UI and isn't installed yet.");
+    eprint!("Download and install it now (~40 MB)? [Y/n] ");
+    io::stderr().flush().ok();
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    let answer = answer.trim();
+    if answer.is_empty() || answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
+        let (path, _) =
+            engine_install::install(engine_install::DEFAULT_ENGINE_VERSION, None, false)?;
+        Ok(Some(path))
+    } else {
+        Ok(None)
     }
 }
 
@@ -4075,5 +4129,14 @@ mod tests {
         assert_eq!(value["pid"], serde_json::Value::Null);
         assert_eq!(value["socket"], serde_json::Value::Null);
         assert_eq!(value["started_at"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn auto_install_only_offered_interactively() {
+        assert!(should_offer_auto_install(false, true, true, false));
+        assert!(!should_offer_auto_install(false, false, true, false)); // piped stdin
+        assert!(!should_offer_auto_install(false, true, false, false)); // piped stdout
+        assert!(!should_offer_auto_install(true, true, true, false)); // already installed
+        assert!(!should_offer_auto_install(false, true, true, true)); // opt-out
     }
 }
