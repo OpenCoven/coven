@@ -4139,7 +4139,9 @@ mod tests {
             client.flush().expect("flush");
             let (status_code, response) = read_windows_pipe_http_response(
                 client,
-                Duration::from_secs(1),
+                // Windows CI runners can take longer than one second to
+                // schedule the server thread while the Rust suite is busy.
+                Duration::from_secs(5),
                 MAX_SOCKET_BODY_BYTES,
             )
             .expect("read response");
