@@ -12,6 +12,7 @@ pub struct HarnessCommand {
     program: String,
     args: Vec<String>,
     cwd: PathBuf,
+    stdin_prompt: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,7 +81,7 @@ pub fn build_harness_command_with_conversation(
     familiar: Option<&crate::harness::FamiliarContext>,
     options: crate::harness::HarnessLaunchOptions<'_>,
 ) -> Result<HarnessCommand> {
-    let (program, args) = crate::harness::command_parts_for_harness_with_conversation(
+    let (program, mut args) = crate::harness::command_parts_for_harness_with_conversation(
         harness_id,
         prompt,
         mode,
@@ -88,12 +89,78 @@ pub fn build_harness_command_with_conversation(
         familiar,
         options,
     )?;
+    let familiar_prompt;
+    let stdin_prompt_text = if harness_id == "codex" {
+        if let Some(familiar) = familiar {
+            familiar_prompt = format!("{}\n\n{prompt}", familiar.identity_preamble());
+            familiar_prompt.as_str()
+        } else {
+            prompt
+        }
+    } else {
+        prompt
+    };
+    let stdin_prompt = move_windows_codex_prompt_to_stdin(
+        harness_id,
+        mode,
+        stdin_prompt_text,
+        &mut args,
+        cfg!(windows),
+    );
 
     Ok(HarnessCommand {
         program: program.to_string(),
         args,
         cwd: cwd.to_path_buf(),
+        stdin_prompt,
     })
+}
+
+/// Windows may resolve an npm-installed Codex harness to `codex.CMD`. Rust
+/// launches batch files through `cmd.exe` and deliberately rejects multiline
+/// or otherwise unsafe batch arguments. Codex supports `-` as the prompt
+/// positional, reading the real prompt from stdin, so keep user-controlled
+/// prompt text out of the batch command line entirely.
+fn move_windows_codex_prompt_to_stdin(
+    harness_id: &str,
+    mode: crate::harness::HarnessLaunchMode,
+    prompt: &str,
+    args: &mut [String],
+    is_windows: bool,
+) -> Option<Vec<u8>> {
+    if !is_windows
+        || harness_id != "codex"
+        || mode != crate::harness::HarnessLaunchMode::NonInteractive
+    {
+        return None;
+    }
+
+    let prompt_arg = args.last_mut()?;
+    *prompt_arg = "-".to_string();
+    Some(prompt.as_bytes().to_vec())
+}
+
+#[cfg(windows)]
+fn write_stdin_prompt(child: &mut std::process::Child, prompt: Option<&[u8]>) -> Result<()> {
+    let Some(prompt) = prompt else {
+        return Ok(());
+    };
+    let result = (|| -> Result<()> {
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("piped harness did not expose stdin for its prompt")?;
+        stdin
+            .write_all(prompt)
+            .context("failed writing harness prompt to stdin")?;
+        stdin.flush().context("failed flushing harness prompt")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    result
 }
 
 pub fn run_attached(command: &HarnessCommand) -> Result<PtyRunResult> {
@@ -163,7 +230,11 @@ pub fn run_piped_attached(
     let mut child = std::process::Command::new(&command.program)
         .args(&command.args)
         .current_dir(&command.cwd)
-        .stdin(Stdio::inherit())
+        .stdin(if command.stdin_prompt.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        })
         // In stream mode Codex duplicates its final answer on stdout while
         // stderr carries the complete labeled transcript that Cave's filter
         // consumes. Keep only the transcript to avoid rendering it twice.
@@ -184,6 +255,7 @@ pub fn run_piped_attached(
                 command.program()
             )
         })?;
+    write_stdin_prompt(&mut child, command.stdin_prompt.as_deref())?;
 
     // Codex on Windows writes its complete `exec` transcript (including the
     // final assistant response) to stderr. `coven run --stream-json` is a
@@ -227,7 +299,11 @@ pub fn run_piped_attached_captured(
     let mut child = std::process::Command::new(&command.program)
         .args(&command.args)
         .current_dir(&command.cwd)
-        .stdin(Stdio::inherit())
+        .stdin(if command.stdin_prompt.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        })
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -237,6 +313,7 @@ pub fn run_piped_attached_captured(
                 command.program()
             )
         })?;
+    write_stdin_prompt(&mut child, command.stdin_prompt.as_deref())?;
     let mut stderr = child
         .stderr
         .take()
@@ -504,10 +581,21 @@ pub fn spawn_piped_with_observer(
     })?;
 
     let pid = child.id();
-    let stdin = child
+    let mut stdin = child
         .stdin
         .take()
         .context("failed to take child stdin in piped mode")?;
+    let stdin: Box<dyn Write + Send> = if let Some(prompt) = command.stdin_prompt.as_deref() {
+        if let Err(error) = stdin.write_all(prompt).and_then(|_| stdin.flush()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error).context("failed writing harness prompt to stdin");
+        }
+        drop(stdin);
+        Box::new(io::sink())
+    } else {
+        Box::new(stdin)
+    };
     let stdout = child
         .stdout
         .take()
@@ -599,10 +687,7 @@ pub fn spawn_piped_with_observer(
         on_exit(result);
     });
 
-    Ok(PipedSession {
-        input: Box::new(stdin),
-        pid,
-    })
+    Ok(PipedSession { input: stdin, pid })
 }
 
 pub fn spawn_detached_with_observer(
@@ -853,6 +938,7 @@ mod tests {
             program: "cat".to_string(),
             args: vec![],
             cwd: temp_dir.path().to_path_buf(),
+            stdin_prompt: None,
         };
 
         let mut session = spawn_detached(&command)?;
@@ -1258,5 +1344,99 @@ exit 0
         #[cfg(not(windows))]
         assert_eq!(command.args(), &["--", "explain && exit"]);
         assert_eq!(command.cwd(), cwd);
+    }
+
+    #[test]
+    fn windows_codex_noninteractive_prompt_uses_stdin() {
+        let prompt = "first line\nsecond & line with %PATH%";
+        let mut args = vec![
+            "exec".to_string(),
+            "--model".to_string(),
+            "gpt-5.5".to_string(),
+            "--".to_string(),
+            prompt.to_string(),
+        ];
+
+        let stdin_prompt = move_windows_codex_prompt_to_stdin(
+            "codex",
+            crate::harness::HarnessLaunchMode::NonInteractive,
+            prompt,
+            &mut args,
+            true,
+        );
+
+        assert_eq!(args.last().map(String::as_str), Some("-"));
+        assert_eq!(stdin_prompt.as_deref(), Some(prompt.as_bytes()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_codex_stdin_prompt_keeps_familiar_identity() -> anyhow::Result<()> {
+        let familiar = crate::harness::FamiliarContext {
+            id: "codex-local".to_string(),
+            display_name: "Codex Local".to_string(),
+            role: None,
+        };
+        let command = build_harness_command_with_conversation(
+            "codex",
+            "diagnose the failure",
+            Path::new("C:\\project"),
+            crate::harness::HarnessLaunchMode::NonInteractive,
+            None,
+            Some(&familiar),
+            crate::harness::HarnessLaunchOptions::default(),
+        )?;
+
+        let prompt = String::from_utf8(command.stdin_prompt.expect("prompt should use stdin"))?;
+        assert!(prompt.starts_with(&familiar.identity_preamble()));
+        assert!(prompt.ends_with("diagnose the failure"));
+        assert_eq!(command.args.last().map(String::as_str), Some("-"));
+        Ok(())
+    }
+
+    #[test]
+    fn stdin_prompt_transport_is_not_used_for_other_launches() {
+        let prompt = "hello";
+        for (harness, mode) in [
+            ("claude", crate::harness::HarnessLaunchMode::NonInteractive),
+            ("codex", crate::harness::HarnessLaunchMode::Interactive),
+        ] {
+            let mut args = vec!["--".to_string(), prompt.to_string()];
+            let stdin_prompt =
+                move_windows_codex_prompt_to_stdin(harness, mode, prompt, &mut args, true);
+            assert!(stdin_prompt.is_none());
+            assert_eq!(args.last().map(String::as_str), Some(prompt));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn captured_piped_batch_receives_multiline_prompt_via_stdin() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let batch = temp_dir.path().join("fake-codex.cmd");
+        std::fs::write(
+            &batch,
+            "@echo off\r\nset /p prompt=\r\n>&2 echo %prompt%\r\nexit /b 0\r\n",
+        )?;
+        let command = HarnessCommand {
+            program: batch.to_string_lossy().into_owned(),
+            args: vec!["exec".to_string(), "--".to_string(), "-".to_string()],
+            cwd: temp_dir.path().to_path_buf(),
+            stdin_prompt: Some(b"hello from stdin\nsecond & unsafe-looking line".to_vec()),
+        };
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let callback_output = captured.clone();
+
+        let result = run_piped_attached_captured(
+            &command,
+            Box::new(move |chunk| {
+                callback_output.lock().unwrap().extend_from_slice(&chunk);
+            }),
+        )?;
+
+        assert_eq!(result.status, "completed");
+        assert_eq!(result.exit_code, Some(0));
+        assert!(String::from_utf8(captured.lock().unwrap().clone())?.contains("hello from stdin"));
+        Ok(())
     }
 }
