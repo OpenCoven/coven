@@ -100,6 +100,40 @@ Unknown `type` values are silently ignored. Formal schema forthcoming with the
 Phase 2 golden fixtures (`coven/tests/fixtures/engine/` —
 forthcoming — added in Phase 2 with the contract test suite).
 
+## Daemon endpoints the engine calls
+
+This section documents the reverse direction: daemon API surfaces that the engine (coven-code) relies on, not surfaces that coven invokes on the engine. The integration is opt-in (`daemonLedger` setting in the engine) and best-effort — failures are logged but do not abort the session.
+
+Full request/response shapes, field validation rules, and error codes are defined in [`docs/API-CONTRACT.md`](API-CONTRACT.md).
+
+### `POST /api/v1/sessions/external`
+
+Called by the engine at session start to register the running session in the daemon ledger. The daemon does not launch or manage the process; it only holds the record.
+
+Key request fields (camelCase JSON body):
+
+| Field            | Required | Notes                                              |
+|------------------|----------|----------------------------------------------------|
+| `id`             | Yes      | Session id chosen by the engine (e.g. a UUID).     |
+| `projectRoot`    | Yes      | Absolute path to the project root.                 |
+| `harness`        | Yes      | Harness id, e.g. `"coven-code"`.                   |
+| `title`          | No       | Display title; defaults to `"External session"`.   |
+| `transcriptPath` | No       | Absolute path to the engine's transcript file.     |
+
+Returns `201` on first registration, `200` on idempotent re-registration with the same id, or `409 session_id_conflict` if a daemon-managed session already holds that id.
+
+### `POST /api/v1/sessions/<id>/complete`
+
+Called by the engine when the session ends to mark it finished in the daemon ledger.
+
+Key request fields (camelCase JSON body):
+
+| Field      | Required | Notes                                                                             |
+|------------|----------|-----------------------------------------------------------------------------------|
+| `exitCode` | No       | Integer exit code. Absent, `null`, or `0` → `"completed"`. Nonzero → `"failed"`. |
+
+Returns `200` with the updated session record on success, `404 session_not_found` if the id is unknown, or `422 not_external_session` if the session was not registered as external.
+
 ## Exit codes (headless)
 
 0 = completed; 1 = errored / budget exceeded; others reserved

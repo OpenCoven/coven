@@ -141,6 +141,9 @@ All API errors use the following stable envelope. Clients must branch on `error.
 | `job_already_queued`   | 409         | A job with the same id already exists in the global queue. |
 | `job_not_assignable`   | 409         | Job has already reached a terminal state.        |
 | `no_available_node`    | 409         | No available registered node satisfies the job's required capabilities. |
+| `session_id_conflict`  | 409         | `POST /sessions/external`: a daemon-managed (non-external) session with the supplied id already exists. |
+| `not_external_session` | 422         | `POST /sessions/:id/complete`: the session exists but is not an external session. Use `POST /sessions/:id/kill` for daemon-managed sessions. |
+| `external_session_not_killable` | 422 | `POST /sessions/:id/kill`: the session is external and not managed by the daemon; use `POST /sessions/:id/complete` instead. |
 
 ## Capability catalog shape (`v1`)
 
@@ -244,6 +247,8 @@ Endpoints that return this shape:
 - `GET /api/v1/sessions` → `SessionRecord[]`
 - `POST /api/v1/sessions` → `SessionRecord`
 - `GET /api/v1/sessions/:id` → `SessionRecord`
+- `POST /api/v1/sessions/external` → `SessionRecord`
+- `POST /api/v1/sessions/:id/complete` → `SessionRecord`
 
 ```json
 {
@@ -255,9 +260,80 @@ Endpoints that return this shape:
   "exit_code": null,
   "archived_at": null,
   "created_at": "2026-05-09T06:43:00Z",
-  "updated_at": "2026-05-09T06:43:05Z"
+  "updated_at": "2026-05-09T06:43:05Z",
+  "conversation_id": null,
+  "familiar_id": null,
+  "labels": [],
+  "visibility": "private",
+  "external": false,
+  "transcript_path": null
 }
 ```
+
+The `external` field is `true` for sessions registered via `POST /api/v1/sessions/external`; it is `false` for all daemon-launched sessions. The `transcript_path` field carries the absolute path to the external session's transcript file when provided at registration; it is `null` for daemon-launched sessions and for external sessions where no path was supplied.
+
+## `POST /api/v1/sessions/external`
+
+Registers a session that is already running outside the daemon (for example, the engine's interactive TUI). The daemon creates a ledger row with `external: true` and does not own the PTY or lifecycle.
+
+### Request body
+
+```json
+{
+  "id": "sess-engine-abc",
+  "projectRoot": "/repo",
+  "harness": "coven-code",
+  "title": "coven-code session",
+  "transcriptPath": "/repo/.claude/sessions/sess-engine-abc.jsonl"
+}
+```
+
+| Field            | Type   | Required | Description                                                                 |
+|------------------|--------|----------|-----------------------------------------------------------------------------|
+| `id`             | string | Yes      | Session id. Must be non-empty after trimming whitespace.                    |
+| `projectRoot`    | string | Yes      | Absolute path to the project root. Must be non-empty after trimming.       |
+| `harness`        | string | Yes      | Harness identifier (e.g. `"coven-code"`). Must be non-empty after trimming.|
+| `title`          | string | No       | Display title. Defaults to `"External session"` when absent or empty.      |
+| `transcriptPath` | string | No       | Absolute path to the external session's transcript file. Stored as-is; the daemon does not read or validate the path. |
+
+### Responses
+
+| Status | Condition                                                                                          |
+|--------|----------------------------------------------------------------------------------------------------|
+| `201`  | Session did not exist; row created. Body: the new `SessionRecord`.                                 |
+| `200`  | An external session with this id was already registered (idempotent re-register). Body: the existing `SessionRecord`. |
+| `409`  | `session_id_conflict` — a daemon-managed (non-external) session with this id already exists. The daemon refuses to alias it. |
+| `400`  | `invalid_request` — malformed JSON or a required field is missing or blank.                        |
+
+On success the response body is the full `SessionRecord` as described in [Session record shape (`v1`)](#session-record-shape-v1), with `external: true` and `status: "running"`.
+
+## `POST /api/v1/sessions/:id/complete`
+
+Marks an externally-registered session finished. The daemon updates the session status based on `exitCode` and returns the updated `SessionRecord`.
+
+### Request body
+
+```json
+{
+  "exitCode": 0
+}
+```
+
+| Field      | Type    | Required | Description                                                                                   |
+|------------|---------|----------|-----------------------------------------------------------------------------------------------|
+| `exitCode` | integer | No       | Process exit code. Absent, `null`, or `0` → status becomes `"completed"`. Any nonzero value → status becomes `"failed"`. |
+
+### Responses
+
+| Status | Condition                                                                                  |
+|--------|--------------------------------------------------------------------------------------------|
+| `200`  | Session updated. Body: the updated `SessionRecord` with the new `status` and `exit_code`.  |
+| `404`  | `session_not_found` — no session with this id exists.                                      |
+| `422`  | `not_external_session` — the session exists but was not registered as external. For daemon-managed sessions use `POST /api/v1/sessions/:id/kill`. |
+
+### Kill on an external session
+
+`POST /api/v1/sessions/:id/kill` returns `422 external_session_not_killable` when the target session has `external: true`. The kill endpoint is only valid for daemon-managed sessions.
 
 ## Event record shape and cursor pagination (`v1`)
 
