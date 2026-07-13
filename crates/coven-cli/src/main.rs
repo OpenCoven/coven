@@ -751,6 +751,32 @@ fn edit_distance(a: &str, b: &str) -> usize {
 fn run_sessions_search(query: &str, json: bool) -> Result<()> {
     let store_path = coven_store_path()?;
     let conn = store::open_store(&store_path)?;
+
+    // Lazily ingest external-session transcripts (e.g. coven-code TUI sessions)
+    // so they become searchable. This is a one-time cost per session: once
+    // `transcript_indexed_at` is set the ingest function is a no-op.
+    let coven_home = coven_home_dir()?;
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    match store::list_uningest_external_sessions(&conn) {
+        Ok(pending) => {
+            for (session_id, _transcript_path) in pending {
+                if let Err(e) =
+                    store::ingest_external_transcript(&conn, &session_id, &coven_home, &now)
+                {
+                    // Best-effort: a failure on one session must not abort the search.
+                    eprintln!(
+                        "warning: run_sessions_search: failed to ingest transcript for session \
+                         {session_id}: {e}"
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            // Non-fatal: fall through to search without transcript data.
+            eprintln!("warning: run_sessions_search: failed to list un-ingested sessions: {e}");
+        }
+    }
+
     let hits = store::search_events(&conn, query)?;
 
     if json {

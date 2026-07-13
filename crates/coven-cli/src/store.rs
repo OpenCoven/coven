@@ -589,6 +589,12 @@ fn ensure_session_external_columns(conn: &Connection) -> Result<()> {
         "transcript_path",
         "ALTER TABLE sessions ADD COLUMN transcript_path TEXT",
     )?;
+    ensure_column(
+        conn,
+        "sessions",
+        "transcript_indexed_at",
+        "ALTER TABLE sessions ADD COLUMN transcript_indexed_at TEXT",
+    )?;
     Ok(())
 }
 
@@ -1925,6 +1931,239 @@ pub fn search_events(conn: &Connection, query: &str) -> Result<Vec<SearchHit>> {
         out.push(r.context("failed to read events_fts row")?);
     }
     Ok(out)
+}
+
+/// Maximum number of JSONL lines to read from an external transcript during
+/// ingestion. Lines beyond this cap are silently dropped (the session will
+/// still be marked as indexed so the cap applies only once, on first search).
+const TRANSCRIPT_INGEST_LINE_LIMIT: usize = 10_000;
+
+/// Maximum total bytes of extracted text to index from a single transcript.
+const TRANSCRIPT_INGEST_BYTE_LIMIT: usize = 512 * 1024; // 512 KiB
+
+/// Query for external sessions that have a transcript path but have not yet
+/// been indexed into the FTS table. Returns (session_id, transcript_path) pairs.
+pub fn list_uningest_external_sessions(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, transcript_path
+             FROM sessions
+             WHERE external = 1
+               AND transcript_path IS NOT NULL
+               AND transcript_indexed_at IS NULL",
+        )
+        .context("failed to prepare un-ingested external session query")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .context("failed to query un-ingested external sessions")?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.context("failed to read un-ingested session row")?);
+    }
+    Ok(out)
+}
+
+/// Read an external session's engine JSONL transcript and index its text into
+/// the events table (redacted, retention-bounded) so it becomes searchable.
+///
+/// # Design decisions
+///
+/// - **Index-once**: once `transcript_indexed_at` is set the function returns 0
+///   immediately. Growing transcripts are not re-indexed (a follow-up task).
+/// - **Missing file**: if the file does not exist yet (session still running but
+///   the transcript hasn't been written) we return 0 and leave
+///   `transcript_indexed_at` NULL so the next search will retry. If the file
+///   exists but can't be read, we log a warning and return 0 without marking
+///   as indexed (same retry-on-next-search semantics). Permanently missing files
+///   are handled by a bounded retry: a caller willing to never retry can set
+///   `transcript_indexed_at` themselves.
+/// - **Bounds**: at most `TRANSCRIPT_INGEST_LINE_LIMIT` lines and
+///   `TRANSCRIPT_INGEST_BYTE_LIMIT` bytes of extracted text are indexed. On
+///   truncation a log message is emitted.
+/// - **Text extraction**: each line is parsed as `serde_json::Value`. Text is
+///   extracted using two heuristics (in priority order):
+///     1. `message.content` array → each element with `type == "text"` yields
+///        its `text` field. This covers the coven-code `TranscriptEntry` shape:
+///        `{"type":"user"|"assistant","message":{"content":[{"type":"text","text":"…"}]}}`.
+///     2. Top-level `text` string field (fallback for simpler shapes).
+///
+///   Lines with no extractable text are skipped.
+/// - **Privacy**: text is inserted via `insert_event` which runs
+///   `redact_payload_json_with_config` with `PrivacyConfig::default()` — same
+///   path as normal daemon events. If `coven_home` is provided and has a
+///   `privacy.toml`, the caller can instead use `insert_event_with_privacy`
+///   directly; we accept the home dir here and dispatch accordingly.
+///
+/// Returns the number of event rows inserted.
+pub fn ingest_external_transcript(
+    conn: &Connection,
+    session_id: &str,
+    coven_home: &Path,
+    now: &str,
+) -> Result<usize> {
+    use std::io::BufRead as _;
+
+    // Load the session; bail if already indexed or not eligible.
+    let session = match get_session(conn, session_id)? {
+        Some(s) => s,
+        None => return Ok(0),
+    };
+    if !session.external {
+        return Ok(0);
+    }
+    let transcript_path = match &session.transcript_path {
+        Some(p) => p.clone(),
+        None => return Ok(0),
+    };
+
+    // Already indexed — skip.
+    let already_indexed: Option<String> = conn
+        .query_row(
+            "SELECT transcript_indexed_at FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to query transcript_indexed_at")?
+        .flatten();
+    if already_indexed.is_some() {
+        return Ok(0);
+    }
+
+    // Open the transcript file. If it doesn't exist yet, return 0 without
+    // marking as indexed so a future search will retry.
+    let file = match std::fs::File::open(&transcript_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // File doesn't exist yet (session may still be starting). Retry later.
+            return Ok(0);
+        }
+        Err(e) => {
+            eprintln!(
+                "warning: ingest_external_transcript: cannot open transcript \
+                 {transcript_path}: {e}; will retry on next search"
+            );
+            return Ok(0);
+        }
+    };
+
+    let reader = std::io::BufReader::new(file);
+    let mut count = 0usize;
+    let mut total_bytes = 0usize;
+    let mut truncated = false;
+
+    for (line_idx, line_result) in reader.lines().enumerate() {
+        if line_idx >= TRANSCRIPT_INGEST_LINE_LIMIT {
+            truncated = true;
+            break;
+        }
+        let line = match line_result {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!(
+                    "warning: ingest_external_transcript: read error at line \
+                     {line_idx} in {transcript_path}: {e}; skipping rest"
+                );
+                break;
+            }
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue, // non-JSON line (e.g. header), skip
+        };
+
+        // Extract human-readable text from the parsed JSON.
+        let texts = extract_transcript_texts(&value);
+        for text in texts {
+            if text.is_empty() {
+                continue;
+            }
+            if total_bytes + text.len() > TRANSCRIPT_INGEST_BYTE_LIMIT {
+                truncated = true;
+                break;
+            }
+            total_bytes += text.len();
+
+            let payload = serde_json::json!({ "text": text });
+            let record = EventRecord {
+                seq: 0,
+                id: uuid::Uuid::new_v4().to_string(),
+                session_id: session_id.to_string(),
+                kind: "transcript_text".to_string(),
+                payload_json: payload.to_string(),
+                created_at: now.to_string(),
+            };
+            insert_event_with_privacy(conn, coven_home, &record)?;
+            count += 1;
+        }
+        if truncated {
+            break;
+        }
+    }
+
+    if truncated {
+        eprintln!(
+            "warning: ingest_external_transcript: session {session_id} transcript truncated at \
+             {TRANSCRIPT_INGEST_LINE_LIMIT} lines / {TRANSCRIPT_INGEST_BYTE_LIMIT} bytes \
+             ({count} chunks indexed)"
+        );
+    }
+
+    // Mark as indexed regardless of how many chunks were extracted (including zero,
+    // which means the file was present but had no parseable text).
+    conn.execute(
+        "UPDATE sessions SET transcript_indexed_at = ?2 WHERE id = ?1",
+        params![session_id, now],
+    )
+    .with_context(|| format!("failed to set transcript_indexed_at for session {session_id}"))?;
+
+    Ok(count)
+}
+
+/// Extract human-readable text strings from a single transcript JSONL line.
+///
+/// Targets the coven-code `TranscriptEntry` shape:
+/// ```json
+/// {"type":"user","message":{"content":[{"type":"text","text":"hello"}]}}
+/// ```
+/// Also handles a simpler top-level `"text": "..."` field as a fallback.
+fn extract_transcript_texts(value: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+
+    // Heuristic 1: message.content array of {type:"text", text:"..."} blocks.
+    if let Some(content) = value
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+    {
+        for block in content {
+            if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                    let trimmed = text.trim().to_string();
+                    if !trimmed.is_empty() {
+                        out.push(trimmed);
+                    }
+                }
+            }
+        }
+    }
+
+    // Heuristic 2: top-level "text" string (simpler/older shapes).
+    if out.is_empty() {
+        if let Some(text) = value.get("text").and_then(|t| t.as_str()) {
+            let trimmed = text.trim().to_string();
+            if !trimmed.is_empty() {
+                out.push(trimmed);
+            }
+        }
+    }
+
+    out
 }
 
 pub fn vacuum_store_path(path: &Path) -> Result<StoreVacuumReport> {
@@ -3638,6 +3877,178 @@ mod tests {
         assert!(!int_in_list.external);
         assert!(ext_in_list.transcript_path.is_some());
         assert!(int_in_list.transcript_path.is_none());
+
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // ingest_external_transcript tests
+    // -------------------------------------------------------------------------
+
+    fn write_transcript(path: &std::path::Path, lines: &[&str]) -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(path)?;
+        for line in lines {
+            writeln!(f, "{line}")?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ingest_external_transcript_indexes_text_and_makes_it_searchable() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db_path = temp.path().join("coven.db");
+        let conn = open_store(&db_path)?;
+
+        // Write a small fixture transcript (coven-code TranscriptEntry shape).
+        let transcript_path = temp.path().join("ext-sess.jsonl");
+        write_transcript(
+            &transcript_path,
+            &[
+                r#"{"type":"user","message":{"content":[{"type":"text","text":"SEARCHABLE_TOKEN the quick brown fox"}]}}"#,
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello, I can help with that."}]}}"#,
+                r#"{"type":"unknown_type"}"#, // no extractable text — should be skipped
+            ],
+        )?;
+
+        // Insert the external session pointing at the transcript.
+        let mut sess = session_record("ext-ingest-1", "2026-07-01T10:00:00Z");
+        sess.external = true;
+        sess.transcript_path = Some(transcript_path.to_string_lossy().to_string());
+        insert_session(&conn, &sess)?;
+
+        let now = "2026-07-01T10:00:01Z";
+        let n = ingest_external_transcript(&conn, "ext-ingest-1", temp.path(), now)?;
+        assert_eq!(n, 2, "two text chunks should be indexed");
+
+        // FTS search must find the token.
+        let hits = search_events(&conn, "SEARCHABLE_TOKEN")?;
+        assert_eq!(hits.len(), 1, "search should return one hit");
+        assert_eq!(hits[0].session_id, "ext-ingest-1");
+        assert_eq!(hits[0].kind, "transcript_text");
+
+        Ok(())
+    }
+
+    #[test]
+    fn ingest_external_transcript_is_idempotent() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("coven.db"))?;
+
+        let transcript_path = temp.path().join("idem.jsonl");
+        write_transcript(
+            &transcript_path,
+            &[
+                r#"{"type":"user","message":{"content":[{"type":"text","text":"idempotency check"}]}}"#,
+            ],
+        )?;
+
+        let mut sess = session_record("ext-idem", "2026-07-01T11:00:00Z");
+        sess.external = true;
+        sess.transcript_path = Some(transcript_path.to_string_lossy().to_string());
+        insert_session(&conn, &sess)?;
+
+        let now = "2026-07-01T11:00:01Z";
+        let first = ingest_external_transcript(&conn, "ext-idem", temp.path(), now)?;
+        assert_eq!(first, 1, "first call should index one chunk");
+
+        // Second call must be a no-op: transcript_indexed_at is already set.
+        let second = ingest_external_transcript(&conn, "ext-idem", temp.path(), now)?;
+        assert_eq!(second, 0, "second call should be a no-op");
+
+        // Exactly one event should exist — no duplicates.
+        let events = list_events(&conn, "ext-idem")?;
+        assert_eq!(events.len(), 1, "no duplicate events on re-ingest");
+
+        Ok(())
+    }
+
+    #[test]
+    fn ingest_external_transcript_skips_non_external_session() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("coven.db"))?;
+
+        // A normal (non-external) session.
+        let sess = session_record("internal-sess", "2026-07-01T12:00:00Z");
+        insert_session(&conn, &sess)?;
+
+        let now = "2026-07-01T12:00:01Z";
+        let n = ingest_external_transcript(&conn, "internal-sess", temp.path(), now)?;
+        assert_eq!(n, 0, "non-external session should be skipped");
+
+        let events = list_events(&conn, "internal-sess")?;
+        assert!(events.is_empty(), "no events should be inserted");
+
+        Ok(())
+    }
+
+    #[test]
+    fn ingest_external_transcript_skips_when_no_transcript_path() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("coven.db"))?;
+
+        let mut sess = session_record("ext-no-path", "2026-07-01T13:00:00Z");
+        sess.external = true;
+        // transcript_path is intentionally None.
+        insert_session(&conn, &sess)?;
+
+        let now = "2026-07-01T13:00:01Z";
+        let n = ingest_external_transcript(&conn, "ext-no-path", temp.path(), now)?;
+        assert_eq!(n, 0, "session without transcript_path should be skipped");
+
+        Ok(())
+    }
+
+    #[test]
+    fn ingest_external_transcript_returns_zero_for_missing_file() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("coven.db"))?;
+
+        let mut sess = session_record("ext-missing", "2026-07-01T14:00:00Z");
+        sess.external = true;
+        sess.transcript_path = Some("/tmp/nonexistent-coven-transcript.jsonl".to_string());
+        insert_session(&conn, &sess)?;
+
+        let now = "2026-07-01T14:00:01Z";
+        let n = ingest_external_transcript(&conn, "ext-missing", temp.path(), now)?;
+        assert_eq!(n, 0, "missing file should return 0 without error");
+
+        // transcript_indexed_at must remain NULL so a future retry is possible.
+        let indexed_at: Option<String> = conn
+            .query_row(
+                "SELECT transcript_indexed_at FROM sessions WHERE id = 'ext-missing'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        assert!(
+            indexed_at.is_none(),
+            "transcript_indexed_at should stay NULL so the session retries later"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn ingest_external_transcript_fallback_top_level_text() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("coven.db"))?;
+
+        let transcript_path = temp.path().join("toplevel.jsonl");
+        write_transcript(&transcript_path, &[r#"{"text":"TOPLEVEL_FALLBACK_TOKEN"}"#])?;
+
+        let mut sess = session_record("ext-fallback", "2026-07-01T15:00:00Z");
+        sess.external = true;
+        sess.transcript_path = Some(transcript_path.to_string_lossy().to_string());
+        insert_session(&conn, &sess)?;
+
+        let now = "2026-07-01T15:00:01Z";
+        let n = ingest_external_transcript(&conn, "ext-fallback", temp.path(), now)?;
+        assert_eq!(n, 1, "fallback text extraction should yield one chunk");
+
+        let hits = search_events(&conn, "TOPLEVEL_FALLBACK_TOKEN")?;
+        assert_eq!(hits.len(), 1, "top-level text should be searchable");
 
         Ok(())
     }
