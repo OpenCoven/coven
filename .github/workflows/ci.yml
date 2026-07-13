@@ -123,6 +123,6 @@ jobs:
       - uses: actions/checkout@v7
       # Commit-pinned (v2.0.20): a supply-chain gate must not itself depend on a
       # mutable action tag. Config lives in deny.toml at the repo root.
-      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check advisories licenses bans sources
