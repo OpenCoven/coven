@@ -3116,7 +3116,7 @@ mod tests {
         // Override HOME so resolve() finds the temp managed install.
         let _guard = env_lock().lock().unwrap();
         let _home_guard = EnvVarGuard::set("HOME", home.path());
-
+        let _userprofile_guard = EnvVarGuard::set("USERPROFILE", home.path());
         assert!(
             harness_available("coven-code"),
             "should be available via managed engine"
