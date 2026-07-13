@@ -9,12 +9,47 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[derive(Debug, serde::Deserialize)]
+struct EngineLock {
+    version: String,
+    #[allow(dead_code)] // read in tests via pinned_contract()
+    contract: u32,
+    sha256: std::collections::HashMap<String, String>,
+}
+
+fn engine_lock() -> &'static EngineLock {
+    use std::sync::OnceLock;
+    static LOCK: OnceLock<EngineLock> = OnceLock::new();
+    LOCK.get_or_init(|| {
+        toml::from_str(include_str!("../engine.lock"))
+            .expect("crates/coven-cli/engine.lock must be valid TOML (regenerate via scripts/pin-engine.sh)")
+    })
+}
+
+/// The exact engine version this coven build pins.
+pub fn pinned_version() -> &'static str {
+    &engine_lock().version
+}
+
+/// The contract version the pinned engine satisfies.
+#[allow(dead_code)] // used in tests; reserved for future contract gating
+pub fn pinned_contract() -> u32 {
+    engine_lock().contract
+}
+
+/// The pinned SHA-256 for a release artifact (archive) filename, if present.
+pub fn pinned_sha256(artifact: &str) -> Option<&'static str> {
+    engine_lock().sha256.get(artifact).map(String::as_str)
+}
+
 #[cfg(windows)]
 pub const ENGINE_BIN_NAME: &str = "coven-code.exe";
 #[cfg(not(windows))]
 pub const ENGINE_BIN_NAME: &str = "coven-code";
 
-/// Oldest engine this coven build can drive (contract v1 surfaces).
+/// Oldest engine this build can drive. Moves INDEPENDENTLY of the pinned
+/// version in engine.lock (minimum-supported vs. currently-pinned release);
+/// their present equality is coincidental.
 pub const MIN_ENGINE_VERSION: (u64, u64, u64) = (0, 6, 1);
 
 #[derive(Debug)]
@@ -299,6 +334,39 @@ mod tests {
         } else {
             assert_eq!(names, &["coven-code"]);
         }
+    }
+
+    #[test]
+    fn pinned_version_is_semver_and_contract_is_current() {
+        let v = pinned_version();
+        let parts: Vec<&str> = v.split('.').collect();
+        assert_eq!(parts.len(), 3, "pinned version must be X.Y.Z, got {v:?}");
+        assert!(
+            parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit())),
+            "non-numeric component in {v:?}"
+        );
+        assert_eq!(pinned_contract(), 1);
+    }
+
+    #[test]
+    fn pinned_sha256_present_for_every_platform_artifact() {
+        for artifact in [
+            "coven-code-linux-x86_64.tar.gz",
+            "coven-code-linux-aarch64.tar.gz",
+            "coven-code-macos-x86_64.tar.gz",
+            "coven-code-macos-aarch64.tar.gz",
+            "coven-code-windows-x86_64.zip",
+        ] {
+            let sum =
+                pinned_sha256(artifact).unwrap_or_else(|| panic!("missing pin for {artifact}"));
+            assert_eq!(sum.len(), 64, "sha256 for {artifact} must be 64 hex chars");
+            assert!(sum.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+    }
+
+    #[test]
+    fn pinned_sha256_unknown_artifact_is_none() {
+        assert!(pinned_sha256("coven-code-plan9-risc.tar.gz").is_none());
     }
 
     #[test]

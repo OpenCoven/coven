@@ -10,10 +10,6 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Dev-mode default engine version, used when `coven engine install` is run
-/// without `--version` and before Task 2.1's engine.lock provides the pin.
-pub const DEFAULT_ENGINE_VERSION: &str = "0.6.1";
-
 #[derive(Debug, PartialEq, Eq)]
 pub enum InstallOutcome {
     Installed,
@@ -85,13 +81,10 @@ impl Drop for ScratchGuard {
 
 /// Download, verify, extract, and activate the engine. Returns the installed
 /// binary path and whether it was freshly installed or already present.
-/// `expected_sha256` is the sha256 of the ARCHIVE; `None` skips
-/// verification with a loud warning (dev mode).
-pub fn install(
-    version: &str,
-    expected_sha256: Option<&str>,
-    force: bool,
-) -> Result<(PathBuf, InstallOutcome)> {
+/// The checksum is looked up from the pinned lock for the pinned version;
+/// installing a non-pinned version skips verification with a loud warning
+/// (dev mode).
+pub fn install(version: &str, force: bool) -> Result<(PathBuf, InstallOutcome)> {
     let home = dirs_next::home_dir().context("cannot determine home directory")?;
     let engine_root = home.join(".coven").join("engine");
     let dest_dir = engine_root.join(version);
@@ -102,6 +95,14 @@ pub fn install(
     }
     let (os, arch) = current_platform()?;
     let artifact = artifact_name(os, arch);
+    // The pinned checksum is only valid for the pinned version (artifact
+    // filenames are version-independent, so a different version's archive
+    // would legitimately differ). Installing a non-pinned version is dev mode.
+    let expected_sha256 = if version == crate::engine::pinned_version() {
+        crate::engine::pinned_sha256(&artifact)
+    } else {
+        None
+    };
     let url = release_url(version, &artifact);
 
     std::fs::create_dir_all(&dest_dir)

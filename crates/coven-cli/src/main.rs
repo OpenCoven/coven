@@ -849,8 +849,7 @@ fn prompt_and_install_engine() -> Result<Option<PathBuf>> {
     io::stdin().read_line(&mut answer)?;
     let answer = answer.trim();
     if answer.is_empty() || answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
-        let (path, _) =
-            engine_install::install(engine_install::DEFAULT_ENGINE_VERSION, None, false)?;
+        let (path, _) = engine_install::install(engine::pinned_version(), false)?;
         Ok(Some(path))
     } else {
         Ok(None)
@@ -994,9 +993,19 @@ fn try_delegate_to_coven_code(binary: &Path) -> Result<()> {
                 engine::MIN_ENGINE_VERSION
             )));
         }
-        Ok(_) => {}
+        Ok(version) => {
+            // parse_version_output already stripped any -rc/build suffix, so this
+            // reconstructed X.Y.Z compares cleanly against the pinned version.
+            let actual = format!("{}.{}.{}", version.0, version.1, version.2);
+            if actual != engine::pinned_version() {
+                eprintln!(
+                    "coven: warning — engine {actual} differs from the pinned {} (run `coven engine install` to sync)",
+                    engine::pinned_version()
+                );
+            }
+        }
         // If we can't read the version, don't block launch — proceed and let the
-        // engine speak for itself. (A pin-drift warning is added in Task 2.1.)
+        // engine speak for itself.
         Err(_) => {}
     }
 
@@ -1119,7 +1128,7 @@ fn run_doctor() -> Result<()> {
                 }
                 Err(_) => println!("       version: unknown (could not run the engine)"),
             }
-            println!("       pin: none (dev)"); // Task 2.1 fills this from engine.lock
+            println!("       pin: {}", engine::pinned_version());
             match engine_auth_summary(&resolved.path) {
                 Some(true) => println!("       auth: logged in"),
                 Some(false) => println!("       auth: not logged in — run `coven auth login`"),
@@ -1706,10 +1715,8 @@ fn run_engine_command(command: EngineCommand) -> Result<()> {
     match command {
         EngineCommand::Status { json } => engine_status(json),
         EngineCommand::Install { version, force } => {
-            let version =
-                version.unwrap_or_else(|| engine_install::DEFAULT_ENGINE_VERSION.to_string());
-            // Task 2.1 will thread the pinned checksum here; None = dev mode.
-            let (path, outcome) = engine_install::install(&version, None, force)?;
+            let version = version.unwrap_or_else(|| engine::pinned_version().to_string());
+            let (path, outcome) = engine_install::install(&version, force)?;
             match outcome {
                 engine_install::InstallOutcome::Installed => {
                     println!("Installed Coven engine {version} at {}", path.display());
@@ -1797,7 +1804,7 @@ fn engine_status(json: bool) -> Result<()> {
                     "path": resolved.path.display().to_string(),
                     "source": engine_source_label(&resolved.source),
                     "version": version_str,
-                    "pin": serde_json::Value::Null, // Task 2.1
+                    "pin": engine::pinned_version(),
                 });
                 println!("{}", serde_json::to_string_pretty(&obj)?);
             } else {
@@ -1805,7 +1812,7 @@ fn engine_status(json: bool) -> Result<()> {
                 println!("  Path:    {}", resolved.path.display());
                 println!("  Source:  {}", engine_source_label(&resolved.source));
                 println!("  Version: {version_str}");
-                println!("  Pin:     none (dev)"); // Task 2.1 fills this in
+                println!("  Pin:     {}", engine::pinned_version());
             }
             Ok(())
         }
