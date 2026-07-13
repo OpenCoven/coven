@@ -47,6 +47,11 @@ pub const ENGINE_BIN_NAME: &str = "coven-code.exe";
 #[cfg(not(windows))]
 pub const ENGINE_BIN_NAME: &str = "coven-code";
 
+/// The built-in harness id for the engine. Platform-invariant (unlike
+/// `ENGINE_BIN_NAME`, which is `coven-code.exe` on Windows) — availability,
+/// spawn, and the harness spec must all agree on this exact id.
+pub const ENGINE_HARNESS_ID: &str = "coven-code";
+
 /// Oldest engine this build can drive. Moves INDEPENDENTLY of the pinned
 /// version in engine.lock (minimum-supported vs. currently-pinned release);
 /// their present equality is coincidental.

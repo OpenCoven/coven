@@ -346,7 +346,7 @@ pub fn built_in_harnesses() -> Vec<HarnessSummary> {
 impl HarnessSummary {
     fn from_spec(spec: HarnessCommandSpec) -> Self {
         Self {
-            available: executable_exists(&spec.executable),
+            available: harness_available(&spec.executable),
             id: spec.id,
             label: spec.label,
             executable: spec.executable,
@@ -467,6 +467,44 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
                     "--output-format".to_string(),
                     "stream-json".to_string(),
                     "--verbose".to_string(),
+                ],
+                session_id_flag: Some("--session-id".to_string()),
+                resume_flag: Some("--resume".to_string()),
+            }),
+        },
+        HarnessCommandSpec {
+            id: crate::engine::ENGINE_HARNESS_ID.to_string(),
+            label: "Coven Code".to_string(),
+            executable: crate::engine::ENGINE_HARNESS_ID.to_string(),
+            interactive_prompt_prefix_args: Vec::new(),
+            non_interactive_prompt_prefix_args: vec!["--print".to_string()],
+            install_hint: "Install the Coven engine with `coven engine install`.".to_string(),
+            source: "bundled".to_string(),
+            manifest_path: None,
+            // The engine composes its own base system prompt; append, never replace.
+            system_prompt_flag: Some("--append-system-prompt".to_string()),
+            model_flag: Some("--model".to_string()),
+            model_arg_template: None,
+            // kebab-case values — the engine's --permission-mode differs from Claude
+            // Code's camelCase bypassPermissions.
+            sandbox: Some(SandboxMapping::Flag {
+                flag: "--permission-mode".to_string(),
+                full: "bypass-permissions".to_string(),
+                read_only: "plan".to_string(),
+            }),
+            capabilities: Capabilities {
+                stream: true,
+                preassigned_session_id: true,
+                think: true,
+                speed: false,
+            },
+            stream_args: Some(StreamArgs {
+                prefix_args: vec![
+                    "--print".to_string(),
+                    "--input-format".to_string(),
+                    "stream-json".to_string(),
+                    "--output-format".to_string(),
+                    "stream-json".to_string(),
                 ],
                 session_id_flag: Some("--session-id".to_string()),
                 resume_flag: Some("--resume".to_string()),
@@ -1072,7 +1110,7 @@ pub fn command_parts_for_harness_with_conversation(
 }
 
 fn launch_option_args(harness_id: &str, options: HarnessLaunchOptions<'_>) -> Vec<String> {
-    if harness_id != "claude" {
+    if harness_id != "claude" && harness_id != crate::engine::ENGINE_HARNESS_ID {
         return Vec::new();
     }
     options
@@ -1190,7 +1228,7 @@ fn continuity_args(
         return None;
     }
     match spec.id.as_str() {
-        "claude" => {
+        id if id == "claude" || id == crate::engine::ENGINE_HARNESS_ID => {
             let flag = match hint {
                 ConversationHint::Init { .. } => "--session-id",
                 ConversationHint::Resume { .. } => "--resume",
@@ -1222,8 +1260,28 @@ fn executable_exists(executable: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Availability check for a harness: most harnesses rely on PATH only, but
+/// `coven-code` is also available when the managed engine resolver finds it
+/// (e.g. `~/.coven/engine/<ver>/coven-code` not on PATH).
+fn harness_available(executable: &str) -> bool {
+    if executable == crate::engine::ENGINE_HARNESS_ID {
+        // engine::resolve() already checks PATH (and the legacy dir); the
+        // extra executable_exists is a cheap safety valve for the rare case
+        // where PATH changed between here and an eventual spawn.
+        return crate::engine::resolve().is_some() || executable_exists(executable);
+    }
+    executable_exists(executable)
+}
+
 #[cfg(windows)]
 pub(crate) fn spawn_executable_for_platform(executable: &str) -> String {
+    // For the managed engine, return the absolute path directly so a coven-code
+    // binary that isn't on PATH can still be spawned correctly.
+    if executable == crate::engine::ENGINE_HARNESS_ID {
+        if let Some(r) = crate::engine::resolve() {
+            return r.path.to_string_lossy().into_owned();
+        }
+    }
     env::var_os("PATH")
         .and_then(|paths| {
             resolve_executable_in_paths_for_windows(
@@ -1238,6 +1296,13 @@ pub(crate) fn spawn_executable_for_platform(executable: &str) -> String {
 
 #[cfg(not(windows))]
 pub(crate) fn spawn_executable_for_platform(executable: &str) -> String {
+    // For the managed engine, return the absolute path directly so a coven-code
+    // binary that isn't on PATH can still be spawned correctly.
+    if executable == crate::engine::ENGINE_HARNESS_ID {
+        if let Some(r) = crate::engine::resolve() {
+            return r.path.to_string_lossy().into_owned();
+        }
+    }
     executable.to_string()
 }
 
@@ -1534,13 +1599,16 @@ mod tests {
     fn built_in_harnesses_returns_codex_and_claude() {
         let harnesses = built_in_harnesses();
 
-        assert_eq!(harnesses.len(), 2);
+        assert_eq!(harnesses.len(), 3);
         assert_eq!(harnesses[0].id, "codex");
         assert_eq!(harnesses[0].label, "Codex");
         assert_eq!(harnesses[0].executable, "codex");
         assert_eq!(harnesses[1].id, "claude");
         assert_eq!(harnesses[1].label, "Claude Code");
         assert_eq!(harnesses[1].executable, "claude");
+        assert_eq!(harnesses[2].id, "coven-code");
+        assert_eq!(harnesses[2].label, "Coven Code");
+        assert_eq!(harnesses[2].executable, "coven-code");
     }
 
     #[test]
@@ -1784,7 +1852,7 @@ mod tests {
         let manifest = temp_dir.path().join("streamy.json");
         fs::write(&manifest, STREAMY_ADAPTER_MANIFEST)?;
 
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
         let previous = env::var_os(EXTERNAL_ADAPTER_MANIFEST_ENV);
         env::set_var(EXTERNAL_ADAPTER_MANIFEST_ENV, &manifest);
         let supports_stream = harness_supports_stream_mode("streamy");
@@ -2249,6 +2317,77 @@ mod tests {
                     "--print".to_string(),
                     "--resume".to_string(),
                     "abc-123".to_string(),
+                    "--".to_string(),
+                    "follow up".to_string(),
+                ]
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn coven_code_init_hint_attaches_session_id_flag_in_print_mode() -> anyhow::Result<()> {
+        // `spawn_executable_for_platform("coven-code")` consults engine::resolve(),
+        // which reads HOME/USERPROFILE. Pin env (and clear any managed-engine home)
+        // so this deterministic-argv test does not race the managed-engine test.
+        let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let empty = tempfile::tempdir()?;
+        let _home_guard = EnvVarGuard::set("HOME", empty.path());
+        #[cfg(windows)]
+        let _userprofile_guard = EnvVarGuard::set("USERPROFILE", empty.path());
+        let hint = ConversationHint::Init {
+            id: "cc-session-42".to_string(),
+        };
+        let parts = command_parts_for_harness_with_conversation(
+            "coven-code",
+            "hello",
+            HarnessLaunchMode::NonInteractive,
+            Some(&hint),
+            None,
+            HarnessLaunchOptions::default(),
+        )?;
+        assert_eq!(
+            parts,
+            (
+                spawn_executable_for_platform("coven-code"),
+                vec![
+                    "--print".to_string(),
+                    "--session-id".to_string(),
+                    "cc-session-42".to_string(),
+                    "--".to_string(),
+                    "hello".to_string(),
+                ]
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn coven_code_resume_hint_attaches_resume_flag_in_print_mode() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let empty = tempfile::tempdir()?;
+        let _home_guard = EnvVarGuard::set("HOME", empty.path());
+        #[cfg(windows)]
+        let _userprofile_guard = EnvVarGuard::set("USERPROFILE", empty.path());
+        let hint = ConversationHint::Resume {
+            id: "cc-session-42".to_string(),
+        };
+        let parts = command_parts_for_harness_with_conversation(
+            "coven-code",
+            "follow up",
+            HarnessLaunchMode::NonInteractive,
+            Some(&hint),
+            None,
+            HarnessLaunchOptions::default(),
+        )?;
+        assert_eq!(
+            parts,
+            (
+                spawn_executable_for_platform("coven-code"),
+                vec![
+                    "--print".to_string(),
+                    "--resume".to_string(),
+                    "cc-session-42".to_string(),
                     "--".to_string(),
                     "follow up".to_string(),
                 ]
@@ -2896,5 +3035,109 @@ mod tests {
     #[cfg(not(unix))]
     fn make_executable(_path: &Path) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    // ── coven-code engine harness tests ──────────────────────────────────────
+
+    #[test]
+    fn coven_code_is_a_built_in_harness() {
+        let specs = built_in_harness_specs();
+        let cc = specs
+            .iter()
+            .find(|s| s.id == "coven-code")
+            .expect("coven-code spec present");
+        assert_eq!(cc.executable, "coven-code");
+        assert_eq!(
+            cc.non_interactive_prompt_prefix_args,
+            vec!["--print".to_string()]
+        );
+        assert_eq!(
+            cc.system_prompt_flag.as_deref(),
+            Some("--append-system-prompt")
+        );
+        assert_eq!(cc.model_flag.as_deref(), Some("--model"));
+        assert!(cc.capabilities.stream);
+        assert!(cc.capabilities.preassigned_session_id);
+        assert!(cc.capabilities.think);
+        let stream = cc.stream_args.as_ref().expect("stream args");
+        assert_eq!(stream.session_id_flag.as_deref(), Some("--session-id"));
+        assert_eq!(stream.resume_flag.as_deref(), Some("--resume"));
+    }
+
+    #[test]
+    fn coven_code_sandbox_uses_kebab_case_permission_mode() {
+        let specs = built_in_harness_specs();
+        let cc = specs.iter().find(|s| s.id == "coven-code").unwrap();
+        let full = cc.sandbox_args(Permission::Full);
+        assert!(
+            full.iter().any(|a| a == "bypass-permissions"),
+            "expected bypass-permissions in {full:?}"
+        );
+        assert!(
+            !full.iter().any(|a| a == "bypassPermissions"),
+            "must NOT use camelCase bypassPermissions; got {full:?}"
+        );
+        let read_only = cc.sandbox_args(Permission::ReadOnly);
+        assert!(
+            read_only.iter().any(|a| a == "plan"),
+            "expected plan in {read_only:?}"
+        );
+    }
+
+    #[test]
+    fn coven_code_think_maps_to_effort_high() -> anyhow::Result<()> {
+        let (_, args) = command_parts_for_harness_with_conversation(
+            "coven-code",
+            "hi",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            None,
+            HarnessLaunchOptions {
+                think: true,
+                ..Default::default()
+            },
+        )?;
+        let effort_pos = args
+            .iter()
+            .position(|a| a == "--effort")
+            .expect("--effort flag present");
+        assert_eq!(args[effort_pos + 1], "high");
+        Ok(())
+    }
+
+    #[test]
+    fn harness_available_returns_true_when_managed_engine_resolves() {
+        // When the managed engine is installed at the standard location,
+        // harness_available("coven-code") must return true even if "coven-code"
+        // is not on PATH.  Use a temp-dir fixture to simulate a managed install.
+        use std::io::Write;
+
+        let home = tempfile::tempdir().unwrap();
+        let engine_dir = home.path().join(".coven").join("engine").join("0.6.1");
+        fs::create_dir_all(&engine_dir).unwrap();
+        let bin = engine_dir.join(crate::engine::ENGINE_BIN_NAME);
+        let mut f = fs::File::create(&bin).unwrap();
+        f.write_all(b"#!/bin/sh\n").unwrap();
+        drop(f);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::write(home.path().join(".coven/engine/current"), "0.6.1").unwrap();
+
+        // Drive resolution deterministically on every platform via the
+        // COVEN_ENGINE_BIN override. `dirs_next::home_dir()` on Windows consults
+        // the SHGetKnownFolderPath API, which a USERPROFILE/HOME env override does
+        // not reliably change — so the managed-home path is not test-controllable
+        // cross-platform. The override exercises the same is_executable() gate and
+        // the same harness_available() code path.
+        let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _override_guard = EnvVarGuard::set("COVEN_ENGINE_BIN", &bin);
+
+        assert!(
+            harness_available("coven-code"),
+            "should be available via managed engine"
+        );
     }
 }
