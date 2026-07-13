@@ -751,6 +751,32 @@ fn edit_distance(a: &str, b: &str) -> usize {
 fn run_sessions_search(query: &str, json: bool) -> Result<()> {
     let store_path = coven_store_path()?;
     let conn = store::open_store(&store_path)?;
+
+    // Lazily ingest external-session transcripts (e.g. coven-code TUI sessions)
+    // so they become searchable. This is a one-time cost per session: once
+    // `transcript_indexed_at` is set the ingest function is a no-op.
+    let coven_home = coven_home_dir()?;
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    match store::list_uningest_external_sessions(&conn) {
+        Ok(pending) => {
+            for (session_id, _transcript_path) in pending {
+                if let Err(e) =
+                    store::ingest_external_transcript(&conn, &session_id, &coven_home, &now)
+                {
+                    // Best-effort: a failure on one session must not abort the search.
+                    eprintln!(
+                        "warning: run_sessions_search: failed to ingest transcript for session \
+                         {session_id}: {e}"
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            // Non-fatal: fall through to search without transcript data.
+            eprintln!("warning: run_sessions_search: failed to list un-ingested sessions: {e}");
+        }
+    }
+
     let hits = store::search_events(&conn, query)?;
 
     if json {
@@ -1114,6 +1140,10 @@ fn run_doctor() -> Result<()> {
         healthy = false;
     }
 
+    // Compute engine auth once so we can reuse it in the Credentials section
+    // without spawning the subprocess twice.
+    let engine_auth: Option<Option<bool>>;
+
     println!("\nEngine:");
     match engine::resolve() {
         Some(resolved) => {
@@ -1138,11 +1168,8 @@ fn run_doctor() -> Result<()> {
                 Err(_) => println!("       version: unknown (could not run the engine)"),
             }
             println!("       pin: {}", engine::pinned_version());
-            match engine_auth_summary(&resolved.path) {
-                Some(true) => println!("       auth: logged in"),
-                Some(false) => println!("       auth: not logged in — run `coven auth login`"),
-                None => println!("       auth: check skipped"),
-            }
+            // auth is shown in the Credentials section below
+            engine_auth = Some(engine_auth_summary(&resolved.path));
         }
         None => {
             healthy = false;
@@ -1150,10 +1177,17 @@ fn run_doctor() -> Result<()> {
             for line in coven_code_install_instructions(target_shell()).lines() {
                 println!("     {line}");
             }
+            // engine is missing; Credentials section will reflect that
+            engine_auth = None;
         }
     }
 
     print_familiars_section(&home);
+
+    println!("\nCredentials:");
+    for line in credentials_lines(engine_auth, &harnesses) {
+        println!("{line}");
+    }
 
     println!("\nNext steps:");
     if let Some(default) = default_harness_id() {
@@ -1804,6 +1838,74 @@ fn engine_auth_summary(binary: &Path) -> Option<bool> {
     child.stdout.take()?.read_to_string(&mut buf).ok()?;
     let json: serde_json::Value = serde_json::from_str(&buf).ok()?;
     json.get("loggedIn")?.as_bool()
+}
+
+/// Pure formatter for the "Credentials:" section of `coven doctor`.
+///
+/// `engine_auth` is:
+/// - `None`          — engine binary is missing; skip engine auth row entirely
+/// - `Some(None)`    — engine present but auth probe returned no result (skipped)
+/// - `Some(Some(true))`  — engine present and logged in
+/// - `Some(Some(false))` — engine present but not logged in
+///
+/// Harnesses with `id == "coven-code"` are skipped (that is the engine, shown above).
+///
+/// Returns lines ready to print (already prefixed with two-space indent).
+fn credentials_lines(
+    engine_auth: Option<Option<bool>>,
+    harnesses: &[harness::HarnessSummary],
+) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+
+    // --- Engine (Coven Code) ---
+    match engine_auth {
+        None => {
+            lines
+                .push("  [!!] Coven Code (engine) — missing; see Engine section above".to_string());
+        }
+        Some(Some(true)) => {
+            lines.push("  [OK] Coven Code (engine) — logged in".to_string());
+        }
+        Some(Some(false)) => {
+            lines.push(
+                "  [!!] Coven Code (engine) — not logged in; run `coven auth login`".to_string(),
+            );
+        }
+        Some(None) => {
+            lines.push("  [--] Coven Code (engine) — auth check skipped".to_string());
+        }
+    }
+
+    // --- Each configured harness (skip coven-code; it is the engine above) ---
+    for h in harnesses {
+        if h.id == "coven-code" {
+            continue;
+        }
+        if h.available {
+            let login_hint = login_hint_for_harness(&h.id);
+            lines.push(format!(
+                "  [OK] {} — available; authenticate with `{}`",
+                h.label, login_hint
+            ));
+        } else {
+            lines.push(format!(
+                "  [--] {} — not installed ({})",
+                h.label,
+                h.install_hint.trim()
+            ));
+        }
+    }
+
+    lines
+}
+
+/// Return the canonical "how to log in" command for a harness by id.
+fn login_hint_for_harness(harness_id: &str) -> &'static str {
+    match harness_id {
+        "codex" => "codex login",
+        "claude" => "claude doctor",
+        _ => "see harness docs",
+    }
 }
 
 fn engine_status(json: bool) -> Result<()> {
@@ -4461,5 +4563,95 @@ mod tests {
             None,
             "None when no harness is available"
         );
+    }
+
+    // --- credentials_lines unit tests ---
+
+    fn make_harness_with_hint(
+        id: &str,
+        available: bool,
+        install_hint: &str,
+    ) -> harness::HarnessSummary {
+        harness::HarnessSummary {
+            id: id.to_string(),
+            label: id.to_string(),
+            executable: id.to_string(),
+            available,
+            install_hint: install_hint.to_string(),
+            source: "built-in".to_string(),
+            manifest_path: None,
+        }
+    }
+
+    #[test]
+    fn credentials_lines_engine_logged_in() {
+        let lines = credentials_lines(Some(Some(true)), &[]);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("logged in"), "got: {}", lines[0]);
+        assert!(lines[0].contains("[OK]"), "got: {}", lines[0]);
+    }
+
+    #[test]
+    fn credentials_lines_engine_not_logged_in() {
+        let lines = credentials_lines(Some(Some(false)), &[]);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("not logged in"), "got: {}", lines[0]);
+        assert!(lines[0].contains("coven auth login"), "got: {}", lines[0]);
+        assert!(lines[0].contains("[!!]"), "got: {}", lines[0]);
+    }
+
+    #[test]
+    fn credentials_lines_engine_auth_skipped() {
+        let lines = credentials_lines(Some(None), &[]);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("skipped"), "got: {}", lines[0]);
+        assert!(lines[0].contains("[--]"), "got: {}", lines[0]);
+    }
+
+    #[test]
+    fn credentials_lines_engine_missing() {
+        let lines = credentials_lines(None, &[]);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("missing"), "got: {}", lines[0]);
+        assert!(lines[0].contains("[!!]"), "got: {}", lines[0]);
+    }
+
+    #[test]
+    fn credentials_lines_skips_coven_code_harness() {
+        let harnesses = vec![make_harness(engine::ENGINE_HARNESS_ID, true)];
+        // coven-code harness should be skipped — only the engine row appears
+        let lines = credentials_lines(Some(Some(true)), &harnesses);
+        assert_eq!(lines.len(), 1, "coven-code harness must not produce a row");
+    }
+
+    #[test]
+    fn credentials_lines_available_harness_shows_login_hint() {
+        let harnesses = vec![
+            make_harness_with_hint("codex", true, "npm install -g @openai/codex"),
+            make_harness_with_hint("claude", true, "npm install -g @anthropic-ai/claude-code"),
+        ];
+        let lines = credentials_lines(Some(Some(true)), &harnesses);
+        // engine row + 2 harness rows
+        assert_eq!(lines.len(), 3);
+        let codex_line = &lines[1];
+        assert!(codex_line.contains("[OK]"), "got: {codex_line}");
+        assert!(codex_line.contains("codex login"), "got: {codex_line}");
+        let claude_line = &lines[2];
+        assert!(claude_line.contains("[OK]"), "got: {claude_line}");
+        assert!(claude_line.contains("claude doctor"), "got: {claude_line}");
+    }
+
+    #[test]
+    fn credentials_lines_unavailable_harness_shows_not_installed() {
+        let harnesses = vec![make_harness_with_hint(
+            "codex",
+            false,
+            "npm install -g @openai/codex",
+        )];
+        let lines = credentials_lines(Some(Some(true)), &harnesses);
+        assert_eq!(lines.len(), 2);
+        let codex_line = &lines[1];
+        assert!(codex_line.contains("[--]"), "got: {codex_line}");
+        assert!(codex_line.contains("not installed"), "got: {codex_line}");
     }
 }
