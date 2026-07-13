@@ -51,6 +51,15 @@ ENV_SECRET_REFERENCE = re.compile(
     r"(?i)\b(?:api[_-]?key|secret|token|password|private[_-]?key)\b\s*[:=]\s*[\"']?"
     r"\$\{?[A-Z0-9_]+(?:[:?][^\"']*)?\}?"
 )
+# A Rust `let` binding whose right-hand side begins with a call expression
+# (identifier chain followed by `(`, e.g. `let token = text.split_whitespace()`).
+# The secret-sounding name binds the RESULT of code that runs later; the line
+# cannot contain a credential literal. A quoted or bare-blob RHS does not match
+# this shape and still trips `generic_assignment`.
+RUST_LET_CALL_BINDING = re.compile(
+    r"^\s*let\s+(?:mut\s+)?[A-Za-z_][A-Za-z0-9_]*\s*(?::[^=]{1,64})?=\s*"
+    r"[A-Za-z_][A-Za-z0-9_]*(?:(?:::|\.)[A-Za-z_][A-Za-z0-9_]*)*!?\("
+)
 
 
 def sh(*args: str) -> str:
@@ -101,9 +110,16 @@ def is_local_path_like_token(token: str) -> bool:
 
 def is_public_repo_url_like_token(token: str) -> bool:
     normalized = token.strip("/")
-    return normalized.startswith("github.com/OpenCoven/coven/") and (
-        "/blob/" in normalized or "/tree/" in normalized
-    )
+    if not re.match(r"github\.com/OpenCoven/[A-Za-z0-9_.-]+/", normalized):
+        return False
+    if "/blob/" in normalized or "/tree/" in normalized:
+        return True
+    # Release-artifact URLs (…/releases/download/<tag>/<artifact>): tags and
+    # artifact filenames are short path segments; cap each so a token-like
+    # blob smuggled into a fake artifact name still trips the entropy rule.
+    if "/releases/download/" in normalized:
+        return all(len(part) <= 64 for part in normalized.split("/"))
+    return False
 
 
 def is_opencoven_repo_relative_path_token(token: str) -> bool:
@@ -234,6 +250,8 @@ def scan_text(text: str, path: str) -> list[tuple[str, int, str]]:
             if name == "generic_assignment" and ENV_SECRET_READ.search(line):
                 continue
             if name == "generic_assignment" and ENV_SECRET_REFERENCE.search(line):
+                continue
+            if name == "generic_assignment" and RUST_LET_CALL_BINDING.match(line):
                 continue
             if name == "generic_assignment" and "grep" in line and re.search(r"-[A-Za-z]*E\b", line):
                 continue
