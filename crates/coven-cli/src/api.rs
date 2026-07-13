@@ -432,6 +432,11 @@ pub fn handle_request_with_runtime(
             json_response(200, &sessions)
         }
         ("POST", "/sessions") => launch_session(coven_home, body, runtime),
+        ("POST", "/sessions/external") => register_external_session(coven_home, body),
+        ("POST", path) if path.starts_with("/sessions/") && path.ends_with("/complete") => {
+            let session_id = session_action_id(path, "/complete");
+            complete_external_session(coven_home, session_id, body)
+        }
         ("POST", path) if path.starts_with("/sessions/") && path.ends_with("/input") => {
             let session_id = session_action_id(path, "/input");
             record_input(coven_home, session_id, body, runtime)
@@ -796,6 +801,8 @@ fn upload_travel_delta(coven_home: &Path, body: Option<&str>, query: &str) -> Re
             familiar_id: Some(profile.familiar_id.clone()),
             labels: vec!["travel".to_string(), "offline-delta".to_string()],
             visibility: "private".to_string(),
+            external: false,
+            transcript_path: None,
         },
     )?;
     if let Some(events) = payload.get("events").and_then(Value::as_array) {
@@ -1514,6 +1521,8 @@ fn launch_session(
         familiar_id: familiar_ctx.as_ref().map(|familiar| familiar.id.clone()),
         labels: Vec::new(),
         visibility: "private".to_string(),
+        external: false,
+        transcript_path: None,
     };
     store::insert_session(&conn, &record)?;
     if let Err(error) = runtime.launch_session(&launch) {
@@ -1545,6 +1554,117 @@ fn launch_session(
         }
     }
     json_response(201, &record)
+}
+
+fn register_external_session(coven_home: &Path, body: Option<&str>) -> Result<ApiResponse> {
+    let payload = match parse_body(body) {
+        Ok(payload) => payload,
+        Err(error) => return api_error(400, "invalid_request", &error.to_string(), None),
+    };
+    let id = match required_string(&payload, "id") {
+        Ok(id) => id,
+        Err(error) => return api_error(400, "invalid_request", &error.to_string(), None),
+    };
+    let project_root = match required_string(&payload, "projectRoot") {
+        Ok(r) => r,
+        Err(error) => return api_error(400, "invalid_request", &error.to_string(), None),
+    };
+    let harness = match required_string(&payload, "harness") {
+        Ok(h) => h,
+        Err(error) => return api_error(400, "invalid_request", &error.to_string(), None),
+    };
+    let title = payload
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("External session")
+        .to_string();
+    let transcript_path = payload
+        .get("transcriptPath")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let now = current_timestamp();
+    let record = store::SessionRecord {
+        id,
+        project_root,
+        harness,
+        title,
+        status: "running".to_string(),
+        exit_code: None,
+        archived_at: None,
+        created_at: now.clone(),
+        updated_at: now,
+        conversation_id: None,
+        familiar_id: None,
+        labels: Vec::new(),
+        visibility: "private".to_string(),
+        external: true,
+        transcript_path,
+    };
+    let conn = store::open_store(&store_path(coven_home))?;
+    // Idempotent: if a row with this id already exists, return 200 with the
+    // existing record rather than failing.
+    let inserted = store::insert_session_if_absent(&conn, &record)?;
+    let status = if inserted { 201 } else { 200 };
+    // Re-read so the response always reflects the persisted row.
+    let persisted = store::get_session(&conn, &record.id)?.unwrap_or(record);
+    // If the insert was skipped (inserted == false) and the existing row is
+    // NOT external, a daemon-managed session already holds this id — reject
+    // rather than silently aliasing it.
+    if !inserted && !persisted.external {
+        return api_error(
+            409,
+            "session_id_conflict",
+            "A daemon-managed session with this id already exists.",
+            Some(json!({ "sessionId": &persisted.id })),
+        );
+    }
+    json_response(status, &persisted)
+}
+
+fn complete_external_session(
+    coven_home: &Path,
+    session_id: &str,
+    body: Option<&str>,
+) -> Result<ApiResponse> {
+    let payload: Value = body
+        .and_then(|b| serde_json::from_str(b).ok())
+        .unwrap_or(Value::Null);
+    let exit_code: Option<i32> = payload
+        .get("exitCode")
+        .and_then(Value::as_i64)
+        .map(|c| c as i32);
+    let status = match exit_code {
+        Some(code) if code != 0 => "failed",
+        _ => "completed",
+    };
+    let conn = store::open_store(&store_path(coven_home))?;
+    match store::get_session(&conn, session_id)? {
+        None => api_error(
+            404,
+            "session_not_found",
+            "Session was not found.",
+            Some(json!({ "sessionId": session_id })),
+        ),
+        Some(session) if !session.external => api_error(
+            422,
+            "not_external_session",
+            "POST /sessions/<id>/complete is only valid for externally-registered sessions. Use POST /sessions/<id>/kill for daemon-managed sessions.",
+            Some(json!({ "sessionId": session_id })),
+        ),
+        Some(_) => {
+            store::update_session_status(
+                &conn,
+                session_id,
+                status,
+                exit_code,
+                &current_timestamp(),
+            )?;
+            let updated = store::get_session(&conn, session_id)?.expect("session vanished");
+            json_response(200, &updated)
+        }
+    }
 }
 
 fn session_launch_from_payload(payload: Value) -> Result<SessionLaunch> {
@@ -1757,6 +1877,14 @@ fn kill_session(
     if session.status != "running" {
         return session_not_live_response(session_id);
     }
+    if session.external {
+        return api_error(
+            422,
+            "external_session_not_killable",
+            "External sessions are not managed by the daemon; use POST /sessions/<id>/complete to mark them finished.",
+            Some(json!({ "sessionId": session_id })),
+        );
+    }
 
     // Same structured-error pattern as the launch + input handlers: a
     // runtime kill failure (libc::kill returning EPERM, etc.) must
@@ -1946,6 +2074,8 @@ fn ensure_cockpit_session(conn: &rusqlite::Connection) -> Result<()> {
         familiar_id: None,
         labels: Vec::new(),
         visibility: "private".to_string(),
+        external: false,
+        transcript_path: None,
     };
     store::insert_session_if_absent(conn, &record)?;
     Ok(())
@@ -3127,6 +3257,8 @@ mod tests {
                 familiar_id: None,
                 labels: Vec::new(),
                 visibility: "private".to_string(),
+                external: false,
+                transcript_path: None,
             },
         )?;
         store::insert_json_event(
@@ -3313,6 +3445,8 @@ mod tests {
             familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
+            external: false,
+            transcript_path: None,
         };
         crate::store::insert_session(&conn, &session)?;
 
@@ -4349,6 +4483,8 @@ mod tests {
             familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
+            external: false,
+            transcript_path: None,
         };
         crate::store::insert_session(&conn, &session)?;
         Ok(())
@@ -4654,6 +4790,8 @@ mod tests {
             familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
+            external: false,
+            transcript_path: None,
         };
         store::insert_session(&conn, &session)?;
         insert_event(&conn, home, "sess-log", "input", json!({"text": "hello"}))?;
@@ -4692,6 +4830,8 @@ mod tests {
             familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
+            external: false,
+            transcript_path: None,
         };
         store::insert_session(&conn, &session)?;
         let fake = fake_openai_key();
@@ -4735,6 +4875,8 @@ mod tests {
             familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
+            external: false,
+            transcript_path: None,
         };
         store::insert_session(&conn, &session)?;
         drop(conn);
@@ -4772,6 +4914,8 @@ mod tests {
             familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
+            external: false,
+            transcript_path: None,
         };
         store::insert_session(&conn, &session)?;
         insert_event(
@@ -4886,6 +5030,8 @@ mod tests {
             familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
+            external: false,
+            transcript_path: None,
         };
         store::insert_session(&conn, &session)?;
         drop(conn);
@@ -4987,6 +5133,8 @@ mod tests {
                     familiar_id: None,
                     labels: Vec::new(),
                     visibility: "private".to_string(),
+                    external: false,
+                    transcript_path: None,
                 },
             )?;
         }
@@ -5265,6 +5413,280 @@ icon = "ph:leaf-fill"
         assert_eq!(response.status, 404);
         let body: serde_json::Value = serde_json::from_str(&response.body)?;
         assert_eq!(body["error"]["code"], "call_not_found");
+        Ok(())
+    }
+
+    #[test]
+    fn register_external_session_returns_201_with_external_flag() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let body = json!({
+            "id": "engine-sess-abc",
+            "projectRoot": temp.path().to_string_lossy(),
+            "harness": "engine",
+            "title": "Engine TUI session",
+            "transcriptPath": "/tmp/engine-sess-abc.jsonl"
+        })
+        .to_string();
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/external",
+            temp.path(),
+            None,
+            Some(&body),
+        )?;
+
+        assert_eq!(response.status, 201, "unexpected body: {}", response.body);
+        let record: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(record["id"], "engine-sess-abc");
+        assert_eq!(record["status"], "running");
+        assert_eq!(record["external"], true);
+        assert_eq!(record["transcript_path"], "/tmp/engine-sess-abc.jsonl");
+
+        // Verify idempotency: a second POST with the same id returns 200, not 201.
+        let response2 = handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/external",
+            temp.path(),
+            None,
+            Some(&body),
+        )?;
+        assert_eq!(
+            response2.status, 200,
+            "idempotent re-register should return 200"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn register_external_session_empty_title_defaults_to_external_session() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+
+        // Empty string title should fall back to "External session".
+        let body_empty = json!({
+            "id": "engine-sess-empty-title",
+            "projectRoot": temp.path().to_string_lossy(),
+            "harness": "engine",
+            "title": ""
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/external",
+            temp.path(),
+            None,
+            Some(&body_empty),
+        )?;
+        assert_eq!(response.status, 201, "unexpected body: {}", response.body);
+        let record: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(
+            record["title"], "External session",
+            "empty title should default to \"External session\""
+        );
+
+        // Whitespace-only title should also fall back to "External session".
+        let body_ws = json!({
+            "id": "engine-sess-ws-title",
+            "projectRoot": temp.path().to_string_lossy(),
+            "harness": "engine",
+            "title": "   "
+        })
+        .to_string();
+        let response_ws = handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/external",
+            temp.path(),
+            None,
+            Some(&body_ws),
+        )?;
+        assert_eq!(
+            response_ws.status, 201,
+            "unexpected body: {}",
+            response_ws.body
+        );
+        let record_ws: serde_json::Value = serde_json::from_str(&response_ws.body)?;
+        assert_eq!(
+            record_ws["title"], "External session",
+            "whitespace-only title should default to \"External session\""
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn complete_external_session_with_exit_0_marks_completed() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+
+        // Register the session first.
+        let reg_body = json!({
+            "id": "engine-sess-complete",
+            "projectRoot": temp.path().to_string_lossy(),
+            "harness": "engine",
+            "title": "will complete"
+        })
+        .to_string();
+        handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/external",
+            temp.path(),
+            None,
+            Some(&reg_body),
+        )?;
+
+        // Complete with exitCode 0.
+        let complete_body = json!({ "exitCode": 0 }).to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/engine-sess-complete/complete",
+            temp.path(),
+            None,
+            Some(&complete_body),
+        )?;
+
+        assert_eq!(response.status, 200, "body: {}", response.body);
+        let record: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(record["status"], "completed");
+        Ok(())
+    }
+
+    #[test]
+    fn complete_external_session_with_nonzero_exit_marks_failed() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+
+        let reg_body = json!({
+            "id": "engine-sess-fail",
+            "projectRoot": temp.path().to_string_lossy(),
+            "harness": "engine",
+            "title": "will fail"
+        })
+        .to_string();
+        handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/external",
+            temp.path(),
+            None,
+            Some(&reg_body),
+        )?;
+
+        let complete_body = json!({ "exitCode": 1 }).to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/engine-sess-fail/complete",
+            temp.path(),
+            None,
+            Some(&complete_body),
+        )?;
+
+        assert_eq!(response.status, 200, "body: {}", response.body);
+        let record: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(record["status"], "failed");
+        Ok(())
+    }
+
+    #[test]
+    fn complete_unknown_session_returns_404() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/no-such-session-id/complete",
+            temp.path(),
+            None,
+            Some(r#"{"exitCode": 0}"#),
+        )?;
+
+        assert_eq!(response.status, 404);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "session_not_found");
+        Ok(())
+    }
+
+    #[test]
+    fn kill_external_session_returns_422() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+
+        // Register an external session so it's in the store as running+external.
+        let reg_body = json!({
+            "id": "ext-kill-guard",
+            "projectRoot": temp.path().to_string_lossy(),
+            "harness": "engine",
+            "title": "external session"
+        })
+        .to_string();
+        handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/external",
+            temp.path(),
+            None,
+            Some(&reg_body),
+        )?;
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/api/v1/sessions/ext-kill-guard/kill",
+            temp.path(),
+            None,
+            None,
+            &NoopSessionRuntime,
+        )?;
+
+        assert_eq!(response.status, 422, "body: {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "external_session_not_killable");
+        assert_eq!(body["error"]["details"]["sessionId"], "ext-kill-guard");
+        Ok(())
+    }
+
+    #[test]
+    fn complete_non_external_session_returns_422() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+
+        // Insert a daemon-managed (non-external) running session.
+        insert_test_session(temp.path(), "daemon-sess")?;
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/daemon-sess/complete",
+            temp.path(),
+            None,
+            Some(r#"{"exitCode": 0}"#),
+        )?;
+
+        assert_eq!(response.status, 422, "body: {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "not_external_session");
+        assert_eq!(body["error"]["details"]["sessionId"], "daemon-sess");
+        Ok(())
+    }
+
+    #[test]
+    fn register_external_session_conflicts_with_daemon_session_returns_409() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+
+        // Insert a daemon-managed session with the id we're about to try to register.
+        insert_test_session(temp.path(), "shared-id")?;
+
+        let reg_body = json!({
+            "id": "shared-id",
+            "projectRoot": temp.path().to_string_lossy(),
+            "harness": "engine",
+            "title": "should conflict"
+        })
+        .to_string();
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/external",
+            temp.path(),
+            None,
+            Some(&reg_body),
+        )?;
+
+        assert_eq!(response.status, 409, "body: {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "session_id_conflict");
+        assert_eq!(body["error"]["details"]["sessionId"], "shared-id");
         Ok(())
     }
 }
