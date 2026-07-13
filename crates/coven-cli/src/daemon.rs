@@ -3957,6 +3957,8 @@ mod tests {
                 familiar_id: None,
                 labels: Vec::new(),
                 visibility: "private".to_string(),
+                external: false,
+                transcript_path: None,
             },
         )?;
         let listener = bind_api_socket(temp_dir.path())?;
@@ -4122,6 +4124,8 @@ mod tests {
             familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
+            external: false,
+            transcript_path: None,
         }
     }
 

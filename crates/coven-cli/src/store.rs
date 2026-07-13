@@ -45,6 +45,15 @@ pub struct SessionRecord {
     pub labels: Vec<String>,
     #[serde(default = "default_visibility")]
     pub visibility: String,
+    /// True when the session was launched outside the daemon (e.g. by the
+    /// coven engine TUI) and registered via POST /sessions/external. The
+    /// daemon does not own the PTY; it only holds the ledger row.
+    #[serde(default)]
+    pub external: bool,
+    /// Absolute path to the transcript file written by an external session.
+    /// Only meaningful when `external` is true.
+    #[serde(default)]
+    pub transcript_path: Option<String>,
 }
 
 fn default_visibility() -> String {
@@ -251,7 +260,9 @@ pub fn open_store(path: &Path) -> Result<Connection> {
             conversation_id TEXT,
             labels TEXT,
             visibility TEXT NOT NULL DEFAULT 'private',
-            familiar_id TEXT
+            familiar_id TEXT,
+            external INTEGER NOT NULL DEFAULT 0,
+            transcript_path TEXT
         );
 
         CREATE TABLE IF NOT EXISTS events (
@@ -470,6 +481,7 @@ pub fn open_store(path: &Path) -> Result<Connection> {
     ensure_visibility_column(&conn)?;
     ensure_familiar_id_column(&conn)?;
     ensure_node_registry_dispatch_columns(&conn)?;
+    ensure_session_external_columns(&conn)?;
 
     backfill_events_fts_if_needed(&conn)?;
 
@@ -560,6 +572,22 @@ fn ensure_event_privacy_columns(conn: &Connection) -> Result<()> {
         "events",
         "sensitive",
         "ALTER TABLE events ADD COLUMN sensitive INTEGER NOT NULL DEFAULT 0",
+    )?;
+    Ok(())
+}
+
+fn ensure_session_external_columns(conn: &Connection) -> Result<()> {
+    ensure_column(
+        conn,
+        "sessions",
+        "external",
+        "ALTER TABLE sessions ADD COLUMN external INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "sessions",
+        "transcript_path",
+        "ALTER TABLE sessions ADD COLUMN transcript_path TEXT",
     )?;
     Ok(())
 }
@@ -1588,8 +1616,9 @@ pub fn insert_session(conn: &Connection, record: &SessionRecord) -> Result<()> {
     conn.execute(
         "INSERT INTO sessions (
             id, project_root, harness, title, status, exit_code, archived_at,
-            created_at, updated_at, conversation_id, labels, visibility, familiar_id
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            created_at, updated_at, conversation_id, labels, visibility, familiar_id,
+            external, transcript_path
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             &record.id,
             &record.project_root,
@@ -1604,6 +1633,8 @@ pub fn insert_session(conn: &Connection, record: &SessionRecord) -> Result<()> {
             labels_json,
             &record.visibility,
             &record.familiar_id,
+            record.external as i32,
+            &record.transcript_path,
         ],
     )
     .with_context(|| format!("failed to insert session {}", record.id))?;
@@ -1621,8 +1652,9 @@ pub fn insert_session_if_absent(conn: &Connection, record: &SessionRecord) -> Re
         .execute(
             "INSERT OR IGNORE INTO sessions (
                 id, project_root, harness, title, status, exit_code, archived_at,
-                created_at, updated_at, conversation_id, labels, visibility, familiar_id
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                created_at, updated_at, conversation_id, labels, visibility, familiar_id,
+                external, transcript_path
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 &record.id,
                 &record.project_root,
@@ -1637,6 +1669,8 @@ pub fn insert_session_if_absent(conn: &Connection, record: &SessionRecord) -> Re
                 labels_json,
                 &record.visibility,
                 &record.familiar_id,
+                record.external as i32,
+                &record.transcript_path,
             ],
         )
         .with_context(|| format!("failed to upsert session {}", record.id))?;
@@ -1669,7 +1703,8 @@ pub fn mark_running_sessions_orphaned(conn: &Connection, updated_at: &str) -> Re
             "UPDATE sessions
              SET status = 'orphaned',
                  updated_at = ?1
-             WHERE status = 'running'",
+             WHERE status = 'running'
+               AND external = 0",
             params![updated_at],
         )
         .context("failed to mark running sessions orphaned")?;
@@ -1752,6 +1787,8 @@ fn list_sessions_with_archive_filter(
     Ok(sessions)
 }
 
+// NOTE: column ORDER here must stay in sync with the positional indices in
+// `session_record_from_row`; append new columns at the END only.
 const SESSION_COLUMNS: &str = "id,
                 project_root,
                 harness,
@@ -1764,7 +1801,9 @@ const SESSION_COLUMNS: &str = "id,
                 conversation_id,
                 labels,
                 visibility,
-                familiar_id";
+                familiar_id,
+                external,
+                transcript_path";
 
 fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
     let labels_str: Option<String> = row.get(10)?;
@@ -1781,6 +1820,7 @@ fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionR
         })?
         .unwrap_or_default();
     let visibility: String = row.get(11)?;
+    let external_int: i32 = row.get(13)?;
     Ok(SessionRecord {
         id: row.get(0)?,
         project_root: row.get(1)?,
@@ -1795,6 +1835,8 @@ fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionR
         familiar_id: row.get(12)?,
         labels,
         visibility,
+        external: external_int != 0,
+        transcript_path: row.get(14)?,
     })
 }
 
@@ -2560,6 +2602,41 @@ mod tests {
     }
 
     #[test]
+    fn orphan_reaper_skips_external_sessions() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+
+        // A normal running session: should be orphaned.
+        let mut non_external = session_record("non-external-running", "2026-04-27T06:00:00Z");
+        non_external.status = "running".to_string();
+        non_external.external = false;
+
+        // An external running session: must NOT be orphaned.
+        let mut external = session_record("external-running", "2026-04-27T06:00:00Z");
+        external.status = "running".to_string();
+        external.external = true;
+
+        insert_session(&conn, &non_external)?;
+        insert_session(&conn, &external)?;
+
+        let updated = mark_running_sessions_orphaned(&conn, "2026-04-27T07:00:00Z")?;
+        assert_eq!(updated, 1, "only the non-external session should be reaped");
+
+        let sessions = list_sessions(&conn)?;
+        let ne = sessions
+            .iter()
+            .find(|s| s.id == "non-external-running")
+            .unwrap();
+        let ex = sessions
+            .iter()
+            .find(|s| s.id == "external-running")
+            .unwrap();
+        assert_eq!(ne.status, "orphaned");
+        assert_eq!(ex.status, "running", "external session must stay running");
+        Ok(())
+    }
+
+    #[test]
     fn marks_only_stale_created_sessions_failed() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let conn = open_store(&temp_dir.path().join("coven.db"))?;
@@ -3182,6 +3259,8 @@ mod tests {
             familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
+            external: false,
+            transcript_path: None,
         }
     }
 
@@ -3480,5 +3559,86 @@ mod tests {
 
     fn fake_github_token() -> String {
         format!("ghp_{}", "b".repeat(40))
+    }
+
+    #[test]
+    fn external_session_fields_round_trip_via_get_and_list() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("test.sqlite3"))?;
+
+        // Insert an external session with a transcript path.
+        let external = SessionRecord {
+            id: "ext-sess-1".to_string(),
+            project_root: "/tmp/proj".to_string(),
+            harness: "engine".to_string(),
+            title: "Engine run".to_string(),
+            status: "running".to_string(),
+            exit_code: None,
+            archived_at: None,
+            created_at: "2026-07-12T10:00:00Z".to_string(),
+            updated_at: "2026-07-12T10:00:00Z".to_string(),
+            conversation_id: None,
+            familiar_id: None,
+            labels: Vec::new(),
+            visibility: "private".to_string(),
+            external: true,
+            transcript_path: Some("/tmp/proj/.claude/transcripts/ext-sess-1.jsonl".to_string()),
+        };
+        insert_session(&conn, &external)?;
+
+        // Insert a regular (non-external) session without a transcript path.
+        let internal = SessionRecord {
+            id: "int-sess-1".to_string(),
+            project_root: "/tmp/proj".to_string(),
+            harness: "codex".to_string(),
+            title: "Normal run".to_string(),
+            status: "created".to_string(),
+            exit_code: None,
+            archived_at: None,
+            created_at: "2026-07-12T10:01:00Z".to_string(),
+            updated_at: "2026-07-12T10:01:00Z".to_string(),
+            conversation_id: None,
+            familiar_id: None,
+            labels: Vec::new(),
+            visibility: "private".to_string(),
+            external: false,
+            transcript_path: None,
+        };
+        insert_session(&conn, &internal)?;
+
+        // Round-trip via get_session.
+        let got_ext = get_session(&conn, "ext-sess-1")?.expect("external session should exist");
+        assert!(got_ext.external, "external flag should be true");
+        assert_eq!(
+            got_ext.transcript_path.as_deref(),
+            Some("/tmp/proj/.claude/transcripts/ext-sess-1.jsonl")
+        );
+
+        let got_int = get_session(&conn, "int-sess-1")?.expect("internal session should exist");
+        assert!(
+            !got_int.external,
+            "internal session external flag should be false"
+        );
+        assert!(
+            got_int.transcript_path.is_none(),
+            "internal session should have no transcript"
+        );
+
+        // Round-trip via list_sessions.
+        let all = list_sessions(&conn)?;
+        let ext_in_list = all
+            .iter()
+            .find(|s| s.id == "ext-sess-1")
+            .expect("ext in list");
+        let int_in_list = all
+            .iter()
+            .find(|s| s.id == "int-sess-1")
+            .expect("int in list");
+        assert!(ext_in_list.external);
+        assert!(!int_in_list.external);
+        assert!(ext_in_list.transcript_path.is_some());
+        assert!(int_in_list.transcript_path.is_none());
+
+        Ok(())
     }
 }

@@ -1599,6 +1599,8 @@ fn launch_patch_session(request: &patch::PatchRequest) -> Result<String> {
         familiar_id: None,
         labels: Vec::new(),
         visibility: "private".to_string(),
+        external: false,
+        transcript_path: None,
     };
     store::insert_session(&conn, &record)?;
     let metadata = serde_json::json!({
@@ -2223,6 +2225,8 @@ fn run_session(
             familiar_id: familiar_ctx.as_ref().map(|f| f.id.clone()),
             labels,
             visibility: visibility.unwrap_or("private").to_string(),
+            external: false,
+            transcript_path: None,
         };
         (r, false)
     };
@@ -2706,7 +2710,13 @@ fn attach_session(session_id: &str) -> Result<()> {
         );
     }
 
-    maybe_spawn_input_forwarder(home.clone(), session_id.to_string());
+    if session.external {
+        eprintln!(
+            "interactive engine session — attach shows the recorded ledger, not the live terminal."
+        );
+    } else {
+        maybe_spawn_input_forwarder(home.clone(), session_id.to_string());
+    }
 
     let mut seen = HashSet::new();
     loop {
@@ -3063,6 +3073,8 @@ mod tests {
             familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
+            external: false,
+            transcript_path: None,
         };
         store::insert_session(&conn, &record)?;
         record.id = "aaab2222-0000-0000-0000-000000000000".to_string();
@@ -4041,6 +4053,8 @@ mod tests {
             familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
+            external: false,
+            transcript_path: None,
         };
 
         assert_eq!(
@@ -4065,6 +4079,8 @@ mod tests {
             familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
+            external: false,
+            transcript_path: None,
         };
 
         let rendered = render_sessions_json(&[session])?;
@@ -4180,6 +4196,8 @@ mod tests {
             familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
+            external: false,
+            transcript_path: None,
         }
     }
 

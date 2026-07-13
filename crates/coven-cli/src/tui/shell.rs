@@ -581,6 +581,8 @@ fn create_local_quest_anchor(
         familiar_id: None,
         labels: Vec::new(),
         visibility: "private".to_string(),
+        external: false,
+        transcript_path: None,
     };
     store::insert_session(&conn, &record)?;
     let harness_label = default_harness
