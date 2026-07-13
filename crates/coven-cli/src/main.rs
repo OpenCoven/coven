@@ -1565,13 +1565,17 @@ fn choose_default_harness() -> Result<patch::HarnessId> {
     anyhow::bail!("no supported harness is available; run `coven doctor` for setup guidance")
 }
 
+fn pick_default_harness(harnesses: &[harness::HarnessSummary]) -> Option<String> {
+    for id in [engine::ENGINE_HARNESS_ID, "codex", "claude"] {
+        if let Some(h) = harnesses.iter().find(|h| h.id == id && h.available) {
+            return Some(h.id.clone());
+        }
+    }
+    None
+}
+
 fn default_harness_id() -> Option<String> {
-    let harnesses = harness::built_in_harnesses();
-    harnesses
-        .iter()
-        .find(|h| h.id == "codex" && h.available)
-        .or_else(|| harnesses.iter().find(|h| h.id == "claude" && h.available))
-        .map(|h| h.id.clone())
+    pick_default_harness(&harness::built_in_harnesses())
 }
 
 fn launch_patch_session(request: &patch::PatchRequest) -> Result<String> {
@@ -4370,6 +4374,74 @@ mod tests {
             out.status.code(),
             Some(2),
             "contract v1 §3: --print/--output-format/--max-turns must be accepted flags"
+        );
+    }
+
+    fn make_harness(id: &str, available: bool) -> harness::HarnessSummary {
+        harness::HarnessSummary {
+            id: id.to_string(),
+            label: id.to_string(),
+            executable: id.to_string(),
+            available,
+            install_hint: String::new(),
+            source: "built-in".to_string(),
+            manifest_path: None,
+        }
+    }
+
+    #[test]
+    fn pick_default_harness_prefers_coven_code_over_codex_and_claude() {
+        let all_available = vec![
+            make_harness(engine::ENGINE_HARNESS_ID, true),
+            make_harness("codex", true),
+            make_harness("claude", true),
+        ];
+        assert_eq!(
+            pick_default_harness(&all_available).as_deref(),
+            Some(engine::ENGINE_HARNESS_ID),
+            "coven-code must win when all three are available"
+        );
+    }
+
+    #[test]
+    fn pick_default_harness_falls_back_to_codex_when_coven_code_unavailable() {
+        let harnesses = vec![
+            make_harness(engine::ENGINE_HARNESS_ID, false),
+            make_harness("codex", true),
+            make_harness("claude", true),
+        ];
+        assert_eq!(
+            pick_default_harness(&harnesses).as_deref(),
+            Some("codex"),
+            "codex is the next fallback when coven-code is unavailable"
+        );
+    }
+
+    #[test]
+    fn pick_default_harness_falls_back_to_claude_as_last_resort() {
+        let harnesses = vec![
+            make_harness(engine::ENGINE_HARNESS_ID, false),
+            make_harness("codex", false),
+            make_harness("claude", true),
+        ];
+        assert_eq!(
+            pick_default_harness(&harnesses).as_deref(),
+            Some("claude"),
+            "claude is the final fallback"
+        );
+    }
+
+    #[test]
+    fn pick_default_harness_returns_none_when_all_unavailable() {
+        let harnesses = vec![
+            make_harness(engine::ENGINE_HARNESS_ID, false),
+            make_harness("codex", false),
+            make_harness("claude", false),
+        ];
+        assert_eq!(
+            pick_default_harness(&harnesses),
+            None,
+            "None when no harness is available"
         );
     }
 }

@@ -472,11 +472,21 @@ fn doctor_reports_no_familiars_when_manifest_absent() -> anyhow::Result<()> {
 fn doctor_missing_harness_prints_cross_platform_setup_loop() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let coven_home = temp_dir.path().join("coven-home");
+    let fake_home = temp_dir.path().join("fake-home");
     fs::create_dir_all(&coven_home)?;
+    fs::create_dir_all(&fake_home)?;
     let coven = coven_bin();
     let empty_path = OsString::new();
 
-    let output = run_coven(&coven, &coven_home, &empty_path, &["doctor"])?;
+    // Point HOME at a scratch dir so the managed-engine resolver (which reads
+    // ~/.coven/engine/) finds nothing — this ensures all three harnesses are
+    // reported as missing regardless of what the developer has installed.
+    let output = Command::new(&coven)
+        .args(["doctor"])
+        .env("COVEN_HOME", &coven_home)
+        .env("PATH", &empty_path)
+        .env("HOME", &fake_home)
+        .output()?;
 
     // No harness available is a blocking problem: doctor must exit 1 so
     // scripts can gate on it, while still printing the full setup loop.
@@ -489,6 +499,11 @@ fn doctor_missing_harness_prints_cross_platform_setup_loop() -> anyhow::Result<(
     assert_stdout_contains("doctor without harnesses", &output, "Harnesses:");
     assert_stdout_contains("doctor without harnesses", &output, "`codex` is missing");
     assert_stdout_contains("doctor without harnesses", &output, "`claude` is missing");
+    assert_stdout_contains(
+        "doctor without harnesses",
+        &output,
+        "`coven-code` is missing",
+    );
     assert_stdout_contains(
         "doctor without harnesses",
         &output,

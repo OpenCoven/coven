@@ -331,6 +331,35 @@ mod tests {
         assert!(got.is_err(), "non-empty malformed line should error");
     }
 
+    /// Golden fixture recorded from the real coven-code engine in bidirectional
+    /// stream mode (`--print --input-format stream-json --output-format stream-json
+    /// --max-turns 1`).  Every non-blank line must deserialise to a known `Event`
+    /// variant — no enum extension was needed (the mode emits system/assistant/result
+    /// only).  Machine-specific values (cwd, session_id) were scrubbed to
+    /// `/workspace` and `fixture-session` respectively before committing.
+    #[test]
+    fn golden_engine_stream_parses_with_the_existing_parser() {
+        // The coven-code harness runs the engine in bidirectional stream mode;
+        // its output must parse with coven's Claude-compatible stream parser.
+        let raw = include_str!("../tests/fixtures/engine/basic.stream.jsonl");
+        let mut kinds = Vec::new();
+        for line in raw.lines().filter(|l| !l.trim().is_empty()) {
+            let event: Event = serde_json::from_str(line).unwrap_or_else(|e| {
+                panic!("engine stream line failed coven's parser: {e}\n  line: {line}")
+            });
+            kinds.push(event);
+        }
+        assert!(!kinds.is_empty(), "fixture must contain events");
+        assert!(
+            kinds.iter().any(|e| matches!(e, Event::System(_))),
+            "expected a system event"
+        );
+        assert!(
+            kinds.iter().any(|e| matches!(e, Event::Result(_))),
+            "expected a result event"
+        );
+    }
+
     #[test]
     fn multiple_events_stream_in_order() {
         let mut buf = Vec::new();

@@ -51,6 +51,8 @@ version.
     JSON-RPC 2.0 (verified via source: `crates/acp/src/connection.rs`); subcommand
     accepts no flags and produces no --help output — it is a fast-path in the CLI
     dispatcher
+11. `--effort {low|medium|high|max}` → extended-thinking budget; coven maps the
+    harness "think" capability to `--effort high`
 
 ## Environment
 
@@ -81,6 +83,8 @@ Type names are verbatim from the engine protocol:
 Event schemas: see [docs/STREAM-JSON.md](STREAM-JSON.md).
 
 Note: STREAM-JSON.md documents the output (engine → coven) side of the protocol.
+
+**Bidirectional mode observed kinds (surface 4):** in `--print --input-format stream-json --output-format stream-json` (the coven-code harness mode), the engine emits exactly `system`(init), `assistant`, and `result`(success) — all handled by coven's existing `Event` enum without extension. Verified against the golden fixture at `crates/coven-cli/tests/fixtures/engine/basic.stream.jsonl`.
 For input frames (coven → engine on stdin), see the Input frames section below.
 
 ### Input frames (stdin, surface 4)
