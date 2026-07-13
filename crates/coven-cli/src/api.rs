@@ -1576,6 +1576,8 @@ fn register_external_session(coven_home: &Path, body: Option<&str>) -> Result<Ap
     let title = payload
         .get("title")
         .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
         .unwrap_or("External session")
         .to_string();
     let transcript_path = payload
@@ -5452,6 +5454,61 @@ icon = "ph:leaf-fill"
         assert_eq!(
             response2.status, 200,
             "idempotent re-register should return 200"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn register_external_session_empty_title_defaults_to_external_session() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+
+        // Empty string title should fall back to "External session".
+        let body_empty = json!({
+            "id": "engine-sess-empty-title",
+            "projectRoot": temp.path().to_string_lossy(),
+            "harness": "engine",
+            "title": ""
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/external",
+            temp.path(),
+            None,
+            Some(&body_empty),
+        )?;
+        assert_eq!(response.status, 201, "unexpected body: {}", response.body);
+        let record: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(
+            record["title"], "External session",
+            "empty title should default to \"External session\""
+        );
+
+        // Whitespace-only title should also fall back to "External session".
+        let body_ws = json!({
+            "id": "engine-sess-ws-title",
+            "projectRoot": temp.path().to_string_lossy(),
+            "harness": "engine",
+            "title": "   "
+        })
+        .to_string();
+        let response_ws = handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/external",
+            temp.path(),
+            None,
+            Some(&body_ws),
+        )?;
+        assert_eq!(
+            response_ws.status, 201,
+            "unexpected body: {}",
+            response_ws.body
+        );
+        let record_ws: serde_json::Value = serde_json::from_str(&response_ws.body)?;
+        assert_eq!(
+            record_ws["title"], "External session",
+            "whitespace-only title should default to \"External session\""
         );
 
         Ok(())
