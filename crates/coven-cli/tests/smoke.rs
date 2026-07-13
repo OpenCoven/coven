@@ -486,6 +486,7 @@ fn doctor_missing_harness_prints_cross_platform_setup_loop() -> anyhow::Result<(
         .env("COVEN_HOME", &coven_home)
         .env("PATH", &empty_path)
         .env("HOME", &fake_home)
+        .env("USERPROFILE", &fake_home)
         .output()?;
 
     // No harness available is a blocking problem: doctor must exit 1 so
