@@ -994,14 +994,23 @@ fn try_delegate_to_coven_code(binary: &Path) -> Result<()> {
             )));
         }
         Ok(version) => {
-            // parse_version_output already stripped any -rc/build suffix, so this
-            // reconstructed X.Y.Z compares cleanly against the pinned version.
-            let actual = format!("{}.{}.{}", version.0, version.1, version.2);
-            if actual != engine::pinned_version() {
-                eprintln!(
-                    "coven: warning — engine {actual} differs from the pinned {} (run `coven engine install` to sync)",
-                    engine::pinned_version()
-                );
+            // parse_version_output already stripped any -rc/build suffix, so the
+            // pinned string parses cleanly for a tuple comparison here.
+            if let Some(pinned) = engine::parse_version_output(engine::pinned_version()) {
+                if version < pinned {
+                    eprintln!(
+                        "coven: warning — engine {}.{}.{} is older than the pinned {}; run `coven engine install` to update",
+                        version.0, version.1, version.2, engine::pinned_version()
+                    );
+                } else if version > pinned {
+                    eprintln!(
+                        "coven: note — engine {}.{}.{} is newer than this build's pinned {}",
+                        version.0,
+                        version.1,
+                        version.2,
+                        engine::pinned_version()
+                    );
+                }
             }
         }
         // If we can't read the version, don't block launch — proceed and let the
