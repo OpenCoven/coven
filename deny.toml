@@ -20,6 +20,10 @@ ignore = ["RUSTSEC-2024-0436"]
 [licenses]
 # Explicit allow-list for licenses currently present in the resolved workspace
 # dependency graph. New licenses fail CI until they are reviewed here.
+# LICENSE BOUNDARY: the coven-code engine is GPL-3.0 and is driven as a separate
+# process, never linked. GPL-3.0 is deliberately absent from this allow-list, so
+# any attempt to add a `claurst-*` engine crate as a dependency fails CI here.
+# See docs/ENGINE-CONTRACT.md.
 allow = [
     "0BSD",
     "Apache-2.0",

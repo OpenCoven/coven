@@ -97,6 +97,25 @@ jobs:
         env:
           COVEN_NPM_DRY_RUN_VERSION: 999.0.0
 
+  engine-contract:
+    name: engine contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install native link dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
+      - name: Build coven
+        run: cargo build -p coven-cli --locked
+      - name: Install the pinned engine
+        run: cargo run -p coven-cli --locked -- engine install
+      - name: Run contract tests against the pinned engine
+        run: |
+          ENGINE="$HOME/.coven/engine/$(cat "$HOME/.coven/engine/current")/coven-code"
+          echo "engine: $ENGINE"
+          "$ENGINE" --version
+          COVEN_ENGINE_BIN="$ENGINE" cargo test -p coven-cli --locked contract -- --nocapture
+
   cargo-deny:
     name: Dependency audit
     runs-on: ubuntu-latest

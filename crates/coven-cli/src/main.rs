@@ -4284,4 +4284,83 @@ mod tests {
             );
         }
     }
+
+    // --- Engine contract tests (see docs/ENGINE-CONTRACT.md) ---
+    // These run only when COVEN_ENGINE_BIN points at a real engine binary (set in
+    // CI after `coven engine install`); otherwise they skip so unit CI stays
+    // hermetic. Filter with: cargo test contract
+    fn contract_engine_bin() -> Option<std::path::PathBuf> {
+        std::env::var_os("COVEN_ENGINE_BIN").map(std::path::PathBuf::from)
+    }
+
+    #[test]
+    fn contract_version_output_parses() {
+        let Some(bin) = contract_engine_bin() else {
+            eprintln!("contract: skipped (COVEN_ENGINE_BIN unset)");
+            return;
+        };
+        let out = std::process::Command::new(&bin)
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "contract v1 §2: --version must exit 0"
+        );
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            crate::engine::parse_version_output(&text).is_some(),
+            "contract v1 §2: --version must print `coven-code <semver>`, got {text:?}"
+        );
+    }
+
+    #[test]
+    fn contract_auth_status_json_is_machine_readable() {
+        let Some(bin) = contract_engine_bin() else {
+            eprintln!("contract: skipped (COVEN_ENGINE_BIN unset)");
+            return;
+        };
+        let out = std::process::Command::new(&bin)
+            .args(["auth", "status", "--json"])
+            .output()
+            .unwrap();
+        // Contract v1 §8: exit 0 (logged in) or 1 (not); stdout is JSON either way.
+        assert!(
+            matches!(out.status.code(), Some(0) | Some(1)),
+            "contract v1 §8: auth status --json exit must be 0 or 1, got {:?}",
+            out.status.code()
+        );
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .expect("contract v1 §8: auth status --json must emit valid JSON");
+        assert!(
+            json.get("loggedIn").and_then(|v| v.as_bool()).is_some(),
+            "contract v1 §8: auth status --json must include a boolean `loggedIn`"
+        );
+    }
+
+    #[test]
+    fn contract_print_flags_are_accepted() {
+        let Some(bin) = contract_engine_bin() else {
+            eprintln!("contract: skipped (COVEN_ENGINE_BIN unset)");
+            return;
+        };
+        // No creds in CI: assert argument acceptance + structured behavior, NOT model
+        // output. A clap usage error is exit 2 — that would be a contract break.
+        let out = std::process::Command::new(&bin)
+            .args([
+                "--print",
+                "ping",
+                "--output-format",
+                "json",
+                "--max-turns",
+                "1",
+            ])
+            .output()
+            .unwrap();
+        assert_ne!(
+            out.status.code(),
+            Some(2),
+            "contract v1 §3: --print/--output-format/--max-turns must be accepted flags"
+        );
+    }
 }
