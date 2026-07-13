@@ -177,11 +177,13 @@ coven
 coven chat
 ```
 
-Bare `coven` opens the interactive Coven UI, which is provided by the separate
-[`coven-code`](https://github.com/OpenCoven/coven-code) front-end (`npm install -g
-@opencoven/coven-code`). If it isn't installed, `coven` prints the install
-command. You can also pass a task directly — `coven "fix the failing tests"` —
-and Coven will show a plan card and run it in a recorded session.
+Bare `coven` opens the interactive Coven UI, powered by the **Coven engine**.
+The first time you run it, `coven` offers to download and install the engine
+automatically (or install it anytime with `coven engine install`); it's a
+version-pinned, checksum-verified binary that `coven` manages for you — there's
+no separate package to install. You can also pass a task directly —
+`coven "fix the failing tests"` — and Coven will show a plan card and run it in
+a recorded session.
 
 ### Option B — Direct commands
 
@@ -224,7 +226,7 @@ Choose a repo, choose a harness, get a verified patch.
 
 | Command          | Action                                                          |
 | ---------------- | --------------------------------------------------------------- |
-| `coven`          | Open the interactive Coven UI (requires `coven-code`)           |
+| `coven`          | Open the interactive Coven UI (engine auto-installed on first run) |
 | `coven "<task>"` | Plan and run a free-text task in a recorded session (Cast flow) |
 | `coven chat`     | Explicitly open the interactive Coven UI                        |
 | `coven tui`      | Same as `coven chat`                                            |

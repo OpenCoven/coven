@@ -849,8 +849,7 @@ fn prompt_and_install_engine() -> Result<Option<PathBuf>> {
     io::stdin().read_line(&mut answer)?;
     let answer = answer.trim();
     if answer.is_empty() || answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
-        let (path, _) =
-            engine_install::install(engine_install::DEFAULT_ENGINE_VERSION, None, false)?;
+        let (path, _) = engine_install::install(engine::pinned_version(), false)?;
         Ok(Some(path))
     } else {
         Ok(None)
@@ -994,9 +993,28 @@ fn try_delegate_to_coven_code(binary: &Path) -> Result<()> {
                 engine::MIN_ENGINE_VERSION
             )));
         }
-        Ok(_) => {}
+        Ok(version) => {
+            // parse_version_output already stripped any -rc/build suffix, so the
+            // pinned string parses cleanly for a tuple comparison here.
+            if let Some(pinned) = engine::parse_version_output(engine::pinned_version()) {
+                if version < pinned {
+                    eprintln!(
+                        "coven: warning — engine {}.{}.{} is older than the pinned {}; run `coven engine install` to update",
+                        version.0, version.1, version.2, engine::pinned_version()
+                    );
+                } else if version > pinned {
+                    eprintln!(
+                        "coven: note — engine {}.{}.{} is newer than this build's pinned {}",
+                        version.0,
+                        version.1,
+                        version.2,
+                        engine::pinned_version()
+                    );
+                }
+            }
+        }
         // If we can't read the version, don't block launch — proceed and let the
-        // engine speak for itself. (A pin-drift warning is added in Task 2.1.)
+        // engine speak for itself.
         Err(_) => {}
     }
 
@@ -1119,7 +1137,7 @@ fn run_doctor() -> Result<()> {
                 }
                 Err(_) => println!("       version: unknown (could not run the engine)"),
             }
-            println!("       pin: none (dev)"); // Task 2.1 fills this from engine.lock
+            println!("       pin: {}", engine::pinned_version());
             match engine_auth_summary(&resolved.path) {
                 Some(true) => println!("       auth: logged in"),
                 Some(false) => println!("       auth: not logged in — run `coven auth login`"),
@@ -1706,10 +1724,8 @@ fn run_engine_command(command: EngineCommand) -> Result<()> {
     match command {
         EngineCommand::Status { json } => engine_status(json),
         EngineCommand::Install { version, force } => {
-            let version =
-                version.unwrap_or_else(|| engine_install::DEFAULT_ENGINE_VERSION.to_string());
-            // Task 2.1 will thread the pinned checksum here; None = dev mode.
-            let (path, outcome) = engine_install::install(&version, None, force)?;
+            let version = version.unwrap_or_else(|| engine::pinned_version().to_string());
+            let (path, outcome) = engine_install::install(&version, force)?;
             match outcome {
                 engine_install::InstallOutcome::Installed => {
                     println!("Installed Coven engine {version} at {}", path.display());
@@ -1797,7 +1813,7 @@ fn engine_status(json: bool) -> Result<()> {
                     "path": resolved.path.display().to_string(),
                     "source": engine_source_label(&resolved.source),
                     "version": version_str,
-                    "pin": serde_json::Value::Null, // Task 2.1
+                    "pin": engine::pinned_version(),
                 });
                 println!("{}", serde_json::to_string_pretty(&obj)?);
             } else {
@@ -1805,7 +1821,7 @@ fn engine_status(json: bool) -> Result<()> {
                 println!("  Path:    {}", resolved.path.display());
                 println!("  Source:  {}", engine_source_label(&resolved.source));
                 println!("  Version: {version_str}");
-                println!("  Pin:     none (dev)"); // Task 2.1 fills this in
+                println!("  Pin:     {}", engine::pinned_version());
             }
             Ok(())
         }
@@ -4276,5 +4292,84 @@ mod tests {
                 "passthrough `{passthrough}` must be exactly one registered subcommand"
             );
         }
+    }
+
+    // --- Engine contract tests (see docs/ENGINE-CONTRACT.md) ---
+    // These run only when COVEN_ENGINE_BIN points at a real engine binary (set in
+    // CI after `coven engine install`); otherwise they skip so unit CI stays
+    // hermetic. Filter with: cargo test contract
+    fn contract_engine_bin() -> Option<std::path::PathBuf> {
+        std::env::var_os("COVEN_ENGINE_BIN").map(std::path::PathBuf::from)
+    }
+
+    #[test]
+    fn contract_version_output_parses() {
+        let Some(bin) = contract_engine_bin() else {
+            eprintln!("contract: skipped (COVEN_ENGINE_BIN unset)");
+            return;
+        };
+        let out = std::process::Command::new(&bin)
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "contract v1 §2: --version must exit 0"
+        );
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            crate::engine::parse_version_output(&text).is_some(),
+            "contract v1 §2: --version must print `coven-code <semver>`, got {text:?}"
+        );
+    }
+
+    #[test]
+    fn contract_auth_status_json_is_machine_readable() {
+        let Some(bin) = contract_engine_bin() else {
+            eprintln!("contract: skipped (COVEN_ENGINE_BIN unset)");
+            return;
+        };
+        let out = std::process::Command::new(&bin)
+            .args(["auth", "status", "--json"])
+            .output()
+            .unwrap();
+        // Contract v1 §8: exit 0 (logged in) or 1 (not); stdout is JSON either way.
+        assert!(
+            matches!(out.status.code(), Some(0) | Some(1)),
+            "contract v1 §8: auth status --json exit must be 0 or 1, got {:?}",
+            out.status.code()
+        );
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .expect("contract v1 §8: auth status --json must emit valid JSON");
+        assert!(
+            json.get("loggedIn").and_then(|v| v.as_bool()).is_some(),
+            "contract v1 §8: auth status --json must include a boolean `loggedIn`"
+        );
+    }
+
+    #[test]
+    fn contract_print_flags_are_accepted() {
+        let Some(bin) = contract_engine_bin() else {
+            eprintln!("contract: skipped (COVEN_ENGINE_BIN unset)");
+            return;
+        };
+        // No creds in CI: assert argument acceptance + structured behavior, NOT model
+        // output. A clap usage error is exit 2 — that would be a contract break.
+        let out = std::process::Command::new(&bin)
+            .args([
+                "--print",
+                "ping",
+                "--output-format",
+                "json",
+                "--max-turns",
+                "1",
+            ])
+            .output()
+            .unwrap();
+        assert_ne!(
+            out.status.code(),
+            Some(2),
+            "contract v1 §3: --print/--output-format/--max-turns must be accepted flags"
+        );
     }
 }
