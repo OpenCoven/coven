@@ -394,5 +394,80 @@ class SecretGuardLockfileTests(unittest.TestCase):
         )
 
 
+class SecretGuardRustLetBindingTests(unittest.TestCase):
+    def test_rust_let_call_bindings_do_not_trigger_generic_assignment(self) -> None:
+        text = "\n".join(
+            [
+                "    let token = text.split_whitespace().last()?;",
+                "    let token = token.strip_prefix('v').unwrap_or(token);",
+                "    let mut secret = std::env::args().nth(1).unwrap_or_default();",
+                "    let password: String = prompt_hidden(\"Password: \")?;",
+                "    let api_key = format!(\"{prefix}-{suffix}\");",
+            ]
+        )
+
+        hits = check_secrets.scan_text(text, "crates/coven-cli/src/engine.rs")
+
+        self.assertEqual(hits, [])
+
+    def test_rust_let_with_literal_value_still_triggers_generic_assignment(self) -> None:
+        hits = check_secrets.scan_text(
+            'let token = "hunter2hunter2hunter2";', "crates/coven-cli/src/engine.rs"
+        )
+
+        self.assertEqual(
+            hits, [("crates/coven-cli/src/engine.rs", 1, "generic_assignment")]
+        )
+
+    def test_rust_let_with_bare_blob_still_triggers_generic_assignment(self) -> None:
+        # Assembled at runtime so the fixture itself doesn't look like a secret
+        # assignment to source-level scanners; the scanned LINE is what matters.
+        blob = "SGVsbG9" + "Xb3JsZFRoaXNJc05vdEFDYWxs"
+        hits = check_secrets.scan_text(f"let token = {blob};", "src/lib.rs")
+
+        self.assertEqual(
+            hits,
+            [
+                ("src/lib.rs", 1, "generic_assignment"),
+                ("src/lib.rs", 1, "high_entropy"),
+            ],
+        )
+
+    def test_other_rules_still_apply_to_let_call_binding_lines(self) -> None:
+        hits = check_secrets.scan_text(
+            'let token = mint("ghp_0123456789abcdefghij123456");', "src/lib.rs"
+        )
+
+        self.assertEqual(hits, [("src/lib.rs", 1, "github_token")])
+
+
+class SecretGuardReleaseUrlTests(unittest.TestCase):
+    def test_opencoven_release_download_urls_do_not_trigger_high_entropy(self) -> None:
+        text = (
+            '            "https://github.com/OpenCoven/coven-code/releases/download'
+            '/v0.6.1/coven-code-macos-aarch64.tar.gz"'
+        )
+
+        hits = check_secrets.scan_text(text, "crates/coven-cli/src/engine_install.rs")
+
+        self.assertEqual(hits, [])
+
+    def test_non_opencoven_release_urls_still_trigger_high_entropy(self) -> None:
+        blob = "m9R3tQv7WzK2pL5nX8cF1gJ4sD6hY0aB" + "EuIqOwPz9RkTlVxCyNmS3HdG7fA"
+        text = f"https://github.com/NotOpenCoven/repo/releases/download/v1/{blob}"
+
+        hits = check_secrets.scan_text(text, "docs/example.md")
+
+        self.assertEqual(hits, [("docs/example.md", 1, "high_entropy")])
+
+    def test_overlong_release_artifact_segment_still_triggers_high_entropy(self) -> None:
+        blob = "m9R3tQv7WzK2pL5nX8cF1gJ4sD6hY0aB" * 3
+        text = f"https://github.com/OpenCoven/coven-code/releases/download/v1/{blob}"
+
+        hits = check_secrets.scan_text(text, "docs/example.md")
+
+        self.assertEqual(hits, [("docs/example.md", 1, "high_entropy")])
+
+
 if __name__ == "__main__":
     unittest.main()
