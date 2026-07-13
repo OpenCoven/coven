@@ -51,6 +51,8 @@ version.
     JSON-RPC 2.0 (verified via source: `crates/acp/src/connection.rs`); subcommand
     accepts no flags and produces no --help output — it is a fast-path in the CLI
     dispatcher
+11. `--effort {low|medium|high|max}` → extended-thinking budget; coven maps the
+    harness "think" capability to `--effort high`
 
 ## Environment
 

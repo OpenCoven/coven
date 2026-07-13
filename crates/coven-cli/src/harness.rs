@@ -1228,7 +1228,7 @@ fn continuity_args(
         return None;
     }
     match spec.id.as_str() {
-        "claude" | "coven-code" => {
+        id if id == "claude" || id == crate::engine::ENGINE_HARNESS_ID => {
             let flag = match hint {
                 ConversationHint::Init { .. } => "--session-id",
                 ConversationHint::Resume { .. } => "--resume",
