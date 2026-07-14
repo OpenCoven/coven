@@ -1702,6 +1702,9 @@ mod tests {
 
     #[test]
     fn command_parts_for_known_harnesses_append_interactive_prompt() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         assert_eq!(
             command_parts_for_harness("codex", "fix tests", HarnessLaunchMode::Interactive)?,
             (
@@ -1721,6 +1724,9 @@ mod tests {
 
     #[test]
     fn command_parts_for_known_harnesses_use_noninteractive_entrypoints() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         assert_eq!(
             command_parts_for_harness("codex", "fix tests", HarnessLaunchMode::NonInteractive)?,
             (
@@ -1751,6 +1757,9 @@ mod tests {
 
     #[test]
     fn dash_prefixed_prompts_stay_positional_behind_double_dash() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         // A prompt starting with `-` must never parse as harness flags.
         for mode in [
             HarnessLaunchMode::Interactive,
@@ -1809,6 +1818,9 @@ mod tests {
 
     #[test]
     fn command_parts_reject_unknown_harnesses() {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         assert!(
             command_parts_for_harness("shell", "hello", HarnessLaunchMode::Interactive)
                 .unwrap_err()
@@ -2039,6 +2051,9 @@ mod tests {
     /// `stream_args()` produced, now read from its declared `stream_args`.
     #[test]
     fn claude_stream_launch_args_unchanged_after_declaration() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let (program, args) = command_parts_for_harness_with_conversation(
             "claude",
             "hello",
@@ -2333,6 +2348,9 @@ mod tests {
 
     #[test]
     fn claude_init_hint_attaches_session_id_flag_in_print_mode() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let hint = ConversationHint::Init {
             id: "abc-123".to_string(),
         };
@@ -2362,6 +2380,9 @@ mod tests {
 
     #[test]
     fn claude_resume_hint_attaches_resume_flag_in_print_mode() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let hint = ConversationHint::Resume {
             id: "abc-123".to_string(),
         };
@@ -2462,6 +2483,9 @@ mod tests {
 
     #[test]
     fn interactive_mode_ignores_conversation_hint() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let hint = ConversationHint::Init {
             id: "abc-123".to_string(),
         };
@@ -2486,6 +2510,9 @@ mod tests {
     #[test]
     fn codex_init_hint_falls_through_to_default_args_so_codex_can_assign_its_own_id(
     ) -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let hint = ConversationHint::Init {
             id: "abc-123".to_string(),
         };
@@ -2516,6 +2543,9 @@ mod tests {
 
     #[test]
     fn codex_resume_hint_uses_exec_resume_subcommand_with_id() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let hint = ConversationHint::Resume {
             id: "019e5998-7130-7872-8d96-a6b67c5b6406".to_string(),
         };
@@ -2548,6 +2578,9 @@ mod tests {
 
     #[test]
     fn claude_stream_mode_preserves_permission_prompts_by_default() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let (program, args) = command_parts_for_harness_with_conversation(
             "claude",
             "hello",
@@ -2589,6 +2622,9 @@ mod tests {
 
     #[test]
     fn non_claude_harnesses_do_not_get_permission_bypass() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let (_, args) =
             command_parts_for_harness("codex", "fix tests", HarnessLaunchMode::NonInteractive)?;
         assert!(!args
@@ -2656,6 +2692,9 @@ mod tests {
 
     #[test]
     fn codex_forwards_model_before_prompt_with_prefix_stripped() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let (program, args) = command_parts_for_harness_with_conversation(
             "codex",
             "fix tests",
@@ -2725,6 +2764,9 @@ mod tests {
 
     #[test]
     fn claude_forwards_model_with_prefix_stripped() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let (_, args) = command_parts_for_harness_with_conversation(
             "claude",
             "hi",
@@ -2751,6 +2793,9 @@ mod tests {
 
     #[test]
     fn claude_think_maps_to_effort_high() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let (_, args) = command_parts_for_harness_with_conversation(
             "claude",
             "hi",
@@ -2777,6 +2822,9 @@ mod tests {
 
     #[test]
     fn claude_speed_maps_to_effort_levels() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let (_, fast_args) = command_parts_for_harness_with_conversation(
             "claude",
             "hi",
@@ -2807,6 +2855,9 @@ mod tests {
 
     #[test]
     fn codex_ignores_think_and_speed_launch_hints() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let with_hints = command_parts_for_harness_with_conversation(
             "codex",
             "fix tests",
@@ -2828,6 +2879,9 @@ mod tests {
 
     #[test]
     fn no_model_leaves_args_unchanged() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let with_model = command_parts_for_harness_with_conversation(
             "codex",
             "fix tests",
@@ -2937,6 +2991,9 @@ mod tests {
 
     #[test]
     fn codex_forwards_permission_before_prompt() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let (_, args) = command_parts_for_harness_with_conversation(
             "codex",
             "fix tests",
@@ -2961,6 +3018,9 @@ mod tests {
 
     #[test]
     fn claude_forwards_permission_full_maps_to_bypass() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let (_, args) = command_parts_for_harness_with_conversation(
             "claude",
             "hi",
@@ -2987,6 +3047,9 @@ mod tests {
 
     #[test]
     fn no_permission_leaves_args_unchanged() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let with_opt = command_parts_for_harness_with_conversation(
             "codex",
             "fix tests",
@@ -3109,6 +3172,9 @@ mod tests {
 
     #[test]
     fn none_hint_matches_legacy_command_parts() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let with_none = command_parts_for_harness_with_conversation(
             "claude",
             "hello",
