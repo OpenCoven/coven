@@ -231,7 +231,7 @@ Choose a repo, choose a harness, get a verified patch.
 | `coven chat`     | Explicitly open the interactive Coven UI                        |
 | `coven tui`      | Same as `coven chat`                                            |
 | `coven doctor`   | Detect supported harness CLIs and print install hints           |
-| `coven status`   | Ecosystem overview: daemon, sessions, familiars, skills, hub (alias: `coven overview`) |
+| `coven status`   | Ecosystem overview: daemon, sessions, familiars, skills, research, hub (alias: `coven overview`) |
 | `coven completions <shell>` | Generate shell completions (bash, zsh, fish, elvish, powershell) |
 
 ### Harness adapters
