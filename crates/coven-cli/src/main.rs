@@ -3890,6 +3890,7 @@ mod tests {
                 "/tui",
                 "/doctor",
                 "/daemon",
+                "/status",
                 "/run",
                 "/patch",
                 "/sessions",
@@ -3930,7 +3931,7 @@ mod tests {
 
     #[test]
     fn magical_tui_frame_surfaces_command_rail_and_snapshot_for_newcomers() {
-        let frame = render_magical_tui_frame_plain(5);
+        let frame = render_magical_tui_frame_plain(6);
 
         // Two-lane body: left command rail + right snapshot lane.
         assert!(frame.contains("Commands"));
@@ -4040,9 +4041,9 @@ mod tests {
     fn magical_tui_frame_windows_long_command_list_with_scroll_hint() {
         // Selection sits well past the visible window — scroll hint must
         // appear and the selected slash must still be in the rendered rail.
-        let frame = render_magical_tui_frame_plain(12); // /sacrifice
+        let frame = render_magical_tui_frame_plain(13); // /sacrifice
         assert!(frame.contains("/sacrifice"));
-        assert!(frame.contains("of 14"));
+        assert!(frame.contains("of 15"));
     }
 
     #[test]

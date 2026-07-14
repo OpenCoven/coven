@@ -7,6 +7,8 @@
 
 use anyhow::{anyhow, Result};
 
+pub(crate) use crate::observe::ObserveView;
+
 /// A first-party Coven harness Cast knows how to route to without asking.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CastHarness {
@@ -88,6 +90,12 @@ pub(crate) enum CastIntent {
     Quest {
         goal: String,
     },
+    /// Read-only observability view (`coven status`, `coven familiars`, …)
+    /// rendered inline in the Cast shell. Same read path as the CLI
+    /// commands — see `observe.rs`.
+    Observe {
+        view: ObserveView,
+    },
     Quit,
 }
 
@@ -158,6 +166,27 @@ fn parse_slash_command(input: &str) -> Result<Option<CastIntent>> {
             CastIntent::SacrificeSession { session_id }
         })?,
         "/quest" => parse_quest_slash(rest)?,
+        "/status" | "/overview" => CastIntent::Observe {
+            view: ObserveView::Status,
+        },
+        "/familiars" => CastIntent::Observe {
+            view: ObserveView::Familiars,
+        },
+        "/skills" => CastIntent::Observe {
+            view: ObserveView::Skills,
+        },
+        "/memory" => CastIntent::Observe {
+            view: ObserveView::Memory,
+        },
+        "/research" => CastIntent::Observe {
+            view: ObserveView::Research,
+        },
+        "/calls" => CastIntent::Observe {
+            view: ObserveView::Calls,
+        },
+        "/hub" => CastIntent::Observe {
+            view: ObserveView::HubStatus,
+        },
         "/quit" | "/exit" => CastIntent::Quit,
         unknown => {
             return Err(anyhow!(
@@ -174,8 +203,31 @@ fn parse_plain_command(input: &str) -> Option<CastIntent> {
             Some(CastIntent::OpenSessions)
         }
         "all sessions" | "show all sessions" => Some(CastIntent::OpenAllSessions),
-        "doctor" | "status" | "health" => Some(CastIntent::Doctor),
+        "doctor" | "health" => Some(CastIntent::Doctor),
         "daemon" | "daemon status" => Some(CastIntent::DaemonStatus),
+        // `status` means the ecosystem overview, matching `coven status`;
+        // setup checks stay on `doctor`/`health`.
+        "status" | "overview" => Some(CastIntent::Observe {
+            view: ObserveView::Status,
+        }),
+        "familiars" | "familiar" | "roster" => Some(CastIntent::Observe {
+            view: ObserveView::Familiars,
+        }),
+        "skills" | "skill" => Some(CastIntent::Observe {
+            view: ObserveView::Skills,
+        }),
+        "memory" => Some(CastIntent::Observe {
+            view: ObserveView::Memory,
+        }),
+        "research" => Some(CastIntent::Observe {
+            view: ObserveView::Research,
+        }),
+        "calls" | "coven calls" => Some(CastIntent::Observe {
+            view: ObserveView::Calls,
+        }),
+        "hub" | "hub status" => Some(CastIntent::Observe {
+            view: ObserveView::HubStatus,
+        }),
         "help" | "?" => Some(CastIntent::Help),
         "quit" | "exit" | "q" | "bye" => Some(CastIntent::Quit),
         "tui" | "menu" | "home" => Some(CastIntent::OpenTui),
@@ -454,6 +506,72 @@ mod tests {
     fn plain_keyword_doctor_runs_doctor() {
         assert_eq!(intent("doctor"), CastIntent::Doctor);
         assert_eq!(intent("DOCTOR"), CastIntent::Doctor);
+    }
+
+    #[test]
+    fn observe_slash_commands_mirror_cli_views() {
+        for (spell, view) in [
+            ("/status", ObserveView::Status),
+            ("/overview", ObserveView::Status),
+            ("/familiars", ObserveView::Familiars),
+            ("/skills", ObserveView::Skills),
+            ("/memory", ObserveView::Memory),
+            ("/research", ObserveView::Research),
+            ("/calls", ObserveView::Calls),
+            ("/hub", ObserveView::HubStatus),
+        ] {
+            assert_eq!(intent(spell), CastIntent::Observe { view }, "spell {spell}");
+        }
+    }
+
+    #[test]
+    fn plain_status_means_the_ecosystem_overview_not_doctor() {
+        // `coven status` is the ecosystem overview; the shell must agree.
+        // Setup checks remain reachable via `doctor` / `health`.
+        assert_eq!(
+            intent("status"),
+            CastIntent::Observe {
+                view: ObserveView::Status
+            }
+        );
+        assert_eq!(
+            intent("overview"),
+            CastIntent::Observe {
+                view: ObserveView::Status
+            }
+        );
+        assert_eq!(intent("health"), CastIntent::Doctor);
+    }
+
+    #[test]
+    fn plain_observe_keywords_route_to_views() {
+        for (spell, view) in [
+            ("familiars", ObserveView::Familiars),
+            ("roster", ObserveView::Familiars),
+            ("skills", ObserveView::Skills),
+            ("memory", ObserveView::Memory),
+            ("research", ObserveView::Research),
+            ("calls", ObserveView::Calls),
+            ("coven calls", ObserveView::Calls),
+            ("hub", ObserveView::HubStatus),
+            ("hub status", ObserveView::HubStatus),
+        ] {
+            assert_eq!(intent(spell), CastIntent::Observe { view }, "spell {spell}");
+        }
+    }
+
+    #[test]
+    fn observe_views_advertise_their_cli_commands() {
+        assert_eq!(ObserveView::Status.command(), "coven status");
+        assert_eq!(ObserveView::HubStatus.command(), "coven hub status");
+        // Multi-word prompts that merely start with an observe keyword stay
+        // natural spells — only exact keywords open views.
+        assert_eq!(
+            intent("memory leak in the daemon"),
+            CastIntent::NaturalSpell {
+                prompt: "memory leak in the daemon".to_string(),
+            }
+        );
     }
 
     #[test]

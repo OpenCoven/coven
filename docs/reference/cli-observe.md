@@ -112,3 +112,14 @@ $ coven familiars
 No familiars configured.
 Add [[familiar]] entries to ~/.coven/familiars.toml to build your roster.
 ```
+
+## In the interactive surfaces
+
+The same views are reachable without leaving the interactive surfaces: the
+Cast composer and the chat UI accept `/status` (alias `/overview`),
+`/familiars`, `/skills`, `/memory`, `/research`, `/calls`, and `/hub`, plus the
+bare words (`status`, `familiars`, `roster`, …). Every card shows the
+scriptable `coven <view>` spelling so the terminal form stays discoverable.
+`status` in a composer means this ecosystem overview; setup checks stay on
+`doctor`/`health`.
+

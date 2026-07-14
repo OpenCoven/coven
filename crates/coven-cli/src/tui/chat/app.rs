@@ -869,6 +869,24 @@ impl App {
                     "Quest planned for: {goal}. Cast will run each phase through this composer; start with the design phase prompt when ready."
                 ));
             }
+            CastIntent::Observe { view } => {
+                let home = self.coven_home.clone().unwrap_or_else(coven_home_dir);
+                match crate::observe::view_text(&home, view) {
+                    Ok(text) => {
+                        self.push_system_message(text.trim_end());
+                        self.push_system_message(&format!(
+                            "Scriptable form: `{}` (add --json for machines).",
+                            view.command()
+                        ));
+                    }
+                    Err(err) => {
+                        self.push_system_message(&format!(
+                            "Could not read that view: {err:#}. The same data is available via `{}`.",
+                            view.command()
+                        ));
+                    }
+                }
+            }
             CastIntent::Quit => return SlashCommandResult::Quit,
         }
         SlashCommandResult::Handled
