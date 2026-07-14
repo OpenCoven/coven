@@ -853,8 +853,13 @@ where
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
-                // Keep polling the child/deadline. Detached reader threads may
-                // have gone away immediately after their final event.
+                // All sender threads are gone (pipes closed, stdin written),
+                // but the child may still be running with its stdio closed.
+                // recv_timeout returns immediately on a disconnected channel,
+                // so sleep explicitly to keep the child/deadline polling at
+                // its normal cadence instead of busy-spinning until the
+                // activity timeout fires.
+                thread::sleep(remaining.min(CODEX_CHILD_POLL_INTERVAL));
             }
         }
     }
@@ -1891,11 +1896,13 @@ exec sleep 10
             stdin_prompt: None,
         };
 
+        // The activity budget must outlive shell startup so the script can
+        // record its pid before the runner kills the group; a 25ms budget
+        // loses that race deterministically on macOS (~180ms cold start).
         let started = Instant::now();
-        let outcome =
-            stream_codex_json_with_timeout(&command, Duration::from_millis(25), |_| Ok(()))?;
+        let outcome = stream_codex_json_with_timeout(&command, Duration::from_secs(1), |_| Ok(()))?;
 
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(5));
         assert!(outcome
             .error
             .as_deref()
