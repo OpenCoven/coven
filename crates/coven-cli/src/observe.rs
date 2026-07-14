@@ -1221,6 +1221,27 @@ mod tests {
             out.contains("No routing decisions recorded."),
             "unexpected routing render: {out}"
         );
+
+        // Assign the job so the routing table gains a row, then confirm the
+        // renderer surfaces the live envelope's route fields.
+        let assign = crate::api::handle_request_with_body(
+            "POST",
+            "/api/v1/hub/jobs/job-1/assign",
+            temp.path(),
+            None,
+            Some(r#"{"nodeId":"node_a"}"#),
+        )?;
+        anyhow::ensure!(assign.status == 200, "assign: {}", assign.body);
+
+        let routing = get_body(temp.path(), "/api/v1/hub/routing")?;
+        let out = render_hub_routing(&routing);
+        assert!(out.contains("job-1"), "routed jobId lost: {out}");
+        assert!(out.contains("node_a"), "routed nodeId lost: {out}");
+
+        let assigned = get_body(temp.path(), "/api/v1/hub/jobs?state=assigned")?;
+        let out = render_hub_jobs(&assigned);
+        assert!(out.contains("job-1"), "assigned job lost: {out}");
+        assert!(out.contains("node_a"), "assigned node lost: {out}");
         Ok(())
     }
 
