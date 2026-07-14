@@ -8,7 +8,7 @@
 > ```
 >
 > **`@opencoven/cli` v0.1.1** · managed engine **`coven-code` v0.7.0** (auto-installed, checksum-verified, on first run) · macOS + Linux (Windows in progress).
-
+>
 > Release notes for **`@opencoven/cli` v0.1.1**, which installs and pins the **Coven engine (`coven-code`) v0.7.0**. Covers the unification work (one `coven` CLI end to end).
 
 **One project. Any harness. Visible work — now behind a single command.**
