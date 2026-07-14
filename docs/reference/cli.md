@@ -4,7 +4,7 @@ read_when:
   - Looking up a Coven CLI flag
   - Scripting against the Coven CLI
 title: "Coven CLI reference"
-description: "Reference for the coven CLI commands: doctor, status, daemon, run, sessions, attach, archive, kill, summon, sacrifice, familiars, skills, hub, and TUI command flags."
+description: "Reference for the coven CLI commands: doctor, status, daemon, run, sessions, attach, archive, kill, summon, sacrifice, familiars, skills, memory, research, calls, hub, and TUI command flags."
 ---
 
 
