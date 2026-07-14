@@ -231,6 +231,8 @@ Choose a repo, choose a harness, get a verified patch.
 | `coven chat`     | Explicitly open the interactive Coven UI                        |
 | `coven tui`      | Same as `coven chat`                                            |
 | `coven doctor`   | Detect supported harness CLIs and print install hints           |
+| `coven status`   | Ecosystem overview: daemon, sessions, familiars, skills, hub (alias: `coven overview`) |
+| `coven completions <shell>` | Generate shell completions (bash, zsh, fish, elvish, powershell) |
 
 ### Harness adapters
 
@@ -275,13 +277,19 @@ Choose a repo, choose a harness, get a verified patch.
 | `coven sessions --plain`                       | Force plain table output for scripts or copying                  |
 | `coven sessions --json`                        | Output sessions as JSON                                          |
 | `coven sessions --json --all`                  | Output all sessions (including archived) as JSON                 |
+| `coven sessions search <query>`                | Full-text search recorded event payloads (`--json` for scripts)  |
+| `coven sessions show <session-id>`             | Show one session's record without attaching (`--json` for scripts) |
+| `coven sessions events <session-id>`           | List recorded events; `--after-seq`/`--limit` page the cursor    |
+| `coven sessions log <session-id>`              | Print a session's log lines without attaching                    |
 | `coven attach <session-id>`                    | Replay/follow session output and forward input                   |
 | `coven summon <session-id>`                    | Restore an archived session, then replay/follow it               |
 | `coven archive <session-id>`                   | Hide a non-running session while preserving its events           |
 | `coven sacrifice <session-id> --yes`           | Permanently delete a non-running session and its events          |
+| `coven kill <session-id>`                      | Kill a running session's process (its event log is kept)         |
 
-> `attach`, `summon`, `archive`, and `sacrifice` accept a unique prefix of the
-> session id (e.g. `coven attach 9099`), so you don't have to paste full UUIDs.
+> `attach`, `summon`, `archive`, `sacrifice`, `kill`, and the `sessions
+> show/events/log` subcommands accept a unique prefix of the session id
+> (e.g. `coven attach 9099`), so you don't have to paste full UUIDs.
 
 > **Session rituals are intentionally explicit.** Archive is reversible and keeps the full event ledger. Summon brings an archived session back. Sacrifice is destructive, refuses live sessions, and requires `--yes` so beginners don't delete work by accident.
 
@@ -306,6 +314,25 @@ Choose a repo, choose a harness, get a verified patch.
 
 > All read operations are side-effect-free. Write operations (kill, cache clear) require `--confirm` and cannot be bypassed. Termination is SIGTERM only — no SIGKILL.
 
+### Coven observability (Cave parity from the terminal)
+
+Everything the CovenCave dashboard reads is also visible from the CLI. All of
+these are read-only, work without a running daemon, and take `--json` for
+machine-readable output that carries the same body as the daemon API route.
+
+| Command                        | Action                                                    | API route              |
+| ------------------------------ | --------------------------------------------------------- | ---------------------- |
+| `coven status`                 | Daemon, sessions, familiars, skills, research, hub at a glance | `/health` + `/overview` |
+| `coven familiars`              | Familiar roster from `~/.coven/familiars.toml`            | `/familiars`           |
+| `coven skills`                 | Installed skills from `~/.coven/skills/`                  | `/skills`              |
+| `coven memory`                 | Familiar memory files from `~/.coven/memory/`             | `/memory`              |
+| `coven research`               | Research loop log from `~/.coven/research/results.tsv`    | `/research`            |
+| `coven calls [<id>]`           | Coven Calls delegation ledger (list or one call)          | `/coven-calls[/:id]`   |
+| `coven hub status`             | Hub role, node availability, queue depth                  | `/hub/status`          |
+| `coven hub nodes`              | Registered executor nodes                                 | `/hub/nodes`           |
+| `coven hub jobs [--state <s>]` | Hub jobs, optionally filtered by state                    | `/hub/jobs`            |
+| `coven hub routing`            | Job→node routing decisions                                | `/hub/routing`         |
+
 ### Parallel work protocol (worktrees, claims, hooks)
 
 | Command                     | Action                                                        |
@@ -315,6 +342,8 @@ Choose a repo, choose a harness, get a verified patch.
 | `coven wt --doctor`         | Report protocol layout and hook issues                        |
 | `coven wt --prune-merged`   | Remove clean worktrees whose branches are merged              |
 | `coven claim acquire <b>`   | Claim a branch for the current agent (TTL-bounded)            |
+| `coven claim release <b>`   | Release this agent's claim for a branch                       |
+| `coven claim heartbeat <b>` | Extend this agent's claim TTL for a branch                    |
 | `coven claim status`        | Show active and expired claims for this repository            |
 | `coven hooks install`       | Install the protocol's pre-commit and pre-push git hooks      |
 
@@ -324,6 +353,7 @@ Choose a repo, choose a harness, get a verified patch.
 | ---------------------- | ------------------------------------------------------- |
 | `coven patch openclaw` | Open the OpenClaw repair rescue loop                    |
 | `coven logs prune`     | Manually prune session logs and raw encrypted artifacts |
+| `coven vacuum`         | Repair and compact the local Coven session store        |
 
 ---
 
@@ -346,6 +376,16 @@ The daemon exposes a versioned HTTP API over a Unix socket. The current public c
 | `/api/v1/sessions/:id/log`               | `GET`  | Redacted log preview for a session                          |
 | `/api/v1/sessions/:id/input`             | `POST` | Forward input to a live session                             |
 | `/api/v1/sessions/:id/kill`              | `POST` | Kill a live session                                         |
+| `/api/v1/overview`                       | `GET`  | Ecosystem counts (sessions, familiars, skills, research)    |
+| `/api/v1/familiars`                      | `GET`  | Familiar roster (`coven familiars`)                         |
+| `/api/v1/skills`                         | `GET`  | Installed skills (`coven skills`)                           |
+| `/api/v1/memory`                         | `GET`  | Familiar memory files (`coven memory`)                      |
+| `/api/v1/research`                       | `GET`  | Research loop log (`coven research`)                        |
+| `/api/v1/coven-calls`                    | `GET`  | Coven Calls delegation ledger (`coven calls`)               |
+| `/api/v1/hub/status`                     | `GET`  | Hub role, node availability, queue depth (`coven hub status`) |
+| `/api/v1/hub/nodes`                      | `GET`  | Registered executor nodes (`coven hub nodes`)               |
+| `/api/v1/hub/jobs`                       | `GET`  | Hub jobs, `?state=` filter (`coven hub jobs`)               |
+| `/api/v1/hub/routing`                    | `GET`  | Job→node routing table (`coven hub routing`)                |
 | `/api/v1/actions`                        | `POST` | Route a control-plane action (advanced clients)             |
 | `/api/v1/travel/profiles`                | `POST` | Generate a read-only travel profile for offline laptop work |
 | `/api/v1/travel/deltas`                  | `POST` | Upload offline travel results for hub reconciliation        |
