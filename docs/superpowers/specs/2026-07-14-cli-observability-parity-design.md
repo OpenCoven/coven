@@ -66,9 +66,10 @@ Related UX findings:
 ### D1 — Render through the in-process API handler
 
 New CLI read commands call `api::handle_request_with_body` directly (the same
-router the daemon serves), then either print the body verbatim (`--json`) or
-parse it to render a human view. This makes `--json` byte-equal to the daemon
-API by construction, with one source of truth for shapes.
+router the daemon serves), then either print the body (`--json`,
+pretty-printed) or parse it to render a human view. This makes `--json`
+value-equal to the daemon API by construction, with one source of truth for
+shapes.
 
 - *Alternative considered:* calling `cockpit_sources`/`hub` functions directly —
   rejected: CLI and API shapes drift independently.
