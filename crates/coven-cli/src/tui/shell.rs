@@ -1890,20 +1890,13 @@ fn run_tui_help() -> Result<()> {
     Ok(())
 }
 
-/// Render a read-only observability view inline. Same read path as the
-/// matching `coven <view>` command (see `observe.rs`), so the shell and
-/// the CLI can never disagree.
+/// Render a read-only observability view inline. Same single render path
+/// as the matching `coven <view>` command (`observe::view_text`), so the
+/// shell and the CLI can never disagree.
 fn run_observe_view(view: cast::ObserveView) -> Result<()> {
-    use cast::ObserveView;
-    match view {
-        ObserveView::Status => crate::observe::run_status(false),
-        ObserveView::Familiars => crate::observe::run_familiars(false),
-        ObserveView::Skills => crate::observe::run_skills(false),
-        ObserveView::Memory => crate::observe::run_memory(false),
-        ObserveView::Research => crate::observe::run_research(false),
-        ObserveView::Calls => crate::observe::run_calls(None, false),
-        ObserveView::HubStatus => crate::observe::run_hub_status(false),
-    }
+    let coven_home = crate::coven_home_dir()?;
+    print!("{}", crate::observe::view_text(&coven_home, view)?);
+    Ok(())
 }
 
 fn run_new_user_start_here() -> Result<()> {
