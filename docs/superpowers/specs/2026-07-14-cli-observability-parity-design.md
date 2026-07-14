@@ -127,8 +127,7 @@ Naming notes (devil's advocate round):
 
 `overview_response` computes from the same sources the sibling routes use:
 
-- `total_familiars` = familiars list length; `active_familiars` = entries whose
-  `status` is `active`.
+- `total_familiars` = familiars list length; `active_familiars` = distinct roster familiars referenced by an open session (`running`/`active`).
 - `skills_count` = skills list length; `average_skill_score` = rounded mean of
   skill scores (0 when empty — scores are stubbed at 0.0 today, so this stays 0
   until scoring lands, which is honest).
