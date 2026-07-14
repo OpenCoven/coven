@@ -55,7 +55,6 @@ const DEFAULT_TITLE_CHARS: usize = 48;
 
 #[derive(Parser, Debug)]
 #[command(name = "coven")]
-#[command(version = env!("COVEN_VERSION_DESC"))]
 #[command(about = "Run project-scoped coding agents without memorizing harness commands")]
 #[command(
     long_about = "Coven runs Codex, Claude Code, and future harnesses inside a local, project-scoped session ledger. Run `coven` with no arguments to open the interactive Coven UI (requires the coven-code front-end), or pass a free-text task to plan and run it directly."
@@ -501,7 +500,35 @@ enum InteractiveShellRoute {
     PlainCast,
 }
 
+/// Compose the `coven --version` line. Pure: takes the resolved installed
+/// engine version (None = not installed) so it's unit-testable.
+fn version_line(coven_desc: &str, installed_engine: Option<&str>, pinned: &str) -> String {
+    match installed_engine {
+        Some(v) => format!("coven {coven_desc} (engine coven-code {v}, pinned {pinned})"),
+        None => format!("coven {coven_desc} (engine not installed, pinned {pinned})"),
+    }
+}
+
 fn main() -> Result<()> {
+    // Raw-args intercept: if the sole top-level argument is --version or -V,
+    // print the composed version line (coven version + installed/pinned engine)
+    // and exit immediately. This must precede Cli::parse() because clap's
+    // compile-time version attribute can't include the runtime engine version.
+    // We only intercept when --version/-V is the SOLE argument so that
+    // passthrough commands like `coven code --version` reach the engine.
+    {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        if args.len() == 1 && (args[0] == "--version" || args[0] == "-V") {
+            let coven_desc = env!("COVEN_VERSION_DESC");
+            let installed = engine::resolve()
+                .and_then(|r| engine::engine_version(&r.path).ok())
+                .map(|(a, b, c)| format!("{a}.{b}.{c}"));
+            let pinned = engine::pinned_version();
+            println!("{}", version_line(coven_desc, installed.as_deref(), pinned));
+            std::process::exit(0);
+        }
+    }
+
     let loaded =
         settings::user_settings_path().as_deref().and_then(|path| {
             match settings::load_from(path) {
@@ -4653,5 +4680,23 @@ mod tests {
         let codex_line = &lines[1];
         assert!(codex_line.contains("[--]"), "got: {codex_line}");
         assert!(codex_line.contains("not installed"), "got: {codex_line}");
+    }
+
+    #[test]
+    fn version_line_with_installed_engine() {
+        let line = version_line("0.7.0-3-gabc123", Some("0.6.1"), "0.6.1");
+        assert_eq!(
+            line,
+            "coven 0.7.0-3-gabc123 (engine coven-code 0.6.1, pinned 0.6.1)"
+        );
+    }
+
+    #[test]
+    fn version_line_engine_not_installed() {
+        let line = version_line("0.7.0-3-gabc123", None, "0.6.1");
+        assert_eq!(
+            line,
+            "coven 0.7.0-3-gabc123 (engine not installed, pinned 0.6.1)"
+        );
     }
 }
