@@ -334,7 +334,7 @@ enum Command {
         command: Option<pc::PcCommand>,
     },
     #[command(
-        about = "Show what's happening across your coven: daemon, sessions, familiars, skills, hub",
+        about = "Show what's happening across your coven: daemon, sessions, familiars, skills, research, hub",
         alias = "overview"
     )]
     Status {
