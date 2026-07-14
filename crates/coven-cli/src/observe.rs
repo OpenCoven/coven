@@ -700,8 +700,8 @@ fn render_session_detail(body: &Value) -> String {
 
 pub(crate) fn run_session_events(
     reference: &str,
-    after_seq: Option<i64>,
-    limit: Option<i64>,
+    after_seq: Option<u64>,
+    limit: Option<u64>,
     json: bool,
 ) -> Result<()> {
     let coven_home = coven_home_dir()?;
