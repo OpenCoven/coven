@@ -121,6 +121,12 @@ pub struct HarnessLaunchOptions<'a> {
     /// sandbox flag when the spec declares one. `Option<Permission>` stays
     /// `Copy` because `Permission` is `Copy`.
     pub permission: Option<Permission>,
+    /// Additional directories the harness should trust beyond its cwd
+    /// (`coven run --add-dir <DIR>`, repeatable). Each entry forwards as
+    /// `[add_dir_flag, <dir>]` when the spec declares an add-dir mechanism;
+    /// harnesses that declare none make the flag a warned no-op. Blank
+    /// entries are skipped. A shared slice keeps the struct `Copy`.
+    pub add_dirs: &'a [String],
 }
 
 impl<'a> HarnessLaunchOptions<'a> {
@@ -243,6 +249,14 @@ pub struct HarnessCommandSpec {
     /// means the harness declares no sandbox mechanism, so `--permission` is a
     /// warned no-op for it (mirrors `model_flag`).
     pub sandbox: Option<SandboxMapping>,
+    /// CLI flag name that grants the harness access to an additional directory
+    /// beyond its cwd (e.g. `Some("--add-dir")` for Codex, Claude, and the
+    /// engine). When set, each `coven run --add-dir <DIR>` repeats as
+    /// `[flag, <dir>]` ahead of the prompt so granted project roots are real
+    /// grants, not advisory prompt text. `None` means the harness declares no
+    /// such mechanism, so `--add-dir` is a warned no-op for it (mirrors
+    /// `model_flag`).
+    pub add_dir_flag: Option<String>,
     /// Behavioral capabilities (stream mode, session pre-assignment, think,
     /// speed). Shared type with the coven-runtimes manifest spec so built-in
     /// harnesses and external adapters declare what they can do through the
@@ -342,6 +356,28 @@ impl HarnessCommandSpec {
             Some(mapping) => mapping.args(permission.to_spec()),
             None => Vec::new(),
         }
+    }
+
+    /// Whether this harness declares a native way to trust additional
+    /// directories. Adapters that declare none make `coven run --add-dir` a
+    /// warned no-op.
+    pub fn supports_add_dir(&self) -> bool {
+        self.add_dir_flag.is_some()
+    }
+
+    /// Translate requested additional directories into argv tokens for this
+    /// harness: one `[flag, <dir>]` pair per non-blank entry. Returns an empty
+    /// vec when the harness declares no add-dir mechanism (caller decides
+    /// whether to warn).
+    pub fn add_dir_args(&self, dirs: &[String]) -> Vec<String> {
+        let Some(flag) = self.add_dir_flag.as_deref() else {
+            return Vec::new();
+        };
+        dirs.iter()
+            .map(|dir| dir.trim())
+            .filter(|dir| !dir.is_empty())
+            .flat_map(|dir| [flag.to_string(), dir.to_string()])
+            .collect()
     }
 }
 
@@ -475,6 +511,10 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
                 full: "danger-full-access".to_string(),
                 read_only: "read-only".to_string(),
             }),
+            // `codex exec --add-dir <DIR>` (repeatable): additional writable
+            // directories alongside the workspace. Verified against the
+            // installed codex CLI.
+            add_dir_flag: Some("--add-dir".to_string()),
             // One-shot `codex exec` only: no stream-json mode, no session
             // pre-assignment (ids are captured from the first turn's output),
             // no think/speed toggles.
@@ -513,6 +553,10 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
                 full: "bypassPermissions".to_string(),
                 read_only: "plan".to_string(),
             }),
+            // `claude --add-dir <directories...>` (repeatable): additional
+            // directories tools may access. Verified against the installed
+            // claude CLI.
+            add_dir_flag: Some("--add-dir".to_string()),
             // Long-lived stream-json mode, `--session-id`/`--resume`
             // pre-assignment, and think/speed via `--effort`. These declared
             // values replace the former `harness_id == "claude"` checks.
@@ -564,6 +608,9 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
                 full: "bypass-permissions".to_string(),
                 read_only: "plan".to_string(),
             }),
+            // `coven-code --add-dir <DIR>` (repeatable), mirroring Claude
+            // Code's flag. Verified against the installed engine binary.
+            add_dir_flag: Some("--add-dir".to_string()),
             capabilities: Capabilities {
                 stream: true,
                 preassigned_session_id: true,
@@ -845,6 +892,10 @@ struct ExternalHarnessAdapterSpec {
     /// Omit and `coven run --permission` stays a warned no-op.
     #[serde(default)]
     sandbox: Option<SandboxMapping>,
+    /// CLI flag that trusts an additional directory (repeated per dir).
+    /// Omit and `coven run --add-dir` stays a warned no-op.
+    #[serde(default, alias = "addDirFlag")]
+    add_dir_flag: Option<String>,
     /// Stream-json launch args. Required when `capabilities.stream`.
     #[serde(default, alias = "streamArgs")]
     stream_args: Option<StreamArgs>,
@@ -1008,6 +1059,10 @@ impl ExternalHarnessAdapterSpec {
                 .map(|tmpl| tmpl.trim().to_string())
                 .filter(|tmpl| !tmpl.is_empty()),
             sandbox: self.sandbox,
+            add_dir_flag: self
+                .add_dir_flag
+                .map(|flag| flag.trim().to_string())
+                .filter(|flag| !flag.is_empty()),
             capabilities: self.capabilities,
             stream_args: self.stream_args,
             continuity_args: self.continuity_args,
@@ -1157,6 +1212,10 @@ fn command_parts_for_harness_with_conversation_inner(
         Some(p) => spec.sandbox_args(p),
         None => Vec::new(),
     };
+    // Additional trusted directories forward as repeated native add-dir flags
+    // ahead of the prompt positional, mirroring model selection. Harnesses
+    // that declare no add-dir mechanism yield no args (the run layer warns).
+    let add_dir_args: Vec<String> = spec.add_dir_args(options.add_dirs);
     let launch_option_args = launch_option_args(harness_id, options);
 
     // Resolve effective prompt: inject familiar identity preamble when present.
@@ -1187,6 +1246,7 @@ fn command_parts_for_harness_with_conversation_inner(
                     sanitize_argv_for_platform(prepend_launch_args(
                         &model_args,
                         &sandbox_args,
+                        &add_dir_args,
                         &launch_option_args,
                         args,
                     )),
@@ -1205,6 +1265,7 @@ fn command_parts_for_harness_with_conversation_inner(
                 sanitize_argv_for_platform(prepend_launch_args(
                     &model_args,
                     &sandbox_args,
+                    &add_dir_args,
                     &launch_option_args,
                     args,
                 )),
@@ -1225,6 +1286,7 @@ fn command_parts_for_harness_with_conversation_inner(
             let args = sanitize_argv_for_platform(prepend_launch_args(
                 &model_args,
                 &sandbox_args,
+                &add_dir_args,
                 &launch_option_args,
                 // `--` before the prompt for the same reason as `prompt_args`:
                 // user data must not parse as harness flags.
@@ -1253,6 +1315,7 @@ fn command_parts_for_harness_with_conversation_inner(
             sanitize_argv_for_platform(prepend_launch_args(
                 &model_args,
                 &sandbox_args,
+                &add_dir_args,
                 &launch_option_args,
                 args,
             )),
@@ -1295,16 +1358,23 @@ fn launch_option_args(harness_id: &str, options: HarnessLaunchOptions<'_>) -> Ve
 fn prepend_launch_args(
     model_args: &[String],
     sandbox_args: &[String],
+    add_dir_args: &[String],
     option_args: &[String],
     args: Vec<String>,
 ) -> Vec<String> {
-    if model_args.is_empty() && sandbox_args.is_empty() && option_args.is_empty() {
+    if model_args.is_empty()
+        && sandbox_args.is_empty()
+        && add_dir_args.is_empty()
+        && option_args.is_empty()
+    {
         return args;
     }
-    let mut out =
-        Vec::with_capacity(model_args.len() + sandbox_args.len() + option_args.len() + args.len());
+    let mut out = Vec::with_capacity(
+        model_args.len() + sandbox_args.len() + add_dir_args.len() + option_args.len() + args.len(),
+    );
     out.extend_from_slice(model_args);
     out.extend_from_slice(sandbox_args);
+    out.extend_from_slice(add_dir_args);
     out.extend_from_slice(option_args);
     out.extend(args);
     out
@@ -1899,6 +1969,7 @@ mod tests {
             model_flag: None,
             model_arg_template: None,
             sandbox: None,
+            add_dir_flag: None,
             capabilities: Capabilities::BASELINE,
             stream_args: None,
             continuity_args: None,
@@ -2104,6 +2175,58 @@ mod tests {
             copi.sandbox_args(Permission::ReadOnly),
             vec!["--deny-tool".to_string(), "write".to_string()]
         );
+        Ok(())
+    }
+
+    /// A manifest adapter can declare its native add-dir trust flag (either
+    /// key casing); omitting it keeps `--add-dir` a warned no-op.
+    #[test]
+    fn manifest_add_dir_flag_maps_repeatable_dirs() -> anyhow::Result<()> {
+        let raw = r#"{
+          "adapters": [
+            {
+              "id": "copi",
+              "label": "Copi",
+              "executable": "copi",
+              "interactive_prompt_prefix_args": ["-i"],
+              "non_interactive_prompt_prefix_args": ["-s", "-p"],
+              "install_hint": "Install copi.",
+              "addDirFlag": "--allow-dir"
+            }
+          ]
+        }"#;
+        let specs =
+            parse_external_harness_specs(raw, Path::new("copi.json"), &built_in_harness_specs())?;
+        let copi = &specs[0];
+        assert!(copi.supports_add_dir());
+        assert_eq!(
+            copi.add_dir_args(&["/tmp/a".to_string(), "/tmp/b".to_string()]),
+            vec![
+                "--allow-dir".to_string(),
+                "/tmp/a".to_string(),
+                "--allow-dir".to_string(),
+                "/tmp/b".to_string(),
+            ]
+        );
+
+        let without = r#"{
+          "adapters": [
+            {
+              "id": "plain",
+              "label": "Plain",
+              "executable": "plain",
+              "interactive_prompt_prefix_args": [],
+              "non_interactive_prompt_prefix_args": ["run"],
+              "install_hint": "Install plain."
+            }
+          ]
+        }"#;
+        let specs = parse_external_harness_specs(
+            without,
+            Path::new("plain.json"),
+            &built_in_harness_specs(),
+        )?;
+        assert!(!specs[0].supports_add_dir());
         Ok(())
     }
 
@@ -3298,6 +3421,7 @@ mod tests {
             model_flag: None,
             model_arg_template: None,
             sandbox: None,
+            add_dir_flag: None,
             capabilities: Capabilities::BASELINE,
             stream_args: None,
             continuity_args: None,
@@ -3305,6 +3429,172 @@ mod tests {
         assert!(!spec.supports_permission());
         assert!(spec.sandbox_args(Permission::Full).is_empty());
         assert!(spec.sandbox_args(Permission::ReadOnly).is_empty());
+    }
+
+    #[test]
+    fn spec_without_add_dir_mechanism_is_an_add_dir_noop() {
+        let spec = HarnessCommandSpec {
+            id: "future".to_string(),
+            label: "Future Harness".to_string(),
+            executable: "future".to_string(),
+            interactive_prompt_prefix_args: Vec::new(),
+            non_interactive_prompt_prefix_args: vec!["run".to_string()],
+            install_hint: "Install the future harness.".to_string(),
+            source: "manifest".to_string(),
+            manifest_path: None,
+            system_prompt_flag: None,
+            model_flag: None,
+            model_arg_template: None,
+            sandbox: None,
+            add_dir_flag: None,
+            capabilities: Capabilities::BASELINE,
+            stream_args: None,
+            continuity_args: None,
+        };
+        assert!(!spec.supports_add_dir());
+        assert!(spec.add_dir_args(&["/tmp/other".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn codex_forwards_add_dirs_before_prompt() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
+        let add_dirs = vec!["/tmp/roots/a".to_string(), "/tmp/roots/b".to_string()];
+        let (_, args) = command_parts_for_harness_with_conversation(
+            "codex",
+            "fix tests",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            None,
+            HarnessLaunchOptions {
+                add_dirs: &add_dirs,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(
+            args,
+            vec![
+                "--add-dir".to_string(),
+                "/tmp/roots/a".to_string(),
+                "--add-dir".to_string(),
+                "/tmp/roots/b".to_string(),
+                "exec".to_string(),
+                "--skip-git-repo-check".to_string(),
+                "--color".to_string(),
+                "never".to_string(),
+                "--".to_string(),
+                "fix tests".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn claude_stream_mode_forwards_add_dirs() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
+        // Blank entries are skipped; real dirs forward as repeated
+        // `--add-dir <DIR>` pairs ahead of the declared stream args,
+        // matching the non-stream path (`HarnessCommandSpec::add_dir_args`).
+        let add_dirs = vec!["/tmp/roots/a".to_string(), "  ".to_string()];
+        let (_, args) = command_parts_for_harness_with_conversation(
+            "claude",
+            "hello prompt",
+            HarnessLaunchMode::Stream,
+            Some(&ConversationHint::Init {
+                id: "session-123".to_string(),
+            }),
+            None,
+            HarnessLaunchOptions {
+                add_dirs: &add_dirs,
+                ..Default::default()
+            },
+        )?;
+        let position = args
+            .iter()
+            .position(|arg| arg == "--add-dir")
+            .expect("stream args must carry --add-dir");
+        assert_eq!(args[position + 1], "/tmp/roots/a");
+        assert_eq!(
+            args.iter().filter(|arg| *arg == "--add-dir").count(),
+            1,
+            "blank add-dir entries are skipped: {args:?}"
+        );
+        assert!(
+            args.iter().any(|arg| arg == "--session-id"),
+            "stream init args expected: {args:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn claude_forwards_add_dirs_after_permission() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
+        let add_dirs = vec!["/tmp/roots/a".to_string()];
+        let (_, args) = command_parts_for_harness_with_conversation(
+            "claude",
+            "hi",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            None,
+            HarnessLaunchOptions {
+                permission: Some(Permission::ReadOnly),
+                add_dirs: &add_dirs,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(
+            args,
+            vec![
+                "--permission-mode".to_string(),
+                "plan".to_string(),
+                "--add-dir".to_string(),
+                "/tmp/roots/a".to_string(),
+                "--print".to_string(),
+                "--".to_string(),
+                "hi".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn blank_add_dirs_leave_args_unchanged() -> anyhow::Result<()> {
+        let blank = vec!["   ".to_string(), String::new()];
+        let with_blank_dirs = command_parts_for_harness_with_conversation(
+            "codex",
+            "fix tests",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            None,
+            HarnessLaunchOptions {
+                add_dirs: &blank,
+                ..Default::default()
+            },
+        )?;
+        let legacy =
+            command_parts_for_harness("codex", "fix tests", HarnessLaunchMode::NonInteractive)?;
+        assert_eq!(with_blank_dirs, legacy, "blank add-dirs are a no-op");
+        Ok(())
+    }
+
+    #[test]
+    fn built_in_harnesses_declare_add_dir_flag() {
+        // Cave forwards granted project roots via repeatable `--add-dir`;
+        // every built-in harness CLI supports the flag natively (verified
+        // against codex, claude, and the coven-code engine binaries).
+        for spec in built_in_harness_specs() {
+            assert_eq!(
+                spec.add_dir_flag.as_deref(),
+                Some("--add-dir"),
+                "built-in `{}` must declare an add-dir mechanism",
+                spec.id
+            );
+        }
     }
 
     #[test]
