@@ -236,17 +236,7 @@ pub fn clear_eval_loop_lock(coven_home: &Path, familiar_id: &str, force: bool) -
 // ── Private helpers ───────────────────────────────────────────────────────────
 
 fn familiar_workspace(coven_home: &Path, familiar_id: &str) -> PathBuf {
-    // Prefer the explicit `workspace` path declared in familiars.toml when present.
-    // Falls back to the conventional `~/.coven/familiars/<id>/` path.
-    crate::cockpit_sources::read_familiars(coven_home)
-        .ok()
-        .and_then(|familiars| {
-            familiars
-                .into_iter()
-                .find(|f| f.id == familiar_id)
-                .and_then(|f| f.workspace)
-        })
-        .unwrap_or_else(|| coven_home.join("familiars").join(familiar_id))
+    crate::cockpit_sources::familiar_workspace(coven_home, familiar_id)
 }
 
 fn eval_loop_lock(workspace: &Path) -> EvalLoopLockDto {

@@ -42,7 +42,8 @@ mod theme;
 mod tui;
 mod verification;
 // Ward identity-layer enforcement (Gates 1-2). Not yet wired into the API
-// router or control plane; see ward.rs for the follow-up gates/endpoints.
+// Wired into the daemon router via `POST /familiars/{id}/edits` (api.rs);
+// Gate 3 (coherence review) remains a follow-up — see ward.rs.
 #[allow(dead_code)]
 mod ward;
 
