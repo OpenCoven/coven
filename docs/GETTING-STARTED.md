@@ -151,6 +151,21 @@ coven sessions --json
 coven sessions --json --all
 ```
 
+To inspect one session without attaching (unique id prefixes work):
+
+```sh
+coven sessions show <session-id>
+coven sessions events <session-id> --limit 100
+coven sessions log <session-id>
+```
+
+To see the whole coven at a glance — daemon, open sessions, familiars,
+skills, and hub — run:
+
+```sh
+coven status
+```
+
 ## Attach, archive, summon, and sacrifice
 
 Lower-level session verbs remain available:

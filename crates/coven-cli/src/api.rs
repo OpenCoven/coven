@@ -1,4 +1,4 @@
-use std::{borrow::Cow, io::Write, path::Path};
+use std::{borrow::Cow, collections::HashSet, io::Write, path::Path};
 
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -1944,20 +1944,47 @@ struct OverviewDto {
 fn overview_response(coven_home: &Path) -> Result<ApiResponse> {
     let conn = store::open_store(&store_path(coven_home))?;
     let sessions = store::list_sessions(&conn)?;
-    let open_sessions = sessions
+    let open: Vec<&store::SessionRecord> = sessions
         .iter()
         .filter(|s| s.status == "running" || s.status == "active")
-        .count() as u32;
+        .collect();
+    let open_sessions = open.len() as u32;
+
+    // Dashboard semantics: a partial overview beats a 500, so unreadable
+    // side sources degrade to empty. The leaf routes (/familiars, /skills,
+    // /research) still report their own read errors loudly.
+    let familiars = crate::cockpit_sources::read_familiars(coven_home).unwrap_or_default();
+    let skills = crate::cockpit_sources::scan_skills(coven_home).unwrap_or_default();
+    let research = crate::cockpit_sources::read_research(coven_home).unwrap_or_default();
+
+    let roster: HashSet<&str> = familiars.iter().map(|f| f.id.as_str()).collect();
+    let active_familiars = open
+        .iter()
+        .filter_map(|s| s.familiar_id.as_deref())
+        .filter(|id| roster.contains(id))
+        .collect::<HashSet<_>>()
+        .len() as u32;
+
+    let average_skill_score = if skills.is_empty() {
+        0
+    } else {
+        let sum: f64 = skills.iter().map(|s| s.score).sum();
+        (sum / skills.len() as f64).round() as u32
+    };
+
     json_response(
         200,
         &OverviewDto {
-            active_familiars: 0,
-            total_familiars: 0,
+            active_familiars,
+            total_familiars: familiars.len() as u32,
             open_sessions,
-            skills_count: 0,
-            average_skill_score: 0,
-            research_iterations: 0,
-            last_research_delta: 0,
+            skills_count: skills.len() as u32,
+            average_skill_score,
+            research_iterations: research.len() as u32,
+            last_research_delta: research
+                .last()
+                .map(|row| row.delta.round() as i32)
+                .unwrap_or(0),
         },
     )
 }
@@ -5330,6 +5357,93 @@ mod tests {
         assert_eq!(body["open_sessions"], 2);
         assert_eq!(body["active_familiars"], 0);
         assert_eq!(body["skills_count"], 0);
+        Ok(())
+    }
+
+    #[test]
+    fn get_overview_counts_familiars_skills_and_research_from_local_sources() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+
+        std::fs::write(
+            home.join("familiars.toml"),
+            r#"
+[[familiar]]
+id = "charm"
+display_name = "Charm"
+role = "steward"
+description = "keeps the hearth"
+
+[[familiar]]
+id = "sage"
+display_name = "Sage"
+role = "researcher"
+description = "digs deep"
+"#,
+        )?;
+
+        for skill in ["eval-loop", "stream-scribe"] {
+            let dir = home.join("skills").join(skill);
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(
+                dir.join("metadata.json"),
+                format!(r#"{{"name":"{skill}","description":"a skill","version":"1.0.0"}}"#),
+            )?;
+        }
+
+        let research_dir = home.join("research");
+        std::fs::create_dir_all(&research_dir)?;
+        std::fs::write(
+            research_dir.join("results.tsv"),
+            "1\tharness capabilities\t7.5\t1.5\tcontinue\tnotes.md\n\
+             2\tstream continuity\t9.0\t2.0\tadopt\tnotes.md\n",
+        )?;
+
+        let conn = store::open_store(&store_path(home))?;
+        let now = "2026-01-01T00:00:00Z";
+        for (id, status, familiar) in [
+            ("s1", "running", Some("charm")),
+            ("s2", "running", Some("charm")),
+            ("s3", "running", Some("ghost-not-in-roster")),
+            ("s4", "ended", Some("sage")),
+        ] {
+            store::insert_session(
+                &conn,
+                &store::SessionRecord {
+                    id: id.into(),
+                    project_root: "/tmp".into(),
+                    harness: "claude".into(),
+                    title: "t".into(),
+                    status: status.into(),
+                    exit_code: None,
+                    archived_at: None,
+                    created_at: now.into(),
+                    updated_at: now.into(),
+                    conversation_id: None,
+                    familiar_id: familiar.map(str::to_string),
+                    labels: Vec::new(),
+                    visibility: "private".to_string(),
+                    external: false,
+                    transcript_path: None,
+                },
+            )?;
+        }
+        drop(conn);
+
+        let response = handle_request("GET", "/api/v1/overview", home, None)?;
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["open_sessions"], 3);
+        assert_eq!(body["total_familiars"], 2);
+        // Only roster familiars with an open session count as active: charm
+        // (running twice, deduped); sage's session ended; the ghost id is not
+        // in the roster.
+        assert_eq!(body["active_familiars"], 1);
+        assert_eq!(body["skills_count"], 2);
+        // Skill scores are stubbed at 0.0 until scoring lands.
+        assert_eq!(body["average_skill_score"], 0);
+        assert_eq!(body["research_iterations"], 2);
+        assert_eq!(body["last_research_delta"], 2);
         Ok(())
     }
 

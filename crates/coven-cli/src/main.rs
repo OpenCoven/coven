@@ -26,6 +26,7 @@ mod executor_node;
 mod familiar_identity;
 mod harness;
 mod hub;
+mod observe;
 mod openclaw_repo;
 mod parallel_protocol;
 mod patch;
@@ -60,6 +61,11 @@ const DEFAULT_TITLE_CHARS: usize = 48;
 #[command(
     long_about = "Coven runs Codex, Claude Code, and future harnesses inside a local, project-scoped session ledger. Run `coven` with no arguments to open the interactive Coven UI (requires the coven-code front-end), or pass a free-text task to plan and run it directly."
 )]
+#[command(after_help = "Common first steps:
+  coven doctor                    check your local setup and harnesses
+  coven run codex \"<task>\"        run a task in a recorded session
+  coven sessions                  browse recorded sessions
+  coven status                    see daemon, sessions, familiars, and hub at a glance")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -335,6 +341,49 @@ enum Command {
         command: Option<pc::PcCommand>,
     },
     #[command(
+        about = "Show what's happening across your coven: daemon, sessions, familiars, skills, research, hub",
+        alias = "overview"
+    )]
+    Status {
+        #[arg(long, help = "Print status as JSON (machine-readable)")]
+        json: bool,
+    },
+    #[command(
+        about = "List the familiar roster from ~/.coven/familiars.toml",
+        alias = "familiar"
+    )]
+    Familiars {
+        #[arg(long, help = "Print familiars as JSON (machine-readable)")]
+        json: bool,
+    },
+    #[command(about = "List installed skills from ~/.coven/skills/", alias = "skill")]
+    Skills {
+        #[arg(long, help = "Print skills as JSON (machine-readable)")]
+        json: bool,
+    },
+    #[command(about = "List familiar memory files from ~/.coven/memory/")]
+    Memory {
+        #[arg(long, help = "Print memory files as JSON (machine-readable)")]
+        json: bool,
+    },
+    #[command(about = "Show the research loop log from ~/.coven/research/")]
+    Research {
+        #[arg(long, help = "Print research rows as JSON (machine-readable)")]
+        json: bool,
+    },
+    #[command(about = "Show the Coven Calls delegation ledger", alias = "call")]
+    Calls {
+        #[arg(help = "Call id for a detail view (omit to list all calls)")]
+        id: Option<String>,
+        #[arg(long, help = "Print calls as JSON (machine-readable)")]
+        json: bool,
+    },
+    #[command(about = "Inspect the multi-host hub control plane (read-only)")]
+    Hub {
+        #[command(subcommand)]
+        command: HubCommand,
+    },
+    #[command(
         about = "Manage model provider credentials (Anthropic, Codex) — runs in the Coven engine"
     )]
     Auth {
@@ -367,6 +416,66 @@ enum SessionsCommand {
         #[arg(help = "Full-text query (FTS5 syntax, e.g. `phoenix OR rises`)")]
         query: String,
         #[arg(long, help = "Print search hits as JSON (machine-readable)")]
+        json: bool,
+    },
+    #[command(about = "Show one session's record (metadata, status, ritual state)")]
+    Show {
+        #[arg(help = "Session id, or a unique prefix of one (list ids with `coven sessions`)")]
+        session_id: String,
+        #[arg(long, help = "Print the session record as JSON (machine-readable)")]
+        json: bool,
+    },
+    #[command(about = "List a session's recorded events (redacted payloads)")]
+    Events {
+        #[arg(help = "Session id, or a unique prefix of one (list ids with `coven sessions`)")]
+        session_id: String,
+        #[arg(
+            long,
+            value_name = "SEQ",
+            help = "Only return events after this sequence cursor"
+        )]
+        after_seq: Option<u64>,
+        #[arg(long, value_name = "N", help = "Return at most N events")]
+        limit: Option<u64>,
+        #[arg(long, help = "Print the event envelope as JSON (machine-readable)")]
+        json: bool,
+    },
+    #[command(about = "Print a session's log lines without attaching")]
+    Log {
+        #[arg(help = "Session id, or a unique prefix of one (list ids with `coven sessions`)")]
+        session_id: String,
+        #[arg(long, help = "Print log lines as JSON (machine-readable)")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum HubCommand {
+    #[command(about = "Show hub role, node availability, and queue depth")]
+    Status {
+        #[arg(long, help = "Print hub status as JSON (machine-readable)")]
+        json: bool,
+    },
+    #[command(about = "List registered executor nodes")]
+    Nodes {
+        #[arg(long, help = "Print nodes as JSON (machine-readable)")]
+        json: bool,
+    },
+    #[command(about = "List hub jobs")]
+    Jobs {
+        #[arg(
+            long,
+            value_name = "STATE",
+            value_parser = ["queued", "assigned", "held", "completed", "failed", "cancelled"],
+            help = "Only show jobs in this state"
+        )]
+        state: Option<String>,
+        #[arg(long, help = "Print jobs as JSON (machine-readable)")]
+        json: bool,
+    },
+    #[command(about = "Show the job→node routing table")]
+    Routing {
+        #[arg(long, help = "Print routes as JSON (machine-readable)")]
         json: bool,
     },
 }
@@ -654,7 +763,33 @@ fn run_cli(cli: Cli) -> Result<()> {
                 query,
                 json: search_json,
             }) => run_sessions_search(&query, search_json),
+            Some(SessionsCommand::Show {
+                session_id,
+                json: show_json,
+            }) => observe::run_session_show(&session_id, show_json),
+            Some(SessionsCommand::Events {
+                session_id,
+                after_seq,
+                limit,
+                json: events_json,
+            }) => observe::run_session_events(&session_id, after_seq, limit, events_json),
+            Some(SessionsCommand::Log {
+                session_id,
+                json: log_json,
+            }) => observe::run_session_log(&session_id, log_json),
             None => tui::sessions::run_command(all, manage, plain, json),
+        },
+        Some(Command::Status { json }) => observe::run_status(json),
+        Some(Command::Familiars { json }) => observe::run_familiars(json),
+        Some(Command::Skills { json }) => observe::run_skills(json),
+        Some(Command::Memory { json }) => observe::run_memory(json),
+        Some(Command::Research { json }) => observe::run_research(json),
+        Some(Command::Calls { id, json }) => observe::run_calls(id.as_deref(), json),
+        Some(Command::Hub { command }) => match command {
+            HubCommand::Status { json } => observe::run_hub_status(json),
+            HubCommand::Nodes { json } => observe::run_hub_nodes(json),
+            HubCommand::Jobs { state, json } => observe::run_hub_jobs(state.as_deref(), json),
+            HubCommand::Routing { json } => observe::run_hub_routing(json),
         },
         Some(Command::Logs { command }) => run_logs_command(command),
         Some(Command::Vacuum) => run_vacuum_command(),
@@ -3330,6 +3465,144 @@ mod tests {
         assert_eq!(near_miss_subcommand("sessons").as_deref(), Some("sessions"));
         assert_eq!(near_miss_subcommand("docter").as_deref(), Some("doctor"));
         assert_eq!(near_miss_subcommand("attch").as_deref(), Some("attach"));
+    }
+
+    #[test]
+    fn near_miss_subcommand_catches_observability_command_typos() {
+        assert_eq!(near_miss_subcommand("stauts").as_deref(), Some("status"));
+        assert_eq!(
+            near_miss_subcommand("familars").as_deref(),
+            Some("familiars")
+        );
+        assert_eq!(near_miss_subcommand("skils").as_deref(), Some("skills"));
+        assert_eq!(
+            near_miss_subcommand("overveiw").as_deref(),
+            Some("overview")
+        );
+    }
+
+    #[test]
+    fn cli_parses_observability_commands() {
+        assert!(matches!(
+            Cli::parse_from(["coven", "status"]).command,
+            Some(Command::Status { json: false })
+        ));
+        assert!(matches!(
+            Cli::parse_from(["coven", "overview", "--json"]).command,
+            Some(Command::Status { json: true })
+        ));
+        assert!(matches!(
+            Cli::parse_from(["coven", "familiars"]).command,
+            Some(Command::Familiars { json: false })
+        ));
+        assert!(matches!(
+            Cli::parse_from(["coven", "skills", "--json"]).command,
+            Some(Command::Skills { json: true })
+        ));
+        assert!(matches!(
+            Cli::parse_from(["coven", "memory"]).command,
+            Some(Command::Memory { json: false })
+        ));
+        assert!(matches!(
+            Cli::parse_from(["coven", "research"]).command,
+            Some(Command::Research { json: false })
+        ));
+        match Cli::parse_from(["coven", "calls", "call-1", "--json"]).command {
+            Some(Command::Calls { id, json }) => {
+                assert_eq!(id.as_deref(), Some("call-1"));
+                assert!(json);
+            }
+            other => panic!("expected calls command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_hub_subcommands() {
+        assert!(matches!(
+            Cli::parse_from(["coven", "hub", "status"]).command,
+            Some(Command::Hub {
+                command: HubCommand::Status { json: false }
+            })
+        ));
+        assert!(matches!(
+            Cli::parse_from(["coven", "hub", "nodes", "--json"]).command,
+            Some(Command::Hub {
+                command: HubCommand::Nodes { json: true }
+            })
+        ));
+        match Cli::parse_from(["coven", "hub", "jobs", "--state", "queued"]).command {
+            Some(Command::Hub {
+                command: HubCommand::Jobs { state, json },
+            }) => {
+                assert_eq!(state.as_deref(), Some("queued"));
+                assert!(!json);
+            }
+            other => panic!("expected hub jobs command, got {other:?}"),
+        }
+        assert!(matches!(
+            Cli::parse_from(["coven", "hub", "routing"]).command,
+            Some(Command::Hub {
+                command: HubCommand::Routing { json: false }
+            })
+        ));
+    }
+
+    #[test]
+    fn cli_rejects_unknown_hub_job_state() {
+        assert!(Cli::try_parse_from(["coven", "hub", "jobs", "--state", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn cli_parses_sessions_inspection_subcommands() {
+        match Cli::parse_from(["coven", "sessions", "show", "sess-1", "--json"]).command {
+            Some(Command::Sessions {
+                command: Some(SessionsCommand::Show { session_id, json }),
+                ..
+            }) => {
+                assert_eq!(session_id, "sess-1");
+                assert!(json);
+            }
+            other => panic!("expected sessions show, got {other:?}"),
+        }
+        match Cli::parse_from([
+            "coven",
+            "sessions",
+            "events",
+            "sess-1",
+            "--after-seq",
+            "7",
+            "--limit",
+            "50",
+        ])
+        .command
+        {
+            Some(Command::Sessions {
+                command:
+                    Some(SessionsCommand::Events {
+                        session_id,
+                        after_seq,
+                        limit,
+                        json,
+                    }),
+                ..
+            }) => {
+                assert_eq!(session_id, "sess-1");
+                assert_eq!(after_seq, Some(7));
+                assert_eq!(limit, Some(50));
+                assert!(!json);
+            }
+            other => panic!("expected sessions events, got {other:?}"),
+        }
+        match Cli::parse_from(["coven", "sessions", "log", "sess-1"]).command {
+            Some(Command::Sessions {
+                command: Some(SessionsCommand::Log { session_id, json }),
+                ..
+            }) => {
+                assert_eq!(session_id, "sess-1");
+                assert!(!json);
+            }
+            other => panic!("expected sessions log, got {other:?}"),
+        }
     }
 
     #[test]
