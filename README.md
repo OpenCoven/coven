@@ -322,16 +322,16 @@ machine-readable output that carries the same body as the daemon API route.
 
 | Command                        | Action                                                    | API route              |
 | ------------------------------ | --------------------------------------------------------- | ---------------------- |
-| `coven status`                 | Daemon, sessions, familiars, skills, research, hub at a glance | `/health` + `/overview` |
-| `coven familiars`              | Familiar roster from `~/.coven/familiars.toml`            | `/familiars`           |
-| `coven skills`                 | Installed skills from `~/.coven/skills/`                  | `/skills`              |
-| `coven memory`                 | Familiar memory files from `~/.coven/memory/`             | `/memory`              |
-| `coven research`               | Research loop log from `~/.coven/research/results.tsv`    | `/research`            |
-| `coven calls [<id>]`           | Coven Calls delegation ledger (list or one call)          | `/coven-calls[/:id]`   |
-| `coven hub status`             | Hub role, node availability, queue depth                  | `/hub/status`          |
-| `coven hub nodes`              | Registered executor nodes                                 | `/hub/nodes`           |
-| `coven hub jobs [--state <s>]` | Hub jobs, optionally filtered by state                    | `/hub/jobs`            |
-| `coven hub routing`            | Job→node routing decisions                                | `/hub/routing`         |
+| `coven status`                 | Daemon, sessions, familiars, skills, research, hub at a glance | `/api/v1/health` + `/api/v1/overview` |
+| `coven familiars`              | Familiar roster from `~/.coven/familiars.toml`            | `/api/v1/familiars`           |
+| `coven skills`                 | Installed skills from `~/.coven/skills/`                  | `/api/v1/skills`              |
+| `coven memory`                 | Familiar memory files from `~/.coven/memory/`             | `/api/v1/memory`              |
+| `coven research`               | Research loop log from `~/.coven/research/results.tsv`    | `/api/v1/research`            |
+| `coven calls [<id>]`           | Coven Calls delegation ledger (list or one call)          | `/api/v1/coven-calls[/:id]`   |
+| `coven hub status`             | Hub role, node availability, queue depth                  | `/api/v1/hub/status`          |
+| `coven hub nodes`              | Registered executor nodes                                 | `/api/v1/hub/nodes`           |
+| `coven hub jobs [--state <s>]` | Hub jobs, optionally filtered by state                    | `/api/v1/hub/jobs`            |
+| `coven hub routing`            | Job→node routing decisions                                | `/api/v1/hub/routing`         |
 
 ### Parallel work protocol (worktrees, claims, hooks)
 
