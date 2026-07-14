@@ -127,8 +127,12 @@ adapters deserialize unchanged with everything off):
   `{ "full_args": ["--allow-all"], "read_only_args": ["--deny-tool", "write"] }`.
 - `coven adapter list --json` includes the declared `capabilities` block for
   every bundled or manifest adapter, using the same field names as manifests.
+- `add_dir_flag` (alias `addDirFlag`) names the harness's native flag for
+  trusting an additional directory beyond its cwd. Each
+  `coven run --add-dir <DIR>` repeats as `[flag, <dir>]` ahead of the prompt
+  (the bundled Codex, Claude, and engine adapters all declare `--add-dir`).
 - Adapters that declare none of this keep today's conservative behavior:
-  one-shot launches only, `--permission` is a warned no-op.
+  one-shot launches only, `--permission` and `--add-dir` are warned no-ops.
 
 Accepted, conformance-tested manifests for real runtimes live in the
 [coven-runtimes canonical registry](https://github.com/OpenCoven/coven-runtimes).

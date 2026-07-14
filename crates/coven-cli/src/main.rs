@@ -193,6 +193,12 @@ enum Command {
         )]
         permission: Option<String>,
         #[arg(
+            long = "add-dir",
+            value_name = "DIR",
+            help = "Additional directory the harness may access beyond its cwd; repeat the flag for multiple directories. Maps to each harness's native trust flag (codex/claude/coven-code --add-dir). Harnesses with no add-dir mechanism warn and continue."
+        )]
+        add_dir: Vec<String>,
+        #[arg(
             long,
             help = "Emit JSONL events on stdout (system.init / user / assistant / tool_result / result)"
         )]
@@ -615,6 +621,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             think,
             speed,
             permission,
+            add_dir,
             stream_json,
             stream_json_input,
         }) => run_session(
@@ -632,6 +639,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             think,
             speed.as_deref(),
             permission.as_deref(),
+            add_dir,
             stream_json,
             stream_json_input,
         ),
@@ -2192,6 +2200,7 @@ fn run_session(
     think: bool,
     speed: Option<&str>,
     permission: Option<&str>,
+    add_dirs: Vec<String>,
     stream_json: bool,
     stream_json_input: bool,
 ) -> Result<()> {
@@ -2292,11 +2301,29 @@ fn run_session(
             );
         }
     }
+    // Requested additional trusted directories. Blank entries are skipped by
+    // the arg builder; harnesses that declare no add-dir mechanism warn
+    // (don't error) so a grant degrades gracefully instead of failing the run.
+    let requested_add_dirs: Vec<String> = add_dirs
+        .iter()
+        .map(|dir| dir.trim().to_string())
+        .filter(|dir| !dir.is_empty())
+        .collect();
+    if let Some(s) = spec.as_ref() {
+        if !requested_add_dirs.is_empty() && !s.supports_add_dir() {
+            eprintln!(
+                "warning: harness `{}` declares no add-dir mechanism; --add-dir is ignored \
+                 (declare add_dir_flag in the adapter manifest to enable it)",
+                s.id
+            );
+        }
+    }
     let launch_options = harness::HarnessLaunchOptions {
         model: requested_model,
         think,
         speed: requested_speed,
         permission: requested_permission,
+        add_dirs: &requested_add_dirs,
     };
 
     let effective_prompt = match (&familiar_ctx, spec.as_ref()) {
@@ -3949,6 +3976,45 @@ mod tests {
             Some(Command::Run { detach, .. }) => assert!(detach),
             other => panic!("expected run command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cli_run_accepts_repeatable_add_dir() {
+        let cli = Cli::parse_from([
+            "coven",
+            "run",
+            "codex",
+            "hello",
+            "--add-dir",
+            "/tmp/roots/a",
+            "--add-dir",
+            "/tmp/roots/b",
+        ]);
+        match cli.command {
+            Some(Command::Run { add_dir, .. }) => assert_eq!(
+                add_dir,
+                vec!["/tmp/roots/a".to_string(), "/tmp/roots/b".to_string()]
+            ),
+            other => panic!("expected run command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_help_advertises_add_dir_for_capability_probes() {
+        use clap::CommandFactory;
+        // Cave gates granted-root forwarding on `coven run --help` matching
+        // /(^|\s)--add-dir(?![\w-])/m; the flag must render in the help text.
+        let mut cmd = Cli::command();
+        let run = cmd
+            .find_subcommand_mut("run")
+            .expect("run subcommand exists");
+        let help = run.render_long_help().to_string();
+        assert!(
+            help.lines().any(|line| line
+                .split_whitespace()
+                .any(|token| token == "--add-dir" || token.starts_with("--add-dir <"))),
+            "run --help must advertise --add-dir for Cave's capability probe:\n{help}"
+        );
     }
 
     #[test]

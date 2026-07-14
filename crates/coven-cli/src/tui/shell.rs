@@ -1211,6 +1211,8 @@ fn dispatch_via_local_pty(
         None,
         // permission: the cast/shell path uses the harness default.
         None,
+        // add-dirs: the cast/shell path grants no extra directories.
+        Vec::new(),
         false,
         false,
     )?;
@@ -1906,6 +1908,8 @@ fn run_guided_harness_session() -> Result<()> {
         None,
         // permission: the cast/shell path uses the harness default.
         None,
+        // add-dirs: the cast/shell path grants no extra directories.
+        Vec::new(),
         false,
         false,
     )
