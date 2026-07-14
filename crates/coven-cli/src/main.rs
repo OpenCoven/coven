@@ -427,9 +427,9 @@ enum SessionsCommand {
             value_name = "SEQ",
             help = "Only return events after this sequence cursor"
         )]
-        after_seq: Option<i64>,
+        after_seq: Option<u64>,
         #[arg(long, value_name = "N", help = "Return at most N events")]
-        limit: Option<i64>,
+        limit: Option<u64>,
         #[arg(long, help = "Print the event envelope as JSON (machine-readable)")]
         json: bool,
     },
