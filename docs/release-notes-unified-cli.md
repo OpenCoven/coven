@@ -1,6 +1,6 @@
 # Coven — The Unified CLI
 
-> Release notes for **`@opencoven/cli` v0.1.0**, which installs and pins the **Coven engine (`coven-code`) v0.7.0**. Covers the unification work (one `coven` CLI end to end).
+> Release notes for **`@opencoven/cli` v0.1.1**, which installs and pins the **Coven engine (`coven-code`) v0.7.0**. Covers the unification work (one `coven` CLI end to end).
 
 **One project. Any harness. Visible work — now behind a single command.**
 
@@ -37,7 +37,7 @@ Interactive engine sessions register themselves in Coven's ledger, so the work y
 
 ### One place for everything
 - `coven doctor` — a single **Credentials** panel answers "am I logged in, to what, via what," plus engine health, version, and pin
-- `coven --version` — shows the whole stack, e.g. `coven v0.1.0 (engine coven-code v0.7.0, pinned v0.7.0)`
+- `coven --version` — shows the whole stack, e.g. `coven v0.1.1 (engine coven-code v0.7.0, pinned v0.7.0)`
 - `coven auth` / `coven models` / `coven acp` — manage credentials, list models, or start the ACP server, all through `coven`
 - `coven engine status | install | which` — manage the engine directly when you want to
 - `coven code <anything>` — raw escape hatch straight to the engine
