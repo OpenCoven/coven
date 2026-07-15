@@ -34,6 +34,8 @@ flowchart LR
 | GET | `/api/v1/api-version` | Versión activa de API + versiones compatibles. | — | `{ apiVersion, supportedApiVersions }` | — |
 | GET | `/api/v1/health` | Accesibilidad del daemon, versión, capabilities, pid. | — | `{ ok, apiVersion, covenVersion, capabilities, daemon }` | `503 runtime_unavailable` |
 | GET | `/api/v1/capabilities` | Catálogo de capabilities con pistas de política. | — | `{ capabilities: [...] }` | — |
+| GET | `/api/v1/capabilities/harnesses` | Agregado de manifiestos de capabilities nativos de harness más skills de Coven (`?refresh=1` re-escanea). | — | `{ coven_skills, harness_capabilities, scanned_at }` | — |
+| GET | `/api/v1/capabilities/:harness` | Manifiesto de capabilities de un harness (`?refresh=1` re-escanea). | — | objeto manifiesto | `404 harness_not_found` |
 | POST | `/api/v1/actions` | Enrutar un id de acción conocido del plano de control. | `{ action, origin, intentId, args }` | `{ ok, accepted, status, event }` | `400 invalid_request` (acción desconocida) |
 | GET | `/api/v1/sessions` | Listar sesiones activas. | — | `SessionRecord[]` | — |
 | POST | `/api/v1/sessions` | Lanzar una sesión de harness limitada al proyecto. | `{ projectRoot, cwd?, harness, prompt, title?, launchMode?, conversation?, conversationId? }` | `SessionRecord` | `400 invalid_request` (incluye cwd fuera de proyecto, id de harness desconocido, body mal formado), `500 launch_failed` (runtime spawn / escritura inicial / arranque del CLI falló; fila marcada como `failed`) |

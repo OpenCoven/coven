@@ -117,6 +117,7 @@ All API errors use the following stable envelope. Clients must branch on `error.
 | `not_found`            | 404         | Generic route not found.                         |
 | `invalid_request`      | 400 or 404  | Malformed request, unknown harness id, missing required field, or unsupported API version. |
 | `session_not_found`    | 404         | Session id does not exist.                       |
+| `harness_not_found`    | 404         | `GET /capabilities/:harnessId`: harness id is not a known capability scan target. |
 | `session_not_live`     | 409         | Session exists but is not running.               |
 | `project_root_violation`| 400        | Reserved. Cwd-outside-root currently emits `invalid_request` with the violation message in the body; promoting to its own code would let clients branch without parsing prose. |
 | `pty_spawn_failed`     | 500         | Reserved. PTY spawn failures currently emit `launch_failed`; promoting to its own code would let clients distinguish "the PTY couldn't open" (likely a host issue) from "the harness CLI errored at startup" (likely an auth/config issue). |
@@ -194,6 +195,29 @@ Known enum values in `v1`:
 - `policy`: `allow`, `requiresApproval`
 
 Clients should ignore unknown future capability ids and action ids unless they explicitly support them.
+
+## Harness capability manifests (`v1`)
+
+Distinct from the control-plane catalog above, `GET /api/v1/capabilities/harnesses` returns what each installed harness brings (global instructions, skills, plugins) plus Coven-owned skills, and `GET /api/v1/capabilities/:harnessId` returns a single harness's manifest. Both accept `?refresh=1` to invalidate the 5-minute scan cache. This surface keeps the snake_case field names pinned by `specs/coven-harness-capabilities/`:
+
+```json
+{
+  "coven_skills": [],
+  "harness_capabilities": [
+    {
+      "harness_id": "codex",
+      "scanned_at": "2026-07-15T12:00:00Z",
+      "global_instructions": { "present": false },
+      "skills": [],
+      "plugins": [],
+      "warnings": []
+    }
+  ],
+  "scanned_at": "2026-07-15T12:00:00Z"
+}
+```
+
+Uninstalled harnesses return empty manifests, never errors. Unknown harness ids on `/capabilities/:harnessId` return `404 harness_not_found`. `harnesses` is a reserved path segment, never a harness id. See [Capabilities endpoint](reference/api-capabilities.md) for the full reference.
 
 ## Control action shape (`v1`)
 

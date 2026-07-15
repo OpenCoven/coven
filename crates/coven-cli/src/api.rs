@@ -326,17 +326,24 @@ pub fn handle_request_with_runtime(
                 }
             }
         }
-        ("GET", p) if p == "/capabilities" || p.starts_with("/capabilities?") => {
+        // Harness-native capability manifests. The bare `/capabilities` path is
+        // the control-plane catalog (matched above), so the aggregate lives at
+        // the reserved `harnesses` segment.
+        ("GET", "/capabilities/harnesses") => {
             let refresh = query.map(|q| q.contains("refresh=1")).unwrap_or(false);
-            let resp = crate::capabilities::get_all(coven_home, refresh);
-            json_response(200, &resp)
+            json_response(200, &crate::capabilities::get_all(coven_home, refresh))
         }
         ("GET", p) if p.starts_with("/capabilities/") => {
             let harness_id = p.trim_start_matches("/capabilities/");
             let refresh = query.map(|q| q.contains("refresh=1")).unwrap_or(false);
             match crate::capabilities::get_one(coven_home, harness_id, refresh) {
                 Some(m) => json_response(200, &m),
-                None => json_response(404, &serde_json::json!({"error": "unknown harness"})),
+                None => api_error(
+                    404,
+                    "harness_not_found",
+                    "Harness id is not a known capability scan target.",
+                    Some(serde_json::json!({ "harnessId": harness_id })),
+                ),
             }
         }
         // Coven Calls delegation ledger
@@ -3565,6 +3572,78 @@ mod tests {
             .contains(r#""actions":["coven.capabilities.refresh"]"#));
         assert!(!response.body.contains("coven.sessions.launch"));
         assert!(!response.body.contains("desktop.window.focus"));
+        Ok(())
+    }
+
+    #[test]
+    fn routes_harness_capability_aggregate_to_json() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+
+        let response = handle_request(
+            "GET",
+            "/api/v1/capabilities/harnesses",
+            temp_dir.path(),
+            None,
+        )?;
+
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains(r#""harness_capabilities""#));
+        assert!(response.body.contains(r#""coven_skills""#));
+        assert!(response.body.contains(r#""scanned_at""#));
+        for harness in ["codex", "claude", "copilot"] {
+            assert!(
+                response
+                    .body
+                    .contains(&format!(r#""harness_id":"{harness}""#)),
+                "aggregate missing manifest for `{harness}`: {}",
+                response.body
+            );
+        }
+        // The bare path stays the control-plane catalog: no harness manifests.
+        let catalog = handle_request("GET", "/api/v1/capabilities", temp_dir.path(), None)?;
+        assert!(!catalog.body.contains(r#""harness_capabilities""#));
+        Ok(())
+    }
+
+    #[test]
+    fn harness_capability_aggregate_accepts_refresh_query() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+
+        let response = handle_request(
+            "GET",
+            "/api/v1/capabilities/harnesses?refresh=1",
+            temp_dir.path(),
+            None,
+        )?;
+
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains(r#""harness_capabilities""#));
+        Ok(())
+    }
+
+    #[test]
+    fn routes_single_harness_capability_manifest() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+
+        let response = handle_request("GET", "/api/v1/capabilities/codex", temp_dir.path(), None)?;
+
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains(r#""harness_id":"codex""#));
+        assert!(response.body.contains(r#""global_instructions""#));
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_harness_capability_manifest_fails_closed_with_structured_error() -> anyhow::Result<()>
+    {
+        let temp_dir = tempfile::tempdir()?;
+
+        let response =
+            handle_request("GET", "/api/v1/capabilities/warlock", temp_dir.path(), None)?;
+
+        assert_eq!(response.status, 404);
+        assert!(response.body.contains(r#""code":"harness_not_found""#));
+        assert!(response.body.contains(r#""harnessId":"warlock""#));
         Ok(())
     }
 

@@ -167,6 +167,12 @@ Coven never writes to harness-native directories. No harness config file is crea
 
 ## API surface
 
+> **Shipped note (#368):** the aggregate landed at `GET /v1/capabilities/harnesses`,
+> not the bare `GET /v1/capabilities` written below — that path was already the
+> control-plane capability catalog (see `docs/API-CONTRACT.md`). The `?harness=`
+> filter did not ship (use `/:harness_id`), and the unknown-harness `404` uses
+> the structured `harness_not_found` error envelope.
+
 ### `GET /v1/capabilities`
 
 Returns the union of Coven-owned skills and all available harness capability manifests.

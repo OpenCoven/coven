@@ -34,6 +34,8 @@ flowchart LR
 | GET | `/api/v1/api-version` | Активная версия API + поддерживаемые версии. | — | `{ apiVersion, supportedApiVersions }` | — |
 | GET | `/api/v1/health` | Доступность демона, версия, capabilities, pid. | — | `{ ok, apiVersion, covenVersion, capabilities, daemon }` | `503 runtime_unavailable` |
 | GET | `/api/v1/capabilities` | Каталог capabilities с подсказками политики. | — | `{ capabilities: [...] }` | — |
+| GET | `/api/v1/capabilities/harnesses` | Агрегат манифестов capabilities harness'ов плюс skills Coven (`?refresh=1` пересканирует). | — | `{ coven_skills, harness_capabilities, scanned_at }` | — |
+| GET | `/api/v1/capabilities/:harness` | Манифест capabilities одного harness'а (`?refresh=1` пересканирует). | — | объект манифеста | `404 harness_not_found` |
 | POST | `/api/v1/actions` | Маршрутизировать известный id действия плоскости управления. | `{ action, origin, intentId, args }` | `{ ok, accepted, status, event }` | `400 invalid_request` (неизвестное действие) |
 | GET | `/api/v1/sessions` | Перечислить активные сессии. | — | `SessionRecord[]` | — |
 | POST | `/api/v1/sessions` | Запустить сессию harness'а, ограниченную проектом. | `{ projectRoot, cwd?, harness, prompt, title?, launchMode?, conversation?, conversationId? }` | `SessionRecord` | `400 invalid_request` (включая cwd вне проекта, неизвестный id harness, некорректный body), `500 launch_failed` (runtime spawn / начальная запись / старт CLI дали сбой; строка помечена как `failed`) |
