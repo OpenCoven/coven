@@ -386,6 +386,16 @@ enum Command {
         #[command(subcommand)]
         command: HubCommand,
     },
+    #[command(about = "Inspect multi-host scheduler decisions and loop recovery (read-only)")]
+    Scheduler {
+        #[command(subcommand)]
+        command: SchedulerCommand,
+    },
+    #[command(about = "Inspect travel-mode handoff state (read-only)")]
+    Travel {
+        #[command(subcommand)]
+        command: TravelCommand,
+    },
     #[command(
         about = "Manage model provider credentials (Anthropic, Codex) — runs in the Coven engine"
     )]
@@ -491,6 +501,41 @@ enum HubCommand {
     #[command(about = "Show the job→node routing table")]
     Routing {
         #[arg(long, help = "Print routes as JSON (machine-readable)")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SchedulerCommand {
+    #[command(about = "Show one scheduler decision (target, reason, inputs)")]
+    Decision {
+        #[arg(help = "Decision id (find ids in `coven hub routing` DECISION column)")]
+        id: String,
+        #[arg(long, help = "Print the decision record as JSON (machine-readable)")]
+        json: bool,
+    },
+    #[command(about = "Show a scheduler loop's recovery state and preserved subqueue")]
+    Loop {
+        #[arg(help = "Loop id (returned by scheduler redispatch responses)")]
+        loop_id: String,
+        #[arg(long, help = "Print the loop state as JSON (machine-readable)")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TravelCommand {
+    #[command(about = "Show a travel client's handoff state machine view")]
+    State {
+        #[arg(long, value_name = "CLIENT_ID", help = "Travel client id to inspect")]
+        client: String,
+        #[arg(
+            long,
+            value_name = "PROFILE_ID",
+            help = "Travel profile id to check freshness against"
+        )]
+        profile: Option<String>,
+        #[arg(long, help = "Print the travel state as JSON (machine-readable)")]
         json: bool,
     },
 }
@@ -810,6 +855,17 @@ fn run_cli(cli: Cli) -> Result<()> {
             }
             HubCommand::Dispatch { job_id, json } => observe::run_hub_dispatch(&job_id, json),
             HubCommand::Routing { json } => observe::run_hub_routing(json),
+        },
+        Some(Command::Scheduler { command }) => match command {
+            SchedulerCommand::Decision { id, json } => observe::run_scheduler_decision(&id, json),
+            SchedulerCommand::Loop { loop_id, json } => observe::run_scheduler_loop(&loop_id, json),
+        },
+        Some(Command::Travel { command }) => match command {
+            TravelCommand::State {
+                client,
+                profile,
+                json,
+            } => observe::run_travel_state(&client, profile.as_deref(), json),
         },
         Some(Command::Logs { command }) => run_logs_command(command),
         Some(Command::Vacuum) => run_vacuum_command(),
@@ -3940,6 +3996,60 @@ mod tests {
                 command: HubCommand::Routing { json: false }
             })
         ));
+    }
+
+    #[test]
+    fn cli_parses_scheduler_subcommands() {
+        match Cli::parse_from(["coven", "scheduler", "decision", "sched_1", "--json"]).command {
+            Some(Command::Scheduler {
+                command: SchedulerCommand::Decision { id, json },
+            }) => {
+                assert_eq!(id, "sched_1");
+                assert!(json);
+            }
+            other => panic!("expected scheduler decision command, got {other:?}"),
+        }
+        match Cli::parse_from(["coven", "scheduler", "loop", "loop-gpu"]).command {
+            Some(Command::Scheduler {
+                command: SchedulerCommand::Loop { loop_id, json },
+            }) => {
+                assert_eq!(loop_id, "loop-gpu");
+                assert!(!json);
+            }
+            other => panic!("expected scheduler loop command, got {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["coven", "scheduler", "decision"]).is_err());
+    }
+
+    #[test]
+    fn cli_parses_travel_state_command() {
+        match Cli::parse_from([
+            "coven",
+            "travel",
+            "state",
+            "--client",
+            "laptop-1",
+            "--profile",
+            "travel_1",
+        ])
+        .command
+        {
+            Some(Command::Travel {
+                command:
+                    TravelCommand::State {
+                        client,
+                        profile,
+                        json,
+                    },
+            }) => {
+                assert_eq!(client, "laptop-1");
+                assert_eq!(profile.as_deref(), Some("travel_1"));
+                assert!(!json);
+            }
+            other => panic!("expected travel state command, got {other:?}"),
+        }
+        // clientId is required by the API, so --client is required here too.
+        assert!(Cli::try_parse_from(["coven", "travel", "state"]).is_err());
     }
 
     #[test]

@@ -880,6 +880,162 @@ fn render_hub_routing(body: &Value) -> String {
     out
 }
 
+// ── coven scheduler decision/loop ────────────────────────────────────────────
+
+pub(crate) fn run_scheduler_decision(decision_id: &str, json: bool) -> Result<()> {
+    let body = api_get(
+        &coven_home_dir()?,
+        &format!("/api/v1/scheduler/decisions/{decision_id}"),
+    )?;
+    if json {
+        return print_json(&body);
+    }
+    print!("{}", render_scheduler_decision(&body));
+    Ok(())
+}
+
+/// Render a `{ role, nodeId? }` scheduler target as `nodeId (role)`.
+fn target_cell(body: &Value) -> String {
+    let target = body.get("target").cloned().unwrap_or(Value::Null);
+    let role = str_cell(&target, "role");
+    match target.get("nodeId").and_then(Value::as_str) {
+        Some(node_id) => format!("{node_id} ({role})"),
+        None => role,
+    }
+}
+
+fn render_scheduler_decision(body: &Value) -> String {
+    let id = str_cell(body, "decisionId");
+    let mut out = String::new();
+    out.push_str(&format!("Scheduler decision {id}\n\n"));
+    out.push_str(&format!("  job      {}\n", str_cell(body, "jobId")));
+    out.push_str(&format!("  target   {}\n", target_cell(body)));
+    out.push_str(&format!(
+        "  reason   {}\n",
+        theme::fit_chars(&str_cell(body, "reason"), DETAIL_TEXT_LIMIT)
+    ));
+    out.push_str(&format!("  created  {}\n", str_cell(body, "createdAt")));
+    if let Some(inputs) = body.get("inputs").filter(|inputs| !inputs.is_null()) {
+        out.push_str(&format!(
+            "\n  inputs\n    {}\n",
+            theme::fit_chars(&inputs.to_string(), DETAIL_TEXT_LIMIT)
+        ));
+    }
+    out.push_str(&format!(
+        "\n  full record: coven scheduler decision {id} --json\n"
+    ));
+    out
+}
+
+pub(crate) fn run_scheduler_loop(loop_id: &str, json: bool) -> Result<()> {
+    let body = api_get(
+        &coven_home_dir()?,
+        &format!("/api/v1/scheduler/loops/{loop_id}"),
+    )?;
+    if json {
+        return print_json(&body);
+    }
+    print!("{}", render_scheduler_loop(&body));
+    Ok(())
+}
+
+fn render_scheduler_loop(body: &Value) -> String {
+    let id = str_cell(body, "loopId");
+    let mut out = String::new();
+    out.push_str(&format!("Scheduler loop {id}\n\n"));
+    out.push_str(&format!("  state     {}\n", str_cell(body, "state")));
+    out.push_str(&format!("  job       {}\n", str_cell(body, "jobId")));
+    out.push_str(&format!("  decision  {}\n", str_cell(body, "decisionId")));
+    out.push_str(&format!("  target    {}\n", target_cell(body)));
+    out.push_str(&format!(
+        "  reason    {}\n",
+        theme::fit_chars(&str_cell(body, "reason"), DETAIL_TEXT_LIMIT)
+    ));
+    if let Some(subqueue) = body
+        .get("preservedSubqueue")
+        .filter(|subqueue| !subqueue.is_null())
+    {
+        let job_ids = subqueue
+            .get("jobIds")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let jobs = job_ids
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!(
+            "  preserved {} job(s) on {}{}\n",
+            job_ids.len(),
+            str_cell(subqueue, "nodeId"),
+            if jobs.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", theme::fit_chars(&jobs, TEXT_CELL_LIMIT))
+            }
+        ));
+    }
+    out.push_str(&format!("  created   {}\n", str_cell(body, "createdAt")));
+    out.push_str(&format!("  updated   {}\n", str_cell(body, "updatedAt")));
+    out.push_str(&format!(
+        "\n  full record: coven scheduler loop {id} --json\n"
+    ));
+    out
+}
+
+// ── coven travel state ───────────────────────────────────────────────────────
+
+pub(crate) fn run_travel_state(
+    client_id: &str,
+    profile_id: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let mut path = format!("/api/v1/travel/state?clientId={client_id}");
+    if let Some(profile_id) = profile_id {
+        path.push_str(&format!("&profileId={profile_id}"));
+    }
+    let body = api_get(&coven_home_dir()?, &path)?;
+    if json {
+        return print_json(&body);
+    }
+    print!("{}", render_travel_state(client_id, &body));
+    Ok(())
+}
+
+fn render_travel_state(client_id: &str, body: &Value) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("Travel state for client {client_id}\n\n"));
+    out.push_str(&format!("  state      {}\n", str_cell(body, "state")));
+    out.push_str(&format!("  profile    {}\n", str_cell(body, "profileId")));
+    out.push_str(&format!(
+        "  freshness  {}\n",
+        str_cell(body, "profileFreshness")
+    ));
+    if let Some(pending) = body.get("pendingDeltaBytes").and_then(Value::as_u64) {
+        out.push_str(&format!("  pending    {pending} delta byte(s)\n"));
+    }
+    let hub = match body.get("hubReachable").and_then(Value::as_bool) {
+        Some(true) => "reachable",
+        Some(false) => "unreachable",
+        None => "—",
+    };
+    out.push_str(&format!("  hub        {hub}\n"));
+    let execution = match body.get("travelExecutionAllowed").and_then(Value::as_bool) {
+        Some(true) => "allowed",
+        Some(false) => "blocked (profile expired)",
+        None => "—",
+    };
+    out.push_str(&format!("  execution  {execution}\n"));
+    if let Some(error) = body.get("lastSyncError").and_then(Value::as_str) {
+        out.push_str(&format!("  sync error {error}\n"));
+    }
+    out.push_str(&format!(
+        "\n  full record: coven travel state --client {client_id} --json\n"
+    ));
+    out
+}
+
 // ── coven sessions show/events/log ───────────────────────────────────────────
 
 pub(crate) fn run_session_show(reference: &str, json: bool) -> Result<()> {
@@ -1574,6 +1730,164 @@ mod tests {
             out.contains("no result reported yet"),
             "missing-envelope state lost: {out}"
         );
+    }
+
+    #[test]
+    fn scheduler_renderers_match_live_api_bodies() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let decide = crate::api::handle_request_with_body(
+            "POST",
+            "/api/v1/scheduler/decisions",
+            temp.path(),
+            None,
+            Some(
+                r#"{
+                    "jobId": "job-gpu-loop",
+                    "requiredCapabilities": ["gpu"],
+                    "taskWeight": "heavyweight",
+                    "travelState": "hub_active",
+                    "nodes": [{
+                        "nodeId": "node-compute-idle",
+                        "role": "compute_executor",
+                        "available": true,
+                        "capabilities": ["gpu"],
+                        "queuePressure": 1
+                    }]
+                }"#,
+            ),
+        )?;
+        anyhow::ensure!(decide.status < 400, "decision: {}", decide.body);
+        let decision_id = serde_json::from_str::<Value>(&decide.body)?["decisionId"]
+            .as_str()
+            .context("decision id missing")?
+            .to_string();
+
+        let decision = get_body(
+            temp.path(),
+            &format!("/api/v1/scheduler/decisions/{decision_id}"),
+        )?;
+        let out = render_scheduler_decision(&decision);
+        assert!(
+            out.contains(&format!("Scheduler decision {decision_id}")),
+            "decision id lost: {out}"
+        );
+        assert!(out.contains("job-gpu-loop"), "job id lost: {out}");
+        assert!(
+            out.contains("node-compute-idle (compute_executor)"),
+            "target lost: {out}"
+        );
+        assert!(
+            out.contains(&format!("coven scheduler decision {decision_id} --json")),
+            "json hint lost: {out}"
+        );
+
+        let redispatch = crate::api::handle_request_with_body(
+            "POST",
+            "/api/v1/scheduler/redispatch",
+            temp.path(),
+            None,
+            Some(
+                r#"{
+                    "loopId": "loop-gpu",
+                    "jobId": "job-gpu-loop",
+                    "currentNodeId": "compute-primary",
+                    "requiredCapabilities": ["gpu"],
+                    "loopResumable": true,
+                    "nodes": [
+                        {
+                            "nodeId": "compute-primary",
+                            "role": "compute_executor",
+                            "available": false,
+                            "capabilities": ["gpu"],
+                            "queuePressure": 3,
+                            "queuedJobIds": ["job-gpu-loop"]
+                        },
+                        {
+                            "nodeId": "compute-fallback",
+                            "role": "compute_executor",
+                            "available": true,
+                            "capabilities": ["gpu"],
+                            "queuePressure": 1,
+                            "queuedJobIds": []
+                        }
+                    ]
+                }"#,
+            ),
+        )?;
+        anyhow::ensure!(redispatch.status < 400, "redispatch: {}", redispatch.body);
+
+        let loop_state = get_body(temp.path(), "/api/v1/scheduler/loops/loop-gpu")?;
+        let out = render_scheduler_loop(&loop_state);
+        assert!(
+            out.contains("Scheduler loop loop-gpu"),
+            "loop id lost: {out}"
+        );
+        assert!(out.contains("redispatched"), "state lost: {out}");
+        assert!(
+            out.contains("compute-fallback (compute_executor)"),
+            "target lost: {out}"
+        );
+        assert!(
+            out.contains("1 job(s) on compute-primary: job-gpu-loop"),
+            "preserved subqueue lost: {out}"
+        );
+        assert!(
+            out.contains("coven scheduler loop loop-gpu --json"),
+            "json hint lost: {out}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn travel_state_renderer_matches_live_api_body() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+
+        // No profile and no deltas: the hub-active default.
+        let state = get_body(temp.path(), "/api/v1/travel/state?clientId=laptop-1")?;
+        let out = render_travel_state("laptop-1", &state);
+        assert!(
+            out.contains("Travel state for client laptop-1"),
+            "client lost: {out}"
+        );
+        assert!(out.contains("state      hub_active"), "state lost: {out}");
+        assert!(out.contains("hub        reachable"), "hub flag lost: {out}");
+        assert!(out.contains("execution  allowed"), "execution lost: {out}");
+
+        // With a fresh generated profile the state machine reports travel_local.
+        let profile = crate::api::handle_request_with_body(
+            "POST",
+            "/api/v1/travel/profiles",
+            temp.path(),
+            None,
+            Some(
+                r#"{
+                    "familiarId": "sage",
+                    "workspaceId": "workspace-1",
+                    "expiresInSeconds": 604800,
+                    "staleAfterSeconds": 172800,
+                    "includeContext": ["memory"]
+                }"#,
+            ),
+        )?;
+        anyhow::ensure!(profile.status < 400, "profile: {}", profile.body);
+        let profile_id = serde_json::from_str::<Value>(&profile.body)?["profileId"]
+            .as_str()
+            .context("profile id missing")?
+            .to_string();
+
+        let state = get_body(
+            temp.path(),
+            &format!("/api/v1/travel/state?clientId=laptop-1&profileId={profile_id}"),
+        )?;
+        let out = render_travel_state("laptop-1", &state);
+        assert!(out.contains("travel_local"), "state lost: {out}");
+        assert!(out.contains(&profile_id), "profile id lost: {out}");
+        assert!(out.contains("freshness  fresh"), "freshness lost: {out}");
+        assert!(
+            out.contains("coven travel state --client laptop-1 --json"),
+            "json hint lost: {out}"
+        );
+        Ok(())
     }
 
     #[test]

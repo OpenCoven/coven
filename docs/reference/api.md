@@ -94,6 +94,8 @@ These power `coven status`, `coven familiars`, `coven skills`, `coven memory`, `
 
 ## Travel (advertised by `capabilities.travel`)
 
+The `GET /travel/state` read route backs `coven travel state --client <id>` ([cli-observe](cli-observe.md)); the write routes are machine-to-machine.
+
 | Method | Path | Purpose | Success | Errors |
 |---|---|---|---|---|
 | POST | `/api/v1/travel/profiles` | Generate a signed, compressed offline travel profile for a familiar. | `201` profile envelope (`profileId`, `expiresAt`, `staleAfter`, `permissions`, `contentHash`, `profileBlob`) | `400 invalid_request` |
@@ -101,6 +103,8 @@ These power `coven status`, `coven familiars`, `coven skills`, `coven memory`, `
 | GET | `/api/v1/travel/state` | Client sync state (`?clientId`, `?profileId`). | `{ state, profileId, pendingDeltaBytes, hubReachable, profileFreshness, travelExecutionAllowed, validStates }` | `400`, `404` |
 
 ## Scheduler (advertised by `capabilities.scheduler`)
+
+The read routes back `coven scheduler decision <id>` and `coven scheduler loop <id>` ([cli-observe](cli-observe.md)); the write routes are machine-to-machine.
 
 | Method | Path | Purpose | Success | Errors |
 |---|---|---|---|---|

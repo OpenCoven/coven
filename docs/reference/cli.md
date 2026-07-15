@@ -4,7 +4,7 @@ read_when:
   - Looking up a Coven CLI flag
   - Scripting against the Coven CLI
 title: "Coven CLI reference"
-description: "Reference for the coven CLI commands: doctor, status, daemon, run, sessions, attach, archive, kill, summon, sacrifice, familiars, skills, memory, research, calls, hub, and TUI command flags."
+description: "Reference for the coven CLI commands: doctor, status, daemon, run, sessions, attach, archive, kill, summon, sacrifice, familiars, skills, memory, research, calls, hub, scheduler, travel, and TUI command flags."
 ---
 
 
@@ -37,6 +37,8 @@ flowchart TB
   Root --> Research["research [--json]"]
   Root --> Calls["calls [id] [--json]"]
   Root --> Hub["hub"]
+  Root --> Scheduler["scheduler"]
+  Root --> Travel["travel"]
 
   Daemon --> DStart["start"]
   Daemon --> DStatus["status [--json]"]
@@ -117,6 +119,8 @@ flowchart TB
 | `coven familiars/skills/memory/research/calls` | Read-path Cave parity views; see [cli-observe](cli-observe.md). |
 | `coven hub status/nodes/jobs/routing` | Read-only hub control-plane inspection; `nodes <id>` and `jobs <id>` show one record; see [cli-observe](cli-observe.md). |
 | `coven hub dispatch <jobId>` | Show a job's executor dispatch record and result envelope. |
+| `coven scheduler decision/loop <id>` | Read-only scheduler decision and loop-recovery views; see [cli-observe](cli-observe.md). |
+| `coven travel state --client <id>` | Read-only travel handoff state machine view; see [cli-observe](cli-observe.md). |
 
 ## Common flags by command
 
@@ -129,6 +133,8 @@ flowchart TB
 | `coven sessions events` | `--after-seq <SEQ>`, `--limit <N>`, `--json` |
 | `coven status` / `familiars` / `skills` / `memory` / `research` / `calls` | `--json` |
 | `coven hub jobs` | `--state <queued\|assigned\|held\|completed\|failed\|cancelled>` (list mode), `[id]` positional for a detail view, `--json` |
+| `coven scheduler decision/loop` | `<id>` positional, `--json` |
+| `coven travel state` | `--client <CLIENT_ID>` (required), `--profile <PROFILE_ID>`, `--json` |
 | `coven sacrifice` | `--yes` (required) |
 | `coven logs prune` | `--dry-run`, `--raw-days <N>`, `--event-days <N>` |
 | `coven wt` | `--list`, `--json` (with `--list`), `--doctor`, `--prune-merged`, `--prune-stale <DAYS>` |

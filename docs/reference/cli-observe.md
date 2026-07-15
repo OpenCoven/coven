@@ -1,10 +1,10 @@
 ---
-summary: "Read-path observability commands: status, familiars, skills, memory, research, calls, hub, and session inspection."
+summary: "Read-path observability commands: status, familiars, skills, memory, research, calls, hub, scheduler, travel, and session inspection."
 read_when:
   - Checking what your coven is doing from a terminal
   - Scripting against Cave-parity read views
 title: "coven observability commands"
-description: "Reference for coven status, familiars, skills, memory, research, calls, hub, and sessions show/events/log: terminal parity with the CovenCave dashboard and the daemon API."
+description: "Reference for coven status, familiars, skills, memory, research, calls, hub, scheduler, travel, and sessions show/events/log: terminal parity with the CovenCave dashboard and the daemon API."
 ---
 
 # Observability commands
@@ -107,6 +107,26 @@ coven hub routing                # job→node routing decisions
 
 Every verb takes `--json`, which prints the matching `/api/v1/hub/*` response
 body unchanged, so scripts and humans read the same contract.
+
+## Scheduler and travel debugging without curl
+
+`coven scheduler` and `coven travel` follow ids the hub views hand out —
+`coven hub routing` rows carry a `DECISION` column, and redispatch responses
+carry a `loopId` — so operators can chase a routing decision without
+`curl --unix-socket`. The write side (decisions, redispatch, profiles, deltas)
+stays machine-to-machine, like the executor protocol:
+
+```bash
+coven scheduler decision <id>       # one decision: job, target, reason, inputs
+coven scheduler loop <loopId>       # loop recovery state + preserved subqueue
+coven travel state --client <id>    # travel/handoff state machine view
+coven travel state --client <id> --profile <profileId>   # + profile freshness
+```
+
+Each verb takes `--json` and prints the matching `/api/v1/scheduler/*` or
+`/api/v1/travel/state` response body unchanged. Unknown ids fail closed with
+the structured API error (`scheduler_decision_not_found`,
+`scheduler_loop_not_found`, `travel_profile_not_found`).
 
 ## Empty states teach setup
 
