@@ -5,8 +5,10 @@
 //! *reader* only — no harness-native file is created, modified, or deleted
 //! by this module.
 //!
-//! Route surface: `GET /capabilities`, `GET /capabilities/:harness_id`
-//! (both accept `?refresh=1`).
+//! Route surface: `GET /capabilities/harnesses`,
+//! `GET /capabilities/:harness_id` (both accept `?refresh=1`).
+//! `GET /capabilities` itself is the control-plane capability catalog
+//! (`control_plane::capabilities`), not this module.
 
 use std::collections::HashMap;
 use std::fs;

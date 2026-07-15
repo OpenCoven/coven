@@ -31,7 +31,8 @@ All error responses use the structured envelope documented in the [API contract]
 | GET | `/api/v1/api-version` | Active API version + supported versions. | `{ apiVersion, supportedApiVersions }` |
 | GET | `/api/v1/health` | Daemon reachability, version, capabilities, pid, hub summary. | `{ ok, apiVersion, covenVersion, capabilities, daemon, hub }` |
 | GET | `/api/v1/capabilities` | Control-plane capability catalog with policy hints and action ids. | `{ capabilities: [...] }` |
-| GET | `/api/v1/capabilities/:harness` | One harness's capability manifest. | manifest object · `404` unknown harness |
+| GET | `/api/v1/capabilities/harnesses` | Aggregate of harness-native capability manifests plus Coven skills (`?refresh=1` re-scans). | `{ coven_skills, harness_capabilities, scanned_at }` |
+| GET | `/api/v1/capabilities/:harness` | One harness's capability manifest (`?refresh=1` re-scans). | manifest object · `404 harness_not_found` |
 | POST | `/api/v1/actions` | Route a known control-plane action id (intent envelope). | `{ ok, accepted, status, event }` · `400 invalid_request` |
 
 ## Sessions and events
