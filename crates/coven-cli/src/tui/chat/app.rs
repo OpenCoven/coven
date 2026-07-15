@@ -1098,7 +1098,8 @@ impl App {
 
     /// Decide whether a launch for `harness` should ride a resumable chat
     /// session, and if so produce the right hint. For harnesses where we can
-    /// pre-assign the session id (claude `--session-id`) the first turn sends
+    /// pre-assign the session id (claude/copilot `--session-id`) the first
+    /// turn sends
     /// `Init` with a freshly generated UUID. For harnesses that auto-assign
     /// (codex) the first turn sends no hint and the id is captured from
     /// output afterwards via `maybe_capture_codex_session_id`.
@@ -1378,11 +1379,15 @@ impl App {
         let home = std::env::var("HOME")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
-        for (harness_id, label) in &[("codex", "Codex"), ("claude", "Claude")] {
-            let m = if *harness_id == "codex" {
-                crate::capabilities::scan_codex_capabilities(&home)
-            } else {
-                crate::capabilities::scan_claude_capabilities(&home)
+        for (harness_id, label) in &[
+            ("codex", "Codex"),
+            ("claude", "Claude"),
+            ("copilot", "Copilot"),
+        ] {
+            let m = match *harness_id {
+                "codex" => crate::capabilities::scan_codex_capabilities(&home),
+                "claude" => crate::capabilities::scan_claude_capabilities(&home),
+                _ => crate::capabilities::scan_copilot_capabilities(&home),
             };
             let instr = if m.global_instructions.present {
                 "✓"
@@ -2195,14 +2200,17 @@ fn should_keep_launch_inline(plan: &CastPlan) -> bool {
 /// turn's conversation via the harness CLI's session-resume mechanism. See
 /// `docs/chat-persistence.md` for the per-harness mechanics.
 fn harness_supports_chat_resume(harness: &str) -> bool {
-    matches!(harness, "claude" | "codex")
+    matches!(harness, "claude" | "codex" | "copilot")
 }
 
 /// Whether `data` (a chunk of harness output) indicates the harness rejected
 /// our `Resume` because the session id it carried no longer exists. Both
 /// claude and codex unhelpfully exit with code 0 in this case, so we have to
 /// pattern-match on their distinctive error wording. See
-/// `docs/chat-persistence.md` under "stale-id auto-recovery".
+/// `docs/chat-persistence.md` under "stale-id auto-recovery". Copilot needs
+/// no arm here: chat resumes it through `--session-id`, which re-creates a
+/// fresh session under the same id when the prior one is gone instead of
+/// erroring.
 ///
 /// The match is a broad `contains` because callers scope the input
 /// before passing it in. For Stream mode `push_event_message` skips the
@@ -2348,7 +2356,10 @@ fn human_facing_agent_output(data: &str, mode: &mut AgentOutputMode) -> Option<S
             *mode = AgentOutputMode::Assistant;
             continue;
         }
-        if is_hidden_transcript_marker(marker) || is_codex_metadata_line(marker) {
+        if is_hidden_transcript_marker(marker)
+            || is_codex_metadata_line(marker)
+            || is_copilot_stats_line(marker)
+        {
             *mode = AgentOutputMode::Hidden;
             continue;
         }
@@ -2389,6 +2400,34 @@ fn is_codex_metadata_line(line: &str) -> bool {
         || line.starts_with("reasoning effort:")
         || line.starts_with("reasoning summaries:")
         || line.starts_with("session id:")
+}
+
+/// One-shot `copilot --prompt` runs close with a columnar stats block on
+/// stderr (`Changes    +0 -0`, `Requests   1 Premium (8s)`,
+/// `Tokens     ↑ 28.0k … • ↓ 43 …`, `Resume     copilot --resume=<id>`),
+/// which the PTY merges into the transcript. Recognize those exact column
+/// shapes — label, a 3+-space gutter, then a value with a distinctive lead —
+/// so chat stays prose-only. Anything looser risks hiding assistant text
+/// that merely starts with the same word.
+fn is_copilot_stats_line(line: &str) -> bool {
+    fn column<'a>(line: &'a str, label: &str) -> Option<&'a str> {
+        line.strip_prefix(label)?
+            .strip_prefix("   ")
+            .map(str::trim_start)
+    }
+    if let Some(value) = column(line, "Changes") {
+        return value.starts_with('+');
+    }
+    if let Some(value) = column(line, "Requests") {
+        return value.chars().next().is_some_and(|c| c.is_ascii_digit());
+    }
+    if let Some(value) = column(line, "Tokens") {
+        return value.starts_with('↑');
+    }
+    if let Some(value) = column(line, "Resume") {
+        return value.starts_with("copilot --resume=");
+    }
+    false
 }
 
 fn skip_escape_sequence<I>(chars: &mut std::iter::Peekable<I>)
@@ -3731,6 +3770,57 @@ mod tests {
         // Plain content with neither phrase.
         assert!(!detect_stale_session("claude", "Hi Persist."));
         assert!(!detect_stale_session("codex", "session id: 019e..."));
+        // Copilot resumes via `--session-id`, which re-creates missing
+        // sessions instead of erroring, so no phrase ever matches.
+        assert!(!detect_stale_session(
+            "copilot",
+            "No conversation found with session ID: x"
+        ));
+    }
+
+    #[test]
+    fn chat_resume_covers_all_built_in_pty_harnesses() {
+        assert!(harness_supports_chat_resume("claude"));
+        assert!(harness_supports_chat_resume("codex"));
+        assert!(harness_supports_chat_resume("copilot"));
+        assert!(!harness_supports_chat_resume("hermes"));
+    }
+
+    #[test]
+    fn copilot_stats_lines_hide_from_chat_transcript() {
+        assert!(is_copilot_stats_line("Changes    +0 -0"));
+        assert!(is_copilot_stats_line("Requests   1 Premium (11s)"));
+        assert!(is_copilot_stats_line(
+            "Tokens     ↑ 28.0k (28.0k written) • ↓ 43 (28 reasoning)"
+        ));
+        assert!(is_copilot_stats_line(
+            "Resume     copilot --resume=0ded81e6-36cc-4b36-bc11-42ef4a254c10"
+        ));
+        // Assistant prose that merely leads with a stats label must stay
+        // visible: no column gutter, or the wrong value shape.
+        assert!(!is_copilot_stats_line(
+            "Changes to the API are listed below"
+        ));
+        assert!(!is_copilot_stats_line(
+            "Requests should be retried with backoff"
+        ));
+        assert!(!is_copilot_stats_line("Tokens are stored in the keychain"));
+        assert!(!is_copilot_stats_line(
+            "Resume     the deployment afterwards"
+        ));
+        assert!(!is_copilot_stats_line("Resume work on the parser"));
+    }
+
+    #[test]
+    fn copilot_transcript_keeps_prose_and_drops_stats_block() {
+        let mut mode = AgentOutputMode::Unknown;
+        let transcript = "The fix is in `parser.rs`.\n\nChanges    +1 -1\nRequests   1 Premium (8s)\nTokens     ↑ 28.0k (20.4k cached) • ↓ 32\nResume     copilot --resume=cb845dd4-234f-46a0-8e6a-7f15ce8170be\n";
+        let visible =
+            human_facing_agent_output(transcript, &mut mode).expect("prose must stay visible");
+        assert!(visible.contains("The fix is in `parser.rs`."));
+        assert!(!visible.contains("Premium"));
+        assert!(!visible.contains("--resume="));
+        assert!(!visible.contains("↑"));
     }
 
     #[test]
