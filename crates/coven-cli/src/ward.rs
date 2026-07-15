@@ -50,16 +50,17 @@
 //!   staging name is unpredictable and `create_new` refuses to open through
 //!   an existing directory entry.
 //! - **Symlinked targets or parent directories** are refused by Gate 2 before
-//!   any byte is written, and the target's parent is re-canonicalized
-//!   immediately before staging — a directory component swapped for a symlink
-//!   after adjudication fails closed instead of redirecting the write.
+//!   any byte is written, and the target's parent is re-created and verified
+//!   component-by-component (never following symlinks) immediately before
+//!   staging — a directory component swapped for a symlink after adjudication
+//!   fails closed with no side effects outside the home.
 //! - **Hard-linked targets** are harmless by construction: `rename` replaces
 //!   the directory entry and never writes through the linked inode.
 //!
 //! Residual risk (accepted): a same-privilege process that can already write
 //! inside the familiar home can still swap path components in the window
-//! between the parent re-check and the final `rename`. The re-check narrows
-//! that race without eliminating it; full elimination needs
+//! between the per-component verification and the final `rename`. The check
+//! narrows that race without eliminating it; full elimination needs
 //! directory-handle-relative I/O (e.g. `openat2` + `RESOLVE_BENEATH`), which
 //! is not portable across the supported platforms. A final-component swap can
 //! also point the Gate 4 pre-write audit read at an attacker-chosen readable
@@ -755,22 +756,12 @@ fn write_atomic(
     let name = path
         .file_name()
         .ok_or_else(|| anyhow!("target has no file name: {}", path.display()))?;
-    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
 
-    // Re-verify the parent immediately before staging. Gate 2 cleared the
-    // target earlier; a directory component swapped for a symlink since then
-    // (TOCTOU) must fail closed rather than redirect the write outside the
-    // familiar home.
-    let canonical_parent = parent
-        .canonicalize()
-        .with_context(|| format!("resolving staging parent {}", parent.display()))?;
-    if !canonical_parent.starts_with(canonical_home) {
-        bail!(
-            "staging parent `{}` resolves outside the familiar home `{}`",
-            parent.display(),
-            canonical_home.display()
-        );
-    }
+    // Re-create and verify the parent immediately before staging. Gate 2
+    // cleared the target earlier; a directory component swapped for a symlink
+    // since then (TOCTOU) must fail closed — with no side effects outside the
+    // familiar home — rather than redirect the write.
+    let canonical_parent = prepare_staging_parent(canonical_home, parent)?;
     let path = canonical_parent.join(name);
 
     let need_audit = decision.tier == Tier::Logged;
@@ -852,6 +843,68 @@ fn staged_path(path: &Path) -> PathBuf {
         .map(|n| n.to_string_lossy())
         .unwrap_or_default();
     path.with_file_name(format!(".{name}.ward-staged-{}", uuid::Uuid::new_v4()))
+}
+
+/// Re-create and verify the staging parent directory component-by-component,
+/// never following symlinks.
+///
+/// `parent` must be the Gate-2-resolved target's parent, lexically under
+/// `canonical_home`. Each component is created with a single (non-recursive,
+/// non-following) `create_dir` and then checked via `symlink_metadata` to be a
+/// real directory — so a component swapped for an escaping symlink after
+/// adjudication fails closed without creating anything outside the home.
+fn prepare_staging_parent(canonical_home: &Path, parent: &Path) -> Result<PathBuf> {
+    let rel = parent.strip_prefix(canonical_home).map_err(|_| {
+        anyhow!(
+            "staging parent `{}` is not under the familiar home `{}`",
+            parent.display(),
+            canonical_home.display()
+        )
+    })?;
+
+    let mut verified = canonical_home.to_path_buf();
+    for component in rel.components() {
+        let Component::Normal(part) = component else {
+            bail!(
+                "staging parent `{}` contains a non-normal path component",
+                parent.display()
+            );
+        };
+        verified.push(part);
+
+        match std::fs::symlink_metadata(&verified) {
+            Ok(meta) if meta.is_dir() => continue,
+            Ok(_) => bail!(
+                "staging parent component `{}` is not a real directory — refusing to \
+                 follow it outside the familiar home",
+                verified.display()
+            ),
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("verifying staging parent {}", verified.display()))
+            }
+        }
+
+        match std::fs::create_dir(&verified) {
+            Ok(()) => {}
+            // A concurrent apply may have created it; the re-check below rules.
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+            Err(err) => {
+                return Err(err).with_context(|| format!("creating {}", verified.display()))
+            }
+        }
+        let meta = std::fs::symlink_metadata(&verified)
+            .with_context(|| format!("verifying staging parent {}", verified.display()))?;
+        if !meta.is_dir() {
+            bail!(
+                "staging parent component `{}` is not a real directory — refusing to \
+                 follow it outside the familiar home",
+                verified.display()
+            );
+        }
+    }
+    Ok(verified)
 }
 
 /// Lowercase hex SHA-256 of `bytes`.
@@ -1473,8 +1526,9 @@ tier = 2
         use std::os::unix::fs::symlink;
 
         // Simulates the TOCTOU window: a directory component is swapped for
-        // an escaping symlink *after* Gate 2 adjudication. The pre-staging
-        // parent re-check must refuse rather than follow it.
+        // an escaping symlink *after* Gate 2 adjudication. The per-component
+        // parent re-check must refuse rather than follow it — and must not
+        // create directories outside the home as a side effect.
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let outside = tmp.path().join("outside");
@@ -1484,20 +1538,22 @@ tier = 2
 
         let canonical_home = home.canonicalize().unwrap();
         let decision = Decision {
-            target: "memory/log.md".into(),
-            resolved: "memory/log.md".into(),
+            target: "memory/notes/log.md".into(),
+            resolved: "memory/notes/log.md".into(),
             tier: Tier::Free,
             verdict: Verdict::Allow,
         };
         let err = write_atomic(
             &canonical_home,
-            &canonical_home.join("memory/log.md"),
+            &canonical_home.join("memory/notes/log.md"),
             b"leak",
             &decision,
         )
         .unwrap_err();
 
-        assert!(err.to_string().contains("outside the familiar home"));
+        assert!(err.to_string().contains("not a real directory"));
+        // Fail-closed with zero side effects outside the home.
+        assert!(!outside.join("notes").exists());
         assert!(!outside.join("log.md").exists());
         assert_eq!(staging_litter(&outside), Vec::<String>::new());
     }
