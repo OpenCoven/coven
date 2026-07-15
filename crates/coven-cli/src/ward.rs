@@ -41,6 +41,8 @@
 //! case-insensitive collision with a protected path — is [`Verdict::Blocked`].
 
 use std::collections::BTreeSet;
+use std::fs::OpenOptions;
+use std::io::{ErrorKind, Write};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -739,11 +741,21 @@ fn write_atomic(path: &Path, contents: &[u8], decision: &Decision) -> Result<Opt
         None
     };
 
-    let staged = staged_path(path);
-    std::fs::write(&staged, contents)
-        .with_context(|| format!("staging write to {}", staged.display()))?;
-    std::fs::rename(&staged, path)
-        .with_context(|| format!("committing write to {}", path.display()))?;
+    let (staged, mut file) = create_staging_file(path)?;
+    let commit = (|| -> Result<()> {
+        file.write_all(contents)
+            .with_context(|| format!("staging write to {}", staged.display()))?;
+        file.sync_all()
+            .with_context(|| format!("syncing staged write to {}", staged.display()))?;
+        drop(file);
+        std::fs::rename(&staged, path)
+            .with_context(|| format!("committing write to {}", path.display()))?;
+        Ok(())
+    })();
+    if commit.is_err() {
+        let _ = std::fs::remove_file(&staged);
+    }
+    commit?;
 
     let audit = need_audit.then(|| AuditRecord {
         target: decision.target.clone(),
@@ -756,14 +768,40 @@ fn write_atomic(path: &Path, contents: &[u8], decision: &Decision) -> Result<Opt
     Ok(audit)
 }
 
-/// The sibling staging path for an atomic write (`<name>.ward-staged`).
+/// Create a fresh sibling staging file for an atomic write.
+///
+/// The staging path is intentionally unpredictable and opened with
+/// `create_new(true)` so a pre-planted symlink or hard link cannot be followed
+/// before the final rename commits the edit into the Gate-2-validated target.
+fn create_staging_file(path: &Path) -> Result<(PathBuf, std::fs::File)> {
+    for _ in 0..16 {
+        let staged = staged_path(path);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)
+        {
+            Ok(file) => return Ok((staged, file)),
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("creating staging file {}", staged.display()))
+            }
+        }
+    }
+    bail!(
+        "could not create a fresh staging file beside {}",
+        path.display()
+    )
+}
+
+/// A randomized sibling staging path for an atomic write.
 fn staged_path(path: &Path) -> PathBuf {
-    let mut name = path
+    let name = path
         .file_name()
-        .map(|n| n.to_os_string())
+        .map(|n| n.to_string_lossy())
         .unwrap_or_default();
-    name.push(".ward-staged");
-    path.with_file_name(name)
+    path.with_file_name(format!(".{name}.ward-staged-{}", uuid::Uuid::new_v4()))
 }
 
 /// Lowercase hex SHA-256 of `bytes`.
@@ -1287,6 +1325,28 @@ tier = 2
 
         assert!(report.is_refused());
         assert!(!tmp.path().parent().unwrap().join("escape.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_does_not_follow_preplanted_staging_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let victim = tmp.path().join("victim.txt");
+        fs::write(&victim, b"safe").unwrap();
+        symlink(&victim, home.join("notes.md.ward-staged")).unwrap();
+
+        let ward = ward_in(&home);
+        let edits = vec![FileEdit::new("notes.md", b"new note".to_vec())];
+        let report = ward.apply(&edits, &Authorization::unsigned()).unwrap();
+
+        assert!(report.is_applied());
+        assert_eq!(fs::read(&victim).unwrap(), b"safe");
+        assert_eq!(fs::read(home.join("notes.md")).unwrap(), b"new note");
+        assert!(home.join("notes.md.ward-staged").exists());
     }
 
     #[test]
