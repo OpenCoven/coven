@@ -45,7 +45,10 @@ route is also reachable with
 `curl --unix-socket ~/.coven/coven.sock http://coven/api/v1/hub/status`).
 `GET /api/v1/health` includes the same summary in its `hub` block, and
 `coven hub nodes` / `coven hub jobs --state held` drill into the recovered
-registry and queues.
+registry and queues. For a single record, `coven hub nodes <id>`,
+`coven hub jobs <id>`, and `coven hub dispatch <jobId>` mirror the
+`GET /api/v1/hub/nodes/:id`, `/hub/jobs/:id`, and `/hub/dispatches/:jobId`
+routes (add `--json` for the raw body).
 
 ## Supervisor setup
 

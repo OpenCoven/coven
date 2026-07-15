@@ -456,21 +456,33 @@ enum HubCommand {
         #[arg(long, help = "Print hub status as JSON (machine-readable)")]
         json: bool,
     },
-    #[command(about = "List registered executor nodes")]
+    #[command(about = "List registered executor nodes, or show one node")]
     Nodes {
+        #[arg(help = "Node id for a detail view (omit to list all nodes)")]
+        id: Option<String>,
         #[arg(long, help = "Print nodes as JSON (machine-readable)")]
         json: bool,
     },
-    #[command(about = "List hub jobs")]
+    #[command(about = "List hub jobs, or show one job")]
     Jobs {
+        #[arg(help = "Job id for a detail view (omit to list jobs)")]
+        id: Option<String>,
         #[arg(
             long,
             value_name = "STATE",
             value_parser = ["queued", "assigned", "held", "completed", "failed", "cancelled"],
-            help = "Only show jobs in this state"
+            conflicts_with = "id",
+            help = "Only show jobs in this state (list mode only)"
         )]
         state: Option<String>,
         #[arg(long, help = "Print jobs as JSON (machine-readable)")]
+        json: bool,
+    },
+    #[command(about = "Show the executor dispatch record for a job")]
+    Dispatch {
+        #[arg(help = "Job id whose dispatch record to show (list ids with `coven hub jobs`)")]
+        job_id: String,
+        #[arg(long, help = "Print the dispatch record as JSON (machine-readable)")]
         json: bool,
     },
     #[command(about = "Show the job→node routing table")]
@@ -787,8 +799,11 @@ fn run_cli(cli: Cli) -> Result<()> {
         Some(Command::Calls { id, json }) => observe::run_calls(id.as_deref(), json),
         Some(Command::Hub { command }) => match command {
             HubCommand::Status { json } => observe::run_hub_status(json),
-            HubCommand::Nodes { json } => observe::run_hub_nodes(json),
-            HubCommand::Jobs { state, json } => observe::run_hub_jobs(state.as_deref(), json),
+            HubCommand::Nodes { id, json } => observe::run_hub_nodes(id.as_deref(), json),
+            HubCommand::Jobs { id, state, json } => {
+                observe::run_hub_jobs(id.as_deref(), state.as_deref(), json)
+            }
+            HubCommand::Dispatch { job_id, json } => observe::run_hub_dispatch(&job_id, json),
             HubCommand::Routing { json } => observe::run_hub_routing(json),
         },
         Some(Command::Logs { command }) => run_logs_command(command),
@@ -3527,17 +3542,49 @@ mod tests {
         assert!(matches!(
             Cli::parse_from(["coven", "hub", "nodes", "--json"]).command,
             Some(Command::Hub {
-                command: HubCommand::Nodes { json: true }
+                command: HubCommand::Nodes {
+                    id: None,
+                    json: true
+                }
             })
         ));
+        match Cli::parse_from(["coven", "hub", "nodes", "node_a"]).command {
+            Some(Command::Hub {
+                command: HubCommand::Nodes { id, json },
+            }) => {
+                assert_eq!(id.as_deref(), Some("node_a"));
+                assert!(!json);
+            }
+            other => panic!("expected hub nodes detail command, got {other:?}"),
+        }
         match Cli::parse_from(["coven", "hub", "jobs", "--state", "queued"]).command {
             Some(Command::Hub {
-                command: HubCommand::Jobs { state, json },
+                command: HubCommand::Jobs { id, state, json },
             }) => {
+                assert_eq!(id, None);
                 assert_eq!(state.as_deref(), Some("queued"));
                 assert!(!json);
             }
             other => panic!("expected hub jobs command, got {other:?}"),
+        }
+        match Cli::parse_from(["coven", "hub", "jobs", "job-1", "--json"]).command {
+            Some(Command::Hub {
+                command: HubCommand::Jobs { id, state, json },
+            }) => {
+                assert_eq!(id.as_deref(), Some("job-1"));
+                assert_eq!(state, None);
+                assert!(json);
+            }
+            other => panic!("expected hub jobs detail command, got {other:?}"),
+        }
+        match Cli::parse_from(["coven", "hub", "dispatch", "job-1"]).command {
+            Some(Command::Hub {
+                command: HubCommand::Dispatch { job_id, json },
+            }) => {
+                assert_eq!(job_id, "job-1");
+                assert!(!json);
+            }
+            other => panic!("expected hub dispatch command, got {other:?}"),
         }
         assert!(matches!(
             Cli::parse_from(["coven", "hub", "routing"]).command,
@@ -3550,6 +3597,13 @@ mod tests {
     #[test]
     fn cli_rejects_unknown_hub_job_state() {
         assert!(Cli::try_parse_from(["coven", "hub", "jobs", "--state", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn cli_rejects_hub_job_detail_combined_with_state_filter() {
+        assert!(
+            Cli::try_parse_from(["coven", "hub", "jobs", "job-1", "--state", "queued"]).is_err()
+        );
     }
 
     #[test]

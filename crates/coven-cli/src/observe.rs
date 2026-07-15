@@ -567,12 +567,24 @@ fn render_hub_status(body: &Value) -> String {
     out
 }
 
-pub(crate) fn run_hub_nodes(json: bool) -> Result<()> {
-    let body = api_get(&coven_home_dir()?, "/api/v1/hub/nodes")?;
-    if json {
-        return print_json(&body);
+pub(crate) fn run_hub_nodes(id: Option<&str>, json: bool) -> Result<()> {
+    let coven_home = coven_home_dir()?;
+    match id {
+        Some(id) => {
+            let body = api_get(&coven_home, &format!("/api/v1/hub/nodes/{id}"))?;
+            if json {
+                return print_json(&body);
+            }
+            print!("{}", render_hub_node_detail(&body));
+        }
+        None => {
+            let body = api_get(&coven_home, "/api/v1/hub/nodes")?;
+            if json {
+                return print_json(&body);
+            }
+            print!("{}", render_hub_nodes(&body));
+        }
     }
-    print!("{}", render_hub_nodes(&body));
     Ok(())
 }
 
@@ -623,16 +635,89 @@ fn render_hub_nodes(body: &Value) -> String {
         ],
         &rows,
     );
-    out.push_str(&format!("\n{} node(s)\n", nodes.len()));
+    out.push_str(&format!(
+        "\n{} node(s) · detail: coven hub nodes <id>\n",
+        nodes.len()
+    ));
     out
 }
 
-pub(crate) fn run_hub_jobs(state: Option<&str>, json: bool) -> Result<()> {
+/// Joined string list from a JSON array field, or an em dash when absent.
+fn list_cell(value: &Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|joined| !joined.is_empty())
+        .unwrap_or_else(|| "—".to_string())
+}
+
+fn render_hub_node_detail(node: &Value) -> String {
+    let node_id = str_cell(node, "nodeId");
+    let mut out = String::new();
+    out.push_str(&format!("Hub node {node_id}\n\n"));
+    out.push_str(&format!("  role          {}\n", str_cell(node, "role")));
+    out.push_str(&format!(
+        "  transport     {}\n",
+        str_cell(node, "transport")
+    ));
+    out.push_str(&format!(
+        "  available     {}\n",
+        str_cell(node, "available")
+    ));
+    out.push_str(&format!(
+        "  pressure      {}\n",
+        str_cell(node, "queuePressure")
+    ));
+    out.push_str(&format!(
+        "  capabilities  {}\n",
+        list_cell(node, "capabilities")
+    ));
+    out.push_str(&format!(
+        "  last health   {}\n",
+        str_cell(node, "lastHealthAt")
+    ));
+    if node.get("lastError").and_then(Value::as_str).is_some() {
+        out.push_str(&format!(
+            "  last error    {}\n",
+            str_cell(node, "lastError")
+        ));
+    }
+    out.push_str(&format!(
+        "  registered    {}\n",
+        str_cell(node, "registeredAt")
+    ));
+    out.push_str(&format!(
+        "  updated       {}\n",
+        str_cell(node, "updatedAt")
+    ));
+    out.push_str(&format!(
+        "\n  jobs: coven hub jobs --state assigned · full record: coven hub nodes {node_id} --json\n"
+    ));
+    out
+}
+
+pub(crate) fn run_hub_jobs(id: Option<&str>, state: Option<&str>, json: bool) -> Result<()> {
+    let coven_home = coven_home_dir()?;
+    if let Some(id) = id {
+        let body = api_get(&coven_home, &format!("/api/v1/hub/jobs/{id}"))?;
+        if json {
+            return print_json(&body);
+        }
+        print!("{}", render_hub_job_detail(&body));
+        return Ok(());
+    }
     let path = match state {
         Some(state) => format!("/api/v1/hub/jobs?state={state}"),
         None => "/api/v1/hub/jobs".to_string(),
     };
-    let body = api_get(&coven_home_dir()?, &path)?;
+    let body = api_get(&coven_home, &path)?;
     if json {
         return print_json(&body);
     }
@@ -669,8 +754,93 @@ fn render_hub_jobs(body: &Value) -> String {
         &rows,
     );
     out.push_str(&format!(
-        "\n{} job(s) · filter with --state <queued|assigned|held|completed|failed|cancelled>\n",
+        "\n{} job(s) · detail: coven hub jobs <id> · filter with --state <queued|assigned|held|completed|failed|cancelled>\n",
         jobs.len()
+    ));
+    out
+}
+
+/// Character budget for free-text/JSON previews in detail views. Wider than
+/// [`TEXT_CELL_LIMIT`] because detail lines own the whole row; `--json` is the
+/// escape hatch for the full record.
+const DETAIL_TEXT_LIMIT: usize = 160;
+
+fn render_hub_job_detail(job: &Value) -> String {
+    let job_id = str_cell(job, "jobId");
+    let mut out = String::new();
+    out.push_str(&format!("Hub job {job_id}\n\n"));
+    out.push_str(&format!("  state      {}\n", str_cell(job, "state")));
+    out.push_str(&format!("  priority   {}\n", str_cell(job, "priority")));
+    out.push_str(&format!(
+        "  requires   {}\n",
+        list_cell(job, "requiredCapabilities")
+    ));
+    out.push_str(&format!(
+        "  node       {}\n",
+        str_cell(job, "assignedNodeId")
+    ));
+    out.push_str(&format!("  loop       {}\n", str_cell(job, "loopId")));
+    out.push_str(&format!("  created    {}\n", str_cell(job, "createdAt")));
+    out.push_str(&format!("  updated    {}\n", str_cell(job, "updatedAt")));
+    if let Some(route) = job.get("route").filter(|route| !route.is_null()) {
+        out.push_str("\n  route\n");
+        out.push_str(&format!("    node       {}\n", str_cell(route, "nodeId")));
+        out.push_str(&format!(
+            "    decision   {}\n",
+            str_cell(route, "decisionId")
+        ));
+        out.push_str(&format!(
+            "    reason     {}\n",
+            theme::fit_chars(&str_cell(route, "reason"), DETAIL_TEXT_LIMIT)
+        ));
+    }
+    if let Some(payload) = job.get("payload").filter(|payload| !payload.is_null()) {
+        out.push_str(&format!(
+            "\n  payload\n    {}\n",
+            theme::fit_chars(&payload.to_string(), DETAIL_TEXT_LIMIT)
+        ));
+    }
+    out.push_str(&format!(
+        "\n  dispatch record: coven hub dispatch {job_id} · full record: coven hub jobs {job_id} --json\n"
+    ));
+    out
+}
+
+pub(crate) fn run_hub_dispatch(job_id: &str, json: bool) -> Result<()> {
+    let body = api_get(
+        &coven_home_dir()?,
+        &format!("/api/v1/hub/dispatches/{job_id}"),
+    )?;
+    if json {
+        return print_json(&body);
+    }
+    print!("{}", render_hub_dispatch(&body));
+    Ok(())
+}
+
+fn render_hub_dispatch(body: &Value) -> String {
+    let job_id = str_cell(body, "jobId");
+    let mut out = String::new();
+    out.push_str(&format!("Executor dispatch {job_id}\n\n"));
+    out.push_str(&format!("  node       {}\n", str_cell(body, "nodeId")));
+    out.push_str(&format!("  status     {}\n", str_cell(body, "status")));
+    out.push_str(&format!("  created    {}\n", str_cell(body, "createdAt")));
+    out.push_str(&format!("  updated    {}\n", str_cell(body, "updatedAt")));
+    if let Some(job) = body.get("job").filter(|job| !job.is_null()) {
+        out.push_str(&format!(
+            "\n  job spec\n    {}\n",
+            theme::fit_chars(&job.to_string(), DETAIL_TEXT_LIMIT)
+        ));
+    }
+    match body.get("envelope").filter(|envelope| !envelope.is_null()) {
+        Some(envelope) => out.push_str(&format!(
+            "\n  result envelope\n    {}\n",
+            theme::fit_chars(&envelope.to_string(), DETAIL_TEXT_LIMIT)
+        )),
+        None => out.push_str("\n  result envelope\n    — (no result reported yet)\n"),
+    }
+    out.push_str(&format!(
+        "\n  full record: coven hub dispatch {job_id} --json\n"
     ));
     out
 }
@@ -1307,6 +1477,103 @@ mod tests {
         assert!(out.contains("job-1"), "assigned job lost: {out}");
         assert!(out.contains("node_a"), "assigned node lost: {out}");
         Ok(())
+    }
+
+    #[test]
+    fn hub_detail_renderers_match_live_api_bodies() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let register = crate::api::handle_request_with_body(
+            "POST",
+            "/api/v1/hub/nodes",
+            temp.path(),
+            None,
+            Some(
+                r#"{"nodeId":"node_a","role":"compute_executor","transport":"ssh","capabilities":["gpu"]}"#,
+            ),
+        )?;
+        anyhow::ensure!(register.status == 201, "register: {}", register.body);
+        let enqueue = crate::api::handle_request_with_body(
+            "POST",
+            "/api/v1/hub/jobs",
+            temp.path(),
+            None,
+            Some(r#"{"jobId":"job-1","requiredCapabilities":["gpu"],"priority":5}"#),
+        )?;
+        anyhow::ensure!(enqueue.status == 201, "enqueue: {}", enqueue.body);
+        let assign = crate::api::handle_request_with_body(
+            "POST",
+            "/api/v1/hub/jobs/job-1/assign",
+            temp.path(),
+            None,
+            Some(r#"{"nodeId":"node_a"}"#),
+        )?;
+        anyhow::ensure!(assign.status == 200, "assign: {}", assign.body);
+
+        let node = get_body(temp.path(), "/api/v1/hub/nodes/node_a")?;
+        let out = render_hub_node_detail(&node);
+        assert!(out.contains("Hub node node_a"), "node id lost: {out}");
+        assert!(out.contains("compute_executor"), "role lost: {out}");
+        assert!(out.contains("gpu"), "capabilities lost: {out}");
+        assert!(
+            out.contains("coven hub nodes node_a --json"),
+            "json hint lost: {out}"
+        );
+
+        let job = get_body(temp.path(), "/api/v1/hub/jobs/job-1")?;
+        let out = render_hub_job_detail(&job);
+        assert!(out.contains("Hub job job-1"), "job id lost: {out}");
+        assert!(out.contains("assigned"), "state lost: {out}");
+        assert!(out.contains("node_a"), "assigned node lost: {out}");
+        assert!(out.contains("route"), "route section lost: {out}");
+        assert!(
+            out.contains("coven hub dispatch job-1"),
+            "dispatch hint lost: {out}"
+        );
+
+        // Persist a dispatch record directly: the dispatch route runs a live
+        // transport, which a unit test must not do.
+        let conn = crate::store::open_store(&temp.path().join(crate::STORE_FILE_NAME))?;
+        crate::store::upsert_executor_dispatch(
+            &conn,
+            &crate::store::ExecutorDispatchRecord {
+                job_id: "job-1".into(),
+                node_id: "node_a".into(),
+                status: "completed".into(),
+                job_json: r#"{"jobId":"job-1","command":["echo","ok"]}"#.into(),
+                envelope_json: Some(
+                    r#"{"jobId":"job-1","status":"completed","exitCode":0}"#.into(),
+                ),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-01T00:00:05Z".into(),
+            },
+        )?;
+        let dispatch = get_body(temp.path(), "/api/v1/hub/dispatches/job-1")?;
+        let out = render_hub_dispatch(&dispatch);
+        assert!(
+            out.contains("Executor dispatch job-1"),
+            "dispatch id lost: {out}"
+        );
+        assert!(out.contains("node_a"), "dispatch node lost: {out}");
+        assert!(out.contains("completed"), "dispatch status lost: {out}");
+        assert!(out.contains("exitCode"), "envelope lost: {out}");
+        Ok(())
+    }
+
+    #[test]
+    fn render_hub_dispatch_marks_missing_envelope() {
+        let out = render_hub_dispatch(&json!({
+            "jobId": "job-2",
+            "nodeId": "node_a",
+            "status": "dispatched",
+            "job": {"command": ["true"]},
+            "envelope": null,
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z",
+        }));
+        assert!(
+            out.contains("no result reported yet"),
+            "missing-envelope state lost: {out}"
+        );
     }
 
     #[test]

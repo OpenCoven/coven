@@ -98,9 +98,15 @@ write-side protocol, which stays machine-to-machine):
 ```bash
 coven hub status                 # role, hubId, node availability, queue depth
 coven hub nodes                  # registered executors with capabilities
+coven hub nodes <id>             # one node: transport, health, capabilities
 coven hub jobs --state queued    # global queue by state
+coven hub jobs <id>              # one job: state, route, payload preview
+coven hub dispatch <jobId>       # executor dispatch record + result envelope
 coven hub routing                # job→node routing decisions
 ```
+
+Every verb takes `--json`, which prints the matching `/api/v1/hub/*` response
+body unchanged, so scripts and humans read the same contract.
 
 ## Empty states teach setup
 

@@ -113,7 +113,8 @@ flowchart TB
 | `coven pc` | macOS-first diagnostics and explicit `--confirm` relief operations. |
 | `coven completions <shell>` | Print shell completions for bash, zsh, fish, elvish, or powershell. |
 | `coven familiars/skills/memory/research/calls` | Read-path Cave parity views; see [cli-observe](cli-observe.md). |
-| `coven hub status/nodes/jobs/routing` | Read-only hub control-plane inspection; see [cli-observe](cli-observe.md). |
+| `coven hub status/nodes/jobs/routing` | Read-only hub control-plane inspection; `nodes <id>` and `jobs <id>` show one record; see [cli-observe](cli-observe.md). |
+| `coven hub dispatch <jobId>` | Show a job's executor dispatch record and result envelope. |
 
 ## Common flags by command
 
@@ -124,7 +125,7 @@ flowchart TB
 | `coven sessions` | `--plain`, `--json`, `--all`, `--manage` |
 | `coven sessions events` | `--after-seq <SEQ>`, `--limit <N>`, `--json` |
 | `coven status` / `familiars` / `skills` / `memory` / `research` / `calls` | `--json` |
-| `coven hub jobs` | `--state <queued\|assigned\|held\|completed\|failed\|cancelled>`, `--json` |
+| `coven hub jobs` | `--state <queued\|assigned\|held\|completed\|failed\|cancelled>` (list mode), `[id]` positional for a detail view, `--json` |
 | `coven sacrifice` | `--yes` (required) |
 | `coven logs prune` | `--dry-run`, `--raw-days <N>`, `--event-days <N>` |
 | `coven wt` | `--list`, `--json` (with `--list`), `--doctor`, `--prune-merged`, `--prune-stale <DAYS>` |
