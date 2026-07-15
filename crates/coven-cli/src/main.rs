@@ -259,8 +259,7 @@ enum Command {
         list: bool,
         #[arg(
             long,
-            requires = "list",
-            help = "Print worktrees as JSON (machine-readable; requires --list)"
+            help = "Print the listing or doctor report as JSON (machine-readable; requires --list or --doctor)"
         )]
         json: bool,
         #[arg(long, conflicts_with_all = ["list", "prune_merged", "prune_stale"], help = "Report protocol layout and hook issues (exits 1 when issues are found)")]

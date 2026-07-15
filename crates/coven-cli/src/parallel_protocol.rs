@@ -47,11 +47,14 @@ pub(crate) fn run_wt_command(
     prune_merged: bool,
     prune_stale: Option<u64>,
 ) -> Result<()> {
+    if json && !(list || doctor) {
+        anyhow::bail!("--json requires --list or --doctor");
+    }
     let repo = Repo::discover()?;
     match (branch, list, doctor, prune_merged, prune_stale) {
         (Some(branch), false, false, false, None) => wt_enter_or_create(&repo, branch),
         (None, true, false, false, None) => wt_list(&repo, json),
-        (None, false, true, false, None) => wt_doctor(&repo),
+        (None, false, true, false, None) => wt_doctor(&repo, json),
         (None, false, false, true, None) => wt_prune_merged(&repo),
         (None, false, false, false, Some(days)) => wt_prune_stale(&repo, days),
         // Unreachable today (clap requires one action), but fail loudly if
@@ -323,37 +326,130 @@ fn render_wt_list_json(rows: &[WorktreeRow]) -> Result<String> {
     serde_json::to_string_pretty(&value).context("failed to serialize worktrees as JSON")
 }
 
-fn wt_doctor(repo: &Repo) -> Result<()> {
-    println!("Coven Parallel Work Protocol doctor");
-    println!("repo: {}", repo.root.display());
-    println!("worktree root: {}", worktree_root(repo)?.display());
-    println!("claims: {}", repo.common_dir.join("agent-claims").display());
-    let mut hooks_missing = false;
+/// Findings gathered by `coven wt --doctor`, rendered as prose or JSON.
+struct WtDoctorReport {
+    repo: PathBuf,
+    worktree_root: PathBuf,
+    claims_dir: PathBuf,
+    /// `(hook name, managed)` for each protocol hook.
+    hooks: Vec<(&'static str, bool)>,
+    /// Worktrees found outside the expected root: `(path, expected root)`.
+    layout_warnings: Vec<(PathBuf, PathBuf)>,
+}
+
+impl WtDoctorReport {
+    fn hooks_missing(&self) -> bool {
+        self.hooks.iter().any(|(_, managed)| !managed)
+    }
+
+    fn ok(&self) -> bool {
+        !self.hooks_missing() && self.layout_warnings.is_empty()
+    }
+}
+
+fn gather_wt_doctor(repo: &Repo) -> Result<WtDoctorReport> {
+    let worktree_root = worktree_root(repo)?;
+    let mut hooks = Vec::new();
     for hook in ["pre-commit", "pre-push"] {
         let path = repo.common_dir.join("hooks").join(hook);
-        let managed = hook_is_managed(&path)?;
-        if !managed {
-            hooks_missing = true;
+        hooks.push((hook, hook_is_managed(&path)?));
+    }
+    let mut layout_warnings = Vec::new();
+    for worktree in list_worktrees()? {
+        if worktree.path != repo.root && !worktree.path.starts_with(&worktree_root) {
+            layout_warnings.push((worktree.path, worktree_root.clone()));
         }
-        let status = if managed { "OK" } else { "missing" };
+    }
+    Ok(WtDoctorReport {
+        repo: repo.root.clone(),
+        worktree_root,
+        claims_dir: repo.common_dir.join("agent-claims"),
+        hooks,
+        layout_warnings,
+    })
+}
+
+fn render_wt_doctor_json(report: &WtDoctorReport) -> Result<String> {
+    let mut checks = Vec::new();
+    for (hook, managed) in &report.hooks {
+        checks.push(if *managed {
+            crate::DoctorCheck::pass(
+                format!("hook:{hook}"),
+                format!("managed {hook} hook installed"),
+            )
+        } else {
+            crate::DoctorCheck::fail(
+                format!("hook:{hook}"),
+                format!("managed {hook} hook missing"),
+                Some("install the managed hooks with `coven hooks install`".to_string()),
+            )
+        });
+    }
+    checks.push(if report.layout_warnings.is_empty() {
+        crate::DoctorCheck::pass(
+            "layout",
+            format!("all worktrees are under {}", report.worktree_root.display()),
+        )
+    } else {
+        let offenders = report
+            .layout_warnings
+            .iter()
+            .map(|(path, _)| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(", ");
+        crate::DoctorCheck::fail(
+            "layout",
+            format!(
+                "{} worktree(s) outside {}: {}",
+                report.layout_warnings.len(),
+                report.worktree_root.display(),
+                offenders
+            ),
+            None,
+        )
+    });
+
+    let ok = report.ok();
+    let value = serde_json::json!({
+        "ok": ok,
+        "blocking": !ok,
+        "repo": report.repo.to_string_lossy(),
+        "worktree_root": report.worktree_root.to_string_lossy(),
+        "claims_dir": report.claims_dir.to_string_lossy(),
+        "checks": checks,
+    });
+    serde_json::to_string_pretty(&value).context("failed to serialize wt doctor report as JSON")
+}
+
+fn wt_doctor(repo: &Repo, json: bool) -> Result<()> {
+    let report = gather_wt_doctor(repo)?;
+    if json {
+        println!("{}", render_wt_doctor_json(&report)?);
+        if !report.ok() {
+            crate::exit_checks_failed();
+        }
+        return Ok(());
+    }
+
+    println!("Coven Parallel Work Protocol doctor");
+    println!("repo: {}", report.repo.display());
+    println!("worktree root: {}", report.worktree_root.display());
+    println!("claims: {}", report.claims_dir.display());
+    for (hook, managed) in &report.hooks {
+        let status = if *managed { "OK" } else { "missing" };
         println!("hook {hook}: {status}");
     }
-    if hooks_missing {
+    if report.hooks_missing() {
         println!("install the managed hooks with `coven hooks install`");
     }
-    let mut layout_ok = true;
-    for worktree in list_worktrees()? {
-        let expected_root = worktree_root(repo)?;
-        if worktree.path != repo.root && !worktree.path.starts_with(&expected_root) {
-            layout_ok = false;
-            println!(
-                "layout warning: {} is outside {}",
-                worktree.path.display(),
-                expected_root.display()
-            );
-        }
+    for (path, expected_root) in &report.layout_warnings {
+        println!(
+            "layout warning: {} is outside {}",
+            path.display(),
+            expected_root.display()
+        );
     }
-    if hooks_missing || !layout_ok {
+    if !report.ok() {
         crate::exit_checks_failed();
     }
     Ok(())
@@ -896,5 +992,82 @@ mod tests {
         assert_eq!(worktrees[1]["branch"], serde_json::Value::Null);
         assert_eq!(worktrees[1]["dirty"], false);
         assert_eq!(worktrees[1]["claimed_by"], serde_json::Value::Null);
+    }
+
+    fn sample_wt_doctor_report() -> WtDoctorReport {
+        WtDoctorReport {
+            repo: PathBuf::from("/tmp/repo"),
+            worktree_root: PathBuf::from("/tmp/repo.wt"),
+            claims_dir: PathBuf::from("/tmp/repo/.git/agent-claims"),
+            hooks: vec![("pre-commit", true), ("pre-push", true)],
+            layout_warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn wt_doctor_json_reports_healthy_repo() {
+        let report = sample_wt_doctor_report();
+        let body = render_wt_doctor_json(&report).expect("render");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["blocking"], false);
+        assert_eq!(value["repo"], "/tmp/repo");
+        assert_eq!(value["worktree_root"], "/tmp/repo.wt");
+        assert_eq!(value["claims_dir"], "/tmp/repo/.git/agent-claims");
+
+        let checks = value["checks"].as_array().expect("checks array");
+        assert_eq!(checks.len(), 3);
+        assert_eq!(checks[0]["id"], "hook:pre-commit");
+        assert_eq!(checks[0]["status"], "pass");
+        assert_eq!(checks[1]["id"], "hook:pre-push");
+        assert_eq!(checks[1]["status"], "pass");
+        assert_eq!(checks[2]["id"], "layout");
+        assert_eq!(checks[2]["status"], "pass");
+    }
+
+    #[test]
+    fn wt_doctor_json_flags_missing_hook_with_install_hint() {
+        let mut report = sample_wt_doctor_report();
+        report.hooks = vec![("pre-commit", true), ("pre-push", false)];
+        let body = render_wt_doctor_json(&report).expect("render");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["blocking"], true);
+        let checks = value["checks"].as_array().expect("checks array");
+        assert_eq!(checks[1]["id"], "hook:pre-push");
+        assert_eq!(checks[1]["status"], "fail");
+        assert_eq!(
+            checks[1]["hint"],
+            "install the managed hooks with `coven hooks install`"
+        );
+    }
+
+    #[test]
+    fn wt_doctor_json_flags_layout_offenders() {
+        let mut report = sample_wt_doctor_report();
+        report.layout_warnings = vec![(
+            PathBuf::from("/elsewhere/stray"),
+            PathBuf::from("/tmp/repo.wt"),
+        )];
+        let body = render_wt_doctor_json(&report).expect("render");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["blocking"], true);
+        let layout = &value["checks"][2];
+        assert_eq!(layout["id"], "layout");
+        assert_eq!(layout["status"], "fail");
+        let message = layout["message"].as_str().expect("message");
+        assert!(message.contains("/elsewhere/stray"));
+        assert!(message.contains("/tmp/repo.wt"));
+    }
+
+    #[test]
+    fn wt_json_flag_requires_list_or_doctor() {
+        let err = run_wt_command(Some("feat/x"), false, true, false, false, None)
+            .expect_err("must reject --json without --list/--doctor");
+        assert!(err.to_string().contains("--json requires"));
     }
 }
