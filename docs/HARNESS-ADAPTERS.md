@@ -9,7 +9,7 @@ description: "How Coven harness adapters work, how external adapters graduate, a
 
 # Harness adapter guide
 
-Coven should treat every harness as an adapter. The daemon ships a small bundled compatibility adapter set for Codex and Claude Code, but no harness should become privileged runtime logic. OpenClaw, Hermes, Aider, Gemini, and future agents should enter through the same adapter contract and maturity checklist.
+Coven should treat every harness as an adapter. The daemon ships a small bundled compatibility adapter set for Codex, Claude Code, and GitHub Copilot CLI, but no harness should become privileged runtime logic. OpenClaw, Hermes, Aider, Gemini, and future agents should enter through the same adapter contract and maturity checklist.
 
 The goal is a harness-neutral runtime:
 
@@ -38,7 +38,7 @@ The current implementation expects the prompt to be the final command argument a
 
 New harnesses should not be added as one-off special cases across the daemon, TUI, docs, OpenClaw plugin, and package READMEs. Add a reusable adapter description first, then wire the daemon and clients against that description.
 
-For now, Codex and Claude Code remain the bundled compatibility defaults. Additional harnesses can be tested through explicit adapter manifests.
+For now, Codex, Claude Code, and GitHub Copilot CLI remain the bundled compatibility defaults. Additional harnesses can be tested through explicit adapter manifests.
 
 Load one manifest file:
 
@@ -185,7 +185,7 @@ Do not promote a harness to public support by only adding it to `built_in_harnes
 
 ## Bundled compatibility adapters
 
-The bundled compatibility adapters are Codex and Claude Code. They are first-class supported user paths, not a model for hardcoding every future harness.
+The bundled compatibility adapters are Codex, Claude Code, and GitHub Copilot CLI. They are first-class supported user paths, not a model for hardcoding every future harness.
 
 ### Codex
 

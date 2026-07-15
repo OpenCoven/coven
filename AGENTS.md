@@ -90,8 +90,8 @@ justifying comment.
 
 - **Keep the Rust authority boundary clean.** Business/authority logic lives in
   the Rust crates. Don't push core decisions into the TS packages.
-- **v0 harness support stays focused on Codex and Claude Code** until policy and
-  adapter contracts are stable. Don't add speculative harness adapters.
+- **Supported harness set is Codex, Claude Code, and GitHub Copilot CLI** until
+  policy and adapter contracts are stable. Don't add speculative harness adapters.
 - **Never weaken the secret scan.** If `check-secrets.py` flags something, fix
   the content — don't allowlist your way past it.
 - Prefer the fast loop (`cargo check`, debug builds) over `--release` unless you

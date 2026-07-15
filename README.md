@@ -86,7 +86,7 @@ The Rust daemon is the authority boundary. All clients — including the CLI its
 ## Features
 
 - **🏠 Project-root boundaries** — Every launch is tied to an explicit repository or project root. The daemon rejects working directories that escape the declared boundary.
-- **🔌 Harness-neutral runtime** — v0 focuses on Codex and Claude Code with a clean adapter path for future harnesses (Hermes, Aider, Gemini, and user-defined CLIs).
+- **🔌 Harness-neutral runtime** — supported harnesses are Codex, Claude Code, and GitHub Copilot CLI, with a clean adapter path for future harnesses (Hermes, Aider, Gemini, and user-defined CLIs).
 - **🖥️ Interactive session browser** — Live and completed work can be selected, rejoined, viewed, archived, restored, or sacrificed without memorizing IDs.
 - **📡 Attachable PTY sessions** — Live sessions can be replayed or followed from explicit CLI verbs.
 - **🔌 Local daemon API** — CastCodes, comux, and the OpenClaw plugin coordinate through one versioned socket contract (`coven.daemon.v1`).
@@ -719,7 +719,7 @@ Yes. The daemon exposes a stable `coven.daemon.v1` HTTP API over a local Unix so
 
 **Q: What if I want to add a new harness (like Aider or Gemini)?**
 
-See [`docs/HARNESS-ADAPTERS.md`](docs/HARNESS-ADAPTERS.md) for the adapter contract. The v0 focus is Codex and Claude Code — new harnesses are planned for later milestones after adapter contracts are stable.
+See [`docs/HARNESS-ADAPTERS.md`](docs/HARNESS-ADAPTERS.md) for the adapter contract. The supported set is Codex, Claude Code, and GitHub Copilot CLI — new harnesses are planned for later milestones after adapter contracts are stable.
 
 ---
 
@@ -799,7 +799,7 @@ cargo run -p coven-cli -- daemon stop
 
 - **Rust is the authority layer.** Process launch, cwd/project-root validation, PTY lifecycle, session persistence, and socket request enforcement are all Rust's responsibility. TypeScript clients improve UX but are never the trust boundary.
 - **All clients are untrusted for enforcement** — this includes comux and the OpenClaw plugin.
-- **Keep harness support focused.** v0 targets Codex and Claude Code only until adapter contracts are stable.
+- **Keep harness support focused.** Supported harnesses are Codex, Claude Code, and GitHub Copilot CLI only until adapter contracts are stable.
 - **OpenClaw separation.** Do not place Coven code in OpenClaw core. The integration belongs in `packages/openclaw-coven` as `@opencoven/coven`.
 - **No future orchestration commands as user-facing** until they exist in the CLI and socket API.
 
