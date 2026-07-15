@@ -103,13 +103,15 @@ flowchart TB
 | `coven sacrifice <session-id> --yes` | Permanently delete a non-running session. |
 | `coven kill <session-id>` | Kill a running session's process; keeps the event log. |
 | `coven patch openclaw <prompt>` | Local OpenClaw rescue loop. Does not commit or push. |
-| `coven logs prune` | Prune expired encrypted raw artifacts and old redacted event logs. |
-| `coven vacuum` | Rebuild the session event FTS index, compact the SQLite store, and print integrity status. |
-| `coven wt <branch>` | Create or enter a sibling `<repo>.wt/<branch-slug>` git worktree. |
-| `coven wt --list/--doctor/--prune-merged/--prune-stale DAYS` | Inspect and clean Coven protocol worktrees. |
-| `coven claim acquire/release/heartbeat/canary <branch>` | Manage TTL-bounded branch ownership for the current agent. |
-| `coven claim status` | Print branch claims from the current repository. |
-| `coven hooks install` | Install local protocol hooks that block unsafe commits and protected pushes. |
+| `coven logs prune` | Prune expired encrypted raw artifacts and old redacted event logs; see [cli-logs](cli-logs.md). |
+| `coven vacuum` | Rebuild the session event FTS index, compact the SQLite store, and print integrity status; see [cli-vacuum](cli-vacuum.md). |
+| `coven wt <branch>` | Create or enter a sibling `<repo>.wt/<branch-slug>` git worktree; see [cli-wt](cli-wt.md). |
+| `coven wt --list/--doctor/--prune-merged/--prune-stale DAYS` | Inspect and clean Coven protocol worktrees; see [cli-wt](cli-wt.md). |
+| `coven claim acquire/release/heartbeat/canary <branch>` | Manage TTL-bounded branch ownership for the current agent; see [cli-claim](cli-claim.md). |
+| `coven claim status` | Print branch claims from the current repository; see [cli-claim](cli-claim.md). |
+| `coven hooks install` | Install local protocol hooks that block unsafe commits and protected pushes; see [cli-claim](cli-claim.md). |
+| `coven engine status/install/which` | Manage the pinned Coven engine (`coven-code`); see [cli-engine](cli-engine.md). |
+| `coven executor probe/run-job` | Stateless executor-node protocol commands, hub-dispatched over SSH; see [cli-executor](cli-executor.md). |
 | `coven pc` | macOS-first diagnostics and explicit `--confirm` relief operations. |
 | `coven completions <shell>` | Print shell completions for bash, zsh, fish, elvish, or powershell. |
 | `coven familiars/skills/memory/research/calls` | Read-path Cave parity views; see [cli-observe](cli-observe.md). |
@@ -131,6 +133,7 @@ flowchart TB
 | `coven logs prune` | `--dry-run`, `--raw-days <N>`, `--event-days <N>` |
 | `coven wt` | `--list`, `--json` (with `--list`), `--doctor`, `--prune-merged`, `--prune-stale <DAYS>` |
 | `coven claim status` | `--json` |
+| `coven engine status` | `--json` |
 | `coven pc kill` | `--confirm` (required) |
 | `coven pc cache clear` | `--confirm` (required) |
 | `coven pc top` | `--n <N>`, `--verbose`, `--json` |
