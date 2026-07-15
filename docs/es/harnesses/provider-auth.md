@@ -62,6 +62,7 @@ Los clientes (comux, el cliente de chat/captura, el plugin de OpenClaw) se conec
 |---|---|---|---|
 | `codex` | `codex login` | `~/.codex/auth.json` (o keychain de plataforma, según la versión de Codex) | Usa `codex logout` para revocar. Coven no necesita reiniciarse. |
 | `claude` | `claude doctor` y luego sigue las indicaciones | `~/.config/anthropic/` y/o keychain del sistema | `claude doctor` también es una comprobación general de salud; Coven solo depende de que el binario esté presente. |
+| `copilot` | `copilot login` | `~/.copilot/` (token del device-flow de GitHub gestionado por la CLI) | Usa `copilot logout` para revocar. El acceso a Copilot del lado de GitHub lo gobierna tu plan de GitHub. |
 
 Si el flujo `login` del harness en sí tiene un problema (refresh token expirado, org revocada, fallo de red), Coven lo presenta como una salida normal del harness — la sesión termina con cualquier código de salida que devuelva la CLI, y el log de eventos contiene el mensaje de error impreso por la CLI.
 

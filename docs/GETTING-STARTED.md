@@ -13,7 +13,7 @@ This guide takes a new user from a fresh checkout or npm install to a visible pr
 
 ## What Coven is
 
-Coven is a local-first runtime for coding-agent harnesses. It runs supported CLIs such as Codex and Claude Code inside explicit project boundaries, records session metadata and events, and exposes the work through a CLI, TUI, and local socket API.
+Coven is a local-first runtime for coding-agent harnesses. It runs supported CLIs such as Codex, Claude Code, and GitHub Copilot CLI inside explicit project boundaries, records session metadata and events, and exposes the work through a CLI, TUI, and local socket API.
 
 The short promise:
 

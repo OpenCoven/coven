@@ -31,6 +31,7 @@ El daemon revalida el id de harness en cada petición de lanzamiento. Los client
 |---|---|---|---|---|
 | `codex` | `codex` | `npm install -g @openai/codex` | `codex login` | [Harness de Codex](/harnesses/codex) |
 | `claude` | `claude` | `npm install -g @anthropic-ai/claude-code` | `claude doctor` | [Harness de Claude Code](/harnesses/claude-code) |
+| `copilot` | `copilot` | `npm install -g @github/copilot` | `copilot login` | [Harness de Copilot CLI](/harnesses/copilot-cli) |
 
 Otras CLIs (Hermes, Aider, Gemini CLI, Cline, comandos personalizados) **no** forman parte de v0. Consulta [Notas sobre futuros harnesses](/FUTURE-HARNESSES) para conocer la dirección del adaptador.
 
@@ -46,6 +47,9 @@ Otras CLIs (Hermes, Aider, Gemini CLI, Cline, comandos personalizados) **no** fo
 
     # Anthropic Claude Code
     npm install -g @anthropic-ai/claude-code
+
+    # GitHub Copilot CLI
+    npm install -g @github/copilot
     ```
 
     Otras rutas de instalación (Homebrew, gestores de paquetes, compilar desde fuente) están documentadas en el README propio de cada proyecto. Coven solo requiere que el binario esté en `PATH` bajo el nombre de ejecutable esperado.
@@ -57,6 +61,7 @@ Otras CLIs (Hermes, Aider, Gemini CLI, Cline, comandos personalizados) **no** fo
     ```bash
     codex login
     claude doctor
+    copilot login
     ```
 
     Consulta [Límite de auth del proveedor](/harnesses/provider-auth) para conocer la justificación.
@@ -95,6 +100,7 @@ Coven no auto-actualiza las CLIs de harness. Trátalas como instalaciones global
 ```bash
 npm install -g @openai/codex@latest
 npm install -g @anthropic-ai/claude-code@latest
+npm install -g @github/copilot@latest
 ```
 
 Después de actualizar, vuelve a ejecutar `coven doctor` para confirmar que la ruta/versión resuelta aún coincide con lo que esperas.
@@ -115,7 +121,7 @@ coven doctor
 | Síntoma | Causa probable | Solución |
 |---|---|---|
 | `coven doctor` informa un harness como `missing` incluso tras instalar | El daemon no recogió el nuevo `PATH` del shell | `coven daemon restart`, luego `coven doctor`. |
-| Doctor encuentra el binario pero `coven run` falla inmediatamente | Auth del proveedor incompleta | Re-ejecuta `codex login` / `claude doctor`. Consulta [auth del proveedor](/harnesses/provider-auth). |
+| Doctor encuentra el binario pero `coven run` falla inmediatamente | Auth del proveedor incompleta | Re-ejecuta `codex login` / `claude doctor` / `copilot login`. Consulta [auth del proveedor](/harnesses/provider-auth). |
 | Doctor muestra una versión obsoleta | Binario más antiguo más temprano en `PATH` | `which -a codex` (o `claude`) y elimina el duplicado. |
 | Doctor informa `unsupported harness` | Error tipográfico en el id de harness | Usa uno de los ids de la tabla anterior. |
 

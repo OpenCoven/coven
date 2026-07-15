@@ -1,5 +1,5 @@
 ---
-summary: "Adapter direction after Codex and Claude Code."
+summary: "Adapter direction after Codex, Claude Code, and Copilot CLI."
 read_when:
   - Tracking the harness roadmap
 title: "Future harnesses"

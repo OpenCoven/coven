@@ -31,6 +31,7 @@ The daemon revalidates the harness id on every launch request. Clients cannot wi
 |---|---|---|---|---|
 | `codex` | `codex` | `npm install -g @openai/codex` | `codex login` | [Codex harness](/harnesses/codex) |
 | `claude` | `claude` | `npm install -g @anthropic-ai/claude-code` | `claude doctor` | [Claude Code harness](/harnesses/claude-code) |
+| `copilot` | `copilot` | `npm install -g @github/copilot` | `copilot login` | [Copilot CLI harness](/harnesses/copilot-cli) |
 
 Other CLIs (Hermes, Aider, Gemini CLI, Cline, custom commands) are **not** bundled in v0. Test them through an explicit manifest and `coven adapter doctor`; see [Future harness notes](/FUTURE-HARNESSES) for the adapter direction.
 
@@ -46,6 +47,9 @@ Other CLIs (Hermes, Aider, Gemini CLI, Cline, custom commands) are **not** bundl
 
     # Anthropic Claude Code
     npm install -g @anthropic-ai/claude-code
+
+    # GitHub Copilot CLI
+    npm install -g @github/copilot
     ```
 
     Other install paths (Homebrew, package managers, build-from-source) are documented in each project's own README. Coven only requires the binary to be on `PATH` under the expected executable name.
@@ -57,6 +61,7 @@ Other CLIs (Hermes, Aider, Gemini CLI, Cline, custom commands) are **not** bundl
     ```bash
     codex login
     claude doctor
+    copilot login
     ```
 
     See [Provider auth boundary](/harnesses/provider-auth) for the rationale.
@@ -76,6 +81,7 @@ Other CLIs (Hermes, Aider, Gemini CLI, Cline, custom commands) are **not** bundl
     daemon:   running  (pid 12345)
     codex:    ok       (/usr/local/bin/codex 0.x.y)
     claude:   ok       (/usr/local/bin/claude 0.x.y)
+    copilot:  ok       (/usr/local/bin/copilot 1.x.y)
     ```
 
     If a row shows `missing`, doctor also prints the exact install command shown in the table above. `coven adapter list --json` is the machine-readable form for clients such as Coven Cave.
@@ -85,6 +91,7 @@ Other CLIs (Hermes, Aider, Gemini CLI, Cline, custom commands) are **not** bundl
     ```bash
     coven run codex "describe this repo"
     coven run claude "polish the CLI help text"
+    coven run copilot "explain the failing CI job"
     ```
   </Step>
 </Steps>
@@ -96,6 +103,7 @@ Coven does not auto-update harness CLIs. Treat them as ordinary global npm (or o
 ```bash
 npm install -g @openai/codex@latest
 npm install -g @anthropic-ai/claude-code@latest
+npm install -g @github/copilot@latest
 ```
 
 After updating, re-run `coven doctor` to confirm the resolved path/version still matches what you expect.
@@ -116,8 +124,8 @@ coven doctor
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `coven doctor` reports a harness as `missing` even after install | New shell `PATH` not picked up by the daemon | `coven daemon restart`, then `coven doctor`. |
-| Doctor finds the binary but `coven run` fails immediately | Provider auth incomplete | Re-run `codex login` / `claude doctor`. See [provider auth](/harnesses/provider-auth). |
-| Doctor shows a stale version | Older binary earlier on `PATH` | `which -a codex` (or `claude`) and remove the duplicate. |
+| Doctor finds the binary but `coven run` fails immediately | Provider auth incomplete | Re-run `codex login` / `claude doctor` / `copilot login`. See [provider auth](/harnesses/provider-auth). |
+| Doctor shows a stale version | Older binary earlier on `PATH` | `which -a codex` (or `claude`, `copilot`) and remove the duplicate. |
 | Doctor reports `unsupported harness` | Typo in harness id | Use one of the ids in the table above. |
 
 
@@ -126,5 +134,6 @@ coven doctor
 - [Harnesses](/harnesses)
 - [Codex harness](/harnesses/codex)
 - [Claude Code harness](/harnesses/claude-code)
+- [Copilot CLI harness](/harnesses/copilot-cli)
 - [Harness adapters](/HARNESS-ADAPTERS)
 - [Future harness notes](/FUTURE-HARNESSES)

@@ -62,6 +62,7 @@ Append-only журнал событий записывает stdout/stderr harne
 |---|---|---|---|
 | `codex` | `codex login` | `~/.codex/auth.json` (или платформенный keychain, в зависимости от версии Codex) | Используй `codex logout`, чтобы отозвать. Coven не нужно перезапускать. |
 | `claude` | `claude doctor`, затем следуй подсказкам | `~/.config/anthropic/` и/или системный keychain | `claude doctor` также является общей проверкой здоровья; Coven полагается только на наличие бинарника. |
+| `copilot` | `copilot login` | `~/.copilot/` (токен device-flow GitHub, управляемый самой CLI) | Используй `copilot logout`, чтобы отозвать. Доступ к Copilot на стороне GitHub определяется твоим планом GitHub. |
 
 Если поток `login` самого harness'а имеет проблему (истёкший refresh-токен, отозванная org, сетевой сбой), Coven отображает это как нормальный выход harness'а — сессия заканчивается с тем кодом выхода, который вернула CLI, а журнал событий содержит сообщение об ошибке, напечатанное CLI.
 

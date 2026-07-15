@@ -17,6 +17,9 @@ A **harness** is an external coding-agent CLI that Coven can launch and supervis
   <Card title="Claude Code" href="/harnesses/claude-code" icon="brain">
     Anthropic Claude Code. Harness id `claude`.
   </Card>
+  <Card title="Copilot CLI" href="/harnesses/copilot-cli" icon="github">
+    GitHub Copilot CLI. Harness id `copilot`.
+  </Card>
   <Card title="OpenClaw bridge" href="/harnesses/openclaw" icon="plug">
     External ACP runtime bridge through external OpenClaw bridge plugin.
   </Card>
@@ -32,11 +35,13 @@ flowchart LR
   Coven[Coven daemon] --> Adapter[Adapter router]
   Adapter --> CodexAdapter[Codex adapter]
   Adapter --> ClaudeAdapter[Claude adapter]
+  Adapter --> CopilotAdapter[Copilot adapter]
   Adapter -. future .-> Future[Hermes / Aider / Gemini]
   OpenClaw[OpenClaw] --> Bridge["OpenClaw bridge plugin"]
   Bridge --> Coven
   CodexAdapter --> CodexPty[Codex PTY]
   ClaudeAdapter --> ClaudePty[Claude Code PTY]
+  CopilotAdapter --> CopilotPty[Copilot CLI PTY]
 ```
 
 ## What every harness has in common
@@ -49,7 +54,7 @@ flowchart LR
 
 ## What stays with the harness
 
-- **Provider auth.** Coven does not store API keys or OAuth tokens. `codex login` and `claude doctor` keep working as they did before.
+- **Provider auth.** Coven does not store API keys or OAuth tokens. `codex login`, `claude doctor`, and `copilot login` keep working as they did before.
 - **Conversation state.** The harness owns its own prompt cache, system prompt, and tool registry.
 - **Tool execution.** Tools run in-process inside the harness; Coven's job is to give it a clean PTY and a project-rooted cwd.
 
@@ -63,12 +68,15 @@ See [Provider auth boundary](/harnesses/provider-auth) for the credential-isolat
     npm install -g @openai/codex
     # or
     npm install -g @anthropic-ai/claude-code
+    # or
+    npm install -g @github/copilot
     ```
   </Step>
   <Step title="Finish provider auth">
     ```bash
     codex login
     claude doctor
+    copilot login
     ```
   </Step>
   <Step title="Verify Coven sees it">

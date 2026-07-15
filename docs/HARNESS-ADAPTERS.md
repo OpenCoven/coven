@@ -32,7 +32,7 @@ A Coven harness adapter defines:
   and `continuity_args` (the [coven-runtimes](https://github.com/OpenCoven/coven-runtimes)
   manifest additions — see below).
 
-The current implementation expects the prompt to be the final command argument after any fixed prefix args. Keep that invariant unless the adapter explicitly documents a safer stdin or protocol mode.
+The current implementation expects the prompt to be the final command argument after any fixed prefix args — either as a positional behind `--`, or bound to a declared `prompt_flag` (`--flag=<prompt>`) for harnesses with no positional prompt slot. Keep that invariant unless the adapter explicitly documents a safer stdin or protocol mode.
 
 ## External adapter rule
 
@@ -73,7 +73,7 @@ coven adapter list --json
 
 Coven does not auto-discover adapter manifests from `COVEN_HOME`, `~/.coven`, or `$XDG_CONFIG_HOME`. External manifests are trusted code-launch configuration, so operators must opt in with `COVEN_HARNESS_ADAPTER_MANIFEST` or `COVEN_HARNESS_ADAPTER_DIRS`.
 
-The prompt is appended as the final command argument after the configured prefix args. Adapter ids must be lowercase and must not collide with built-in ids. Executables are names only, not shell strings or paths.
+The prompt is appended as the final command argument after the configured prefix args (bound to the declared `prompt_flag` when the adapter has one). Adapter ids must be lowercase and must not collide with built-in ids. Executables are names only, not shell strings or paths.
 
 ### Declared capabilities, sandbox, and stream args
 
@@ -130,7 +130,17 @@ adapters deserialize unchanged with everything off):
 - `add_dir_flag` (alias `addDirFlag`) names the harness's native flag for
   trusting an additional directory beyond its cwd. Each
   `coven run --add-dir <DIR>` repeats as `[flag, <dir>]` ahead of the prompt
-  (the bundled Codex, Claude, and engine adapters all declare `--add-dir`).
+  (the bundled Codex, Claude, engine, and Copilot adapters all declare
+  `--add-dir`).
+- `prompt_flag` (alias `promptFlag`) names a flag that carries the user
+  prompt as its **value** for harnesses with no positional prompt slot (e.g.
+  Copilot's `--prompt`, Hermes' `-q`). Coven appends the bound
+  `--flag=<prompt>` form instead of `-- <prompt>`, so `-`-prefixed prompts
+  stay data. `interactive_prompt_flag` (alias `interactivePromptFlag`)
+  optionally overrides it for interactive launches only (Copilot opens its
+  TUI with `--interactive=<prompt>` but exits after a `--prompt=<prompt>`
+  run). Omit both and the prompt stays the final positional argument behind
+  `--`.
 - Adapters that declare none of this keep today's conservative behavior:
   one-shot launches only, `--permission` and `--add-dir` are warned no-ops.
 

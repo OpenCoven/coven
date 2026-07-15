@@ -6,6 +6,12 @@ read_when:
 title: "Coven changelog and release notes"
 ---
 
+## Week of July 14, 2026
+
+### New features
+
+- **GitHub Copilot CLI is a supported built-in harness (v0.0.54).** `coven run copilot "…"` now launches the GitHub Copilot CLI (`npm install -g @github/copilot`) under the same project-rooted PTY supervision as Codex and Claude Code. `--permission full|read-only` maps to Copilot's native flags (`--allow-all` / `--deny-tool write --deny-tool shell`), `--model`, `--add-dir`, and `--think`/`--speed` (via `--effort`) forward natively, and `coven chat` keeps cross-turn conversations through pre-assigned `--session-id` UUIDs. Copilot has no long-lived stream mode, so chat turns run per-turn one-shots like Codex. `coven doctor` detects the binary and prints install/auth hints (`copilot login`). Adapter manifests gain optional `prompt_flag`/`interactive_prompt_flag` fields for harnesses whose prompt rides a flag instead of a positional. See [Copilot CLI harness](/harnesses/copilot-cli) and [issue #381](https://github.com/OpenCoven/coven/issues/381).
+
 ## Week of July 4, 2026
 
 ### New features

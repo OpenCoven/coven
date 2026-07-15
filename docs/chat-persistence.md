@@ -9,6 +9,7 @@ extend the mechanism to additional harnesses.
 | --- | --- | --- |
 | `claude` | ✅ stream-mode | Long-lived `claude --print --input-format stream-json --output-format stream-json --verbose` daemon process per chat, plus `--session-id <uuid>` on the first turn and `--resume <uuid>` for cross-restart continuation. Turn 1 spawns + sends initial user envelope; turns 2..N pipe a new user envelope into the same stdin (no cold-start). Unix kills the stream process tree with `setsid()` + `kill(-pid, SIGKILL)`; Windows uses a Job Object owned by the daemon. |
 | `codex` | ✅ per-turn | Chat runs plain `codex exec …`; it captures `session id: <uuid>` from output and feeds it back as `codex exec … resume <uuid> <prompt>` on later turns. `coven run codex --stream-json` separately uses Codex's one-shot `exec --json` protocol, but Codex has no long-lived stream mode, so each chat turn cold-starts. |
+| `copilot` | ✅ per-turn | Chat pre-assigns a UUID on turn 1 (`copilot --session-id <uuid> --prompt=…`) and sends the same `--session-id <uuid>` on later turns. Copilot has no long-lived stream mode, so each chat turn cold-starts. `--session-id` resumes an existing session *or* creates a fresh one under that id, so stale ids self-heal instead of erroring. |
 
 Conversations persist across `coven chat` invocations on a per-project basis:
 on startup the chat seeds its in-memory map from
@@ -84,9 +85,10 @@ claude across `coven chat` restarts), the chat app passes a
 
 The chat app keeps a `HashMap<harness_id, conversation_id>` seeded from the
 persistence file on startup. On the first turn for a harness that doesn't
-have a stored id yet, it generates a UUID (claude) or waits to capture one
-from output (codex), stores it, and sends `Init` (claude) or no hint
-(codex). On every later turn it sends `Resume` with the stored id. `/clear`
+have a stored id yet, it generates a UUID (claude, copilot) or waits to
+capture one from output (codex), stores it, and sends `Init` (claude,
+copilot) or no hint (codex). On every later turn it sends `Resume` with the
+stored id. `/clear`
 (and Ctrl+L) drop the map *and* the visible transcript; `/new` drops just
 the map.
 
@@ -147,7 +149,9 @@ CLI's own session API avoids both problems.
   re-sends the user's original prompt with no resume hint, **and**
   suppresses every remaining event from the failed daemon session (the
   stale-error chunk itself, any trailing teardown output, and the orphaned
-  exit event). The transcript reads: "Prior <harness> conversation no
+  exit event). Copilot never enters this path: its `--session-id` resumes
+  re-create a missing session under the same id instead of erroring. The
+  transcript reads: "Prior <harness> conversation no
   longer exists. Starting a new one and re-sending your message." → reply
   from the fresh conversation, with no scary raw error in between.
   Bounded to one auto-retry per user turn — a second stale event in the
@@ -172,7 +176,10 @@ CLI's own session API avoids both problems.
    Claude: pre-assign via `--session-id <uuid>`, resume via `--resume <uuid>`
    — both work with `--print`. Codex: auto-assigns and prints
    `session id: <uuid>` in the run header; resume via `codex exec … resume
-   <uuid> <prompt>`.
+   <uuid> <prompt>`. Copilot: `--session-id <uuid>` serves both directions —
+   it pre-assigns on a fresh launch and resumes an existing session
+   (`--resume` only binds its value as `--resume=<id>`, which the token-pair
+   continuity form can't emit).
 
 2. **Extend `continuity_args` in `crates/coven-cli/src/harness.rs`.** Add a
    new arm to the `match spec.id` block translating `Init` and `Resume` into

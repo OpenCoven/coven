@@ -29,7 +29,7 @@ flowchart TD
   DaemonChk -- yes --> Harness{harness detected?}
   Harness -- no --> InstallHarness["Install harness CLI\n(see install hint)"]
   Harness -- yes --> RunChk{coven run works?}
-  RunChk -- no --> RunFix["Check provider auth\n(codex login / claude doctor)"]
+  RunChk -- no --> RunFix["Check provider auth\n(codex login / claude doctor / copilot login)"]
   RunChk -- yes --> AttachChk{attach behavior expected?}
   AttachChk -- no --> AttachFix["Session may be archived/orphaned\nUse coven sessions --all"]
   AttachChk -- yes --> Done([Working])
