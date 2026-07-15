@@ -417,7 +417,7 @@ fn dispatch_cast_plan(plan: CastPlan) -> Result<()> {
             }
         }
         CastIntent::Doctor => {
-            run_doctor()?;
+            run_doctor(false)?;
             CastOutcome {
                 request: request_text,
                 launched: Some("Coven doctor".to_string()),
@@ -1649,7 +1649,7 @@ fn run_magical_tui_action(action: MagicalTuiAction) -> Result<()> {
         MagicalTuiAction::StartHere => run_new_user_start_here(),
         MagicalTuiAction::Help => run_tui_help(),
         MagicalTuiAction::OpenTui => run(),
-        MagicalTuiAction::Doctor => run_doctor(),
+        MagicalTuiAction::Doctor => run_doctor(false),
         MagicalTuiAction::DaemonStatus => run_daemon_command(DaemonCommand::Status { json: false }),
         MagicalTuiAction::CovenStatus => run_observe_view(cast::ObserveView::Status),
         MagicalTuiAction::RunHarness => run_guided_harness_session(),
@@ -1910,7 +1910,7 @@ fn run_new_user_start_here() -> Result<()> {
     println!("  2. coven run codex \"explain this repo in 5 bullets\"");
     println!("  3. coven sessions");
     println!("\nSetup check:\n");
-    run_doctor()
+    run_doctor(false)
 }
 
 fn run_guided_harness_session() -> Result<()> {

@@ -97,7 +97,10 @@ enum Command {
     #[command(
         about = "Check local setup and print next steps (exits 1 when a blocking problem is found)"
     )]
-    Doctor,
+    Doctor {
+        #[arg(long, help = "Print checks as JSON (machine-readable)")]
+        json: bool,
+    },
     #[command(about = "Generate shell completions (bash, zsh, fish, elvish, powershell)")]
     Completions {
         #[arg(help = "Shell to generate completions for")]
@@ -493,6 +496,8 @@ enum AdapterCommand {
     Doctor {
         #[arg(help = "Adapter id to diagnose")]
         adapter: Option<String>,
+        #[arg(long, help = "Print checks as JSON (machine-readable)")]
+        json: bool,
     },
     #[command(about = "Install a trusted local adapter recipe")]
     Install {
@@ -700,7 +705,7 @@ fn run_cli(cli: Cli) -> Result<()> {
 
     match cli.command {
         None | Some(Command::Chat) | Some(Command::Tui) => run_shared_interactive_shell(),
-        Some(Command::Doctor) => run_doctor(),
+        Some(Command::Doctor { json }) => run_doctor(json),
         Some(Command::Completions { shell }) => {
             use clap::CommandFactory;
             clap_complete::generate(
@@ -1248,49 +1253,153 @@ fn interactive_shell_route(
 /// `coven doctor && …`. Individual missing harnesses print `[!!]` but don't
 /// fail the check while another harness is available — one working harness
 /// makes coven usable.
-fn run_doctor() -> Result<()> {
+/// Everything `coven doctor` inspects, gathered before rendering so the
+/// prose and `--json` surfaces read the same probe results and cannot drift.
+struct DoctorReport {
+    home: PathBuf,
+    project_root: Option<PathBuf>,
+    daemon: Option<daemon::DaemonStatusState>,
+    repos_config_path: PathBuf,
+    repos: Vec<DoctorRepoReport>,
+    harnesses: Vec<harness::HarnessSummary>,
+    engine: Option<DoctorEngineReport>,
+    /// See [`credentials_lines`] for the meaning of the nesting.
+    engine_auth: Option<Option<bool>>,
+    familiars_manifest: PathBuf,
+    familiars: std::result::Result<Vec<cockpit_sources::FamiliarDto>, String>,
+    default_harness: Option<String>,
+}
+
+struct DoctorRepoReport {
+    name: String,
+    path: PathBuf,
+    ok: bool,
+}
+
+struct DoctorEngineReport {
+    path: PathBuf,
+    source_label: String,
+    version: Option<(u64, u64, u64)>,
+}
+
+impl DoctorReport {
+    /// A blocking problem exists exactly when one of these holds; prose exit
+    /// codes and the JSON `ok` field both derive from this list.
+    fn healthy(&self) -> bool {
+        let daemon_ok = !matches!(self.daemon, Some(daemon::DaemonStatusState::Stale(_)));
+        let repos_ok = self.repos.iter().all(|repo| repo.ok);
+        let harness_ok = self.harnesses.iter().any(|harness| harness.available);
+        let engine_ok = match &self.engine {
+            None => false,
+            Some(engine) => engine
+                .version
+                .map(engine::version_meets_minimum)
+                .unwrap_or(true),
+        };
+        daemon_ok && repos_ok && harness_ok && engine_ok
+    }
+}
+
+fn gather_doctor_report() -> Result<DoctorReport> {
     let home = coven_home_dir()?;
-    let mut healthy = true;
-    println!("Coven doctor");
-    println!("Store: {}", home.display());
-    match std::env::current_dir()
+    let project_root = std::env::current_dir()
         .ok()
-        .and_then(|cwd| project::canonical_project_root(&cwd).ok())
-    {
+        .and_then(|cwd| project::canonical_project_root(&cwd).ok());
+    let daemon = daemon::background_server_status(&home)?;
+    let repos_config = repos_config::load_with_settings(&home, settings::cached())?;
+    let repos = repos_config
+        .entries()
+        .map(|(name, path)| {
+            let ok = path.is_dir() && path.join(".git").exists();
+            DoctorRepoReport {
+                name: name.to_string(),
+                path,
+                ok,
+            }
+        })
+        .collect();
+    let harnesses = harness::configured_harnesses()?;
+    let (engine, engine_auth) = match engine::resolve() {
+        Some(resolved) => {
+            let auth = engine_auth_summary(&resolved.path);
+            (
+                Some(DoctorEngineReport {
+                    source_label: engine_source_label(&resolved.source).to_string(),
+                    version: engine::engine_version(&resolved.path).ok(),
+                    path: resolved.path,
+                }),
+                Some(auth),
+            )
+        }
+        None => (None, None),
+    };
+    let familiars = cockpit_sources::read_familiars(&home).map_err(|err| format!("{err:#}"));
+    Ok(DoctorReport {
+        familiars_manifest: home.join("familiars.toml"),
+        repos_config_path: repos_config::config_path(&home),
+        home,
+        project_root,
+        daemon,
+        repos,
+        harnesses,
+        engine,
+        engine_auth,
+        familiars,
+        default_harness: default_harness_id(),
+    })
+}
+
+fn run_doctor(json: bool) -> Result<()> {
+    let report = gather_doctor_report()?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&doctor_json_body(&report))?
+        );
+        if !report.healthy() {
+            exit_checks_failed();
+        }
+        return Ok(());
+    }
+    print_doctor_prose(&report);
+    if !report.healthy() {
+        println!("\nDoctor found problems; review the failing checks above.");
+        exit_checks_failed();
+    }
+    Ok(())
+}
+
+fn print_doctor_prose(report: &DoctorReport) {
+    println!("Coven doctor");
+    println!("Store: {}", report.home.display());
+    match &report.project_root {
         Some(root) => println!("Project: {}", root.display()),
         None => println!("Project: not inside a git/project root yet"),
     }
 
     println!("\nDaemon:");
-    match daemon::background_server_status(&home)? {
+    match &report.daemon {
         Some(daemon::DaemonStatusState::Running(status)) => {
             // `ok` is always true for a live daemon, so the prose "Running"
             // already conveys it; the `--json` path keeps the field.
             println!("  Running (pid {}, socket {})", status.pid, status.socket);
         }
         Some(daemon::DaemonStatusState::Stale(status)) => {
-            healthy = false;
             println!("  Stale (pid {}, socket {})", status.pid, status.socket);
         }
         None => println!("  Not running"),
     }
 
-    let repos_config = repos_config::load_with_settings(&home, settings::cached())?;
-    if !repos_config.is_empty() {
-        println!("\nRepos ({}):", repos_config::config_path(&home).display());
-        for (name, path) in repos_config.entries() {
-            let ok = path.is_dir() && path.join(".git").exists();
-            if !ok {
-                healthy = false;
-            }
-            let marker = if ok { "OK" } else { "!!" };
-            println!("  [{marker}] {name:<16} {}", path.display());
+    if !report.repos.is_empty() {
+        println!("\nRepos ({}):", report.repos_config_path.display());
+        for repo in &report.repos {
+            let marker = if repo.ok { "OK" } else { "!!" };
+            println!("  [{marker}] {:<16} {}", repo.name, repo.path.display());
         }
     }
 
     println!("\nHarnesses:");
-    let harnesses = harness::configured_harnesses()?;
-    for harness in &harnesses {
+    for harness in &report.harnesses {
         let status = if harness.available {
             "ready"
         } else {
@@ -1307,78 +1416,273 @@ fn run_doctor() -> Result<()> {
             println!("       {}", harness.install_hint);
         }
     }
-    if !harnesses.iter().any(|harness| harness.available) {
-        healthy = false;
-    }
-
-    // Compute engine auth once so we can reuse it in the Credentials section
-    // without spawning the subprocess twice.
-    let engine_auth: Option<Option<bool>>;
 
     println!("\nEngine:");
-    match engine::resolve() {
-        Some(resolved) => {
-            println!(
-                "  [OK] {} ({})",
-                resolved.path.display(),
-                engine_source_label(&resolved.source)
-            );
-            match engine::engine_version(&resolved.path) {
-                Ok(version) => {
+    match &report.engine {
+        Some(engine) => {
+            println!("  [OK] {} ({})", engine.path.display(), engine.source_label);
+            match engine.version {
+                Some(version) => {
                     let (a, b, c) = version;
                     let (min_a, min_b, min_c) = engine::MIN_ENGINE_VERSION;
                     if engine::version_meets_minimum(version) {
                         println!("       version {a}.{b}.{c} (minimum {min_a}.{min_b}.{min_c})");
                     } else {
-                        healthy = false;
                         println!(
                             "  [!!] version {a}.{b}.{c} is older than the minimum {min_a}.{min_b}.{min_c} — run: coven engine install"
                         );
                     }
                 }
-                Err(_) => println!("       version: unknown (could not run the engine)"),
+                None => println!("       version: unknown (could not run the engine)"),
             }
             println!("       pin: {}", engine::pinned_version());
-            // auth is shown in the Credentials section below
-            engine_auth = Some(engine_auth_summary(&resolved.path));
         }
         None => {
-            healthy = false;
             println!("  [!!] the Coven engine is missing — `coven` and `coven chat` need it");
             for line in coven_code_install_instructions(target_shell()).lines() {
                 println!("     {line}");
             }
-            // engine is missing; Credentials section will reflect that
-            engine_auth = None;
         }
     }
 
-    print_familiars_section(&home);
+    print_familiars_section(&report.familiars_manifest, &report.familiars);
 
     println!("\nCredentials:");
-    for line in credentials_lines(engine_auth, &harnesses) {
+    for line in credentials_lines(report.engine_auth, &report.harnesses) {
         println!("{line}");
     }
 
     println!("\nNext steps:");
-    if let Some(default) = default_harness_id() {
-        println!("  coven run {default} \"explain this repo in 5 bullets\"");
-        println!("  coven sessions");
+    for line in doctor_next_steps(report.default_harness.as_deref()) {
+        println!("  {line}");
+    }
+}
+
+/// The "Next steps" block, shared verbatim by the prose and `--json` outputs.
+fn doctor_next_steps(default_harness: Option<&str>) -> Vec<String> {
+    match default_harness {
+        Some(default) => vec![
+            format!("coven run {default} \"explain this repo in 5 bullets\""),
+            "coven sessions".to_string(),
+        ],
+        None => vec![
+            "Install and authenticate at least one harness in this same shell.".to_string(),
+            "Codex: npm install -g @openai/codex && codex login".to_string(),
+            "Claude Code: npm install -g @anthropic-ai/claude-code && claude doctor".to_string(),
+            "If PATH changed, open a new terminal and run `coven doctor` again.".to_string(),
+            "Then run: coven daemon start".to_string(),
+            "Install docs: https://github.com/OpenCoven/coven/blob/main/docs/install/index.md"
+                .to_string(),
+        ],
+    }
+}
+
+#[derive(serde::Serialize)]
+struct DoctorCheck {
+    id: String,
+    /// "pass", "warn", or "fail". Every "fail" is blocking (doctor exits 1);
+    /// "warn" needs attention but does not block.
+    status: &'static str,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<String>,
+}
+
+impl DoctorCheck {
+    fn pass(id: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            status: "pass",
+            message: message.into(),
+            hint: None,
+        }
+    }
+
+    fn warn(id: impl Into<String>, message: impl Into<String>, hint: Option<String>) -> Self {
+        Self {
+            id: id.into(),
+            status: "warn",
+            message: message.into(),
+            hint,
+        }
+    }
+
+    fn fail(id: impl Into<String>, message: impl Into<String>, hint: Option<String>) -> Self {
+        Self {
+            id: id.into(),
+            status: "fail",
+            message: message.into(),
+            hint,
+        }
+    }
+}
+
+/// Derive the machine-readable check list from a gathered report. Statuses
+/// mirror the prose markers: `fail` is exactly the set of conditions that
+/// flip [`DoctorReport::healthy`], so `ok`/exit-code semantics stay identical
+/// across both output modes.
+fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
+    let mut checks = Vec::new();
+
+    checks.push(match &report.daemon {
+        Some(daemon::DaemonStatusState::Running(status)) => DoctorCheck::pass(
+            "daemon",
+            format!("running (pid {}, socket {})", status.pid, status.socket),
+        ),
+        Some(daemon::DaemonStatusState::Stale(status)) => DoctorCheck::fail(
+            "daemon",
+            format!(
+                "stale daemon record (pid {}, socket {})",
+                status.pid, status.socket
+            ),
+            Some("run: coven daemon restart".to_string()),
+        ),
+        None => DoctorCheck::warn(
+            "daemon",
+            "not running",
+            Some("run: coven daemon start".to_string()),
+        ),
+    });
+
+    for repo in &report.repos {
+        checks.push(if repo.ok {
+            DoctorCheck::pass(
+                format!("repo:{}", repo.name),
+                repo.path.display().to_string(),
+            )
+        } else {
+            DoctorCheck::fail(
+                format!("repo:{}", repo.name),
+                format!("{} is missing or not a git repository", repo.path.display()),
+                Some(format!(
+                    "fix the path in {}",
+                    report.repos_config_path.display()
+                )),
+            )
+        });
+    }
+
+    for harness in &report.harnesses {
+        checks.push(if harness.available {
+            DoctorCheck::pass(
+                format!("harness:{}", harness.id),
+                format!("`{}` is ready ({})", harness.executable, harness.source),
+            )
+        } else {
+            DoctorCheck::warn(
+                format!("harness:{}", harness.id),
+                format!("`{}` is missing", harness.executable),
+                Some(harness.install_hint.trim().to_string()),
+            )
+        });
+    }
+    let available = report
+        .harnesses
+        .iter()
+        .filter(|harness| harness.available)
+        .count();
+    checks.push(if available > 0 {
+        DoctorCheck::pass(
+            "harnesses",
+            format!(
+                "{available} of {} configured harnesses available",
+                report.harnesses.len()
+            ),
+        )
     } else {
-        println!("  Install and authenticate at least one harness in this same shell.");
-        println!("  Codex: npm install -g @openai/codex && codex login");
-        println!("  Claude Code: npm install -g @anthropic-ai/claude-code && claude doctor");
-        println!("  If PATH changed, open a new terminal and run `coven doctor` again.");
-        println!("  Then run: coven daemon start");
-        println!(
-            "  Install docs: https://github.com/OpenCoven/coven/blob/main/docs/install/index.md"
-        );
+        DoctorCheck::fail(
+            "harnesses",
+            "no harness is available",
+            Some("install codex or claude, then rerun coven doctor".to_string()),
+        )
+    });
+
+    checks.push(match &report.engine {
+        None => DoctorCheck::fail(
+            "engine",
+            "the Coven engine is missing — `coven` and `coven chat` need it",
+            Some("run: coven engine install".to_string()),
+        ),
+        Some(engine) => {
+            let located = format!("{} ({})", engine.path.display(), engine.source_label);
+            match engine.version {
+                None => DoctorCheck::warn(
+                    "engine",
+                    format!("{located}, version unknown (could not run the engine)"),
+                    None,
+                ),
+                Some(version) => {
+                    let (a, b, c) = version;
+                    let (min_a, min_b, min_c) = engine::MIN_ENGINE_VERSION;
+                    if engine::version_meets_minimum(version) {
+                        DoctorCheck::pass(
+                            "engine",
+                            format!("{located}, version {a}.{b}.{c} (pin {})", engine::pinned_version()),
+                        )
+                    } else {
+                        DoctorCheck::fail(
+                            "engine",
+                            format!(
+                                "version {a}.{b}.{c} is older than the minimum {min_a}.{min_b}.{min_c}"
+                            ),
+                            Some("run: coven engine install".to_string()),
+                        )
+                    }
+                }
+            }
+        }
+    });
+
+    checks.push(match &report.familiars {
+        Err(error) => DoctorCheck::warn(
+            "familiars",
+            format!(
+                "could not read {}: {error}",
+                report.familiars_manifest.display()
+            ),
+            None,
+        ),
+        Ok(familiars) if familiars.is_empty() => DoctorCheck::pass(
+            "familiars",
+            format!("none configured ({})", report.familiars_manifest.display()),
+        ),
+        Ok(familiars) => DoctorCheck::pass("familiars", format!("{} configured", familiars.len())),
+    });
+
+    if let Some(auth) = report.engine_auth {
+        checks.push(match auth {
+            Some(true) => DoctorCheck::pass("credentials:engine", "logged in"),
+            Some(false) => DoctorCheck::warn(
+                "credentials:engine",
+                "not logged in",
+                Some("run: coven auth login".to_string()),
+            ),
+            None => DoctorCheck::warn("credentials:engine", "auth check skipped", None),
+        });
     }
-    if !healthy {
-        println!("\nDoctor found problems; review the failing checks above.");
-        exit_checks_failed();
-    }
-    Ok(())
+
+    checks
+}
+
+fn doctor_json_body(report: &DoctorReport) -> serde_json::Value {
+    let checks = doctor_checks(report);
+    let ok = checks.iter().all(|check| check.status != "fail");
+    debug_assert_eq!(
+        ok,
+        report.healthy(),
+        "check statuses drifted from healthy()"
+    );
+    serde_json::json!({
+        "ok": ok,
+        "blocking": !ok,
+        "store": report.home.display().to_string(),
+        "project": report
+            .project_root
+            .as_ref()
+            .map(|root| root.display().to_string()),
+        "checks": checks,
+        "nextSteps": doctor_next_steps(report.default_harness.as_deref()),
+    })
 }
 
 /// Human label for an adapter spec's `source` field. The raw value ("bundled")
@@ -1395,13 +1699,15 @@ fn adapter_source_label(source: &str) -> &str {
 /// `coven run --familiar <id>` will resolve, and how fresh each one's memory is.
 /// Identity is the product's spine, so doctor should make it as visible as the
 /// daemon and harness state — without claiming anything the manifest doesn't say.
-fn print_familiars_section(home: &Path) {
-    let manifest = home.join("familiars.toml");
-    let familiars = match cockpit_sources::read_familiars(home) {
+fn print_familiars_section(
+    manifest: &Path,
+    familiars: &std::result::Result<Vec<cockpit_sources::FamiliarDto>, String>,
+) {
+    let familiars = match familiars {
         Ok(familiars) => familiars,
         Err(err) => {
             println!("\nFamiliars:");
-            println!("  !! could not read {}: {err:#}", manifest.display());
+            println!("  !! could not read {}: {err}", manifest.display());
             return;
         }
     };
@@ -1422,7 +1728,7 @@ fn print_familiars_section(home: &Path) {
         .map(|familiar| familiar.id.len())
         .max()
         .unwrap_or(0);
-    for familiar in &familiars {
+    for familiar in familiars {
         let role = if familiar.role.is_empty() {
             String::new()
         } else {
@@ -1438,7 +1744,7 @@ fn print_familiars_section(home: &Path) {
 fn run_adapter_command(command: AdapterCommand) -> Result<()> {
     match command {
         AdapterCommand::List { json } => run_adapter_list(json),
-        AdapterCommand::Doctor { adapter } => run_adapter_doctor(adapter.as_deref()),
+        AdapterCommand::Doctor { adapter, json } => run_adapter_doctor(adapter.as_deref(), json),
         AdapterCommand::Install { adapter } => run_adapter_install(&adapter),
     }
 }
@@ -1474,7 +1780,7 @@ fn run_adapter_list(json: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_adapter_doctor(adapter: Option<&str>) -> Result<()> {
+fn run_adapter_doctor(adapter: Option<&str>, json: bool) -> Result<()> {
     let harnesses = harness::configured_harnesses()?;
     let filtered: Vec<_> = match adapter {
         Some(id) => harnesses
@@ -1490,6 +1796,39 @@ fn run_adapter_doctor(adapter: Option<&str>) -> Result<()> {
                 "unknown adapter `{id}`; run `coven adapter list` to see configured adapters"
             );
         }
+    }
+
+    let ok = filtered.iter().all(|harness| harness.available);
+    if json {
+        let checks: Vec<DoctorCheck> = filtered
+            .iter()
+            .map(|harness| {
+                if harness.available {
+                    DoctorCheck::pass(
+                        format!("adapter:{}", harness.id),
+                        format!("`{}` is ready", harness.executable),
+                    )
+                } else {
+                    DoctorCheck::fail(
+                        format!("adapter:{}", harness.id),
+                        format!("`{}` is missing", harness.executable),
+                        Some(harness.install_hint.trim().to_string()),
+                    )
+                }
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": ok,
+                "blocking": !ok,
+                "checks": checks,
+            }))?
+        );
+        if !ok {
+            exit_checks_failed();
+        }
+        return Ok(());
     }
 
     println!("Coven adapter doctor");
@@ -1511,7 +1850,7 @@ fn run_adapter_doctor(adapter: Option<&str>) -> Result<()> {
             println!("       {}", harness.install_hint);
         }
     }
-    if filtered.iter().any(|harness| !harness.available) {
+    if !ok {
         println!("\nAdapter doctor found unavailable adapters; see the [!!] lines above.");
         exit_checks_failed();
     }
@@ -3514,6 +3853,14 @@ mod tests {
             }
             other => panic!("expected calls command, got {other:?}"),
         }
+        assert!(matches!(
+            Cli::parse_from(["coven", "doctor"]).command,
+            Some(Command::Doctor { json: false })
+        ));
+        assert!(matches!(
+            Cli::parse_from(["coven", "doctor", "--json"]).command,
+            Some(Command::Doctor { json: true })
+        ));
     }
 
     #[test]
@@ -4403,8 +4750,22 @@ mod tests {
         let doctor_one = Cli::parse_from(["coven", "adapter", "doctor", "claude"]);
         match doctor_one.command {
             Some(Command::Adapter {
-                command: AdapterCommand::Doctor { adapter },
-            }) => assert_eq!(adapter.as_deref(), Some("claude")),
+                command: AdapterCommand::Doctor { adapter, json },
+            }) => {
+                assert_eq!(adapter.as_deref(), Some("claude"));
+                assert!(!json);
+            }
+            other => panic!("expected adapter doctor command, got {other:?}"),
+        }
+
+        let doctor_json = Cli::parse_from(["coven", "adapter", "doctor", "--json"]);
+        match doctor_json.command {
+            Some(Command::Adapter {
+                command: AdapterCommand::Doctor { adapter, json },
+            }) => {
+                assert_eq!(adapter, None);
+                assert!(json);
+            }
             other => panic!("expected adapter doctor command, got {other:?}"),
         }
 
@@ -5117,6 +5478,160 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("missing"), "got: {}", lines[0]);
         assert!(lines[0].contains("[!!]"), "got: {}", lines[0]);
+    }
+
+    // --- doctor report/check unit tests ---
+
+    fn make_doctor_report() -> DoctorReport {
+        DoctorReport {
+            home: PathBuf::from("/tmp/coven-home"),
+            project_root: Some(PathBuf::from("/tmp/project")),
+            daemon: Some(daemon::DaemonStatusState::Running(daemon::DaemonStatus {
+                pid: 42,
+                started_at: "2026-01-01T00:00:00Z".to_string(),
+                socket: "/tmp/coven-home/coven.sock".to_string(),
+            })),
+            repos_config_path: PathBuf::from("/tmp/coven-home/repos.toml"),
+            repos: vec![],
+            harnesses: vec![make_harness_with_hint("codex", true, "npm i -g codex")],
+            engine: Some(DoctorEngineReport {
+                path: PathBuf::from("/usr/local/bin/coven-code"),
+                source_label: "managed install".to_string(),
+                version: Some(engine::MIN_ENGINE_VERSION),
+            }),
+            engine_auth: Some(Some(true)),
+            familiars_manifest: PathBuf::from("/tmp/coven-home/familiars.toml"),
+            familiars: Ok(vec![]),
+            default_harness: Some("codex".to_string()),
+        }
+    }
+
+    /// The JSON `ok` field is derived from check statuses while the exit code
+    /// derives from `healthy()`; they must agree for every failure mode.
+    #[test]
+    fn doctor_checks_fail_statuses_match_healthy() {
+        let healthy = make_doctor_report();
+        assert!(healthy.healthy());
+
+        let mut stale_daemon = make_doctor_report();
+        stale_daemon.daemon = Some(daemon::DaemonStatusState::Stale(daemon::DaemonStatus {
+            pid: 42,
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            socket: "/tmp/coven-home/coven.sock".to_string(),
+        }));
+
+        let mut bad_repo = make_doctor_report();
+        bad_repo.repos.push(DoctorRepoReport {
+            name: "openclaw".to_string(),
+            path: PathBuf::from("/does/not/exist"),
+            ok: false,
+        });
+
+        let mut no_harness = make_doctor_report();
+        no_harness.harnesses = vec![make_harness_with_hint("codex", false, "npm i -g codex")];
+
+        let mut no_engine = make_doctor_report();
+        no_engine.engine = None;
+        no_engine.engine_auth = None;
+
+        let mut old_engine = make_doctor_report();
+        old_engine.engine.as_mut().unwrap().version = Some((0, 0, 1));
+
+        let mut unknown_engine_version = make_doctor_report();
+        unknown_engine_version.engine.as_mut().unwrap().version = None;
+
+        for (label, report) in [
+            ("healthy", &healthy),
+            ("stale daemon", &stale_daemon),
+            ("bad repo", &bad_repo),
+            ("no harness", &no_harness),
+            ("no engine", &no_engine),
+            ("old engine", &old_engine),
+            ("unknown engine version", &unknown_engine_version),
+        ] {
+            let checks = doctor_checks(report);
+            let ok = checks.iter().all(|check| check.status != "fail");
+            assert_eq!(
+                ok,
+                report.healthy(),
+                "{label}: check statuses disagree with healthy()"
+            );
+        }
+    }
+
+    #[test]
+    fn doctor_json_body_shapes_the_scriptable_envelope() {
+        let mut report = make_doctor_report();
+        report.harnesses = vec![make_harness_with_hint("codex", false, "npm i -g codex\n")];
+        report.engine = None;
+        report.engine_auth = None;
+        report.default_harness = None;
+
+        let body = doctor_json_body(&report);
+        assert_eq!(body["ok"], serde_json::json!(false));
+        assert_eq!(body["blocking"], serde_json::json!(true));
+        assert_eq!(body["store"], serde_json::json!("/tmp/coven-home"));
+        assert_eq!(body["project"], serde_json::json!("/tmp/project"));
+        let checks = body["checks"].as_array().expect("checks array");
+        let harness_check = checks
+            .iter()
+            .find(|check| check["id"] == "harness:codex")
+            .expect("harness:codex check");
+        assert_eq!(harness_check["status"], "warn");
+        assert_eq!(harness_check["hint"], "npm i -g codex");
+        let aggregate = checks
+            .iter()
+            .find(|check| check["id"] == "harnesses")
+            .expect("harnesses check");
+        assert_eq!(aggregate["status"], "fail");
+        let engine = checks
+            .iter()
+            .find(|check| check["id"] == "engine")
+            .expect("engine check");
+        assert_eq!(engine["status"], "fail");
+        assert_eq!(engine["hint"], "run: coven engine install");
+        assert!(
+            checks
+                .iter()
+                .all(|check| check["id"] != "credentials:engine"),
+            "engine-missing reports must omit the engine credentials row"
+        );
+        let steps = body["nextSteps"].as_array().expect("nextSteps array");
+        assert!(
+            steps
+                .iter()
+                .any(|step| step.as_str().unwrap_or_default().contains("coven doctor")),
+            "setup loop should tell the user to rerun doctor: {steps:?}"
+        );
+    }
+
+    #[test]
+    fn doctor_passing_report_keeps_daemon_and_credentials_checks() {
+        let body = doctor_json_body(&make_doctor_report());
+        assert_eq!(body["ok"], serde_json::json!(true));
+        assert_eq!(body["blocking"], serde_json::json!(false));
+        let checks = body["checks"].as_array().expect("checks array");
+        let daemon = checks
+            .iter()
+            .find(|check| check["id"] == "daemon")
+            .expect("daemon check");
+        assert_eq!(daemon["status"], "pass");
+        assert!(
+            daemon["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("pid 42"),
+            "daemon message should carry the pid: {daemon}"
+        );
+        let credentials = checks
+            .iter()
+            .find(|check| check["id"] == "credentials:engine")
+            .expect("credentials:engine check");
+        assert_eq!(credentials["status"], "pass");
+        assert!(
+            checks.iter().all(|check| check["status"] != "fail"),
+            "healthy report must not contain fail checks"
+        );
     }
 
     #[test]

@@ -414,6 +414,135 @@ fn pc_top_and_disk_emit_machine_readable_json() -> anyhow::Result<()> {
 }
 
 #[test]
+fn doctor_json_reports_blocking_failure_when_no_harness_is_available() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    let fake_home = temp_dir.path().join("fake-home");
+    fs::create_dir_all(&coven_home)?;
+    fs::create_dir_all(&fake_home)?;
+    let coven = coven_bin();
+    let empty_path = OsString::new();
+
+    let output = Command::new(&coven)
+        .args(["doctor", "--json"])
+        .env("COVEN_HOME", &coven_home)
+        .env("PATH", &empty_path)
+        .env("HOME", &fake_home)
+        .output()?;
+
+    // Same exit contract as prose doctor: blocking problems exit 1.
+    assert_failure("doctor --json without harnesses", &output);
+    let value = parse_stdout_json("doctor --json without harnesses", &output)?;
+    assert_eq!(value["ok"], Value::Bool(false));
+    assert_eq!(value["blocking"], Value::Bool(true));
+    let checks = value["checks"]
+        .as_array()
+        .expect("doctor JSON should include a checks array");
+    let harnesses = checks
+        .iter()
+        .find(|check| check["id"] == "harnesses")
+        .expect("doctor JSON should include the harnesses aggregate check");
+    assert_eq!(harnesses["status"], "fail");
+    let engine = checks
+        .iter()
+        .find(|check| check["id"] == "engine")
+        .expect("doctor JSON should include the engine check");
+    assert_eq!(engine["status"], "fail");
+    assert!(
+        value["nextSteps"]
+            .as_array()
+            .is_some_and(|steps| !steps.is_empty()),
+        "doctor JSON should carry next steps: {value}"
+    );
+    Ok(())
+}
+
+#[test]
+fn doctor_json_passes_with_fake_harness_and_engine() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    fs::create_dir_all(&coven_home)?;
+    let fake_bin = temp_dir.path().join("bin");
+    fs::create_dir_all(&fake_bin)?;
+    write_fake_codex(&fake_bin)?;
+    write_fake_coven_code(&fake_bin)?;
+    let path = prepend_path(&fake_bin);
+    let coven = coven_bin();
+
+    let output = run_coven(&coven, &coven_home, &path, &["doctor", "--json"])?;
+
+    assert_success("doctor --json with fakes", &output);
+    let value = parse_stdout_json("doctor --json with fakes", &output)?;
+    assert_eq!(value["ok"], Value::Bool(true));
+    assert_eq!(value["blocking"], Value::Bool(false));
+    let checks = value["checks"]
+        .as_array()
+        .expect("doctor JSON should include a checks array");
+    assert!(
+        checks.iter().all(|check| check["status"] != "fail"),
+        "passing doctor must not report fail checks: {value}"
+    );
+    let codex = checks
+        .iter()
+        .find(|check| check["id"] == "harness:codex")
+        .expect("doctor JSON should report harness:codex");
+    assert_eq!(codex["status"], "pass");
+    Ok(())
+}
+
+#[test]
+fn adapter_doctor_json_reports_each_adapter() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    fs::create_dir_all(&coven_home)?;
+    let fake_bin = temp_dir.path().join("bin");
+    fs::create_dir_all(&fake_bin)?;
+    write_fake_codex(&fake_bin)?;
+    let path = prepend_path(&fake_bin);
+    let coven = coven_bin();
+
+    let output = run_coven(
+        &coven,
+        &coven_home,
+        &path,
+        &["adapter", "doctor", "codex", "--json"],
+    )?;
+
+    assert_success("adapter doctor codex --json", &output);
+    let value = parse_stdout_json("adapter doctor codex --json", &output)?;
+    assert_eq!(value["ok"], Value::Bool(true));
+    let checks = value["checks"]
+        .as_array()
+        .expect("adapter doctor JSON should include a checks array");
+    assert_eq!(checks.len(), 1);
+    assert_eq!(checks[0]["id"], "adapter:codex");
+    assert_eq!(checks[0]["status"], "pass");
+
+    // A missing adapter is blocking for adapter doctor: JSON keeps the exit-1
+    // contract and carries the install hint.
+    let empty_path = OsString::new();
+    let fake_home = temp_dir.path().join("fake-home");
+    fs::create_dir_all(&fake_home)?;
+    let output = Command::new(&coven)
+        .args(["adapter", "doctor", "codex", "--json"])
+        .env("COVEN_HOME", &coven_home)
+        .env("PATH", &empty_path)
+        .env("HOME", &fake_home)
+        .output()?;
+    assert_failure("adapter doctor codex --json (missing)", &output);
+    let value = parse_stdout_json("adapter doctor codex --json (missing)", &output)?;
+    assert_eq!(value["ok"], Value::Bool(false));
+    assert_eq!(value["checks"][0]["status"], "fail");
+    assert!(
+        value["checks"][0]["hint"]
+            .as_str()
+            .is_some_and(|hint| !hint.is_empty()),
+        "missing adapter should carry an install hint: {value}"
+    );
+    Ok(())
+}
+
+#[test]
 fn doctor_lists_configured_familiars() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let coven_home = temp_dir.path().join("coven-home");

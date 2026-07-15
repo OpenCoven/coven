@@ -16,6 +16,40 @@ coven doctor
 The command is read-only. It prints local setup state and a next step without
 starting a session.
 
+## Machine-readable output
+
+`coven doctor --json` emits one JSON document for scripts and CI gates, with
+the same exit contract as the prose output (exit 1 when a blocking problem is
+found):
+
+```json
+{
+  "ok": true,
+  "blocking": false,
+  "store": "/home/alex/.coven",
+  "project": "/home/alex/src/app",
+  "checks": [
+    { "id": "daemon", "status": "pass", "message": "running (pid 12345, socket /home/alex/.coven/coven.sock)" },
+    { "id": "harness:codex", "status": "pass", "message": "`codex` is ready (built-in)" },
+    { "id": "harnesses", "status": "pass", "message": "1 of 3 configured harnesses available" },
+    { "id": "engine", "status": "pass", "message": "/home/alex/.coven/engine/bin/coven-code (managed install), version 0.6.1 (pin 0.6.1)" }
+  ],
+  "nextSteps": ["coven run codex \"explain this repo in 5 bullets\"", "coven sessions"]
+}
+```
+
+Check `status` is `pass`, `warn`, or `fail`. Every `fail` is blocking — `ok`
+is false and the command exits 1 — while `warn` needs attention but does not
+block (for example a daemon that has not been started yet). Failing checks
+carry a `hint` with the repair command. Gate scripts on the envelope:
+
+```sh
+coven doctor --json | jq -e .ok
+```
+
+`coven adapter doctor [id] --json` uses the same envelope for adapter
+availability, where any missing adapter is a `fail`.
+
 ## What it checks
 
 | Section | Meaning |

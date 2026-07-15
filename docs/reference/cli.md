@@ -90,7 +90,7 @@ flowchart TB
 |---|---|
 | `coven` | Open the beginner-friendly interactive menu. |
 | `coven tui` | Explicitly open the slash-command TUI. |
-| `coven doctor` | Check local setup; exits 1 when a blocking problem is found. |
+| `coven doctor` | Check local setup; exits 1 when a blocking problem is found. `--json` emits a `{ ok, blocking, checks, nextSteps }` envelope. |
 | `coven status` | Ecosystem overview: daemon, sessions, familiars, skills, research, hub. Alias: `coven overview`. |
 | `coven daemon start/status/restart/stop` | Manage the local daemon. |
 | `coven run <harness> <prompt>` | Launch a project-scoped harness session. Current harness ids: `codex`, `claude`. |
@@ -120,6 +120,7 @@ flowchart TB
 | Command | Flags |
 |---|---|
 | `coven run` | `--cwd <path>`, `--title <text>`, `--detach`, `--model <id>`, `--think`, `--speed fast\|balanced\|thorough` |
+| `coven doctor` | `--json` |
 | `coven daemon status` | `--json` |
 | `coven sessions` | `--plain`, `--json`, `--all`, `--manage` |
 | `coven sessions events` | `--after-seq <SEQ>`, `--limit <N>`, `--json` |
