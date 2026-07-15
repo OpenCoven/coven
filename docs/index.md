@@ -187,4 +187,7 @@ coven daemon restart
   <Card title="Roadmap" href="/ROADMAP" icon="map">
     Current milestones, adapter direction, and public product boundaries.
   </Card>
+  <Card title="Merge guide" href="/MERGE-GUIDE" icon="git-merge">
+    Claims, worktrees, local gates, scoped PRs, and squash-merge attribution.
+  </Card>
 </Columns>
