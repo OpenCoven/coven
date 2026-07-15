@@ -393,7 +393,7 @@ fn dispatch_cast_plan(plan: CastPlan) -> Result<()> {
             }
         }
         CastIntent::KillSession { session_id } => {
-            let mut client = DaemonChatClient::default();
+            let mut client = DaemonChatClient::detect()?;
             client.kill_session(&session_id)?;
             CastOutcome {
                 request: request_text,
@@ -1165,7 +1165,7 @@ fn dispatch_via_daemon(
         conversation_id: None,
     };
 
-    let mut client = DaemonChatClient::default();
+    let mut client = DaemonChatClient::detect()?;
     let session = client.launch_session(launch).with_context(|| {
         format!(
             "Cast failed to launch {} session via the daemon",
@@ -1419,7 +1419,7 @@ fn attach_via_daemon(
     request_text: &str,
     origin: AttachOrigin,
 ) -> Result<CastOutcome> {
-    let mut client = DaemonChatClient::default();
+    let mut client = DaemonChatClient::detect()?;
     let session = client
         .get_session(session_id)
         .with_context(|| format!("Cast could not look up session `{session_id}` via the daemon"))?;

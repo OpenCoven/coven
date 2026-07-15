@@ -888,10 +888,7 @@ pub fn trusted_adapter_manifest_matches_recipe(path: &Path, adapter_id: &str) ->
 }
 
 fn coven_home_from_process_env() -> Option<PathBuf> {
-    env::var_os("COVEN_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| dirs_next::home_dir().map(|home| home.join(crate::DEFAULT_COVEN_HOME_DIR)))
+    crate::paths::coven_home_dir().ok()
 }
 
 fn adapter_manifest_paths_in_dir(dir: &Path) -> Vec<PathBuf> {

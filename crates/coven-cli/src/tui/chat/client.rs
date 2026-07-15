@@ -116,16 +116,16 @@ pub(crate) struct DaemonChatClient {
     api_checked: bool,
 }
 
-impl Default for DaemonChatClient {
-    fn default() -> Self {
-        Self {
-            coven_home: coven_home_dir(),
-            api_checked: false,
-        }
-    }
-}
-
 impl DaemonChatClient {
+    /// Resolve a client from the process environment. Fails when no Coven
+    /// home can be determined instead of guessing a cwd-relative `.coven`.
+    pub(crate) fn detect() -> anyhow::Result<Self> {
+        Ok(Self {
+            coven_home: crate::paths::coven_home_dir()?,
+            api_checked: false,
+        })
+    }
+
     /// Construct a client pinned to a specific Coven home directory. Used by
     /// the Cast follower when it needs to spin up a second client on a
     /// background thread without re-detecting `$COVEN_HOME`.
@@ -476,13 +476,6 @@ fn daemon_error(status: u16, body: &str) -> anyhow::Error {
         }
     }
     anyhow!("Coven daemon rejected request with HTTP {status}")
-}
-
-pub(super) fn coven_home_dir() -> PathBuf {
-    std::env::var_os("COVEN_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs_next::home_dir().map(|home| home.join(".coven")))
-        .unwrap_or_else(|| PathBuf::from(".coven"))
 }
 
 fn session_title(prompt: &str) -> String {

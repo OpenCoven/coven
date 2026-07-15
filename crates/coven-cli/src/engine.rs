@@ -101,15 +101,12 @@ pub fn resolve_from(
 
     // 2. Managed ~/.coven/engine/<current>/ENGINE_BIN_NAME
     if let Some(home) = home {
-        let current_file = home.join(".coven").join("engine").join("current");
+        let engine_root = crate::paths::managed_engine_root(home);
+        let current_file = engine_root.join("current");
         if let Ok(version) = std::fs::read_to_string(&current_file) {
             let version = version.trim();
             if !version.is_empty() {
-                let candidate = home
-                    .join(".coven")
-                    .join("engine")
-                    .join(version)
-                    .join(ENGINE_BIN_NAME);
+                let candidate = engine_root.join(version).join(ENGINE_BIN_NAME);
                 if is_executable(&candidate) {
                     return Some(ResolvedEngine {
                         path: candidate,

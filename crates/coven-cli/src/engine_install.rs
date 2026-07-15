@@ -86,7 +86,7 @@ impl Drop for ScratchGuard {
 /// (dev mode).
 pub fn install(version: &str, force: bool) -> Result<(PathBuf, InstallOutcome)> {
     let home = dirs_next::home_dir().context("cannot determine home directory")?;
-    let engine_root = home.join(".coven").join("engine");
+    let engine_root = crate::paths::managed_engine_root(&home);
     let dest_dir = engine_root.join(version);
     let dest = dest_dir.join(crate::engine::ENGINE_BIN_NAME);
     if dest.exists() && !force {

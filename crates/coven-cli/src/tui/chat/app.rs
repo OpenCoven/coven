@@ -18,7 +18,7 @@ use crate::{
 };
 
 use super::client::{
-    coven_home_dir, ChatClient, ChatDaemonStatus, ChatEventQuery, DaemonChatClient, LaunchRequest,
+    ChatClient, ChatDaemonStatus, ChatEventQuery, DaemonChatClient, LaunchRequest,
 };
 use super::persistence;
 use super::settings::{self, ChatSettings, StreamingMode};
@@ -252,15 +252,16 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
 pub(super) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 impl App {
-    pub(super) fn new() -> Self {
+    pub(super) fn new() -> anyhow::Result<Self> {
         let agents = discover_agents();
         let active_agent = agents.iter().position(|a| a.available);
-        Self::new_with_state(
+        let coven_home = crate::coven_home_dir()?;
+        Ok(Self::new_with_state(
             agents,
             active_agent,
-            Box::<DaemonChatClient>::default(),
-            Some(coven_home_dir()),
-        )
+            Box::new(DaemonChatClient::with_coven_home(coven_home.clone())),
+            Some(coven_home),
+        ))
     }
 
     pub(super) fn new_with_state(
@@ -870,7 +871,7 @@ impl App {
                 ));
             }
             CastIntent::Observe { view } => {
-                let home = self.coven_home.clone().unwrap_or_else(coven_home_dir);
+                let home = self.resolved_coven_home();
                 match crate::observe::view_text(&home, view) {
                     Ok(text) => {
                         self.push_system_message(text.trim_end());
@@ -1335,13 +1336,24 @@ impl App {
         }
     }
 
+    /// The Coven home for store-backed views and exports: the app-pinned
+    /// home (always set in production via [`App::new`]), else environment
+    /// resolution, else the bare default directory name as a display-safe
+    /// last resort when no home exists at all.
+    fn resolved_coven_home(&self) -> PathBuf {
+        self.coven_home
+            .clone()
+            .or_else(|| crate::coven_home_dir().ok())
+            .unwrap_or_else(|| PathBuf::from(crate::DEFAULT_COVEN_HOME_DIR))
+    }
+
     fn push_doctor_summary(&mut self) {
         let project = std::env::current_dir()
             .ok()
             .and_then(|cwd| project::canonical_project_root(&cwd).ok())
             .map(|root| root.display().to_string())
             .unwrap_or_else(|| "not inside a git/project root yet".to_string());
-        let store_path = self.coven_home.clone().unwrap_or_else(coven_home_dir);
+        let store_path = self.resolved_coven_home();
         let harnesses = harness::built_in_harnesses();
         let mut lines = vec![
             "Doctor".to_string(),
@@ -1871,8 +1883,7 @@ impl App {
             return;
         }
 
-        let home = dirs_next::home_dir().unwrap_or_default();
-        let export_dir = home.join(".coven").join("exports");
+        let export_dir = self.resolved_coven_home().join("exports");
         if std::fs::create_dir_all(&export_dir).is_err() {
             self.push_system_message("Failed to create export directory.");
             return;

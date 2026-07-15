@@ -30,6 +30,7 @@ mod observe;
 mod openclaw_repo;
 mod parallel_protocol;
 mod patch;
+mod paths;
 mod pc;
 mod privacy;
 mod project;
@@ -52,7 +53,8 @@ mod ward;
 // Ward::apply on the same write path; see threads_gate.rs.
 mod threads_gate;
 
-pub(crate) const DEFAULT_COVEN_HOME_DIR: &str = ".coven";
+pub(crate) use paths::{coven_home_dir, DEFAULT_COVEN_HOME_DIR};
+
 pub(crate) const STORE_FILE_NAME: &str = "coven.sqlite3";
 const DEFAULT_SESSION_STATUS: &str = "created";
 const RUNNING_SESSION_STATUS: &str = "running";
@@ -3747,56 +3749,6 @@ fn coven_store_path_if_exists() -> Result<Option<PathBuf>> {
     Ok(store_path.exists().then_some(store_path))
 }
 
-fn coven_home_dir() -> Result<PathBuf> {
-    coven_home_from_env(
-        std::env::var_os("COVEN_HOME"),
-        std::env::var_os("HOME"),
-        std::env::var_os("USERPROFILE"),
-        std::env::var_os("HOMEDRIVE"),
-        std::env::var_os("HOMEPATH"),
-        dirs_next::home_dir().map(OsString::from),
-    )
-}
-
-fn coven_home_from_env(
-    coven_home: Option<OsString>,
-    home: Option<OsString>,
-    user_profile: Option<OsString>,
-    home_drive: Option<OsString>,
-    home_path: Option<OsString>,
-    platform_home: Option<OsString>,
-) -> Result<PathBuf> {
-    if let Some(coven_home) = coven_home.filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(coven_home));
-    }
-
-    let home = home
-        .filter(|value| !value.is_empty())
-        .or_else(|| user_profile.filter(|value| !value.is_empty()))
-        .or_else(|| windows_home_from_drive_and_path(home_drive, home_path))
-        .or_else(|| platform_home.filter(|value| !value.is_empty()))
-        .ok_or_else(|| {
-            anyhow!(
-                "could not find a home directory for Coven. Set COVEN_HOME to choose a store path, \
-for example `COVEN_HOME=$HOME/.coven` on macOS/Linux or \
-`$env:COVEN_HOME=\"$env:USERPROFILE\\.coven\"` in PowerShell."
-            )
-        })?;
-    Ok(PathBuf::from(home).join(DEFAULT_COVEN_HOME_DIR))
-}
-
-fn windows_home_from_drive_and_path(
-    home_drive: Option<OsString>,
-    home_path: Option<OsString>,
-) -> Option<OsString> {
-    let drive = home_drive?.into_string().ok()?;
-    let path = home_path?.into_string().ok()?;
-    if drive.is_empty() || path.is_empty() {
-        return None;
-    }
-    Some(OsString::from(format!("{drive}{path}")))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4230,54 +4182,6 @@ mod tests {
             session_title(None, prompt),
             "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUV"
         );
-    }
-
-    #[test]
-    fn coven_home_from_env_respects_coven_home() -> Result<()> {
-        let path = coven_home_from_env(
-            Some(OsString::from("/tmp/custom-coven-home")),
-            Some(OsString::from("/tmp/ignored-home")),
-            None,
-            None,
-            None,
-            None,
-        )?;
-
-        assert_eq!(path, PathBuf::from("/tmp/custom-coven-home"));
-        Ok(())
-    }
-
-    #[test]
-    fn coven_home_from_env_defaults_under_home() -> Result<()> {
-        let path = coven_home_from_env(
-            None,
-            Some(OsString::from("/tmp/user-home")),
-            None,
-            None,
-            None,
-            None,
-        )?;
-
-        assert_eq!(path, PathBuf::from("/tmp/user-home").join(".coven"));
-        Ok(())
-    }
-
-    #[test]
-    fn coven_home_from_env_uses_windows_drive_and_path_when_needed() -> Result<()> {
-        let path = coven_home_from_env(
-            None,
-            None,
-            None,
-            Some(OsString::from("C:")),
-            Some(OsString::from("\\Users\\hostname")),
-            None,
-        )?;
-
-        assert_eq!(
-            path,
-            PathBuf::from("C:\\Users\\hostname").join(DEFAULT_COVEN_HOME_DIR)
-        );
-        Ok(())
     }
 
     #[test]
