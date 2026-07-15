@@ -19,20 +19,39 @@ Coven's local API is versioned as a **named contract**. The current value is `co
 
 ## Negotiation
 
+Read the version from `GET /api/v1/api-version` and the capability flags from `GET /api/v1/health`:
+
+```http
+GET /api/v1/api-version
+```
+
+```json
+{
+  "apiVersion": "coven.daemon.v1",
+  "supportedApiVersions": ["coven.daemon.v1"]
+}
+```
+
 ```http
 GET /api/v1/health
 ```
 
 ```json
 {
+  "ok": true,
   "apiVersion": "coven.daemon.v1",
-  "supportedVersions": ["coven.daemon.v1"],
+  "covenVersion": "0.0.0",
   "capabilities": {
     "sessions": true,
     "events": true,
-    "actions": true,
-    "harnesses": ["codex", "claude"]
-  }
+    "travel": true,
+    "scheduler": true,
+    "hub": true,
+    "executorDispatch": true,
+    "eventCursor": "sequence",
+    "structuredErrors": true
+  },
+  "daemon": { "pid": 12345, "startedAt": "2026-07-14T12:00:00Z", "socket": "/home/alex/.coven/coven.sock" }
 }
 ```
 
