@@ -53,7 +53,7 @@ mod ward;
 // Ward::apply on the same write path; see threads_gate.rs.
 mod threads_gate;
 
-pub(crate) use paths::{coven_home_dir, DEFAULT_COVEN_HOME_DIR};
+pub(crate) use paths::coven_home_dir;
 
 pub(crate) const STORE_FILE_NAME: &str = "coven.sqlite3";
 const DEFAULT_SESSION_STATUS: &str = "created";
@@ -4860,7 +4860,10 @@ mod tests {
         let _home = EnvVarGuard::remove("HOME");
         let _user_profile = EnvVarGuard::set("USERPROFILE", &user_profile);
 
-        assert_eq!(coven_home_dir()?, user_profile.join(DEFAULT_COVEN_HOME_DIR));
+        assert_eq!(
+            coven_home_dir()?,
+            user_profile.join(paths::DEFAULT_COVEN_HOME_DIR)
+        );
         Ok(())
     }
 

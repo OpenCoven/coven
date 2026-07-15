@@ -1192,7 +1192,7 @@ pub(crate) fn render_chat_frame_plain_for_test(width: u16, height: u16) -> Strin
         agents,
         Some(0),
         Box::new(DaemonChatClient::with_coven_home(std::env::temp_dir())),
-        None,
+        Some(std::env::temp_dir()),
     );
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -1763,7 +1763,7 @@ mod tests {
             Box::new(crate::tui::chat::client::DaemonChatClient::with_coven_home(
                 std::env::temp_dir(),
             )),
-            None,
+            Some(std::env::temp_dir()),
         );
         app.show_help = true;
         app.help_scroll = scroll;
