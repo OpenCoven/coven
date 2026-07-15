@@ -26,7 +26,7 @@ coven-runtime-spec = { git = "https://github.com/OpenCoven/coven-runtimes", tag 
 # Pinned to a release tag like coven-runtime-spec above. NOTE: repo is private
 # until the visibility flip (Val decision); local builds authenticate via the
 # git CLI (.cargo/config.toml `net.git-fetch-with-cli`).
-coven-threads-core = { git = "https://github.com/OpenCoven/coven-threads", tag = "v0.1.0", version = "0.1.0" }
+coven-threads-core = { git = "https://github.com/OpenCoven/coven-threads", tag = "v0.1.2", version = "0.1.0" }
 blake3 = "1"
 time = { version = "0.3", features = ["formatting"] }
 crossterm = "0.29"
