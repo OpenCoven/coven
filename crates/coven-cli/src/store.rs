@@ -227,6 +227,13 @@ pub struct StoreVacuumReport {
     pub integrity_check: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WardedSurfaceCommitment {
+    familiar_id: String,
+    surface: String,
+    entry_hash: Vec<u8>,
+}
+
 #[derive(Debug, Default)]
 pub struct EventsQueryOptions {
     pub after_seq: Option<i64>,
@@ -2223,6 +2230,7 @@ fn extract_transcript_texts(value: &serde_json::Value) -> Vec<String> {
 
 pub fn vacuum_store_path(path: &Path) -> Result<StoreVacuumReport> {
     let conn = open_store(path)?;
+    let pre_compaction = load_warded_surface_commitments(&conn)?;
 
     let event_index_rebuilt = sqlite_object_exists(&conn, "table", "events_fts")?;
     if event_index_rebuilt {
@@ -2234,11 +2242,90 @@ pub fn vacuum_store_path(path: &Path) -> Result<StoreVacuumReport> {
         .context("failed to vacuum Coven store")?;
     let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     let integrity_check = pragma_integrity_check(&conn)?;
+    append_compaction_ledger_events(&conn, &pre_compaction)?;
 
     Ok(StoreVacuumReport {
         event_index_rebuilt,
         integrity_check,
     })
+}
+
+fn load_warded_surface_commitments(conn: &Connection) -> Result<Vec<WardedSurfaceCommitment>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT familiar_id, surface, entry_hash
+             FROM ward_manifest
+             ORDER BY familiar_id, surface",
+        )
+        .context("loading warded surface commitments before compaction")?;
+    let rows = stmt.query_map([], |row| {
+        Ok(WardedSurfaceCommitment {
+            familiar_id: row.get(0)?,
+            surface: row.get(1)?,
+            entry_hash: row.get(2)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .context("reading warded surface commitments before compaction")
+}
+
+fn append_compaction_ledger_events(
+    conn: &Connection,
+    pre_compaction: &[WardedSurfaceCommitment],
+) -> Result<()> {
+    if pre_compaction.is_empty() {
+        return Ok(());
+    }
+
+    let format = time::format_description::well_known::Rfc3339;
+    let now = time::OffsetDateTime::now_utc().format(&format)?;
+    for pre in pre_compaction {
+        let post = load_warded_surface_commitment(conn, &pre.familiar_id, &pre.surface)?;
+        let decision = match post.as_deref() {
+            Some(bytes) if bytes == pre.entry_hash.as_slice() => "compacted:unchanged",
+            Some(_) => "compacted:changed",
+            None => "compacted:missing_post",
+        };
+        let files_touched = serde_json::to_string(&[pre.surface.as_str()])?;
+        conn.execute(
+            "INSERT INTO ward_audit (
+                event_type, proposal_id, familiar_id, ward_version, ward_hash,
+                tier, decision, approver, diff_hash, files_touched, channel,
+                thread_id, submitted_at, decided_at
+            ) VALUES (?1, NULL, ?2, NULL, ?3, NULL, ?4, NULL, ?5, ?6, ?7, NULL, ?8, ?8)",
+            params![
+                coven_threads_core::AuditEventType::CompactionLedger.tag(),
+                pre.familiar_id,
+                pre.entry_hash,
+                decision,
+                post,
+                files_touched,
+                format!("{:?}", coven_threads_core::Channel::Forced).to_lowercase(),
+                now,
+            ],
+        )
+        .with_context(|| {
+            format!(
+                "appending WARD-C6 compaction ledger for {}:{}",
+                pre.familiar_id, pre.surface
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn load_warded_surface_commitment(
+    conn: &Connection,
+    familiar_id: &str,
+    surface: &str,
+) -> Result<Option<Vec<u8>>> {
+    conn.query_row(
+        "SELECT entry_hash FROM ward_manifest WHERE familiar_id = ?1 AND surface = ?2",
+        params![familiar_id, surface],
+        |row| row.get(0),
+    )
+    .optional()
+    .context("loading warded surface commitment after compaction")
 }
 
 fn sqlite_object_exists(conn: &Connection, object_type: &str, name: &str) -> Result<bool> {
@@ -3754,6 +3841,101 @@ mod tests {
         let hits = search_events(&conn, "phoenix")?;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].event_id, "e1");
+        Ok(())
+    }
+
+    #[test]
+    fn vacuum_appends_compaction_ledger_for_warded_surface() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("test.sqlite3");
+        let conn = open_store(&path)?;
+        let pre_commitment = vec![0x42; 32];
+        conn.execute(
+            "INSERT INTO ward_manifest (familiar_id, surface, manifest_id, entry_hash)
+             VALUES ('sage', 'SOUL.md', '11111111-1111-1111-1111-111111111111', ?1)",
+            [&pre_commitment],
+        )?;
+        drop(conn);
+
+        vacuum_store_path(&path)?;
+
+        let conn = open_store(&path)?;
+        let row = conn.query_row(
+            "SELECT familiar_id, ward_hash, diff_hash, files_touched, channel, decision
+             FROM ward_audit WHERE event_type = 'compaction_ledger'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )?;
+        assert_eq!(row.0, "sage");
+        assert_eq!(row.1, pre_commitment);
+        assert_eq!(row.2, Some(vec![0x42; 32]));
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&row.3)?,
+            vec!["SOUL.md".to_string()]
+        );
+        assert_eq!(row.4.as_deref(), Some("forced"));
+        assert_eq!(row.5, "compacted:unchanged");
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit WHERE event_type = 'compaction_ledger'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn vacuum_without_warded_surfaces_appends_no_compaction_ledger() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("test.sqlite3");
+        drop(open_store(&path)?);
+
+        vacuum_store_path(&path)?;
+
+        let conn = open_store(&path)?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit WHERE event_type = 'compaction_ledger'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn compaction_ledger_keeps_ward_audit_append_only() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("test.sqlite3");
+        let conn = open_store(&path)?;
+        conn.execute(
+            "INSERT INTO ward_manifest (familiar_id, surface, manifest_id, entry_hash)
+             VALUES ('sage', 'SOUL.md', '11111111-1111-1111-1111-111111111111', ?1)",
+            [&vec![0x24; 32]],
+        )?;
+        drop(conn);
+
+        vacuum_store_path(&path)?;
+
+        let conn = open_store(&path)?;
+        let update = conn.execute(
+            "UPDATE ward_audit SET decision = 'tampered' WHERE event_type = 'compaction_ledger'",
+            [],
+        );
+        assert!(update.is_err(), "UPDATE must abort on ward_audit");
+        let delete = conn.execute(
+            "DELETE FROM ward_audit WHERE event_type = 'compaction_ledger'",
+            [],
+        );
+        assert!(delete.is_err(), "DELETE must abort on ward_audit");
         Ok(())
     }
 
