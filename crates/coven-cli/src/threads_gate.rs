@@ -912,6 +912,7 @@ tier = 0
         assert!(format!("{err:#}").contains("workspace-relative"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlinked_surface_is_refused_not_followed() {
         let f = fixture();
@@ -950,6 +951,7 @@ tier = 0
         assert!(format!("{err:#}").contains("not a regular file"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlinked_ancestor_directory_is_refused() {
         // Second review pass finding: symlink_metadata only guards the final
