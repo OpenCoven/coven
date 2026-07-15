@@ -16,6 +16,7 @@ repository: a repo at `~/src/coven` keeps its worktrees under
 coven wt fix/output-polish   # create (or re-enter) a worktree for the branch
 coven wt --list              # branch, dirty state, active claim, path
 coven wt --doctor            # layout + hook check; exits 1 on problems
+coven wt --doctor --json     # same checks, machine-readable
 coven wt --prune-merged      # remove clean worktrees merged into the primary
 coven wt --prune-stale 14    # remove clean worktrees untouched for 14 days
 ```
@@ -65,6 +66,45 @@ directory, and whether the managed `pre-commit`/`pre-push` hooks are
 installed. It warns about worktrees outside the `<repo>.wt` layout and exits
 1 when hooks are missing or the layout is broken — install the hooks with
 `coven hooks install` ([cli-claim](cli-claim.md)).
+
+`--doctor --json` emits the same machine-readable shape as the other doctor
+surfaces (`coven doctor --json`, `coven adapter doctor --json`), with the
+identical exit-code semantics:
+
+```sh
+coven wt --doctor --json
+```
+
+```json
+{
+  "ok": false,
+  "blocking": true,
+  "repo": "/home/alex/src/coven",
+  "worktree_root": "/home/alex/src/coven.wt",
+  "claims_dir": "/home/alex/src/coven/.git/agent-claims",
+  "checks": [
+    {
+      "id": "hook:pre-commit",
+      "status": "pass",
+      "message": "managed pre-commit hook installed"
+    },
+    {
+      "id": "hook:pre-push",
+      "status": "fail",
+      "message": "managed pre-push hook missing",
+      "hint": "install the managed hooks with `coven hooks install`"
+    },
+    {
+      "id": "layout",
+      "status": "pass",
+      "message": "all worktrees are under /home/alex/src/coven.wt"
+    }
+  ]
+}
+```
+
+Check `id`s are stable: `hook:pre-commit`, `hook:pre-push`, and `layout`.
+Every `fail` is blocking (exit 1).
 
 ## Pruning
 
