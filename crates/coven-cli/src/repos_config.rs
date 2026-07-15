@@ -72,10 +72,6 @@ impl ReposConfig {
             .iter()
             .map(|(name, entry)| (name.as_str(), expand_tilde(&entry.path)))
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.repos.is_empty()
-    }
 }
 
 fn expand_tilde(path: &Path) -> PathBuf {
@@ -104,7 +100,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let config = load(temp.path())?;
         assert_eq!(config, ReposConfig::default());
-        assert!(config.is_empty());
+        assert!(config.entries().next().is_none());
         assert!(config.default_name().is_none());
         Ok(())
     }
