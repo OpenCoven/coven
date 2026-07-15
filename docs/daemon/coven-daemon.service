@@ -15,7 +15,6 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=coven
-Group=coven
 
 # systemd creates/owns /var/lib/coven (0700) for this user on start.
 StateDirectory=coven
