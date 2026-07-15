@@ -20,6 +20,15 @@ clap_complete = "4"
 # release tag; the daemon reads a manifest's declared capabilities through
 # these types instead of hardcoded harness-id checks (integration.md, PR 1).
 coven-runtime-spec = { git = "https://github.com/OpenCoven/coven-runtimes", tag = "v0.1.3", version = "0.1.3" }
+# The authority-boundary gate layer for familiar protected surfaces
+# (PHASE-0-DESIGN.md in OpenCoven/coven-threads; RFC-0001 §5). The daemon is
+# the only caller: familiar-controlled processes never reach this crate.
+# Pinned to a release tag like coven-runtime-spec above. NOTE: repo is private
+# until the visibility flip (Val decision); local builds authenticate via the
+# git CLI (.cargo/config.toml `net.git-fetch-with-cli`).
+coven-threads-core = { git = "https://github.com/OpenCoven/coven-threads", tag = "v0.1.2", version = "0.1.0" }
+blake3 = "1"
+time = { version = "0.3", features = ["formatting"] }
 crossterm = "0.29"
 flate2 = "1"
 json5 = "1.3"
@@ -31,7 +40,7 @@ serde_json = "1"
 sha2 = "0.11"
 toml = "1.1"
 toml_edit = { version = "0.25", features = ["serde"] }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v5"] }
 sysinfo = "0.39"
 dirs-next = "2"
 chacha20poly1305 = { version = "0.10", features = ["std", "rand_core"] }

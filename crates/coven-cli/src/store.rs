@@ -472,6 +472,13 @@ pub fn open_store(path: &Path) -> Result<Connection> {
         ",
     )
     .context("failed to initialize Coven store schema")?;
+    // The coven-threads gate layer's daemon-owned tables: the append-only
+    // ward.audit ledger (single audit store — PHASE-0-DESIGN §3.4, RFC-0001
+    // §5.6) and the per-familiar surface baseline manifest. Both idempotent.
+    conn.execute_batch(coven_threads_core::WARD_AUDIT_SCHEMA_SQL)
+        .context("failed to initialize ward_audit schema")?;
+    conn.execute_batch(crate::threads_gate::WARD_MANIFEST_SCHEMA_SQL)
+        .context("failed to initialize ward_manifest schema")?;
     ensure_exit_code_column(&conn)?;
     ensure_archived_at_column(&conn)?;
     ensure_conversation_id_column(&conn)?;

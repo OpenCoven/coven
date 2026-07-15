@@ -2506,16 +2506,29 @@ fn apply_familiar_edits(
             return api_error(500, "ward_config_invalid", &format!("{error:#}"), None);
         }
     };
-    let ward = match ward::Ward::new(&workspace, config) {
+    let ward = match ward::Ward::new(&workspace, config.clone()) {
         Ok(ward) => ward,
         Err(error) => {
             return api_error(500, "ward_config_invalid", &format!("{error:#}"), None);
         }
     };
 
-    let report = ward.apply(&edits, &authorization)?;
-    let changes: Vec<Value> = report.changes.iter().map(ward_change_json).collect();
-    if report.is_refused() {
+    // The coven-threads gate (Phase 2, OpenCoven/coven-threads §5): protected
+    // (Tier 0) targets are validated against the familiar's weave — the typed
+    // authority state of each surface — before the Ward's own apply boundary.
+    // Editable-tier targets stay the Ward tiers' lane. Adjudication is pure
+    // (`Ward::evaluate`), so resolving targets here does not write anything.
+    let adjudication = ward.evaluate(&ward::Proposal {
+        targets: edits.iter().map(|e| e.target.clone()).collect(),
+        authorization: authorization.clone(),
+    });
+    // A proposal with any Blocked target (traversal/symlink escape, case
+    // collision, unauthorized Tier-0) is refused as a unit BEFORE the threads
+    // gate runs: a blocked target must never ride into a staged proposal, and
+    // 403 here matches Ward::apply's own all-or-nothing refusal shape.
+    if adjudication.is_blocked() {
+        let report = ward.apply(&edits, &authorization)?;
+        let changes: Vec<Value> = report.changes.iter().map(ward_change_json).collect();
         return api_error(
             403,
             "ward_refused",
@@ -2523,15 +2536,93 @@ fn apply_familiar_edits(
             Some(json!({ "changes": changes })),
         );
     }
+    let gated_targets: Vec<String> = adjudication
+        .decisions
+        .iter()
+        .filter(|d| d.tier == ward::Tier::Protected && !d.verdict.is_blocked())
+        .map(|d| d.resolved.clone())
+        .collect();
+    let gate_report = {
+        let conn = store::open_store(&store_path(coven_home))?;
+        match crate::threads_gate::gate_protected_edits(
+            &conn,
+            &crate::threads_gate::GateRequest {
+                coven_home,
+                familiar_id,
+                workspace: &workspace,
+                config: &config,
+                edits: &edits,
+                gated_targets: &gated_targets,
+                authorization: &authorization,
+            },
+        ) {
+            Ok(report) => report,
+            Err(error) => {
+                // Fail closed: a gate that cannot run is a refusal, never a
+                // pass-through (RFC-0001 §5.4 Gate 4).
+                return api_error(
+                    500,
+                    "threads_gate_unavailable",
+                    &format!("The authority gate could not adjudicate the proposal: {error:#}"),
+                    None,
+                );
+            }
+        }
+    };
+    match &gate_report.outcome {
+        crate::threads_gate::GateOutcome::Rejected => {
+            return api_error(
+                403,
+                "ward_refused",
+                "The authority gate rejected the proposal; nothing was written.",
+                Some(json!({ "threadsGate": gate_report.to_json() })),
+            );
+        }
+        crate::threads_gate::GateOutcome::Staged { .. } => {
+            // §5 DegradeToProposal: staged at ~/.coven/pending/, principal
+            // notified via the pending file + audit ledger; no write happens.
+            return json_response(
+                202,
+                &json!({
+                    "ok": true,
+                    "disposition": "staged",
+                    "threadsGate": gate_report.to_json(),
+                }),
+            );
+        }
+        crate::threads_gate::GateOutcome::Permitted => {}
+    }
+
+    let report = ward.apply(&edits, &authorization)?;
+    let changes: Vec<Value> = report.changes.iter().map(ward_change_json).collect();
+    let threads_gate_json = gate_report.to_json();
+    if report.is_refused() {
+        return api_error(
+            403,
+            "ward_refused",
+            "The Ward refused the proposal; nothing was written.",
+            Some(json!({ "changes": changes, "threadsGate": threads_gate_json })),
+        );
+    }
     if report.is_held() {
         return json_response(
             202,
-            &json!({ "ok": true, "disposition": "held", "changes": changes }),
+            &json!({
+                "ok": true,
+                "disposition": "held",
+                "changes": changes,
+                "threadsGate": threads_gate_json,
+            }),
         );
     }
     json_response(
         200,
-        &json!({ "ok": true, "disposition": "applied", "changes": changes }),
+        &json!({
+            "ok": true,
+            "disposition": "applied",
+            "changes": changes,
+            "threadsGate": threads_gate_json,
+        }),
     )
 }
 
@@ -5900,6 +5991,139 @@ tier = 1
             std::fs::read_to_string(workspace.join("SOUL.md"))?,
             "# Sage\n"
         );
+        // The coven-threads gate ran first and permitted: the verdict is in
+        // the payload and in the append-only ward_audit ledger.
+        assert_eq!(
+            body["threadsGate"]["outcome"]["kind"], "permitted",
+            "got {}",
+            response.body
+        );
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let decision: String = conn.query_row(
+            "SELECT decision FROM ward_audit WHERE familiar_id='sage' ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(decision, "permit");
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_stages_to_pending_after_out_of_band_drift() -> Result<()> {
+        // §5 of the coven-threads design (DegradeToProposal), end to end:
+        // baseline the surface, drift it outside the daemon, then propose —
+        // the write is staged at ~/.coven/pending/, the surface is untouched,
+        // and `staged` is the one additive disposition the §6 compatibility
+        // contract allows.
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+
+        // First signed request bootstraps the content baseline (held).
+        let first = post_edits(
+            home,
+            r#"{"edits":[{"target":"SOUL.md","contents":"new identity"}],
+                "principalKeyFingerprint":"fpr-val"}"#,
+        )?;
+        assert_eq!(first.status, 202, "got {}", first.body);
+
+        // Out-of-band drift: something edits SOUL.md around the daemon.
+        std::fs::write(workspace.join("SOUL.md"), "# Mallory\n")?;
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"SOUL.md","contents":"new identity v2"}],
+                "principalKeyFingerprint":"fpr-val"}"#,
+        )?;
+        assert_eq!(response.status, 202, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["disposition"], "staged");
+        assert_eq!(body["threadsGate"]["outcome"]["kind"], "staged");
+
+        let pending = body["threadsGate"]["outcome"]["pendingPath"]
+            .as_str()
+            .expect("staged outcome carries pendingPath");
+        assert!(
+            std::path::Path::new(pending).exists(),
+            "pending proposal file must exist"
+        );
+        // The staged proposal carries the full desired contents.
+        let staged: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(pending)?)?;
+        assert_eq!(staged["edits"][0]["surface"], "SOUL.md");
+        // Nothing wrote the protected surface.
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("SOUL.md"))?,
+            "# Mallory\n"
+        );
+        // The degrade decision is in the append-only ledger.
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let decision: String = conn.query_row(
+            "SELECT decision FROM ward_audit WHERE familiar_id='sage' ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(decision, "degrade_to_proposal");
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_blocked_target_refuses_even_with_drifted_surface() -> Result<()> {
+        // Review finding: a mixed proposal (drifted Tier-0 edit + traversal
+        // escape) must be refused as a unit BEFORE the threads gate can stage
+        // it — a blocked target must never ride into ~/.coven/pending/.
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+
+        // Baseline SOUL.md, then drift it so the gate would want to stage.
+        let first = post_edits(
+            home,
+            r#"{"edits":[{"target":"SOUL.md","contents":"new identity"}],
+                "principalKeyFingerprint":"fpr-val"}"#,
+        )?;
+        assert_eq!(first.status, 202, "got {}", first.body);
+        std::fs::write(workspace.join("SOUL.md"), "# Mallory\n")?;
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[
+                {"target":"SOUL.md","contents":"new identity v2"},
+                {"target":"../escape.md","contents":"nope"}
+            ], "principalKeyFingerprint":"fpr-val"}"#,
+        )?;
+        assert_eq!(response.status, 403, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "ward_refused");
+        // Nothing was staged and nothing escaped.
+        let pending = home.join("pending");
+        let staged_count = std::fs::read_dir(&pending)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(staged_count, 0, "blocked proposal must not stage");
+        assert!(!home.join("familiars/escape.md").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_editable_tier_bypasses_the_weave() -> Result<()> {
+        // Editable-tier writes are the Ward tiers' lane: the weave reports no
+        // verdicts and appends nothing to ward_audit.
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_warded_familiar(home)?;
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"notes/today.md","contents":"hello ward"}]}"#,
+        )?;
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(
+            body["threadsGate"]["verdicts"].as_array().map(Vec::len),
+            Some(0)
+        );
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM ward_audit", [], |row| row.get(0))?;
+        assert_eq!(count, 0);
         Ok(())
     }
 

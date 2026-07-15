@@ -47,6 +47,10 @@ mod verification;
 // Gate 3 (coherence review) remains a follow-up — see ward.rs.
 #[allow(dead_code)]
 mod ward;
+// The coven-threads validator call site: typed authority-state gating of
+// protected-surface mutations (OpenCoven/coven-threads Phase 2). Runs before
+// Ward::apply on the same write path; see threads_gate.rs.
+mod threads_gate;
 
 pub(crate) const DEFAULT_COVEN_HOME_DIR: &str = ".coven";
 pub(crate) const STORE_FILE_NAME: &str = "coven.sqlite3";
