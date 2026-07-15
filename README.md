@@ -369,6 +369,7 @@ The daemon exposes a versioned HTTP API over a Unix socket. The current public c
 | `/api/v1/health`                         | `GET`  | Daemon health, API version, and capability catalog          |
 | `/api/v1/api-version`                    | `GET`  | Active and supported API versions                           |
 | `/api/v1/capabilities`                   | `GET`  | Machine-readable capability catalog for clients             |
+| `/api/v1/capabilities/harnesses`         | `GET`  | Harness-native capability manifests plus Coven skills       |
 | `/api/v1/sessions`                       | `GET`  | List sessions                                               |
 | `/api/v1/sessions`                       | `POST` | Launch a session                                            |
 | `/api/v1/sessions/:id`                   | `GET`  | Fetch one session                                           |
