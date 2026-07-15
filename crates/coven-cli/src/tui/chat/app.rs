@@ -1387,7 +1387,8 @@ impl App {
             let m = match *harness_id {
                 "codex" => crate::capabilities::scan_codex_capabilities(&home),
                 "claude" => crate::capabilities::scan_claude_capabilities(&home),
-                _ => crate::capabilities::scan_copilot_capabilities(&home),
+                "copilot" => crate::capabilities::scan_copilot_capabilities(&home),
+                other => unreachable!("unhandled capabilities row for harness `{other}`"),
             };
             let instr = if m.global_instructions.present {
                 "✓"
