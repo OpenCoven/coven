@@ -330,12 +330,12 @@ pub fn handle_request_with_runtime(
         // the control-plane catalog (matched above), so the aggregate lives at
         // the reserved `harnesses` segment.
         ("GET", "/capabilities/harnesses") => {
-            let refresh = query.map(|q| q.contains("refresh=1")).unwrap_or(false);
+            let refresh = query.is_some_and(|q| query_param(q, "refresh") == Some("1"));
             json_response(200, &crate::capabilities::get_all(coven_home, refresh))
         }
         ("GET", p) if p.starts_with("/capabilities/") => {
             let harness_id = p.trim_start_matches("/capabilities/");
-            let refresh = query.map(|q| q.contains("refresh=1")).unwrap_or(false);
+            let refresh = query.is_some_and(|q| query_param(q, "refresh") == Some("1"));
             match crate::capabilities::get_one(coven_home, harness_id, refresh) {
                 Some(m) => json_response(200, &m),
                 None => api_error(

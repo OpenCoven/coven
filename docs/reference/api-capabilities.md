@@ -1,9 +1,9 @@
 ---
-summary: "GET /api/v1/capabilities discovery."
+summary: "GET /api/v1/capabilities discovery: control-plane catalog and harness manifests."
 read_when:
   - Looking up the capabilities API
 title: "Capabilities endpoint"
-description: "Reference for GET /api/v1/capabilities: the schema clients use to discover Coven daemon features, supported harnesses, and action ids."
+description: "Reference for the /api/v1/capabilities routes: the control-plane catalog on the bare path, the harness capability aggregate at /capabilities/harnesses, and single-harness manifests at /capabilities/:harnessId."
 ---
 
 Coven exposes two capability concepts on adjacent paths. Do not confuse them:
