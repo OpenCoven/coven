@@ -2515,6 +2515,20 @@ fn apply_familiar_edits(
         targets: edits.iter().map(|e| e.target.clone()).collect(),
         authorization: authorization.clone(),
     });
+    // A proposal with any Blocked target (traversal/symlink escape, case
+    // collision, unauthorized Tier-0) is refused as a unit BEFORE the threads
+    // gate runs: a blocked target must never ride into a staged proposal, and
+    // 403 here matches Ward::apply's own all-or-nothing refusal shape.
+    if adjudication.is_blocked() {
+        let report = ward.apply(&edits, &authorization)?;
+        let changes: Vec<Value> = report.changes.iter().map(ward_change_json).collect();
+        return api_error(
+            403,
+            "ward_refused",
+            "The Ward refused the proposal; nothing was written.",
+            Some(json!({ "changes": changes })),
+        );
+    }
     let gated_targets: Vec<String> = adjudication
         .decisions
         .iter()
@@ -5970,6 +5984,44 @@ tier = 1
             |row| row.get(0),
         )?;
         assert_eq!(decision, "degrade_to_proposal");
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_blocked_target_refuses_even_with_drifted_surface() -> Result<()> {
+        // Review finding: a mixed proposal (drifted Tier-0 edit + traversal
+        // escape) must be refused as a unit BEFORE the threads gate can stage
+        // it — a blocked target must never ride into ~/.coven/pending/.
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+
+        // Baseline SOUL.md, then drift it so the gate would want to stage.
+        let first = post_edits(
+            home,
+            r#"{"edits":[{"target":"SOUL.md","contents":"new identity"}],
+                "principalKeyFingerprint":"fpr-val"}"#,
+        )?;
+        assert_eq!(first.status, 202, "got {}", first.body);
+        std::fs::write(workspace.join("SOUL.md"), "# Mallory\n")?;
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[
+                {"target":"SOUL.md","contents":"new identity v2"},
+                {"target":"../escape.md","contents":"nope"}
+            ], "principalKeyFingerprint":"fpr-val"}"#,
+        )?;
+        assert_eq!(response.status, 403, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "ward_refused");
+        // Nothing was staged and nothing escaped.
+        let pending = home.join("pending");
+        let staged_count = std::fs::read_dir(&pending)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(staged_count, 0, "blocked proposal must not stage");
+        assert!(!home.join("familiars/escape.md").exists());
         Ok(())
     }
 

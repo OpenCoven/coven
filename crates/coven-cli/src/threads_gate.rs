@@ -331,18 +331,50 @@ fn familiar_weave_id(familiar_id: &str) -> threads::FamiliarId {
     ))
 }
 
+/// Read a protected surface's current content for baseline comparison.
+///
+/// `surface` strings come from `ward.toml` declarations and Gate-2-resolved
+/// targets. Resolved targets are already confined, but ward.toml literals are
+/// only operator-authored convention — so this function re-enforces
+/// confinement itself (fail-closed, review finding): no absolute paths, no
+/// `..`/`.` segments, and the read is capped so a pathological declaration
+/// cannot balloon memory.
 fn read_surface(workspace: &Path, surface: &str) -> Result<Vec<u8>> {
+    const MAX_SURFACE_BYTES: u64 = 16 * 1024 * 1024;
+
+    if surface.starts_with('/') || surface.starts_with('\\') {
+        anyhow::bail!("protected surface `{surface}` must be workspace-relative");
+    }
     let mut path = workspace.to_path_buf();
     for segment in surface.split('/').filter(|s| !s.is_empty()) {
+        if segment == ".." || segment == "." || segment.contains('\\') || segment.contains(':') {
+            anyhow::bail!(
+                "protected surface `{surface}` contains a path-escaping segment; \
+                 declarations must stay inside the familiar workspace"
+            );
+        }
         path.push(segment);
     }
-    match std::fs::read(&path) {
-        Ok(bytes) => Ok(bytes),
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
         // An absent protected file baselines as empty: creating it later is
         // drift like any other content change.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(err) => Err(err).with_context(|| format!("reading surface {}", path.display())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(err).with_context(|| format!("inspecting surface {}", path.display()))
+        }
+    };
+    // Only regular files are hashable surfaces; a symlinked or special-file
+    // surface is refused rather than followed out of the workspace.
+    if !metadata.is_file() {
+        anyhow::bail!("protected surface `{surface}` is not a regular file inside the workspace");
     }
+    if metadata.len() > MAX_SURFACE_BYTES {
+        anyhow::bail!(
+            "protected surface `{surface}` exceeds the {MAX_SURFACE_BYTES}-byte baseline cap"
+        );
+    }
+    std::fs::read(&path).with_context(|| format!("reading surface {}", path.display()))
 }
 
 fn load_or_create_manifest_id(conn: &Connection, familiar_id: &str) -> Result<threads::ManifestId> {
@@ -761,6 +793,124 @@ tier = 2
         assert!(update.is_err(), "UPDATE must abort on ward_audit");
         let delete = f.conn.execute("DELETE FROM ward_audit", []);
         assert!(delete.is_err(), "DELETE must abort on ward_audit");
+    }
+
+    #[test]
+    fn traversal_surface_declarations_are_refused() {
+        // Review finding: ward.toml surface strings were joined with
+        // PathBuf::push, so ".." segments escaped the workspace. read_surface
+        // now fail-closes on escaping declarations instead of reading outside.
+        let f = fixture();
+        // A secret outside the workspace that a poisoned ward.toml might aim at.
+        std::fs::write(f.coven_home.join("outside-secret.txt"), b"secret").unwrap();
+
+        let config = ward::WardConfig::from_toml_str(
+            r#"
+principal_key_fingerprint = "fp-val-1"
+protected_surface = ["../outside-secret.txt"]
+default_tier = 2
+
+[[surface]]
+path = "../outside-secret.txt"
+tier = 0
+"#,
+        )
+        .expect("ward config parses");
+
+        let err = gate_protected_edits(
+            &f.conn,
+            &GateRequest {
+                coven_home: &f.coven_home,
+                familiar_id: "sage",
+                workspace: &f.workspace,
+                config: &config,
+                edits: &[ward::FileEdit::new("SOUL.md", "x")],
+                gated_targets: &["SOUL.md".to_string()],
+                authorization: &signed(),
+            },
+        )
+        .expect_err("escaping declaration must refuse");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("path-escaping"),
+            "error should name the escape: {message}"
+        );
+        // Fail-closed: nothing was audited or staged for the refused run.
+        let count: i64 = f
+            .conn
+            .query_row("SELECT COUNT(*) FROM ward_audit", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn absolute_surface_declarations_are_refused() {
+        let f = fixture();
+        let config = ward::WardConfig::from_toml_str(
+            r#"
+principal_key_fingerprint = "fp-val-1"
+protected_surface = ["/etc/hosts"]
+default_tier = 2
+
+[[surface]]
+path = "/etc/hosts"
+tier = 0
+"#,
+        )
+        .expect("ward config parses");
+
+        let err = gate_protected_edits(
+            &f.conn,
+            &GateRequest {
+                coven_home: &f.coven_home,
+                familiar_id: "sage",
+                workspace: &f.workspace,
+                config: &config,
+                edits: &[ward::FileEdit::new("SOUL.md", "x")],
+                gated_targets: &["SOUL.md".to_string()],
+                authorization: &signed(),
+            },
+        )
+        .expect_err("absolute declaration must refuse");
+        assert!(format!("{err:#}").contains("workspace-relative"));
+    }
+
+    #[test]
+    fn symlinked_surface_is_refused_not_followed() {
+        let f = fixture();
+        std::fs::write(f.coven_home.join("outside-secret.txt"), b"secret").unwrap();
+        std::os::unix::fs::symlink(
+            f.coven_home.join("outside-secret.txt"),
+            f.workspace.join("LINKED.md"),
+        )
+        .unwrap();
+        let config = ward::WardConfig::from_toml_str(
+            r#"
+principal_key_fingerprint = "fp-val-1"
+protected_surface = ["LINKED.md"]
+default_tier = 2
+
+[[surface]]
+path = "LINKED.md"
+tier = 0
+"#,
+        )
+        .expect("ward config parses");
+
+        let err = gate_protected_edits(
+            &f.conn,
+            &GateRequest {
+                coven_home: &f.coven_home,
+                familiar_id: "sage",
+                workspace: &f.workspace,
+                config: &config,
+                edits: &[ward::FileEdit::new("LINKED.md", "x")],
+                gated_targets: &["LINKED.md".to_string()],
+                authorization: &signed(),
+            },
+        )
+        .expect_err("symlinked surface must refuse");
+        assert!(format!("{err:#}").contains("not a regular file"));
     }
 
     #[test]
