@@ -337,8 +337,9 @@ fn familiar_weave_id(familiar_id: &str) -> threads::FamiliarId {
 /// targets. Resolved targets are already confined, but ward.toml literals are
 /// only operator-authored convention — so this function re-enforces
 /// confinement itself (fail-closed, review finding): no absolute paths, no
-/// `..`/`.` segments, and the read is capped so a pathological declaration
-/// cannot balloon memory.
+/// `..`/`.` segments, no symlinks anywhere in the path (intermediate
+/// directories included), and the read is capped so a pathological
+/// declaration cannot balloon memory.
 fn read_surface(workspace: &Path, surface: &str) -> Result<Vec<u8>> {
     const MAX_SURFACE_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -355,6 +356,42 @@ fn read_surface(workspace: &Path, surface: &str) -> Result<Vec<u8>> {
         }
         path.push(segment);
     }
+
+    // Intermediate symlinks: `symlink_metadata` below only protects the final
+    // component, so canonicalize the deepest *existing* ancestor and require
+    // it to stay inside the canonical workspace (second review pass finding —
+    // `linkdir/secret` with `linkdir` pointing outside must refuse).
+    let canonical_workspace = workspace.canonicalize().with_context(|| {
+        format!(
+            "familiar workspace `{}` is not resolvable",
+            workspace.display()
+        )
+    })?;
+    let mut ancestor = path.parent();
+    let deepest_existing = loop {
+        match ancestor {
+            Some(candidate) => match candidate.canonicalize() {
+                Ok(resolved) => break Some(resolved),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    ancestor = candidate.parent();
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("resolving ancestor of surface {}", path.display())
+                    })
+                }
+            },
+            None => break None,
+        }
+    };
+    match deepest_existing {
+        Some(resolved) if resolved.starts_with(&canonical_workspace) => {}
+        _ => anyhow::bail!(
+            "protected surface `{surface}` resolves outside the familiar workspace \
+             (symlinked ancestor?); declarations must stay inside it"
+        ),
+    }
+
     let metadata = match std::fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         // An absent protected file baselines as empty: creating it later is
@@ -911,6 +948,91 @@ tier = 0
         )
         .expect_err("symlinked surface must refuse");
         assert!(format!("{err:#}").contains("not a regular file"));
+    }
+
+    #[test]
+    fn symlinked_ancestor_directory_is_refused() {
+        // Second review pass finding: symlink_metadata only guards the final
+        // component. A surface like "linkdir/secret" where linkdir points
+        // outside the workspace must refuse, not read through the link.
+        let f = fixture();
+        let outside = f.coven_home.join("outside-dir");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.md"), b"secret").unwrap();
+        std::os::unix::fs::symlink(&outside, f.workspace.join("linkdir")).unwrap();
+
+        let config = ward::WardConfig::from_toml_str(
+            r#"
+principal_key_fingerprint = "fp-val-1"
+protected_surface = ["linkdir/secret.md"]
+default_tier = 2
+
+[[surface]]
+path = "linkdir/secret.md"
+tier = 0
+"#,
+        )
+        .expect("ward config parses");
+
+        let err = gate_protected_edits(
+            &f.conn,
+            &GateRequest {
+                coven_home: &f.coven_home,
+                familiar_id: "sage",
+                workspace: &f.workspace,
+                config: &config,
+                edits: &[ward::FileEdit::new("linkdir/secret.md", "x")],
+                gated_targets: &["linkdir/secret.md".to_string()],
+                authorization: &signed(),
+            },
+        )
+        .expect_err("symlinked ancestor must refuse");
+        assert!(
+            format!("{err:#}").contains("resolves outside"),
+            "error should name the escape: {err:#}"
+        );
+    }
+
+    #[test]
+    fn absent_nested_surface_still_baselines_as_empty() {
+        // The ancestor walk must not break the absent-surface convention: a
+        // declared surface in a not-yet-created subdirectory (no symlinks)
+        // baselines as empty rather than erroring.
+        let f = fixture();
+        let config = ward::WardConfig::from_toml_str(
+            r#"
+principal_key_fingerprint = "fp-val-1"
+protected_surface = ["SOUL.md", "identity/CORE.md"]
+default_tier = 2
+
+[[surface]]
+path = "SOUL.md"
+tier = 0
+
+[[surface]]
+path = "identity/CORE.md"
+tier = 0
+"#,
+        )
+        .expect("ward config parses");
+
+        let report = gate_protected_edits(
+            &f.conn,
+            &GateRequest {
+                coven_home: &f.coven_home,
+                familiar_id: "sage",
+                workspace: &f.workspace,
+                config: &config,
+                edits: &soul_edit(),
+                gated_targets: &["SOUL.md".to_string()],
+                authorization: &signed(),
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(report.outcome, GateOutcome::Permitted),
+            "{report:?}"
+        );
     }
 
     #[test]
