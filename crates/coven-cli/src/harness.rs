@@ -234,8 +234,8 @@ pub struct HarnessCommandSpec {
     /// should be injected by prepending a preamble to the prompt instead.
     pub system_prompt_flag: Option<String>,
     /// CLI flag name that carries the user prompt as its VALUE rather than a
-    /// trailing positional (e.g. `Some("-q")` for Hermes' `chat -q QUERY`,
-    /// which has no positional prompt slot). When set, `prompt_args` appends
+    /// trailing positional (e.g. `Some("--prompt")` for Copilot, which
+    /// rejects positional prompts outright). When set, `prompt_args` appends
     /// `--flag=<prompt>` instead of the `-- <prompt>` options-terminator form.
     /// `None` (the default) keeps the positional-append behavior.
     pub prompt_flag: Option<String>,
@@ -428,14 +428,13 @@ impl HarnessCommandSpec {
         };
 
         // Some harnesses take the prompt as the VALUE of a flag rather than a
-        // trailing positional (e.g. Hermes' `chat -q QUERY` has no positional
-        // prompt slot at all, and Copilot rejects positional prompts). For
-        // those, append `--flag=<prompt>`. The `=` form keeps a prompt that
-        // starts with `-` from being misparsed as a new option, so it stays
-        // safe without an options terminator (which would otherwise starve
-        // the flag of its value). Interactive mode prefers the dedicated
-        // interactive flag when one is declared (e.g. Copilot's
-        // `--interactive`), falling back to the shared prompt flag.
+        // trailing positional (e.g. Copilot rejects positional prompts
+        // outright). For those, append `--flag=<prompt>`. The `=` form keeps
+        // a prompt that starts with `-` from being misparsed as a new
+        // option, so it stays safe without an options terminator (which
+        // would otherwise starve the flag of its value). Interactive mode
+        // prefers the dedicated interactive flag when one is declared (e.g.
+        // Copilot's `--interactive`), falling back to the shared prompt flag.
         let prompt_flag = match mode {
             HarnessLaunchMode::Interactive => self
                 .interactive_prompt_flag
@@ -1969,7 +1968,7 @@ mod tests {
     }
 
     #[test]
-    fn built_in_harnesses_returns_codex_and_claude() {
+    fn built_in_harnesses_list_bundled_adapters_in_order() {
         let harnesses = built_in_harnesses();
 
         assert_eq!(harnesses.len(), 4);
@@ -2294,6 +2293,68 @@ mod tests {
                 "--session-id".to_string(),
                 "abc-123".to_string(),
             ]
+        );
+        Ok(())
+    }
+
+    /// A manifest adapter can declare flag-carried prompts (`promptFlag`,
+    /// with an optional interactive-mode override), and argv construction
+    /// binds the prompt via the `=` form in the matching mode.
+    #[test]
+    fn manifest_prompt_flags_bind_prompt_per_mode() -> anyhow::Result<()> {
+        let raw = r#"{
+          "adapters": [
+            {
+              "id": "copi",
+              "label": "Copi",
+              "executable": "copi",
+              "interactive_prompt_prefix_args": [],
+              "non_interactive_prompt_prefix_args": ["--quiet"],
+              "install_hint": "Install copi.",
+              "promptFlag": "--prompt",
+              "interactivePromptFlag": "--interactive"
+            }
+          ]
+        }"#;
+        let specs =
+            parse_external_harness_specs(raw, Path::new("copi.json"), &built_in_harness_specs())?;
+        let copi = &specs[0];
+        assert_eq!(copi.prompt_flag.as_deref(), Some("--prompt"));
+        assert_eq!(
+            copi.interactive_prompt_flag.as_deref(),
+            Some("--interactive")
+        );
+        assert_eq!(
+            copi.prompt_args("fix tests", HarnessLaunchMode::NonInteractive),
+            vec!["--quiet".to_string(), "--prompt=fix tests".to_string()]
+        );
+        assert_eq!(
+            copi.prompt_args("fix tests", HarnessLaunchMode::Interactive),
+            vec!["--interactive=fix tests".to_string()]
+        );
+
+        // Without the interactive override, both modes share `promptFlag`.
+        let shared = r#"{
+          "adapters": [
+            {
+              "id": "copi",
+              "label": "Copi",
+              "executable": "copi",
+              "interactive_prompt_prefix_args": [],
+              "non_interactive_prompt_prefix_args": [],
+              "install_hint": "Install copi.",
+              "promptFlag": "-q"
+            }
+          ]
+        }"#;
+        let specs = parse_external_harness_specs(
+            shared,
+            Path::new("copi.json"),
+            &built_in_harness_specs(),
+        )?;
+        assert_eq!(
+            specs[0].prompt_args("hello", HarnessLaunchMode::Interactive),
+            vec!["-q=hello".to_string()]
         );
         Ok(())
     }
