@@ -39,6 +39,32 @@
 //! Ward fails closed: any proposal whose target cannot be safely resolved
 //! inside the familiar home — traversal escape, symlink escape, or a
 //! case-insensitive collision with a protected path — is [`Verdict::Blocked`].
+//!
+//! ## Atomic write & staging threat model
+//!
+//! [`Ward::apply`] commits each cleared edit by staging a randomized sibling
+//! file (`.{name}.ward-staged-<uuid>`, opened with `create_new`) and renaming
+//! it onto the Gate-2-validated target:
+//!
+//! - **Pre-planted staging symlinks or hard links** cannot be followed: the
+//!   staging name is unpredictable and `create_new` refuses to open through
+//!   an existing directory entry.
+//! - **Symlinked targets or parent directories** are refused by Gate 2 before
+//!   any byte is written, and the target's parent is re-created and verified
+//!   component-by-component (never following symlinks) immediately before
+//!   staging — a directory component swapped for a symlink after adjudication
+//!   fails closed with no side effects outside the home.
+//! - **Hard-linked targets** are harmless by construction: `rename` replaces
+//!   the directory entry and never writes through the linked inode.
+//!
+//! Residual risk (accepted): a same-privilege process that can already write
+//! inside the familiar home can still swap path components in the window
+//! between the per-component verification and the final `rename`. The check
+//! narrows that race without eliminating it; full elimination needs
+//! directory-handle-relative I/O (e.g. `openat2` + `RESOLVE_BENEATH`), which
+//! is not portable across the supported platforms. A final-component swap can
+//! also point the Gate 4 pre-write audit read at an attacker-chosen readable
+//! file, affecting only the recorded `prev_sha256` — never where bytes land.
 
 use std::collections::BTreeSet;
 use std::fs::OpenOptions;
@@ -618,9 +644,10 @@ impl Ward {
     ///   change authorized by Gate 1 (Gate 3 is not yet implemented, so an
     ///   authorized protected change cannot be cleared here) — the proposal is
     ///   *held* as a unit and nothing is written.
-    /// - Otherwise every edit is Tier 2/3: each is written atomically (staged in
-    ///   the target's directory, then renamed into place) and every Tier 2
-    ///   write emits a Gate 4 [`AuditRecord`].
+    /// - Otherwise every edit is Tier 2/3: each is written atomically (staged
+    ///   as a randomized `create_new` sibling in the target's re-verified
+    ///   directory, then renamed into place) and every Tier 2 write emits a
+    ///   Gate 4 [`AuditRecord`].
     ///
     /// Because writes are routed through [`Ward::evaluate`] first, Gate 2 path
     /// confinement applies to the apply too: an edit that resolves out of the
@@ -680,7 +707,7 @@ impl Ward {
         let mut changes = Vec::with_capacity(edits.len());
         for (edit, decision) in edits.iter().zip(outcome.decisions) {
             let abs = join_resolved(&canonical_home, &decision.resolved);
-            let audit = write_atomic(&abs, &edit.new_contents, &decision)?;
+            let audit = write_atomic(&canonical_home, &abs, &edit.new_contents, &decision)?;
             changes.push(AppliedChange {
                 decision,
                 disposition: Disposition::Applied,
@@ -717,17 +744,31 @@ fn join_resolved(canonical_home: &Path, resolved: &str) -> PathBuf {
 /// into place (rename is atomic within a filesystem). Returns a Gate 4 audit
 /// record for Tier 2 writes; Tier 3 (free) writes return `None`. Tier 0/1 never
 /// reach this function — they are held or refused upstream.
-fn write_atomic(path: &Path, contents: &[u8], decision: &Decision) -> Result<Option<AuditRecord>> {
+fn write_atomic(
+    canonical_home: &Path,
+    path: &Path,
+    contents: &[u8],
+    decision: &Decision,
+) -> Result<Option<AuditRecord>> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("target has no parent directory: {}", path.display()))?;
-    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("target has no file name: {}", path.display()))?;
+
+    // Re-create and verify the parent immediately before staging. Gate 2
+    // cleared the target earlier; a directory component swapped for a symlink
+    // since then (TOCTOU) must fail closed — with no side effects outside the
+    // familiar home — rather than redirect the write.
+    let canonical_parent = prepare_staging_parent(canonical_home, parent)?;
+    let path = canonical_parent.join(name);
 
     let need_audit = decision.tier == Tier::Logged;
 
     // Capture prior contents for the audit hash (only when we will log).
     let prev = if need_audit {
-        match std::fs::read(path) {
+        match std::fs::read(&path) {
             Ok(bytes) => Some(bytes),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
             Err(err) => {
@@ -741,14 +782,14 @@ fn write_atomic(path: &Path, contents: &[u8], decision: &Decision) -> Result<Opt
         None
     };
 
-    let (staged, mut file) = create_staging_file(path)?;
+    let (staged, mut file) = create_staging_file(&path)?;
     let commit = (|| -> Result<()> {
         file.write_all(contents)
             .with_context(|| format!("staging write to {}", staged.display()))?;
         file.sync_all()
             .with_context(|| format!("syncing staged write to {}", staged.display()))?;
         drop(file);
-        std::fs::rename(&staged, path)
+        std::fs::rename(&staged, &path)
             .with_context(|| format!("committing write to {}", path.display()))?;
         Ok(())
     })();
@@ -802,6 +843,68 @@ fn staged_path(path: &Path) -> PathBuf {
         .map(|n| n.to_string_lossy())
         .unwrap_or_default();
     path.with_file_name(format!(".{name}.ward-staged-{}", uuid::Uuid::new_v4()))
+}
+
+/// Re-create and verify the staging parent directory component-by-component,
+/// never following symlinks.
+///
+/// `parent` must be the Gate-2-resolved target's parent, lexically under
+/// `canonical_home`. Each component is created with a single (non-recursive,
+/// non-following) `create_dir` and then checked via `symlink_metadata` to be a
+/// real directory — so a component swapped for an escaping symlink after
+/// adjudication fails closed without creating anything outside the home.
+fn prepare_staging_parent(canonical_home: &Path, parent: &Path) -> Result<PathBuf> {
+    let rel = parent.strip_prefix(canonical_home).map_err(|_| {
+        anyhow!(
+            "staging parent `{}` is not under the familiar home `{}`",
+            parent.display(),
+            canonical_home.display()
+        )
+    })?;
+
+    let mut verified = canonical_home.to_path_buf();
+    for component in rel.components() {
+        let Component::Normal(part) = component else {
+            bail!(
+                "staging parent `{}` contains a non-normal path component",
+                parent.display()
+            );
+        };
+        verified.push(part);
+
+        match std::fs::symlink_metadata(&verified) {
+            Ok(meta) if meta.is_dir() => continue,
+            Ok(_) => bail!(
+                "staging parent component `{}` is not a real directory — refusing to \
+                 follow it outside the familiar home",
+                verified.display()
+            ),
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("verifying staging parent {}", verified.display()))
+            }
+        }
+
+        match std::fs::create_dir(&verified) {
+            Ok(()) => {}
+            // A concurrent apply may have created it; the re-check below rules.
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+            Err(err) => {
+                return Err(err).with_context(|| format!("creating {}", verified.display()))
+            }
+        }
+        let meta = std::fs::symlink_metadata(&verified)
+            .with_context(|| format!("verifying staging parent {}", verified.display()))?;
+        if !meta.is_dir() {
+            bail!(
+                "staging parent component `{}` is not a real directory — refusing to \
+                 follow it outside the familiar home",
+                verified.display()
+            );
+        }
+    }
+    Ok(verified)
 }
 
 /// Lowercase hex SHA-256 of `bytes`.
@@ -956,6 +1059,19 @@ mod tests {
 
     fn ward_in(dir: &Path) -> Ward {
         Ward::new(dir.to_path_buf(), sample_config()).expect("valid ward")
+    }
+
+    /// Directory entries that look like staging files (randomized names make
+    /// exact-path existence checks meaningless — scan for the marker instead).
+    fn staging_litter(dir: &Path) -> Vec<String> {
+        match fs::read_dir(dir) {
+            Ok(entries) => entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.contains(".ward-staged"))
+                .collect(),
+            Err(_) => Vec::new(),
+        }
     }
 
     #[test]
@@ -1255,8 +1371,15 @@ tier = 2
         assert_eq!(audits[0].next_sha256, sha256_hex(b"entry"));
         assert_eq!(audits[0].bytes_written, 5);
 
-        // No staging litter remains after the atomic rename.
-        assert!(!tmp.path().join("memory/log.md.ward-staged").exists());
+        // No staging litter remains after the atomic renames.
+        assert_eq!(
+            staging_litter(&tmp.path().join("memory")),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            staging_litter(&tmp.path().join("scratch")),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -1346,7 +1469,117 @@ tier = 2
         assert!(report.is_applied());
         assert_eq!(fs::read(&victim).unwrap(), b"safe");
         assert_eq!(fs::read(home.join("notes.md")).unwrap(), b"new note");
-        assert!(home.join("notes.md.ward-staged").exists());
+        // The attacker's decoy is untouched: still a symlink pointing at the
+        // victim, and the randomized staging left no litter of its own.
+        let decoy = home.join("notes.md.ward-staged");
+        assert!(decoy.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_link(&decoy).unwrap(), victim);
+        assert_eq!(
+            staging_litter(&home),
+            vec!["notes.md.ward-staged".to_string()]
+        );
+    }
+
+    #[test]
+    fn failed_commit_cleans_up_staged_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        // The target exists as a directory: staging succeeds, the final
+        // rename fails, and the staged file must not be left behind.
+        fs::create_dir_all(tmp.path().join("scratch/notes.txt")).unwrap();
+
+        let edits = vec![FileEdit::new("scratch/notes.txt", b"x".to_vec())];
+        let result = ward.apply(&edits, &Authorization::unsigned());
+
+        assert!(result.is_err());
+        assert_eq!(
+            staging_litter(&tmp.path().join("scratch")),
+            Vec::<String>::new()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_refuses_symlinked_parent_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        // `memory` is pre-planted as a symlink escaping the home.
+        symlink(&outside, home.join("memory")).unwrap();
+
+        let ward = ward_in(&home);
+        let edits = vec![FileEdit::new("memory/log.md", b"leak".to_vec())];
+        let report = ward.apply(&edits, &Authorization::unsigned()).unwrap();
+
+        // Gate 2 refuses before any byte is written outside the home.
+        assert!(report.is_refused());
+        assert!(!outside.join("log.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_fails_closed_when_parent_swapped_for_symlink() {
+        use std::os::unix::fs::symlink;
+
+        // Simulates the TOCTOU window: a directory component is swapped for
+        // an escaping symlink *after* Gate 2 adjudication. The per-component
+        // parent re-check must refuse rather than follow it — and must not
+        // create directories outside the home as a side effect.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, home.join("memory")).unwrap();
+
+        let canonical_home = home.canonicalize().unwrap();
+        let decision = Decision {
+            target: "memory/notes/log.md".into(),
+            resolved: "memory/notes/log.md".into(),
+            tier: Tier::Free,
+            verdict: Verdict::Allow,
+        };
+        let err = write_atomic(
+            &canonical_home,
+            &canonical_home.join("memory/notes/log.md"),
+            b"leak",
+            &decision,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("not a real directory"));
+        // Fail-closed with zero side effects outside the home.
+        assert!(!outside.join("notes").exists());
+        assert!(!outside.join("log.md").exists());
+        assert_eq!(staging_litter(&outside), Vec::<String>::new());
+    }
+
+    #[test]
+    fn apply_replaces_hard_linked_target_without_writing_through_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(home.join("memory")).unwrap();
+        let outside = tmp.path().join("outside.txt");
+        fs::write(&outside, b"safe").unwrap();
+        // The target is pre-planted as a hard link to a file outside the home.
+        fs::hard_link(&outside, home.join("memory/log.md")).unwrap();
+
+        let ward = ward_in(&home);
+        let edits = vec![FileEdit::new("memory/log.md", b"new".to_vec())];
+        let report = ward.apply(&edits, &Authorization::unsigned()).unwrap();
+
+        // rename() replaces the directory entry and never writes through the
+        // linked inode: the outside file keeps its bytes.
+        assert!(report.is_applied());
+        assert_eq!(fs::read(&outside).unwrap(), b"safe");
+        assert_eq!(fs::read(home.join("memory/log.md")).unwrap(), b"new");
+        // The audit still hashes the true prior contents of the target path.
+        let audit = report.audit_records().next().unwrap();
+        assert_eq!(audit.prev_sha256, Some(sha256_hex(b"safe")));
     }
 
     #[test]
