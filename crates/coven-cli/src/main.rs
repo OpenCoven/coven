@@ -2125,7 +2125,7 @@ fn choose_default_harness() -> Result<patch::HarnessId> {
 }
 
 fn pick_default_harness(harnesses: &[harness::HarnessSummary]) -> Option<String> {
-    for id in [engine::ENGINE_HARNESS_ID, "codex", "claude"] {
+    for id in [engine::ENGINE_HARNESS_ID, "codex", "claude", "copilot"] {
         if let Some(h) = harnesses.iter().find(|h| h.id == id && h.available) {
             return Some(h.id.clone());
         }
@@ -2429,6 +2429,7 @@ fn login_hint_for_harness(harness_id: &str) -> &'static str {
     match harness_id {
         "codex" => "codex login",
         "claude" => "claude doctor",
+        "copilot" => "copilot login",
         _ => "see harness docs",
     }
 }

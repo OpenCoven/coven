@@ -233,6 +233,19 @@ pub struct HarnessCommandSpec {
     /// for Claude). `None` means the harness has no such flag and identity
     /// should be injected by prepending a preamble to the prompt instead.
     pub system_prompt_flag: Option<String>,
+    /// CLI flag name that carries the user prompt as its VALUE rather than a
+    /// trailing positional (e.g. `Some("-q")` for Hermes' `chat -q QUERY`,
+    /// which has no positional prompt slot). When set, `prompt_args` appends
+    /// `--flag=<prompt>` instead of the `-- <prompt>` options-terminator form.
+    /// `None` (the default) keeps the positional-append behavior.
+    pub prompt_flag: Option<String>,
+    /// Interactive-mode override for `prompt_flag`, for harnesses whose
+    /// interactive entrypoint takes the prompt behind a *different* flag than
+    /// the non-interactive one (e.g. Copilot's `--interactive <prompt>` opens
+    /// the TUI and runs the prompt, while `--prompt <prompt>` exits after
+    /// completion). Only consulted in `HarnessLaunchMode::Interactive`, where
+    /// it falls back to `prompt_flag` when unset.
+    pub interactive_prompt_flag: Option<String>,
     /// CLI flag name to select a model (e.g. `Some("--model")` for both Codex and
     /// Claude). When set, `coven run --model <ID>` forwards `[flag, <model>]`.
     /// `None` (and no `model_arg_template`) means the harness declares no model
@@ -414,6 +427,30 @@ impl HarnessCommandSpec {
             HarnessLaunchMode::Stream => &self.non_interactive_prompt_prefix_args,
         };
 
+        // Some harnesses take the prompt as the VALUE of a flag rather than a
+        // trailing positional (e.g. Hermes' `chat -q QUERY` has no positional
+        // prompt slot at all, and Copilot rejects positional prompts). For
+        // those, append `--flag=<prompt>`. The `=` form keeps a prompt that
+        // starts with `-` from being misparsed as a new option, so it stays
+        // safe without an options terminator (which would otherwise starve
+        // the flag of its value). Interactive mode prefers the dedicated
+        // interactive flag when one is declared (e.g. Copilot's
+        // `--interactive`), falling back to the shared prompt flag.
+        let prompt_flag = match mode {
+            HarnessLaunchMode::Interactive => self
+                .interactive_prompt_flag
+                .as_deref()
+                .or(self.prompt_flag.as_deref()),
+            _ => self.prompt_flag.as_deref(),
+        };
+        if let Some(flag) = prompt_flag {
+            return prefix_args
+                .iter()
+                .cloned()
+                .chain([format!("{flag}={prompt}")])
+                .collect();
+        }
+
         // The prompt is user data: a prompt starting with `-` must reach the
         // harness as the positional argument, not be parsed as flags, so it
         // always rides behind an options terminator.
@@ -486,6 +523,8 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
             id: "codex".to_string(),
             label: "Codex".to_string(),
             executable: "codex".to_string(),
+            prompt_flag: None,
+            interactive_prompt_flag: None,
             interactive_prompt_prefix_args: Vec::new(),
             non_interactive_prompt_prefix_args: vec![
                 "exec".to_string(),
@@ -537,6 +576,8 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
             id: "claude".to_string(),
             label: "Claude Code".to_string(),
             executable: "claude".to_string(),
+            prompt_flag: None,
+            interactive_prompt_flag: None,
             interactive_prompt_prefix_args: Vec::new(),
             non_interactive_prompt_prefix_args: vec!["--print".to_string()],
             install_hint: "Install Claude Code with `npm install -g @anthropic-ai/claude-code`; if it is already installed, make sure `claude` is on PATH and run `claude doctor` to finish local auth/setup, then retry `coven doctor`.".to_string(),
@@ -592,6 +633,8 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
             id: crate::engine::ENGINE_HARNESS_ID.to_string(),
             label: "Coven Code".to_string(),
             executable: crate::engine::ENGINE_HARNESS_ID.to_string(),
+            prompt_flag: None,
+            interactive_prompt_flag: None,
             interactive_prompt_prefix_args: Vec::new(),
             non_interactive_prompt_prefix_args: vec!["--print".to_string()],
             install_hint: "Install the Coven engine with `coven engine install`.".to_string(),
@@ -633,6 +676,76 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
                 resume_prefix_args: vec!["--print".to_string()],
                 session_id_flag: Some("--session-id".to_string()),
                 resume_flag: Some("--resume".to_string()),
+            }),
+        },
+        HarnessCommandSpec {
+            id: "copilot".to_string(),
+            label: "Copilot CLI".to_string(),
+            executable: "copilot".to_string(),
+            // Copilot rejects positional prompts outright: non-interactive
+            // one-shots are `--prompt <text>` and interactive-with-prompt is
+            // `--interactive <text>`. Both ride the `=` form via
+            // `prompt_args`. Verified against the installed copilot CLI.
+            prompt_flag: Some("--prompt".to_string()),
+            interactive_prompt_flag: Some("--interactive".to_string()),
+            interactive_prompt_prefix_args: Vec::new(),
+            // Copilot colorizes whenever it sees a TTY, and Coven runs
+            // non-interactive launches under a PTY — mirror codex's
+            // `--color never` hygiene. Interactive launches keep color.
+            non_interactive_prompt_prefix_args: vec!["--no-color".to_string()],
+            install_hint: "Install GitHub Copilot CLI with `npm install -g @github/copilot` or `brew install --cask copilot-cli`; if it is already installed, make sure `copilot` is on PATH and run `copilot login` to authenticate, then retry `coven doctor`.".to_string(),
+            source: "bundled".to_string(),
+            manifest_path: None,
+            // Copilot has no system-prompt flag; identity is injected as a
+            // bracketed preamble prepended to the prompt.
+            system_prompt_flag: None,
+            // `copilot --model <MODEL>` selects the model (`auto` lets
+            // Copilot pick). Verified against the installed copilot CLI.
+            model_flag: Some("--model".to_string()),
+            model_arg_template: None,
+            // Copilot's permission surface is boolean/multi-token flags, so
+            // the argv-list sandbox form applies: full → `--allow-all`
+            // (tools, paths, and URLs), read-only → deny file writes and
+            // shell outright (deny rules beat every allow rule; reads stay
+            // natively allowed and any other tool prompt auto-denies in
+            // non-interactive mode). Verified against the installed copilot
+            // CLI: `--allow-all` wrote a file, the deny pair blocked it.
+            sandbox: Some(SandboxMapping::Args {
+                full_args: vec!["--allow-all".to_string()],
+                read_only_args: vec![
+                    "--deny-tool".to_string(),
+                    "write".to_string(),
+                    "--deny-tool".to_string(),
+                    "shell".to_string(),
+                ],
+            }),
+            // `copilot --add-dir <DIR>` (repeatable): additional directories
+            // the harness may access beyond its cwd. Verified against the
+            // installed copilot CLI.
+            add_dir_flag: Some("--add-dir".to_string()),
+            // One-shot `copilot --prompt` only: no stream-json stdin mode.
+            // `--session-id <uuid>` pre-assigns the session id on a fresh
+            // launch; think/speed map to `--effort` (see
+            // `launch_option_args`).
+            capabilities: Capabilities {
+                stream: false,
+                preassigned_session_id: true,
+                think: true,
+                speed: true,
+            },
+            stream_args: None,
+            continuity_args: Some(ContinuityArgs {
+                init_prefix_args: vec!["--no-color".to_string()],
+                resume_prefix_args: vec!["--no-color".to_string()],
+                // `--session-id` serves both launches: it creates a fresh
+                // session under a chosen UUID and resumes an existing one
+                // (`--resume` only binds its value as `--resume=<id>`, which
+                // the token-pair continuity form can't emit). A resume
+                // against a wiped store self-heals into a fresh session with
+                // the same id instead of erroring. Verified against the
+                // installed copilot CLI.
+                session_id_flag: Some("--session-id".to_string()),
+                resume_flag: Some("--session-id".to_string()),
             }),
         },
     ]
@@ -876,6 +989,10 @@ struct ExternalHarnessAdapterSpec {
     install_hint: String,
     #[serde(default, alias = "systemPromptFlag")]
     system_prompt_flag: Option<String>,
+    #[serde(default, alias = "promptFlag")]
+    prompt_flag: Option<String>,
+    #[serde(default, alias = "interactivePromptFlag")]
+    interactive_prompt_flag: Option<String>,
     /// How this adapter takes a model selection. Declare `model_flag` for a
     /// simple `--flag <value>` pair, or `model_arg_template` for anything else
     /// (e.g. `"-c model={model}"`). Omit both and `coven run --model` is a
@@ -1048,6 +1165,14 @@ impl ExternalHarnessAdapterSpec {
             manifest_path: Some(manifest_path.to_string_lossy().into_owned()),
             system_prompt_flag: self
                 .system_prompt_flag
+                .map(|flag| flag.trim().to_string())
+                .filter(|flag| !flag.is_empty()),
+            prompt_flag: self
+                .prompt_flag
+                .map(|flag| flag.trim().to_string())
+                .filter(|flag| !flag.is_empty()),
+            interactive_prompt_flag: self
+                .interactive_prompt_flag
                 .map(|flag| flag.trim().to_string())
                 .filter(|flag| !flag.is_empty()),
             model_flag: self
@@ -1288,10 +1413,16 @@ fn command_parts_for_harness_with_conversation_inner(
                 &sandbox_args,
                 &add_dir_args,
                 &launch_option_args,
-                // `--` before the prompt for the same reason as `prompt_args`:
-                // user data must not parse as harness flags.
+                // The prompt rides behind the harness's prompt flag when it
+                // declares one (continuity launches are always
+                // non-interactive, so the shared `prompt_flag` applies), or
+                // behind `--` for positional-prompt harnesses — user data
+                // must not parse as harness flags either way.
                 args.into_iter()
-                    .chain(["--".to_string(), effective_prompt])
+                    .chain(match spec.prompt_flag.as_deref() {
+                        Some(flag) => vec![format!("{flag}={effective_prompt}")],
+                        None => vec!["--".to_string(), effective_prompt],
+                    })
                     .collect(),
             ));
             return Ok((program, with_claude_permission_flags(harness_id, args)));
@@ -1343,7 +1474,13 @@ fn add_codex_exec_json_flag(spec: &HarnessCommandSpec, args: &mut Vec<String>) -
 }
 
 fn launch_option_args(harness_id: &str, options: HarnessLaunchOptions<'_>) -> Vec<String> {
-    if harness_id != "claude" && harness_id != crate::engine::ENGINE_HARNESS_ID {
+    // Claude, the engine, and Copilot share the same `--effort <level>` flag,
+    // and Copilot accepts every level `claude_effort` emits (verified against
+    // the installed copilot CLI).
+    if harness_id != "claude"
+        && harness_id != crate::engine::ENGINE_HARNESS_ID
+        && harness_id != "copilot"
+    {
         return Vec::new();
     }
     options
@@ -1835,7 +1972,7 @@ mod tests {
     fn built_in_harnesses_returns_codex_and_claude() {
         let harnesses = built_in_harnesses();
 
-        assert_eq!(harnesses.len(), 3);
+        assert_eq!(harnesses.len(), 4);
         assert_eq!(harnesses[0].id, "codex");
         assert_eq!(harnesses[0].label, "Codex");
         assert_eq!(harnesses[0].executable, "codex");
@@ -1845,6 +1982,9 @@ mod tests {
         assert_eq!(harnesses[2].id, "coven-code");
         assert_eq!(harnesses[2].label, "Coven Code");
         assert_eq!(harnesses[2].executable, "coven-code");
+        assert_eq!(harnesses[3].id, "copilot");
+        assert_eq!(harnesses[3].label, "Copilot CLI");
+        assert_eq!(harnesses[3].executable, "copilot");
     }
 
     #[test]
@@ -1858,6 +1998,10 @@ mod tests {
             .iter()
             .find(|harness| harness.id == "claude")
             .expect("claude harness should exist");
+        let copilot = harnesses
+            .iter()
+            .find(|harness| harness.id == "copilot")
+            .expect("copilot harness should exist");
 
         assert!(codex.install_hint.contains("npm install -g @openai/codex"));
         assert!(codex.install_hint.contains("brew install --cask codex"));
@@ -1870,6 +2014,15 @@ mod tests {
         assert!(claude.install_hint.contains("claude doctor"));
         assert!(claude.install_hint.contains("claude"));
         assert!(claude.install_hint.contains("PATH"));
+
+        assert!(copilot
+            .install_hint
+            .contains("npm install -g @github/copilot"));
+        assert!(copilot
+            .install_hint
+            .contains("brew install --cask copilot-cli"));
+        assert!(copilot.install_hint.contains("copilot login"));
+        assert!(copilot.install_hint.contains("PATH"));
     }
 
     #[test]
@@ -1960,6 +2113,8 @@ mod tests {
             id: "future".to_string(),
             label: "Future Harness".to_string(),
             executable: "future".to_string(),
+            prompt_flag: None,
+            interactive_prompt_flag: None,
             interactive_prompt_prefix_args: vec!["chat".to_string()],
             non_interactive_prompt_prefix_args: vec!["exec".to_string(), "-q".to_string()],
             install_hint: "Install the future harness.".to_string(),
@@ -3412,6 +3567,8 @@ mod tests {
             id: "future".to_string(),
             label: "Future Harness".to_string(),
             executable: "future".to_string(),
+            prompt_flag: None,
+            interactive_prompt_flag: None,
             interactive_prompt_prefix_args: Vec::new(),
             non_interactive_prompt_prefix_args: vec!["run".to_string()],
             install_hint: "Install the future harness.".to_string(),
@@ -3437,6 +3594,8 @@ mod tests {
             id: "future".to_string(),
             label: "Future Harness".to_string(),
             executable: "future".to_string(),
+            prompt_flag: None,
+            interactive_prompt_flag: None,
             interactive_prompt_prefix_args: Vec::new(),
             non_interactive_prompt_prefix_args: vec!["run".to_string()],
             install_hint: "Install the future harness.".to_string(),
@@ -3875,6 +4034,225 @@ mod tests {
             .position(|a| a == "--effort")
             .expect("--effort flag present");
         assert_eq!(args[effort_pos + 1], "high");
+        Ok(())
+    }
+
+    // ── Copilot ──────────────────────────────────────────────────────────
+    //
+    // Argv shapes in these tests are verified against the installed GitHub
+    // Copilot CLI (1.0.70): positional prompts are rejected outright, so the
+    // prompt always rides a flag's `=` form.
+
+    #[test]
+    fn copilot_noninteractive_uses_prompt_flag_equals_form() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
+        assert_eq!(
+            command_parts_for_harness("copilot", "fix tests", HarnessLaunchMode::NonInteractive)?,
+            (
+                "copilot".to_string(),
+                vec!["--no-color".to_string(), "--prompt=fix tests".to_string()]
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn copilot_interactive_uses_interactive_flag_equals_form() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().unwrap();
+        assert_eq!(
+            command_parts_for_harness("copilot", "polish ui", HarnessLaunchMode::Interactive)?,
+            (
+                "copilot".to_string(),
+                vec!["--interactive=polish ui".to_string()]
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn copilot_dash_prefixed_prompt_stays_inside_flag_value() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().unwrap();
+        // A prompt starting with `-` must never parse as harness flags; the
+        // `=` form binds it as the prompt flag's value.
+        let (_, args) = command_parts_for_harness(
+            "copilot",
+            "--version; rm -rf /",
+            HarnessLaunchMode::NonInteractive,
+        )?;
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("--prompt=--version; rm -rf /"),
+            "prompt must be the final argv entry bound via `=`: {args:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn copilot_stream_mode_falls_back_to_noninteractive_one_shot() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().unwrap();
+        // Copilot has no stream-json stdin mode; a Stream request must build
+        // the one-shot non-interactive command instead.
+        assert!(!harness_supports_stream_mode("copilot"));
+        assert_eq!(
+            command_parts_for_harness("copilot", "hi", HarnessLaunchMode::Stream)?,
+            (
+                "copilot".to_string(),
+                vec!["--no-color".to_string(), "--prompt=hi".to_string()]
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn copilot_init_hint_preassigns_session_id_with_prompt_flag() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().unwrap();
+        assert!(harness_supports_preassigned_session_id("copilot"));
+        let hint = ConversationHint::Init {
+            id: "11111111-2222-4333-8444-555555555555".to_string(),
+        };
+        let parts = command_parts_for_harness_with_conversation(
+            "copilot",
+            "hello",
+            HarnessLaunchMode::NonInteractive,
+            Some(&hint),
+            None,
+            HarnessLaunchOptions::default(),
+        )?;
+        assert_eq!(
+            parts,
+            (
+                "copilot".to_string(),
+                vec![
+                    "--no-color".to_string(),
+                    "--session-id".to_string(),
+                    "11111111-2222-4333-8444-555555555555".to_string(),
+                    "--prompt=hello".to_string(),
+                ]
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn copilot_resume_hint_reuses_session_id_flag() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().unwrap();
+        // Copilot's `--resume` only binds its value as `--resume=<id>`, which
+        // the token-pair continuity form can't emit; `--session-id <id>`
+        // resumes the same session (and self-heals to a fresh session with
+        // that id when the store was wiped).
+        let hint = ConversationHint::Resume {
+            id: "11111111-2222-4333-8444-555555555555".to_string(),
+        };
+        let parts = command_parts_for_harness_with_conversation(
+            "copilot",
+            "follow up",
+            HarnessLaunchMode::NonInteractive,
+            Some(&hint),
+            None,
+            HarnessLaunchOptions::default(),
+        )?;
+        assert_eq!(
+            parts,
+            (
+                "copilot".to_string(),
+                vec![
+                    "--no-color".to_string(),
+                    "--session-id".to_string(),
+                    "11111111-2222-4333-8444-555555555555".to_string(),
+                    "--prompt=follow up".to_string(),
+                ]
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn copilot_sandbox_maps_full_and_read_only_to_argv_lists() {
+        let specs = built_in_harness_specs();
+        let copilot = specs.iter().find(|s| s.id == "copilot").unwrap();
+        assert!(copilot.supports_permission());
+        assert_eq!(
+            copilot.sandbox_args(Permission::Full),
+            vec!["--allow-all".to_string()]
+        );
+        assert_eq!(
+            copilot.sandbox_args(Permission::ReadOnly),
+            vec![
+                "--deny-tool".to_string(),
+                "write".to_string(),
+                "--deny-tool".to_string(),
+                "shell".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn copilot_launch_options_prepend_model_permission_dirs_and_effort() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().unwrap();
+        let add_dirs = vec!["/tmp/extra".to_string()];
+        let (_, args) = command_parts_for_harness_with_conversation(
+            "copilot",
+            "hi",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            None,
+            HarnessLaunchOptions {
+                model: Some("openai/gpt-5.5"),
+                speed: Some(HarnessSpeed::Fast),
+                permission: Some(Permission::ReadOnly),
+                add_dirs: &add_dirs,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(
+            args,
+            vec![
+                "--model".to_string(),
+                "gpt-5.5".to_string(),
+                "--deny-tool".to_string(),
+                "write".to_string(),
+                "--deny-tool".to_string(),
+                "shell".to_string(),
+                "--add-dir".to_string(),
+                "/tmp/extra".to_string(),
+                "--effort".to_string(),
+                "low".to_string(),
+                "--no-color".to_string(),
+                "--prompt=hi".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn copilot_identity_preamble_rides_inside_prompt_flag_value() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().unwrap();
+        // Copilot has no system-prompt flag, so familiar identity is injected
+        // as a bracketed preamble inside the prompt flag's value.
+        let familiar = FamiliarContext {
+            id: "charm".to_string(),
+            display_name: "Charm".to_string(),
+            role: None,
+        };
+        let (_, args) = command_parts_for_harness_with_conversation(
+            "copilot",
+            "do the task",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            Some(&familiar),
+            HarnessLaunchOptions::default(),
+        )?;
+        let prompt_arg = args.last().expect("prompt arg present");
+        assert!(
+            prompt_arg.starts_with("--prompt=[Identity: You are Charm"),
+            "identity preamble must lead the prompt value: {prompt_arg:?}"
+        );
+        assert!(
+            prompt_arg.ends_with("do the task"),
+            "task prompt must close the prompt value: {prompt_arg:?}"
+        );
         Ok(())
     }
 
