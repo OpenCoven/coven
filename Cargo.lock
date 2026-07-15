@@ -680,11 +680,12 @@ dependencies = [
 [[package]]
 name = "coven-threads-core"
 version = "0.1.0"
-source = "git+https://github.com/OpenCoven/coven-threads?tag=v0.1.2#a64db33b4f55fe4c1a0bc16e7fe70943e504da29"
+source = "git+https://github.com/OpenCoven/coven-threads?tag=v0.1.3#5b4a51acfa7818cfd53c55998cd4a0bc733fc2fd"
 dependencies = [
  "blake3",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "time",
  "uuid",
