@@ -2039,7 +2039,7 @@ impl MeaningfulOutputDetector {
                 EscapeState::Ground => {
                     // Whitespace and C0 controls do not prove that a harness
                     // reached a usable prompt. Printable ASCII or UTF-8 does.
-                    meaningful |= *byte >= 0x80 || (*byte >= 0x20 && *byte != 0x7f);
+                    meaningful |= *byte >= 0x80 || (*byte > 0x20 && *byte != 0x7f);
                     EscapeState::Ground
                 }
                 EscapeState::Escape if *byte == b'[' => EscapeState::Csi,
@@ -3184,7 +3184,7 @@ exit 0
         assert!(!detector.push(b"\x1b[?1004"));
         assert!(!detector.push(b"\x1b[?25\x1b[?1004h\x1b]0;terminal title"));
         assert!(!detector.push(b"\x1b\\\x1b("));
-        assert!(!detector.push(b"B\x1b#8\r\n\t"));
+        assert!(!detector.push(b"B\x1b#8   \r\n\t"));
         assert!(detector.push(b"\x1b[32mready"));
     }
 
