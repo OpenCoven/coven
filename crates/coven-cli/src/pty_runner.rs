@@ -74,6 +74,13 @@ impl Write for SharedPtyWriter {
             .map_err(|_| io::Error::other("PTY writer lock poisoned"))?
             .flush()
     }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.inner
+            .lock()
+            .map_err(|_| io::Error::other("PTY writer lock poisoned"))?
+            .write_all(buf)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2017,6 +2024,7 @@ enum EscapeState {
     #[default]
     Ground,
     Escape,
+    EscapeIntermediate,
     Csi,
     String,
     StringEscape,
@@ -2038,7 +2046,17 @@ impl MeaningfulOutputDetector {
                 EscapeState::Escape if matches!(*byte, b']' | b'P' | b'^' | b'_') => {
                     EscapeState::String
                 }
+                EscapeState::Escape if (0x20..=0x2f).contains(byte) => {
+                    EscapeState::EscapeIntermediate
+                }
+                EscapeState::Escape if *byte == 0x1b => EscapeState::Escape,
                 EscapeState::Escape => EscapeState::Ground,
+                EscapeState::EscapeIntermediate if (0x20..=0x2f).contains(byte) => {
+                    EscapeState::EscapeIntermediate
+                }
+                EscapeState::EscapeIntermediate if *byte == 0x1b => EscapeState::Escape,
+                EscapeState::EscapeIntermediate => EscapeState::Ground,
+                EscapeState::Csi if *byte == 0x1b => EscapeState::Escape,
                 EscapeState::Csi if (0x40..=0x7e).contains(byte) => EscapeState::Ground,
                 EscapeState::Csi => EscapeState::Csi,
                 EscapeState::String if *byte == 0x07 => EscapeState::Ground,
@@ -3164,8 +3182,9 @@ exit 0
     fn startup_detector_ignores_terminal_control_traffic_across_chunks() {
         let mut detector = MeaningfulOutputDetector::default();
         assert!(!detector.push(b"\x1b[?1004"));
-        assert!(!detector.push(b"h\x1b]0;terminal title"));
-        assert!(!detector.push(b"\x1b\\\r\n\t"));
+        assert!(!detector.push(b"\x1b[?25\x1b[?1004h\x1b]0;terminal title"));
+        assert!(!detector.push(b"\x1b\\\x1b("));
+        assert!(!detector.push(b"B\x1b#8\r\n\t"));
         assert!(detector.push(b"\x1b[32mready"));
     }
 
