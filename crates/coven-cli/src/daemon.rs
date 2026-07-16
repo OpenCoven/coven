@@ -2757,6 +2757,208 @@ mod tests {
     }
 
     #[test]
+    fn startup_timeout_observer_marks_running_session_failed_with_diagnostic() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = crate::store::open_store(&temp_dir.path().join("coven.sqlite3"))?;
+        let mut session = session_record("startup-timeout");
+        session.status = "running".to_string();
+        crate::store::insert_session(&conn, &session)?;
+
+        let observer = output_observer(temp_dir.path().to_path_buf(), session.id.clone());
+        let pty_runner::DetachedPtyObserver {
+            mut on_output,
+            on_exit,
+        } = observer;
+        on_output(
+            b"Coven stopped the detached PTY: no meaningful output was produced before the startup timeout (50 ms).\n"
+                .to_vec(),
+        );
+        on_exit(pty_runner::PtyRunResult {
+            status: "failed",
+            exit_code: None,
+        });
+
+        let persisted = crate::store::get_session(&conn, &session.id)?.unwrap();
+        assert_eq!(persisted.status, "failed");
+        assert_eq!(persisted.exit_code, None);
+        let events = crate::store::list_events(&conn, &session.id)?;
+        assert!(events.iter().any(|event| {
+            event.kind == "output" && event.payload_json.contains("no meaningful output")
+        }));
+        assert!(events.iter().any(|event| {
+            event.kind == "exit"
+                && event.payload_json.contains("failed")
+                && event.payload_json.contains("null")
+        }));
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_detached_pty_success_persists_marker_and_completed_exit() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let coven_home = temp_dir.path().join("home");
+        std::fs::create_dir_all(&coven_home)?;
+        let conn = crate::store::open_store(&coven_home.join("coven.sqlite3"))?;
+        let session = session_record("native-pty-success");
+        crate::store::insert_session(&conn, &session)?;
+        let trace_file = temp_dir.path().join("query-trace.txt");
+        let command = pty_runner::windows_detached_stub_command(
+            temp_dir.path(),
+            "queries",
+            Some(&trace_file),
+        )?;
+        let observer = output_observer(coven_home.clone(), session.id.clone());
+
+        let _detached = pty_runner::spawn_detached_with_observer_for_test(
+            &command,
+            observer,
+            Duration::from_secs(5),
+        )?;
+        let persisted =
+            wait_for_session_status(&conn, &session.id, "completed", Duration::from_secs(10))?;
+
+        assert_eq!(persisted.exit_code, Some(0));
+        wait_for_session_event(&conn, &session.id, "exit", Duration::from_secs(3))?;
+        let events = crate::store::list_events(&conn, &session.id)?;
+        let payloads = events
+            .iter()
+            .map(|event| event.payload_json.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(payloads.contains("WINDOWS_PTY_STUB_OK_🎉"), "{payloads}");
+        for query in ["\\u001b[6n", "\\u001b[c", "\\u001b[0c", "\\u001b[5n"] {
+            assert!(!payloads.contains(query), "query leaked: {query:?}");
+        }
+        assert!(events.iter().any(|event| {
+            event.kind == "exit"
+                && event.payload_json.contains("completed")
+                && event.payload_json.contains("0")
+        }));
+        let trace = std::fs::read_to_string(trace_file)?;
+        assert!(trace.starts_with("started mode="), "{trace:?}");
+        for stage in ["cpr", "da", "status", "da0"] {
+            assert!(trace.lines().any(|line| line == stage), "{trace:?}");
+        }
+        std::fs::remove_file(temp_dir.path().join("windows-detached-pty-stub.exe"))
+            .context("native PTY stub executable remained in use after completed exit")?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_detached_pty_timeout_persists_failed_exit_and_kills_tree() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let coven_home = temp_dir.path().join("home");
+        std::fs::create_dir_all(&coven_home)?;
+        let conn = crate::store::open_store(&coven_home.join("coven.sqlite3"))?;
+        let session = session_record("native-pty-timeout");
+        crate::store::insert_session(&conn, &session)?;
+        let pid_file = temp_dir.path().join("descendant.pid");
+        let command =
+            pty_runner::windows_detached_stub_command(temp_dir.path(), "timeout", Some(&pid_file))?;
+        let observer = output_observer(coven_home.clone(), session.id.clone());
+
+        let _detached = pty_runner::spawn_detached_with_observer_for_test(
+            &command,
+            observer,
+            Duration::from_secs(2),
+        )?;
+        let persisted =
+            wait_for_session_status(&conn, &session.id, "failed", Duration::from_secs(10))?;
+        let descendant_pid: u32 = std::fs::read_to_string(&pid_file)?.trim().parse()?;
+
+        assert_eq!(persisted.exit_code, None);
+        wait_for_session_event(&conn, &session.id, "exit", Duration::from_secs(3))?;
+        let events = crate::store::list_events(&conn, &session.id)?;
+        let payloads = events
+            .iter()
+            .map(|event| event.payload_json.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(payloads.contains("no meaningful output"), "{payloads}");
+        assert!(!payloads.contains("\\u001b[6n"), "{payloads}");
+        assert!(events.iter().any(|event| {
+            event.kind == "exit"
+                && event.payload_json.contains("failed")
+                && event.payload_json.contains("null")
+        }));
+        assert!(
+            wait_for_windows_process_exit(descendant_pid, Duration::from_secs(3)),
+            "startup timeout left descendant process {descendant_pid} running"
+        );
+        std::fs::remove_file(temp_dir.path().join("windows-detached-pty-stub.exe"))
+            .context("native PTY stub executable remained in use after timeout")?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn wait_for_session_status(
+        conn: &rusqlite::Connection,
+        session_id: &str,
+        expected: &str,
+        timeout: Duration,
+    ) -> Result<crate::store::SessionRecord> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let session = crate::store::get_session(conn, session_id)?
+                .with_context(|| format!("session {session_id} disappeared during PTY test"))?;
+            if session.status == expected {
+                return Ok(session);
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "session {session_id} stayed {:?}; expected {expected:?}",
+                    session.status
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(windows)]
+    fn wait_for_session_event(
+        conn: &rusqlite::Connection,
+        session_id: &str,
+        kind: &str,
+        timeout: Duration,
+    ) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if crate::store::list_events(conn, session_id)?
+                .iter()
+                .any(|event| event.kind == kind)
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("session {session_id} never recorded {kind:?} event");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(windows)]
+    fn wait_for_windows_process_exit(pid: u32, timeout: Duration) -> bool {
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, WAIT_OBJECT_0},
+            System::Threading::{OpenProcess, WaitForSingleObject},
+        };
+        // SAFETY: the checked process handle is closed exactly once.
+        unsafe {
+            const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+            let process = OpenProcess(SYNCHRONIZE_ACCESS, 0, pid);
+            if process == 0 as _ {
+                return true;
+            }
+            let milliseconds = timeout.as_millis().min(u32::MAX as u128) as u32;
+            let result = WaitForSingleObject(process, milliseconds);
+            CloseHandle(process);
+            result == WAIT_OBJECT_0
+        }
+    }
+
+    #[test]
     fn live_runtime_rejects_stream_launch_for_non_stream_capable_harness() {
         let runtime = LiveSessionRuntime::default();
         let launch = crate::api::SessionLaunch {

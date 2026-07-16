@@ -1,14 +1,16 @@
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::AtomicI32;
 #[cfg(unix)]
-use std::sync::{Mutex, MutexGuard};
+use std::sync::MutexGuard;
 
 use anyhow::{Context, Result};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -49,6 +51,79 @@ pub struct DetachedPtySession {
 pub struct DetachedPtyObserver {
     pub on_output: Box<dyn FnMut(Vec<u8>) + Send + 'static>,
     pub on_exit: Box<dyn FnOnce(PtyRunResult) + Send + 'static>,
+}
+
+const DETACHED_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
+struct SharedPtyWriter {
+    inner: Arc<Mutex<Box<dyn Write + Send>>>,
+}
+
+impl Write for SharedPtyWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner
+            .lock()
+            .map_err(|_| io::Error::other("PTY writer lock poisoned"))?
+            .write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner
+            .lock()
+            .map_err(|_| io::Error::other("PTY writer lock poisoned"))?
+            .flush()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SharedPtyKiller {
+    inner: Arc<Mutex<PtyKillerInner>>,
+}
+
+#[derive(Debug)]
+struct PtyKillerInner {
+    fallback: Box<dyn ChildKiller + Send + Sync>,
+    #[cfg(windows)]
+    job_handle: Option<windows_sys::Win32::Foundation::HANDLE>,
+}
+
+#[cfg(windows)]
+unsafe impl Send for PtyKillerInner {}
+
+#[cfg(windows)]
+impl Drop for PtyKillerInner {
+    fn drop(&mut self) {
+        if let Some(handle) = self.job_handle.take() {
+            // SAFETY: this struct exclusively owns the job handle.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+        }
+    }
+}
+
+impl ChildKiller for SharedPtyKiller {
+    fn kill(&mut self) -> io::Result<()> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| io::Error::other("PTY killer lock poisoned"))?;
+        #[cfg(windows)]
+        if let Some(handle) = inner.job_handle.take() {
+            // Terminating the job stops the harness and every process it
+            // spawned. This is what prevents startup-timeout orphans.
+            let result =
+                unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(handle, 1) };
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+            if result != 0 {
+                return Ok(());
+            }
+        }
+        inner.fallback.kill()
+    }
+
+    fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+        Box::new(self.clone())
+    }
 }
 
 impl HarnessCommand {
@@ -1574,44 +1649,234 @@ pub fn spawn_detached_with_observer(
     command: &HarnessCommand,
     observer: Option<DetachedPtyObserver>,
 ) -> Result<DetachedPtySession> {
+    spawn_detached_with_observer_and_timeout(command, observer, detached_startup_timeout())
+}
+
+fn spawn_detached_with_observer_and_timeout(
+    command: &HarnessCommand,
+    observer: Option<DetachedPtyObserver>,
+    startup_timeout: Duration,
+) -> Result<DetachedPtySession> {
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(terminal_size())
         .context("failed to open PTY")?;
-    let mut child = pair
-        .slave
+    let portable_pty::PtyPair { master, slave } = pair;
+    let mut child = slave
         .spawn_command(command.to_command_builder())
         .with_context(|| format!("failed to spawn harness `{}`", command.program()))?;
-    drop(pair.slave);
+    drop(slave);
 
-    let mut reader = pair
-        .master
+    let mut reader = master
         .try_clone_reader()
         .context("failed to clone PTY reader")?;
-    let input = pair
-        .master
-        .take_writer()
-        .context("failed to open PTY writer")?;
-    let killer = child.clone_killer();
+    let writer = master.take_writer().context("failed to open PTY writer")?;
+    let mut shared_writer = SharedPtyWriter {
+        inner: Arc::new(Mutex::new(writer)),
+    };
+    let input: Box<dyn Write + Send> = Box::new(shared_writer.clone());
+    let killer = shared_pty_killer(child.as_ref());
+    let timeout_killer = killer.clone_killer();
 
+    // 0 = waiting for meaningful output, 1 = output or exit observed,
+    // 2 = startup timeout won the race. VT queries do not count because the
+    // filter consumes them before this state is advanced.
+    let startup_state = Arc::new(AtomicU8::new(0));
+    let DetachedPtyObserver { on_output, on_exit } = observer.unwrap_or(DetachedPtyObserver {
+        on_output: Box::new(|_| {}),
+        on_exit: Box::new(|_| {}),
+    });
+    let on_output = Arc::new(Mutex::new(on_output));
+
+    let timeout_state = Arc::clone(&startup_state);
+    let timeout_output = Arc::clone(&on_output);
     thread::spawn(move || {
-        let mut observer = observer;
-        drain_detached_output(
-            &mut reader,
-            observer.as_mut().map(|observer| &mut observer.on_output),
-        );
-        let result = wait_for_child(&mut child);
-        if let Some(observer) = observer {
-            (observer.on_exit)(result);
+        thread::sleep(startup_timeout);
+        if timeout_state
+            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            if let Ok(mut callback) = timeout_output.lock() {
+                callback(
+                    format!(
+                        "Coven stopped the detached PTY: no meaningful output was produced before the startup timeout ({} ms).\n",
+                        startup_timeout.as_millis()
+                    )
+                    .into_bytes(),
+                );
+            }
+            let mut timeout_killer = timeout_killer;
+            let _ = timeout_killer.kill();
         }
     });
 
-    Ok(DetachedPtySession { input, killer })
+    let (child_exit_tx, child_exit_rx) = mpsc::channel();
+    let child_exit_state = Arc::clone(&startup_state);
+    thread::spawn(move || {
+        // The cloned read/write pipe handles do not own the Windows HPCON.
+        // Keep the MasterPty alive until the child exits; dropping it when
+        // this function returned was the source of intermittent 0x7fffffff
+        // ConPTY exits with no output (#329).
+        let _master = master;
+        let result = wait_for_child(&mut child);
+        child_exit_state
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .ok();
+        drop(_master);
+        let _ = child_exit_tx.send(result);
+    });
+
+    thread::spawn(move || {
+        let output_state = Arc::clone(&startup_state);
+        let output_callback = Arc::clone(&on_output);
+        let mut meaningful_detector = MeaningfulOutputDetector::default();
+        let mut bridge: Box<dyn FnMut(Vec<u8>) + Send + 'static> = Box::new(move |chunk| {
+            if meaningful_detector.push(&chunk) {
+                output_state
+                    .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                    .ok();
+            }
+            if let Ok(mut callback) = output_callback.lock() {
+                callback(chunk);
+            }
+        });
+        drain_detached_pty_output(&mut reader, &mut shared_writer, Some(&mut bridge));
+        let mut result = child_exit_rx.recv().unwrap_or(PtyRunResult {
+            status: "failed",
+            exit_code: None,
+        });
+        let previous = startup_state.swap(1, Ordering::AcqRel);
+        if previous == 2 {
+            result = PtyRunResult {
+                status: "failed",
+                exit_code: None,
+            };
+        }
+        on_exit(result);
+    });
+
+    Ok(DetachedPtySession {
+        input,
+        killer: Box::new(killer),
+    })
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn spawn_detached_with_observer_for_test(
+    command: &HarnessCommand,
+    observer: DetachedPtyObserver,
+    startup_timeout: Duration,
+) -> Result<DetachedPtySession> {
+    spawn_detached_with_observer_and_timeout(command, Some(observer), startup_timeout)
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn windows_detached_stub_command(
+    build_dir: &Path,
+    mode: &str,
+    auxiliary_file: Option<&Path>,
+) -> Result<HarnessCommand> {
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/windows_detached_pty_stub.rs");
+    let executable = build_dir.join("windows-detached-pty-stub.exe");
+    let compile = std::process::Command::new("rustc.exe")
+        .args(["--edition=2021", "-o"])
+        .arg(&executable)
+        .arg(&source)
+        .output()
+        .context("failed to compile native Windows detached-PTY stub")?;
+    anyhow::ensure!(
+        compile.status.success(),
+        "native Windows detached-PTY stub failed to compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let mut args = vec![mode.to_string()];
+    if let Some(auxiliary_file) = auxiliary_file {
+        args.push(auxiliary_file.to_string_lossy().into_owned());
+    }
+    Ok(HarnessCommand {
+        program: executable.to_string_lossy().into_owned(),
+        args,
+        cwd: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+        stdin_prompt: None,
+    })
+}
+
+fn detached_startup_timeout() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(milliseconds) = std::env::var("COVEN_PTY_STARTUP_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Duration::from_millis(milliseconds.max(1));
+    }
+    DETACHED_STARTUP_TIMEOUT
+}
+
+fn shared_pty_killer(child: &dyn portable_pty::Child) -> SharedPtyKiller {
+    #[cfg(windows)]
+    let job_handle = child.process_id().and_then(assign_process_to_job);
+    SharedPtyKiller {
+        inner: Arc::new(Mutex::new(PtyKillerInner {
+            fallback: child.clone_killer(),
+            #[cfg(windows)]
+            job_handle,
+        })),
+    }
+}
+
+#[cfg(windows)]
+fn assign_process_to_job(pid: u32) -> Option<windows_sys::Win32::Foundation::HANDLE> {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+        System::{
+            JobObjects::{AssignProcessToJobObject, CreateJobObjectW},
+            Threading::{OpenProcess, PROCESS_ALL_ACCESS},
+        },
+    };
+    // SAFETY: all returned handles are checked and either closed here or
+    // transferred to PtyKillerInner for exclusive ownership.
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job == INVALID_HANDLE_VALUE || job == 0 as _ {
+            return None;
+        }
+        let process = OpenProcess(PROCESS_ALL_ACCESS, 0, pid);
+        if process == INVALID_HANDLE_VALUE || process == 0 as _ {
+            CloseHandle(job);
+            return None;
+        }
+        let assigned = AssignProcessToJobObject(job, process);
+        CloseHandle(process);
+        if assigned == 0 {
+            CloseHandle(job);
+            None
+        } else {
+            Some(job)
+        }
+    }
+}
+
+fn drain_detached_pty_output(
+    reader: &mut dyn Read,
+    writer: &mut dyn Write,
+    on_output: Option<&mut Box<dyn FnMut(Vec<u8>) + Send + 'static>>,
+) {
+    let mut filter = VtQueryFilter::default();
+    drain_detached_output_inner(reader, on_output, Some((&mut filter, writer)));
 }
 
 fn drain_detached_output(
     reader: &mut dyn Read,
+    on_output: Option<&mut Box<dyn FnMut(Vec<u8>) + Send + 'static>>,
+) {
+    drain_detached_output_inner(reader, on_output, None);
+}
+
+fn drain_detached_output_inner(
+    reader: &mut dyn Read,
     mut on_output: Option<&mut Box<dyn FnMut(Vec<u8>) + Send + 'static>>,
+    mut vt: Option<(&mut VtQueryFilter, &mut dyn Write)>,
 ) {
     let mut buffer = [0_u8; 8192];
     // Per-drain UTF-8 reassembly buffer. Each call to this function
@@ -1623,6 +1888,9 @@ fn drain_detached_output(
     loop {
         match reader.read(&mut buffer) {
             Ok(0) => {
+                if let Some((filter, _)) = vt.as_mut() {
+                    filter.finish(&mut utf8_buf);
+                }
                 // EOF: flush any trailing bytes (lossy if the stream
                 // ended mid-codepoint — better to surface garbled
                 // glyphs than drop the final message entirely).
@@ -1635,7 +1903,11 @@ fn drain_detached_output(
                 break;
             }
             Ok(bytes_read) => {
-                utf8_buf.extend_from_slice(&buffer[..bytes_read]);
+                if let Some((filter, writer)) = vt.as_mut() {
+                    filter.push(&buffer[..bytes_read], *writer, &mut utf8_buf);
+                } else {
+                    utf8_buf.extend_from_slice(&buffer[..bytes_read]);
+                }
                 // Emit the longest valid-UTF-8 prefix; keep the trailing
                 // partial codepoint in the buffer for the next read.
                 let valid_up_to = match std::str::from_utf8(&utf8_buf) {
@@ -1668,6 +1940,115 @@ fn drain_detached_output(
             }
             Err(_) => break,
         }
+    }
+}
+
+#[derive(Default)]
+struct VtQueryFilter {
+    pending: Vec<u8>,
+}
+
+impl VtQueryFilter {
+    fn push(&mut self, chunk: &[u8], writer: &mut dyn Write, output: &mut Vec<u8>) {
+        self.pending.extend_from_slice(chunk);
+        let mut offset = 0;
+        while offset < self.pending.len() {
+            let Some(relative_escape) =
+                self.pending[offset..].iter().position(|byte| *byte == 0x1b)
+            else {
+                output.extend_from_slice(&self.pending[offset..]);
+                offset = self.pending.len();
+                break;
+            };
+            let escape = offset + relative_escape;
+            output.extend_from_slice(&self.pending[offset..escape]);
+            let remaining = &self.pending[escape..];
+            if let Some((query_len, reply)) = vt_query_reply(remaining) {
+                if writer
+                    .write_all(reply)
+                    .and_then(|_| writer.flush())
+                    .is_err()
+                {
+                    // If the child closed its input while writing a reply,
+                    // keep draining its output; process exit remains the
+                    // authoritative lifecycle signal.
+                }
+                offset = escape + query_len;
+            } else if VT_QUERIES
+                .iter()
+                .any(|(query, _)| query.starts_with(remaining))
+            {
+                offset = escape;
+                break;
+            } else {
+                output.push(0x1b);
+                offset = escape + 1;
+            }
+        }
+        self.pending.drain(..offset);
+    }
+
+    fn finish(&mut self, output: &mut Vec<u8>) {
+        output.append(&mut self.pending);
+    }
+}
+
+const VT_QUERIES: [(&[u8], &[u8]); 4] = [
+    (b"\x1b[6n", b"\x1b[1;1R"),
+    (b"\x1b[c", b"\x1b[?62;c"),
+    (b"\x1b[0c", b"\x1b[?62;c"),
+    (b"\x1b[5n", b"\x1b[0n"),
+];
+
+fn vt_query_reply(bytes: &[u8]) -> Option<(usize, &'static [u8])> {
+    VT_QUERIES
+        .iter()
+        .find(|(query, _)| bytes.starts_with(query))
+        .map(|(query, reply)| (query.len(), *reply))
+}
+
+#[derive(Default)]
+struct MeaningfulOutputDetector {
+    state: EscapeState,
+}
+
+#[derive(Default, Clone, Copy)]
+enum EscapeState {
+    #[default]
+    Ground,
+    Escape,
+    Csi,
+    String,
+    StringEscape,
+}
+
+impl MeaningfulOutputDetector {
+    fn push(&mut self, bytes: &[u8]) -> bool {
+        let mut meaningful = false;
+        for byte in bytes {
+            self.state = match self.state {
+                EscapeState::Ground if *byte == 0x1b => EscapeState::Escape,
+                EscapeState::Ground => {
+                    // Whitespace and C0 controls do not prove that a harness
+                    // reached a usable prompt. Printable ASCII or UTF-8 does.
+                    meaningful |= *byte >= 0x80 || (*byte >= 0x20 && *byte != 0x7f);
+                    EscapeState::Ground
+                }
+                EscapeState::Escape if *byte == b'[' => EscapeState::Csi,
+                EscapeState::Escape if matches!(*byte, b']' | b'P' | b'^' | b'_') => {
+                    EscapeState::String
+                }
+                EscapeState::Escape => EscapeState::Ground,
+                EscapeState::Csi if (0x40..=0x7e).contains(byte) => EscapeState::Ground,
+                EscapeState::Csi => EscapeState::Csi,
+                EscapeState::String if *byte == 0x07 => EscapeState::Ground,
+                EscapeState::String if *byte == 0x1b => EscapeState::StringEscape,
+                EscapeState::String => EscapeState::String,
+                EscapeState::StringEscape if *byte == b'\\' => EscapeState::Ground,
+                EscapeState::StringEscape => EscapeState::String,
+            };
+        }
+        meaningful
     }
 }
 
@@ -1826,6 +2207,131 @@ mod tests {
         session.input.flush()?;
         session.killer.kill()?;
         Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_detached_pty_stub_completes_after_terminal_replies() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let trace_file = temp_dir.path().join("query-trace.txt");
+        let command = windows_detached_stub_command(temp_dir.path(), "queries", Some(&trace_file))?;
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_for_output = Arc::clone(&captured);
+        let (exit_tx, exit_rx) = mpsc::channel();
+        let observer = DetachedPtyObserver {
+            on_output: Box::new(move |chunk| {
+                captured_for_output.lock().unwrap().extend(chunk);
+            }),
+            on_exit: Box::new(move |result| {
+                let _ = exit_tx.send(result);
+            }),
+        };
+
+        let mut session = spawn_detached_with_observer_and_timeout(
+            &command,
+            Some(observer),
+            Duration::from_secs(5),
+        )?;
+        let result = match exit_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = session.killer.kill();
+                anyhow::bail!(
+                    "{error}; trace: {:?}; observed: {:?}",
+                    std::fs::read_to_string(&trace_file),
+                    String::from_utf8_lossy(&captured.lock().unwrap())
+                );
+            }
+        };
+
+        let observed = String::from_utf8_lossy(&captured.lock().unwrap()).into_owned();
+        let trace = std::fs::read_to_string(&trace_file).unwrap_or_default();
+        assert_eq!(
+            result.status, "completed",
+            "result: {result:?}; observed output: {observed:?}; trace: {trace:?}"
+        );
+        assert_eq!(result.exit_code, Some(0));
+        assert!(observed.contains("WINDOWS_PTY_STUB_OK_🎉"), "{observed:?}");
+        for query in ["\x1b[6n", "\x1b[c", "\x1b[0c", "\x1b[5n"] {
+            assert!(!observed.contains(query), "query leaked: {query:?}");
+        }
+        assert!(trace.starts_with("started mode="), "{trace:?}");
+        for stage in ["cpr", "da", "status", "da0"] {
+            assert!(trace.lines().any(|line| line == stage), "{trace:?}");
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_detached_pty_timeout_fails_and_kills_descendant() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let pid_file = temp_dir.path().join("descendant.pid");
+        let command = windows_detached_stub_command(temp_dir.path(), "timeout", Some(&pid_file))?;
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_for_output = Arc::clone(&captured);
+        let (exit_tx, exit_rx) = mpsc::channel();
+        let observer = DetachedPtyObserver {
+            on_output: Box::new(move |chunk| {
+                captured_for_output.lock().unwrap().extend(chunk);
+            }),
+            on_exit: Box::new(move |result| {
+                let _ = exit_tx.send(result);
+            }),
+        };
+
+        let mut session = spawn_detached_with_observer_and_timeout(
+            &command,
+            Some(observer),
+            Duration::from_secs(2),
+        )?;
+        let result = match exit_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = session.killer.kill();
+                return Err(error.into());
+            }
+        };
+        let descendant_pid: u32 = std::fs::read_to_string(&pid_file)
+            .with_context(|| {
+                format!(
+                    "timeout stub did not create pid file; observed output: {:?}",
+                    String::from_utf8_lossy(&captured.lock().unwrap())
+                )
+            })?
+            .trim()
+            .parse()?;
+
+        assert_eq!(result.status, "failed");
+        assert_eq!(result.exit_code, None);
+        let output = String::from_utf8(captured.lock().unwrap().clone())?;
+        assert!(output.contains("no meaningful output"), "{output:?}");
+        assert!(!output.contains("\x1b[6n"), "query leaked: {output:?}");
+        assert!(
+            wait_for_windows_process_exit(descendant_pid, Duration::from_secs(3)),
+            "startup timeout left descendant process {descendant_pid} running"
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn wait_for_windows_process_exit(pid: u32, timeout: Duration) -> bool {
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, WAIT_OBJECT_0},
+            System::Threading::{OpenProcess, WaitForSingleObject},
+        };
+        // SAFETY: the process handle is checked and closed exactly once.
+        unsafe {
+            const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+            let process = OpenProcess(SYNCHRONIZE_ACCESS, 0, pid);
+            if process == 0 as _ {
+                return true;
+            }
+            let milliseconds = timeout.as_millis().min(u32::MAX as u128) as u32;
+            let result = WaitForSingleObject(process, milliseconds);
+            CloseHandle(process);
+            result == WAIT_OBJECT_0
+        }
     }
 
     /// Serializes the fake-claude tests: each writes an executable script and
@@ -2591,6 +3097,76 @@ exit 0
             final_text.contains('\u{FFFD}'),
             "the flushed bytes are unrecoverable; expected U+FFFD replacement, got: {final_text:?}"
         );
+    }
+
+    #[test]
+    fn detached_pty_answers_split_vt_queries_without_leaking_them() {
+        let emoji = "🎉".as_bytes();
+        let chunks: Vec<&[u8]> = vec![
+            b"ready ",
+            b"\x1b[",
+            b"6n",
+            &emoji[..2],
+            &emoji[2..],
+            b"\x1b[c\x1b[0",
+            b"c\x1b[5n done",
+        ];
+        let mut reader = ChunkedReader {
+            chunks: chunks.into(),
+        };
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_for_callback = captured.clone();
+        let mut callback: Box<dyn FnMut(Vec<u8>) + Send + 'static> = Box::new(move |chunk| {
+            captured_for_callback
+                .lock()
+                .unwrap()
+                .extend_from_slice(&chunk);
+        });
+        let mut replies = Vec::new();
+
+        drain_detached_pty_output(&mut reader, &mut replies, Some(&mut callback));
+
+        assert_eq!(
+            captured.lock().unwrap().as_slice(),
+            "ready 🎉 done".as_bytes()
+        );
+        assert_eq!(
+            replies, b"\x1b[1;1R\x1b[?62;c\x1b[?62;c\x1b[0n",
+            "CPR, primary/explicit DA, and status queries must receive terminal replies"
+        );
+    }
+
+    #[test]
+    fn detached_pty_preserves_unknown_and_incomplete_escape_sequences() {
+        let mut reader = ChunkedReader {
+            chunks: vec![b"before\x1b[31mred\x1b[".as_slice()].into(),
+        };
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_for_callback = captured.clone();
+        let mut callback: Box<dyn FnMut(Vec<u8>) + Send + 'static> = Box::new(move |chunk| {
+            captured_for_callback
+                .lock()
+                .unwrap()
+                .extend_from_slice(&chunk);
+        });
+        let mut replies = Vec::new();
+
+        drain_detached_pty_output(&mut reader, &mut replies, Some(&mut callback));
+
+        assert_eq!(
+            captured.lock().unwrap().as_slice(),
+            b"before\x1b[31mred\x1b["
+        );
+        assert!(replies.is_empty());
+    }
+
+    #[test]
+    fn startup_detector_ignores_terminal_control_traffic_across_chunks() {
+        let mut detector = MeaningfulOutputDetector::default();
+        assert!(!detector.push(b"\x1b[?1004"));
+        assert!(!detector.push(b"h\x1b]0;terminal title"));
+        assert!(!detector.push(b"\x1b\\\r\n\t"));
+        assert!(detector.push(b"\x1b[32mready"));
     }
 
     #[test]
