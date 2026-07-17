@@ -6,6 +6,14 @@ read_when:
 title: "Coven changelog and release notes"
 ---
 
+## Week of July 14, 2026
+
+### New features
+
+- **`coven scheduler` and `coven travel` read verbs.** The scheduler and travel daemon surfaces were API-only; ids they hand out (`coven hub routing` rows carry a `decisionId`, redispatch responses carry a `loopId`) had no CLI follow-up. `coven scheduler decision <id>`, `coven scheduler loop <loopId>`, and `coven travel state --client <id> [--profile <profileId>]` now render those read routes through the observe pattern — human prose by default, `--json` printing the exact `/api/v1/scheduler/*` / `/api/v1/travel/state` body. Write surfaces (decisions, redispatch, profiles, deltas) stay machine-to-machine like the executor protocol. See [observability commands](/reference/cli-observe) and [issue #390](https://github.com/OpenCoven/coven/issues/390).
+- **Harness capability aggregate is reachable at `GET /api/v1/capabilities/harnesses`.** The endpoint returning Coven skills plus one capability manifest per harness (`{ coven_skills, harness_capabilities, scanned_at }`, with `?refresh=1` re-scan) was previously shadowed by the control-plane capability catalog on the bare `/api/v1/capabilities` path and unreachable. The catalog keeps the bare path, the aggregate now lives at `/capabilities/harnesses`, and unknown ids on `/capabilities/:harnessId` fail closed with a structured `404 harness_not_found` envelope. See [Capabilities endpoint](/reference/api-capabilities) and [issue #368](https://github.com/OpenCoven/coven/issues/368).
+- **GitHub Copilot CLI is a supported built-in harness (v0.0.54).** `coven run copilot "…"` now launches the GitHub Copilot CLI (`npm install -g @github/copilot`) under the same project-rooted PTY supervision as Codex and Claude Code. `--permission full|read-only` maps to Copilot's native flags (`--allow-all` / `--deny-tool write --deny-tool shell`), `--model`, `--add-dir`, and `--think`/`--speed` (via `--effort`) forward natively, and `coven chat` keeps cross-turn conversations through pre-assigned `--session-id` UUIDs. Copilot has no long-lived stream mode, so chat turns run per-turn one-shots like Codex. `coven doctor` detects the binary and prints install/auth hints (`copilot login`). Adapter manifests gain optional `prompt_flag`/`interactive_prompt_flag` fields for harnesses whose prompt rides a flag instead of a positional. See [Copilot CLI harness](/harnesses/copilot-cli) and [issue #381](https://github.com/OpenCoven/coven/issues/381).
+
 ## Week of July 4, 2026
 
 ### New features
@@ -17,6 +25,10 @@ title: "Coven changelog and release notes"
 
 - **CLI-login-only model selection (v0.0.53).** The model-selection docs now expose only the supported Codex CLI and Claude Code login paths. Provider/API-key option pages for OpenAI, Anthropic, Google, and local-model backends were removed from the selectable `/models` surface so clients and users are routed through `codex login` or `claude doctor` instead of raw provider credentials. See [Model selection](/models).
 - **Multi-host daemon specs.** Added PRODUCT and TECH specs for travel profiles, offline deltas, scheduler roles, redispatch, failure handling, and the issue mapping for the multi-host daemon track.
+
+### Bug fixes
+
+- **Windows Codex stream bridge.** `coven run codex --stream-json` now launches `codex exec --json` through ordinary pipes, so npm's `codex.cmd` no longer relies on the headless ConPTY/OpenConsole handoff. Completed Codex messages are normalized into Coven `assistant` events, native thread ids are retained for resume, and timeout, protocol failure, and Unix cancellation are bounded with owned process-tree cleanup instead of leaving a session running forever. Windows uses a Job Object when assignment succeeds and `taskkill /T /F` for Coven-supervised fallback cleanup. See [stream-JSON protocol](/STREAM-JSON) and [Codex harness notes](/harnesses/codex).
 
 ## Week of June 24, 2026
 

@@ -45,6 +45,15 @@ pub struct SessionRecord {
     pub labels: Vec<String>,
     #[serde(default = "default_visibility")]
     pub visibility: String,
+    /// True when the session was launched outside the daemon (e.g. by the
+    /// coven engine TUI) and registered via POST /sessions/external. The
+    /// daemon does not own the PTY; it only holds the ledger row.
+    #[serde(default)]
+    pub external: bool,
+    /// Absolute path to the transcript file written by an external session.
+    /// Only meaningful when `external` is true.
+    #[serde(default)]
+    pub transcript_path: Option<String>,
 }
 
 fn default_visibility() -> String {
@@ -218,6 +227,13 @@ pub struct StoreVacuumReport {
     pub integrity_check: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WardedSurfaceCommitment {
+    familiar_id: String,
+    surface: String,
+    entry_hash: Vec<u8>,
+}
+
 #[derive(Debug, Default)]
 pub struct EventsQueryOptions {
     pub after_seq: Option<i64>,
@@ -251,7 +267,9 @@ pub fn open_store(path: &Path) -> Result<Connection> {
             conversation_id TEXT,
             labels TEXT,
             visibility TEXT NOT NULL DEFAULT 'private',
-            familiar_id TEXT
+            familiar_id TEXT,
+            external INTEGER NOT NULL DEFAULT 0,
+            transcript_path TEXT
         );
 
         CREATE TABLE IF NOT EXISTS events (
@@ -461,6 +479,13 @@ pub fn open_store(path: &Path) -> Result<Connection> {
         ",
     )
     .context("failed to initialize Coven store schema")?;
+    // The coven-threads gate layer's daemon-owned tables: the append-only
+    // ward.audit ledger (single audit store — PHASE-0-DESIGN §3.4, RFC-0001
+    // §5.6) and the per-familiar surface baseline manifest. Both idempotent.
+    conn.execute_batch(coven_threads_core::WARD_AUDIT_SCHEMA_SQL)
+        .context("failed to initialize ward_audit schema")?;
+    conn.execute_batch(crate::threads_gate::WARD_MANIFEST_SCHEMA_SQL)
+        .context("failed to initialize ward_manifest schema")?;
     ensure_exit_code_column(&conn)?;
     ensure_archived_at_column(&conn)?;
     ensure_conversation_id_column(&conn)?;
@@ -470,6 +495,7 @@ pub fn open_store(path: &Path) -> Result<Connection> {
     ensure_visibility_column(&conn)?;
     ensure_familiar_id_column(&conn)?;
     ensure_node_registry_dispatch_columns(&conn)?;
+    ensure_session_external_columns(&conn)?;
 
     backfill_events_fts_if_needed(&conn)?;
 
@@ -560,6 +586,28 @@ fn ensure_event_privacy_columns(conn: &Connection) -> Result<()> {
         "events",
         "sensitive",
         "ALTER TABLE events ADD COLUMN sensitive INTEGER NOT NULL DEFAULT 0",
+    )?;
+    Ok(())
+}
+
+fn ensure_session_external_columns(conn: &Connection) -> Result<()> {
+    ensure_column(
+        conn,
+        "sessions",
+        "external",
+        "ALTER TABLE sessions ADD COLUMN external INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "sessions",
+        "transcript_path",
+        "ALTER TABLE sessions ADD COLUMN transcript_path TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "sessions",
+        "transcript_indexed_at",
+        "ALTER TABLE sessions ADD COLUMN transcript_indexed_at TEXT",
     )?;
     Ok(())
 }
@@ -1588,8 +1636,9 @@ pub fn insert_session(conn: &Connection, record: &SessionRecord) -> Result<()> {
     conn.execute(
         "INSERT INTO sessions (
             id, project_root, harness, title, status, exit_code, archived_at,
-            created_at, updated_at, conversation_id, labels, visibility, familiar_id
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            created_at, updated_at, conversation_id, labels, visibility, familiar_id,
+            external, transcript_path
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             &record.id,
             &record.project_root,
@@ -1604,6 +1653,8 @@ pub fn insert_session(conn: &Connection, record: &SessionRecord) -> Result<()> {
             labels_json,
             &record.visibility,
             &record.familiar_id,
+            record.external as i32,
+            &record.transcript_path,
         ],
     )
     .with_context(|| format!("failed to insert session {}", record.id))?;
@@ -1621,8 +1672,9 @@ pub fn insert_session_if_absent(conn: &Connection, record: &SessionRecord) -> Re
         .execute(
             "INSERT OR IGNORE INTO sessions (
                 id, project_root, harness, title, status, exit_code, archived_at,
-                created_at, updated_at, conversation_id, labels, visibility, familiar_id
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                created_at, updated_at, conversation_id, labels, visibility, familiar_id,
+                external, transcript_path
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 &record.id,
                 &record.project_root,
@@ -1637,6 +1689,8 @@ pub fn insert_session_if_absent(conn: &Connection, record: &SessionRecord) -> Re
                 labels_json,
                 &record.visibility,
                 &record.familiar_id,
+                record.external as i32,
+                &record.transcript_path,
             ],
         )
         .with_context(|| format!("failed to upsert session {}", record.id))?;
@@ -1663,13 +1717,38 @@ pub fn update_session_status(
     Ok(())
 }
 
+/// Persist the harness-native id that continues a multi-turn conversation.
+///
+/// Coven's `id` remains the stable ledger/session id exposed to callers.
+/// Harnesses such as Codex mint a different id for their own resume API, so
+/// callers can safely keep passing the Coven id while the runner resolves the
+/// native conversation id internally.
+pub fn update_session_conversation_id(
+    conn: &Connection,
+    session_id: &str,
+    conversation_id: &str,
+    updated_at: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions
+         SET conversation_id = ?2,
+             updated_at = ?3
+         WHERE id = ?1",
+        params![session_id, conversation_id, updated_at],
+    )
+    .with_context(|| format!("failed to update conversation id for session {session_id}"))?;
+
+    Ok(())
+}
+
 pub fn mark_running_sessions_orphaned(conn: &Connection, updated_at: &str) -> Result<usize> {
     let updated = conn
         .execute(
             "UPDATE sessions
              SET status = 'orphaned',
                  updated_at = ?1
-             WHERE status = 'running'",
+             WHERE status = 'running'
+               AND external = 0",
             params![updated_at],
         )
         .context("failed to mark running sessions orphaned")?;
@@ -1716,6 +1795,30 @@ pub fn get_session(conn: &Connection, session_id: &str) -> Result<Option<Session
         .with_context(|| format!("failed to read session {session_id}"))
 }
 
+/// Resolve the most recently updated ledger row for a harness-native
+/// conversation id. This keeps `--continue <Codex thread id>` compatible with
+/// callers that persist the native id instead of Coven's ledger id.
+pub fn get_latest_session_by_conversation_id(
+    conn: &Connection,
+    conversation_id: &str,
+) -> Result<Option<SessionRecord>> {
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT
+                {SESSION_COLUMNS}
+            FROM sessions
+            WHERE conversation_id = ?1
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT 1",
+        ))
+        .context("failed to prepare conversation session lookup query")?;
+
+    statement
+        .query_row(params![conversation_id], session_record_from_row)
+        .optional()
+        .with_context(|| format!("failed to read conversation {conversation_id}"))
+}
+
 pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionRecord>> {
     list_sessions_with_archive_filter(conn, false)
 }
@@ -1752,6 +1855,8 @@ fn list_sessions_with_archive_filter(
     Ok(sessions)
 }
 
+// NOTE: column ORDER here must stay in sync with the positional indices in
+// `session_record_from_row`; append new columns at the END only.
 const SESSION_COLUMNS: &str = "id,
                 project_root,
                 harness,
@@ -1764,7 +1869,9 @@ const SESSION_COLUMNS: &str = "id,
                 conversation_id,
                 labels,
                 visibility,
-                familiar_id";
+                familiar_id,
+                external,
+                transcript_path";
 
 fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
     let labels_str: Option<String> = row.get(10)?;
@@ -1781,6 +1888,7 @@ fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionR
         })?
         .unwrap_or_default();
     let visibility: String = row.get(11)?;
+    let external_int: i32 = row.get(13)?;
     Ok(SessionRecord {
         id: row.get(0)?,
         project_root: row.get(1)?,
@@ -1795,6 +1903,8 @@ fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionR
         familiar_id: row.get(12)?,
         labels,
         visibility,
+        external: external_int != 0,
+        transcript_path: row.get(14)?,
     })
 }
 
@@ -1885,8 +1995,242 @@ pub fn search_events(conn: &Connection, query: &str) -> Result<Vec<SearchHit>> {
     Ok(out)
 }
 
+/// Maximum number of JSONL lines to read from an external transcript during
+/// ingestion. Lines beyond this cap are silently dropped (the session will
+/// still be marked as indexed so the cap applies only once, on first search).
+const TRANSCRIPT_INGEST_LINE_LIMIT: usize = 10_000;
+
+/// Maximum total bytes of extracted text to index from a single transcript.
+const TRANSCRIPT_INGEST_BYTE_LIMIT: usize = 512 * 1024; // 512 KiB
+
+/// Query for external sessions that have a transcript path but have not yet
+/// been indexed into the FTS table. Returns (session_id, transcript_path) pairs.
+pub fn list_uningest_external_sessions(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, transcript_path
+             FROM sessions
+             WHERE external = 1
+               AND transcript_path IS NOT NULL
+               AND transcript_indexed_at IS NULL",
+        )
+        .context("failed to prepare un-ingested external session query")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .context("failed to query un-ingested external sessions")?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.context("failed to read un-ingested session row")?);
+    }
+    Ok(out)
+}
+
+/// Read an external session's engine JSONL transcript and index its text into
+/// the events table (redacted, retention-bounded) so it becomes searchable.
+///
+/// # Design decisions
+///
+/// - **Index-once**: once `transcript_indexed_at` is set the function returns 0
+///   immediately. Growing transcripts are not re-indexed (a follow-up task).
+/// - **Missing file**: if the file does not exist yet (session still running but
+///   the transcript hasn't been written) we return 0 and leave
+///   `transcript_indexed_at` NULL so the next search will retry. If the file
+///   exists but can't be read, we log a warning and return 0 without marking
+///   as indexed (same retry-on-next-search semantics). Permanently missing files
+///   are handled by a bounded retry: a caller willing to never retry can set
+///   `transcript_indexed_at` themselves.
+/// - **Bounds**: at most `TRANSCRIPT_INGEST_LINE_LIMIT` lines and
+///   `TRANSCRIPT_INGEST_BYTE_LIMIT` bytes of extracted text are indexed. On
+///   truncation a log message is emitted.
+/// - **Text extraction**: each line is parsed as `serde_json::Value`. Text is
+///   extracted using two heuristics (in priority order):
+///     1. `message.content` array → each element with `type == "text"` yields
+///        its `text` field. This covers the coven-code `TranscriptEntry` shape:
+///        `{"type":"user"|"assistant","message":{"content":[{"type":"text","text":"…"}]}}`.
+///     2. Top-level `text` string field (fallback for simpler shapes).
+///
+///   Lines with no extractable text are skipped.
+/// - **Privacy**: text is inserted via `insert_event` which runs
+///   `redact_payload_json_with_config` with `PrivacyConfig::default()` — same
+///   path as normal daemon events. If `coven_home` is provided and has a
+///   `privacy.toml`, the caller can instead use `insert_event_with_privacy`
+///   directly; we accept the home dir here and dispatch accordingly.
+///
+/// Returns the number of event rows inserted.
+pub fn ingest_external_transcript(
+    conn: &Connection,
+    session_id: &str,
+    coven_home: &Path,
+    now: &str,
+) -> Result<usize> {
+    use std::io::BufRead as _;
+
+    // Load the session; bail if already indexed or not eligible.
+    let session = match get_session(conn, session_id)? {
+        Some(s) => s,
+        None => return Ok(0),
+    };
+    if !session.external {
+        return Ok(0);
+    }
+    let transcript_path = match &session.transcript_path {
+        Some(p) => p.clone(),
+        None => return Ok(0),
+    };
+
+    // Already indexed — skip.
+    let already_indexed: Option<String> = conn
+        .query_row(
+            "SELECT transcript_indexed_at FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to query transcript_indexed_at")?
+        .flatten();
+    if already_indexed.is_some() {
+        return Ok(0);
+    }
+
+    // Open the transcript file. If it doesn't exist yet, return 0 without
+    // marking as indexed so a future search will retry.
+    let file = match std::fs::File::open(&transcript_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // File doesn't exist yet (session may still be starting). Retry later.
+            return Ok(0);
+        }
+        Err(e) => {
+            eprintln!(
+                "warning: ingest_external_transcript: cannot open transcript \
+                 {transcript_path}: {e}; will retry on next search"
+            );
+            return Ok(0);
+        }
+    };
+
+    let reader = std::io::BufReader::new(file);
+    let mut count = 0usize;
+    let mut total_bytes = 0usize;
+    let mut truncated = false;
+
+    for (line_idx, line_result) in reader.lines().enumerate() {
+        if line_idx >= TRANSCRIPT_INGEST_LINE_LIMIT {
+            truncated = true;
+            break;
+        }
+        let line = match line_result {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!(
+                    "warning: ingest_external_transcript: read error at line \
+                     {line_idx} in {transcript_path}: {e}; skipping rest"
+                );
+                break;
+            }
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue, // non-JSON line (e.g. header), skip
+        };
+
+        // Extract human-readable text from the parsed JSON.
+        let texts = extract_transcript_texts(&value);
+        for text in texts {
+            if text.is_empty() {
+                continue;
+            }
+            if total_bytes + text.len() > TRANSCRIPT_INGEST_BYTE_LIMIT {
+                truncated = true;
+                break;
+            }
+            total_bytes += text.len();
+
+            let payload = serde_json::json!({ "text": text });
+            let record = EventRecord {
+                seq: 0,
+                id: uuid::Uuid::new_v4().to_string(),
+                session_id: session_id.to_string(),
+                kind: "transcript_text".to_string(),
+                payload_json: payload.to_string(),
+                created_at: now.to_string(),
+            };
+            insert_event_with_privacy(conn, coven_home, &record)?;
+            count += 1;
+        }
+        if truncated {
+            break;
+        }
+    }
+
+    if truncated {
+        eprintln!(
+            "warning: ingest_external_transcript: session {session_id} transcript truncated at \
+             {TRANSCRIPT_INGEST_LINE_LIMIT} lines / {TRANSCRIPT_INGEST_BYTE_LIMIT} bytes \
+             ({count} chunks indexed)"
+        );
+    }
+
+    // Mark as indexed regardless of how many chunks were extracted (including zero,
+    // which means the file was present but had no parseable text).
+    conn.execute(
+        "UPDATE sessions SET transcript_indexed_at = ?2 WHERE id = ?1",
+        params![session_id, now],
+    )
+    .with_context(|| format!("failed to set transcript_indexed_at for session {session_id}"))?;
+
+    Ok(count)
+}
+
+/// Extract human-readable text strings from a single transcript JSONL line.
+///
+/// Targets the coven-code `TranscriptEntry` shape:
+/// ```json
+/// {"type":"user","message":{"content":[{"type":"text","text":"hello"}]}}
+/// ```
+/// Also handles a simpler top-level `"text": "..."` field as a fallback.
+fn extract_transcript_texts(value: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+
+    // Heuristic 1: message.content array of {type:"text", text:"..."} blocks.
+    if let Some(content) = value
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+    {
+        for block in content {
+            if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                    let trimmed = text.trim().to_string();
+                    if !trimmed.is_empty() {
+                        out.push(trimmed);
+                    }
+                }
+            }
+        }
+    }
+
+    // Heuristic 2: top-level "text" string (simpler/older shapes).
+    if out.is_empty() {
+        if let Some(text) = value.get("text").and_then(|t| t.as_str()) {
+            let trimmed = text.trim().to_string();
+            if !trimmed.is_empty() {
+                out.push(trimmed);
+            }
+        }
+    }
+
+    out
+}
+
 pub fn vacuum_store_path(path: &Path) -> Result<StoreVacuumReport> {
     let conn = open_store(path)?;
+    let pre_compaction = load_warded_surface_commitments(&conn)?;
 
     let event_index_rebuilt = sqlite_object_exists(&conn, "table", "events_fts")?;
     if event_index_rebuilt {
@@ -1898,11 +2242,90 @@ pub fn vacuum_store_path(path: &Path) -> Result<StoreVacuumReport> {
         .context("failed to vacuum Coven store")?;
     let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     let integrity_check = pragma_integrity_check(&conn)?;
+    append_compaction_ledger_events(&conn, &pre_compaction)?;
 
     Ok(StoreVacuumReport {
         event_index_rebuilt,
         integrity_check,
     })
+}
+
+fn load_warded_surface_commitments(conn: &Connection) -> Result<Vec<WardedSurfaceCommitment>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT familiar_id, surface, entry_hash
+             FROM ward_manifest
+             ORDER BY familiar_id, surface",
+        )
+        .context("loading warded surface commitments before compaction")?;
+    let rows = stmt.query_map([], |row| {
+        Ok(WardedSurfaceCommitment {
+            familiar_id: row.get(0)?,
+            surface: row.get(1)?,
+            entry_hash: row.get(2)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .context("reading warded surface commitments before compaction")
+}
+
+fn append_compaction_ledger_events(
+    conn: &Connection,
+    pre_compaction: &[WardedSurfaceCommitment],
+) -> Result<()> {
+    if pre_compaction.is_empty() {
+        return Ok(());
+    }
+
+    let format = time::format_description::well_known::Rfc3339;
+    let now = time::OffsetDateTime::now_utc().format(&format)?;
+    for pre in pre_compaction {
+        let post = load_warded_surface_commitment(conn, &pre.familiar_id, &pre.surface)?;
+        let decision = match post.as_deref() {
+            Some(bytes) if bytes == pre.entry_hash.as_slice() => "compacted:unchanged",
+            Some(_) => "compacted:changed",
+            None => "compacted:missing_post",
+        };
+        let files_touched = serde_json::to_string(&[pre.surface.as_str()])?;
+        conn.execute(
+            "INSERT INTO ward_audit (
+                event_type, proposal_id, familiar_id, ward_version, ward_hash,
+                tier, decision, approver, diff_hash, files_touched, channel,
+                thread_id, submitted_at, decided_at
+            ) VALUES (?1, NULL, ?2, NULL, ?3, NULL, ?4, NULL, ?5, ?6, ?7, NULL, ?8, ?8)",
+            params![
+                coven_threads_core::AuditEventType::CompactionLedger.tag(),
+                pre.familiar_id,
+                pre.entry_hash,
+                decision,
+                post,
+                files_touched,
+                format!("{:?}", coven_threads_core::Channel::Forced).to_lowercase(),
+                now,
+            ],
+        )
+        .with_context(|| {
+            format!(
+                "appending WARD-C6 compaction ledger for {}:{}",
+                pre.familiar_id, pre.surface
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn load_warded_surface_commitment(
+    conn: &Connection,
+    familiar_id: &str,
+    surface: &str,
+) -> Result<Option<Vec<u8>>> {
+    conn.query_row(
+        "SELECT entry_hash FROM ward_manifest WHERE familiar_id = ?1 AND surface = ?2",
+        params![familiar_id, surface],
+        |row| row.get(0),
+    )
+    .optional()
+    .context("loading warded surface commitment after compaction")
 }
 
 fn sqlite_object_exists(conn: &Connection, object_type: &str, name: &str) -> Result<bool> {
@@ -2560,6 +2983,41 @@ mod tests {
     }
 
     #[test]
+    fn orphan_reaper_skips_external_sessions() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+
+        // A normal running session: should be orphaned.
+        let mut non_external = session_record("non-external-running", "2026-04-27T06:00:00Z");
+        non_external.status = "running".to_string();
+        non_external.external = false;
+
+        // An external running session: must NOT be orphaned.
+        let mut external = session_record("external-running", "2026-04-27T06:00:00Z");
+        external.status = "running".to_string();
+        external.external = true;
+
+        insert_session(&conn, &non_external)?;
+        insert_session(&conn, &external)?;
+
+        let updated = mark_running_sessions_orphaned(&conn, "2026-04-27T07:00:00Z")?;
+        assert_eq!(updated, 1, "only the non-external session should be reaped");
+
+        let sessions = list_sessions(&conn)?;
+        let ne = sessions
+            .iter()
+            .find(|s| s.id == "non-external-running")
+            .unwrap();
+        let ex = sessions
+            .iter()
+            .find(|s| s.id == "external-running")
+            .unwrap();
+        assert_eq!(ne.status, "orphaned");
+        assert_eq!(ex.status, "running", "external session must stay running");
+        Ok(())
+    }
+
+    #[test]
     fn marks_only_stale_created_sessions_failed() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let conn = open_store(&temp_dir.path().join("coven.db"))?;
@@ -3182,6 +3640,8 @@ mod tests {
             familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
+            external: false,
+            transcript_path: None,
         }
     }
 
@@ -3199,6 +3659,27 @@ mod tests {
         )?;
         let hit = latest_active_for_project(&conn, "/p")?;
         assert_eq!(hit.as_deref(), Some("newer"));
+        Ok(())
+    }
+
+    #[test]
+    fn native_conversation_id_round_trips_for_resume_lookup() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("test.sqlite3"))?;
+        insert_session(&conn, &session_record("ledger-1", "2026-01-01T00:00:00Z"))?;
+
+        update_session_conversation_id(
+            &conn,
+            "ledger-1",
+            "codex-thread-123",
+            "2026-01-02T00:00:00Z",
+        )?;
+
+        let ledger = get_session(&conn, "ledger-1")?.expect("ledger row should exist");
+        assert_eq!(ledger.conversation_id.as_deref(), Some("codex-thread-123"));
+        let resumed = get_latest_session_by_conversation_id(&conn, "codex-thread-123")?
+            .expect("native thread id should resolve back to the ledger row");
+        assert_eq!(resumed.id, "ledger-1");
         Ok(())
     }
 
@@ -3364,6 +3845,101 @@ mod tests {
     }
 
     #[test]
+    fn vacuum_appends_compaction_ledger_for_warded_surface() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("test.sqlite3");
+        let conn = open_store(&path)?;
+        let pre_commitment = vec![0x42; 32];
+        conn.execute(
+            "INSERT INTO ward_manifest (familiar_id, surface, manifest_id, entry_hash)
+             VALUES ('sage', 'SOUL.md', '11111111-1111-1111-1111-111111111111', ?1)",
+            [&pre_commitment],
+        )?;
+        drop(conn);
+
+        vacuum_store_path(&path)?;
+
+        let conn = open_store(&path)?;
+        let row = conn.query_row(
+            "SELECT familiar_id, ward_hash, diff_hash, files_touched, channel, decision
+             FROM ward_audit WHERE event_type = 'compaction_ledger'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )?;
+        assert_eq!(row.0, "sage");
+        assert_eq!(row.1, pre_commitment);
+        assert_eq!(row.2, Some(vec![0x42; 32]));
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&row.3)?,
+            vec!["SOUL.md".to_string()]
+        );
+        assert_eq!(row.4.as_deref(), Some("forced"));
+        assert_eq!(row.5, "compacted:unchanged");
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit WHERE event_type = 'compaction_ledger'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn vacuum_without_warded_surfaces_appends_no_compaction_ledger() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("test.sqlite3");
+        drop(open_store(&path)?);
+
+        vacuum_store_path(&path)?;
+
+        let conn = open_store(&path)?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit WHERE event_type = 'compaction_ledger'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn compaction_ledger_keeps_ward_audit_append_only() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("test.sqlite3");
+        let conn = open_store(&path)?;
+        conn.execute(
+            "INSERT INTO ward_manifest (familiar_id, surface, manifest_id, entry_hash)
+             VALUES ('sage', 'SOUL.md', '11111111-1111-1111-1111-111111111111', ?1)",
+            [&vec![0x24; 32]],
+        )?;
+        drop(conn);
+
+        vacuum_store_path(&path)?;
+
+        let conn = open_store(&path)?;
+        let update = conn.execute(
+            "UPDATE ward_audit SET decision = 'tampered' WHERE event_type = 'compaction_ledger'",
+            [],
+        );
+        assert!(update.is_err(), "UPDATE must abort on ward_audit");
+        let delete = conn.execute(
+            "DELETE FROM ward_audit WHERE event_type = 'compaction_ledger'",
+            [],
+        );
+        assert!(delete.is_err(), "DELETE must abort on ward_audit");
+        Ok(())
+    }
+
+    #[test]
     fn new_columns_default_correctly() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let conn = open_store(&temp.path().join("test.sqlite3"))?;
@@ -3480,5 +4056,258 @@ mod tests {
 
     fn fake_github_token() -> String {
         format!("ghp_{}", "b".repeat(40))
+    }
+
+    #[test]
+    fn external_session_fields_round_trip_via_get_and_list() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("test.sqlite3"))?;
+
+        // Insert an external session with a transcript path.
+        let external = SessionRecord {
+            id: "ext-sess-1".to_string(),
+            project_root: "/tmp/proj".to_string(),
+            harness: "engine".to_string(),
+            title: "Engine run".to_string(),
+            status: "running".to_string(),
+            exit_code: None,
+            archived_at: None,
+            created_at: "2026-07-12T10:00:00Z".to_string(),
+            updated_at: "2026-07-12T10:00:00Z".to_string(),
+            conversation_id: None,
+            familiar_id: None,
+            labels: Vec::new(),
+            visibility: "private".to_string(),
+            external: true,
+            transcript_path: Some("/tmp/proj/.claude/transcripts/ext-sess-1.jsonl".to_string()),
+        };
+        insert_session(&conn, &external)?;
+
+        // Insert a regular (non-external) session without a transcript path.
+        let internal = SessionRecord {
+            id: "int-sess-1".to_string(),
+            project_root: "/tmp/proj".to_string(),
+            harness: "codex".to_string(),
+            title: "Normal run".to_string(),
+            status: "created".to_string(),
+            exit_code: None,
+            archived_at: None,
+            created_at: "2026-07-12T10:01:00Z".to_string(),
+            updated_at: "2026-07-12T10:01:00Z".to_string(),
+            conversation_id: None,
+            familiar_id: None,
+            labels: Vec::new(),
+            visibility: "private".to_string(),
+            external: false,
+            transcript_path: None,
+        };
+        insert_session(&conn, &internal)?;
+
+        // Round-trip via get_session.
+        let got_ext = get_session(&conn, "ext-sess-1")?.expect("external session should exist");
+        assert!(got_ext.external, "external flag should be true");
+        assert_eq!(
+            got_ext.transcript_path.as_deref(),
+            Some("/tmp/proj/.claude/transcripts/ext-sess-1.jsonl")
+        );
+
+        let got_int = get_session(&conn, "int-sess-1")?.expect("internal session should exist");
+        assert!(
+            !got_int.external,
+            "internal session external flag should be false"
+        );
+        assert!(
+            got_int.transcript_path.is_none(),
+            "internal session should have no transcript"
+        );
+
+        // Round-trip via list_sessions.
+        let all = list_sessions(&conn)?;
+        let ext_in_list = all
+            .iter()
+            .find(|s| s.id == "ext-sess-1")
+            .expect("ext in list");
+        let int_in_list = all
+            .iter()
+            .find(|s| s.id == "int-sess-1")
+            .expect("int in list");
+        assert!(ext_in_list.external);
+        assert!(!int_in_list.external);
+        assert!(ext_in_list.transcript_path.is_some());
+        assert!(int_in_list.transcript_path.is_none());
+
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // ingest_external_transcript tests
+    // -------------------------------------------------------------------------
+
+    fn write_transcript(path: &std::path::Path, lines: &[&str]) -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(path)?;
+        for line in lines {
+            writeln!(f, "{line}")?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ingest_external_transcript_indexes_text_and_makes_it_searchable() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db_path = temp.path().join("coven.db");
+        let conn = open_store(&db_path)?;
+
+        // Write a small fixture transcript (coven-code TranscriptEntry shape).
+        let transcript_path = temp.path().join("ext-sess.jsonl");
+        write_transcript(
+            &transcript_path,
+            &[
+                r#"{"type":"user","message":{"content":[{"type":"text","text":"SEARCHABLE_TOKEN the quick brown fox"}]}}"#,
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello, I can help with that."}]}}"#,
+                r#"{"type":"unknown_type"}"#, // no extractable text — should be skipped
+            ],
+        )?;
+
+        // Insert the external session pointing at the transcript.
+        let mut sess = session_record("ext-ingest-1", "2026-07-01T10:00:00Z");
+        sess.external = true;
+        sess.transcript_path = Some(transcript_path.to_string_lossy().to_string());
+        insert_session(&conn, &sess)?;
+
+        let now = "2026-07-01T10:00:01Z";
+        let n = ingest_external_transcript(&conn, "ext-ingest-1", temp.path(), now)?;
+        assert_eq!(n, 2, "two text chunks should be indexed");
+
+        // FTS search must find the token.
+        let hits = search_events(&conn, "SEARCHABLE_TOKEN")?;
+        assert_eq!(hits.len(), 1, "search should return one hit");
+        assert_eq!(hits[0].session_id, "ext-ingest-1");
+        assert_eq!(hits[0].kind, "transcript_text");
+
+        Ok(())
+    }
+
+    #[test]
+    fn ingest_external_transcript_is_idempotent() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("coven.db"))?;
+
+        let transcript_path = temp.path().join("idem.jsonl");
+        write_transcript(
+            &transcript_path,
+            &[
+                r#"{"type":"user","message":{"content":[{"type":"text","text":"idempotency check"}]}}"#,
+            ],
+        )?;
+
+        let mut sess = session_record("ext-idem", "2026-07-01T11:00:00Z");
+        sess.external = true;
+        sess.transcript_path = Some(transcript_path.to_string_lossy().to_string());
+        insert_session(&conn, &sess)?;
+
+        let now = "2026-07-01T11:00:01Z";
+        let first = ingest_external_transcript(&conn, "ext-idem", temp.path(), now)?;
+        assert_eq!(first, 1, "first call should index one chunk");
+
+        // Second call must be a no-op: transcript_indexed_at is already set.
+        let second = ingest_external_transcript(&conn, "ext-idem", temp.path(), now)?;
+        assert_eq!(second, 0, "second call should be a no-op");
+
+        // Exactly one event should exist — no duplicates.
+        let events = list_events(&conn, "ext-idem")?;
+        assert_eq!(events.len(), 1, "no duplicate events on re-ingest");
+
+        Ok(())
+    }
+
+    #[test]
+    fn ingest_external_transcript_skips_non_external_session() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("coven.db"))?;
+
+        // A normal (non-external) session.
+        let sess = session_record("internal-sess", "2026-07-01T12:00:00Z");
+        insert_session(&conn, &sess)?;
+
+        let now = "2026-07-01T12:00:01Z";
+        let n = ingest_external_transcript(&conn, "internal-sess", temp.path(), now)?;
+        assert_eq!(n, 0, "non-external session should be skipped");
+
+        let events = list_events(&conn, "internal-sess")?;
+        assert!(events.is_empty(), "no events should be inserted");
+
+        Ok(())
+    }
+
+    #[test]
+    fn ingest_external_transcript_skips_when_no_transcript_path() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("coven.db"))?;
+
+        let mut sess = session_record("ext-no-path", "2026-07-01T13:00:00Z");
+        sess.external = true;
+        // transcript_path is intentionally None.
+        insert_session(&conn, &sess)?;
+
+        let now = "2026-07-01T13:00:01Z";
+        let n = ingest_external_transcript(&conn, "ext-no-path", temp.path(), now)?;
+        assert_eq!(n, 0, "session without transcript_path should be skipped");
+
+        Ok(())
+    }
+
+    #[test]
+    fn ingest_external_transcript_returns_zero_for_missing_file() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("coven.db"))?;
+
+        let mut sess = session_record("ext-missing", "2026-07-01T14:00:00Z");
+        sess.external = true;
+        sess.transcript_path = Some("/tmp/nonexistent-coven-transcript.jsonl".to_string());
+        insert_session(&conn, &sess)?;
+
+        let now = "2026-07-01T14:00:01Z";
+        let n = ingest_external_transcript(&conn, "ext-missing", temp.path(), now)?;
+        assert_eq!(n, 0, "missing file should return 0 without error");
+
+        // transcript_indexed_at must remain NULL so a future retry is possible.
+        let indexed_at: Option<String> = conn
+            .query_row(
+                "SELECT transcript_indexed_at FROM sessions WHERE id = 'ext-missing'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        assert!(
+            indexed_at.is_none(),
+            "transcript_indexed_at should stay NULL so the session retries later"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn ingest_external_transcript_fallback_top_level_text() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("coven.db"))?;
+
+        let transcript_path = temp.path().join("toplevel.jsonl");
+        write_transcript(&transcript_path, &[r#"{"text":"TOPLEVEL_FALLBACK_TOKEN"}"#])?;
+
+        let mut sess = session_record("ext-fallback", "2026-07-01T15:00:00Z");
+        sess.external = true;
+        sess.transcript_path = Some(transcript_path.to_string_lossy().to_string());
+        insert_session(&conn, &sess)?;
+
+        let now = "2026-07-01T15:00:01Z";
+        let n = ingest_external_transcript(&conn, "ext-fallback", temp.path(), now)?;
+        assert_eq!(n, 1, "fallback text extraction should yield one chunk");
+
+        let hits = search_events(&conn, "TOPLEVEL_FALLBACK_TOKEN")?;
+        assert_eq!(hits.len(), 1, "top-level text should be searchable");
+
+        Ok(())
     }
 }

@@ -30,7 +30,7 @@ pub(crate) use attach::{
 };
 pub(crate) use follow::{follow_until_exit, CastSessionExit, FollowerObserver, FollowerPacer};
 pub(crate) use gate::{evaluate_gate, GateOutcome};
-pub(crate) use intent::{parse_spell, CastHarness, CastIntent};
+pub(crate) use intent::{parse_spell, CastHarness, CastIntent, ObserveView};
 pub(crate) use outcome::CastOutcome;
 pub(crate) use plan::{build_plan, CastPlan};
 pub(crate) use quest::{

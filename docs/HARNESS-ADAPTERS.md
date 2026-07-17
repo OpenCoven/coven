@@ -9,7 +9,7 @@ description: "How Coven harness adapters work, how external adapters graduate, a
 
 # Harness adapter guide
 
-Coven should treat every harness as an adapter. The daemon ships a small bundled compatibility adapter set for Codex and Claude Code, but no harness should become privileged runtime logic. OpenClaw, Hermes, Aider, Gemini, and future agents should enter through the same adapter contract and maturity checklist.
+Coven should treat every harness as an adapter. The daemon ships a small bundled compatibility adapter set for Codex, Claude Code, and GitHub Copilot CLI, but no harness should become privileged runtime logic. OpenClaw, Hermes, Aider, Gemini, and future agents should enter through the same adapter contract and maturity checklist.
 
 The goal is a harness-neutral runtime:
 
@@ -28,17 +28,17 @@ A Coven harness adapter defines:
 - prompt argument shape for interactive mode;
 - prompt argument shape for non-interactive mode;
 - install/authentication hint for `coven doctor`; and
-- optional **declared behavior**: `capabilities`, `sandbox`, and
-  `stream_args` (the [coven-runtimes](https://github.com/OpenCoven/coven-runtimes)
+- optional **declared behavior**: `capabilities`, `sandbox`, `stream_args`,
+  and `continuity_args` (the [coven-runtimes](https://github.com/OpenCoven/coven-runtimes)
   manifest additions — see below).
 
-The current implementation expects the prompt to be the final command argument after any fixed prefix args. Keep that invariant unless the adapter explicitly documents a safer stdin or protocol mode.
+The current implementation expects the prompt to be the final command argument after any fixed prefix args — either as a positional behind `--`, or bound to a declared `prompt_flag` (`--flag=<prompt>`) for harnesses with no positional prompt slot. Keep that invariant unless the adapter explicitly documents a safer stdin or protocol mode.
 
 ## External adapter rule
 
 New harnesses should not be added as one-off special cases across the daemon, TUI, docs, OpenClaw plugin, and package READMEs. Add a reusable adapter description first, then wire the daemon and clients against that description.
 
-For now, Codex and Claude Code remain the bundled compatibility defaults. Additional harnesses can be tested through explicit adapter manifests.
+For now, Codex, Claude Code, and GitHub Copilot CLI remain the bundled compatibility defaults. Additional harnesses can be tested through explicit adapter manifests.
 
 Load one manifest file:
 
@@ -73,7 +73,7 @@ coven adapter list --json
 
 Coven does not auto-discover adapter manifests from `COVEN_HOME`, `~/.coven`, or `$XDG_CONFIG_HOME`. External manifests are trusted code-launch configuration, so operators must opt in with `COVEN_HARNESS_ADAPTER_MANIFEST` or `COVEN_HARNESS_ADAPTER_DIRS`.
 
-The prompt is appended as the final command argument after the configured prefix args. Adapter ids must be lowercase and must not collide with built-in ids. Executables are names only, not shell strings or paths.
+The prompt is appended as the final command argument after the configured prefix args (bound to the declared `prompt_flag` when the adapter has one). Adapter ids must be lowercase and must not collide with built-in ids. Executables are names only, not shell strings or paths.
 
 ### Declared capabilities, sandbox, and stream args
 
@@ -98,6 +98,12 @@ adapters deserialize unchanged with everything off):
         "prefix_args": ["--print", "--input-format", "stream-json", "--output-format", "stream-json"],
         "session_id_flag": "--session-id",
         "resume_flag": "--resume"
+      },
+      "continuity_args": {
+        "init_prefix_args": ["--print"],
+        "resume_prefix_args": ["--print"],
+        "session_id_flag": "--session-id",
+        "resume_flag": "--resume"
       }
     }
   ]
@@ -108,13 +114,35 @@ adapters deserialize unchanged with everything off):
   long-lived stream-json mode, exactly like the bundled Claude adapter (which
   declares the same fields internally). `stream` requires `stream_args`;
   `stream_args` without `stream` is rejected as dead config.
-- `capabilities.preassigned_session_id` requires `stream_args.session_id_flag`.
+- `capabilities.preassigned_session_id` requires a session id flag in either
+  `stream_args` or `continuity_args`.
+- `continuity_args` tells one-shot non-interactive runs how to initialize or
+  resume an upstream conversation. `session_id_flag` is only valid when
+  `capabilities.preassigned_session_id` is true; resume-only adapters can omit
+  it and use `resume_prefix_args` to place the resumed session id as a
+  positional argument.
 - `sandbox` maps `coven run --permission <full|read-only>` to the harness's
   native flags. Two forms: a single `--flag value` pair per policy (shown
   above), or an argv list per policy for boolean/multi-token permission flags:
   `{ "full_args": ["--allow-all"], "read_only_args": ["--deny-tool", "write"] }`.
+- `coven adapter list --json` includes the declared `capabilities` block for
+  every bundled or manifest adapter, using the same field names as manifests.
+- `add_dir_flag` (alias `addDirFlag`) names the harness's native flag for
+  trusting an additional directory beyond its cwd. Each
+  `coven run --add-dir <DIR>` repeats as `[flag, <dir>]` ahead of the prompt
+  (the bundled Codex, Claude, engine, and Copilot adapters all declare
+  `--add-dir`).
+- `prompt_flag` (alias `promptFlag`) names a flag that carries the user
+  prompt as its **value** for harnesses with no positional prompt slot (e.g.
+  Copilot's `--prompt`, Hermes' `-q`). Coven appends the bound
+  `--flag=<prompt>` form instead of `-- <prompt>`, so `-`-prefixed prompts
+  stay data. `interactive_prompt_flag` (alias `interactivePromptFlag`)
+  optionally overrides it for interactive launches only (Copilot opens its
+  TUI with `--interactive=<prompt>` but exits after a `--prompt=<prompt>`
+  run). Omit both and the prompt stays the final positional argument behind
+  `--`.
 - Adapters that declare none of this keep today's conservative behavior:
-  one-shot launches only, `--permission` is a warned no-op.
+  one-shot launches only, `--permission` and `--add-dir` are warned no-ops.
 
 Accepted, conformance-tested manifests for real runtimes live in the
 [coven-runtimes canonical registry](https://github.com/OpenCoven/coven-runtimes).
@@ -167,7 +195,7 @@ Do not promote a harness to public support by only adding it to `built_in_harnes
 
 ## Bundled compatibility adapters
 
-The bundled compatibility adapters are Codex and Claude Code. They are first-class supported user paths, not a model for hardcoding every future harness.
+The bundled compatibility adapters are Codex, Claude Code, and GitHub Copilot CLI. They are first-class supported user paths, not a model for hardcoding every future harness.
 
 ### Codex
 

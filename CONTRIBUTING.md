@@ -86,7 +86,7 @@ Use a throwaway repository for smoke runs. Do not run untrusted prompts or harne
 - Rust owns process launch, cwd/project-root validation, PTY lifecycle, session persistence, and socket request enforcement.
 - Socket clients are not trusted, including comux and the OpenClaw plugin.
 - TypeScript clients may improve UX, but must not become the authority boundary.
-- Keep v0 harness support focused on Codex and Claude Code until policy and adapter contracts are stable.
+- Keep harness support focused on Codex, Claude Code, and GitHub Copilot CLI until policy and adapter contracts are stable.
 - Do not place Coven code in OpenClaw core. The integration belongs in `packages/openclaw-coven` and publishes as `@opencoven/coven`.
 
 ## Documentation Rules

@@ -32,7 +32,7 @@ use events::run_event_loop;
 
 pub fn run_chat() -> Result<()> {
     let mut terminal = TerminalSession::enter()?;
-    let mut app = App::new();
+    let mut app = App::new()?;
     let result = run_event_loop(&mut terminal, &mut app);
     // Tear down long-lived stream sessions (claude --stream-json) before
     // we release the terminal. Covers every normal exit path — /exit,

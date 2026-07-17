@@ -10,10 +10,6 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Default engine version, used when `coven engine install` is run without
-/// `--version`.
-pub const DEFAULT_ENGINE_VERSION: &str = "0.6.1";
-
 #[derive(Debug, PartialEq, Eq)]
 pub enum InstallOutcome {
     Installed,
@@ -54,16 +50,6 @@ pub fn current_platform() -> Result<(&'static str, &'static str)> {
     Ok((os, arch))
 }
 
-/// Return the independently pinned archive checksum for a released engine
-/// artifact, when this Coven build knows one.
-///
-/// Phase 0 shipped before an engine lockfile was populated, so there may be no
-/// built-in pin for some versions/platforms. In that case production install
-/// paths must fail closed unless the caller supplies an explicit checksum.
-pub fn pinned_archive_sha256(_version: &str, _os: &str, _arch: &str) -> Option<&'static str> {
-    None
-}
-
 /// Removes scratch paths (the downloaded archive and the extraction stage
 /// dir) when it drops — on success or on any early `?`/`bail!` return. The
 /// final installed binary lives in `dest_dir`, not in these paths, so
@@ -95,15 +81,16 @@ impl Drop for ScratchGuard {
 
 /// Download, verify, extract, and activate the engine. Returns the installed
 /// binary path and whether it was freshly installed or already present.
-/// `expected_sha256` is the sha256 of the ARCHIVE and is required: archives are
-/// never extracted or activated without a caller-provided or built-in pin.
+/// `expected_sha256` is the sha256 of the ARCHIVE and is required: archives
+/// are never extracted or activated without a caller-provided or built-in
+/// pin (see `engine::pinned_sha256` and the `--sha256` install flag).
 pub fn install(
     version: &str,
     expected_sha256: &str,
     force: bool,
 ) -> Result<(PathBuf, InstallOutcome)> {
     let home = dirs_next::home_dir().context("cannot determine home directory")?;
-    let engine_root = home.join(".coven").join("engine");
+    let engine_root = crate::paths::managed_engine_root(&home);
     let dest_dir = engine_root.join(version);
     let dest = dest_dir.join(crate::engine::ENGINE_BIN_NAME);
     if dest.exists() && !force {

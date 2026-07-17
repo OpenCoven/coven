@@ -185,6 +185,14 @@ where
             CastStep::new(CastStepKind::Inform, "Walk through `coven patch openclaw`"),
         ),
         CastIntent::Quest { ref goal } => quest_plan(goal, intent.clone(), &default_harness),
+        CastIntent::Observe { view } => simple_plan(
+            intent,
+            view.headline(),
+            CastStep::new(
+                CastStepKind::Inform,
+                format!("Read-only view; same data as `{}`", view.command()),
+            ),
+        ),
         CastIntent::Quit => simple_plan(
             intent,
             "Close Cast without changing anything",
@@ -517,6 +525,29 @@ mod tests {
             .steps
             .iter()
             .any(|step| step.kind == CastStepKind::LaunchSession));
+    }
+
+    #[test]
+    fn observe_plans_are_safe_informational_reads() {
+        for view in [
+            crate::observe::ObserveView::Status,
+            crate::observe::ObserveView::Familiars,
+            crate::observe::ObserveView::HubStatus,
+        ] {
+            let plan = build_plan(CastIntent::Observe { view }, none).unwrap();
+            assert_eq!(plan.risk(), CastRisk::Safe, "view {view:?}");
+            assert_eq!(plan.headline, view.headline());
+            assert!(
+                plan.steps
+                    .iter()
+                    .all(|step| step.kind == CastStepKind::Inform),
+                "observe steps must be informational, view {view:?}"
+            );
+            assert!(
+                plan.steps[0].note.contains(view.command()),
+                "plan should teach the scriptable command, view {view:?}"
+            );
+        }
     }
 
     #[test]

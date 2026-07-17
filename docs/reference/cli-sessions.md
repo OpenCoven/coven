@@ -11,6 +11,9 @@ description: "Reference for coven sessions: list, inspect, filter, and export Co
 ```bash
 coven sessions [--manage | --plain | --json] [--all]
 coven sessions search <query> [--json]
+coven sessions show <session-id> [--json]
+coven sessions events <session-id> [--after-seq <SEQ>] [--limit <N>] [--json]
+coven sessions log <session-id> [--json]
 ```
 
 `coven sessions` is the safest way to find a session id before attaching,
@@ -45,6 +48,21 @@ coven sessions search "session stuck" --json
 
 `coven sessions search` runs full-text search over recorded event payloads. Use
 the JSON form when a client needs stable fields instead of terminal snippets.
+
+## Inspecting one session
+
+```bash
+coven sessions show 9099                   # record metadata; unique prefixes work
+coven sessions events 9099 --limit 100     # recorded events, redacted payloads
+coven sessions events 9099 --after-seq 42  # resume from a sequence cursor
+coven sessions log 9099                    # replay-style log lines, then exit
+```
+
+These are the non-interactive counterparts to `coven attach`: they print and
+exit, so scripts and CI can read a session without a PTY. `events --json`
+returns the same paginated envelope as `GET /api/v1/sessions/:id/events`
+(`events`, `nextCursor.afterSeq`, `hasMore`). See
+[observability commands](cli-observe.md) for the full read-path surface.
 
 ## Lifecycle commands
 

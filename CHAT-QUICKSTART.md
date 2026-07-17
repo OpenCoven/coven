@@ -34,6 +34,7 @@ Everything the UI does is also available as explicit CLI commands:
 
 ```bash
 coven doctor                      # check your setup
+coven status                      # daemon, sessions, familiars, skills, hub at a glance
 coven run codex "fix the tests"   # launch a recorded session
 coven sessions                    # browse sessions (plain table when piped)
 coven attach <session-id-prefix>  # follow a session

@@ -4,7 +4,7 @@ read_when:
   - Looking up a Coven CLI flag
   - Scripting against the Coven CLI
 title: "Coven CLI reference"
-description: "Reference for the coven CLI commands: doctor, daemon, run, sessions, attach, archive, kill, summon, sacrifice, view, and TUI command flags."
+description: "Reference for the coven CLI commands: doctor, status, daemon, run, sessions, attach, archive, kill, summon, sacrifice, familiars, skills, memory, research, calls, hub, scheduler, travel, and TUI command flags."
 ---
 
 
@@ -30,6 +30,15 @@ flowchart TB
   Root --> Hooks["hooks"]
   Root --> Pc["pc (macOS-first)"]
   Root --> Completions["completions"]
+  Root --> Status["status [--json]"]
+  Root --> Familiars["familiars [--json]"]
+  Root --> Skills["skills [--json]"]
+  Root --> Memory["memory [--json]"]
+  Root --> Research["research [--json]"]
+  Root --> Calls["calls [id] [--json]"]
+  Root --> Hub["hub"]
+  Root --> Scheduler["scheduler"]
+  Root --> Travel["travel"]
 
   Daemon --> DStart["start"]
   Daemon --> DStatus["status [--json]"]
@@ -43,6 +52,15 @@ flowchart TB
   Sessions --> SJson["--json"]
   Sessions --> SAll["--all"]
   Sessions --> SManage["--manage"]
+  Sessions --> SSearch["search &lt;query&gt;"]
+  Sessions --> SShow["show &lt;id&gt;"]
+  Sessions --> SEvents["events &lt;id&gt;"]
+  Sessions --> SLog["log &lt;id&gt;"]
+
+  Hub --> HubStatus["status [--json]"]
+  Hub --> HubNodes["nodes [--json]"]
+  Hub --> HubJobs["jobs [--state s] [--json]"]
+  Hub --> HubRouting["routing [--json]"]
 
   Patch --> POpenclaw["openclaw &lt;prompt&gt;"]
 
@@ -74,37 +92,54 @@ flowchart TB
 |---|---|
 | `coven` | Open the beginner-friendly interactive menu. |
 | `coven tui` | Explicitly open the slash-command TUI. |
-| `coven doctor` | Check local setup; exits 1 when a blocking problem is found. |
+| `coven doctor` | Check local setup; exits 1 when a blocking problem is found. `--json` emits a `{ ok, blocking, checks, nextSteps }` envelope. |
+| `coven status` | Ecosystem overview: daemon, sessions, familiars, skills, research, hub. Alias: `coven overview`. |
 | `coven daemon start/status/restart/stop` | Manage the local daemon. |
 | `coven run <harness> <prompt>` | Launch a project-scoped harness session. Current harness ids: `codex`, `claude`. |
 | `coven sessions` | Open the session browser; supports `--plain`, `--json`, `--all`, and `--manage`. |
+| `coven sessions search <query>` | Full-text search recorded event payloads. |
+| `coven sessions show/events/log <session-id>` | Inspect one session without attaching; see [cli-observe](cli-observe.md). |
 | `coven attach <session-id>` | Replay/follow session output and forward input when live. |
 | `coven summon <session-id>` | Restore an archived session, then replay/follow it. |
 | `coven archive <session-id>` | Hide a non-running session while preserving events. |
 | `coven sacrifice <session-id> --yes` | Permanently delete a non-running session. |
 | `coven kill <session-id>` | Kill a running session's process; keeps the event log. |
 | `coven patch openclaw <prompt>` | Local OpenClaw rescue loop. Does not commit or push. |
-| `coven logs prune` | Prune expired encrypted raw artifacts and old redacted event logs. |
-| `coven vacuum` | Rebuild the session event FTS index, compact the SQLite store, and print integrity status. |
-| `coven wt <branch>` | Create or enter a sibling `<repo>.wt/<branch-slug>` git worktree. |
-| `coven wt --list/--doctor/--prune-merged/--prune-stale DAYS` | Inspect and clean Coven protocol worktrees. |
-| `coven claim acquire/release/heartbeat/canary <branch>` | Manage TTL-bounded branch ownership for the current agent. |
-| `coven claim status` | Print branch claims from the current repository. |
-| `coven hooks install` | Install local protocol hooks that block unsafe commits and protected pushes. |
+| `coven logs prune` | Prune expired encrypted raw artifacts and old redacted event logs; see [cli-logs](cli-logs.md). |
+| `coven vacuum` | Rebuild the session event FTS index, compact the SQLite store, and print integrity status; see [cli-vacuum](cli-vacuum.md). |
+| `coven wt <branch>` | Create or enter a sibling `<repo>.wt/<branch-slug>` git worktree; see [cli-wt](cli-wt.md). |
+| `coven wt --list/--doctor/--prune-merged/--prune-stale DAYS` | Inspect and clean Coven protocol worktrees; see [cli-wt](cli-wt.md). |
+| `coven claim acquire/release/heartbeat/canary <branch>` | Manage TTL-bounded branch ownership for the current agent; see [cli-claim](cli-claim.md). |
+| `coven claim status` | Print branch claims from the current repository; see [cli-claim](cli-claim.md). |
+| `coven hooks install` | Install local protocol hooks that block unsafe commits and protected pushes; see [cli-claim](cli-claim.md). |
+| `coven engine status/install/which` | Manage the pinned Coven engine (`coven-code`); see [cli-engine](cli-engine.md). |
+| `coven executor probe/run-job` | Stateless executor-node protocol commands, hub-dispatched over SSH; see [cli-executor](cli-executor.md). |
 | `coven pc` | macOS-first diagnostics and explicit `--confirm` relief operations. |
 | `coven completions <shell>` | Print shell completions for bash, zsh, fish, elvish, or powershell. |
+| `coven familiars/skills/memory/research/calls` | Read-path Cave parity views; see [cli-observe](cli-observe.md). |
+| `coven hub status/nodes/jobs/routing` | Read-only hub control-plane inspection; `nodes <id>` and `jobs <id>` show one record; see [cli-observe](cli-observe.md). |
+| `coven hub dispatch <jobId>` | Show a job's executor dispatch record and result envelope. |
+| `coven scheduler decision/loop <id>` | Read-only scheduler decision and loop-recovery views; see [cli-observe](cli-observe.md). |
+| `coven travel state --client <id>` | Read-only travel handoff state machine view; see [cli-observe](cli-observe.md). |
 
 ## Common flags by command
 
 | Command | Flags |
 |---|---|
 | `coven run` | `--cwd <path>`, `--title <text>`, `--detach`, `--model <id>`, `--think`, `--speed fast\|balanced\|thorough` |
+| `coven doctor` | `--json` |
 | `coven daemon status` | `--json` |
 | `coven sessions` | `--plain`, `--json`, `--all`, `--manage` |
+| `coven sessions events` | `--after-seq <SEQ>`, `--limit <N>`, `--json` |
+| `coven status` / `familiars` / `skills` / `memory` / `research` / `calls` | `--json` |
+| `coven hub jobs` | `--state <queued\|assigned\|held\|completed\|failed\|cancelled>` (list mode), `[id]` positional for a detail view, `--json` |
+| `coven scheduler decision/loop` | `<id>` positional, `--json` |
+| `coven travel state` | `--client <CLIENT_ID>` (required), `--profile <PROFILE_ID>`, `--json` |
 | `coven sacrifice` | `--yes` (required) |
 | `coven logs prune` | `--dry-run`, `--raw-days <N>`, `--event-days <N>` |
 | `coven wt` | `--list`, `--json` (with `--list`), `--doctor`, `--prune-merged`, `--prune-stale <DAYS>` |
 | `coven claim status` | `--json` |
+| `coven engine status` | `--json` |
 | `coven pc kill` | `--confirm` (required) |
 | `coven pc cache clear` | `--confirm` (required) |
 | `coven pc top` | `--n <N>`, `--verbose`, `--json` |

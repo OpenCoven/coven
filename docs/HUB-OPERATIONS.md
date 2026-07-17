@@ -36,12 +36,19 @@ Nothing needs to be replayed manually: reopening the store reloads the
 registry and queues. After a restart, verify recovery with:
 
 ```sh
-curl --unix-socket ~/.coven/coven.sock http://coven/api/v1/hub/status
+coven hub status
 ```
 
 and confirm `role`, `hubId`, node availability, and queue depths match
-expectations. `GET /api/v1/health` includes the same summary in its `hub`
-block.
+expectations (`--json` gives the raw `GET /api/v1/hub/status` body; the raw
+route is also reachable with
+`curl --unix-socket ~/.coven/coven.sock http://coven/api/v1/hub/status`).
+`GET /api/v1/health` includes the same summary in its `hub` block, and
+`coven hub nodes` / `coven hub jobs --state held` drill into the recovered
+registry and queues. For a single record, `coven hub nodes <id>`,
+`coven hub jobs <id>`, and `coven hub dispatch <jobId>` mirror the
+`GET /api/v1/hub/nodes/:id`, `/hub/jobs/:id`, and `/hub/dispatches/:jobId`
+routes (add `--json` for the raw body).
 
 ## Supervisor setup
 
@@ -125,11 +132,13 @@ respects a clean `coven daemon stop`.
    need to be told; the hub polls/dispatches, so held work resumes when the
    hub is back.
 2. **Crash recovery:** the supervisor restarts the daemon automatically.
-   Check `GET /api/v1/hub/status` and confirm:
+   Check `coven hub status` and confirm:
    - `nodesTotal` matches your registered fleet;
    - jobs that were `assigned` are still `assigned` (or `held` if their
-     executor's health has gone stale in the meantime);
-   - `executorQueues` still lists work for offline executors.
+     executor's health has gone stale in the meantime) —
+     `coven hub jobs --state held` lists the held set;
+   - `executorQueues` still lists work for offline executors
+     (`coven hub status --json`).
 3. **Executor loss while the hub was down:** report the executor's health
    (`POST /api/v1/hub/nodes/:id/health` with `available: false`). Its
    assigned jobs transition to `held` and stay in its subqueue until the node

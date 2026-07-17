@@ -3,7 +3,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use coven_runtime_spec::{Capabilities, SandboxMapping, StreamArgs};
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +19,7 @@ pub struct HarnessSummary {
     pub executable: String,
     pub available: bool,
     pub install_hint: String,
+    pub capabilities: Capabilities,
     pub source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest_path: Option<String>,
@@ -120,6 +121,12 @@ pub struct HarnessLaunchOptions<'a> {
     /// sandbox flag when the spec declares one. `Option<Permission>` stays
     /// `Copy` because `Permission` is `Copy`.
     pub permission: Option<Permission>,
+    /// Additional directories the harness should trust beyond its cwd
+    /// (`coven run --add-dir <DIR>`, repeatable). Each entry forwards as
+    /// `[add_dir_flag, <dir>]` when the spec declares an add-dir mechanism;
+    /// harnesses that declare none make the flag a warned no-op. Blank
+    /// entries are skipped. A shared slice keeps the struct `Copy`.
+    pub add_dirs: &'a [String],
 }
 
 impl<'a> HarnessLaunchOptions<'a> {
@@ -226,6 +233,19 @@ pub struct HarnessCommandSpec {
     /// for Claude). `None` means the harness has no such flag and identity
     /// should be injected by prepending a preamble to the prompt instead.
     pub system_prompt_flag: Option<String>,
+    /// CLI flag name that carries the user prompt as its VALUE rather than a
+    /// trailing positional (e.g. `Some("--prompt")` for Copilot, which
+    /// rejects positional prompts outright). When set, `prompt_args` appends
+    /// `--flag=<prompt>` instead of the `-- <prompt>` options-terminator form.
+    /// `None` (the default) keeps the positional-append behavior.
+    pub prompt_flag: Option<String>,
+    /// Interactive-mode override for `prompt_flag`, for harnesses whose
+    /// interactive entrypoint takes the prompt behind a *different* flag than
+    /// the non-interactive one (e.g. Copilot's `--interactive <prompt>` opens
+    /// the TUI and runs the prompt, while `--prompt <prompt>` exits after
+    /// completion). Only consulted in `HarnessLaunchMode::Interactive`, where
+    /// it falls back to `prompt_flag` when unset.
+    pub interactive_prompt_flag: Option<String>,
     /// CLI flag name to select a model (e.g. `Some("--model")` for both Codex and
     /// Claude). When set, `coven run --model <ID>` forwards `[flag, <model>]`.
     /// `None` (and no `model_arg_template`) means the harness declares no model
@@ -242,6 +262,14 @@ pub struct HarnessCommandSpec {
     /// means the harness declares no sandbox mechanism, so `--permission` is a
     /// warned no-op for it (mirrors `model_flag`).
     pub sandbox: Option<SandboxMapping>,
+    /// CLI flag name that grants the harness access to an additional directory
+    /// beyond its cwd (e.g. `Some("--add-dir")` for Codex, Claude, and the
+    /// engine). When set, each `coven run --add-dir <DIR>` repeats as
+    /// `[flag, <dir>]` ahead of the prompt so granted project roots are real
+    /// grants, not advisory prompt text. `None` means the harness declares no
+    /// such mechanism, so `--add-dir` is a warned no-op for it (mirrors
+    /// `model_flag`).
+    pub add_dir_flag: Option<String>,
     /// Behavioral capabilities (stream mode, session pre-assignment, think,
     /// speed). Shared type with the coven-runtimes manifest spec so built-in
     /// harnesses and external adapters declare what they can do through the
@@ -251,6 +279,58 @@ pub struct HarnessCommandSpec {
     /// flags). Required when `capabilities.stream`; shared type with the
     /// coven-runtimes manifest spec.
     pub stream_args: Option<StreamArgs>,
+    /// One-shot non-interactive session-continuity args. This mirrors
+    /// `stream_args` for cold-started turns: adapters declare how to initialize
+    /// or resume an upstream conversation without Coven hardcoding ids.
+    pub continuity_args: Option<ContinuityArgs>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContinuityArgs {
+    #[serde(default, alias = "initPrefixArgs")]
+    pub init_prefix_args: Vec<String>,
+    #[serde(default, alias = "resumePrefixArgs")]
+    pub resume_prefix_args: Vec<String>,
+    #[serde(
+        default,
+        alias = "sessionIdFlag",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub session_id_flag: Option<String>,
+    #[serde(default, alias = "resumeFlag", skip_serializing_if = "Option::is_none")]
+    pub resume_flag: Option<String>,
+}
+
+impl ContinuityArgs {
+    fn session_id_flag(&self) -> Option<&str> {
+        self.session_id_flag
+            .as_deref()
+            .map(str::trim)
+            .filter(|flag| !flag.is_empty())
+    }
+
+    fn resume_flag(&self) -> Option<&str> {
+        self.resume_flag
+            .as_deref()
+            .map(str::trim)
+            .filter(|flag| !flag.is_empty())
+    }
+
+    fn has_init_launch(&self) -> bool {
+        self.session_id_flag().is_some()
+            || self
+                .init_prefix_args
+                .iter()
+                .any(|arg| !arg.trim().is_empty())
+    }
+
+    fn has_resume_launch(&self) -> bool {
+        self.resume_flag().is_some()
+            || self
+                .resume_prefix_args
+                .iter()
+                .any(|arg| !arg.trim().is_empty())
+    }
 }
 
 impl HarnessCommandSpec {
@@ -290,6 +370,28 @@ impl HarnessCommandSpec {
             None => Vec::new(),
         }
     }
+
+    /// Whether this harness declares a native way to trust additional
+    /// directories. Adapters that declare none make `coven run --add-dir` a
+    /// warned no-op.
+    pub fn supports_add_dir(&self) -> bool {
+        self.add_dir_flag.is_some()
+    }
+
+    /// Translate requested additional directories into argv tokens for this
+    /// harness: one `[flag, <dir>]` pair per non-blank entry. Returns an empty
+    /// vec when the harness declares no add-dir mechanism (caller decides
+    /// whether to warn).
+    pub fn add_dir_args(&self, dirs: &[String]) -> Vec<String> {
+        let Some(flag) = self.add_dir_flag.as_deref() else {
+            return Vec::new();
+        };
+        dirs.iter()
+            .map(|dir| dir.trim())
+            .filter(|dir| !dir.is_empty())
+            .flat_map(|dir| [flag.to_string(), dir.to_string()])
+            .collect()
+    }
 }
 
 /// Strip a leading `provider/` namespace from a model id. Cave stores and sends
@@ -325,6 +427,29 @@ impl HarnessCommandSpec {
             HarnessLaunchMode::Stream => &self.non_interactive_prompt_prefix_args,
         };
 
+        // Some harnesses take the prompt as the VALUE of a flag rather than a
+        // trailing positional (e.g. Copilot rejects positional prompts
+        // outright). For those, append `--flag=<prompt>`. The `=` form keeps
+        // a prompt that starts with `-` from being misparsed as a new
+        // option, so it stays safe without an options terminator (which
+        // would otherwise starve the flag of its value). Interactive mode
+        // prefers the dedicated interactive flag when one is declared (e.g.
+        // Copilot's `--interactive`), falling back to the shared prompt flag.
+        let prompt_flag = match mode {
+            HarnessLaunchMode::Interactive => self
+                .interactive_prompt_flag
+                .as_deref()
+                .or(self.prompt_flag.as_deref()),
+            _ => self.prompt_flag.as_deref(),
+        };
+        if let Some(flag) = prompt_flag {
+            return prefix_args
+                .iter()
+                .cloned()
+                .chain([format!("{flag}={prompt}")])
+                .collect();
+        }
+
         // The prompt is user data: a prompt starting with `-` must reach the
         // harness as the positional argument, not be parsed as flags, so it
         // always rides behind an options terminator.
@@ -346,13 +471,14 @@ pub fn built_in_harnesses() -> Vec<HarnessSummary> {
 impl HarnessSummary {
     fn from_spec(spec: HarnessCommandSpec) -> Self {
         Self {
-            available: executable_exists(&spec.executable),
+            available: harness_available(&spec.executable),
             id: spec.id,
             label: spec.label,
             executable: spec.executable,
             install_hint: spec.install_hint,
             source: spec.source,
             manifest_path: spec.manifest_path,
+            capabilities: spec.capabilities,
         }
     }
 }
@@ -396,6 +522,8 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
             id: "codex".to_string(),
             label: "Codex".to_string(),
             executable: "codex".to_string(),
+            prompt_flag: None,
+            interactive_prompt_flag: None,
             interactive_prompt_prefix_args: Vec::new(),
             non_interactive_prompt_prefix_args: vec![
                 "exec".to_string(),
@@ -421,16 +549,34 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
                 full: "danger-full-access".to_string(),
                 read_only: "read-only".to_string(),
             }),
+            // `codex exec --add-dir <DIR>` (repeatable): additional writable
+            // directories alongside the workspace. Verified against the
+            // installed codex CLI.
+            add_dir_flag: Some("--add-dir".to_string()),
             // One-shot `codex exec` only: no stream-json mode, no session
             // pre-assignment (ids are captured from the first turn's output),
             // no think/speed toggles.
             capabilities: Capabilities::BASELINE,
             stream_args: None,
+            continuity_args: Some(ContinuityArgs {
+                init_prefix_args: Vec::new(),
+                resume_prefix_args: vec![
+                    "exec".to_string(),
+                    "--skip-git-repo-check".to_string(),
+                    "--color".to_string(),
+                    "never".to_string(),
+                    "resume".to_string(),
+                ],
+                session_id_flag: None,
+                resume_flag: None,
+            }),
         },
         HarnessCommandSpec {
             id: "claude".to_string(),
             label: "Claude Code".to_string(),
             executable: "claude".to_string(),
+            prompt_flag: None,
+            interactive_prompt_flag: None,
             interactive_prompt_prefix_args: Vec::new(),
             non_interactive_prompt_prefix_args: vec!["--print".to_string()],
             install_hint: "Install Claude Code with `npm install -g @anthropic-ai/claude-code`; if it is already installed, make sure `claude` is on PATH and run `claude doctor` to finish local auth/setup, then retry `coven doctor`.".to_string(),
@@ -447,6 +593,10 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
                 full: "bypassPermissions".to_string(),
                 read_only: "plan".to_string(),
             }),
+            // `claude --add-dir <directories...>` (repeatable): additional
+            // directories tools may access. Verified against the installed
+            // claude CLI.
+            add_dir_flag: Some("--add-dir".to_string()),
             // Long-lived stream-json mode, `--session-id`/`--resume`
             // pre-assignment, and think/speed via `--effort`. These declared
             // values replace the former `harness_id == "claude"` checks.
@@ -470,6 +620,131 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
                 ],
                 session_id_flag: Some("--session-id".to_string()),
                 resume_flag: Some("--resume".to_string()),
+            }),
+            continuity_args: Some(ContinuityArgs {
+                init_prefix_args: vec!["--print".to_string()],
+                resume_prefix_args: vec!["--print".to_string()],
+                session_id_flag: Some("--session-id".to_string()),
+                resume_flag: Some("--resume".to_string()),
+            }),
+        },
+        HarnessCommandSpec {
+            id: crate::engine::ENGINE_HARNESS_ID.to_string(),
+            label: "Coven Code".to_string(),
+            executable: crate::engine::ENGINE_HARNESS_ID.to_string(),
+            prompt_flag: None,
+            interactive_prompt_flag: None,
+            interactive_prompt_prefix_args: Vec::new(),
+            non_interactive_prompt_prefix_args: vec!["--print".to_string()],
+            install_hint: "Install the Coven engine with `coven engine install`.".to_string(),
+            source: "bundled".to_string(),
+            manifest_path: None,
+            // The engine composes its own base system prompt; append, never replace.
+            system_prompt_flag: Some("--append-system-prompt".to_string()),
+            model_flag: Some("--model".to_string()),
+            model_arg_template: None,
+            // kebab-case values — the engine's --permission-mode differs from Claude
+            // Code's camelCase bypassPermissions.
+            sandbox: Some(SandboxMapping::Flag {
+                flag: "--permission-mode".to_string(),
+                full: "bypass-permissions".to_string(),
+                read_only: "plan".to_string(),
+            }),
+            // `coven-code --add-dir <DIR>` (repeatable), mirroring Claude
+            // Code's flag. Verified against the installed engine binary.
+            add_dir_flag: Some("--add-dir".to_string()),
+            capabilities: Capabilities {
+                stream: true,
+                preassigned_session_id: true,
+                think: true,
+                speed: false,
+            },
+            stream_args: Some(StreamArgs {
+                prefix_args: vec![
+                    "--print".to_string(),
+                    "--input-format".to_string(),
+                    "stream-json".to_string(),
+                    "--output-format".to_string(),
+                    "stream-json".to_string(),
+                ],
+                session_id_flag: Some("--session-id".to_string()),
+                resume_flag: Some("--resume".to_string()),
+            }),
+            continuity_args: Some(ContinuityArgs {
+                init_prefix_args: vec!["--print".to_string()],
+                resume_prefix_args: vec!["--print".to_string()],
+                session_id_flag: Some("--session-id".to_string()),
+                resume_flag: Some("--resume".to_string()),
+            }),
+        },
+        HarnessCommandSpec {
+            id: "copilot".to_string(),
+            label: "Copilot CLI".to_string(),
+            executable: "copilot".to_string(),
+            // Copilot rejects positional prompts outright: non-interactive
+            // one-shots are `--prompt <text>` and interactive-with-prompt is
+            // `--interactive <text>`. Both ride the `=` form via
+            // `prompt_args`. Verified against the installed copilot CLI.
+            prompt_flag: Some("--prompt".to_string()),
+            interactive_prompt_flag: Some("--interactive".to_string()),
+            interactive_prompt_prefix_args: Vec::new(),
+            // Copilot colorizes whenever it sees a TTY, and Coven runs
+            // non-interactive launches under a PTY — mirror codex's
+            // `--color never` hygiene. Interactive launches keep color.
+            non_interactive_prompt_prefix_args: vec!["--no-color".to_string()],
+            install_hint: "Install GitHub Copilot CLI with `npm install -g @github/copilot` or `brew install --cask copilot-cli`; if it is already installed, make sure `copilot` is on PATH and run `copilot login` to authenticate, then retry `coven doctor`.".to_string(),
+            source: "bundled".to_string(),
+            manifest_path: None,
+            // Copilot has no system-prompt flag; identity is injected as a
+            // bracketed preamble prepended to the prompt.
+            system_prompt_flag: None,
+            // `copilot --model <MODEL>` selects the model (`auto` lets
+            // Copilot pick). Verified against the installed copilot CLI.
+            model_flag: Some("--model".to_string()),
+            model_arg_template: None,
+            // Copilot's permission surface is boolean/multi-token flags, so
+            // the argv-list sandbox form applies: full → `--allow-all`
+            // (tools, paths, and URLs), read-only → deny file writes and
+            // shell outright (deny rules beat every allow rule; reads stay
+            // natively allowed and any other tool prompt auto-denies in
+            // non-interactive mode). Verified against the installed copilot
+            // CLI: `--allow-all` wrote a file, the deny pair blocked it.
+            sandbox: Some(SandboxMapping::Args {
+                full_args: vec!["--allow-all".to_string()],
+                read_only_args: vec![
+                    "--deny-tool".to_string(),
+                    "write".to_string(),
+                    "--deny-tool".to_string(),
+                    "shell".to_string(),
+                ],
+            }),
+            // `copilot --add-dir <DIR>` (repeatable): additional directories
+            // the harness may access beyond its cwd. Verified against the
+            // installed copilot CLI.
+            add_dir_flag: Some("--add-dir".to_string()),
+            // One-shot `copilot --prompt` only: no stream-json stdin mode.
+            // `--session-id <uuid>` pre-assigns the session id on a fresh
+            // launch; think/speed map to `--effort` (see
+            // `launch_option_args`).
+            capabilities: Capabilities {
+                stream: false,
+                preassigned_session_id: true,
+                think: true,
+                speed: true,
+            },
+            stream_args: None,
+            continuity_args: Some(ContinuityArgs {
+                init_prefix_args: vec!["--no-color".to_string()],
+                resume_prefix_args: vec!["--no-color".to_string()],
+                // `--session-id` serves both launches: it creates a fresh
+                // session under a chosen UUID and resumes an existing one
+                // (`--resume` only binds its value as `--resume=<id>`, which
+                // the token-pair continuity form can't emit). A resume
+                // against a wiped store self-heals into a fresh session with
+                // the same id instead of erroring. Verified against the
+                // installed copilot CLI.
+                session_id_flag: Some("--session-id".to_string()),
+                resume_flag: Some("--session-id".to_string()),
             }),
         },
     ]
@@ -613,10 +888,7 @@ pub fn trusted_adapter_manifest_matches_recipe(path: &Path, adapter_id: &str) ->
 }
 
 fn coven_home_from_process_env() -> Option<PathBuf> {
-    env::var_os("COVEN_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| dirs_next::home_dir().map(|home| home.join(crate::DEFAULT_COVEN_HOME_DIR)))
+    crate::paths::coven_home_dir().ok()
 }
 
 fn adapter_manifest_paths_in_dir(dir: &Path) -> Vec<PathBuf> {
@@ -713,6 +985,10 @@ struct ExternalHarnessAdapterSpec {
     install_hint: String,
     #[serde(default, alias = "systemPromptFlag")]
     system_prompt_flag: Option<String>,
+    #[serde(default, alias = "promptFlag")]
+    prompt_flag: Option<String>,
+    #[serde(default, alias = "interactivePromptFlag")]
+    interactive_prompt_flag: Option<String>,
     /// How this adapter takes a model selection. Declare `model_flag` for a
     /// simple `--flag <value>` pair, or `model_arg_template` for anything else
     /// (e.g. `"-c model={model}"`). Omit both and `coven run --model` is a
@@ -729,9 +1005,16 @@ struct ExternalHarnessAdapterSpec {
     /// Omit and `coven run --permission` stays a warned no-op.
     #[serde(default)]
     sandbox: Option<SandboxMapping>,
+    /// CLI flag that trusts an additional directory (repeated per dir).
+    /// Omit and `coven run --add-dir` stays a warned no-op.
+    #[serde(default, alias = "addDirFlag")]
+    add_dir_flag: Option<String>,
     /// Stream-json launch args. Required when `capabilities.stream`.
     #[serde(default, alias = "streamArgs")]
     stream_args: Option<StreamArgs>,
+    /// One-shot non-interactive continuity args.
+    #[serde(default, alias = "continuityArgs")]
+    continuity_args: Option<ContinuityArgs>,
 }
 
 impl ExternalHarnessAdapterSpec {
@@ -801,16 +1084,40 @@ impl ExternalHarnessAdapterSpec {
             }
             _ => {}
         }
+        if let Some(args) = &self.continuity_args {
+            if !args.has_init_launch() && !args.has_resume_launch() {
+                anyhow::bail!(
+                    "external harness adapter `{id}` in {} provides `continuity_args` but \
+                     no usable init or resume launch args",
+                    manifest_path.display()
+                );
+            }
+            if args.session_id_flag().is_some() && !self.capabilities.preassigned_session_id {
+                anyhow::bail!(
+                    "external harness adapter `{id}` in {} provides \
+                     `continuity_args.session_id_flag` but \
+                     `capabilities.preassigned_session_id` is false (dead config)",
+                    manifest_path.display()
+                );
+            }
+        }
+        let stream_session_id_flag = self
+            .stream_args
+            .as_ref()
+            .and_then(|args| args.session_id_flag.as_deref())
+            .map(str::trim)
+            .filter(|flag| !flag.is_empty());
+        let continuity_session_id_flag = self
+            .continuity_args
+            .as_ref()
+            .and_then(ContinuityArgs::session_id_flag);
         if self.capabilities.preassigned_session_id
-            && self
-                .stream_args
-                .as_ref()
-                .and_then(|args| args.session_id_flag.as_deref())
-                .is_none_or(|flag| flag.trim().is_empty())
+            && stream_session_id_flag.is_none()
+            && continuity_session_id_flag.is_none()
         {
             anyhow::bail!(
                 "external harness adapter `{id}` in {} declares \
-                 `capabilities.preassigned_session_id` but no `stream_args.session_id_flag`",
+                 `capabilities.preassigned_session_id` but no session id flag",
                 manifest_path.display()
             );
         }
@@ -856,6 +1163,14 @@ impl ExternalHarnessAdapterSpec {
                 .system_prompt_flag
                 .map(|flag| flag.trim().to_string())
                 .filter(|flag| !flag.is_empty()),
+            prompt_flag: self
+                .prompt_flag
+                .map(|flag| flag.trim().to_string())
+                .filter(|flag| !flag.is_empty()),
+            interactive_prompt_flag: self
+                .interactive_prompt_flag
+                .map(|flag| flag.trim().to_string())
+                .filter(|flag| !flag.is_empty()),
             model_flag: self
                 .model_flag
                 .map(|flag| flag.trim().to_string())
@@ -865,8 +1180,13 @@ impl ExternalHarnessAdapterSpec {
                 .map(|tmpl| tmpl.trim().to_string())
                 .filter(|tmpl| !tmpl.is_empty()),
             sandbox: self.sandbox,
+            add_dir_flag: self
+                .add_dir_flag
+                .map(|flag| flag.trim().to_string())
+                .filter(|flag| !flag.is_empty()),
             capabilities: self.capabilities,
             stream_args: self.stream_args,
+            continuity_args: self.continuity_args,
         })
     }
 }
@@ -951,6 +1271,41 @@ pub fn command_parts_for_harness_with_conversation(
     familiar: Option<&FamiliarContext>,
     options: HarnessLaunchOptions<'_>,
 ) -> Result<(String, Vec<String>)> {
+    command_parts_for_harness_with_conversation_inner(
+        harness_id, prompt, mode, hint, familiar, options, false,
+    )
+}
+
+/// Build a one-shot Codex command whose `exec` subcommand is explicitly in
+/// its supported JSONL mode. This belongs in command construction, rather
+/// than a later argv scan, so user values such as `--model exec` or a prompt
+/// literally equal to `--json` cannot be mistaken for syntax.
+pub fn command_parts_for_codex_json_with_conversation(
+    harness_id: &str,
+    prompt: &str,
+    mode: HarnessLaunchMode,
+    hint: Option<&ConversationHint>,
+    familiar: Option<&FamiliarContext>,
+    options: HarnessLaunchOptions<'_>,
+) -> Result<(String, Vec<String>)> {
+    if harness_id != "codex" {
+        anyhow::bail!("Codex JSON command construction requested for `{harness_id}`");
+    }
+    command_parts_for_harness_with_conversation_inner(
+        harness_id, prompt, mode, hint, familiar, options, true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn command_parts_for_harness_with_conversation_inner(
+    harness_id: &str,
+    prompt: &str,
+    mode: HarnessLaunchMode,
+    hint: Option<&ConversationHint>,
+    familiar: Option<&FamiliarContext>,
+    options: HarnessLaunchOptions<'_>,
+    codex_json: bool,
+) -> Result<(String, Vec<String>)> {
     let specs = configured_harness_specs()?;
     let configured_ids = specs
         .iter()
@@ -978,6 +1333,10 @@ pub fn command_parts_for_harness_with_conversation(
         Some(p) => spec.sandbox_args(p),
         None => Vec::new(),
     };
+    // Additional trusted directories forward as repeated native add-dir flags
+    // ahead of the prompt positional, mirroring model selection. Harnesses
+    // that declare no add-dir mechanism yield no args (the run layer warns).
+    let add_dir_args: Vec<String> = spec.add_dir_args(options.add_dirs);
     let launch_option_args = launch_option_args(harness_id, options);
 
     // Resolve effective prompt: inject familiar identity preamble when present.
@@ -1008,6 +1367,7 @@ pub fn command_parts_for_harness_with_conversation(
                     sanitize_argv_for_platform(prepend_launch_args(
                         &model_args,
                         &sandbox_args,
+                        &add_dir_args,
                         &launch_option_args,
                         args,
                     )),
@@ -1015,6 +1375,10 @@ pub fn command_parts_for_harness_with_conversation(
             ));
         }
         // Harness doesn't support stream: fall through to non-interactive.
+        let mut args = spec.prompt_args(&effective_prompt, HarnessLaunchMode::NonInteractive);
+        if codex_json {
+            add_codex_exec_json_flag(&spec, &mut args)?;
+        }
         return Ok((
             program,
             with_claude_permission_flags(
@@ -1022,8 +1386,9 @@ pub fn command_parts_for_harness_with_conversation(
                 sanitize_argv_for_platform(prepend_launch_args(
                     &model_args,
                     &sandbox_args,
+                    &add_dir_args,
                     &launch_option_args,
-                    spec.prompt_args(&effective_prompt, HarnessLaunchMode::NonInteractive),
+                    args,
                 )),
             ),
         ));
@@ -1031,6 +1396,9 @@ pub fn command_parts_for_harness_with_conversation(
 
     if let Some(hint) = hint {
         if let Some(mut args) = continuity_args(&spec, mode, hint) {
+            if codex_json {
+                add_codex_exec_json_flag(&spec, &mut args)?;
+            }
             // Inject identity via --system-prompt for harnesses that support it.
             if let (Some(flag), Some(f)) = (spec.system_prompt_flag.as_deref(), familiar) {
                 args.insert(0, f.identity_preamble());
@@ -1039,11 +1407,18 @@ pub fn command_parts_for_harness_with_conversation(
             let args = sanitize_argv_for_platform(prepend_launch_args(
                 &model_args,
                 &sandbox_args,
+                &add_dir_args,
                 &launch_option_args,
-                // `--` before the prompt for the same reason as `prompt_args`:
-                // user data must not parse as harness flags.
+                // The prompt rides behind the harness's prompt flag when it
+                // declares one (continuity launches are always
+                // non-interactive, so the shared `prompt_flag` applies), or
+                // behind `--` for positional-prompt harnesses — user data
+                // must not parse as harness flags either way.
                 args.into_iter()
-                    .chain(["--".to_string(), effective_prompt])
+                    .chain(match spec.prompt_flag.as_deref() {
+                        Some(flag) => vec![format!("{flag}={effective_prompt}")],
+                        None => vec!["--".to_string(), effective_prompt],
+                    })
                     .collect(),
             ));
             return Ok((program, with_claude_permission_flags(harness_id, args)));
@@ -1051,6 +1426,9 @@ pub fn command_parts_for_harness_with_conversation(
     }
 
     let mut args = spec.prompt_args(&effective_prompt, mode);
+    if codex_json {
+        add_codex_exec_json_flag(&spec, &mut args)?;
+    }
     // Inject identity via --system-prompt for harnesses that support it,
     // prepending before the prompt args.
     if let (Some(flag), Some(f)) = (spec.system_prompt_flag.as_deref(), familiar) {
@@ -1064,6 +1442,7 @@ pub fn command_parts_for_harness_with_conversation(
             sanitize_argv_for_platform(prepend_launch_args(
                 &model_args,
                 &sandbox_args,
+                &add_dir_args,
                 &launch_option_args,
                 args,
             )),
@@ -1071,8 +1450,33 @@ pub fn command_parts_for_harness_with_conversation(
     ))
 }
 
+/// Add `--json` directly after Codex's declared `exec` subcommand while the
+/// argument vector still consists only of harness-owned prefix args plus the
+/// final prompt. Launch options are prepended later, and the prompt is behind
+/// `--`, so neither can affect this structural insertion point.
+fn add_codex_exec_json_flag(spec: &HarnessCommandSpec, args: &mut Vec<String>) -> Result<()> {
+    let exec_index = spec
+        .non_interactive_prompt_prefix_args
+        .iter()
+        .position(|arg| arg == "exec")
+        .context("Codex adapter must declare an `exec` non-interactive subcommand")?;
+    if args.get(exec_index).map(String::as_str) != Some("exec") {
+        anyhow::bail!(
+            "Codex adapter's constructed command no longer contains `exec` at its declared position"
+        );
+    }
+    args.insert(exec_index + 1, "--json".to_string());
+    Ok(())
+}
+
 fn launch_option_args(harness_id: &str, options: HarnessLaunchOptions<'_>) -> Vec<String> {
-    if harness_id != "claude" {
+    // Claude, the engine, and Copilot share the same `--effort <level>` flag,
+    // and Copilot accepts every level `claude_effort` emits (verified against
+    // the installed copilot CLI).
+    if harness_id != "claude"
+        && harness_id != crate::engine::ENGINE_HARNESS_ID
+        && harness_id != "copilot"
+    {
         return Vec::new();
     }
     options
@@ -1087,16 +1491,23 @@ fn launch_option_args(harness_id: &str, options: HarnessLaunchOptions<'_>) -> Ve
 fn prepend_launch_args(
     model_args: &[String],
     sandbox_args: &[String],
+    add_dir_args: &[String],
     option_args: &[String],
     args: Vec<String>,
 ) -> Vec<String> {
-    if model_args.is_empty() && sandbox_args.is_empty() && option_args.is_empty() {
+    if model_args.is_empty()
+        && sandbox_args.is_empty()
+        && add_dir_args.is_empty()
+        && option_args.is_empty()
+    {
         return args;
     }
-    let mut out =
-        Vec::with_capacity(model_args.len() + sandbox_args.len() + option_args.len() + args.len());
+    let mut out = Vec::with_capacity(
+        model_args.len() + sandbox_args.len() + add_dir_args.len() + option_args.len() + args.len(),
+    );
     out.extend_from_slice(model_args);
     out.extend_from_slice(sandbox_args);
+    out.extend_from_slice(add_dir_args);
     out.extend_from_slice(option_args);
     out.extend(args);
     out
@@ -1189,30 +1600,26 @@ fn continuity_args(
     if mode != HarnessLaunchMode::NonInteractive {
         return None;
     }
-    match spec.id.as_str() {
-        "claude" => {
-            let flag = match hint {
-                ConversationHint::Init { .. } => "--session-id",
-                ConversationHint::Resume { .. } => "--resume",
-            };
-            Some(vec![
-                "--print".to_string(),
-                flag.to_string(),
-                hint.id().to_string(),
-            ])
+    let declared = spec.continuity_args.as_ref()?;
+    match hint {
+        ConversationHint::Init { .. } => {
+            let flag = declared.session_id_flag()?;
+            let mut args = declared.init_prefix_args.clone();
+            args.push(flag.to_string());
+            args.push(hint.id().to_string());
+            Some(args)
         }
-        "codex" => match hint {
-            // Codex auto-assigns the session id on the first turn; we capture
-            // it from output and feed it back on subsequent turns.
-            ConversationHint::Init { .. } => None,
-            ConversationHint::Resume { id } => {
-                let mut args: Vec<String> = spec.non_interactive_prompt_prefix_args.to_vec();
-                args.push("resume".to_string());
-                args.push(id.clone());
-                Some(args)
+        ConversationHint::Resume { .. } => {
+            if !declared.has_resume_launch() {
+                return None;
             }
-        },
-        _ => None,
+            let mut args = declared.resume_prefix_args.clone();
+            if let Some(flag) = declared.resume_flag() {
+                args.push(flag.to_string());
+            }
+            args.push(hint.id().to_string());
+            Some(args)
+        }
     }
 }
 
@@ -1222,8 +1629,28 @@ fn executable_exists(executable: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Availability check for a harness: most harnesses rely on PATH only, but
+/// `coven-code` is also available when the managed engine resolver finds it
+/// (e.g. `~/.coven/engine/<ver>/coven-code` not on PATH).
+fn harness_available(executable: &str) -> bool {
+    if executable == crate::engine::ENGINE_HARNESS_ID {
+        // engine::resolve() already checks PATH (and the legacy dir); the
+        // extra executable_exists is a cheap safety valve for the rare case
+        // where PATH changed between here and an eventual spawn.
+        return crate::engine::resolve().is_some() || executable_exists(executable);
+    }
+    executable_exists(executable)
+}
+
 #[cfg(windows)]
 pub(crate) fn spawn_executable_for_platform(executable: &str) -> String {
+    // For the managed engine, return the absolute path directly so a coven-code
+    // binary that isn't on PATH can still be spawned correctly.
+    if executable == crate::engine::ENGINE_HARNESS_ID {
+        if let Some(r) = crate::engine::resolve() {
+            return r.path.to_string_lossy().into_owned();
+        }
+    }
     env::var_os("PATH")
         .and_then(|paths| {
             resolve_executable_in_paths_for_windows(
@@ -1238,6 +1665,13 @@ pub(crate) fn spawn_executable_for_platform(executable: &str) -> String {
 
 #[cfg(not(windows))]
 pub(crate) fn spawn_executable_for_platform(executable: &str) -> String {
+    // For the managed engine, return the absolute path directly so a coven-code
+    // binary that isn't on PATH can still be spawned correctly.
+    if executable == crate::engine::ENGINE_HARNESS_ID {
+        if let Some(r) = crate::engine::resolve() {
+            return r.path.to_string_lossy().into_owned();
+        }
+    }
     executable.to_string()
 }
 
@@ -1531,16 +1965,22 @@ mod tests {
     }
 
     #[test]
-    fn built_in_harnesses_returns_codex_and_claude() {
+    fn built_in_harnesses_list_bundled_adapters_in_order() {
         let harnesses = built_in_harnesses();
 
-        assert_eq!(harnesses.len(), 2);
+        assert_eq!(harnesses.len(), 4);
         assert_eq!(harnesses[0].id, "codex");
         assert_eq!(harnesses[0].label, "Codex");
         assert_eq!(harnesses[0].executable, "codex");
         assert_eq!(harnesses[1].id, "claude");
         assert_eq!(harnesses[1].label, "Claude Code");
         assert_eq!(harnesses[1].executable, "claude");
+        assert_eq!(harnesses[2].id, "coven-code");
+        assert_eq!(harnesses[2].label, "Coven Code");
+        assert_eq!(harnesses[2].executable, "coven-code");
+        assert_eq!(harnesses[3].id, "copilot");
+        assert_eq!(harnesses[3].label, "Copilot CLI");
+        assert_eq!(harnesses[3].executable, "copilot");
     }
 
     #[test]
@@ -1554,6 +1994,10 @@ mod tests {
             .iter()
             .find(|harness| harness.id == "claude")
             .expect("claude harness should exist");
+        let copilot = harnesses
+            .iter()
+            .find(|harness| harness.id == "copilot")
+            .expect("copilot harness should exist");
 
         assert!(codex.install_hint.contains("npm install -g @openai/codex"));
         assert!(codex.install_hint.contains("brew install --cask codex"));
@@ -1566,10 +2010,22 @@ mod tests {
         assert!(claude.install_hint.contains("claude doctor"));
         assert!(claude.install_hint.contains("claude"));
         assert!(claude.install_hint.contains("PATH"));
+
+        assert!(copilot
+            .install_hint
+            .contains("npm install -g @github/copilot"));
+        assert!(copilot
+            .install_hint
+            .contains("brew install --cask copilot-cli"));
+        assert!(copilot.install_hint.contains("copilot login"));
+        assert!(copilot.install_hint.contains("PATH"));
     }
 
     #[test]
     fn command_parts_for_known_harnesses_append_interactive_prompt() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         assert_eq!(
             command_parts_for_harness("codex", "fix tests", HarnessLaunchMode::Interactive)?,
             (
@@ -1589,6 +2045,9 @@ mod tests {
 
     #[test]
     fn command_parts_for_known_harnesses_use_noninteractive_entrypoints() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         assert_eq!(
             command_parts_for_harness("codex", "fix tests", HarnessLaunchMode::NonInteractive)?,
             (
@@ -1619,6 +2078,9 @@ mod tests {
 
     #[test]
     fn dash_prefixed_prompts_stay_positional_behind_double_dash() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         // A prompt starting with `-` must never parse as harness flags.
         for mode in [
             HarnessLaunchMode::Interactive,
@@ -1647,6 +2109,8 @@ mod tests {
             id: "future".to_string(),
             label: "Future Harness".to_string(),
             executable: "future".to_string(),
+            prompt_flag: None,
+            interactive_prompt_flag: None,
             interactive_prompt_prefix_args: vec!["chat".to_string()],
             non_interactive_prompt_prefix_args: vec!["exec".to_string(), "-q".to_string()],
             install_hint: "Install the future harness.".to_string(),
@@ -1656,8 +2120,10 @@ mod tests {
             model_flag: None,
             model_arg_template: None,
             sandbox: None,
+            add_dir_flag: None,
             capabilities: Capabilities::BASELINE,
             stream_args: None,
+            continuity_args: None,
         };
 
         assert_eq!(
@@ -1677,6 +2143,9 @@ mod tests {
 
     #[test]
     fn command_parts_reject_unknown_harnesses() {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         assert!(
             command_parts_for_harness("shell", "hello", HarnessLaunchMode::Interactive)
                 .unwrap_err()
@@ -1784,7 +2253,7 @@ mod tests {
         let manifest = temp_dir.path().join("streamy.json");
         fs::write(&manifest, STREAMY_ADAPTER_MANIFEST)?;
 
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
         let previous = env::var_os(EXTERNAL_ADAPTER_MANIFEST_ENV);
         env::set_var(EXTERNAL_ADAPTER_MANIFEST_ENV, &manifest);
         let supports_stream = harness_supports_stream_mode("streamy");
@@ -1825,6 +2294,68 @@ mod tests {
         Ok(())
     }
 
+    /// A manifest adapter can declare flag-carried prompts (`promptFlag`,
+    /// with an optional interactive-mode override), and argv construction
+    /// binds the prompt via the `=` form in the matching mode.
+    #[test]
+    fn manifest_prompt_flags_bind_prompt_per_mode() -> anyhow::Result<()> {
+        let raw = r#"{
+          "adapters": [
+            {
+              "id": "copi",
+              "label": "Copi",
+              "executable": "copi",
+              "interactive_prompt_prefix_args": [],
+              "non_interactive_prompt_prefix_args": ["--quiet"],
+              "install_hint": "Install copi.",
+              "promptFlag": "--prompt",
+              "interactivePromptFlag": "--interactive"
+            }
+          ]
+        }"#;
+        let specs =
+            parse_external_harness_specs(raw, Path::new("copi.json"), &built_in_harness_specs())?;
+        let copi = &specs[0];
+        assert_eq!(copi.prompt_flag.as_deref(), Some("--prompt"));
+        assert_eq!(
+            copi.interactive_prompt_flag.as_deref(),
+            Some("--interactive")
+        );
+        assert_eq!(
+            copi.prompt_args("fix tests", HarnessLaunchMode::NonInteractive),
+            vec!["--quiet".to_string(), "--prompt=fix tests".to_string()]
+        );
+        assert_eq!(
+            copi.prompt_args("fix tests", HarnessLaunchMode::Interactive),
+            vec!["--interactive=fix tests".to_string()]
+        );
+
+        // Without the interactive override, both modes share `promptFlag`.
+        let shared = r#"{
+          "adapters": [
+            {
+              "id": "copi",
+              "label": "Copi",
+              "executable": "copi",
+              "interactive_prompt_prefix_args": [],
+              "non_interactive_prompt_prefix_args": [],
+              "install_hint": "Install copi.",
+              "promptFlag": "-q"
+            }
+          ]
+        }"#;
+        let specs = parse_external_harness_specs(
+            shared,
+            Path::new("copi.json"),
+            &built_in_harness_specs(),
+        )?;
+        assert_eq!(
+            specs[0].prompt_args("hello", HarnessLaunchMode::Interactive),
+            vec!["-q=hello".to_string()]
+        );
+        Ok(())
+    }
+
     /// The argv-list sandbox form (GitHub Copilot CLI shape) maps
     /// `--permission` through for a manifest adapter.
     #[test]
@@ -1860,6 +2391,58 @@ mod tests {
         Ok(())
     }
 
+    /// A manifest adapter can declare its native add-dir trust flag (either
+    /// key casing); omitting it keeps `--add-dir` a warned no-op.
+    #[test]
+    fn manifest_add_dir_flag_maps_repeatable_dirs() -> anyhow::Result<()> {
+        let raw = r#"{
+          "adapters": [
+            {
+              "id": "copi",
+              "label": "Copi",
+              "executable": "copi",
+              "interactive_prompt_prefix_args": ["-i"],
+              "non_interactive_prompt_prefix_args": ["-s", "-p"],
+              "install_hint": "Install copi.",
+              "addDirFlag": "--allow-dir"
+            }
+          ]
+        }"#;
+        let specs =
+            parse_external_harness_specs(raw, Path::new("copi.json"), &built_in_harness_specs())?;
+        let copi = &specs[0];
+        assert!(copi.supports_add_dir());
+        assert_eq!(
+            copi.add_dir_args(&["/tmp/a".to_string(), "/tmp/b".to_string()]),
+            vec![
+                "--allow-dir".to_string(),
+                "/tmp/a".to_string(),
+                "--allow-dir".to_string(),
+                "/tmp/b".to_string(),
+            ]
+        );
+
+        let without = r#"{
+          "adapters": [
+            {
+              "id": "plain",
+              "label": "Plain",
+              "executable": "plain",
+              "interactive_prompt_prefix_args": [],
+              "non_interactive_prompt_prefix_args": ["run"],
+              "install_hint": "Install plain."
+            }
+          ]
+        }"#;
+        let specs = parse_external_harness_specs(
+            without,
+            Path::new("plain.json"),
+            &built_in_harness_specs(),
+        )?;
+        assert!(!specs[0].supports_add_dir());
+        Ok(())
+    }
+
     #[test]
     fn manifest_capability_cross_checks_reject_undeclarable_configs() {
         let built_ins = built_in_harness_specs();
@@ -1890,7 +2473,7 @@ mod tests {
                     "install_hint":"hint",
                     "capabilities":{"stream":true,"preassigned_session_id":true},
                     "stream_args":{"prefix_args":["-p"]}}]}"#,
-                "no `stream_args.session_id_flag`",
+                "no session id flag",
             ),
         ];
         for (raw, expected) in cases {
@@ -1903,10 +2486,210 @@ mod tests {
         }
     }
 
+    #[test]
+    fn manifest_continuity_adapter_uses_declared_noninteractive_args() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let manifest = temp_dir.path().join("continuity.json");
+        fs::write(
+            &manifest,
+            r#"{
+              "adapters": [
+                {
+                  "id": "threaded",
+                  "label": "Threaded",
+                  "executable": "threaded",
+                  "interactive_prompt_prefix_args": [],
+                  "non_interactive_prompt_prefix_args": ["run"],
+                  "install_hint": "Install threaded.",
+                  "capabilities": { "preassigned_session_id": true },
+                  "continuity_args": {
+                    "init_prefix_args": ["run", "--json"],
+                    "resume_prefix_args": ["run", "--json"],
+                    "session_id_flag": "--session",
+                    "resume_flag": "--resume"
+                  }
+                }
+              ]
+            }"#,
+        )?;
+
+        let _guard = env_lock().lock().unwrap();
+        let previous_manifest = env::var_os(EXTERNAL_ADAPTER_MANIFEST_ENV);
+        let previous_dirs = env::var_os(EXTERNAL_ADAPTER_DIRS_ENV);
+        env::set_var(EXTERNAL_ADAPTER_MANIFEST_ENV, &manifest);
+        env::remove_var(EXTERNAL_ADAPTER_DIRS_ENV);
+
+        let init = command_parts_for_harness_with_conversation(
+            "threaded",
+            "hello",
+            HarnessLaunchMode::NonInteractive,
+            Some(&ConversationHint::Init {
+                id: "session-1".to_string(),
+            }),
+            None,
+            HarnessLaunchOptions::default(),
+        );
+        let resume = command_parts_for_harness_with_conversation(
+            "threaded",
+            "again",
+            HarnessLaunchMode::NonInteractive,
+            Some(&ConversationHint::Resume {
+                id: "session-1".to_string(),
+            }),
+            None,
+            HarnessLaunchOptions::default(),
+        );
+
+        restore_adapter_manifest_env(previous_manifest);
+        restore_adapter_dirs_env(previous_dirs);
+
+        assert_eq!(
+            init?,
+            (
+                "threaded".to_string(),
+                vec![
+                    "run".to_string(),
+                    "--json".to_string(),
+                    "--session".to_string(),
+                    "session-1".to_string(),
+                    "--".to_string(),
+                    "hello".to_string(),
+                ]
+            )
+        );
+        assert_eq!(
+            resume?,
+            (
+                "threaded".to_string(),
+                vec![
+                    "run".to_string(),
+                    "--json".to_string(),
+                    "--resume".to_string(),
+                    "session-1".to_string(),
+                    "--".to_string(),
+                    "again".to_string(),
+                ]
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_resume_only_continuity_allows_generated_session_ids() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let manifest = temp_dir.path().join("resume-only.json");
+        fs::write(
+            &manifest,
+            r#"{
+              "adapters": [
+                {
+                  "id": "resume-only",
+                  "label": "Resume Only",
+                  "executable": "resume-only",
+                  "interactive_prompt_prefix_args": [],
+                  "non_interactive_prompt_prefix_args": ["exec"],
+                  "install_hint": "Install resume-only.",
+                  "continuity_args": {
+                    "resume_prefix_args": ["exec", "resume"]
+                  }
+                }
+              ]
+            }"#,
+        )?;
+
+        let _guard = env_lock().lock().unwrap();
+        let previous_manifest = env::var_os(EXTERNAL_ADAPTER_MANIFEST_ENV);
+        let previous_dirs = env::var_os(EXTERNAL_ADAPTER_DIRS_ENV);
+        env::set_var(EXTERNAL_ADAPTER_MANIFEST_ENV, &manifest);
+        env::remove_var(EXTERNAL_ADAPTER_DIRS_ENV);
+
+        let init = command_parts_for_harness_with_conversation(
+            "resume-only",
+            "first",
+            HarnessLaunchMode::NonInteractive,
+            Some(&ConversationHint::Init {
+                id: "ignored".to_string(),
+            }),
+            None,
+            HarnessLaunchOptions::default(),
+        );
+        let resume = command_parts_for_harness_with_conversation(
+            "resume-only",
+            "again",
+            HarnessLaunchMode::NonInteractive,
+            Some(&ConversationHint::Resume {
+                id: "upstream-1".to_string(),
+            }),
+            None,
+            HarnessLaunchOptions::default(),
+        );
+
+        restore_adapter_manifest_env(previous_manifest);
+        restore_adapter_dirs_env(previous_dirs);
+
+        assert_eq!(
+            init?,
+            (
+                "resume-only".to_string(),
+                vec!["exec".to_string(), "--".to_string(), "first".to_string()]
+            )
+        );
+        assert_eq!(
+            resume?,
+            (
+                "resume-only".to_string(),
+                vec![
+                    "exec".to_string(),
+                    "resume".to_string(),
+                    "upstream-1".to_string(),
+                    "--".to_string(),
+                    "again".to_string(),
+                ]
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_continuity_rejects_dead_preassigned_session_config() {
+        let built_ins = built_in_harness_specs();
+        let cases: &[(&str, &str)] = &[
+            (
+                r#"{"adapters":[{"id":"x","label":"X","executable":"x",
+                    "interactive_prompt_prefix_args":[],
+                    "non_interactive_prompt_prefix_args":["run"],
+                    "install_hint":"hint",
+                    "continuity_args":{"init_prefix_args":["run"],"session_id_flag":"--session"}}]}"#,
+                "`continuity_args.session_id_flag` but `capabilities.preassigned_session_id` is false",
+            ),
+            (
+                r#"{"adapters":[{"id":"x","label":"X","executable":"x",
+                    "interactive_prompt_prefix_args":[],
+                    "non_interactive_prompt_prefix_args":["run"],
+                    "install_hint":"hint",
+                    "capabilities":{"preassigned_session_id":true},
+                    "continuity_args":{"init_prefix_args":["run"]}}]}"#,
+                "declares `capabilities.preassigned_session_id` but no session id flag",
+            ),
+        ];
+
+        for (raw, expected) in cases {
+            let err = parse_external_harness_specs(raw, Path::new("x.json"), &built_ins)
+                .expect_err("invalid continuity config must be rejected");
+            assert!(
+                err.to_string().contains(expected),
+                "expected `{expected}` in: {err:#}"
+            );
+        }
+    }
+
     /// Claude's stream launch is byte-for-byte what the old hardcoded
     /// `stream_args()` produced, now read from its declared `stream_args`.
     #[test]
     fn claude_stream_launch_args_unchanged_after_declaration() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let (program, args) = command_parts_for_harness_with_conversation(
             "claude",
             "hello",
@@ -2186,12 +2969,14 @@ mod tests {
             .unwrap();
         assert_eq!(codex.source, "bundled");
         assert!(codex.manifest_path.is_none());
+        assert_eq!(codex.capabilities, Capabilities::BASELINE);
 
         let custom = harnesses
             .iter()
             .find(|harness| harness.id == "solo-codex")
             .unwrap();
         assert_eq!(custom.source, "manifest");
+        assert_eq!(custom.capabilities, Capabilities::BASELINE);
         assert_eq!(
             custom.manifest_path.as_deref(),
             Some(manifest.to_string_lossy().as_ref())
@@ -2201,6 +2986,9 @@ mod tests {
 
     #[test]
     fn claude_init_hint_attaches_session_id_flag_in_print_mode() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let hint = ConversationHint::Init {
             id: "abc-123".to_string(),
         };
@@ -2230,6 +3018,9 @@ mod tests {
 
     #[test]
     fn claude_resume_hint_attaches_resume_flag_in_print_mode() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let hint = ConversationHint::Resume {
             id: "abc-123".to_string(),
         };
@@ -2258,7 +3049,81 @@ mod tests {
     }
 
     #[test]
+    fn coven_code_init_hint_attaches_session_id_flag_in_print_mode() -> anyhow::Result<()> {
+        // `spawn_executable_for_platform("coven-code")` consults engine::resolve(),
+        // which reads HOME/USERPROFILE. Pin env (and clear any managed-engine home)
+        // so this deterministic-argv test does not race the managed-engine test.
+        let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let empty = tempfile::tempdir()?;
+        let _home_guard = EnvVarGuard::set("HOME", empty.path());
+        #[cfg(windows)]
+        let _userprofile_guard = EnvVarGuard::set("USERPROFILE", empty.path());
+        let hint = ConversationHint::Init {
+            id: "cc-session-42".to_string(),
+        };
+        let parts = command_parts_for_harness_with_conversation(
+            "coven-code",
+            "hello",
+            HarnessLaunchMode::NonInteractive,
+            Some(&hint),
+            None,
+            HarnessLaunchOptions::default(),
+        )?;
+        assert_eq!(
+            parts,
+            (
+                spawn_executable_for_platform("coven-code"),
+                vec![
+                    "--print".to_string(),
+                    "--session-id".to_string(),
+                    "cc-session-42".to_string(),
+                    "--".to_string(),
+                    "hello".to_string(),
+                ]
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn coven_code_resume_hint_attaches_resume_flag_in_print_mode() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let empty = tempfile::tempdir()?;
+        let _home_guard = EnvVarGuard::set("HOME", empty.path());
+        #[cfg(windows)]
+        let _userprofile_guard = EnvVarGuard::set("USERPROFILE", empty.path());
+        let hint = ConversationHint::Resume {
+            id: "cc-session-42".to_string(),
+        };
+        let parts = command_parts_for_harness_with_conversation(
+            "coven-code",
+            "follow up",
+            HarnessLaunchMode::NonInteractive,
+            Some(&hint),
+            None,
+            HarnessLaunchOptions::default(),
+        )?;
+        assert_eq!(
+            parts,
+            (
+                spawn_executable_for_platform("coven-code"),
+                vec![
+                    "--print".to_string(),
+                    "--resume".to_string(),
+                    "cc-session-42".to_string(),
+                    "--".to_string(),
+                    "follow up".to_string(),
+                ]
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
     fn interactive_mode_ignores_conversation_hint() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let hint = ConversationHint::Init {
             id: "abc-123".to_string(),
         };
@@ -2283,6 +3148,9 @@ mod tests {
     #[test]
     fn codex_init_hint_falls_through_to_default_args_so_codex_can_assign_its_own_id(
     ) -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let hint = ConversationHint::Init {
             id: "abc-123".to_string(),
         };
@@ -2313,6 +3181,9 @@ mod tests {
 
     #[test]
     fn codex_resume_hint_uses_exec_resume_subcommand_with_id() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let hint = ConversationHint::Resume {
             id: "019e5998-7130-7872-8d96-a6b67c5b6406".to_string(),
         };
@@ -2345,6 +3216,9 @@ mod tests {
 
     #[test]
     fn claude_stream_mode_preserves_permission_prompts_by_default() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let (program, args) = command_parts_for_harness_with_conversation(
             "claude",
             "hello",
@@ -2386,6 +3260,9 @@ mod tests {
 
     #[test]
     fn non_claude_harnesses_do_not_get_permission_bypass() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let (_, args) =
             command_parts_for_harness("codex", "fix tests", HarnessLaunchMode::NonInteractive)?;
         assert!(!args
@@ -2452,7 +3329,25 @@ mod tests {
     }
 
     #[test]
+    fn harness_summary_serializes_declared_capabilities() {
+        let harnesses = built_in_harnesses();
+        let json = serde_json::to_value(&harnesses).unwrap();
+
+        assert_eq!(json[0]["id"], "codex");
+        assert_eq!(json[0]["capabilities"]["stream"], false);
+        assert_eq!(json[0]["capabilities"]["preassigned_session_id"], false);
+        assert_eq!(json[1]["id"], "claude");
+        assert_eq!(json[1]["capabilities"]["stream"], true);
+        assert_eq!(json[1]["capabilities"]["preassigned_session_id"], true);
+        assert_eq!(json[1]["capabilities"]["think"], true);
+        assert_eq!(json[1]["capabilities"]["speed"], true);
+    }
+
+    #[test]
     fn codex_forwards_model_before_prompt_with_prefix_stripped() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let (program, args) = command_parts_for_harness_with_conversation(
             "codex",
             "fix tests",
@@ -2486,7 +3381,45 @@ mod tests {
     }
 
     #[test]
+    fn codex_json_mode_inserts_flag_at_the_declared_subcommand_not_user_values(
+    ) -> anyhow::Result<()> {
+        // Both values deliberately look like CLI syntax. The model value comes
+        // before the real `exec` subcommand, while the prompt is protected by
+        // the trailing `--` separator. JSON mode must be constructed from the
+        // harness spec, never by scanning those user-controlled entries.
+        let (_, args) = command_parts_for_codex_json_with_conversation(
+            "codex",
+            "--json",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            None,
+            HarnessLaunchOptions {
+                model: Some("openai/exec"),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(
+            args,
+            vec![
+                "--model".to_string(),
+                "exec".to_string(),
+                "exec".to_string(),
+                "--json".to_string(),
+                "--skip-git-repo-check".to_string(),
+                "--color".to_string(),
+                "never".to_string(),
+                "--".to_string(),
+                "--json".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn claude_forwards_model_with_prefix_stripped() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let (_, args) = command_parts_for_harness_with_conversation(
             "claude",
             "hi",
@@ -2513,6 +3446,9 @@ mod tests {
 
     #[test]
     fn claude_think_maps_to_effort_high() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let (_, args) = command_parts_for_harness_with_conversation(
             "claude",
             "hi",
@@ -2539,6 +3475,9 @@ mod tests {
 
     #[test]
     fn claude_speed_maps_to_effort_levels() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let (_, fast_args) = command_parts_for_harness_with_conversation(
             "claude",
             "hi",
@@ -2569,6 +3508,9 @@ mod tests {
 
     #[test]
     fn codex_ignores_think_and_speed_launch_hints() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let with_hints = command_parts_for_harness_with_conversation(
             "codex",
             "fix tests",
@@ -2590,6 +3532,9 @@ mod tests {
 
     #[test]
     fn no_model_leaves_args_unchanged() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let with_model = command_parts_for_harness_with_conversation(
             "codex",
             "fix tests",
@@ -2680,6 +3625,8 @@ mod tests {
             id: "future".to_string(),
             label: "Future Harness".to_string(),
             executable: "future".to_string(),
+            prompt_flag: None,
+            interactive_prompt_flag: None,
             interactive_prompt_prefix_args: Vec::new(),
             non_interactive_prompt_prefix_args: vec!["run".to_string()],
             install_hint: "Install the future harness.".to_string(),
@@ -2689,8 +3636,10 @@ mod tests {
             model_flag: None,
             model_arg_template: None,
             sandbox: None,
+            add_dir_flag: None,
             capabilities: Capabilities::BASELINE,
             stream_args: None,
+            continuity_args: None,
         };
         assert!(!spec.supports_permission());
         assert!(spec.sandbox_args(Permission::Full).is_empty());
@@ -2698,7 +3647,178 @@ mod tests {
     }
 
     #[test]
+    fn spec_without_add_dir_mechanism_is_an_add_dir_noop() {
+        let spec = HarnessCommandSpec {
+            id: "future".to_string(),
+            label: "Future Harness".to_string(),
+            executable: "future".to_string(),
+            prompt_flag: None,
+            interactive_prompt_flag: None,
+            interactive_prompt_prefix_args: Vec::new(),
+            non_interactive_prompt_prefix_args: vec!["run".to_string()],
+            install_hint: "Install the future harness.".to_string(),
+            source: "manifest".to_string(),
+            manifest_path: None,
+            system_prompt_flag: None,
+            model_flag: None,
+            model_arg_template: None,
+            sandbox: None,
+            add_dir_flag: None,
+            capabilities: Capabilities::BASELINE,
+            stream_args: None,
+            continuity_args: None,
+        };
+        assert!(!spec.supports_add_dir());
+        assert!(spec.add_dir_args(&["/tmp/other".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn codex_forwards_add_dirs_before_prompt() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
+        let add_dirs = vec!["/tmp/roots/a".to_string(), "/tmp/roots/b".to_string()];
+        let (_, args) = command_parts_for_harness_with_conversation(
+            "codex",
+            "fix tests",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            None,
+            HarnessLaunchOptions {
+                add_dirs: &add_dirs,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(
+            args,
+            vec![
+                "--add-dir".to_string(),
+                "/tmp/roots/a".to_string(),
+                "--add-dir".to_string(),
+                "/tmp/roots/b".to_string(),
+                "exec".to_string(),
+                "--skip-git-repo-check".to_string(),
+                "--color".to_string(),
+                "never".to_string(),
+                "--".to_string(),
+                "fix tests".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn claude_stream_mode_forwards_add_dirs() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
+        // Blank entries are skipped; real dirs forward as repeated
+        // `--add-dir <DIR>` pairs ahead of the declared stream args,
+        // matching the non-stream path (`HarnessCommandSpec::add_dir_args`).
+        let add_dirs = vec!["/tmp/roots/a".to_string(), "  ".to_string()];
+        let (_, args) = command_parts_for_harness_with_conversation(
+            "claude",
+            "hello prompt",
+            HarnessLaunchMode::Stream,
+            Some(&ConversationHint::Init {
+                id: "session-123".to_string(),
+            }),
+            None,
+            HarnessLaunchOptions {
+                add_dirs: &add_dirs,
+                ..Default::default()
+            },
+        )?;
+        let position = args
+            .iter()
+            .position(|arg| arg == "--add-dir")
+            .expect("stream args must carry --add-dir");
+        assert_eq!(args[position + 1], "/tmp/roots/a");
+        assert_eq!(
+            args.iter().filter(|arg| *arg == "--add-dir").count(),
+            1,
+            "blank add-dir entries are skipped: {args:?}"
+        );
+        assert!(
+            args.iter().any(|arg| arg == "--session-id"),
+            "stream init args expected: {args:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn claude_forwards_add_dirs_after_permission() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
+        let add_dirs = vec!["/tmp/roots/a".to_string()];
+        let (_, args) = command_parts_for_harness_with_conversation(
+            "claude",
+            "hi",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            None,
+            HarnessLaunchOptions {
+                permission: Some(Permission::ReadOnly),
+                add_dirs: &add_dirs,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(
+            args,
+            vec![
+                "--permission-mode".to_string(),
+                "plan".to_string(),
+                "--add-dir".to_string(),
+                "/tmp/roots/a".to_string(),
+                "--print".to_string(),
+                "--".to_string(),
+                "hi".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn blank_add_dirs_leave_args_unchanged() -> anyhow::Result<()> {
+        let blank = vec!["   ".to_string(), String::new()];
+        let with_blank_dirs = command_parts_for_harness_with_conversation(
+            "codex",
+            "fix tests",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            None,
+            HarnessLaunchOptions {
+                add_dirs: &blank,
+                ..Default::default()
+            },
+        )?;
+        let legacy =
+            command_parts_for_harness("codex", "fix tests", HarnessLaunchMode::NonInteractive)?;
+        assert_eq!(with_blank_dirs, legacy, "blank add-dirs are a no-op");
+        Ok(())
+    }
+
+    #[test]
+    fn built_in_harnesses_declare_add_dir_flag() {
+        // Cave forwards granted project roots via repeatable `--add-dir`;
+        // every built-in harness CLI supports the flag natively (verified
+        // against codex, claude, and the coven-code engine binaries).
+        for spec in built_in_harness_specs() {
+            assert_eq!(
+                spec.add_dir_flag.as_deref(),
+                Some("--add-dir"),
+                "built-in `{}` must declare an add-dir mechanism",
+                spec.id
+            );
+        }
+    }
+
+    #[test]
     fn codex_forwards_permission_before_prompt() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let (_, args) = command_parts_for_harness_with_conversation(
             "codex",
             "fix tests",
@@ -2723,6 +3843,9 @@ mod tests {
 
     #[test]
     fn claude_forwards_permission_full_maps_to_bypass() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let (_, args) = command_parts_for_harness_with_conversation(
             "claude",
             "hi",
@@ -2749,6 +3872,9 @@ mod tests {
 
     #[test]
     fn no_permission_leaves_args_unchanged() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let with_opt = command_parts_for_harness_with_conversation(
             "codex",
             "fix tests",
@@ -2871,6 +3997,9 @@ mod tests {
 
     #[test]
     fn none_hint_matches_legacy_command_parts() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
         let with_none = command_parts_for_harness_with_conversation(
             "claude",
             "hello",
@@ -2896,5 +4025,328 @@ mod tests {
     #[cfg(not(unix))]
     fn make_executable(_path: &Path) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    // ── coven-code engine harness tests ──────────────────────────────────────
+
+    #[test]
+    fn coven_code_is_a_built_in_harness() {
+        let specs = built_in_harness_specs();
+        let cc = specs
+            .iter()
+            .find(|s| s.id == "coven-code")
+            .expect("coven-code spec present");
+        assert_eq!(cc.executable, "coven-code");
+        assert_eq!(
+            cc.non_interactive_prompt_prefix_args,
+            vec!["--print".to_string()]
+        );
+        assert_eq!(
+            cc.system_prompt_flag.as_deref(),
+            Some("--append-system-prompt")
+        );
+        assert_eq!(cc.model_flag.as_deref(), Some("--model"));
+        assert!(cc.capabilities.stream);
+        assert!(cc.capabilities.preassigned_session_id);
+        assert!(cc.capabilities.think);
+        let stream = cc.stream_args.as_ref().expect("stream args");
+        assert_eq!(stream.session_id_flag.as_deref(), Some("--session-id"));
+        assert_eq!(stream.resume_flag.as_deref(), Some("--resume"));
+    }
+
+    #[test]
+    fn coven_code_sandbox_uses_kebab_case_permission_mode() {
+        let specs = built_in_harness_specs();
+        let cc = specs.iter().find(|s| s.id == "coven-code").unwrap();
+        let full = cc.sandbox_args(Permission::Full);
+        assert!(
+            full.iter().any(|a| a == "bypass-permissions"),
+            "expected bypass-permissions in {full:?}"
+        );
+        assert!(
+            !full.iter().any(|a| a == "bypassPermissions"),
+            "must NOT use camelCase bypassPermissions; got {full:?}"
+        );
+        let read_only = cc.sandbox_args(Permission::ReadOnly);
+        assert!(
+            read_only.iter().any(|a| a == "plan"),
+            "expected plan in {read_only:?}"
+        );
+    }
+
+    #[test]
+    fn coven_code_think_maps_to_effort_high() -> anyhow::Result<()> {
+        let (_, args) = command_parts_for_harness_with_conversation(
+            "coven-code",
+            "hi",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            None,
+            HarnessLaunchOptions {
+                think: true,
+                ..Default::default()
+            },
+        )?;
+        let effort_pos = args
+            .iter()
+            .position(|a| a == "--effort")
+            .expect("--effort flag present");
+        assert_eq!(args[effort_pos + 1], "high");
+        Ok(())
+    }
+
+    // ── Copilot ──────────────────────────────────────────────────────────
+    //
+    // Argv shapes in these tests are verified against the installed GitHub
+    // Copilot CLI (1.0.70): positional prompts are rejected outright, so the
+    // prompt always rides a flag's `=` form.
+
+    #[test]
+    fn copilot_noninteractive_uses_prompt_flag_equals_form() -> anyhow::Result<()> {
+        // Spec resolution reads the adapter env vars; hold the shared env
+        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
+        let _guard = env_lock().lock().unwrap();
+        assert_eq!(
+            command_parts_for_harness("copilot", "fix tests", HarnessLaunchMode::NonInteractive)?,
+            (
+                "copilot".to_string(),
+                vec!["--no-color".to_string(), "--prompt=fix tests".to_string()]
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn copilot_interactive_uses_interactive_flag_equals_form() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().unwrap();
+        assert_eq!(
+            command_parts_for_harness("copilot", "polish ui", HarnessLaunchMode::Interactive)?,
+            (
+                "copilot".to_string(),
+                vec!["--interactive=polish ui".to_string()]
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn copilot_dash_prefixed_prompt_stays_inside_flag_value() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().unwrap();
+        // A prompt starting with `-` must never parse as harness flags; the
+        // `=` form binds it as the prompt flag's value.
+        let (_, args) = command_parts_for_harness(
+            "copilot",
+            "--version; rm -rf /",
+            HarnessLaunchMode::NonInteractive,
+        )?;
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("--prompt=--version; rm -rf /"),
+            "prompt must be the final argv entry bound via `=`: {args:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn copilot_stream_mode_falls_back_to_noninteractive_one_shot() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().unwrap();
+        // Copilot has no stream-json stdin mode; a Stream request must build
+        // the one-shot non-interactive command instead.
+        assert!(!harness_supports_stream_mode("copilot"));
+        assert_eq!(
+            command_parts_for_harness("copilot", "hi", HarnessLaunchMode::Stream)?,
+            (
+                "copilot".to_string(),
+                vec!["--no-color".to_string(), "--prompt=hi".to_string()]
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn copilot_init_hint_preassigns_session_id_with_prompt_flag() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().unwrap();
+        assert!(harness_supports_preassigned_session_id("copilot"));
+        let hint = ConversationHint::Init {
+            id: "11111111-2222-4333-8444-555555555555".to_string(),
+        };
+        let parts = command_parts_for_harness_with_conversation(
+            "copilot",
+            "hello",
+            HarnessLaunchMode::NonInteractive,
+            Some(&hint),
+            None,
+            HarnessLaunchOptions::default(),
+        )?;
+        assert_eq!(
+            parts,
+            (
+                "copilot".to_string(),
+                vec![
+                    "--no-color".to_string(),
+                    "--session-id".to_string(),
+                    "11111111-2222-4333-8444-555555555555".to_string(),
+                    "--prompt=hello".to_string(),
+                ]
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn copilot_resume_hint_reuses_session_id_flag() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().unwrap();
+        // Copilot's `--resume` only binds its value as `--resume=<id>`, which
+        // the token-pair continuity form can't emit; `--session-id <id>`
+        // resumes the same session (and self-heals to a fresh session with
+        // that id when the store was wiped).
+        let hint = ConversationHint::Resume {
+            id: "11111111-2222-4333-8444-555555555555".to_string(),
+        };
+        let parts = command_parts_for_harness_with_conversation(
+            "copilot",
+            "follow up",
+            HarnessLaunchMode::NonInteractive,
+            Some(&hint),
+            None,
+            HarnessLaunchOptions::default(),
+        )?;
+        assert_eq!(
+            parts,
+            (
+                "copilot".to_string(),
+                vec![
+                    "--no-color".to_string(),
+                    "--session-id".to_string(),
+                    "11111111-2222-4333-8444-555555555555".to_string(),
+                    "--prompt=follow up".to_string(),
+                ]
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn copilot_sandbox_maps_full_and_read_only_to_argv_lists() {
+        let specs = built_in_harness_specs();
+        let copilot = specs.iter().find(|s| s.id == "copilot").unwrap();
+        assert!(copilot.supports_permission());
+        assert_eq!(
+            copilot.sandbox_args(Permission::Full),
+            vec!["--allow-all".to_string()]
+        );
+        assert_eq!(
+            copilot.sandbox_args(Permission::ReadOnly),
+            vec![
+                "--deny-tool".to_string(),
+                "write".to_string(),
+                "--deny-tool".to_string(),
+                "shell".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn copilot_launch_options_prepend_model_permission_dirs_and_effort() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().unwrap();
+        let add_dirs = vec!["/tmp/extra".to_string()];
+        let (_, args) = command_parts_for_harness_with_conversation(
+            "copilot",
+            "hi",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            None,
+            HarnessLaunchOptions {
+                model: Some("openai/gpt-5.5"),
+                speed: Some(HarnessSpeed::Fast),
+                permission: Some(Permission::ReadOnly),
+                add_dirs: &add_dirs,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(
+            args,
+            vec![
+                "--model".to_string(),
+                "gpt-5.5".to_string(),
+                "--deny-tool".to_string(),
+                "write".to_string(),
+                "--deny-tool".to_string(),
+                "shell".to_string(),
+                "--add-dir".to_string(),
+                "/tmp/extra".to_string(),
+                "--effort".to_string(),
+                "low".to_string(),
+                "--no-color".to_string(),
+                "--prompt=hi".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn copilot_identity_preamble_rides_inside_prompt_flag_value() -> anyhow::Result<()> {
+        let _guard = env_lock().lock().unwrap();
+        // Copilot has no system-prompt flag, so familiar identity is injected
+        // as a bracketed preamble inside the prompt flag's value.
+        let familiar = FamiliarContext {
+            id: "charm".to_string(),
+            display_name: "Charm".to_string(),
+            role: None,
+        };
+        let (_, args) = command_parts_for_harness_with_conversation(
+            "copilot",
+            "do the task",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            Some(&familiar),
+            HarnessLaunchOptions::default(),
+        )?;
+        let prompt_arg = args.last().expect("prompt arg present");
+        assert!(
+            prompt_arg.starts_with("--prompt=[Identity: You are Charm"),
+            "identity preamble must lead the prompt value: {prompt_arg:?}"
+        );
+        assert!(
+            prompt_arg.ends_with("do the task"),
+            "task prompt must close the prompt value: {prompt_arg:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn harness_available_returns_true_when_managed_engine_resolves() {
+        // When the managed engine is installed at the standard location,
+        // harness_available("coven-code") must return true even if "coven-code"
+        // is not on PATH.  Use a temp-dir fixture to simulate a managed install.
+        use std::io::Write;
+
+        let home = tempfile::tempdir().unwrap();
+        let engine_dir = home.path().join(".coven").join("engine").join("0.6.1");
+        fs::create_dir_all(&engine_dir).unwrap();
+        let bin = engine_dir.join(crate::engine::ENGINE_BIN_NAME);
+        let mut f = fs::File::create(&bin).unwrap();
+        f.write_all(b"#!/bin/sh\n").unwrap();
+        drop(f);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::write(home.path().join(".coven/engine/current"), "0.6.1").unwrap();
+
+        // Drive resolution deterministically on every platform via the
+        // COVEN_ENGINE_BIN override. `dirs_next::home_dir()` on Windows consults
+        // the SHGetKnownFolderPath API, which a USERPROFILE/HOME env override does
+        // not reliably change — so the managed-home path is not test-controllable
+        // cross-platform. The override exercises the same is_executable() gate and
+        // the same harness_available() code path.
+        let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _override_guard = EnvVarGuard::set("COVEN_ENGINE_BIN", &bin);
+
+        assert!(
+            harness_available("coven-code"),
+            "should be available via managed engine"
+        );
     }
 }

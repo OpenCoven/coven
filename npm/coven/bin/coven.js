@@ -14,10 +14,6 @@ const binaryName = process.platform === 'win32' ? 'coven.exe' : 'coven';
 const platformKey = `${process.platform}-${process.arch}`;
 const packageName = PLATFORM_PACKAGES[platformKey];
 
-function wrapperVersion() {
-  return require('../package.json').version;
-}
-
 function resolveBinary() {
   if (!packageName) {
     throw new Error(
@@ -42,11 +38,11 @@ try {
   process.exit(1);
 }
 
+// Delegate every argument — including a lone --version/-V — to the native
+// binary, which renders the full `coven vX (engine coven-code …, pinned …)`
+// line. (The wrapper previously short-circuited --version to its own
+// package.json version, which shadowed that output for npm installs.)
 const args = process.argv.slice(2);
-if (args.length === 1 && (args[0] === '--version' || args[0] === '-V')) {
-  console.log(wrapperVersion());
-  process.exit(0);
-}
 
 const child = spawn(binary, args, {
   stdio: 'inherit',

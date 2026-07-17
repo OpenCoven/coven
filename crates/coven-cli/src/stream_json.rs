@@ -94,15 +94,16 @@ pub struct ToolResult {
     pub session_id: String,
 }
 
-/// Raw output captured from a harness that has no native stream-json
-/// protocol (codex, external adapters). In `--stream-json` mode those
-/// harnesses run on a PTY; every captured chunk is wrapped in one `output`
-/// frame so stdout stays JSONL-only instead of interleaving raw PTY bytes
-/// with the stream (#307). `text` is the raw PTY text: it may contain ANSI
-/// escape sequences, carriage returns, and partial lines, and chunk
-/// boundaries follow PTY reads rather than line breaks. Each chunk is
-/// guaranteed valid UTF-8 (codepoints split across reads are reassembled
-/// before wrapping).
+/// Raw output captured from an external harness that has no native
+/// machine-readable protocol. In `--stream-json` mode those adapters run on a
+/// PTY; every captured chunk is wrapped in one `output` frame so stdout stays
+/// JSONL-only instead of interleaving raw PTY bytes with the stream (#307).
+/// `text` is the raw PTY text: it may contain ANSI escape sequences,
+/// carriage returns, and partial lines, and chunk boundaries follow PTY reads
+/// rather than line breaks. Each chunk is guaranteed valid UTF-8 (codepoints
+/// split across reads are reassembled before wrapping). Codex is deliberately
+/// not in this category: its `codex exec --json` frames are normalized into
+/// `assistant` events by the dedicated pipe bridge.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HarnessOutput {
     pub text: String,
@@ -116,6 +117,11 @@ pub struct RunResult {
     pub is_error: bool,
     pub num_turns: u32,
     pub session_id: String,
+    /// Harness-native conversation id, when the harness creates one. For
+    /// Codex this is the `thread_id` emitted by `codex exec --json`; it is
+    /// distinct from Coven's stable ledger `session_id` and can be supplied
+    /// back to the harness on a later resume.
+    pub harness_session_id: Option<String>,
     pub error: Option<String>,
 }
 
@@ -177,6 +183,7 @@ mod tests {
             is_error: false,
             num_turns: 1,
             session_id: "s1".into(),
+            harness_session_id: None,
             error: None,
         });
         let mut buf = Vec::new();
@@ -188,6 +195,7 @@ mod tests {
         assert_eq!(v["is_error"], false);
         assert_eq!(v["num_turns"], 1);
         assert_eq!(v["session_id"], "s1");
+        assert!(v.get("harness_session_id").is_some());
         assert!(v.get("error").is_some(), "null error field is preserved");
     }
 
@@ -331,6 +339,35 @@ mod tests {
         assert!(got.is_err(), "non-empty malformed line should error");
     }
 
+    /// Golden fixture recorded from the real coven-code engine in bidirectional
+    /// stream mode (`--print --input-format stream-json --output-format stream-json
+    /// --max-turns 1`).  Every non-blank line must deserialise to a known `Event`
+    /// variant — no enum extension was needed (the mode emits system/assistant/result
+    /// only).  Machine-specific values (cwd, session_id) were scrubbed to
+    /// `/workspace` and `fixture-session` respectively before committing.
+    #[test]
+    fn golden_engine_stream_parses_with_the_existing_parser() {
+        // The coven-code harness runs the engine in bidirectional stream mode;
+        // its output must parse with coven's Claude-compatible stream parser.
+        let raw = include_str!("../tests/fixtures/engine/basic.stream.jsonl");
+        let mut kinds = Vec::new();
+        for line in raw.lines().filter(|l| !l.trim().is_empty()) {
+            let event: Event = serde_json::from_str(line).unwrap_or_else(|e| {
+                panic!("engine stream line failed coven's parser: {e}\n  line: {line}")
+            });
+            kinds.push(event);
+        }
+        assert!(!kinds.is_empty(), "fixture must contain events");
+        assert!(
+            kinds.iter().any(|e| matches!(e, Event::System(_))),
+            "expected a system event"
+        );
+        assert!(
+            kinds.iter().any(|e| matches!(e, Event::Result(_))),
+            "expected a result event"
+        );
+    }
+
     #[test]
     fn multiple_events_stream_in_order() {
         let mut buf = Vec::new();
@@ -355,6 +392,7 @@ mod tests {
                 is_error: false,
                 num_turns: 0,
                 session_id: "s1".into(),
+                harness_session_id: None,
                 error: None,
             }),
         )

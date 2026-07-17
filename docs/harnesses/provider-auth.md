@@ -12,7 +12,7 @@ Coven supervises harness PTYs. It never reads, proxies, persists, or mints provi
 
 ## TL;DR
 
-- Provider tokens live wherever the harness already puts them — typically `~/.codex/`, `~/.config/anthropic/`, or a system keychain managed by that CLI.
+- Provider tokens live wherever the harness already puts them — typically `~/.codex/`, `~/.config/anthropic/`, `~/.copilot/`, or a system keychain managed by that CLI.
 - The Coven daemon never reads them, never stores them in SQLite, never forwards them over the socket API, and never logs them into the event ledger.
 - `coven doctor` only checks whether the harness binary exists; it does **not** test provider credentials. Each harness already ships its own `login` / `doctor` for that.
 - Treat Coven as having **zero** knowledge of provider auth state. The boundary is intentional.
@@ -35,7 +35,7 @@ flowchart LR
 The arrow that matters is the missing one: the daemon has no dotted line into the provider credential store. Three reasons:
 
 1. **Smaller blast radius.** A compromised Coven daemon, socket, or client cannot leak provider tokens it never had. A bug in event logging cannot accidentally record a token Coven never possessed.
-2. **No credential drift.** Codex, Claude Code, and future harnesses iterate on their own auth flows (OAuth refresh, device codes, on-device keys). Coven would have to chase every change. By staying out, we never get out of sync.
+2. **No credential drift.** Codex, Claude Code, Copilot CLI, and future harnesses iterate on their own auth flows (OAuth refresh, device codes, on-device keys). Coven would have to chase every change. By staying out, we never get out of sync.
 3. **Audit clarity.** When something goes wrong with billing, rate limits, or revoked tokens, the user knows the answer lives in **one** place — the harness's own CLI. Coven is not a credential layer to debug.
 
 ## What this means at each surface
@@ -62,6 +62,7 @@ Clients (CastCodes, comux, the OpenClaw plugin) connect to the local socket. The
 |---|---|---|---|
 | `codex` | `codex login` | `~/.codex/auth.json` (or platform keychain, depending on Codex version) | Use `codex logout` to revoke. Coven does not need to be restarted. |
 | `claude` | `claude doctor` then follow prompts | `~/.config/anthropic/` and/or system keychain | `claude doctor` is also a general health check; Coven only relies on the binary being present. |
+| `copilot` | `copilot login` | `~/.copilot/` (GitHub device-flow token managed by the CLI) | Use `copilot logout` to revoke. GitHub-side Copilot access is governed by your GitHub plan. |
 
 If the harness's `login` flow itself has a problem (expired refresh token, revoked org, network failure), Coven surfaces this as a normal harness exit — the session ends with whatever exit code the CLI returned, and the event log contains the error message printed by the CLI.
 

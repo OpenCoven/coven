@@ -1,0 +1,64 @@
+name: Engine bump
+
+on:
+  schedule:
+    - cron: '17 8 * * *' # daily, arbitrary minute to avoid the top-of-hour rush
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    name: Propose engine pin bump
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: true
+
+      - name: Detect latest engine release vs the pin
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          latest="$(gh release view --repo OpenCoven/coven-code --json tagName -q .tagName)"
+          latest="${latest#v}"
+          current="$(sed -n 's/^version = "\(.*\)"/\1/p' crates/coven-cli/engine.lock)"
+          echo "latest=$latest"  >> "$GITHUB_OUTPUT"
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          if [ "$latest" != "$current" ] && [ "$(printf '%s\n%s\n' "$current" "$latest" | sort -V | tail -1)" = "$latest" ]; then
+            echo "newer=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "newer=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Regenerate the pin and open a PR
+        if: steps.detect.outputs.newer == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LATEST: ${{ steps.detect.outputs.latest }}
+        run: |
+          set -euo pipefail
+          branch="engine-bump/${LATEST}"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            echo "branch $branch already exists; nothing to do"; exit 0
+          fi
+          git config user.name  "coven-bot"
+          git config user.email "coven-bot@users.noreply.github.com"
+          bash scripts/pin-engine.sh "$LATEST"
+          git checkout -b "$branch"
+          git add crates/coven-cli/engine.lock
+          # Note: this commit is unsigned — coven-bot has no signing key in CI.
+          # The commit lands on a throwaway engine-bump/* branch and is reviewed
+          # + merged by a human via GitHub. The resulting merge/squash commit is
+          # what branch protection governs; do NOT add signing config here.
+          git commit -m "chore(engine): bump pinned engine to ${LATEST}"
+          git push origin "$branch"
+          gh pr create \
+            --title "chore(engine): bump pinned engine to ${LATEST}" \
+            --body "Automated engine pin bump to \`${LATEST}\` (from the latest OpenCoven/coven-code release). The \`engine-contract\` CI job verifies this coven build drives the pinned engine. Regenerated via \`scripts/pin-engine.sh ${LATEST}\`." \
+            --base main \
+            --head "$branch"

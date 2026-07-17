@@ -13,7 +13,7 @@ This guide takes a new user from a fresh checkout or npm install to a visible pr
 
 ## What Coven is
 
-Coven is a local-first runtime for coding-agent harnesses. It runs supported CLIs such as Codex and Claude Code inside explicit project boundaries, records session metadata and events, and exposes the work through a CLI, TUI, and local socket API.
+Coven is a local-first runtime for coding-agent harnesses. It runs supported CLIs such as Codex, Claude Code, and GitHub Copilot CLI inside explicit project boundaries, records session metadata and events, and exposes the work through a CLI, TUI, and local socket API.
 
 The short promise:
 
@@ -149,6 +149,21 @@ coven sessions --plain
 coven sessions --all --plain
 coven sessions --json
 coven sessions --json --all
+```
+
+To inspect one session without attaching (unique id prefixes work):
+
+```sh
+coven sessions show <session-id>
+coven sessions events <session-id> --limit 100
+coven sessions log <session-id>
+```
+
+To see the whole coven at a glance — daemon, open sessions, familiars,
+skills, and hub — run:
+
+```sh
+coven status
 ```
 
 ## Attach, archive, summon, and sacrifice

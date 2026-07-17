@@ -1,0 +1,49 @@
+# coven-daemon.service — always-on Coven daemon for a cloud host.
+#
+# Install: /etc/systemd/system/coven-daemon.service
+# Runs `coven daemon serve` in the foreground under a dedicated, unprivileged
+# user, binding an UNAUTHENTICATED HTTP API to loopback only. The network
+# boundary is Tailscale, NOT this process — never change --tcp to a non-loopback
+# address. See cloud-host-runbook.md for the full deploy.
+
+[Unit]
+Description=Coven daemon (familiar runtime, loopback HTTP API)
+Documentation=https://github.com/OpenCoven/coven/blob/main/docs/daemon/cloud-host-runbook.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=coven
+
+# systemd creates/owns /var/lib/coven (0700) for this user on start.
+StateDirectory=coven
+StateDirectoryMode=0700
+Environment=COVEN_HOME=/var/lib/coven
+
+# The one and only daemon instance on this host. The API is unauthenticated,
+# so it MUST bind loopback. Tailscale (see runbook) fronts it for remote reach.
+# To reach it over `tailscale serve`, append `--allow-host <fqdn>.ts.net` here
+# (a `systemctl edit` drop-in is cleanest) so the loopback guard trusts the
+# proxied Tailnet hostname — see cloud-host-runbook.md step 3. The SSH-tunnel
+# path needs no change.
+ExecStart=/usr/local/bin/coven daemon serve --tcp 127.0.0.1:3000
+
+# Single-instance discipline: coven refuses to take over a healthy socket, but
+# let systemd own supervision so nothing else spawns a second `daemon serve`.
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+
+# --- Light hardening -------------------------------------------------------
+# Kept deliberately modest: a familiar runs agent workloads (PTYs, spawns
+# harnesses, writes into working repos). Aggressive sandboxing (ProtectSystem=
+# strict, SystemCallFilter, ProtectHome) WILL break those. Add more only after
+# you have confirmed your workloads still run.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+
+[Install]
+WantedBy=multi-user.target

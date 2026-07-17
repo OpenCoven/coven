@@ -6,6 +6,12 @@ read_when:
 title: "Changelog y notas de release de Coven"
 ---
 
+## Semana del 14 de julio de 2026
+
+### Nuevas funcionalidades
+
+- **GitHub Copilot CLI es un harness integrado soportado (v0.0.54).** `coven run copilot "…"` ahora lanza la GitHub Copilot CLI (`npm install -g @github/copilot`) bajo la misma supervisión PTY anclada al proyecto que Codex y Claude Code. `--permission full|read-only` se mapea a los flags nativos de Copilot (`--allow-all` / `--deny-tool write --deny-tool shell`), `--model`, `--add-dir` y `--think`/`--speed` (vía `--effort`) se reenvían de forma nativa, y `coven chat` mantiene conversaciones entre turnos mediante UUIDs preasignados con `--session-id`. Consulta [Harness de Copilot CLI](/harnesses/copilot-cli) y el [issue #381](https://github.com/OpenCoven/coven/issues/381).
+
 ## Semana del 4 de julio de 2026
 
 ### Actualizaciones

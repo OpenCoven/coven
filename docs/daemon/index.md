@@ -76,5 +76,6 @@ The daemon validates every request, even from local clients. See [Authority boun
 - [Configuration](/daemon/configuration)
 - [Auth posture](/daemon/auth-posture)
 - [Remote access](/daemon/remote-access)
+- [Cloud host runbook](/daemon/cloud-host-runbook)
 - [Logs](/daemon/logs)
 - [Diagnostics](/daemon/diagnostics)

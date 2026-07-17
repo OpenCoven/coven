@@ -65,6 +65,22 @@ struct FamiliarEntry {
     workspace: Option<String>,
 }
 
+/// Resolve the on-disk workspace (familiar home) for a familiar.
+///
+/// Prefers the explicit `workspace` path declared in familiars.toml when
+/// present; falls back to the conventional `~/.coven/familiars/<id>/` path.
+pub(crate) fn familiar_workspace(coven_home: &Path, familiar_id: &str) -> std::path::PathBuf {
+    read_familiars(coven_home)
+        .ok()
+        .and_then(|familiars| {
+            familiars
+                .into_iter()
+                .find(|f| f.id == familiar_id)
+                .and_then(|f| f.workspace)
+        })
+        .unwrap_or_else(|| coven_home.join("familiars").join(familiar_id))
+}
+
 pub fn read_familiars(coven_home: &Path) -> Result<Vec<FamiliarDto>> {
     let path = coven_home.join(FAMILIARS_CONFIG_FILE);
     let raw = match fs::read_to_string(&path) {

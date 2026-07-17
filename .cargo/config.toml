@@ -1,0 +1,5 @@
+# Fetch git dependencies with the system `git` CLI instead of libgit2 so that
+# ambient credentials (osxkeychain, gh auth, CI checkout tokens) apply. Needed
+# for the private OpenCoven/coven-threads dependency until its visibility flip.
+[net]
+git-fetch-with-cli = true

@@ -1746,6 +1746,7 @@ pub fn serve_next_tcp_connection(
     coven_home: &Path,
     status: Option<DaemonStatus>,
     runtime: &dyn SessionRuntime,
+    allowed_hosts: &[String],
 ) -> Result<()> {
     let (stream, _) = listener
         .accept()
@@ -1764,7 +1765,7 @@ pub fn serve_next_tcp_connection(
         status,
         runtime,
         Some(MAX_TCP_BODY_BYTES),
-        true,
+        HostGuard::Loopback { allowed_hosts },
     )
 }
 
@@ -2016,8 +2017,18 @@ fn acquire_serve_lock(coven_home: &Path) -> Result<std::fs::File> {
 }
 
 #[cfg(unix)]
-pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&str>) -> Result<()> {
+pub fn serve_forever(
+    coven_home: &Path,
+    started_at: String,
+    tcp_addr: Option<&str>,
+    allowed_hosts: &[String],
+) -> Result<()> {
     use std::sync::Arc;
+    // `--allow-host` only widens the TCP guard; it is meaningless without `--tcp`.
+    // Warn rather than fail so a stray flag doesn't take the daemon down.
+    if !allowed_hosts.is_empty() && tcp_addr.is_none() {
+        eprintln!("coven daemon: --allow-host has no effect without --tcp; ignoring");
+    }
     // First thing, before touching the socket or the store: take the
     // single-writer serve lock and hold it for the whole process lifetime. It
     // is the authoritative guard against two daemons writing one SQLite store —
@@ -2068,6 +2079,7 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
         let tcp_home = coven_home.to_path_buf();
         let tcp_status = status.clone();
         let tcp_runtime = Arc::clone(&runtime);
+        let tcp_allowed_hosts: Vec<String> = allowed_hosts.to_vec();
         // TCP accept errors are logged and the loop continues — misbehaving
         // network clients should not bring down the daemon. The Unix loop
         // below uses the same strategy: a single malformed local request must
@@ -2080,6 +2092,7 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
                     &tcp_home,
                     Some(tcp_status.clone()),
                     tcp_runtime.as_ref(),
+                    &tcp_allowed_hosts,
                 ) {
                     // A client hanging up mid-response is expected under SSE +
                     // polling load; don't log it or throttle the accept loop.
@@ -2174,6 +2187,16 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
     }
 }
 
+/// Whether `handle_http_stream` runs its CSRF/DNS-rebinding guard, and if so
+/// which non-loopback hosts it tolerates. The Unix socket is filesystem-gated
+/// and skips the check (`Disabled`); the TCP transport enforces loopback plus
+/// the operator's `--allow-host` allowlist (`Loopback`).
+#[derive(Clone, Copy)]
+enum HostGuard<'a> {
+    Disabled,
+    Loopback { allowed_hosts: &'a [String] },
+}
+
 fn handle_http_stream<R, W>(
     read: R,
     mut write: W,
@@ -2181,7 +2204,7 @@ fn handle_http_stream<R, W>(
     status: Option<DaemonStatus>,
     runtime: &dyn SessionRuntime,
     max_body_bytes: Option<usize>,
-    enforce_loopback_guard: bool,
+    guard: HostGuard<'_>,
 ) -> Result<()>
 where
     R: Read,
@@ -2194,12 +2217,22 @@ where
     // and DNS-rebinding: a real CLI/proxy client never sends a cross-origin
     // Origin, and a rebinding attack arrives with a non-loopback Host. The Unix
     // socket is filesystem-gated and skips this.
-    if enforce_loopback_guard {
-        if !host_is_loopback(headers.host.as_deref()) {
-            return write_forbidden(&mut write, "Host header must be a loopback address.");
+    //
+    // `allowed_hosts` (from `--allow-host`) widens the guard by an exact-match
+    // allowlist so a trusted reverse proxy — e.g. `tailscale serve`, which
+    // forwards a fixed tailnet FQDN it cannot rewrite — can reach the API. The
+    // bind stays loopback and the API stays unauthenticated; the operator is
+    // asserting an authenticated transport (Tailscale/SSH) fronts that host.
+    if let HostGuard::Loopback { allowed_hosts } = guard {
+        let host = headers.host.as_deref();
+        if !host_is_loopback(host) && !host_in_allowlist(host, allowed_hosts) {
+            return write_forbidden(
+                &mut write,
+                "Host header must be a loopback or allowed address.",
+            );
         }
         if let Some(origin) = headers.origin.as_deref() {
-            if !origin_is_loopback(origin) {
+            if !origin_is_loopback(origin) && !origin_in_allowlist(origin, allowed_hosts) {
                 return write_forbidden(&mut write, "Cross-origin requests are not allowed.");
             }
         }
@@ -2259,6 +2292,36 @@ fn host_is_loopback(host: Option<&str>) -> bool {
 fn origin_is_loopback(origin: &str) -> bool {
     match origin.trim().split_once("://") {
         Some((_scheme, rest)) => is_loopback_host(strip_port(rest)),
+        None => false,
+    }
+}
+
+/// Exact (case-insensitive, port-insensitive) match of a request `Host` against
+/// the `--allow-host` allowlist. Hostnames are case-insensitive; ports are
+/// stripped on both sides. No wildcards — a rebinding attacker must control the
+/// exact host the operator vouched for, which they cannot forge over the
+/// authenticated transport that fronts it.
+fn host_in_allowlist(host: Option<&str>, allowed: &[String]) -> bool {
+    match host {
+        Some(h) => {
+            let h = strip_port(h.trim());
+            allowed
+                .iter()
+                .any(|a| strip_port(a.trim()).eq_ignore_ascii_case(h))
+        }
+        None => false,
+    }
+}
+
+/// Same allowlist check applied to a request `Origin` (`scheme://host[:port]`).
+fn origin_in_allowlist(origin: &str, allowed: &[String]) -> bool {
+    match origin.trim().split_once("://") {
+        Some((_scheme, rest)) => {
+            let h = strip_port(rest);
+            allowed
+                .iter()
+                .any(|a| strip_port(a.trim()).eq_ignore_ascii_case(h))
+        }
         None => false,
     }
 }
@@ -2345,7 +2408,7 @@ fn serve_accepted_connection(
         status,
         runtime,
         Some(MAX_SOCKET_BODY_BYTES),
-        false,
+        HostGuard::Disabled,
     )
 }
 
@@ -2449,7 +2512,12 @@ pub(crate) fn windows_pipe_name(coven_home: &Path) -> String {
 }
 
 #[cfg(windows)]
-pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&str>) -> Result<()> {
+pub fn serve_forever(
+    coven_home: &Path,
+    started_at: String,
+    tcp_addr: Option<&str>,
+    allowed_hosts: &[String],
+) -> Result<()> {
     use interprocess::{
         local_socket::{prelude::*, GenericNamespaced, ListenerOptions},
         os::windows::local_socket::ListenerOptionsExt,
@@ -2460,6 +2528,7 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
     };
 
     let _ = tcp_addr; // TCP not wired on Windows in this prototype
+    let _ = allowed_hosts; // only meaningful on the (Unix) TCP transport
 
     let status = DaemonStatus {
         pid: std::process::id(),
@@ -2511,7 +2580,7 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
                 Some(conn_status),
                 conn_runtime.as_ref(),
                 Some(MAX_SOCKET_BODY_BYTES),
-                false,
+                HostGuard::Disabled,
             ) {
                 if !is_client_disconnect(&error) {
                     eprintln!("coven daemon: pipe connection error: {error:#}");
@@ -2536,7 +2605,7 @@ pub fn serve_forever(coven_home: &Path, started_at: String, tcp_addr: Option<&st
                     Some(conn_status),
                     conn_runtime.as_ref(),
                     Some(MAX_SOCKET_BODY_BYTES),
-                    false,
+                    HostGuard::Disabled,
                 ) {
                     if !is_client_disconnect(&error) {
                         eprintln!("coven daemon: pipe connection error: {error:#}");
@@ -2952,7 +3021,7 @@ mod tests {
             None,
             &runtime,
             None,
-            false,
+            HostGuard::Disabled,
         )
         .expect("handle ok");
         let response = String::from_utf8(output).expect("utf8");
@@ -2983,7 +3052,7 @@ mod tests {
             None,
             &runtime,
             Some(MAX_TCP_BODY_BYTES),
-            false,
+            HostGuard::Disabled,
         )
         .expect("handle ok");
         let response = String::from_utf8(output).expect("utf8");
@@ -3011,7 +3080,7 @@ mod tests {
             None,
             &NoopSessionRuntime,
             Some(MAX_TCP_BODY_BYTES),
-            true,
+            HostGuard::Loopback { allowed_hosts: &[] },
         )
         .expect("handle ok");
         let response = String::from_utf8(output).expect("utf8");
@@ -3038,7 +3107,7 @@ mod tests {
             None,
             &NoopSessionRuntime,
             Some(MAX_TCP_BODY_BYTES),
-            true,
+            HostGuard::Loopback { allowed_hosts: &[] },
         )
         .expect("handle ok");
         let response = String::from_utf8(output).expect("utf8");
@@ -3046,6 +3115,94 @@ mod tests {
             response.starts_with("HTTP/1.1 403 Forbidden"),
             "got: {response}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_http_stream_allow_host_permits_listed_host_and_origin() {
+        use crate::api::NoopSessionRuntime;
+        use std::io::Cursor;
+        let temp = tempfile::tempdir().expect("tempdir");
+        ensure_private_coven_home(temp.path()).expect("ensure home");
+        // A Tailscale-served request: the proxy forwards the tailnet FQDN as both
+        // Host and Origin. Neither is loopback, but both are on the allowlist.
+        let request = b"GET /api/v1/health HTTP/1.1\r\nHost: coven-host.taile46e90.ts.net\r\nOrigin: https://coven-host.taile46e90.ts.net\r\n\r\n";
+        let mut stream = Cursor::new(Vec::from(&request[..]));
+        let mut output: Vec<u8> = Vec::new();
+        let allowed = vec!["coven-host.taile46e90.ts.net".to_string()];
+        handle_http_stream(
+            &mut stream,
+            &mut output,
+            temp.path(),
+            None,
+            &NoopSessionRuntime,
+            Some(MAX_TCP_BODY_BYTES),
+            HostGuard::Loopback {
+                allowed_hosts: &allowed,
+            },
+        )
+        .expect("handle ok");
+        let response = String::from_utf8(output).expect("utf8");
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_http_stream_allow_host_still_blocks_unlisted_host() {
+        use crate::api::NoopSessionRuntime;
+        use std::io::Cursor;
+        let temp = tempfile::tempdir().expect("tempdir");
+        ensure_private_coven_home(temp.path()).expect("ensure home");
+        // Allowlisting one host must not open the guard for a different one.
+        let request = b"GET /api/v1/health HTTP/1.1\r\nHost: evil.example\r\n\r\n";
+        let mut stream = Cursor::new(Vec::from(&request[..]));
+        let mut output: Vec<u8> = Vec::new();
+        let allowed = vec!["coven-host.taile46e90.ts.net".to_string()];
+        handle_http_stream(
+            &mut stream,
+            &mut output,
+            temp.path(),
+            None,
+            &NoopSessionRuntime,
+            Some(MAX_TCP_BODY_BYTES),
+            HostGuard::Loopback {
+                allowed_hosts: &allowed,
+            },
+        )
+        .expect("handle ok");
+        let response = String::from_utf8(output).expect("utf8");
+        assert!(
+            response.starts_with("HTTP/1.1 403 Forbidden"),
+            "got: {response}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_and_origin_allowlist_match_is_case_and_port_insensitive() {
+        let allowed = vec!["Coven-Host.Taile46E90.TS.net".to_string()];
+        // Host: case-insensitive, and a forwarded port must not defeat the match.
+        assert!(host_in_allowlist(
+            Some("coven-host.taile46e90.ts.net:3000"),
+            &allowed
+        ));
+        assert!(host_in_allowlist(
+            Some("COVEN-HOST.TAILE46E90.TS.NET"),
+            &allowed
+        ));
+        // Origin: scheme is stripped, host compared the same way.
+        assert!(origin_in_allowlist(
+            "https://coven-host.taile46e90.ts.net",
+            &allowed
+        ));
+        // Non-members and an empty allowlist never match.
+        assert!(!host_in_allowlist(Some("evil.example"), &allowed));
+        assert!(!host_in_allowlist(
+            Some("coven-host.taile46e90.ts.net"),
+            &[]
+        ));
+        assert!(!host_in_allowlist(None, &allowed));
+        assert!(!origin_in_allowlist("https://evil.example", &allowed));
     }
 
     #[cfg(unix)]
@@ -3082,7 +3239,7 @@ mod tests {
             None,
             &NoopSessionRuntime,
             Some(MAX_TCP_BODY_BYTES),
-            true,
+            HostGuard::Loopback { allowed_hosts: &[] },
         )
         .expect("handle ok");
         let response = String::from_utf8(output).expect("utf8");
@@ -3106,7 +3263,7 @@ mod tests {
             None,
             &NoopSessionRuntime,
             None,
-            false,
+            HostGuard::Disabled,
         )
         .expect("handle ok");
         let response = String::from_utf8(output).expect("utf8");
@@ -3127,7 +3284,8 @@ mod tests {
         let coven_home = temp.path().to_path_buf();
         let server = thread::spawn(move || {
             let runtime = NoopSessionRuntime;
-            serve_next_tcp_connection(&listener, &coven_home, None, &runtime).expect("serve tcp");
+            serve_next_tcp_connection(&listener, &coven_home, None, &runtime, &[])
+                .expect("serve tcp");
         });
 
         let mut client = TcpStream::connect(addr).expect("connect");
@@ -3957,6 +4115,8 @@ mod tests {
                 familiar_id: None,
                 labels: Vec::new(),
                 visibility: "private".to_string(),
+                external: false,
+                transcript_path: None,
             },
         )?;
         let listener = bind_api_socket(temp_dir.path())?;
@@ -4122,6 +4282,8 @@ mod tests {
             familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
+            external: false,
+            transcript_path: None,
         }
     }
 
@@ -4169,7 +4331,7 @@ mod tests {
                     Some(status.clone()),
                     &runtime,
                     None,
-                    false,
+                    HostGuard::Disabled,
                 )?;
             }
             Ok::<_, anyhow::Error>(())

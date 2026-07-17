@@ -1,4 +1,4 @@
-use std::{borrow::Cow, io::Write, path::Path};
+use std::{borrow::Cow, collections::HashSet, io::Write, path::Path};
 
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -241,6 +241,14 @@ pub fn handle_request_with_runtime(
                 .trim_end_matches("/icon");
             update_familiar_icon(coven_home, id, body)
         }
+        // The Ward-enforced write path into a familiar home. Every write is
+        // adjudicated by `ward::Ward::apply` (Gates 1–2, fail-closed, audited).
+        ("POST", path) if path.starts_with("/familiars/") && path.ends_with("/edits") => {
+            let id = path
+                .trim_start_matches("/familiars/")
+                .trim_end_matches("/edits");
+            apply_familiar_edits(coven_home, id, body)
+        }
         ("GET", "/skills") => json_response(200, &crate::cockpit_sources::scan_skills(coven_home)?),
         ("GET", p) if p.starts_with("/skills/eval-loop/") && !p.ends_with("/run") => {
             let familiar_id = p.trim_start_matches("/skills/eval-loop/");
@@ -318,17 +326,24 @@ pub fn handle_request_with_runtime(
                 }
             }
         }
-        ("GET", p) if p == "/capabilities" || p.starts_with("/capabilities?") => {
-            let refresh = query.map(|q| q.contains("refresh=1")).unwrap_or(false);
-            let resp = crate::capabilities::get_all(coven_home, refresh);
-            json_response(200, &resp)
+        // Harness-native capability manifests. The bare `/capabilities` path is
+        // the control-plane catalog (matched above), so the aggregate lives at
+        // the reserved `harnesses` segment.
+        ("GET", "/capabilities/harnesses") => {
+            let refresh = query.is_some_and(|q| query_param(q, "refresh") == Some("1"));
+            json_response(200, &crate::capabilities::get_all(coven_home, refresh))
         }
         ("GET", p) if p.starts_with("/capabilities/") => {
             let harness_id = p.trim_start_matches("/capabilities/");
-            let refresh = query.map(|q| q.contains("refresh=1")).unwrap_or(false);
+            let refresh = query.is_some_and(|q| query_param(q, "refresh") == Some("1"));
             match crate::capabilities::get_one(coven_home, harness_id, refresh) {
                 Some(m) => json_response(200, &m),
-                None => json_response(404, &serde_json::json!({"error": "unknown harness"})),
+                None => api_error(
+                    404,
+                    "harness_not_found",
+                    "Harness id is not a known capability scan target.",
+                    Some(serde_json::json!({ "harnessId": harness_id })),
+                ),
             }
         }
         // Coven Calls delegation ledger
@@ -432,6 +447,11 @@ pub fn handle_request_with_runtime(
             json_response(200, &sessions)
         }
         ("POST", "/sessions") => launch_session(coven_home, body, runtime),
+        ("POST", "/sessions/external") => register_external_session(coven_home, body),
+        ("POST", path) if path.starts_with("/sessions/") && path.ends_with("/complete") => {
+            let session_id = session_action_id(path, "/complete");
+            complete_external_session(coven_home, session_id, body)
+        }
         ("POST", path) if path.starts_with("/sessions/") && path.ends_with("/input") => {
             let session_id = session_action_id(path, "/input");
             record_input(coven_home, session_id, body, runtime)
@@ -796,6 +816,8 @@ fn upload_travel_delta(coven_home: &Path, body: Option<&str>, query: &str) -> Re
             familiar_id: Some(profile.familiar_id.clone()),
             labels: vec!["travel".to_string(), "offline-delta".to_string()],
             visibility: "private".to_string(),
+            external: false,
+            transcript_path: None,
         },
     )?;
     if let Some(events) = payload.get("events").and_then(Value::as_array) {
@@ -1514,6 +1536,8 @@ fn launch_session(
         familiar_id: familiar_ctx.as_ref().map(|familiar| familiar.id.clone()),
         labels: Vec::new(),
         visibility: "private".to_string(),
+        external: false,
+        transcript_path: None,
     };
     store::insert_session(&conn, &record)?;
     if let Err(error) = runtime.launch_session(&launch) {
@@ -1545,6 +1569,117 @@ fn launch_session(
         }
     }
     json_response(201, &record)
+}
+
+fn register_external_session(coven_home: &Path, body: Option<&str>) -> Result<ApiResponse> {
+    let payload = match parse_body(body) {
+        Ok(payload) => payload,
+        Err(error) => return api_error(400, "invalid_request", &error.to_string(), None),
+    };
+    let id = match required_string(&payload, "id") {
+        Ok(id) => id,
+        Err(error) => return api_error(400, "invalid_request", &error.to_string(), None),
+    };
+    let project_root = match required_string(&payload, "projectRoot") {
+        Ok(r) => r,
+        Err(error) => return api_error(400, "invalid_request", &error.to_string(), None),
+    };
+    let harness = match required_string(&payload, "harness") {
+        Ok(h) => h,
+        Err(error) => return api_error(400, "invalid_request", &error.to_string(), None),
+    };
+    let title = payload
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("External session")
+        .to_string();
+    let transcript_path = payload
+        .get("transcriptPath")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let now = current_timestamp();
+    let record = store::SessionRecord {
+        id,
+        project_root,
+        harness,
+        title,
+        status: "running".to_string(),
+        exit_code: None,
+        archived_at: None,
+        created_at: now.clone(),
+        updated_at: now,
+        conversation_id: None,
+        familiar_id: None,
+        labels: Vec::new(),
+        visibility: "private".to_string(),
+        external: true,
+        transcript_path,
+    };
+    let conn = store::open_store(&store_path(coven_home))?;
+    // Idempotent: if a row with this id already exists, return 200 with the
+    // existing record rather than failing.
+    let inserted = store::insert_session_if_absent(&conn, &record)?;
+    let status = if inserted { 201 } else { 200 };
+    // Re-read so the response always reflects the persisted row.
+    let persisted = store::get_session(&conn, &record.id)?.unwrap_or(record);
+    // If the insert was skipped (inserted == false) and the existing row is
+    // NOT external, a daemon-managed session already holds this id — reject
+    // rather than silently aliasing it.
+    if !inserted && !persisted.external {
+        return api_error(
+            409,
+            "session_id_conflict",
+            "A daemon-managed session with this id already exists.",
+            Some(json!({ "sessionId": &persisted.id })),
+        );
+    }
+    json_response(status, &persisted)
+}
+
+fn complete_external_session(
+    coven_home: &Path,
+    session_id: &str,
+    body: Option<&str>,
+) -> Result<ApiResponse> {
+    let payload: Value = body
+        .and_then(|b| serde_json::from_str(b).ok())
+        .unwrap_or(Value::Null);
+    let exit_code: Option<i32> = payload
+        .get("exitCode")
+        .and_then(Value::as_i64)
+        .map(|c| c as i32);
+    let status = match exit_code {
+        Some(code) if code != 0 => "failed",
+        _ => "completed",
+    };
+    let conn = store::open_store(&store_path(coven_home))?;
+    match store::get_session(&conn, session_id)? {
+        None => api_error(
+            404,
+            "session_not_found",
+            "Session was not found.",
+            Some(json!({ "sessionId": session_id })),
+        ),
+        Some(session) if !session.external => api_error(
+            422,
+            "not_external_session",
+            "POST /sessions/<id>/complete is only valid for externally-registered sessions. Use POST /sessions/<id>/kill for daemon-managed sessions.",
+            Some(json!({ "sessionId": session_id })),
+        ),
+        Some(_) => {
+            store::update_session_status(
+                &conn,
+                session_id,
+                status,
+                exit_code,
+                &current_timestamp(),
+            )?;
+            let updated = store::get_session(&conn, session_id)?.expect("session vanished");
+            json_response(200, &updated)
+        }
+    }
 }
 
 fn session_launch_from_payload(payload: Value) -> Result<SessionLaunch> {
@@ -1757,6 +1892,14 @@ fn kill_session(
     if session.status != "running" {
         return session_not_live_response(session_id);
     }
+    if session.external {
+        return api_error(
+            422,
+            "external_session_not_killable",
+            "External sessions are not managed by the daemon; use POST /sessions/<id>/complete to mark them finished.",
+            Some(json!({ "sessionId": session_id })),
+        );
+    }
 
     // Same structured-error pattern as the launch + input handlers: a
     // runtime kill failure (libc::kill returning EPERM, etc.) must
@@ -1808,20 +1951,47 @@ struct OverviewDto {
 fn overview_response(coven_home: &Path) -> Result<ApiResponse> {
     let conn = store::open_store(&store_path(coven_home))?;
     let sessions = store::list_sessions(&conn)?;
-    let open_sessions = sessions
+    let open: Vec<&store::SessionRecord> = sessions
         .iter()
         .filter(|s| s.status == "running" || s.status == "active")
-        .count() as u32;
+        .collect();
+    let open_sessions = open.len() as u32;
+
+    // Dashboard semantics: a partial overview beats a 500, so unreadable
+    // side sources degrade to empty. The leaf routes (/familiars, /skills,
+    // /research) still report their own read errors loudly.
+    let familiars = crate::cockpit_sources::read_familiars(coven_home).unwrap_or_default();
+    let skills = crate::cockpit_sources::scan_skills(coven_home).unwrap_or_default();
+    let research = crate::cockpit_sources::read_research(coven_home).unwrap_or_default();
+
+    let roster: HashSet<&str> = familiars.iter().map(|f| f.id.as_str()).collect();
+    let active_familiars = open
+        .iter()
+        .filter_map(|s| s.familiar_id.as_deref())
+        .filter(|id| roster.contains(id))
+        .collect::<HashSet<_>>()
+        .len() as u32;
+
+    let average_skill_score = if skills.is_empty() {
+        0
+    } else {
+        let sum: f64 = skills.iter().map(|s| s.score).sum();
+        (sum / skills.len() as f64).round() as u32
+    };
+
     json_response(
         200,
         &OverviewDto {
-            active_familiars: 0,
-            total_familiars: 0,
+            active_familiars,
+            total_familiars: familiars.len() as u32,
             open_sessions,
-            skills_count: 0,
-            average_skill_score: 0,
-            research_iterations: 0,
-            last_research_delta: 0,
+            skills_count: skills.len() as u32,
+            average_skill_score,
+            research_iterations: research.len() as u32,
+            last_research_delta: research
+                .last()
+                .map(|row| row.delta.round() as i32)
+                .unwrap_or(0),
         },
     )
 }
@@ -1946,6 +2116,8 @@ fn ensure_cockpit_session(conn: &rusqlite::Connection) -> Result<()> {
         familiar_id: None,
         labels: Vec::new(),
         visibility: "private".to_string(),
+        external: false,
+        transcript_path: None,
     };
     store::insert_session_if_absent(conn, &record)?;
     Ok(())
@@ -2216,6 +2388,273 @@ fn update_familiar_icon(
             Some(json!({ "id": familiar_id })),
         ),
     }
+}
+
+/// `POST /familiars/{id}/edits` — the Ward-enforced write path into a familiar
+/// home.
+///
+/// The daemon is the sole write authority for familiar homes it manages, and
+/// this endpoint is deliberately the *only* daemon surface that writes
+/// arbitrary files there: every edit is adjudicated by [`crate::ward::Ward::apply`],
+/// the fail-closed Gates 1–2 + Gate 4 audit boundary. Fail-closed extends to
+/// configuration: a familiar without a `ward.toml` in its workspace cannot be
+/// written through this endpoint at all.
+///
+/// Request body:
+///
+/// ```json
+/// {
+///   "edits": [{ "target": "notes/today.md", "contents": "..." }],
+///   "principalKeyFingerprint": "optional-signing-key-fingerprint"
+/// }
+/// ```
+///
+/// Responses: `200` applied (with Gate 4 audit records), `202` held for
+/// Gate 3 coherence review (nothing written), `403` refused (nothing
+/// written), `409` no ward.toml.
+fn apply_familiar_edits(
+    coven_home: &Path,
+    familiar_id: &str,
+    body: Option<&str>,
+) -> Result<ApiResponse> {
+    use crate::ward;
+
+    if familiar_id.is_empty() || familiar_id.contains('/') {
+        return api_error(
+            400,
+            "invalid_request",
+            "Familiar id is required and must not contain '/'.",
+            None,
+        );
+    }
+    if crate::familiar_identity::resolve(coven_home, familiar_id)?.is_none() {
+        return api_error(
+            404,
+            "familiar_not_found",
+            "No familiar with that id is declared in familiars.toml.",
+            Some(json!({ "id": familiar_id })),
+        );
+    }
+    let payload = match parse_body(body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return api_error(400, "invalid_request", &error.to_string(), None);
+        }
+    };
+
+    let Some(raw_edits) = payload.get("edits").and_then(Value::as_array) else {
+        return api_error(
+            400,
+            "invalid_request",
+            "Field `edits` must be an array of { target, contents } objects.",
+            None,
+        );
+    };
+    if raw_edits.is_empty() {
+        return api_error(
+            400,
+            "invalid_request",
+            "Field `edits` must not be empty.",
+            None,
+        );
+    }
+    let mut edits = Vec::with_capacity(raw_edits.len());
+    for (index, edit) in raw_edits.iter().enumerate() {
+        let (Some(target), Some(contents)) = (
+            edit.get("target").and_then(Value::as_str),
+            edit.get("contents").and_then(Value::as_str),
+        ) else {
+            return api_error(
+                400,
+                "invalid_request",
+                "Each edit must carry string `target` and `contents` fields.",
+                Some(json!({ "index": index })),
+            );
+        };
+        edits.push(ward::FileEdit::new(target, contents.to_owned()));
+    }
+
+    let authorization = match payload.get("principalKeyFingerprint") {
+        None | Some(Value::Null) => ward::Authorization::unsigned(),
+        Some(Value::String(fingerprint)) => ward::Authorization::signed_by(fingerprint.clone()),
+        Some(_) => {
+            return api_error(
+                400,
+                "invalid_request",
+                "Field `principalKeyFingerprint` must be a string or null.",
+                None,
+            );
+        }
+    };
+
+    let workspace = crate::cockpit_sources::familiar_workspace(coven_home, familiar_id);
+    let config = match ward::WardConfig::load(&workspace) {
+        Ok(Some(config)) => config,
+        Ok(None) => {
+            return api_error(
+                409,
+                "ward_not_configured",
+                "This familiar has no ward.toml; the daemon refuses unwarded writes \
+                 into a familiar home. Declare the familiar's surface in ward.toml first.",
+                Some(json!({
+                    "id": familiar_id,
+                    "workspace": workspace.display().to_string(),
+                })),
+            );
+        }
+        Err(error) => {
+            return api_error(500, "ward_config_invalid", &format!("{error:#}"), None);
+        }
+    };
+    let ward = match ward::Ward::new(&workspace, config.clone()) {
+        Ok(ward) => ward,
+        Err(error) => {
+            return api_error(500, "ward_config_invalid", &format!("{error:#}"), None);
+        }
+    };
+
+    // The coven-threads gate (Phase 2, OpenCoven/coven-threads §5): protected
+    // (Tier 0) targets are validated against the familiar's weave — the typed
+    // authority state of each surface — before the Ward's own apply boundary.
+    // Editable-tier targets stay the Ward tiers' lane. Adjudication is pure
+    // (`Ward::evaluate`), so resolving targets here does not write anything.
+    let adjudication = ward.evaluate(&ward::Proposal {
+        targets: edits.iter().map(|e| e.target.clone()).collect(),
+        authorization: authorization.clone(),
+    });
+    // A proposal with any Blocked target (traversal/symlink escape, case
+    // collision, unauthorized Tier-0) is refused as a unit BEFORE the threads
+    // gate runs: a blocked target must never ride into a staged proposal, and
+    // 403 here matches Ward::apply's own all-or-nothing refusal shape.
+    if adjudication.is_blocked() {
+        let report = ward.apply(&edits, &authorization)?;
+        let changes: Vec<Value> = report.changes.iter().map(ward_change_json).collect();
+        return api_error(
+            403,
+            "ward_refused",
+            "The Ward refused the proposal; nothing was written.",
+            Some(json!({ "changes": changes })),
+        );
+    }
+    let gated_targets: Vec<String> = adjudication
+        .decisions
+        .iter()
+        .filter(|d| d.tier == ward::Tier::Protected && !d.verdict.is_blocked())
+        .map(|d| d.resolved.clone())
+        .collect();
+    let gate_report = {
+        let conn = store::open_store(&store_path(coven_home))?;
+        match crate::threads_gate::gate_protected_edits(
+            &conn,
+            &crate::threads_gate::GateRequest {
+                coven_home,
+                familiar_id,
+                workspace: &workspace,
+                config: &config,
+                edits: &edits,
+                gated_targets: &gated_targets,
+                authorization: &authorization,
+            },
+        ) {
+            Ok(report) => report,
+            Err(error) => {
+                // Fail closed: a gate that cannot run is a refusal, never a
+                // pass-through (RFC-0001 §5.4 Gate 4).
+                return api_error(
+                    500,
+                    "threads_gate_unavailable",
+                    &format!("The authority gate could not adjudicate the proposal: {error:#}"),
+                    None,
+                );
+            }
+        }
+    };
+    match &gate_report.outcome {
+        crate::threads_gate::GateOutcome::Rejected => {
+            return api_error(
+                403,
+                "ward_refused",
+                "The authority gate rejected the proposal; nothing was written.",
+                Some(json!({ "threadsGate": gate_report.to_json() })),
+            );
+        }
+        crate::threads_gate::GateOutcome::Staged { .. } => {
+            // §5 DegradeToProposal: staged at ~/.coven/pending/, principal
+            // notified via the pending file + audit ledger; no write happens.
+            return json_response(
+                202,
+                &json!({
+                    "ok": true,
+                    "disposition": "staged",
+                    "threadsGate": gate_report.to_json(),
+                }),
+            );
+        }
+        crate::threads_gate::GateOutcome::Permitted => {}
+    }
+
+    let report = ward.apply(&edits, &authorization)?;
+    let changes: Vec<Value> = report.changes.iter().map(ward_change_json).collect();
+    let threads_gate_json = gate_report.to_json();
+    if report.is_refused() {
+        return api_error(
+            403,
+            "ward_refused",
+            "The Ward refused the proposal; nothing was written.",
+            Some(json!({ "changes": changes, "threadsGate": threads_gate_json })),
+        );
+    }
+    if report.is_held() {
+        return json_response(
+            202,
+            &json!({
+                "ok": true,
+                "disposition": "held",
+                "changes": changes,
+                "threadsGate": threads_gate_json,
+            }),
+        );
+    }
+    json_response(
+        200,
+        &json!({
+            "ok": true,
+            "disposition": "applied",
+            "changes": changes,
+            "threadsGate": threads_gate_json,
+        }),
+    )
+}
+
+/// Serialize one Ward per-edit outcome for the `/familiars/{id}/edits` response.
+fn ward_change_json(change: &crate::ward::AppliedChange) -> Value {
+    use crate::ward::{Disposition, Verdict};
+
+    let disposition = match change.disposition {
+        Disposition::Applied => "applied",
+        Disposition::HeldForCoherence => "held",
+        Disposition::Refused => "refused",
+    };
+    let verdict = match &change.decision.verdict {
+        Verdict::Allow => json!({ "kind": "allow" }),
+        Verdict::AllowWithLog => json!({ "kind": "allowWithLog" }),
+        Verdict::RequiresCoherenceReview => json!({ "kind": "requiresCoherenceReview" }),
+        Verdict::AuthorizedProtectedChange => json!({ "kind": "authorizedProtectedChange" }),
+        Verdict::Blocked { reason } => {
+            json!({ "kind": "blocked", "reason": reason.to_string() })
+        }
+    };
+    let mut value = json!({
+        "target": change.decision.target,
+        "resolved": change.decision.resolved,
+        "tier": u8::from(change.decision.tier),
+        "verdict": verdict,
+        "disposition": disposition,
+    });
+    if let Some(audit) = &change.audit {
+        value["audit"] = serde_json::to_value(audit).unwrap_or(Value::Null);
+    }
+    value
 }
 
 pub(crate) fn parse_body(body: Option<&str>) -> Result<Value> {
@@ -3127,6 +3566,8 @@ mod tests {
                 familiar_id: None,
                 labels: Vec::new(),
                 visibility: "private".to_string(),
+                external: false,
+                transcript_path: None,
             },
         )?;
         store::insert_json_event(
@@ -3226,6 +3667,78 @@ mod tests {
     }
 
     #[test]
+    fn routes_harness_capability_aggregate_to_json() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+
+        let response = handle_request(
+            "GET",
+            "/api/v1/capabilities/harnesses",
+            temp_dir.path(),
+            None,
+        )?;
+
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains(r#""harness_capabilities""#));
+        assert!(response.body.contains(r#""coven_skills""#));
+        assert!(response.body.contains(r#""scanned_at""#));
+        for harness in ["codex", "claude", "copilot"] {
+            assert!(
+                response
+                    .body
+                    .contains(&format!(r#""harness_id":"{harness}""#)),
+                "aggregate missing manifest for `{harness}`: {}",
+                response.body
+            );
+        }
+        // The bare path stays the control-plane catalog: no harness manifests.
+        let catalog = handle_request("GET", "/api/v1/capabilities", temp_dir.path(), None)?;
+        assert!(!catalog.body.contains(r#""harness_capabilities""#));
+        Ok(())
+    }
+
+    #[test]
+    fn harness_capability_aggregate_accepts_refresh_query() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+
+        let response = handle_request(
+            "GET",
+            "/api/v1/capabilities/harnesses?refresh=1",
+            temp_dir.path(),
+            None,
+        )?;
+
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains(r#""harness_capabilities""#));
+        Ok(())
+    }
+
+    #[test]
+    fn routes_single_harness_capability_manifest() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+
+        let response = handle_request("GET", "/api/v1/capabilities/codex", temp_dir.path(), None)?;
+
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains(r#""harness_id":"codex""#));
+        assert!(response.body.contains(r#""global_instructions""#));
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_harness_capability_manifest_fails_closed_with_structured_error() -> anyhow::Result<()>
+    {
+        let temp_dir = tempfile::tempdir()?;
+
+        let response =
+            handle_request("GET", "/api/v1/capabilities/warlock", temp_dir.path(), None)?;
+
+        assert_eq!(response.status, 404);
+        assert!(response.body.contains(r#""code":"harness_not_found""#));
+        assert!(response.body.contains(r#""harnessId":"warlock""#));
+        Ok(())
+    }
+
+    #[test]
     fn malformed_control_actions_fail_closed_with_structured_json() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
 
@@ -3313,6 +3826,8 @@ mod tests {
             familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
+            external: false,
+            transcript_path: None,
         };
         crate::store::insert_session(&conn, &session)?;
 
@@ -4349,6 +4864,8 @@ mod tests {
             familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
+            external: false,
+            transcript_path: None,
         };
         crate::store::insert_session(&conn, &session)?;
         Ok(())
@@ -4654,6 +5171,8 @@ mod tests {
             familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
+            external: false,
+            transcript_path: None,
         };
         store::insert_session(&conn, &session)?;
         insert_event(&conn, home, "sess-log", "input", json!({"text": "hello"}))?;
@@ -4692,6 +5211,8 @@ mod tests {
             familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
+            external: false,
+            transcript_path: None,
         };
         store::insert_session(&conn, &session)?;
         let fake = fake_openai_key();
@@ -4735,6 +5256,8 @@ mod tests {
             familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
+            external: false,
+            transcript_path: None,
         };
         store::insert_session(&conn, &session)?;
         drop(conn);
@@ -4772,6 +5295,8 @@ mod tests {
             familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
+            external: false,
+            transcript_path: None,
         };
         store::insert_session(&conn, &session)?;
         insert_event(
@@ -4886,6 +5411,8 @@ mod tests {
             familiar_id: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
+            external: false,
+            transcript_path: None,
         };
         store::insert_session(&conn, &session)?;
         drop(conn);
@@ -4987,6 +5514,8 @@ mod tests {
                     familiar_id: None,
                     labels: Vec::new(),
                     visibility: "private".to_string(),
+                    external: false,
+                    transcript_path: None,
                 },
             )?;
         }
@@ -4998,6 +5527,93 @@ mod tests {
         assert_eq!(body["open_sessions"], 2);
         assert_eq!(body["active_familiars"], 0);
         assert_eq!(body["skills_count"], 0);
+        Ok(())
+    }
+
+    #[test]
+    fn get_overview_counts_familiars_skills_and_research_from_local_sources() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+
+        std::fs::write(
+            home.join("familiars.toml"),
+            r#"
+[[familiar]]
+id = "charm"
+display_name = "Charm"
+role = "steward"
+description = "keeps the hearth"
+
+[[familiar]]
+id = "sage"
+display_name = "Sage"
+role = "researcher"
+description = "digs deep"
+"#,
+        )?;
+
+        for skill in ["eval-loop", "stream-scribe"] {
+            let dir = home.join("skills").join(skill);
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(
+                dir.join("metadata.json"),
+                format!(r#"{{"name":"{skill}","description":"a skill","version":"1.0.0"}}"#),
+            )?;
+        }
+
+        let research_dir = home.join("research");
+        std::fs::create_dir_all(&research_dir)?;
+        std::fs::write(
+            research_dir.join("results.tsv"),
+            "1\tharness capabilities\t7.5\t1.5\tcontinue\tnotes.md\n\
+             2\tstream continuity\t9.0\t2.0\tadopt\tnotes.md\n",
+        )?;
+
+        let conn = store::open_store(&store_path(home))?;
+        let now = "2026-01-01T00:00:00Z";
+        for (id, status, familiar) in [
+            ("s1", "running", Some("charm")),
+            ("s2", "running", Some("charm")),
+            ("s3", "running", Some("ghost-not-in-roster")),
+            ("s4", "ended", Some("sage")),
+        ] {
+            store::insert_session(
+                &conn,
+                &store::SessionRecord {
+                    id: id.into(),
+                    project_root: "/tmp".into(),
+                    harness: "claude".into(),
+                    title: "t".into(),
+                    status: status.into(),
+                    exit_code: None,
+                    archived_at: None,
+                    created_at: now.into(),
+                    updated_at: now.into(),
+                    conversation_id: None,
+                    familiar_id: familiar.map(str::to_string),
+                    labels: Vec::new(),
+                    visibility: "private".to_string(),
+                    external: false,
+                    transcript_path: None,
+                },
+            )?;
+        }
+        drop(conn);
+
+        let response = handle_request("GET", "/api/v1/overview", home, None)?;
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["open_sessions"], 3);
+        assert_eq!(body["total_familiars"], 2);
+        // Only roster familiars with an open session count as active: charm
+        // (running twice, deduped); sage's session ended; the ghost id is not
+        // in the roster.
+        assert_eq!(body["active_familiars"], 1);
+        assert_eq!(body["skills_count"], 2);
+        // Skill scores are stubbed at 0.0 until scoring lands.
+        assert_eq!(body["average_skill_score"], 0);
+        assert_eq!(body["research_iterations"], 2);
+        assert_eq!(body["last_research_delta"], 2);
         Ok(())
     }
 
@@ -5238,6 +5854,355 @@ icon = "ph:leaf-fill"
         Ok(())
     }
 
+    // ---- POST /api/v1/familiars/{id}/edits (Ward write path) -------------
+
+    /// Seed a warded sage: familiars.toml plus a workspace carrying a
+    /// ward.toml with SOUL.md protected (tier 0), reviewed/ tier 1, and the
+    /// default tier 2 everywhere else. Returns the workspace path.
+    fn seed_warded_familiar(home: &Path) -> Result<std::path::PathBuf> {
+        seed_familiars_toml(home)?;
+        let workspace = home.join("familiars").join("sage");
+        std::fs::create_dir_all(&workspace)?;
+        std::fs::write(workspace.join("SOUL.md"), "# Sage\n")?;
+        std::fs::write(
+            workspace.join("ward.toml"),
+            r#"principal_key_fingerprint = "fpr-val"
+protected_surface = ["SOUL.md"]
+
+[[surface]]
+path = "SOUL.md"
+tier = 0
+
+[[surface]]
+path = "reviewed/"
+tier = 1
+"#,
+        )?;
+        Ok(workspace)
+    }
+
+    fn post_edits(home: &Path, body: &str) -> Result<ApiResponse> {
+        handle_request_with_body(
+            "POST",
+            "/api/v1/familiars/sage/edits",
+            home,
+            None,
+            Some(body),
+        )
+    }
+
+    #[test]
+    fn post_familiar_edits_applies_and_audits_tier2_write() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"notes/today.md","contents":"hello ward"}]}"#,
+        )?;
+
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["disposition"], "applied");
+        assert_eq!(body["changes"][0]["tier"], 2);
+        assert_eq!(body["changes"][0]["disposition"], "applied");
+        // Gate 4: a tier-2 write must carry a tamper-evident audit record.
+        assert!(
+            body["changes"][0]["audit"]["nextSha256"].is_string(),
+            "expected audit record, got {}",
+            body["changes"][0]
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("notes/today.md"))?,
+            "hello ward"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_refuses_traversal_and_writes_nothing() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+
+        // All-or-nothing: a clean tier-2 edit bundled with a traversal escape
+        // must not be written either.
+        let response = post_edits(
+            home,
+            r#"{"edits":[
+                {"target":"notes/ok.md","contents":"fine"},
+                {"target":"../escape.md","contents":"nope"}
+            ]}"#,
+        )?;
+
+        assert_eq!(response.status, 403, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "ward_refused");
+        assert!(!workspace.join("notes/ok.md").exists());
+        assert!(!home.join("familiars/escape.md").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_refuses_unsigned_protected_write() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"SOUL.md","contents":"new identity"}]}"#,
+        )?;
+
+        assert_eq!(response.status, 403, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "ward_refused");
+        assert_eq!(
+            body["error"]["details"]["changes"][0]["verdict"]["kind"],
+            "blocked"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("SOUL.md"))?,
+            "# Sage\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_holds_authorized_protected_write() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+
+        // Gate 1 passes, but Gate 3 (coherence) is unimplemented: held, not
+        // written — fail-closed.
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"SOUL.md","contents":"new identity"}],
+                "principalKeyFingerprint":"fpr-val"}"#,
+        )?;
+
+        assert_eq!(response.status, 202, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["disposition"], "held");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("SOUL.md"))?,
+            "# Sage\n"
+        );
+        // The coven-threads gate ran first and permitted: the verdict is in
+        // the payload and in the append-only ward_audit ledger.
+        assert_eq!(
+            body["threadsGate"]["outcome"]["kind"], "permitted",
+            "got {}",
+            response.body
+        );
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let decision: String = conn.query_row(
+            "SELECT decision FROM ward_audit WHERE familiar_id='sage' ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(decision, "permit");
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_stages_to_pending_after_out_of_band_drift() -> Result<()> {
+        // §5 of the coven-threads design (DegradeToProposal), end to end:
+        // baseline the surface, drift it outside the daemon, then propose —
+        // the write is staged at ~/.coven/pending/, the surface is untouched,
+        // and `staged` is the one additive disposition the §6 compatibility
+        // contract allows.
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+
+        // First signed request bootstraps the content baseline (held).
+        let first = post_edits(
+            home,
+            r#"{"edits":[{"target":"SOUL.md","contents":"new identity"}],
+                "principalKeyFingerprint":"fpr-val"}"#,
+        )?;
+        assert_eq!(first.status, 202, "got {}", first.body);
+
+        // Out-of-band drift: something edits SOUL.md around the daemon.
+        std::fs::write(workspace.join("SOUL.md"), "# Mallory\n")?;
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"SOUL.md","contents":"new identity v2"}],
+                "principalKeyFingerprint":"fpr-val"}"#,
+        )?;
+        assert_eq!(response.status, 202, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["disposition"], "staged");
+        assert_eq!(body["threadsGate"]["outcome"]["kind"], "staged");
+
+        let pending = body["threadsGate"]["outcome"]["pendingPath"]
+            .as_str()
+            .expect("staged outcome carries pendingPath");
+        assert!(
+            std::path::Path::new(pending).exists(),
+            "pending proposal file must exist"
+        );
+        // The staged proposal carries the full desired contents.
+        let staged: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(pending)?)?;
+        assert_eq!(staged["edits"][0]["surface"], "SOUL.md");
+        // Nothing wrote the protected surface.
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("SOUL.md"))?,
+            "# Mallory\n"
+        );
+        // The degrade decision is in the append-only ledger.
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let decision: String = conn.query_row(
+            "SELECT decision FROM ward_audit WHERE familiar_id='sage' ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(decision, "degrade_to_proposal");
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_blocked_target_refuses_even_with_drifted_surface() -> Result<()> {
+        // Review finding: a mixed proposal (drifted Tier-0 edit + traversal
+        // escape) must be refused as a unit BEFORE the threads gate can stage
+        // it — a blocked target must never ride into ~/.coven/pending/.
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+
+        // Baseline SOUL.md, then drift it so the gate would want to stage.
+        let first = post_edits(
+            home,
+            r#"{"edits":[{"target":"SOUL.md","contents":"new identity"}],
+                "principalKeyFingerprint":"fpr-val"}"#,
+        )?;
+        assert_eq!(first.status, 202, "got {}", first.body);
+        std::fs::write(workspace.join("SOUL.md"), "# Mallory\n")?;
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[
+                {"target":"SOUL.md","contents":"new identity v2"},
+                {"target":"../escape.md","contents":"nope"}
+            ], "principalKeyFingerprint":"fpr-val"}"#,
+        )?;
+        assert_eq!(response.status, 403, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "ward_refused");
+        // Nothing was staged and nothing escaped.
+        let pending = home.join("pending");
+        let staged_count = std::fs::read_dir(&pending)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(staged_count, 0, "blocked proposal must not stage");
+        assert!(!home.join("familiars/escape.md").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_editable_tier_bypasses_the_weave() -> Result<()> {
+        // Editable-tier writes are the Ward tiers' lane: the weave reports no
+        // verdicts and appends nothing to ward_audit.
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_warded_familiar(home)?;
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"notes/today.md","contents":"hello ward"}]}"#,
+        )?;
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(
+            body["threadsGate"]["verdicts"].as_array().map(Vec::len),
+            Some(0)
+        );
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM ward_audit", [], |row| row.get(0))?;
+        assert_eq!(count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_holds_tier1_write() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"reviewed/skill.md","contents":"tweak"}]}"#,
+        )?;
+
+        assert_eq!(response.status, 202, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["disposition"], "held");
+        assert_eq!(
+            body["changes"][0]["verdict"]["kind"],
+            "requiresCoherenceReview"
+        );
+        assert!(!workspace.join("reviewed/skill.md").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_fails_closed_without_ward_toml() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_familiars_toml(home)?;
+        let workspace = home.join("familiars").join("sage");
+        std::fs::create_dir_all(&workspace)?;
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"notes/today.md","contents":"hello"}]}"#,
+        )?;
+
+        assert_eq!(response.status, 409, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "ward_not_configured");
+        assert!(!workspace.join("notes/today.md").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_returns_404_for_unknown_familiar() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_familiars_toml(home)?;
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/familiars/ghost/edits",
+            home,
+            None,
+            Some(r#"{"edits":[{"target":"x.md","contents":"y"}]}"#),
+        )?;
+
+        assert_eq!(response.status, 404, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "familiar_not_found");
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_rejects_missing_edits_field() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_warded_familiar(home)?;
+
+        let response = post_edits(home, r#"{"nope":true}"#)?;
+
+        assert_eq!(response.status, 400, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "invalid_request");
+        Ok(())
+    }
+
     #[test]
     fn get_coven_calls_api_route_returns_empty_array_when_no_file() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
@@ -5265,6 +6230,280 @@ icon = "ph:leaf-fill"
         assert_eq!(response.status, 404);
         let body: serde_json::Value = serde_json::from_str(&response.body)?;
         assert_eq!(body["error"]["code"], "call_not_found");
+        Ok(())
+    }
+
+    #[test]
+    fn register_external_session_returns_201_with_external_flag() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let body = json!({
+            "id": "engine-sess-abc",
+            "projectRoot": temp.path().to_string_lossy(),
+            "harness": "engine",
+            "title": "Engine TUI session",
+            "transcriptPath": "/tmp/engine-sess-abc.jsonl"
+        })
+        .to_string();
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/external",
+            temp.path(),
+            None,
+            Some(&body),
+        )?;
+
+        assert_eq!(response.status, 201, "unexpected body: {}", response.body);
+        let record: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(record["id"], "engine-sess-abc");
+        assert_eq!(record["status"], "running");
+        assert_eq!(record["external"], true);
+        assert_eq!(record["transcript_path"], "/tmp/engine-sess-abc.jsonl");
+
+        // Verify idempotency: a second POST with the same id returns 200, not 201.
+        let response2 = handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/external",
+            temp.path(),
+            None,
+            Some(&body),
+        )?;
+        assert_eq!(
+            response2.status, 200,
+            "idempotent re-register should return 200"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn register_external_session_empty_title_defaults_to_external_session() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+
+        // Empty string title should fall back to "External session".
+        let body_empty = json!({
+            "id": "engine-sess-empty-title",
+            "projectRoot": temp.path().to_string_lossy(),
+            "harness": "engine",
+            "title": ""
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/external",
+            temp.path(),
+            None,
+            Some(&body_empty),
+        )?;
+        assert_eq!(response.status, 201, "unexpected body: {}", response.body);
+        let record: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(
+            record["title"], "External session",
+            "empty title should default to \"External session\""
+        );
+
+        // Whitespace-only title should also fall back to "External session".
+        let body_ws = json!({
+            "id": "engine-sess-ws-title",
+            "projectRoot": temp.path().to_string_lossy(),
+            "harness": "engine",
+            "title": "   "
+        })
+        .to_string();
+        let response_ws = handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/external",
+            temp.path(),
+            None,
+            Some(&body_ws),
+        )?;
+        assert_eq!(
+            response_ws.status, 201,
+            "unexpected body: {}",
+            response_ws.body
+        );
+        let record_ws: serde_json::Value = serde_json::from_str(&response_ws.body)?;
+        assert_eq!(
+            record_ws["title"], "External session",
+            "whitespace-only title should default to \"External session\""
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn complete_external_session_with_exit_0_marks_completed() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+
+        // Register the session first.
+        let reg_body = json!({
+            "id": "engine-sess-complete",
+            "projectRoot": temp.path().to_string_lossy(),
+            "harness": "engine",
+            "title": "will complete"
+        })
+        .to_string();
+        handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/external",
+            temp.path(),
+            None,
+            Some(&reg_body),
+        )?;
+
+        // Complete with exitCode 0.
+        let complete_body = json!({ "exitCode": 0 }).to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/engine-sess-complete/complete",
+            temp.path(),
+            None,
+            Some(&complete_body),
+        )?;
+
+        assert_eq!(response.status, 200, "body: {}", response.body);
+        let record: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(record["status"], "completed");
+        Ok(())
+    }
+
+    #[test]
+    fn complete_external_session_with_nonzero_exit_marks_failed() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+
+        let reg_body = json!({
+            "id": "engine-sess-fail",
+            "projectRoot": temp.path().to_string_lossy(),
+            "harness": "engine",
+            "title": "will fail"
+        })
+        .to_string();
+        handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/external",
+            temp.path(),
+            None,
+            Some(&reg_body),
+        )?;
+
+        let complete_body = json!({ "exitCode": 1 }).to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/engine-sess-fail/complete",
+            temp.path(),
+            None,
+            Some(&complete_body),
+        )?;
+
+        assert_eq!(response.status, 200, "body: {}", response.body);
+        let record: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(record["status"], "failed");
+        Ok(())
+    }
+
+    #[test]
+    fn complete_unknown_session_returns_404() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/no-such-session-id/complete",
+            temp.path(),
+            None,
+            Some(r#"{"exitCode": 0}"#),
+        )?;
+
+        assert_eq!(response.status, 404);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "session_not_found");
+        Ok(())
+    }
+
+    #[test]
+    fn kill_external_session_returns_422() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+
+        // Register an external session so it's in the store as running+external.
+        let reg_body = json!({
+            "id": "ext-kill-guard",
+            "projectRoot": temp.path().to_string_lossy(),
+            "harness": "engine",
+            "title": "external session"
+        })
+        .to_string();
+        handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/external",
+            temp.path(),
+            None,
+            Some(&reg_body),
+        )?;
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/api/v1/sessions/ext-kill-guard/kill",
+            temp.path(),
+            None,
+            None,
+            &NoopSessionRuntime,
+        )?;
+
+        assert_eq!(response.status, 422, "body: {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "external_session_not_killable");
+        assert_eq!(body["error"]["details"]["sessionId"], "ext-kill-guard");
+        Ok(())
+    }
+
+    #[test]
+    fn complete_non_external_session_returns_422() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+
+        // Insert a daemon-managed (non-external) running session.
+        insert_test_session(temp.path(), "daemon-sess")?;
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/daemon-sess/complete",
+            temp.path(),
+            None,
+            Some(r#"{"exitCode": 0}"#),
+        )?;
+
+        assert_eq!(response.status, 422, "body: {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "not_external_session");
+        assert_eq!(body["error"]["details"]["sessionId"], "daemon-sess");
+        Ok(())
+    }
+
+    #[test]
+    fn register_external_session_conflicts_with_daemon_session_returns_409() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+
+        // Insert a daemon-managed session with the id we're about to try to register.
+        insert_test_session(temp.path(), "shared-id")?;
+
+        let reg_body = json!({
+            "id": "shared-id",
+            "projectRoot": temp.path().to_string_lossy(),
+            "harness": "engine",
+            "title": "should conflict"
+        })
+        .to_string();
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/external",
+            temp.path(),
+            None,
+            Some(&reg_body),
+        )?;
+
+        assert_eq!(response.status, 409, "body: {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "session_id_conflict");
+        assert_eq!(body["error"]["details"]["sessionId"], "shared-id");
         Ok(())
     }
 }

@@ -1,11 +1,11 @@
 ---
 title: "Guía de adaptadores de harness"
-description: "La forma del adaptador de harness que Coven usa hoy, la barra para añadir nuevos harnesses y cómo Codex y Claude Code se mapean a la superficie de adaptador v0."
+description: "La forma del adaptador de harness que Coven usa hoy, la barra para añadir nuevos harnesses y cómo Codex, Claude Code y GitHub Copilot CLI se mapean a la superficie de adaptador v0."
 ---
 
 # Guía de adaptadores de harness
 
-Coven v0 soporta Codex y Claude Code. Esta guía describe la forma actual del adaptador y la barra para añadir más harnesses.
+Coven soporta Codex, Claude Code y GitHub Copilot CLI. Esta guía describe la forma actual del adaptador y la barra para añadir más harnesses.
 
 ## Forma actual del adaptador
 

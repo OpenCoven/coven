@@ -39,6 +39,7 @@ pub(crate) enum MagicalTuiAction {
     OpenTui,
     Doctor,
     DaemonStatus,
+    CovenStatus,
     RunHarness,
     PatchOpenClaw,
     Sessions,
@@ -155,6 +156,14 @@ pub(crate) fn magical_tui_items() -> &'static [MagicalTuiItem] {
             description: "See whether the local Coven daemon is awake",
             command: "coven daemon status",
             action: MagicalTuiAction::DaemonStatus,
+        },
+        MagicalTuiItem {
+            key: "s",
+            slash: "/status",
+            label: "Coven status",
+            description: "Sessions, familiars, skills, research, and hub at a glance",
+            command: "coven status",
+            action: MagicalTuiAction::CovenStatus,
         },
         MagicalTuiItem {
             key: "4",
@@ -384,7 +393,7 @@ fn dispatch_cast_plan(plan: CastPlan) -> Result<()> {
             }
         }
         CastIntent::KillSession { session_id } => {
-            let mut client = DaemonChatClient::default();
+            let mut client = DaemonChatClient::detect()?;
             client.kill_session(&session_id)?;
             CastOutcome {
                 request: request_text,
@@ -408,7 +417,7 @@ fn dispatch_cast_plan(plan: CastPlan) -> Result<()> {
             }
         }
         CastIntent::Doctor => {
-            run_doctor()?;
+            run_doctor(false)?;
             CastOutcome {
                 request: request_text,
                 launched: Some("Coven doctor".to_string()),
@@ -448,6 +457,19 @@ fn dispatch_cast_plan(plan: CastPlan) -> Result<()> {
             CastOutcome::for_request(request_text)
         }
         CastIntent::Quest { goal } => dispatch_cast_quest(&plan, &goal)?,
+        CastIntent::Observe { view } => {
+            run_observe_view(view)?;
+            CastOutcome {
+                request: request_text,
+                launched: Some(view.headline().to_string()),
+                session_id: None,
+                next_step: Some(format!(
+                    "Scriptable form: `{}` (add --json for machines)",
+                    view.command()
+                )),
+                notes: vec![],
+            }
+        }
         CastIntent::Quit => {
             let primary = theme::fg(theme::PRIMARY);
             let reset = theme::reset();
@@ -581,6 +603,8 @@ fn create_local_quest_anchor(
         familiar_id: None,
         labels: Vec::new(),
         visibility: "private".to_string(),
+        external: false,
+        transcript_path: None,
     };
     store::insert_session(&conn, &record)?;
     let harness_label = default_harness
@@ -1141,7 +1165,7 @@ fn dispatch_via_daemon(
         conversation_id: None,
     };
 
-    let mut client = DaemonChatClient::default();
+    let mut client = DaemonChatClient::detect()?;
     let session = client.launch_session(launch).with_context(|| {
         format!(
             "Cast failed to launch {} session via the daemon",
@@ -1209,6 +1233,8 @@ fn dispatch_via_local_pty(
         None,
         // permission: the cast/shell path uses the harness default.
         None,
+        // add-dirs: the cast/shell path grants no extra directories.
+        Vec::new(),
         false,
         false,
     )?;
@@ -1393,7 +1419,7 @@ fn attach_via_daemon(
     request_text: &str,
     origin: AttachOrigin,
 ) -> Result<CastOutcome> {
-    let mut client = DaemonChatClient::default();
+    let mut client = DaemonChatClient::detect()?;
     let session = client
         .get_session(session_id)
         .with_context(|| format!("Cast could not look up session `{session_id}` via the daemon"))?;
@@ -1623,8 +1649,9 @@ fn run_magical_tui_action(action: MagicalTuiAction) -> Result<()> {
         MagicalTuiAction::StartHere => run_new_user_start_here(),
         MagicalTuiAction::Help => run_tui_help(),
         MagicalTuiAction::OpenTui => run(),
-        MagicalTuiAction::Doctor => run_doctor(),
+        MagicalTuiAction::Doctor => run_doctor(false),
         MagicalTuiAction::DaemonStatus => run_daemon_command(DaemonCommand::Status { json: false }),
+        MagicalTuiAction::CovenStatus => run_observe_view(cast::ObserveView::Status),
         MagicalTuiAction::RunHarness => run_guided_harness_session(),
         MagicalTuiAction::PatchOpenClaw => {
             run_patch(None, vec![], None, None, None, false, false, true)
@@ -1859,6 +1886,16 @@ fn run_tui_help() -> Result<()> {
     println!("  /sessions");
     println!("  /attach <session-id>");
     println!("  /doctor");
+    println!("  /status · /familiars · /skills · /memory · /research · /calls · /hub");
+    Ok(())
+}
+
+/// Render a read-only observability view inline. Same single render path
+/// as the matching `coven <view>` command (`observe::view_text`), so the
+/// shell and the CLI can never disagree.
+fn run_observe_view(view: cast::ObserveView) -> Result<()> {
+    let coven_home = crate::coven_home_dir()?;
+    print!("{}", crate::observe::view_text(&coven_home, view)?);
     Ok(())
 }
 
@@ -1873,7 +1910,7 @@ fn run_new_user_start_here() -> Result<()> {
     println!("  2. coven run codex \"explain this repo in 5 bullets\"");
     println!("  3. coven sessions");
     println!("\nSetup check:\n");
-    run_doctor()
+    run_doctor(false)
 }
 
 fn run_guided_harness_session() -> Result<()> {
@@ -1904,6 +1941,8 @@ fn run_guided_harness_session() -> Result<()> {
         None,
         // permission: the cast/shell path uses the harness default.
         None,
+        // add-dirs: the cast/shell path grants no extra directories.
+        Vec::new(),
         false,
         false,
     )
