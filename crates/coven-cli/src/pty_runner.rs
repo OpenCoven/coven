@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
-use std::sync::TryLockError;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -56,60 +55,117 @@ pub struct DetachedPtyObserver {
 
 #[cfg(windows)]
 const DETACHED_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
-const TERMINAL_REPLY_QUEUE_CAPACITY: usize = 16;
+const PTY_WRITE_QUEUE_CAPACITY: usize = 16;
+enum PtyWriteRequest {
+    Write {
+        bytes: Vec<u8>,
+        flush: bool,
+        completion: Option<SyncSender<io::Result<()>>>,
+    },
+    Flush {
+        completion: SyncSender<io::Result<()>>,
+    },
+}
 
 #[derive(Clone)]
 struct SharedPtyWriter {
-    inner: Arc<Mutex<Box<dyn Write + Send>>>,
+    sender: SyncSender<PtyWriteRequest>,
 }
 
 impl Write for SharedPtyWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.inner
-            .lock()
-            .map_err(|_| io::Error::other("PTY writer lock poisoned"))?
-            .write(buf)
+        self.write_and_wait(buf, false)?;
+        Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.inner
-            .lock()
-            .map_err(|_| io::Error::other("PTY writer lock poisoned"))?
-            .flush()
+        let (completion, completed) = mpsc::sync_channel(1);
+        self.sender
+            .send(PtyWriteRequest::Flush { completion })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "PTY writer stopped"))?;
+        completed
+            .recv()
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "PTY writer stopped"))?
     }
 
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-        self.inner
-            .lock()
-            .map_err(|_| io::Error::other("PTY writer lock poisoned"))?
-            .write_all(buf)
+        self.write_and_wait(buf, false)
     }
 }
 
 impl SharedPtyWriter {
-    fn try_write_terminal_reply(&self, reply: &[u8]) -> io::Result<bool> {
-        match self.inner.try_lock() {
-            Ok(mut writer) => {
-                writer.write_all(reply)?;
-                writer.flush()?;
-                Ok(true)
-            }
-            Err(TryLockError::WouldBlock) => Ok(false),
-            Err(TryLockError::Poisoned(_)) => Err(io::Error::other("PTY writer lock poisoned")),
-        }
+    fn write_and_wait(&self, bytes: &[u8], flush: bool) -> io::Result<()> {
+        let (completion, completed) = mpsc::sync_channel(1);
+        self.sender
+            .send(PtyWriteRequest::Write {
+                bytes: bytes.to_vec(),
+                flush,
+                completion: Some(completion),
+            })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "PTY writer stopped"))?;
+        completed
+            .recv()
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "PTY writer stopped"))?
+    }
+
+    fn queue_terminal_reply(&self, reply: &'static [u8]) {
+        // The output drain must never wait for the PTY input side. All replies
+        // use this single FIFO path, preserving query order without blocking.
+        let _ = self.sender.try_send(PtyWriteRequest::Write {
+            bytes: reply.to_vec(),
+            flush: true,
+            completion: None,
+        });
     }
 }
 
-fn dispatch_terminal_reply(
-    writer: &SharedPtyWriter,
-    deferred: &SyncSender<&'static [u8]>,
-    reply: &'static [u8],
-) {
-    // Keep the output drain independent of a potentially blocked `send_input`.
-    // Uncontended replies stay on the reader thread for ConPTY compatibility;
-    // contended replies move to the bounded fallback writer without waiting.
-    if matches!(writer.try_write_terminal_reply(reply), Ok(false)) {
-        let _ = deferred.try_send(reply);
+fn spawn_shared_pty_writer(writer: Box<dyn Write + Send>) -> SharedPtyWriter {
+    let (sender, receiver) = mpsc::sync_channel(PTY_WRITE_QUEUE_CAPACITY);
+    thread::spawn(move || run_pty_writer(writer, receiver));
+    SharedPtyWriter { sender }
+}
+
+fn run_pty_writer(mut writer: Box<dyn Write + Send>, receiver: mpsc::Receiver<PtyWriteRequest>) {
+    while let Ok(request) = receiver.recv() {
+        let (result, completion) = match request {
+            PtyWriteRequest::Write {
+                bytes,
+                flush,
+                completion,
+            } => {
+                let result = if completion.is_none() {
+                    writer.write(&bytes).and_then(|written| {
+                        if written == bytes.len() {
+                            Ok(())
+                        } else {
+                            Err(io::Error::new(
+                                io::ErrorKind::WriteZero,
+                                "short terminal reply write",
+                            ))
+                        }
+                    })
+                } else {
+                    writer.write_all(&bytes)
+                }
+                .and_then(|_| if flush { writer.flush() } else { Ok(()) });
+                (result, completion)
+            }
+            PtyWriteRequest::Flush { completion } => (writer.flush(), Some(completion)),
+        };
+        let failed = result.is_err();
+        let terminal_reply = completion.is_none();
+        if let Some(completion) = completion {
+            let _ = completion.send(result);
+        }
+        if terminal_reply && !failed {
+            // ConPTY can acknowledge a tiny pipe write before its console
+            // input loop is ready for the next reply. A short writer-thread
+            // yield preserves FIFO pacing without ever delaying output drain.
+            thread::sleep(Duration::from_millis(1));
+        }
+        if failed {
+            break;
+        }
     }
 }
 
@@ -1738,24 +1794,8 @@ fn spawn_detached_with_observer_and_timeout(
         .try_clone_reader()
         .context("failed to clone PTY reader")?;
     let writer = master.take_writer().context("failed to open PTY writer")?;
-    let shared_writer = SharedPtyWriter {
-        inner: Arc::new(Mutex::new(writer)),
-    };
+    let shared_writer = spawn_shared_pty_writer(writer);
     let input: Box<dyn Write + Send> = Box::new(shared_writer.clone());
-    let (terminal_reply_tx, terminal_reply_rx) =
-        mpsc::sync_channel::<&'static [u8]>(TERMINAL_REPLY_QUEUE_CAPACITY);
-    let mut terminal_reply_writer = shared_writer.clone();
-    thread::spawn(move || {
-        while let Ok(reply) = terminal_reply_rx.recv() {
-            if terminal_reply_writer
-                .write_all(reply)
-                .and_then(|_| terminal_reply_writer.flush())
-                .is_err()
-            {
-                break;
-            }
-        }
-    });
     let killer = shared_pty_killer(child.as_ref());
     let timeout_killer = killer.clone_killer();
 
@@ -1823,9 +1863,7 @@ fn spawn_detached_with_observer_and_timeout(
                 callback(chunk);
             }
         });
-        let mut terminal_reply = |reply| {
-            dispatch_terminal_reply(&shared_writer, &terminal_reply_tx, reply);
-        };
+        let mut terminal_reply = |reply| shared_writer.queue_terminal_reply(reply);
         drain_detached_pty_output(&mut reader, &mut terminal_reply, Some(&mut bridge));
         let mut result = child_exit_rx.recv().unwrap_or(PtyRunResult {
             status: "failed",
@@ -3278,18 +3316,46 @@ exit 0
         let mut callback: Box<dyn FnMut(Vec<u8>) + Send + 'static> = Box::new(move |chunk| {
             captured_for_callback.lock().unwrap().extend(chunk);
         });
-        let writer = SharedPtyWriter {
-            inner: Arc::new(Mutex::new(Box::new(Vec::<u8>::new()))),
-        };
-        let held_writer = Arc::clone(&writer.inner);
-        let _held_guard = held_writer.lock().unwrap();
-        let (reply_tx, _reply_rx) = mpsc::sync_channel::<&'static [u8]>(1);
-        reply_tx.try_send(b"queue already full".as_slice()).unwrap();
-        let mut terminal_reply = |reply| dispatch_terminal_reply(&writer, &reply_tx, reply);
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        let writer = SharedPtyWriter { sender };
+        assert!(writer
+            .sender
+            .try_send(PtyWriteRequest::Write {
+                bytes: b"queue already full".to_vec(),
+                flush: true,
+                completion: None,
+            })
+            .is_ok());
+        let mut terminal_reply = |reply| writer.queue_terminal_reply(reply);
 
         drain_detached_pty_output(&mut reader, &mut terminal_reply, Some(&mut callback));
 
         assert_eq!(captured.lock().unwrap().as_slice(), b"beforeafter");
+    }
+
+    #[test]
+    fn terminal_replies_share_one_fifo_writer_path() -> anyhow::Result<()> {
+        struct RecordingWriter(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for RecordingWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let mut writer = spawn_shared_pty_writer(Box::new(RecordingWriter(Arc::clone(&recorded))));
+        writer.queue_terminal_reply(b"reply-a");
+        writer.queue_terminal_reply(b"reply-b");
+        writer.flush()?;
+
+        assert_eq!(recorded.lock().unwrap().as_slice(), b"reply-areply-b");
+        Ok(())
     }
 
     #[test]
