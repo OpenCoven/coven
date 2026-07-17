@@ -259,9 +259,10 @@ impl SessionRuntime for LiveSessionRuntime {
             launch.launch_mode,
             launch.conversation.as_ref(),
             familiar_ctx.as_ref(),
-            // The daemon launch path does not carry model/think/speed selection
-            // yet; `coven run` drives those foreground flags.
-            crate::harness::HarnessLaunchOptions::default(),
+            crate::harness::HarnessLaunchOptions {
+                model: launch.model.as_deref(),
+                ..Default::default()
+            },
         )?;
         let observer = self
             .coven_home
@@ -2833,6 +2834,7 @@ mod tests {
             project_root: "/tmp/x".to_string(),
             cwd: "/tmp/x".to_string(),
             harness: "codex".to_string(),
+            model: None,
             launch_mode: crate::harness::HarnessLaunchMode::Stream,
             prompt: "hello".to_string(),
             title: "stream codex (should be rejected)".to_string(),

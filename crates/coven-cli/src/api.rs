@@ -92,6 +92,10 @@ pub struct SessionLaunch {
     pub project_root: String,
     pub cwd: String,
     pub harness: String,
+    /// Optional namespaced model id (for example `openai/gpt-5.6-sol`). The
+    /// runtime keeps the provider prefix here and lets the harness adapter
+    /// normalize it for the underlying CLI.
+    pub model: Option<String>,
     pub launch_mode: HarnessLaunchMode,
     pub prompt: String,
     pub title: String,
@@ -1724,6 +1728,12 @@ fn session_launch_from_payload(payload: Value) -> Result<SessionLaunch> {
         );
     }
     let launch_mode = launch_mode_from_payload(&payload)?;
+    let model = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(ToOwned::to_owned);
     let prompt = required_string(&payload, "prompt")?;
     let title = payload
         .get("title")
@@ -1757,6 +1767,7 @@ fn session_launch_from_payload(payload: Value) -> Result<SessionLaunch> {
         project_root: canonical_project_root.to_string_lossy().into_owned(),
         cwd: canonical_cwd.to_string_lossy().into_owned(),
         harness,
+        model,
         launch_mode,
         prompt,
         title,
@@ -4280,6 +4291,7 @@ mod tests {
             "projectRoot": project_root,
             "cwd": cwd,
             "harness": "codex",
+            "model": "openai/gpt-5.6-sol",
             "prompt": "hello coven",
             "title": "Demo"
         })
@@ -4299,6 +4311,10 @@ mod tests {
         assert!(response.body.contains(r#""status":"running""#));
         assert_eq!(runtime.launches.borrow().len(), 1);
         assert_eq!(runtime.launches.borrow()[0].harness, "codex");
+        assert_eq!(
+            runtime.launches.borrow()[0].model.as_deref(),
+            Some("openai/gpt-5.6-sol")
+        );
         assert_eq!(
             runtime.launches.borrow()[0].launch_mode,
             HarnessLaunchMode::Interactive
@@ -4348,6 +4364,7 @@ mod tests {
             runtime.launches.borrow()[0].launch_mode,
             HarnessLaunchMode::NonInteractive
         );
+        assert!(runtime.launches.borrow()[0].model.is_none());
         Ok(())
     }
 
