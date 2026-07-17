@@ -481,7 +481,10 @@ fn store_baseline(
     conn.execute(
         "INSERT INTO ward_manifest (familiar_id, surface, manifest_id, entry_hash)
          VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT (familiar_id, surface) DO NOTHING",
+         ON CONFLICT (familiar_id, surface) DO UPDATE SET
+             manifest_id = excluded.manifest_id,
+             entry_hash = excluded.entry_hash,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
         params![
             familiar_id,
             surface,
@@ -491,6 +494,19 @@ fn store_baseline(
     )
     .context("storing ward_manifest baseline")?;
     Ok(())
+}
+
+pub(crate) fn advance_surface_baseline(
+    conn: &Connection,
+    familiar_id: &str,
+    workspace: &Path,
+    surface: &str,
+) -> Result<()> {
+    let manifest_id = load_or_create_manifest_id(conn, familiar_id)?;
+    let surface_id = threads::SurfaceId::new(surface.to_string());
+    let disk = read_surface(workspace, surface)?;
+    let entry_hash = threads::manifest_entry_hash(&surface_id, &disk);
+    store_baseline(conn, familiar_id, surface, &manifest_id, &entry_hash)
 }
 
 pub(crate) fn append_audit_row(
