@@ -275,10 +275,27 @@ pub fn register_node(coven_home: &Path, body: Option<&str>) -> Result<ApiRespons
             Some(serde_json::to_string(config).context("failed to serialize transport config")?)
         }
         // Preserve a previously registered dispatch config when the
-        // re-registration omits it.
-        None => existing
+        // re-registration omits it — but never re-activate a stored `local`
+        // (or unparseable) config through the API: that would let a client
+        // keep an internal-only daemon-side program dispatchable.
+        None => match existing
             .as_ref()
-            .and_then(|node| node.transport_config_json.clone()),
+            .and_then(|node| node.transport_config_json.clone())
+        {
+            Some(stored) => {
+                if !stored_transport_config_is_ssh(&stored) {
+                    return api_error(
+                        400,
+                        "invalid_request",
+                        "this node's stored transport config cannot be preserved through the \
+                         daemon API; supply a valid SSH transportConfig",
+                        None,
+                    );
+                }
+                Some(stored)
+            }
+            None => None,
+        },
     };
     let record = store::NodeRecord {
         node_id: request.node_id.clone(),
@@ -318,6 +335,15 @@ fn validate_registered_transport_config(config: &executor_node::TransportConfig)
             bail!("local transport configs cannot be registered through the daemon API")
         }
     }
+}
+
+/// Whether a stored transport config JSON parses as an SSH transport — the
+/// only kind an API re-registration may carry forward.
+fn stored_transport_config_is_ssh(stored: &str) -> bool {
+    matches!(
+        serde_json::from_str::<executor_node::TransportConfig>(stored),
+        Ok(executor_node::TransportConfig::Ssh { .. })
+    )
 }
 
 pub fn list_nodes(coven_home: &Path) -> Result<ApiResponse> {
@@ -1294,7 +1320,7 @@ mod tests {
         program: &str,
         capabilities: &str,
     ) -> anyhow::Result<(u16, serde_json::Value)> {
-        let conn = crate::store::open_store(&temp.path().join("coven.sqlite3"))?;
+        let conn = crate::store::open_store(&super::store_path(temp.path()))?;
         let now = super::current_timestamp();
         let transport_config = serde_json::json!({
             "kind": "local",
@@ -1314,6 +1340,8 @@ mod tests {
             updated_at: now,
         };
         crate::store::upsert_node(&conn, &record)?;
+        // Release the write connection before the API read opens its own.
+        drop(conn);
         get(temp, &format!("/api/v1/hub/nodes/{node_id}"))
     }
 
@@ -1373,6 +1401,49 @@ mod tests {
             &temp,
             "/api/v1/hub/nodes",
             r#"{"nodeId":"node_stationary","role":"stationary_executor","capabilities":["shell","browser"]}"#,
+        )?;
+        assert_eq!(status, 200);
+        assert_eq!(node["transportConfig"]["kind"], "ssh");
+        Ok(())
+    }
+
+    #[test]
+    fn reregistration_cannot_preserve_a_stored_local_transport() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        // Seed a node with an internal-only local transport (test seam /
+        // legacy data path — not reachable through the API).
+        let (status, node) = register_dispatchable_node(
+            &temp,
+            "node_seeded",
+            "stationary_executor",
+            "/usr/local/bin/coven",
+            r#"["shell"]"#,
+        )?;
+        assert_eq!(status, 200);
+        assert_eq!(node["transportConfig"]["kind"], "local");
+
+        // An API re-registration without transportConfig must not carry the
+        // stored local transport forward.
+        let (status, body) = post(
+            &temp,
+            "/api/v1/hub/nodes",
+            r#"{"nodeId":"node_seeded","role":"stationary_executor","capabilities":["shell"]}"#,
+        )?;
+        assert_eq!(status, 400);
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cannot be preserved through the daemon API"));
+
+        // Supplying a valid SSH transportConfig replaces the local one.
+        let (status, node) = post(
+            &temp,
+            "/api/v1/hub/nodes",
+            r#"{
+                "nodeId":"node_seeded",
+                "role":"stationary_executor",
+                "transportConfig":{"kind":"ssh","host":"executor.internal"}
+            }"#,
         )?;
         assert_eq!(status, 200);
         assert_eq!(node["transportConfig"]["kind"], "ssh");
