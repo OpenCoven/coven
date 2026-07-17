@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::{SecondsFormat, Utc};
 use clap::{Parser, Subcommand};
 use uuid::Uuid;
@@ -600,6 +600,17 @@ enum DaemonCommand {
                     interfaces or untrusted networks."
         )]
         tcp: Option<String>,
+        #[arg(
+            long = "allow-host",
+            value_name = "HOST",
+            help = "Also accept this Host/Origin header on the --tcp listener, in \
+                    addition to loopback (repeatable). For a trusted reverse proxy \
+                    that forwards a fixed hostname it cannot rewrite — e.g. a \
+                    Tailscale-served FQDN. Exact host match. The API is still \
+                    unauthenticated, so only add a host fronted by an authenticated \
+                    transport (Tailscale/SSH); the bind stays loopback."
+        )]
+        allow_host: Vec<String>,
     },
 }
 
@@ -614,6 +625,12 @@ enum EngineCommand {
     Install {
         #[arg(long, help = "Install a specific version instead of the default")]
         version: Option<String>,
+        #[arg(
+            long = "sha256",
+            value_name = "HEX",
+            help = "Expected SHA-256 of the engine archive when no built-in pin exists"
+        )]
+        sha256: Option<String>,
         #[arg(long, help = "Reinstall even if already present")]
         force: bool,
     },
@@ -1127,7 +1144,16 @@ fn prompt_and_install_engine() -> Result<Option<PathBuf>> {
     io::stdin().read_line(&mut answer)?;
     let answer = answer.trim();
     if answer.is_empty() || answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
-        let (path, _) = engine_install::install(engine::pinned_version(), false)?;
+        let (os, arch) = engine_install::current_platform()?;
+        let artifact = engine_install::artifact_name(os, arch);
+        let version = engine::pinned_version();
+        let expected_sha256 = engine::pinned_sha256(&artifact).with_context(|| {
+            format!(
+                "no pinned checksum for Coven engine {version} ({artifact}); \
+                 refusing to auto-install an unverified engine"
+            )
+        })?;
+        let (path, _) = engine_install::install(version, expected_sha256, false)?;
         Ok(Some(path))
     } else {
         Ok(None)
@@ -2346,12 +2372,48 @@ fn run_vacuum_command() -> Result<()> {
     Ok(())
 }
 
+/// Pick the archive checksum for `coven engine install`. The built-in pin is
+/// authoritative: `--sha256` only fills in when no pin exists, and a flag
+/// that contradicts a pin is an error rather than an override.
+fn resolve_install_sha256<'a>(
+    pinned: Option<&'a str>,
+    flag: Option<&'a str>,
+    version: &str,
+    artifact: &str,
+) -> Result<&'a str> {
+    match (pinned, flag) {
+        (Some(pin), Some(flag)) if !pin.eq_ignore_ascii_case(flag) => bail!(
+            "--sha256 contradicts the built-in pin for engine {version} ({artifact}): \
+             pinned {pin}, got {flag}. Drop --sha256 to install the pinned archive."
+        ),
+        (Some(pin), _) => Ok(pin),
+        (None, Some(flag)) => Ok(flag),
+        (None, None) => bail!(
+            "no pinned checksum for Coven engine {version} ({artifact}); \
+             pass --sha256 <HEX> with the archive's expected checksum"
+        ),
+    }
+}
+
 fn run_engine_command(command: EngineCommand) -> Result<()> {
     match command {
         EngineCommand::Status { json } => engine_status(json),
-        EngineCommand::Install { version, force } => {
+        EngineCommand::Install {
+            version,
+            sha256,
+            force,
+        } => {
             let version = version.unwrap_or_else(|| engine::pinned_version().to_string());
-            let (path, outcome) = engine_install::install(&version, force)?;
+            let (os, arch) = engine_install::current_platform()?;
+            let artifact = engine_install::artifact_name(os, arch);
+            // The built-in pin is only valid for the pinned version (artifact
+            // filenames are version-independent).
+            let pinned = (version == engine::pinned_version())
+                .then(|| engine::pinned_sha256(&artifact))
+                .flatten();
+            let expected_sha256 =
+                resolve_install_sha256(pinned, sha256.as_deref(), &version, &artifact)?;
+            let (path, outcome) = engine_install::install(&version, expected_sha256, force)?;
             match outcome {
                 engine_install::InstallOutcome::Installed => {
                     println!("Installed Coven engine {version} at {}", path.display());
@@ -2598,18 +2660,19 @@ fn run_daemon_command(command: DaemonCommand) -> Result<()> {
                 println!("Coven daemon: was not running");
             }
         }
-        DaemonCommand::Serve { tcp } => {
+        DaemonCommand::Serve { tcp, allow_host } => {
             #[cfg(unix)]
             {
-                daemon::serve_forever(&home, current_timestamp(), tcp.as_deref())?;
+                daemon::serve_forever(&home, current_timestamp(), tcp.as_deref(), &allow_host)?;
             }
             #[cfg(windows)]
             {
-                daemon::serve_forever(&home, current_timestamp(), tcp.as_deref())?;
+                daemon::serve_forever(&home, current_timestamp(), tcp.as_deref(), &allow_host)?;
             }
             #[cfg(not(any(unix, windows)))]
             {
                 let _ = tcp;
+                let _ = allow_host;
                 anyhow::bail!(
                     "coven daemon server is only implemented on Unix-like systems and Windows for now"
                 );
@@ -4181,6 +4244,41 @@ mod tests {
             session_title(None, prompt),
             "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUV"
         );
+    }
+
+    #[test]
+    fn install_sha256_prefers_the_built_in_pin() {
+        let pin = "a".repeat(64);
+        // Pin only.
+        assert_eq!(
+            resolve_install_sha256(Some(&pin), None, "0.6.1", "x.tar.gz").unwrap(),
+            pin
+        );
+        // Matching flag is redundant but allowed (case-insensitive).
+        assert_eq!(
+            resolve_install_sha256(Some(&pin), Some(&pin.to_uppercase()), "0.6.1", "x.tar.gz")
+                .unwrap(),
+            pin
+        );
+        // Flag fills in only when no pin exists.
+        let flag = "b".repeat(64);
+        assert_eq!(
+            resolve_install_sha256(None, Some(&flag), "0.9.9", "x.tar.gz").unwrap(),
+            flag
+        );
+    }
+
+    #[test]
+    fn install_sha256_rejects_contradiction_and_missing_pin() {
+        let pin = "a".repeat(64);
+        let flag = "b".repeat(64);
+        let err = resolve_install_sha256(Some(&pin), Some(&flag), "0.6.1", "x.tar.gz")
+            .expect_err("contradicting flag must not override the pin");
+        assert!(err.to_string().contains("contradicts the built-in pin"));
+
+        let err = resolve_install_sha256(None, None, "0.9.9", "x.tar.gz")
+            .expect_err("no pin and no flag must fail closed");
+        assert!(err.to_string().contains("pass --sha256"));
     }
 
     #[test]

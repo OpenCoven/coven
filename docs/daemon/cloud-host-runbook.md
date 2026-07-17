@@ -73,8 +73,37 @@ curl -fsSL https://tailscale.com/install.sh | sh
 sudo tailscale up --hostname coven-host
 ```
 
-Now expose the loopback API **into the Tailnet only** — the daemon stays bound
-to `127.0.0.1`; `tailscale serve` proxies to it:
+Your familiar's Tailnet address is now `coven-host.<your-tailnet>.ts.net` (find
+`<your-tailnet>` with `tailscale status --json | jq -r .Self.DNSName`).
+
+**Allow that hostname on the daemon.** The TCP API defends against DNS-rebinding
+by rejecting any request whose `Host` header is not loopback — and `tailscale
+serve` forwards the original Tailnet FQDN, which it cannot rewrite. So without
+this step the proxied request 403s with `Host header must be a loopback or
+allowed address.` Add the FQDN to the daemon's allowlist with `--allow-host` (a
+systemd drop-in keeps the shipped unit intact):
+
+```sh
+sudo systemctl edit coven-daemon
+```
+
+In the editor, set (substitute your FQDN):
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/coven daemon serve --tcp 127.0.0.1:3000 \
+  --allow-host coven-host.<your-tailnet>.ts.net
+```
+
+```sh
+sudo systemctl restart coven-daemon
+```
+
+The bind stays on `127.0.0.1` and the API stays unauthenticated — `--allow-host`
+only tells the guard to trust that one proxied hostname; Tailscale is still the
+boundary. Now expose the loopback API **into the Tailnet only** — the daemon
+stays bound to `127.0.0.1`; `tailscale serve` proxies to it:
 
 ```sh
 sudo tailscale serve --bg http://127.0.0.1:3000
@@ -89,6 +118,10 @@ curl -fsS https://coven-host.<your-tailnet>.ts.net/api/v1/health
 That URL is your familiar in the cloud. It is reachable only by devices you have
 authorized in Tailscale, over an encrypted WireGuard link, and Tailscale
 terminates TLS for you.
+
+> Prefer not to allowlist a hostname? Skip `tailscale serve` and reach the
+> daemon over an **SSH tunnel** instead — it presents `Host: 127.0.0.1`, so the
+> loopback guard passes untouched. See [Remote access](/daemon/remote-access).
 
 ## 4. Lock the public interface (backstop)
 

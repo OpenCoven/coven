@@ -1,4 +1,10 @@
-use std::{borrow::Cow, collections::HashSet, io::Write, path::Path};
+use std::{
+    borrow::Cow,
+    collections::HashSet,
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -14,7 +20,7 @@ use crate::{
     daemon::DaemonStatus,
     encrypted_artifacts::SensitiveArtifactStore,
     harness::{ConversationHint, HarnessLaunchMode},
-    privacy, project, store,
+    privacy, project, store, ward,
 };
 
 const MAX_EVENTS_LIMIT: i64 = 1_000;
@@ -248,6 +254,19 @@ pub fn handle_request_with_runtime(
                 .trim_start_matches("/familiars/")
                 .trim_end_matches("/edits");
             apply_familiar_edits(coven_home, id, body)
+        }
+        ("GET", "/threads/weaves") => threads_weaves_response(coven_home),
+        ("POST", path) if path.starts_with("/threads/proposals/") && path.ends_with("/approve") => {
+            let id = path
+                .trim_start_matches("/threads/proposals/")
+                .trim_end_matches("/approve");
+            decide_threads_proposal(coven_home, id, "approve", body)
+        }
+        ("POST", path) if path.starts_with("/threads/proposals/") && path.ends_with("/reject") => {
+            let id = path
+                .trim_start_matches("/threads/proposals/")
+                .trim_end_matches("/reject");
+            decide_threads_proposal(coven_home, id, "reject", body)
         }
         ("GET", "/skills") => json_response(200, &crate::cockpit_sources::scan_skills(coven_home)?),
         ("GET", p) if p.starts_with("/skills/eval-loop/") && !p.ends_with("/run") => {
@@ -2624,6 +2643,319 @@ fn apply_familiar_edits(
             "threadsGate": threads_gate_json,
         }),
     )
+}
+
+fn threads_weaves_response(coven_home: &Path) -> Result<ApiResponse> {
+    let conn = store::open_store(&store_path(coven_home))?;
+    let mut entries = Vec::new();
+    for familiar in crate::cockpit_sources::read_familiars(coven_home)? {
+        let workspace = crate::cockpit_sources::familiar_workspace(coven_home, &familiar.id);
+        let Some(config) = ward::WardConfig::load(&workspace)? else {
+            continue;
+        };
+        let state = crate::threads_gate::build_weave_state(
+            &conn,
+            &familiar.id,
+            &workspace,
+            &config,
+            &[],
+            false,
+        )?;
+        let coherence = state.weave.coherence();
+        let mut weave = serde_json::to_value(state.weave.to_record())
+            .context("serializing weave record for Cave threads response")?;
+        if let Some(obj) = weave.as_object_mut() {
+            obj.insert("familiar_id".to_string(), json!(familiar.id));
+        }
+        entries.push(json!({ "weave": weave, "coherence": coherence }));
+    }
+    json_response(200, &entries)
+}
+
+fn decide_threads_proposal(
+    coven_home: &Path,
+    proposal_id: &str,
+    decision: &str,
+    body: Option<&str>,
+) -> Result<ApiResponse> {
+    let proposal_uuid = match Uuid::parse_str(proposal_id) {
+        Ok(uuid) => uuid,
+        Err(_) => {
+            return json_response(
+                404,
+                &json!({ "blocked": true, "why": "proposal-not-found" }),
+            )
+        }
+    };
+    let note = match parse_body(body) {
+        Ok(payload) => match payload.get("note") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(note)) => Some(note.clone()),
+            Some(_) => {
+                return json_response(400, &json!({ "blocked": true, "why": "invalid-note" }))
+            }
+        },
+        Err(_) => return json_response(400, &json!({ "blocked": true, "why": "invalid-json" })),
+    };
+    let Some(path) = find_pending_proposal(coven_home, proposal_uuid)? else {
+        return json_response(
+            404,
+            &json!({ "blocked": true, "why": "proposal-not-found" }),
+        );
+    };
+    let pending: coven_threads_core::PendingProposal = match fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+    {
+        Some(pending) => pending,
+        None => return json_response(409, &json!({ "blocked": true, "why": "proposal-corrupt" })),
+    };
+    if pending.id.0 != proposal_uuid {
+        return json_response(409, &json!({ "blocked": true, "why": "proposal-corrupt" }));
+    }
+    let Some(familiar_id) = human_familiar_id_for_weave(coven_home, pending.familiar_id)? else {
+        return json_response(
+            409,
+            &json!({ "blocked": true, "why": "proposal-familiar-missing" }),
+        );
+    };
+    let workspace = crate::cockpit_sources::familiar_workspace(coven_home, &familiar_id);
+    let Some(config) = ward::WardConfig::load(&workspace)? else {
+        return json_response(
+            409,
+            &json!({ "blocked": true, "why": "ward-not-configured" }),
+        );
+    };
+    let authorization = authorization_from_writer(&pending.writer);
+    let edits = match staged_edits_to_ward_edits(&pending) {
+        Ok(edits) => edits,
+        Err(_) => {
+            return json_response(409, &json!({ "blocked": true, "why": "proposal-corrupt" }))
+        }
+    };
+    let targets: Vec<String> = edits.iter().map(|edit| edit.target.clone()).collect();
+    let ward = ward::Ward::new(&workspace, config.clone())?;
+    let adjudication = ward.evaluate(&ward::Proposal {
+        targets: targets.clone(),
+        authorization: authorization.clone(),
+    });
+    if adjudication.is_blocked() {
+        fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+        return json_response(
+            409,
+            &json!({ "blocked": true, "why": "proposal-revalidation-failed" }),
+        );
+    }
+    let gated_targets: Vec<String> = adjudication
+        .decisions
+        .iter()
+        .filter(|d| d.tier == ward::Tier::Protected && !d.verdict.is_blocked())
+        .map(|d| d.resolved.clone())
+        .collect();
+    if decision == "approve" && gated_targets.is_empty() {
+        fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+        return json_response(
+            409,
+            &json!({ "blocked": true, "why": "proposal-revalidation-failed" }),
+        );
+    }
+    let conn = store::open_store(&store_path(coven_home))?;
+    let state = crate::threads_gate::build_weave_state(
+        &conn,
+        &familiar_id,
+        &workspace,
+        &config,
+        &gated_targets,
+        false,
+    )?;
+
+    if decision == "reject" {
+        append_proposal_decision_audit(
+            &conn,
+            ProposalDecisionAudit {
+                event_type: coven_threads_core::AuditEventType::ProposalRejected,
+                proposal_id,
+                familiar_id: &familiar_id,
+                weave_hash: state.weave.weave_hash(),
+                approver: Some(&pending.writer),
+                files_touched: &targets,
+                decision: "rejected",
+            },
+        )?;
+        fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+        return json_response(
+            200,
+            &json!({
+                "ok": true,
+                "decision": "rejected",
+                "proposalId": proposal_id,
+                "filesTouched": targets,
+                "note": note,
+            }),
+        );
+    }
+
+    for target in &gated_targets {
+        let request = coven_threads_core::MutationRequest {
+            surface: coven_threads_core::SurfaceId::new(target.clone()),
+            writer: pending.writer.clone(),
+            channel: coven_threads_core::Channel::Mutation,
+        };
+        let verdict = coven_threads_core::validate_fail_closed(&state.weave, &request);
+        crate::threads_gate::append_audit_row(
+            &conn,
+            &familiar_id,
+            &state.familiar_uuid,
+            state.weave.weave_hash(),
+            &request,
+            &verdict,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        if !verdict.permits_write() {
+            fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+            return json_response(
+                409,
+                &json!({
+                    "blocked": true,
+                    "why": "proposal-revalidation-failed",
+                    "proposalId": proposal_id,
+                    "verdict": verdict,
+                }),
+            );
+        }
+    }
+
+    let report = ward.apply_after_threads_approval(&edits, &authorization)?;
+    if report.is_refused() {
+        fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+        return json_response(
+            409,
+            &json!({ "blocked": true, "why": "proposal-revalidation-failed" }),
+        );
+    }
+    append_proposal_decision_audit(
+        &conn,
+        ProposalDecisionAudit {
+            event_type: coven_threads_core::AuditEventType::ProposalApproved,
+            proposal_id,
+            familiar_id: &familiar_id,
+            weave_hash: state.weave.weave_hash(),
+            approver: Some(&pending.writer),
+            files_touched: &targets,
+            decision: "approved",
+        },
+    )?;
+    fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+    json_response(
+        200,
+        &json!({
+            "ok": true,
+            "decision": "approved",
+            "proposalId": proposal_id,
+            "filesTouched": targets,
+            "note": note,
+        }),
+    )
+}
+
+fn find_pending_proposal(coven_home: &Path, proposal_id: Uuid) -> Result<Option<PathBuf>> {
+    let pending_dir = coven_home.join("pending");
+    let entries = match fs::read_dir(&pending_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("reading {}", pending_dir.display())),
+    };
+    let needle = proposal_id.to_string();
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.contains(&needle) {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+fn human_familiar_id_for_weave(
+    coven_home: &Path,
+    familiar_uuid: coven_threads_core::FamiliarId,
+) -> Result<Option<String>> {
+    for familiar in crate::cockpit_sources::read_familiars(coven_home)? {
+        if crate::threads_gate::familiar_weave_id(&familiar.id) == familiar_uuid {
+            return Ok(Some(familiar.id));
+        }
+    }
+    Ok(None)
+}
+
+fn authorization_from_writer(writer: &coven_threads_core::WriterId) -> ward::Authorization {
+    writer
+        .as_str()
+        .strip_prefix("principal:")
+        .map(|fp| ward::Authorization::signed_by(fp.to_string()))
+        .unwrap_or_else(ward::Authorization::unsigned)
+}
+
+fn staged_edits_to_ward_edits(
+    pending: &coven_threads_core::PendingProposal,
+) -> Result<Vec<ward::FileEdit>> {
+    pending
+        .edits
+        .iter()
+        .map(|edit| {
+            let bytes = edit
+                .contents
+                .to_bytes()
+                .map_err(|err| anyhow::anyhow!("decoding staged contents: {err}"))?;
+            let contents = String::from_utf8(bytes)
+                .context("staged proposal contents are not utf8; Ward FileEdit is text-only")?;
+            Ok(ward::FileEdit::new(edit.surface.as_str(), contents))
+        })
+        .collect()
+}
+
+struct ProposalDecisionAudit<'a> {
+    event_type: coven_threads_core::AuditEventType,
+    proposal_id: &'a str,
+    familiar_id: &'a str,
+    weave_hash: &'a [u8],
+    approver: Option<&'a coven_threads_core::WriterId>,
+    files_touched: &'a [String],
+    decision: &'a str,
+}
+
+fn append_proposal_decision_audit(
+    conn: &rusqlite::Connection,
+    audit: ProposalDecisionAudit<'_>,
+) -> Result<()> {
+    let files_touched = serde_json::to_string(audit.files_touched)?;
+    let now =
+        time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
+    conn.execute(
+        "INSERT INTO ward_audit (
+            event_type, proposal_id, familiar_id, ward_version, ward_hash,
+            tier, decision, approver, diff_hash, files_touched, channel,
+            thread_id, submitted_at, decided_at
+        ) VALUES (?1, ?2, ?3, NULL, ?4, NULL, ?5, ?6, NULL, ?7, ?8, NULL, ?9, ?9)",
+        rusqlite::params![
+            audit.event_type.tag(),
+            audit.proposal_id,
+            audit.familiar_id,
+            audit.weave_hash,
+            audit.decision,
+            audit.approver.map(|w| w.as_str().to_string()),
+            files_touched,
+            format!("{:?}", coven_threads_core::Channel::Mutation).to_lowercase(),
+            now,
+        ],
+    )
+    .context("appending proposal decision to ward_audit")?;
+    Ok(())
 }
 
 /// Serialize one Ward per-edit outcome for the `/familiars/{id}/edits` response.
@@ -6124,6 +6456,249 @@ tier = 1
         let conn = store::open_store(&home.join("coven.sqlite3"))?;
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM ward_audit", [], |row| row.get(0))?;
         assert_eq!(count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn threads_weaves_returns_cave_normalizable_weave_entries() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_warded_familiar(home)?;
+
+        let baseline = post_edits(
+            home,
+            r#"{"edits":[{"target":"SOUL.md","contents":"new identity"}],
+                "principalKeyFingerprint":"fpr-val"}"#,
+        )?;
+        assert_eq!(baseline.status, 202, "got {}", baseline.body);
+
+        let response = handle_request("GET", "/api/v1/threads/weaves", home, None)?;
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        let entries = body.as_array().expect("daemon returns a raw entry array");
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry["coherence"], "Coherent");
+        assert_eq!(entry["weave"]["familiar_id"], "sage");
+        assert!(entry["weave"]["id"].is_string());
+        assert!(entry["weave"]["weave_hash"]
+            .as_array()
+            .is_some_and(|v| !v.is_empty()));
+        assert_eq!(entry["weave"]["threads"][0]["surface"], "SOUL.md");
+        assert_eq!(entry["weave"]["threads"][0]["writer"], "principal:fpr-val");
+        assert_eq!(entry["weave"]["threads"][0]["tension"], "Holds");
+        assert!(entry["weave"]["threads"][0]["created_at"].is_array());
+        assert!(entry["weave"]["threads"][0]["strands"]
+            .as_array()
+            .is_some_and(|v| !v.is_empty()));
+        assert!(entry["weave"]["pattern_descriptor"]["name"].is_string());
+        Ok(())
+    }
+
+    fn stage_pending_protected_edit(home: &Path) -> Result<(std::path::PathBuf, String)> {
+        let workspace = seed_warded_familiar(home)?;
+        let baseline = post_edits(
+            home,
+            r#"{"edits":[{"target":"SOUL.md","contents":"new identity"}],
+                "principalKeyFingerprint":"fpr-val"}"#,
+        )?;
+        assert_eq!(baseline.status, 202, "got {}", baseline.body);
+        std::fs::write(workspace.join("SOUL.md"), "# Mallory\n")?;
+        let staged = post_edits(
+            home,
+            r#"{"edits":[{"target":"SOUL.md","contents":"approved identity"}],
+                "principalKeyFingerprint":"fpr-val"}"#,
+        )?;
+        assert_eq!(staged.status, 202, "got {}", staged.body);
+        let body: serde_json::Value = serde_json::from_str(&staged.body)?;
+        let pending = std::path::PathBuf::from(
+            body["threadsGate"]["outcome"]["pendingPath"]
+                .as_str()
+                .expect("staged response carries pendingPath"),
+        );
+        let proposal_id = body["threadsGate"]["outcome"]["proposalId"]
+            .as_str()
+            .expect("staged response carries proposalId")
+            .to_string();
+        Ok((pending, proposal_id))
+    }
+
+    #[test]
+    fn threads_approve_revalidates_applies_audits_and_removes_pending() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id) = stage_pending_protected_edit(home)?;
+        let workspace = home.join("familiars").join("sage");
+        std::fs::write(workspace.join("SOUL.md"), "# Sage\n")?;
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(r#"{"note":"principal reviewed"}"#),
+        )?;
+
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["decision"], "approved");
+        assert_eq!(body["proposalId"], proposal_id);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("SOUL.md"))?,
+            "approved identity"
+        );
+        assert!(!pending.exists(), "approved proposal must be removed");
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let event_type: String = conn.query_row(
+            "SELECT event_type FROM ward_audit WHERE proposal_id = ?1 ORDER BY id DESC LIMIT 1",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(event_type, "proposal_approved");
+        Ok(())
+    }
+
+    #[test]
+    fn threads_approve_drifted_staged_write_refuses_without_applying() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id) = stage_pending_protected_edit(home)?;
+        let workspace = home.join("familiars").join("sage");
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+
+        assert_eq!(response.status, 409, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["blocked"], true);
+        assert_eq!(body["why"], "proposal-revalidation-failed");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("SOUL.md"))?,
+            "# Mallory\n"
+        );
+        assert!(
+            !pending.exists(),
+            "valid refused proposal decision is final"
+        );
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let approved_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit WHERE event_type='proposal_approved' AND proposal_id = ?1",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(approved_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn threads_reject_audits_removes_pending_and_does_not_apply() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id) = stage_pending_protected_edit(home)?;
+        let workspace = home.join("familiars").join("sage");
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/reject"),
+            home,
+            None,
+            Some(r#"{"note":"not this change"}"#),
+        )?;
+
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["decision"], "rejected");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("SOUL.md"))?,
+            "# Mallory\n"
+        );
+        assert!(!pending.exists(), "rejected proposal must be removed");
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let event_type: String = conn.query_row(
+            "SELECT event_type FROM ward_audit WHERE proposal_id = ?1 ORDER BY id DESC LIMIT 1",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(event_type, "proposal_rejected");
+        Ok(())
+    }
+
+    #[test]
+    fn threads_decision_preserves_ward_audit_append_only() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (_pending, proposal_id) = stage_pending_protected_edit(home)?;
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/reject"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+        assert_eq!(response.status, 200, "got {}", response.body);
+
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let update = conn.execute(
+            "UPDATE ward_audit SET decision = 'tampered' WHERE proposal_id = ?1",
+            [&proposal_id],
+        );
+        assert!(update.is_err(), "UPDATE must abort on ward_audit");
+        let delete = conn.execute(
+            "DELETE FROM ward_audit WHERE proposal_id = ?1",
+            [&proposal_id],
+        );
+        assert!(delete.is_err(), "DELETE must abort on ward_audit");
+        Ok(())
+    }
+
+    #[test]
+    fn threads_decision_corrupt_pending_blocks_and_keeps_file() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let pending_dir = home.join("pending");
+        std::fs::create_dir_all(&pending_dir)?;
+        let proposal_id = uuid::Uuid::new_v4().to_string();
+        let file = pending_dir.join(format!("{}-{proposal_id}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&file, "{not json")?;
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+
+        assert_eq!(response.status, 409, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["blocked"], true);
+        assert_eq!(body["why"], "proposal-corrupt");
+        assert!(file.exists(), "corrupt proposal must remain for inspection");
+        Ok(())
+    }
+
+    #[test]
+    fn threads_decision_unknown_proposal_fails_closed() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{}/reject", uuid::Uuid::new_v4()),
+            home,
+            None,
+            Some("{}"),
+        )?;
+
+        assert_eq!(response.status, 404, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["blocked"], true);
+        assert_eq!(body["why"], "proposal-not-found");
         Ok(())
     }
 

@@ -81,10 +81,14 @@ impl Drop for ScratchGuard {
 
 /// Download, verify, extract, and activate the engine. Returns the installed
 /// binary path and whether it was freshly installed or already present.
-/// The checksum is looked up from the pinned lock for the pinned version;
-/// installing a non-pinned version skips verification with a loud warning
-/// (dev mode).
-pub fn install(version: &str, force: bool) -> Result<(PathBuf, InstallOutcome)> {
+/// `expected_sha256` is the sha256 of the ARCHIVE and is required: archives
+/// are never extracted or activated without a caller-provided or built-in
+/// pin (see `engine::pinned_sha256` and the `--sha256` install flag).
+pub fn install(
+    version: &str,
+    expected_sha256: &str,
+    force: bool,
+) -> Result<(PathBuf, InstallOutcome)> {
     let home = dirs_next::home_dir().context("cannot determine home directory")?;
     let engine_root = crate::paths::managed_engine_root(&home);
     let dest_dir = engine_root.join(version);
@@ -95,14 +99,6 @@ pub fn install(version: &str, force: bool) -> Result<(PathBuf, InstallOutcome)> 
     }
     let (os, arch) = current_platform()?;
     let artifact = artifact_name(os, arch);
-    // The pinned checksum is only valid for the pinned version (artifact
-    // filenames are version-independent, so a different version's archive
-    // would legitimately differ). Installing a non-pinned version is dev mode.
-    let expected_sha256 = if version == crate::engine::pinned_version() {
-        crate::engine::pinned_sha256(&artifact)
-    } else {
-        None
-    };
     let url = release_url(version, &artifact);
 
     std::fs::create_dir_all(&dest_dir)
@@ -124,19 +120,16 @@ pub fn install(version: &str, force: bool) -> Result<(PathBuf, InstallOutcome)> 
     }
 
     // 2. Verify the ARCHIVE checksum BEFORE extraction (fail closed).
+    if !is_sha256_hex(expected_sha256) {
+        bail!("invalid sha256 pin for {artifact}: expected 64 hexadecimal characters");
+    }
     let bytes = std::fs::read(&archive)
         .with_context(|| format!("reading downloaded archive {}", archive.display()))?;
     let digest = hex_digest(&bytes);
-    match expected_sha256 {
-        Some(expected) if !digest.eq_ignore_ascii_case(expected) => {
-            bail!(
-                "checksum mismatch for {artifact}: expected {expected}, got {digest}. Refusing to install."
-            );
-        }
-        None => eprintln!(
-            "warning: no pinned checksum for {artifact}; installing unverified (dev mode)"
-        ),
-        _ => {}
+    if !digest.eq_ignore_ascii_case(expected_sha256) {
+        bail!(
+            "checksum mismatch for {artifact}: expected {expected_sha256}, got {digest}. Refusing to install."
+        );
     }
 
     // `.stage` is a fixed per-version path; concurrent `install` of the SAME
@@ -202,6 +195,10 @@ fn hex_digest(bytes: &[u8]) -> String {
         .collect()
 }
 
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,5 +231,16 @@ mod tests {
             release_url("0.6.1", "coven-code-macos-aarch64.tar.gz"),
             "https://github.com/OpenCoven/coven-code/releases/download/v0.6.1/coven-code-macos-aarch64.tar.gz"
         );
+    }
+
+    #[test]
+    fn sha256_pin_validation_requires_full_hex_digest() {
+        assert!(is_sha256_hex(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        ));
+        assert!(!is_sha256_hex("abc"));
+        assert!(!is_sha256_hex(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg"
+        ));
     }
 }

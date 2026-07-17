@@ -716,6 +716,53 @@ impl Ward {
         }
         Ok(ApplyReport { changes })
     }
+
+    /// Apply edits after an explicit principal proposal approval has cleared the
+    /// daemon-side threads replay. Gate 1 and Gate 2 still run here; Gate 3's
+    /// "held for review" state is the decision this endpoint represents.
+    pub(crate) fn apply_after_threads_approval(
+        &self,
+        edits: &[FileEdit],
+        authorization: &Authorization,
+    ) -> Result<ApplyReport> {
+        let proposal = Proposal {
+            targets: edits.iter().map(|e| e.target.clone()).collect(),
+            authorization: authorization.clone(),
+        };
+        let outcome = self.evaluate(&proposal);
+        if outcome.is_blocked() {
+            let changes = outcome
+                .decisions
+                .into_iter()
+                .map(|decision| AppliedChange {
+                    disposition: if decision.verdict.is_blocked() {
+                        Disposition::Refused
+                    } else {
+                        Disposition::HeldForCoherence
+                    },
+                    decision,
+                    audit: None,
+                })
+                .collect();
+            return Ok(ApplyReport { changes });
+        }
+
+        let canonical_home = self
+            .home
+            .canonicalize()
+            .with_context(|| format!("ward home `{}` is not resolvable", self.home.display()))?;
+        let mut changes = Vec::with_capacity(edits.len());
+        for (edit, decision) in edits.iter().zip(outcome.decisions) {
+            let abs = join_resolved(&canonical_home, &decision.resolved);
+            let audit = write_atomic(&canonical_home, &abs, &edit.new_contents, &decision)?;
+            changes.push(AppliedChange {
+                decision,
+                disposition: Disposition::Applied,
+                audit,
+            });
+        }
+        Ok(ApplyReport { changes })
+    }
 }
 
 /// Whether a verdict needs Gate 3 coherence review before it can be applied.

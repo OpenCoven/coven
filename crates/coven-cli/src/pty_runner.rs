@@ -558,13 +558,15 @@ impl CodexProcessTree {
                 // A Job Object can be unavailable when a parent policy forbids
                 // assignment. Fall back to Windows' documented tree kill for
                 // npm's cmd.exe -> node.exe -> codex.exe chain.
-                let pid = self.pid.to_string();
-                let _ = std::process::Command::new("taskkill")
-                    .args(["/PID", &pid, "/T", "/F"])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
+                if let Some(taskkill) = trusted_windows_taskkill_path() {
+                    let pid = self.pid.to_string();
+                    let _ = std::process::Command::new(taskkill)
+                        .args(["/PID", &pid, "/T", "/F"])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                }
             }
         }
         let _ = child.kill();
@@ -599,6 +601,34 @@ impl Drop for CodexProcessTree {
             unsafe { windows_sys::Win32::Foundation::CloseHandle(job) };
         }
     }
+}
+
+#[cfg(windows)]
+fn trusted_windows_taskkill_path() -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+    let mut buffer = vec![0u16; 260];
+    let len = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+    if len == 0 {
+        return None;
+    }
+    let len = len as usize;
+    if len >= buffer.len() {
+        buffer.resize(len + 1, 0);
+        let len = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+        if len == 0 || len as usize >= buffer.len() {
+            return None;
+        }
+        buffer.truncate(len as usize);
+    } else {
+        buffer.truncate(len);
+    }
+
+    let path = PathBuf::from(std::ffi::OsString::from_wide(&buffer)).join("taskkill.exe");
+    // A missing binary (or an unexpected system directory) must surface as
+    // "no trusted taskkill" rather than a silently ignored spawn failure.
+    path.is_file().then_some(path)
 }
 
 #[cfg(windows)]
