@@ -144,6 +144,12 @@ pub struct GateRequest<'a> {
     pub authorization: &'a ward::Authorization,
 }
 
+/// The daemon's current weave state for one familiar, as used by the validator.
+pub(crate) struct WeaveState {
+    pub familiar_uuid: threads::FamiliarId,
+    pub weave: threads::Weave,
+}
+
 /// Gate a proposal's protected targets through the coven-threads weave.
 pub fn gate_protected_edits(conn: &Connection, req: &GateRequest<'_>) -> Result<GateReport> {
     let GateRequest {
@@ -162,23 +168,96 @@ pub fn gate_protected_edits(conn: &Connection, req: &GateRequest<'_>) -> Result<
         });
     }
 
-    let familiar_uuid = familiar_weave_id(familiar_id);
-    let principal_writer =
-        threads::WriterId::new(format!("principal:{}", config.principal_key_fingerprint));
     let request_writer = match &authorization.principal_signature_fingerprint {
         Some(fp) => threads::WriterId::new(format!("principal:{fp}")),
         None => threads::WriterId::new("client:unsigned"),
     };
+    let now = time::OffsetDateTime::now_utc();
+    let state = build_weave_state(conn, familiar_id, workspace, config, gated_targets, true)?;
+    let familiar_uuid = state.familiar_uuid;
+    let weave = state.weave;
+
+    // Validate every gated target; audit every verdict (RFC-0001 §5.6).
+    let mut verdicts = Vec::with_capacity(gated_targets.len());
+    let mut degraded: Option<(threads::ThreadId, threads::FrayOrSnap)> = None;
+    let mut rejected = false;
+    for target in gated_targets {
+        let request = threads::MutationRequest {
+            surface: threads::SurfaceId::new(target.clone()),
+            writer: request_writer.clone(),
+            channel: threads::Channel::Mutation,
+        };
+        let verdict = threads::validate_fail_closed(&weave, &request);
+        append_audit_row(
+            conn,
+            familiar_id,
+            &familiar_uuid,
+            weave.weave_hash(),
+            &request,
+            &verdict,
+            now,
+        )?;
+        match &verdict {
+            threads::Verdict::Reject { .. } => rejected = true,
+            threads::Verdict::DegradeToProposal { thread, fray } => {
+                degraded.get_or_insert((*thread, fray.clone()));
+            }
+            threads::Verdict::Permit { .. } => {}
+        }
+        verdicts.push((target.clone(), verdict));
+    }
+
+    // Unit semantics (§5 + the Ward's own all-or-nothing rule): any Reject
+    // refuses the proposal; otherwise any fray stages the whole proposal.
+    let outcome = if rejected {
+        GateOutcome::Rejected
+    } else if let Some((thread_id, fray)) = degraded {
+        let (pending_path, proposal_id) = stage_pending_proposal(
+            coven_home,
+            &familiar_uuid,
+            &request_writer,
+            thread_id,
+            fray,
+            edits,
+            now,
+        )?;
+        GateOutcome::Staged {
+            pending_path,
+            proposal_id,
+        }
+    } else {
+        GateOutcome::Permitted
+    };
+
+    Ok(GateReport { verdicts, outcome })
+}
+
+/// Build the daemon's authoritative weave view for a familiar.
+///
+/// `bootstrap_missing_baselines` is true only on the mutation path, preserving
+/// the existing first-sight semantics. Read/decision replays observe missing
+/// baselines without mutating the store.
+pub(crate) fn build_weave_state(
+    conn: &Connection,
+    familiar_id: &str,
+    workspace: &Path,
+    config: &ward::WardConfig,
+    extra_targets: &[String],
+    bootstrap_missing_baselines: bool,
+) -> Result<WeaveState> {
+    let familiar_uuid = familiar_weave_id(familiar_id);
+    let principal_writer =
+        threads::WriterId::new(format!("principal:{}", config.principal_key_fingerprint));
 
     // Weave one thread per protected surface: the literal (non-glob) tier-0
-    // declarations plus every gated target in this request.
+    // declarations plus any resolved protected targets being replayed.
     let mut surfaces: Vec<String> = config
         .protected_surface
         .iter()
         .filter(|entry| !entry.contains(['*', '?', '[']))
         .cloned()
         .collect();
-    for target in gated_targets {
+    for target in extra_targets {
         if !surfaces.contains(target) {
             surfaces.push(target.clone());
         }
@@ -187,7 +266,6 @@ pub fn gate_protected_edits(conn: &Connection, req: &GateRequest<'_>) -> Result<
 
     let manifest_id = load_or_create_manifest_id(conn, familiar_id)?;
     let now = time::OffsetDateTime::now_utc();
-
     let mut woven = Vec::with_capacity(surfaces.len());
     for surface in &surfaces {
         let surface_id = threads::SurfaceId::new(surface.clone());
@@ -200,13 +278,14 @@ pub fn gate_protected_edits(conn: &Connection, req: &GateRequest<'_>) -> Result<
                 let drifted = recorded.as_slice() != current_hash.as_slice();
                 (recorded, drifted)
             }
-            None => {
+            None if bootstrap_missing_baselines => {
                 // First sight: bootstrap the baseline from current content.
                 // Observation, not authority — recording a baseline grants
                 // nothing; it only makes future drift detectable.
                 store_baseline(conn, familiar_id, surface, &manifest_id, &current_hash)?;
                 (current_hash.to_vec(), false)
             }
+            None => (current_hash.to_vec(), false),
         };
 
         let mut thread = threads::Thread {
@@ -267,64 +346,15 @@ pub fn gate_protected_edits(conn: &Connection, req: &GateRequest<'_>) -> Result<
     )
     .context("weaving protected surfaces")?;
 
-    // Validate every gated target; audit every verdict (RFC-0001 §5.6).
-    let mut verdicts = Vec::with_capacity(gated_targets.len());
-    let mut degraded: Option<(threads::ThreadId, threads::FrayOrSnap)> = None;
-    let mut rejected = false;
-    for target in gated_targets {
-        let request = threads::MutationRequest {
-            surface: threads::SurfaceId::new(target.clone()),
-            writer: request_writer.clone(),
-            channel: threads::Channel::Mutation,
-        };
-        let verdict = threads::validate_fail_closed(&weave, &request);
-        append_audit_row(
-            conn,
-            familiar_id,
-            &familiar_uuid,
-            weave.weave_hash(),
-            &request,
-            &verdict,
-            now,
-        )?;
-        match &verdict {
-            threads::Verdict::Reject { .. } => rejected = true,
-            threads::Verdict::DegradeToProposal { thread, fray } => {
-                degraded.get_or_insert((*thread, fray.clone()));
-            }
-            threads::Verdict::Permit { .. } => {}
-        }
-        verdicts.push((target.clone(), verdict));
-    }
-
-    // Unit semantics (§5 + the Ward's own all-or-nothing rule): any Reject
-    // refuses the proposal; otherwise any fray stages the whole proposal.
-    let outcome = if rejected {
-        GateOutcome::Rejected
-    } else if let Some((thread_id, fray)) = degraded {
-        let (pending_path, proposal_id) = stage_pending_proposal(
-            coven_home,
-            &familiar_uuid,
-            &request_writer,
-            thread_id,
-            fray,
-            edits,
-            now,
-        )?;
-        GateOutcome::Staged {
-            pending_path,
-            proposal_id,
-        }
-    } else {
-        GateOutcome::Permitted
-    };
-
-    Ok(GateReport { verdicts, outcome })
+    Ok(WeaveState {
+        familiar_uuid,
+        weave,
+    })
 }
 
 /// Deterministic weave-level familiar id from the human-readable familiar id
 /// (UUIDv5 over the OID namespace, so audits correlate across restarts).
-fn familiar_weave_id(familiar_id: &str) -> threads::FamiliarId {
+pub(crate) fn familiar_weave_id(familiar_id: &str) -> threads::FamiliarId {
     threads::FamiliarId(uuid::Uuid::new_v5(
         &uuid::Uuid::NAMESPACE_OID,
         familiar_id.as_bytes(),
@@ -463,7 +493,7 @@ fn store_baseline(
     Ok(())
 }
 
-fn append_audit_row(
+pub(crate) fn append_audit_row(
     conn: &Connection,
     familiar_id: &str,
     familiar_uuid: &threads::FamiliarId,
