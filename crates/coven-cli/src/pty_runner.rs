@@ -2,7 +2,8 @@ use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
+use std::sync::TryLockError;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -53,7 +54,9 @@ pub struct DetachedPtyObserver {
     pub on_exit: Box<dyn FnOnce(PtyRunResult) + Send + 'static>,
 }
 
+#[cfg(windows)]
 const DETACHED_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const TERMINAL_REPLY_QUEUE_CAPACITY: usize = 16;
 
 #[derive(Clone)]
 struct SharedPtyWriter {
@@ -80,6 +83,33 @@ impl Write for SharedPtyWriter {
             .lock()
             .map_err(|_| io::Error::other("PTY writer lock poisoned"))?
             .write_all(buf)
+    }
+}
+
+impl SharedPtyWriter {
+    fn try_write_terminal_reply(&self, reply: &[u8]) -> io::Result<bool> {
+        match self.inner.try_lock() {
+            Ok(mut writer) => {
+                writer.write_all(reply)?;
+                writer.flush()?;
+                Ok(true)
+            }
+            Err(TryLockError::WouldBlock) => Ok(false),
+            Err(TryLockError::Poisoned(_)) => Err(io::Error::other("PTY writer lock poisoned")),
+        }
+    }
+}
+
+fn dispatch_terminal_reply(
+    writer: &SharedPtyWriter,
+    deferred: &SyncSender<&'static [u8]>,
+    reply: &'static [u8],
+) {
+    // Keep the output drain independent of a potentially blocked `send_input`.
+    // Uncontended replies stay on the reader thread for ConPTY compatibility;
+    // contended replies move to the bounded fallback writer without waiting.
+    if matches!(writer.try_write_terminal_reply(reply), Ok(false)) {
+        let _ = deferred.try_send(reply);
     }
 }
 
@@ -1692,7 +1722,7 @@ pub fn spawn_detached_with_observer(
 fn spawn_detached_with_observer_and_timeout(
     command: &HarnessCommand,
     observer: Option<DetachedPtyObserver>,
-    startup_timeout: Duration,
+    startup_timeout: Option<Duration>,
 ) -> Result<DetachedPtySession> {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -1708,10 +1738,24 @@ fn spawn_detached_with_observer_and_timeout(
         .try_clone_reader()
         .context("failed to clone PTY reader")?;
     let writer = master.take_writer().context("failed to open PTY writer")?;
-    let mut shared_writer = SharedPtyWriter {
+    let shared_writer = SharedPtyWriter {
         inner: Arc::new(Mutex::new(writer)),
     };
     let input: Box<dyn Write + Send> = Box::new(shared_writer.clone());
+    let (terminal_reply_tx, terminal_reply_rx) =
+        mpsc::sync_channel::<&'static [u8]>(TERMINAL_REPLY_QUEUE_CAPACITY);
+    let mut terminal_reply_writer = shared_writer.clone();
+    thread::spawn(move || {
+        while let Ok(reply) = terminal_reply_rx.recv() {
+            if terminal_reply_writer
+                .write_all(reply)
+                .and_then(|_| terminal_reply_writer.flush())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
     let killer = shared_pty_killer(child.as_ref());
     let timeout_killer = killer.clone_killer();
 
@@ -1725,27 +1769,29 @@ fn spawn_detached_with_observer_and_timeout(
     });
     let on_output = Arc::new(Mutex::new(on_output));
 
-    let timeout_state = Arc::clone(&startup_state);
-    let timeout_output = Arc::clone(&on_output);
-    thread::spawn(move || {
-        thread::sleep(startup_timeout);
-        if timeout_state
-            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            if let Ok(mut callback) = timeout_output.lock() {
-                callback(
-                    format!(
-                        "Coven stopped the detached PTY: no meaningful output was produced before the startup timeout ({} ms).\n",
-                        startup_timeout.as_millis()
-                    )
-                    .into_bytes(),
-                );
+    if let Some(startup_timeout) = startup_timeout {
+        let timeout_state = Arc::clone(&startup_state);
+        let timeout_output = Arc::clone(&on_output);
+        thread::spawn(move || {
+            thread::sleep(startup_timeout);
+            if timeout_state
+                .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                if let Ok(mut callback) = timeout_output.lock() {
+                    callback(
+                        format!(
+                            "Coven stopped the detached PTY: no meaningful output was produced before the startup timeout ({} ms).\n",
+                            startup_timeout.as_millis()
+                        )
+                        .into_bytes(),
+                    );
+                }
+                let mut timeout_killer = timeout_killer;
+                let _ = timeout_killer.kill();
             }
-            let mut timeout_killer = timeout_killer;
-            let _ = timeout_killer.kill();
-        }
-    });
+        });
+    }
 
     let (child_exit_tx, child_exit_rx) = mpsc::channel();
     let child_exit_state = Arc::clone(&startup_state);
@@ -1777,7 +1823,10 @@ fn spawn_detached_with_observer_and_timeout(
                 callback(chunk);
             }
         });
-        drain_detached_pty_output(&mut reader, &mut shared_writer, Some(&mut bridge));
+        let mut terminal_reply = |reply| {
+            dispatch_terminal_reply(&shared_writer, &terminal_reply_tx, reply);
+        };
+        drain_detached_pty_output(&mut reader, &mut terminal_reply, Some(&mut bridge));
         let mut result = child_exit_rx.recv().unwrap_or(PtyRunResult {
             status: "failed",
             exit_code: None,
@@ -1804,7 +1853,7 @@ pub(crate) fn spawn_detached_with_observer_for_test(
     observer: DetachedPtyObserver,
     startup_timeout: Duration,
 ) -> Result<DetachedPtySession> {
-    spawn_detached_with_observer_and_timeout(command, Some(observer), startup_timeout)
+    spawn_detached_with_observer_and_timeout(command, Some(observer), Some(startup_timeout))
 }
 
 #[cfg(all(test, windows))]
@@ -1839,15 +1888,21 @@ pub(crate) fn windows_detached_stub_command(
     })
 }
 
-fn detached_startup_timeout() -> Duration {
-    #[cfg(debug_assertions)]
-    if let Some(milliseconds) = std::env::var("COVEN_PTY_STARTUP_TIMEOUT_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
+fn detached_startup_timeout() -> Option<Duration> {
+    #[cfg(not(windows))]
     {
-        return Duration::from_millis(milliseconds.max(1));
+        None
     }
-    DETACHED_STARTUP_TIMEOUT
+    #[cfg(windows)]
+    {
+        if let Some(milliseconds) = std::env::var("COVEN_PTY_STARTUP_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            return Some(Duration::from_millis(milliseconds.max(1)));
+        }
+        Some(DETACHED_STARTUP_TIMEOUT)
+    }
 }
 
 fn shared_pty_killer(child: &dyn portable_pty::Child) -> SharedPtyKiller {
@@ -1896,11 +1951,11 @@ fn assign_process_to_job(pid: u32) -> Option<windows_sys::Win32::Foundation::HAN
 
 fn drain_detached_pty_output(
     reader: &mut dyn Read,
-    writer: &mut dyn Write,
+    terminal_reply: &mut dyn FnMut(&'static [u8]),
     on_output: Option<&mut Box<dyn FnMut(Vec<u8>) + Send + 'static>>,
 ) {
     let mut filter = VtQueryFilter::default();
-    drain_detached_output_inner(reader, on_output, Some((&mut filter, writer)));
+    drain_detached_output_inner(reader, on_output, Some((&mut filter, terminal_reply)));
 }
 
 fn drain_detached_output(
@@ -1913,7 +1968,7 @@ fn drain_detached_output(
 fn drain_detached_output_inner(
     reader: &mut dyn Read,
     mut on_output: Option<&mut Box<dyn FnMut(Vec<u8>) + Send + 'static>>,
-    mut vt: Option<(&mut VtQueryFilter, &mut dyn Write)>,
+    mut vt: Option<(&mut VtQueryFilter, &mut dyn FnMut(&'static [u8]))>,
 ) {
     let mut buffer = [0_u8; 8192];
     // Per-drain UTF-8 reassembly buffer. Each call to this function
@@ -1940,8 +1995,8 @@ fn drain_detached_output_inner(
                 break;
             }
             Ok(bytes_read) => {
-                if let Some((filter, writer)) = vt.as_mut() {
-                    filter.push(&buffer[..bytes_read], *writer, &mut utf8_buf);
+                if let Some((filter, terminal_reply)) = vt.as_mut() {
+                    filter.push(&buffer[..bytes_read], *terminal_reply, &mut utf8_buf);
                 } else {
                     utf8_buf.extend_from_slice(&buffer[..bytes_read]);
                 }
@@ -1986,7 +2041,12 @@ struct VtQueryFilter {
 }
 
 impl VtQueryFilter {
-    fn push(&mut self, chunk: &[u8], writer: &mut dyn Write, output: &mut Vec<u8>) {
+    fn push(
+        &mut self,
+        chunk: &[u8],
+        terminal_reply: &mut dyn FnMut(&'static [u8]),
+        output: &mut Vec<u8>,
+    ) {
         self.pending.extend_from_slice(chunk);
         let mut offset = 0;
         while offset < self.pending.len() {
@@ -2001,15 +2061,7 @@ impl VtQueryFilter {
             output.extend_from_slice(&self.pending[offset..escape]);
             let remaining = &self.pending[escape..];
             if let Some((query_len, reply)) = vt_query_reply(remaining) {
-                if writer
-                    .write_all(reply)
-                    .and_then(|_| writer.flush())
-                    .is_err()
-                {
-                    // If the child closed its input while writing a reply,
-                    // keep draining its output; process exit remains the
-                    // authoritative lifecycle signal.
-                }
+                terminal_reply(reply);
                 offset = escape + query_len;
             } else if VT_QUERIES
                 .iter()
@@ -2257,6 +2309,12 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn detached_startup_timeout_is_disabled() {
+        assert_eq!(detached_startup_timeout(), None);
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_detached_pty_stub_completes_after_terminal_replies() -> anyhow::Result<()> {
@@ -2278,7 +2336,7 @@ mod tests {
         let mut session = spawn_detached_with_observer_and_timeout(
             &command,
             Some(observer),
-            Duration::from_secs(5),
+            Some(Duration::from_secs(5)),
         )?;
         let result = match exit_rx.recv_timeout(Duration::from_secs(10)) {
             Ok(result) => result,
@@ -2331,7 +2389,7 @@ mod tests {
         let mut session = spawn_detached_with_observer_and_timeout(
             &command,
             Some(observer),
-            Duration::from_secs(2),
+            Some(Duration::from_secs(2)),
         )?;
         let result = match exit_rx.recv_timeout(Duration::from_secs(10)) {
             Ok(result) => result,
@@ -3171,8 +3229,9 @@ exit 0
                 .extend_from_slice(&chunk);
         });
         let mut replies = Vec::new();
+        let mut terminal_reply = |reply: &'static [u8]| replies.extend_from_slice(reply);
 
-        drain_detached_pty_output(&mut reader, &mut replies, Some(&mut callback));
+        drain_detached_pty_output(&mut reader, &mut terminal_reply, Some(&mut callback));
 
         assert_eq!(
             captured.lock().unwrap().as_slice(),
@@ -3198,14 +3257,39 @@ exit 0
                 .extend_from_slice(&chunk);
         });
         let mut replies = Vec::new();
+        let mut terminal_reply = |reply: &'static [u8]| replies.extend_from_slice(reply);
 
-        drain_detached_pty_output(&mut reader, &mut replies, Some(&mut callback));
+        drain_detached_pty_output(&mut reader, &mut terminal_reply, Some(&mut callback));
 
         assert_eq!(
             captured.lock().unwrap().as_slice(),
             b"before\x1b[31mred\x1b["
         );
         assert!(replies.is_empty());
+    }
+
+    #[test]
+    fn detached_pty_keeps_draining_when_terminal_reply_queue_is_full() {
+        let mut reader = ChunkedReader {
+            chunks: vec![b"before\x1b[6nafter".as_slice()].into(),
+        };
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_for_callback = Arc::clone(&captured);
+        let mut callback: Box<dyn FnMut(Vec<u8>) + Send + 'static> = Box::new(move |chunk| {
+            captured_for_callback.lock().unwrap().extend(chunk);
+        });
+        let writer = SharedPtyWriter {
+            inner: Arc::new(Mutex::new(Box::new(Vec::<u8>::new()))),
+        };
+        let held_writer = Arc::clone(&writer.inner);
+        let _held_guard = held_writer.lock().unwrap();
+        let (reply_tx, _reply_rx) = mpsc::sync_channel::<&'static [u8]>(1);
+        reply_tx.try_send(b"queue already full".as_slice()).unwrap();
+        let mut terminal_reply = |reply| dispatch_terminal_reply(&writer, &reply_tx, reply);
+
+        drain_detached_pty_output(&mut reader, &mut terminal_reply, Some(&mut callback));
+
+        assert_eq!(captured.lock().unwrap().as_slice(), b"beforeafter");
     }
 
     #[test]
