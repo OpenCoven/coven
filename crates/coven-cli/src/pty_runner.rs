@@ -2003,10 +2003,12 @@ fn drain_detached_output(
     drain_detached_output_inner(reader, on_output, None);
 }
 
+type VtDrain<'a> = (&'a mut VtQueryFilter, &'a mut dyn FnMut(&'static [u8]));
+
 fn drain_detached_output_inner(
     reader: &mut dyn Read,
     mut on_output: Option<&mut Box<dyn FnMut(Vec<u8>) + Send + 'static>>,
-    mut vt: Option<(&mut VtQueryFilter, &mut dyn FnMut(&'static [u8]))>,
+    mut vt: Option<VtDrain<'_>>,
 ) {
     let mut buffer = [0_u8; 8192];
     // Per-drain UTF-8 reassembly buffer. Each call to this function
