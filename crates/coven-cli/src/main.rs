@@ -432,6 +432,12 @@ enum EngineCommand {
     Install {
         #[arg(long, help = "Install a specific version instead of the default")]
         version: Option<String>,
+        #[arg(
+            long = "sha256",
+            value_name = "HEX",
+            help = "Expected SHA-256 of the engine archive when no built-in pin exists"
+        )]
+        sha256: Option<String>,
         #[arg(long, help = "Reinstall even if already present")]
         force: bool,
     },
@@ -849,8 +855,20 @@ fn prompt_and_install_engine() -> Result<Option<PathBuf>> {
     io::stdin().read_line(&mut answer)?;
     let answer = answer.trim();
     if answer.is_empty() || answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
-        let (path, _) =
-            engine_install::install(engine_install::DEFAULT_ENGINE_VERSION, None, false)?;
+        let (os, arch) = engine_install::current_platform()?;
+        let expected_sha256 =
+            engine_install::pinned_archive_sha256(engine_install::DEFAULT_ENGINE_VERSION, os, arch)
+                .with_context(|| {
+                    format!(
+                        "no pinned checksum for Coven engine {} ({os}-{arch}); refusing to auto-install unverified engine",
+                        engine_install::DEFAULT_ENGINE_VERSION
+                    )
+                })?;
+        let (path, _) = engine_install::install(
+            engine_install::DEFAULT_ENGINE_VERSION,
+            expected_sha256,
+            false,
+        )?;
         Ok(Some(path))
     } else {
         Ok(None)
@@ -1705,11 +1723,23 @@ fn run_vacuum_command() -> Result<()> {
 fn run_engine_command(command: EngineCommand) -> Result<()> {
     match command {
         EngineCommand::Status { json } => engine_status(json),
-        EngineCommand::Install { version, force } => {
+        EngineCommand::Install {
+            version,
+            sha256,
+            force,
+        } => {
             let version =
                 version.unwrap_or_else(|| engine_install::DEFAULT_ENGINE_VERSION.to_string());
-            // Task 2.1 will thread the pinned checksum here; None = dev mode.
-            let (path, outcome) = engine_install::install(&version, None, force)?;
+            let (os, arch) = engine_install::current_platform()?;
+            let expected_sha256 = sha256
+                .as_deref()
+                .or_else(|| engine_install::pinned_archive_sha256(&version, os, arch))
+                .with_context(|| {
+                    format!(
+                        "no pinned checksum for Coven engine {version} ({os}-{arch}); pass --sha256 <HEX> to install a custom verified archive"
+                    )
+                })?;
+            let (path, outcome) = engine_install::install(&version, expected_sha256, force)?;
             match outcome {
                 engine_install::InstallOutcome::Installed => {
                     println!("Installed Coven engine {version} at {}", path.display());
