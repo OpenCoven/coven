@@ -785,11 +785,16 @@ fn external_harness_specs() -> Result<Vec<HarnessCommandSpec>> {
     for manifest in external_adapter_manifest_sources() {
         for spec in manifest.load_specs(&built_ins)? {
             if !ids.insert(spec.id.clone()) {
-                anyhow::bail!(
-                    "external harness adapter `{}` in {} duplicates another adapter id",
+                // First manifest wins. A repeated id (the same adapter
+                // scaffolded into two configured dirs, say) must not brick
+                // every `coven run`: skip the later copy and say so.
+                eprintln!(
+                    "warning: ignoring external harness adapter `{}` in {}: \
+                     the id duplicates an adapter that was already loaded",
                     spec.id,
                     manifest.path().display()
                 );
+                continue;
             }
             specs.push(spec);
         }
@@ -964,6 +969,9 @@ fn parse_external_harness_specs(
         .adapters
         .into_iter()
         .map(|adapter| adapter.into_spec(path, built_ins))
+        // `Ok(None)` marks an adapter shadowed by a built-in harness: it is
+        // skipped (built-in wins) rather than failing the whole registry.
+        .filter_map(Result::transpose)
         .collect()
 }
 
@@ -1022,7 +1030,7 @@ impl ExternalHarnessAdapterSpec {
         self,
         manifest_path: &Path,
         built_ins: &[HarnessCommandSpec],
-    ) -> Result<HarnessCommandSpec> {
+    ) -> Result<Option<HarnessCommandSpec>> {
         let id = self.id.trim().to_lowercase();
         if !valid_adapter_id(&id) {
             anyhow::bail!(
@@ -1032,10 +1040,18 @@ impl ExternalHarnessAdapterSpec {
             );
         }
         if built_ins.iter().any(|spec| spec.id == id) {
-            anyhow::bail!(
-                "external harness adapter `{id}` in {} conflicts with a built-in harness",
+            // A CLI upgrade can promote an adapter to built-in after a
+            // manifest for it was scaffolded (copilot, coven-code). Treating
+            // that as fatal bricked every `coven run` — including harnesses
+            // the manifest never mentioned — so the built-in wins and the
+            // stale manifest is skipped with a warning instead.
+            eprintln!(
+                "warning: ignoring external harness adapter `{id}` in {}: \
+                 this Coven CLI ships `{id}` as a built-in harness. Delete the \
+                 manifest to silence this warning.",
                 manifest_path.display()
             );
+            return Ok(None);
         }
         let executable = self.executable.trim().to_string();
         if executable.is_empty()
@@ -1150,7 +1166,7 @@ impl ExternalHarnessAdapterSpec {
             }
             _ => {}
         }
-        Ok(HarnessCommandSpec {
+        Ok(Some(HarnessCommandSpec {
             id,
             label: self.label.trim().to_string(),
             executable,
@@ -1187,7 +1203,7 @@ impl ExternalHarnessAdapterSpec {
             capabilities: self.capabilities,
             stream_args: self.stream_args,
             continuity_args: self.continuity_args,
-        })
+        }))
     }
 }
 
@@ -2484,6 +2500,148 @@ mod tests {
                 "expected `{expected}` in: {err:#}"
             );
         }
+    }
+
+    /// A manifest id that shadows a built-in harness must not fail the whole
+    /// registry. A CLI upgrade can promote an adapter to built-in after a
+    /// manifest for it was scaffolded (copilot, coven-code), and the old
+    /// fatal error bricked every `coven run` — harnesses the manifest never
+    /// mentioned included. The built-in wins; siblings still load.
+    #[test]
+    fn manifest_shadowing_built_in_is_skipped_not_fatal() -> anyhow::Result<()> {
+        let raw = r#"{
+          "adapters": [
+            {
+              "id": "codex",
+              "label": "Codex (external)",
+              "executable": "codex",
+              "interactive_prompt_prefix_args": [],
+              "non_interactive_prompt_prefix_args": ["exec"],
+              "install_hint": "Install codex."
+            },
+            {
+              "id": "sidecar",
+              "label": "Sidecar",
+              "executable": "sidecar",
+              "interactive_prompt_prefix_args": [],
+              "non_interactive_prompt_prefix_args": ["run"],
+              "install_hint": "Install sidecar."
+            }
+          ]
+        }"#;
+        let specs = parse_external_harness_specs(
+            raw,
+            Path::new("adapters.json"),
+            &built_in_harness_specs(),
+        )?;
+        let ids: Vec<&str> = specs.iter().map(|spec| spec.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["sidecar"],
+            "shadowed built-in id must be skipped while the rest of the manifest loads"
+        );
+        Ok(())
+    }
+
+    /// End-to-end guard for the Cave regression: with a stale manifest that
+    /// shadows `codex` configured through the adapter-dirs env, launching the
+    /// built-in codex harness must still work instead of erroring at registry
+    /// load.
+    #[test]
+    fn shadowing_manifest_does_not_break_built_in_launch() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        fs::write(
+            temp_dir.path().join("codex.json"),
+            r#"{
+              "adapters": [
+                {
+                  "id": "codex",
+                  "label": "Codex (stale scaffold)",
+                  "executable": "codex",
+                  "interactive_prompt_prefix_args": [],
+                  "non_interactive_prompt_prefix_args": ["exec"],
+                  "install_hint": "Install codex."
+                }
+              ]
+            }"#,
+        )?;
+
+        let _guard = env_lock().lock().unwrap();
+        let previous_manifest = env::var_os(EXTERNAL_ADAPTER_MANIFEST_ENV);
+        let previous_dirs = env::var_os(EXTERNAL_ADAPTER_DIRS_ENV);
+        env::remove_var(EXTERNAL_ADAPTER_MANIFEST_ENV);
+        env::set_var(EXTERNAL_ADAPTER_DIRS_ENV, temp_dir.path());
+
+        let specs = configured_harness_specs();
+        let launch = command_parts_for_harness("codex", "hello", HarnessLaunchMode::NonInteractive);
+
+        restore_adapter_manifest_env(previous_manifest);
+        restore_adapter_dirs_env(previous_dirs);
+
+        let specs = specs?;
+        let codex = specs
+            .iter()
+            .find(|spec| spec.id == "codex")
+            .expect("built-in codex spec present");
+        assert_eq!(
+            codex.source, "bundled",
+            "built-in must win over the manifest"
+        );
+        let (program, args) = launch?;
+        assert_eq!(program, "codex");
+        assert!(!args.is_empty());
+        Ok(())
+    }
+
+    /// The same adapter id appearing twice (e.g. one manifest scaffolded into
+    /// two configured dirs) keeps the first copy instead of failing the whole
+    /// registry.
+    #[test]
+    fn duplicate_external_adapter_id_keeps_first_copy() -> anyhow::Result<()> {
+        let first_dir = tempfile::tempdir()?;
+        let second_dir = tempfile::tempdir()?;
+        let manifest_for = |label: &str| {
+            format!(
+                r#"{{
+                  "adapters": [
+                    {{
+                      "id": "sidecar",
+                      "label": "{label}",
+                      "executable": "sidecar",
+                      "interactive_prompt_prefix_args": [],
+                      "non_interactive_prompt_prefix_args": ["run"],
+                      "install_hint": "Install sidecar."
+                    }}
+                  ]
+                }}"#
+            )
+        };
+        fs::write(first_dir.path().join("sidecar.json"), manifest_for("First"))?;
+        fs::write(
+            second_dir.path().join("sidecar.json"),
+            manifest_for("Second"),
+        )?;
+
+        let _guard = env_lock().lock().unwrap();
+        let previous_manifest = env::var_os(EXTERNAL_ADAPTER_MANIFEST_ENV);
+        let previous_dirs = env::var_os(EXTERNAL_ADAPTER_DIRS_ENV);
+        env::remove_var(EXTERNAL_ADAPTER_MANIFEST_ENV);
+        env::set_var(
+            EXTERNAL_ADAPTER_DIRS_ENV,
+            env::join_paths([first_dir.path(), second_dir.path()])?,
+        );
+
+        let specs = configured_harness_specs();
+
+        restore_adapter_manifest_env(previous_manifest);
+        restore_adapter_dirs_env(previous_dirs);
+
+        let specs = specs?;
+        let sidecars: Vec<&HarnessCommandSpec> =
+            specs.iter().filter(|spec| spec.id == "sidecar").collect();
+        assert_eq!(sidecars.len(), 1, "duplicate id must collapse to one spec");
+        assert_eq!(sidecars[0].label, "First", "first manifest wins");
+        Ok(())
     }
 
     #[test]
