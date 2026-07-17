@@ -543,7 +543,10 @@ fn trusted_windows_taskkill_path() -> Option<PathBuf> {
         buffer.truncate(len);
     }
 
-    Some(PathBuf::from(std::ffi::OsString::from_wide(&buffer)).join("taskkill.exe"))
+    let path = PathBuf::from(std::ffi::OsString::from_wide(&buffer)).join("taskkill.exe");
+    // A missing binary (or an unexpected system directory) must surface as
+    // "no trusted taskkill" rather than a silently ignored spawn failure.
+    path.is_file().then_some(path)
 }
 
 #[cfg(windows)]
