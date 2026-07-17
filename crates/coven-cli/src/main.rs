@@ -600,6 +600,17 @@ enum DaemonCommand {
                     interfaces or untrusted networks."
         )]
         tcp: Option<String>,
+        #[arg(
+            long = "allow-host",
+            value_name = "HOST",
+            help = "Also accept this Host/Origin header on the --tcp listener, in \
+                    addition to loopback (repeatable). For a trusted reverse proxy \
+                    that forwards a fixed hostname it cannot rewrite — e.g. a \
+                    Tailscale-served FQDN. Exact host match. The API is still \
+                    unauthenticated, so only add a host fronted by an authenticated \
+                    transport (Tailscale/SSH); the bind stays loopback."
+        )]
+        allow_host: Vec<String>,
     },
 }
 
@@ -2598,18 +2609,19 @@ fn run_daemon_command(command: DaemonCommand) -> Result<()> {
                 println!("Coven daemon: was not running");
             }
         }
-        DaemonCommand::Serve { tcp } => {
+        DaemonCommand::Serve { tcp, allow_host } => {
             #[cfg(unix)]
             {
-                daemon::serve_forever(&home, current_timestamp(), tcp.as_deref())?;
+                daemon::serve_forever(&home, current_timestamp(), tcp.as_deref(), &allow_host)?;
             }
             #[cfg(windows)]
             {
-                daemon::serve_forever(&home, current_timestamp(), tcp.as_deref())?;
+                daemon::serve_forever(&home, current_timestamp(), tcp.as_deref(), &allow_host)?;
             }
             #[cfg(not(any(unix, windows)))]
             {
                 let _ = tcp;
+                let _ = allow_host;
                 anyhow::bail!(
                     "coven daemon server is only implemented on Unix-like systems and Windows for now"
                 );
