@@ -3536,7 +3536,10 @@ exit 0
         };
         let mut assistant = Vec::new();
 
-        let outcome = stream_codex_json_with_timeout(&command, Duration::from_secs(2), |text| {
+        // PowerShell can take several seconds to cold-start on a loaded
+        // Windows runner. This test exercises stdin and JSONL framing, not the
+        // activity deadline, so leave enough headroom for process startup.
+        let outcome = stream_codex_json_with_timeout(&command, Duration::from_secs(10), |text| {
             assistant.push(text.to_string());
             Ok(())
         })?;
