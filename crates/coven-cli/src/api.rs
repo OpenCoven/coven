@@ -2634,6 +2634,7 @@ fn apply_familiar_edits(
             }),
         );
     }
+    advance_applied_protected_baselines(coven_home, familiar_id, &workspace, &report.changes)?;
     json_response(
         200,
         &json!({
@@ -2643,6 +2644,30 @@ fn apply_familiar_edits(
             "threadsGate": threads_gate_json,
         }),
     )
+}
+
+fn advance_applied_protected_baselines(
+    coven_home: &Path,
+    familiar_id: &str,
+    workspace: &Path,
+    changes: &[ward::AppliedChange],
+) -> Result<()> {
+    let protected: Vec<String> = changes
+        .iter()
+        .filter(|change| {
+            change.disposition == ward::Disposition::Applied
+                && change.decision.tier == ward::Tier::Protected
+        })
+        .map(|change| change.decision.resolved.clone())
+        .collect();
+    if protected.is_empty() {
+        return Ok(());
+    }
+    let conn = store::open_store(&store_path(coven_home))?;
+    for surface in protected {
+        crate::threads_gate::advance_surface_baseline(&conn, familiar_id, workspace, &surface)?;
+    }
+    Ok(())
 }
 
 fn threads_weaves_response(coven_home: &Path) -> Result<ApiResponse> {
@@ -2739,8 +2764,24 @@ fn decide_threads_proposal(
         targets: targets.clone(),
         authorization: authorization.clone(),
     });
+    let conn = store::open_store(&store_path(coven_home))?;
     if adjudication.is_blocked() {
-        fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+        let state = crate::threads_gate::build_weave_state(
+            &conn,
+            &familiar_id,
+            &workspace,
+            &config,
+            &[],
+            false,
+        )?;
+        append_proposal_refusal_audit(
+            &conn,
+            proposal_id,
+            &familiar_id,
+            state.weave.weave_hash(),
+            &pending.writer,
+            &targets,
+        )?;
         return json_response(
             409,
             &json!({ "blocked": true, "why": "proposal-revalidation-failed" }),
@@ -2752,14 +2793,6 @@ fn decide_threads_proposal(
         .filter(|d| d.tier == ward::Tier::Protected && !d.verdict.is_blocked())
         .map(|d| d.resolved.clone())
         .collect();
-    if decision == "approve" && gated_targets.is_empty() {
-        fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
-        return json_response(
-            409,
-            &json!({ "blocked": true, "why": "proposal-revalidation-failed" }),
-        );
-    }
-    let conn = store::open_store(&store_path(coven_home))?;
     let state = crate::threads_gate::build_weave_state(
         &conn,
         &familiar_id,
@@ -2768,6 +2801,20 @@ fn decide_threads_proposal(
         &gated_targets,
         false,
     )?;
+    if decision == "approve" && gated_targets.is_empty() {
+        append_proposal_refusal_audit(
+            &conn,
+            proposal_id,
+            &familiar_id,
+            state.weave.weave_hash(),
+            &pending.writer,
+            &targets,
+        )?;
+        return json_response(
+            409,
+            &json!({ "blocked": true, "why": "proposal-revalidation-failed" }),
+        );
+    }
 
     if decision == "reject" {
         append_proposal_decision_audit(
@@ -2812,7 +2859,14 @@ fn decide_threads_proposal(
             time::OffsetDateTime::now_utc(),
         )?;
         if !verdict.permits_write() {
-            fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+            append_proposal_refusal_audit(
+                &conn,
+                proposal_id,
+                &familiar_id,
+                state.weave.weave_hash(),
+                &pending.writer,
+                &targets,
+            )?;
             return json_response(
                 409,
                 &json!({
@@ -2827,11 +2881,21 @@ fn decide_threads_proposal(
 
     let report = ward.apply_after_threads_approval(&edits, &authorization)?;
     if report.is_refused() {
-        fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+        append_proposal_refusal_audit(
+            &conn,
+            proposal_id,
+            &familiar_id,
+            state.weave.weave_hash(),
+            &pending.writer,
+            &targets,
+        )?;
         return json_response(
             409,
             &json!({ "blocked": true, "why": "proposal-revalidation-failed" }),
         );
+    }
+    for target in &gated_targets {
+        crate::threads_gate::advance_surface_baseline(&conn, &familiar_id, &workspace, target)?;
     }
     append_proposal_decision_audit(
         &conn,
@@ -2917,6 +2981,28 @@ fn staged_edits_to_ward_edits(
             Ok(ward::FileEdit::new(edit.surface.as_str(), contents))
         })
         .collect()
+}
+
+fn append_proposal_refusal_audit(
+    conn: &rusqlite::Connection,
+    proposal_id: &str,
+    familiar_id: &str,
+    weave_hash: &[u8],
+    approver: &coven_threads_core::WriterId,
+    files_touched: &[String],
+) -> Result<()> {
+    append_proposal_decision_audit(
+        conn,
+        ProposalDecisionAudit {
+            event_type: coven_threads_core::AuditEventType::ProposalRejected,
+            proposal_id,
+            familiar_id,
+            weave_hash,
+            approver: Some(approver),
+            files_touched,
+            decision: "proposal-revalidation-failed",
+        },
+    )
 }
 
 struct ProposalDecisionAudit<'a> {
@@ -6558,8 +6644,105 @@ tier = 1
         Ok(())
     }
 
+    fn ward_manifest_entry_hash(home: &Path, familiar_id: &str, surface: &str) -> Result<Vec<u8>> {
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        conn.query_row(
+            "SELECT entry_hash FROM ward_manifest WHERE familiar_id = ?1 AND surface = ?2",
+            [familiar_id, surface],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    }
+
     #[test]
-    fn threads_approve_drifted_staged_write_refuses_without_applying() -> Result<()> {
+    fn threads_approve_advances_baseline_after_apply() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id) = stage_pending_protected_edit(home)?;
+        let before = ward_manifest_entry_hash(home, "sage", "SOUL.md")?;
+        let workspace = home.join("familiars").join("sage");
+        std::fs::write(workspace.join("SOUL.md"), "# Sage\n")?;
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+
+        assert_eq!(response.status, 200, "got {}", response.body);
+        assert!(!pending.exists(), "approved proposal must be removed");
+        let after = ward_manifest_entry_hash(home, "sage", "SOUL.md")?;
+        assert_ne!(after, before, "baseline must advance to the approved bytes");
+        assert_eq!(
+            after,
+            coven_threads_core::manifest_entry_hash(
+                &coven_threads_core::SurfaceId::new("SOUL.md"),
+                b"approved identity"
+            )
+            .to_vec()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn threads_approve_second_cycle_succeeds_after_baseline_advance() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (first_pending, first_proposal_id) = stage_pending_protected_edit(home)?;
+        let workspace = home.join("familiars").join("sage");
+        std::fs::write(workspace.join("SOUL.md"), "# Sage\n")?;
+        let first = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{first_proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+        assert_eq!(first.status, 200, "got {}", first.body);
+        assert!(!first_pending.exists());
+
+        std::fs::write(workspace.join("SOUL.md"), "# Eve\n")?;
+        let staged = post_edits(
+            home,
+            r#"{"edits":[{"target":"SOUL.md","contents":"second identity"}],
+                "principalKeyFingerprint":"fpr-val"}"#,
+        )?;
+        assert_eq!(staged.status, 202, "got {}", staged.body);
+        let body: serde_json::Value = serde_json::from_str(&staged.body)?;
+        let second_pending = std::path::PathBuf::from(
+            body["threadsGate"]["outcome"]["pendingPath"]
+                .as_str()
+                .expect("staged response carries pendingPath"),
+        );
+        let second_proposal_id = body["threadsGate"]["outcome"]["proposalId"]
+            .as_str()
+            .expect("staged response carries proposalId");
+
+        std::fs::write(workspace.join("SOUL.md"), "approved identity")?;
+        let second = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{second_proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+
+        assert_eq!(second.status, 200, "got {}", second.body);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("SOUL.md"))?,
+            "second identity"
+        );
+        assert!(
+            !second_pending.exists(),
+            "approved second proposal is consumed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn threads_approve_refusal_keeps_pending_audits_and_retry_can_succeed() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let home = temp.path();
         let (pending, proposal_id) = stage_pending_protected_edit(home)?;
@@ -6582,16 +6765,40 @@ tier = 1
             "# Mallory\n"
         );
         assert!(
-            !pending.exists(),
-            "valid refused proposal decision is final"
+            pending.exists(),
+            "refused approve must leave the pending proposal retryable"
         );
         let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let proposal_audit_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit WHERE proposal_id = ?1",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert!(
+            proposal_audit_count > 0,
+            "refused approve must leave proposal-scoped audit evidence"
+        );
         let approved_count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM ward_audit WHERE event_type='proposal_approved' AND proposal_id = ?1",
             [&proposal_id],
             |row| row.get(0),
         )?;
         assert_eq!(approved_count, 0);
+
+        std::fs::write(workspace.join("SOUL.md"), "# Sage\n")?;
+        let retry = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+        assert_eq!(retry.status, 200, "got {}", retry.body);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("SOUL.md"))?,
+            "approved identity"
+        );
+        assert!(!pending.exists(), "approved retry consumes proposal");
         Ok(())
     }
 
