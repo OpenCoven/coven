@@ -2755,8 +2755,18 @@ fn threads_weaves_response(coven_home: &Path) -> Result<ApiResponse> {
     let mut entries = Vec::new();
     for familiar in crate::cockpit_sources::read_familiars(coven_home)? {
         let workspace = crate::cockpit_sources::familiar_workspace(coven_home, &familiar.id);
-        let Some(config) = ward::WardConfig::load(&workspace)? else {
-            continue;
+        let config = match ward::WardConfig::load(&workspace) {
+            Ok(Some(config)) => config,
+            Ok(None) => continue,
+            Err(error) => {
+                let message = format!(
+                    "threads/weaves: skipping familiar {} because ward config failed to load: {error:#}",
+                    familiar.id
+                );
+                eprintln!("coven daemon: {message}");
+                crate::daemon::append_daemon_recovery_log(coven_home, &message);
+                continue;
+            }
         };
         let state = crate::threads_gate::build_weave_state(
             &conn,
@@ -6732,6 +6742,39 @@ tier = 1
             .as_array()
             .is_some_and(|v| !v.is_empty()));
         assert!(entry["weave"]["pattern_descriptor"]["name"].is_string());
+        Ok(())
+    }
+
+    #[test]
+    fn threads_weaves_skips_malformed_ward_without_aborting_fleet_read() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_warded_familiar(home)?;
+
+        let cody_workspace = home.join("familiars").join("cody");
+        std::fs::create_dir_all(&cody_workspace)?;
+        std::fs::write(cody_workspace.join("SOUL.md"), "# Cody\n")?;
+        std::fs::write(
+            cody_workspace.join("ward.toml"),
+            r#"protected_surface = ["SOUL.md"]
+
+[[surface]]
+path = "SOUL.md"
+tier = 0
+"#,
+        )?;
+
+        let response = handle_request("GET", "/api/v1/threads/weaves", home, None)?;
+
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        let entries = body.as_array().expect("weaves response is an array");
+        assert_eq!(
+            entries.len(),
+            1,
+            "malformed cody ward must not abort or appear"
+        );
+        assert_eq!(entries[0]["weave"]["familiar_id"], "sage");
         Ok(())
     }
 

@@ -1848,12 +1848,10 @@ pub fn bind_api_socket(coven_home: &Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
-#[cfg(unix)]
 pub fn daemon_recovery_log_path(coven_home: &Path) -> PathBuf {
     coven_home.join("daemon-recovery.log")
 }
 
-#[cfg(unix)]
 pub fn append_daemon_recovery_log(coven_home: &Path, msg: &str) {
     let path = daemon_recovery_log_path(coven_home);
     let line = format!("[{}] {}\n", crate::api::current_timestamp(), msg);
@@ -2245,14 +2243,23 @@ where
     }
     let body = read_http_body(&mut reader, headers.content_length)?;
     let (method, path) = parse_request_line(&request_line)?;
-    let response = crate::api::handle_request_with_runtime(
+    let response = match crate::api::handle_request_with_runtime(
         method,
         path,
         coven_home,
         status,
         body.as_deref(),
         runtime,
-    )?;
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            append_daemon_recovery_log(
+                coven_home,
+                &format!("API handler error for {method} {path}: {error:#}"),
+            );
+            return write_internal_server_error(&mut write, &format!("{error:#}"));
+        }
+    };
     let reason = http_reason_phrase(response.status);
     let http = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -2265,6 +2272,26 @@ where
     write
         .write_all(http.as_bytes())
         .context("failed to write API response")?;
+    Ok(())
+}
+
+fn write_internal_server_error<W: Write>(write: &mut W, message: &str) -> Result<()> {
+    let body = serde_json::json!({
+        "ok": false,
+        "error": {
+            "code": "internal_error",
+            "message": message,
+        },
+    })
+    .to_string();
+    let http = format!(
+        "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    write
+        .write_all(http.as_bytes())
+        .context("failed to write 500 response")?;
     Ok(())
 }
 
@@ -3231,6 +3258,42 @@ mod tests {
         let response = String::from_utf8(output).expect("utf8");
         assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
         assert!(response.contains("\"apiVersion\""), "got: {response}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_http_stream_converts_api_handler_error_to_json_500() {
+        use crate::api::NoopSessionRuntime;
+        use std::io::Cursor;
+        let temp = tempfile::tempdir().expect("tempdir");
+        ensure_private_coven_home(temp.path()).expect("ensure home");
+        std::fs::write(temp.path().join("familiars.toml"), "not = [valid")
+            .expect("write malformed config");
+        let request = b"GET /api/v1/familiars HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n";
+        let mut stream = Cursor::new(Vec::from(&request[..]));
+        let mut output: Vec<u8> = Vec::new();
+        let runtime = NoopSessionRuntime;
+
+        handle_http_stream(
+            &mut stream,
+            &mut output,
+            temp.path(),
+            None,
+            &runtime,
+            None,
+            HostGuard::Disabled,
+        )
+        .expect("handler errors should still write an HTTP response");
+
+        let response = String::from_utf8(output).expect("utf8");
+        assert!(
+            response.starts_with("HTTP/1.1 500 Internal Server Error"),
+            "got: {response}"
+        );
+        assert!(
+            response.contains(r#""code":"internal_error""#),
+            "got: {response}"
+        );
     }
 
     #[cfg(unix)]
@@ -4660,7 +4723,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
     #[test]
     fn append_daemon_recovery_log_creates_and_appends() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
