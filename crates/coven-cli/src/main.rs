@@ -48,6 +48,7 @@ mod verification;
 // Gate 3 (coherence review) remains a follow-up — see ward.rs.
 #[allow(dead_code)]
 mod ward;
+mod ward_migrate;
 // The coven-threads validator call site: typed authority-state gating of
 // protected-surface mutations (OpenCoven/coven-threads Phase 2). Runs before
 // Ward::apply on the same write path; see threads_gate.rs.
@@ -130,6 +131,11 @@ enum Command {
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
+    },
+    #[command(about = "Inspect and migrate Ward configuration")]
+    Ward {
+        #[command(subcommand)]
+        command: WardCommand,
     },
     #[command(
         about = "Stateless executor-node protocol commands (hub-dispatched over SSH/private network)"
@@ -641,6 +647,23 @@ enum EngineCommand {
 }
 
 #[derive(Subcommand, Debug)]
+enum WardCommand {
+    #[command(about = "Migrate Ward v0.1 ward.toml files to Phase-2 WardConfig")]
+    Migrate {
+        #[arg(long, value_name = "ID", help = "Only migrate the named familiar")]
+        familiar: Option<String>,
+        #[arg(
+            long,
+            value_name = "FPR",
+            help = "Principal key fingerprint to write into migrated WardConfig"
+        )]
+        fingerprint: String,
+        #[arg(long, help = "Write changes; default is a dry-run report")]
+        apply: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum LogsCommand {
     #[command(about = "Prune expired raw artifacts and old redacted event logs")]
     Prune {
@@ -800,6 +823,7 @@ fn run_cli(cli: Cli) -> Result<()> {
         Some(Command::Adapter { command }) => run_adapter_command(command),
         Some(Command::Engine { command }) => run_engine_command(command),
         Some(Command::Daemon { command }) => run_daemon_command(command),
+        Some(Command::Ward { command }) => run_ward_command(command),
         Some(Command::Executor { command }) => run_executor_command(command),
         Some(Command::Run {
             harness,
@@ -2678,6 +2702,31 @@ fn run_daemon_command(command: DaemonCommand) -> Result<()> {
                 anyhow::bail!(
                     "coven daemon server is only implemented on Unix-like systems and Windows for now"
                 );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_ward_command(command: WardCommand) -> Result<()> {
+    match command {
+        WardCommand::Migrate {
+            familiar,
+            fingerprint,
+            apply,
+        } => {
+            let home = coven_home_dir()?;
+            let report = ward_migrate::run_migration(
+                &home,
+                ward_migrate::WardMigrateOptions {
+                    familiar,
+                    fingerprint,
+                    apply,
+                },
+            )?;
+            ward_migrate::print_report(&report);
+            if report.has_errors() {
+                bail!("one or more Ward migrations failed or were unmigratable");
             }
         }
     }
@@ -4887,6 +4936,36 @@ mod tests {
 
         let vacuum = Cli::parse_from(["coven", "vacuum"]);
         assert!(matches!(vacuum.command, Some(Command::Vacuum)));
+    }
+
+    #[test]
+    fn cli_parses_ward_migrate_options() {
+        let cli = Cli::parse_from([
+            "coven",
+            "ward",
+            "migrate",
+            "--familiar",
+            "nova",
+            "--fingerprint",
+            "SHA256:test-principal",
+            "--apply",
+        ]);
+
+        match cli.command {
+            Some(Command::Ward {
+                command:
+                    WardCommand::Migrate {
+                        familiar,
+                        fingerprint,
+                        apply,
+                    },
+            }) => {
+                assert_eq!(familiar.as_deref(), Some("nova"));
+                assert_eq!(fingerprint, "SHA256:test-principal");
+                assert!(apply);
+            }
+            other => panic!("expected ward migrate command, got {other:?}"),
+        }
     }
 
     #[test]
