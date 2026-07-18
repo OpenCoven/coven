@@ -2697,6 +2697,14 @@ fn advance_applied_protected_baselines(
 /// unknown familiar and a missing `ward.toml` are structured 404s, an invalid
 /// config is a 500 (`ward_config_invalid`), never a silent default.
 fn familiar_ward_response(coven_home: &Path, familiar_id: &str) -> Result<ApiResponse> {
+    if familiar_id.is_empty() || familiar_id.contains('/') {
+        return api_error(
+            400,
+            "invalid_request",
+            "Familiar id is required and must not contain '/'.",
+            None,
+        );
+    }
     let known = crate::cockpit_sources::read_familiars(coven_home)?
         .into_iter()
         .any(|familiar| familiar.id == familiar_id);
@@ -6291,6 +6299,14 @@ tier = 2
         assert_eq!(response.status, 404);
         let body: serde_json::Value = serde_json::from_str(&response.body)?;
         assert_eq!(body["error"]["code"], "ward_not_configured");
+
+        // Malformed ids are a 400, matching the /icon and /edits contract.
+        for path in ["/api/v1/familiars//ward", "/api/v1/familiars/a/b/ward"] {
+            let response = handle_request("GET", path, home, None)?;
+            assert_eq!(response.status, 400, "path {path}");
+            let body: serde_json::Value = serde_json::from_str(&response.body)?;
+            assert_eq!(body["error"]["code"], "invalid_request");
+        }
         Ok(())
     }
 
