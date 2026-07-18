@@ -216,8 +216,11 @@ pub fn gate_protected_edits(conn: &Connection, req: &GateRequest<'_>) -> Result<
             coven_home,
             &familiar_uuid,
             &request_writer,
-            thread_id,
-            fray,
+            StagingLane {
+                thread_id,
+                fray,
+                review_kind: None,
+            },
             edits,
             now,
         )?;
@@ -563,12 +566,96 @@ pub(crate) fn append_audit_row(
     Ok(())
 }
 
+/// Stage a proposal held **solely** for Gate-3 coherence review (Tier-1
+/// targets) as a pending proposal beside the Tier-0 authority lane
+/// (`docs/design/ward-gate3-coherence.md` G3.1).
+///
+/// Tier-1 surfaces are deliberately not woven, so the staged record carries
+/// `FrayOrSnap::NotCovered { channel: Mutation }` — literally true: no thread
+/// covers the surface — under a fresh `ThreadId`, plus the `reviewKind:
+/// "coherence"` sidecar marker the decide path branches on. One
+/// `proposal_submitted` row lands in the append-only `ward_audit` ledger.
+/// Resolution is PR 4 of the design; until then the existing decide-path
+/// guards keep approval fail-closed.
+pub fn stage_coherence_proposal(
+    conn: &Connection,
+    coven_home: &Path,
+    familiar_id: &str,
+    workspace: &Path,
+    config: &ward::WardConfig,
+    edits: &[ward::FileEdit],
+    authorization: &ward::Authorization,
+) -> Result<(PathBuf, String)> {
+    let request_writer = match &authorization.principal_signature_fingerprint {
+        Some(fp) => threads::WriterId::new(format!("principal:{fp}")),
+        None => threads::WriterId::new("client:unsigned"),
+    };
+    let now = time::OffsetDateTime::now_utc();
+    // Read-only weave view: coherence staging must not bootstrap baselines.
+    let state = build_weave_state(conn, familiar_id, workspace, config, &[], false)?;
+    let thread_id = threads::ThreadId::new();
+    let (pending_path, proposal_id) = stage_pending_proposal(
+        coven_home,
+        &state.familiar_uuid,
+        &request_writer,
+        StagingLane {
+            thread_id,
+            fray: threads::FrayOrSnap::NotCovered {
+                channel: threads::Channel::Mutation,
+            },
+            review_kind: Some("coherence"),
+        },
+        edits,
+        now,
+    )?;
+
+    let files_touched = serde_json::to_string(
+        &edits
+            .iter()
+            .map(|edit| edit.target.as_str())
+            .collect::<Vec<_>>(),
+    )?;
+    let format = time::format_description::well_known::Rfc3339;
+    let now_text = now.format(&format)?;
+    conn.execute(
+        "INSERT INTO ward_audit (
+            event_type, proposal_id, familiar_id, ward_version, ward_hash,
+            tier, decision, approver, diff_hash, files_touched, channel,
+            thread_id, submitted_at, decided_at
+        ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, NULL, NULL, ?7, ?8, ?10, ?9, ?9)",
+        rusqlite::params![
+            threads::AuditEventType::ProposalSubmitted.tag(),
+            proposal_id,
+            familiar_id,
+            state.weave.weave_hash(),
+            i64::from(u8::from(ward::Tier::Reviewed)),
+            "staged:coherence",
+            files_touched,
+            format!("{:?}", threads::Channel::Mutation).to_lowercase(),
+            now_text,
+            thread_id.0.to_string(),
+        ],
+    )
+    .context("appending proposal_submitted audit for coherence staging")?;
+
+    Ok((pending_path, proposal_id))
+}
+
+/// Which review lane a staged proposal belongs to, plus the thread evidence
+/// recorded with it.
+struct StagingLane {
+    thread_id: threads::ThreadId,
+    fray: threads::FrayOrSnap,
+    /// `Some("coherence")` writes the sidecar marker; `None` is the
+    /// authority lane (absent field ⇒ authority for existing files).
+    review_kind: Option<&'static str>,
+}
+
 fn stage_pending_proposal(
     coven_home: &Path,
     familiar_uuid: &threads::FamiliarId,
     writer: &threads::WriterId,
-    thread_id: threads::ThreadId,
-    fray: threads::FrayOrSnap,
+    lane: StagingLane,
     edits: &[ward::FileEdit],
     now: time::OffsetDateTime,
 ) -> Result<(PathBuf, String)> {
@@ -577,8 +664,8 @@ fn stage_pending_proposal(
         familiar_id: *familiar_uuid,
         writer: writer.clone(),
         channel: threads::Channel::Mutation,
-        thread_id,
-        fray,
+        thread_id: lane.thread_id,
+        fray: lane.fray,
         edits: edits
             .iter()
             .map(|edit| threads::StagedEdit {
@@ -593,7 +680,23 @@ fn stage_pending_proposal(
     std::fs::create_dir_all(&pending_dir)
         .with_context(|| format!("creating {}", pending_dir.display()))?;
     let path = pending_dir.join(proposal.file_name());
-    let body = serde_json::to_vec_pretty(&proposal).context("serializing pending proposal")?;
+    let body = {
+        /// On-disk pending-proposal shape: the core type plus the optional
+        /// lane marker (absent ⇒ authority, so existing files and the core
+        /// deserializer keep working unchanged).
+        #[derive(serde::Serialize)]
+        struct StagedProposalFile<'a> {
+            #[serde(flatten)]
+            proposal: &'a threads::PendingProposal,
+            #[serde(rename = "reviewKind", skip_serializing_if = "Option::is_none")]
+            review_kind: Option<&'static str>,
+        }
+        serde_json::to_vec_pretty(&StagedProposalFile {
+            proposal: &proposal,
+            review_kind: lane.review_kind,
+        })
+        .context("serializing pending proposal")?
+    };
     // Atomic sibling-staged write, same discipline as the Ward's own writes.
     let staged = path.with_extension("json.staged");
     std::fs::write(&staged, &body)

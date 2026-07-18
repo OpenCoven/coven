@@ -2643,6 +2643,46 @@ fn apply_familiar_edits(
         );
     }
     if report.is_held() {
+        // Gate 3 (docs/design/ward-gate3-coherence.md G3.1): a proposal held
+        // *solely* for Tier-1 coherence review is staged for the principal
+        // instead of dead-ending. Any authorized-protected hold keeps the
+        // plain `held` shape — mixed proposals stay all-or-nothing.
+        // Stage only when every verdict is cleared-or-coherence — i.e. the
+        // *only* hold reason is Tier-1 review. Anything else (authorized
+        // protected changes today, future verdicts by default) keeps the
+        // plain held shape: fail closed toward the authority lane.
+        let coherence_only = report.changes.iter().all(|change| {
+            matches!(
+                change.decision.verdict,
+                ward::Verdict::Allow
+                    | ward::Verdict::AllowWithLog
+                    | ward::Verdict::RequiresCoherenceReview
+            )
+        });
+        if coherence_only {
+            let conn = store::open_store(&store_path(coven_home))?;
+            let (pending_path, proposal_id) = crate::threads_gate::stage_coherence_proposal(
+                &conn,
+                coven_home,
+                familiar_id,
+                &workspace,
+                &config,
+                &edits,
+                &authorization,
+            )?;
+            return json_response(
+                202,
+                &json!({
+                    "ok": true,
+                    "disposition": "staged",
+                    "reviewKind": "coherence",
+                    "proposalId": proposal_id,
+                    "pendingPath": pending_path.display().to_string(),
+                    "changes": changes,
+                    "threadsGate": threads_gate_json,
+                }),
+            );
+        }
         return json_response(
             202,
             &json!({
@@ -6592,6 +6632,9 @@ tier = 1
         assert_eq!(response.status, 202, "got {}", response.body);
         let body: serde_json::Value = serde_json::from_str(&response.body)?;
         assert_eq!(body["disposition"], "held");
+        // An authorized-protected hold is the authority lane's business —
+        // it must NOT be staged into the Gate-3 coherence lane.
+        assert!(body.get("reviewKind").is_none());
         assert_eq!(
             std::fs::read_to_string(workspace.join("SOUL.md"))?,
             "# Sage\n"
@@ -7190,13 +7233,50 @@ tier = 0
             r#"{"edits":[{"target":"reviewed/skill.md","contents":"tweak"}]}"#,
         )?;
 
+        // Gate 3 G3.1: a pure Tier-1 hold is staged for coherence review
+        // instead of dead-ending as a bare hold. Nothing is written.
         assert_eq!(response.status, 202, "got {}", response.body);
         let body: serde_json::Value = serde_json::from_str(&response.body)?;
-        assert_eq!(body["disposition"], "held");
+        assert_eq!(body["disposition"], "staged");
+        assert_eq!(body["reviewKind"], "coherence");
         assert_eq!(
             body["changes"][0]["verdict"]["kind"],
             "requiresCoherenceReview"
         );
+        assert!(!workspace.join("reviewed/skill.md").exists());
+
+        // The pending file exists, carries the sidecar marker, and still
+        // parses as the core PendingProposal type (marker is additive).
+        let pending_path =
+            std::path::PathBuf::from(body["pendingPath"].as_str().expect("pendingPath present"));
+        let raw = std::fs::read_to_string(&pending_path)?;
+        let staged: serde_json::Value = serde_json::from_str(&raw)?;
+        assert_eq!(staged["reviewKind"], "coherence");
+        let parsed: coven_threads_core::PendingProposal = serde_json::from_str(&raw)?;
+        assert_eq!(parsed.id.0.to_string(), body["proposalId"]);
+        assert_eq!(parsed.edits.len(), 1);
+
+        // One proposal_submitted row landed in the append-only ledger.
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit WHERE event_type = 'proposal_submitted' \
+             AND decision = 'staged:coherence'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, 1);
+
+        // Fail-closed until Gate-3 resolution (PR 4) lands: approving a
+        // coherence proposal 409s; nothing is written.
+        let proposal_id = body["proposalId"].as_str().expect("proposalId");
+        let approve = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+        assert_eq!(approve.status, 409, "got {}", approve.body);
         assert!(!workspace.join("reviewed/skill.md").exists());
         Ok(())
     }
