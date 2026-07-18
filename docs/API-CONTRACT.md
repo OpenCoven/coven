@@ -262,6 +262,21 @@ Unknown action ids return `400` and fail closed:
 }
 ```
 
+## `POST /api/v1/sessions`
+
+Launches a daemon-managed harness session. `model` is optional; when present,
+the daemon forwards the namespaced id through the selected harness adapter.
+Clients that omit it retain the harness's own default model.
+
+```json
+{
+  "projectRoot": "/repo",
+  "harness": "codex",
+  "model": "openai/gpt-5.6-sol",
+  "prompt": "Fix the tests"
+}
+```
+
 ## Session record shape (`v1`)
 
 In `v1`, session responses stay as raw JSON objects using the Rust daemon's snake_case field names.
