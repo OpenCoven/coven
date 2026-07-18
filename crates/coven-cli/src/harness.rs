@@ -968,7 +968,7 @@ const GROK_BUILD_ADAPTER_MANIFEST: &str = r#"{
       "executable": "grok",
       "interactive_prompt_prefix_args": ["--no-auto-update", "--no-alt-screen", "--output-format", "plain"],
       "non_interactive_prompt_prefix_args": ["--no-auto-update", "--no-alt-screen", "--output-format", "plain"],
-      "install_hint": "Install Grok Build with `npm install -g @xai-official/grok` or via the official install guide at https://docs.x.ai/build; make sure `grok` is on PATH and run `grok login` (or set XAI_API_KEY for headless auth), then retry `coven adapter doctor grok`.",
+      "install_hint": "Install Grok Build with the official installer: `curl -fsSL https://x.ai/cli/install.sh | bash` (macOS/Linux) or `irm https://x.ai/cli/install.ps1 | iex` (Windows PowerShell) — see https://docs.x.ai/build. Make sure `grok` is on PATH and run `grok login` (or set XAI_API_KEY for headless auth), then retry `coven adapter doctor grok`.",
       "system_prompt_flag": "--rules",
       "prompt_flag": "--single",
       "interactive_prompt_flag": "--single",

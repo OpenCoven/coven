@@ -18,15 +18,16 @@ The Coven harness id is `grok`; the executable is `grok`.
 <Steps>
   <Step title="Install and authenticate Grok Build">
     ```bash
-    npm install -g @xai-official/grok
+    curl -fsSL https://x.ai/cli/install.sh | bash   # macOS / Linux / Git Bash
+    irm https://x.ai/cli/install.ps1 | iex          # Windows PowerShell
     ```
 
-    Or follow the official install guide at https://docs.x.ai/build. Then authenticate with the CLI:
+    These are the official installers from the Grok Build README; see the install guide at https://docs.x.ai/build for other options. Then authenticate with the CLI:
 
     ```bash
     grok login
     # Headless or remote machine:
-    grok login --device-auth
+    grok login --device-code
     ```
 
     Grok also supports `XAI_API_KEY` for headless automation. Coven does not read, store, or inject that credential; Grok resolves it from its own inherited environment.
@@ -82,6 +83,8 @@ On the flag itself, Grok's source accepts `plan`, `dontAsk`, and `acceptEdits` a
 
 Grok Build does not document a native additional-directory flag, so `coven run grok --add-dir ...` is a warned no-op. Start the session at the intended project root instead.
 
+**`coven chat` turns run in Grok's read-and-answer default.** The chat launch API currently carries no permission field for any harness, so chat turns always launch without `--permission-mode`. For Codex/Claude/Copilot that lands on their non-blocking native defaults; for Grok it lands on the auto-cancel `default` mode described above — chat with Grok can read the project and answer questions, but a turn that tries to edit files or run non-auto-approved commands has those tool calls auto-cancelled (the model is told, and will typically say so in its reply). For edit tasks, use `coven run grok --permission full` directly. Lifting this properly means adding permission plumbing to the chat launch API — a chat-surface change that affects every harness and is out of scope for this recipe.
+
 ## Current maturity
 
 This recipe covers:
@@ -98,7 +101,8 @@ Not yet done, and required before this graduates past experimental:
 - a real authenticated multi-turn smoke test (first turn, resume, read-only vs. full permission enforcement) against a live Grok Build account;
 - live confirmation of the source-verified headless permission behavior (would-prompt tool calls auto-cancelled and reported to the model, never a hang) — note that because an omitted `--permission-mode` leaves headless Grok cancelling writes rather than acting like `full`, the "omit `--permission` ⇒ full" convention cannot be extended to Grok as its CLI stands today, so the explicit-permission-required guidance above is expected to stay;
 - repeating both on Linux and Windows, not just macOS;
-- a continuity story for plain `coven run --continue` (today only chat sessions pre-assign Grok's session id, so plain-CLI resume would target a session Grok never created).
+- a continuity story for plain `coven run --continue` (today only chat sessions pre-assign Grok's session id, so plain-CLI resume would target a session Grok never created);
+- permission plumbing for `coven chat` (the chat launch API passes no `--permission` for any harness; with Grok that means chat turns are read-and-answer only, with mutating tool calls auto-cancelled — see [Permissions](#permissions)).
 
 ## Upstream references
 
