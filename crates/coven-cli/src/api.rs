@@ -2647,10 +2647,18 @@ fn apply_familiar_edits(
         // *solely* for Tier-1 coherence review is staged for the principal
         // instead of dead-ending. Any authorized-protected hold keeps the
         // plain `held` shape — mixed proposals stay all-or-nothing.
-        let coherence_only = report
-            .changes
-            .iter()
-            .all(|change| change.decision.verdict != ward::Verdict::AuthorizedProtectedChange);
+        // Stage only when every verdict is cleared-or-coherence — i.e. the
+        // *only* hold reason is Tier-1 review. Anything else (authorized
+        // protected changes today, future verdicts by default) keeps the
+        // plain held shape: fail closed toward the authority lane.
+        let coherence_only = report.changes.iter().all(|change| {
+            matches!(
+                change.decision.verdict,
+                ward::Verdict::Allow
+                    | ward::Verdict::AllowWithLog
+                    | ward::Verdict::RequiresCoherenceReview
+            )
+        });
         if coherence_only {
             let conn = store::open_store(&store_path(coven_home))?;
             let (pending_path, proposal_id) = crate::threads_gate::stage_coherence_proposal(

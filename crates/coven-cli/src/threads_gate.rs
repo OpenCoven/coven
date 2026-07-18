@@ -593,12 +593,13 @@ pub fn stage_coherence_proposal(
     let now = time::OffsetDateTime::now_utc();
     // Read-only weave view: coherence staging must not bootstrap baselines.
     let state = build_weave_state(conn, familiar_id, workspace, config, &[], false)?;
+    let thread_id = threads::ThreadId::new();
     let (pending_path, proposal_id) = stage_pending_proposal(
         coven_home,
         &state.familiar_uuid,
         &request_writer,
         StagingLane {
-            thread_id: threads::ThreadId::new(),
+            thread_id,
             fray: threads::FrayOrSnap::NotCovered {
                 channel: threads::Channel::Mutation,
             },
@@ -621,7 +622,7 @@ pub fn stage_coherence_proposal(
             event_type, proposal_id, familiar_id, ward_version, ward_hash,
             tier, decision, approver, diff_hash, files_touched, channel,
             thread_id, submitted_at, decided_at
-        ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, NULL, NULL, ?7, ?8, NULL, ?9, ?9)",
+        ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, NULL, NULL, ?7, ?8, ?10, ?9, ?9)",
         rusqlite::params![
             threads::AuditEventType::ProposalSubmitted.tag(),
             proposal_id,
@@ -632,6 +633,7 @@ pub fn stage_coherence_proposal(
             files_touched,
             format!("{:?}", threads::Channel::Mutation).to_lowercase(),
             now_text,
+            thread_id.0.to_string(),
         ],
     )
     .context("appending proposal_submitted audit for coherence staging")?;
@@ -678,18 +680,22 @@ fn stage_pending_proposal(
     std::fs::create_dir_all(&pending_dir)
         .with_context(|| format!("creating {}", pending_dir.display()))?;
     let path = pending_dir.join(proposal.file_name());
-    let body = if let Some(kind) = lane.review_kind {
-        // The marker rides beside the core type's fields (additive; readers
-        // treat an absent field as "authority", so existing files and the
-        // core deserializer keep working unchanged).
-        let mut value = serde_json::to_value(&proposal).context("serializing pending proposal")?;
-        value
-            .as_object_mut()
-            .context("pending proposal serialized as a non-object")?
-            .insert("reviewKind".to_string(), serde_json::json!(kind));
-        serde_json::to_vec_pretty(&value).context("serializing pending proposal")?
-    } else {
-        serde_json::to_vec_pretty(&proposal).context("serializing pending proposal")?
+    let body = {
+        /// On-disk pending-proposal shape: the core type plus the optional
+        /// lane marker (absent ⇒ authority, so existing files and the core
+        /// deserializer keep working unchanged).
+        #[derive(serde::Serialize)]
+        struct StagedProposalFile<'a> {
+            #[serde(flatten)]
+            proposal: &'a threads::PendingProposal,
+            #[serde(rename = "reviewKind", skip_serializing_if = "Option::is_none")]
+            review_kind: Option<&'static str>,
+        }
+        serde_json::to_vec_pretty(&StagedProposalFile {
+            proposal: &proposal,
+            review_kind: lane.review_kind,
+        })
+        .context("serializing pending proposal")?
     };
     // Atomic sibling-staged write, same discipline as the Ward's own writes.
     let staged = path.with_extension("json.staged");
