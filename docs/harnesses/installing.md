@@ -35,6 +35,8 @@ The daemon revalidates the harness id on every launch request. Clients cannot wi
 
 Other CLIs (Hermes, Aider, Gemini CLI, Cline, custom commands) are **not** bundled in v0. Test them through an explicit manifest and `coven adapter doctor`; see [Future harness notes](/FUTURE-HARNESSES) for the adapter direction.
 
+Grok Build has a reviewed **experimental recipe** but is not bundled by default. Install the Grok CLI and authenticate first, then run `coven adapter install grok`; see [Grok Build](/harnesses/grok-build) for the complete setup and permission mapping.
+
 ## Step-by-step install
 
 <Steps>
@@ -135,5 +137,6 @@ coven doctor
 - [Codex harness](/harnesses/codex)
 - [Claude Code harness](/harnesses/claude-code)
 - [Copilot CLI harness](/harnesses/copilot-cli)
+- [Grok Build adapter](/harnesses/grok-build)
 - [Harness adapters](/HARNESS-ADAPTERS)
 - [Future harness notes](/FUTURE-HARNESSES)

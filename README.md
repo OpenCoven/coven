@@ -243,6 +243,8 @@ Choose a repo, choose a harness, get a verified patch.
 | `coven adapter doctor [id]`   | Diagnose all adapters, or one adapter id      |
 | `coven adapter install <id>`  | Install a trusted local adapter recipe        |
 
+Experimental opt-in recipe: `coven adapter install grok` adds the [Grok Build adapter](docs/harnesses/grok-build.md) without promoting it into Coven's bundled default harness set.
+
 ### Daemon lifecycle
 
 | Command                | Action                                         |

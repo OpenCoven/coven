@@ -2225,7 +2225,7 @@ fn should_keep_launch_inline(plan: &CastPlan) -> bool {
 /// turn's conversation via the harness CLI's session-resume mechanism. See
 /// `docs/chat-persistence.md` for the per-harness mechanics.
 fn harness_supports_chat_resume(harness: &str) -> bool {
-    matches!(harness, "claude" | "codex" | "copilot")
+    matches!(harness, "claude" | "codex" | "copilot" | "grok")
 }
 
 /// Whether `data` (a chunk of harness output) indicates the harness rejected
@@ -3808,6 +3808,7 @@ mod tests {
         assert!(harness_supports_chat_resume("claude"));
         assert!(harness_supports_chat_resume("codex"));
         assert!(harness_supports_chat_resume("copilot"));
+        assert!(harness_supports_chat_resume("grok"));
         assert!(!harness_supports_chat_resume("hermes"));
     }
 

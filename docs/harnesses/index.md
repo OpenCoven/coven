@@ -23,6 +23,9 @@ A **harness** is an external coding-agent CLI that Coven can launch and supervis
   <Card title="OpenClaw bridge" href="/harnesses/openclaw" icon="plug">
     External ACP runtime bridge through external OpenClaw bridge plugin.
   </Card>
+  <Card title="Grok Build (experimental)" href="/harnesses/grok-build" icon="terminal">
+    Trusted xAI Grok Build recipe. Installable harness id `grok`.
+  </Card>
   <Card title="Future harnesses" href="/FUTURE-HARNESSES" icon="compass">
     Hermes, Aider, Gemini CLI, Cline — adapter direction and roadmap signals.
   </Card>
@@ -36,12 +39,14 @@ flowchart LR
   Adapter --> CodexAdapter[Codex adapter]
   Adapter --> ClaudeAdapter[Claude adapter]
   Adapter --> CopilotAdapter[Copilot adapter]
+  Adapter -. recipe .-> GrokAdapter[Grok Build adapter]
   Adapter -. future .-> Future[Hermes / Aider / Gemini]
   OpenClaw[OpenClaw] --> Bridge["OpenClaw bridge plugin"]
   Bridge --> Coven
   CodexAdapter --> CodexPty[Codex PTY]
   ClaudeAdapter --> ClaudePty[Claude Code PTY]
   CopilotAdapter --> CopilotPty[Copilot CLI PTY]
+  GrokAdapter --> GrokPty[Grok Build PTY]
 ```
 
 ## What every harness has in common
@@ -88,9 +93,12 @@ See [Provider auth boundary](/harnesses/provider-auth) for the credential-isolat
 
 If `coven doctor` reports a harness as missing, see [Installing harness CLIs](/harnesses/installing).
 
+Grok Build is an experimental opt-in recipe rather than a bundled default. See [Grok Build](/harnesses/grok-build) for its separate CLI and adapter installation steps.
+
 ## Related
 
 - [Provider auth boundary](/harnesses/provider-auth)
 - [OpenClaw bridge](/harnesses/openclaw)
+- [Grok Build adapter](/harnesses/grok-build)
 - [Harness adapter guide](/HARNESS-ADAPTERS)
 - [Future harness notes](/FUTURE-HARNESSES)

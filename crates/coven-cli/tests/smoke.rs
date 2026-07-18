@@ -824,6 +824,108 @@ fn adapter_install_hermes_writes_trusted_manifest() -> anyhow::Result<()> {
 }
 
 #[test]
+fn adapter_install_grok_writes_trusted_manifest() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let coven = coven_bin();
+
+    let install = run_coven(&coven, &coven_home, &path, &["adapter", "install", "grok"])?;
+
+    assert_success("adapter install grok", &install);
+    assert_stdout_contains("adapter install grok", &install, "Installed adapter `grok`");
+    let manifest_path = coven_home.join("adapters").join("grok.json");
+    let manifest = serde_json::from_str::<Value>(&fs::read_to_string(manifest_path)?)?;
+    let adapter = manifest
+        .get("adapters")
+        .and_then(Value::as_array)
+        .and_then(|adapters| adapters.first())
+        .expect("installed manifest should include one adapter");
+    assert_eq!(adapter.get("id").and_then(Value::as_str), Some("grok"));
+    assert_eq!(
+        adapter.get("executable").and_then(Value::as_str),
+        Some("grok")
+    );
+    assert_eq!(
+        adapter.get("prompt_flag").and_then(Value::as_str),
+        Some("--single")
+    );
+    assert_eq!(
+        adapter
+            .get("non_interactive_prompt_prefix_args")
+            .and_then(Value::as_array)
+            .and_then(|args| args.last())
+            .and_then(Value::as_str),
+        Some("plain")
+    );
+
+    // Keep diagnosis independent of whether Grok Build is installed on the
+    // contributor's machine.
+    let doctor = run_coven(
+        &coven,
+        &coven_home,
+        &OsString::new(),
+        &["adapter", "doctor", "grok"],
+    )?;
+    assert_failure("adapter doctor grok", &doctor);
+    assert_stdout_contains("adapter doctor grok", &doctor, "Grok Build");
+    assert_stdout_contains("adapter doctor grok", &doctor, "manifest:");
+    assert_stdout_contains(
+        "adapter doctor grok",
+        &doctor,
+        "Adapter doctor found unavailable adapters",
+    );
+    Ok(())
+}
+
+/// A plain `coven run grok <prompt>` turn: no `--stream-json`, no daemon, no
+/// `--continue`. This is the same shape every `stream: false` harness gets
+/// (Copilot is `stream: false` too) — `run_session`'s `conversation_hint`
+/// stays `None` here regardless of `capabilities.preassigned_session_id`;
+/// only the TUI chat path (`conversation_hint_for_harness` in
+/// `tui/chat/app.rs`, unit-tested there) and the `--stream-json` passthrough
+/// (stream-capable harnesses only) ever assign one. So unlike the
+/// `harness.rs` argv-construction tests above, this test intentionally does
+/// not exercise `--session-id`/`--resume` — that would test a usage pattern
+/// the plain CLI doesn't support for this class of harness, Grok included.
+#[test]
+fn grok_adapter_runs_a_plain_turn() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    let fake_bin = temp_dir.path().join("bin");
+    let repo = temp_dir.path().join("repo");
+    let arg_log = temp_dir.path().join("grok-args.log");
+    fs::create_dir_all(&fake_bin)?;
+    fs::create_dir_all(&repo)?;
+    init_git_repo(&repo)?;
+    write_fake_grok(&fake_bin)?;
+    let path = prepend_path(&fake_bin);
+    let coven = coven_bin();
+
+    let install = run_coven(&coven, &coven_home, &path, &["adapter", "install", "grok"])?;
+    assert_success("adapter install grok", &install);
+    let doctor = run_coven(&coven, &coven_home, &path, &["adapter", "doctor", "grok"])?;
+    assert_success("adapter doctor available grok", &doctor);
+
+    let arg_log_value = arg_log.to_string_lossy().into_owned();
+    let turn = run_coven_in(
+        &coven,
+        &coven_home,
+        &path,
+        &repo,
+        &[("FAKE_GROK_ARG_LOG", arg_log_value.as_str())],
+        &["run", "grok", "explain this repo"],
+    )?;
+    assert_success("Grok turn", &turn);
+    assert_stdout_contains("Grok turn", &turn, "fake grok reply");
+
+    let invocations = fs::read_to_string(&arg_log)?;
+    assert!(invocations.contains("--output-format\nplain\n"));
+    assert!(!invocations.contains("--session-id"));
+    Ok(())
+}
+
+#[test]
 fn adapter_install_hermes_replaces_existing_manifest() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let coven_home = temp_dir.path().join("coven-home");
@@ -1243,6 +1345,27 @@ printf 'fake codex complete: %s\n' "$*"
     let mut permissions = fs::metadata(&codex)?.permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&codex, permissions)?;
+    Ok(())
+}
+
+fn write_fake_grok(fake_bin: &Path) -> anyhow::Result<()> {
+    let grok = fake_bin.join("grok");
+    fs::write(
+        &grok,
+        r#"#!/bin/sh
+if [ -n "$FAKE_GROK_ARG_LOG" ]; then
+  printf 'BEGIN\n' >> "$FAKE_GROK_ARG_LOG"
+  for arg in "$@"; do
+    printf '%s\n' "$arg" >> "$FAKE_GROK_ARG_LOG"
+  done
+fi
+
+printf 'fake grok reply\n'
+"#,
+    )?;
+    let mut permissions = fs::metadata(&grok)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&grok, permissions)?;
     Ok(())
 }
 

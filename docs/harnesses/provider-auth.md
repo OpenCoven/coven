@@ -63,6 +63,7 @@ Clients (CastCodes, comux, the OpenClaw plugin) connect to the local socket. The
 | `codex` | `codex login` | `~/.codex/auth.json` (or platform keychain, depending on Codex version) | Use `codex logout` to revoke. Coven does not need to be restarted. |
 | `claude` | `claude doctor` then follow prompts | `~/.config/anthropic/` and/or system keychain | `claude doctor` is also a general health check; Coven only relies on the binary being present. |
 | `copilot` | `copilot login` | `~/.copilot/` (GitHub device-flow token managed by the CLI) | Use `copilot logout` to revoke. GitHub-side Copilot access is governed by your GitHub plan. |
+| `grok` (experimental recipe) | `grok login` or `grok login --device-auth` | `~/.grok/` and/or provider-managed local auth | `XAI_API_KEY` is also supported for headless use; Coven inherits it but never reads or stores it. |
 
 If the harness's `login` flow itself has a problem (expired refresh token, revoked org, network failure), Coven surfaces this as a normal harness exit — the session ends with whatever exit code the CLI returned, and the event log contains the error message printed by the CLI.
 
