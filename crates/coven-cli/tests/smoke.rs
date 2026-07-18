@@ -11,6 +11,7 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use serde_json::{json, Value};
 
 #[test]
@@ -1320,18 +1321,26 @@ fn wait_for_session_status(
     session_id: &str,
     expected_status: &str,
 ) -> anyhow::Result<()> {
+    let mut last_observed = None;
     wait_until(
         &format!("session {session_id} status {expected_status}"),
         || {
             let (_status, body) =
                 unix_http_request(coven_home, "GET", &format!("/sessions/{session_id}"), None)?;
             let body = serde_json::from_str::<Value>(&body)?;
+            last_observed = Some(body.to_string());
             Ok(body
                 .get("status")
                 .and_then(Value::as_str)
                 .is_some_and(|status| status == expected_status))
         },
     )
+    .with_context(|| {
+        format!(
+            "last observed session response: {}",
+            last_observed.unwrap_or_else(|| "<none>".to_string())
+        )
+    })
 }
 
 fn wait_for_event_text(coven_home: &Path, session_id: &str, needle: &str) -> anyhow::Result<()> {

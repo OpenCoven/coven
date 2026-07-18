@@ -1717,6 +1717,28 @@ pub fn update_session_status(
     Ok(())
 }
 
+pub fn update_session_status_if_current(
+    conn: &Connection,
+    session_id: &str,
+    current_status: &str,
+    status: &str,
+    exit_code: Option<i32>,
+    updated_at: &str,
+) -> Result<bool> {
+    let affected = conn
+        .execute(
+            "UPDATE sessions
+             SET status = ?3,
+                 exit_code = ?4,
+                 updated_at = ?5
+             WHERE id = ?1 AND status = ?2",
+            params![session_id, current_status, status, exit_code, updated_at],
+        )
+        .with_context(|| format!("failed to update session {session_id}"))?;
+
+    Ok(affected > 0)
+}
+
 /// Persist the harness-native id that continues a multi-turn conversation.
 ///
 /// Coven's `id` remains the stable ledger/session id exposed to callers.
@@ -2950,6 +2972,38 @@ mod tests {
         assert_eq!(sessions[0].status, "completed");
         assert_eq!(sessions[0].exit_code, Some(0));
         assert_eq!(sessions[0].updated_at, "2026-04-27T06:01:00Z");
+        Ok(())
+    }
+
+    #[test]
+    fn conditionally_updates_session_status_only_from_expected_current_status() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+        let mut session = session_record("session-1", "2026-04-27T06:00:00Z");
+        session.status = "running".to_string();
+        insert_session(&conn, &session)?;
+
+        assert!(update_session_status_if_current(
+            &conn,
+            "session-1",
+            "running",
+            "killed",
+            None,
+            "2026-04-27T06:01:00Z",
+        )?);
+        assert!(!update_session_status_if_current(
+            &conn,
+            "session-1",
+            "running",
+            "failed",
+            Some(1),
+            "2026-04-27T06:02:00Z",
+        )?);
+
+        let stored = get_session(&conn, "session-1")?.expect("session should exist");
+        assert_eq!(stored.status, "killed");
+        assert_eq!(stored.exit_code, None);
+        assert_eq!(stored.updated_at, "2026-04-27T06:01:00Z");
         Ok(())
     }
 
