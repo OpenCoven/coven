@@ -18,7 +18,7 @@ corresponding daemon API route.
 | Command | Human view | `--json` body |
 |---|---|---|
 | `coven status` | Ecosystem overview | `{ "health": …, "overview": … }` composition of `GET /api/v1/health` and `GET /api/v1/overview` |
-| `coven familiars` | Roster table | `GET /api/v1/familiars` |
+| `coven familiars [<id>]` | Roster table, or one familiar's Ward surface (tiers, protected paths, principal binding) | `GET /api/v1/familiars[/:id/ward]` |
 | `coven skills` | Skill inventory | `GET /api/v1/skills` |
 | `coven memory` | Memory file table | `GET /api/v1/memory` |
 | `coven research` | Research loop log | `GET /api/v1/research` |
@@ -70,6 +70,34 @@ bodies (this shape is owned by the CLI, like `coven daemon status --json`):
 The `health.daemon` block reflects a *live* daemon only; a stale status file
 shows up as `daemon: null` here, while `coven daemon status --json` reports
 the `stale` state explicitly.
+
+## Ward surface inspection
+
+`coven familiars <id>` reads the same `ward.toml` the daemon's
+Ward-enforced write path (`POST /api/v1/familiars/:id/edits`) adjudicates —
+one source of truth for what a familiar's principal has protected:
+
+```text
+Familiar sage — Ward surface
+
+  workspace  /home/x/.coven/familiars/sage
+  principal  SHA256:principal-key
+  unmatched  tier 2 (logged)
+
+  tier              path
+  0      protected  SOUL.md
+  2      logged     memory/
+  3      free       scratch/
+
+  protected: SOUL.md
+```
+
+Tiers: `0` protected (Gate-1 principal signature required), `1` reviewed
+(held for Gate-3 coherence), `2` logged (written with a Gate-4 audit
+record), `3` free. `unmatched` is the tier assigned to paths no surface
+entry matches. An unknown id fails with `familiar_not_found`; a familiar
+without a `ward.toml` fails with `ward_not_configured` — the same
+fail-closed shapes the write path returns.
 
 ## Session inspection without a PTY
 

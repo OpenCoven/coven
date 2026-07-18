@@ -251,6 +251,14 @@ pub fn handle_request_with_runtime(
                 .trim_end_matches("/icon");
             update_familiar_icon(coven_home, id, body)
         }
+        // The declared Ward surface for one familiar — the read-side twin of
+        // the `/edits` write path below (same config, same fail-closed 404s).
+        ("GET", path) if path.starts_with("/familiars/") && path.ends_with("/ward") => {
+            let id = path
+                .trim_start_matches("/familiars/")
+                .trim_end_matches("/ward");
+            familiar_ward_response(coven_home, id)
+        }
         // The Ward-enforced write path into a familiar home. Every write is
         // adjudicated by `ward::Ward::apply` (Gates 1–2, fail-closed, audited).
         ("POST", path) if path.starts_with("/familiars/") && path.ends_with("/edits") => {
@@ -2679,6 +2687,59 @@ fn advance_applied_protected_baselines(
         crate::threads_gate::advance_surface_baseline(&conn, familiar_id, workspace, &surface)?;
     }
     Ok(())
+}
+
+/// `GET /familiars/{id}/ward` — the declared Ward surface for one familiar.
+///
+/// Read-only observability twin of [`apply_familiar_edits`]: it loads the same
+/// `ward.toml` the write path enforces and reports the tiers as adjudicated —
+/// no separate source of truth. Fail-closed shapes mirror the write path: an
+/// unknown familiar and a missing `ward.toml` are structured 404s, an invalid
+/// config is a 500 (`ward_config_invalid`), never a silent default.
+fn familiar_ward_response(coven_home: &Path, familiar_id: &str) -> Result<ApiResponse> {
+    let known = crate::cockpit_sources::read_familiars(coven_home)?
+        .into_iter()
+        .any(|familiar| familiar.id == familiar_id);
+    if !known {
+        return api_error(
+            404,
+            "familiar_not_found",
+            "No familiar with that id is declared in familiars.toml.",
+            Some(json!({ "id": familiar_id })),
+        );
+    }
+    let workspace = crate::cockpit_sources::familiar_workspace(coven_home, familiar_id);
+    let config = match ward::WardConfig::load(&workspace) {
+        Ok(Some(config)) => config,
+        Ok(None) => {
+            return api_error(
+                404,
+                "ward_not_configured",
+                "This familiar has no ward.toml; the Ward-enforced write path is unavailable.",
+                Some(json!({
+                    "id": familiar_id,
+                    "workspace": workspace.to_string_lossy(),
+                })),
+            );
+        }
+        Err(error) => {
+            return api_error(500, "ward_config_invalid", &format!("{error:#}"), None);
+        }
+    };
+    json_response(
+        200,
+        &json!({
+            "ok": true,
+            "familiarId": familiar_id,
+            "workspace": workspace.to_string_lossy(),
+            "ward": {
+                "principalKeyFingerprint": config.principal_key_fingerprint,
+                "defaultTier": config.default_tier,
+                "surface": config.surface,
+                "protectedSurface": config.protected_surface,
+            },
+        }),
+    )
 }
 
 fn threads_weaves_response(coven_home: &Path) -> Result<ApiResponse> {
@@ -6170,6 +6231,66 @@ description = "Reads and synthesizes."
 icon = "ph:leaf-fill"
 "#,
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn familiar_ward_route_reports_declared_surface() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_familiars_toml(home)?;
+        let workspace = home.join("familiars").join("sage");
+        std::fs::create_dir_all(&workspace)?;
+        std::fs::write(
+            workspace.join("ward.toml"),
+            r#"principal_key_fingerprint = "SHA256:principal-key"
+protected_surface = ["SOUL.md"]
+
+[[surface]]
+path = "SOUL.md"
+tier = 0
+
+[[surface]]
+path = "memory/"
+tier = 2
+"#,
+        )?;
+
+        let response = handle_request("GET", "/api/v1/familiars/sage/ward", home, None)?;
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["familiarId"], "sage");
+        assert_eq!(
+            body["ward"]["principalKeyFingerprint"],
+            "SHA256:principal-key"
+        );
+        assert_eq!(body["ward"]["defaultTier"], 2);
+        assert_eq!(body["ward"]["surface"][0]["path"], "SOUL.md");
+        assert_eq!(body["ward"]["surface"][0]["tier"], 0);
+        assert_eq!(body["ward"]["surface"][1]["path"], "memory/");
+        assert_eq!(body["ward"]["surface"][1]["tier"], 2);
+        assert_eq!(body["ward"]["protectedSurface"][0], "SOUL.md");
+        Ok(())
+    }
+
+    #[test]
+    fn familiar_ward_route_fails_closed_on_unknown_and_unconfigured() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_familiars_toml(home)?;
+
+        // Unknown familiar id.
+        let response = handle_request("GET", "/api/v1/familiars/ghost/ward", home, None)?;
+        assert_eq!(response.status, 404);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "familiar_not_found");
+
+        // Known familiar without a ward.toml.
+        let response = handle_request("GET", "/api/v1/familiars/sage/ward", home, None)?;
+        assert_eq!(response.status, 404);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "ward_not_configured");
         Ok(())
     }
 

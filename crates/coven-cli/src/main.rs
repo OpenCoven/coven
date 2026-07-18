@@ -361,6 +361,8 @@ enum Command {
         alias = "familiar"
     )]
     Familiars {
+        #[arg(help = "Familiar id: show its declared Ward surface (tiers) instead of the roster")]
+        id: Option<String>,
         #[arg(long, help = "Print familiars as JSON (machine-readable)")]
         json: bool,
     },
@@ -864,7 +866,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             None => tui::sessions::run_command(all, manage, plain, json),
         },
         Some(Command::Status { json }) => observe::run_status(json),
-        Some(Command::Familiars { json }) => observe::run_familiars(json),
+        Some(Command::Familiars { id, json }) => observe::run_familiars(id.as_deref(), json),
         Some(Command::Skills { json }) => observe::run_skills(json),
         Some(Command::Memory { json }) => observe::run_memory(json),
         Some(Command::Research { json }) => observe::run_research(json),
@@ -3922,7 +3924,17 @@ mod tests {
         ));
         assert!(matches!(
             Cli::parse_from(["coven", "familiars"]).command,
-            Some(Command::Familiars { json: false })
+            Some(Command::Familiars {
+                id: None,
+                json: false
+            })
+        ));
+        assert!(matches!(
+            Cli::parse_from(["coven", "familiars", "nova", "--json"]).command,
+            Some(Command::Familiars {
+                id: Some(_),
+                json: true
+            })
         ));
         assert!(matches!(
             Cli::parse_from(["coven", "skills", "--json"]).command,

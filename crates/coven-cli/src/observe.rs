@@ -267,13 +267,90 @@ fn render_status(
 
 // ── coven familiars / skills / memory / research ─────────────────────────────
 
-pub(crate) fn run_familiars(json: bool) -> Result<()> {
+pub(crate) fn run_familiars(id: Option<&str>, json: bool) -> Result<()> {
     let coven_home = coven_home_dir()?;
-    if json {
-        return print_json(&api_get(&coven_home, "/api/v1/familiars")?);
+    match id {
+        Some(id) => {
+            let body = api_get(&coven_home, &format!("/api/v1/familiars/{id}/ward"))?;
+            if json {
+                return print_json(&body);
+            }
+            print!("{}", render_familiar_ward(&body));
+        }
+        None => {
+            if json {
+                return print_json(&api_get(&coven_home, "/api/v1/familiars")?);
+            }
+            print!("{}", view_text(&coven_home, ObserveView::Familiars)?);
+        }
     }
-    print!("{}", view_text(&coven_home, ObserveView::Familiars)?);
     Ok(())
+}
+
+/// Human name for a Ward tier number (mirrors `ward::Tier`).
+fn tier_label(tier: u64) -> &'static str {
+    match tier {
+        0 => "protected",
+        1 => "reviewed",
+        2 => "logged",
+        3 => "free",
+        _ => "unknown",
+    }
+}
+
+fn render_familiar_ward(body: &Value) -> String {
+    let familiar = body
+        .get("familiarId")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    let ward = body.get("ward").cloned().unwrap_or(Value::Null);
+    let mut out = String::new();
+    out.push_str(&format!("Familiar {familiar} — Ward surface\n\n"));
+    out.push_str(&format!(
+        "  workspace  {}\n",
+        body.get("workspace").and_then(Value::as_str).unwrap_or("?")
+    ));
+    out.push_str(&format!(
+        "  principal  {}\n",
+        str_cell(&ward, "principalKeyFingerprint")
+    ));
+    if let Some(tier) = ward.get("defaultTier").and_then(Value::as_u64) {
+        out.push_str(&format!(
+            "  unmatched  tier {tier} ({})\n",
+            tier_label(tier)
+        ));
+    }
+    let surface = ward
+        .get("surface")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    out.push_str(&format!("\n  {:<6} {:<10} path\n", "tier", ""));
+    for entry in &surface {
+        let tier = entry
+            .get("tier")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::MAX);
+        out.push_str(&format!(
+            "  {:<6} {:<10} {}\n",
+            tier,
+            tier_label(tier),
+            entry.get("path").and_then(Value::as_str).unwrap_or("?")
+        ));
+    }
+    let protected = ward
+        .get("protectedSurface")
+        .and_then(Value::as_array)
+        .map(|paths| {
+            paths
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    out.push_str(&format!("\n  protected: {protected}\n"));
+    out
 }
 
 fn render_familiars(body: &Value) -> String {
@@ -1322,6 +1399,36 @@ mod tests {
         assert!(out.contains("nova → sage"));
         assert!(out.contains("running"));
         assert!(out.contains("coven calls <id>"));
+    }
+
+    #[test]
+    fn render_familiar_ward_shows_tiers_and_protected_surface() {
+        let body = json!({
+            "ok": true,
+            "familiarId": "sage",
+            "workspace": "/home/x/.coven/familiars/sage",
+            "ward": {
+                "principalKeyFingerprint": "SHA256:principal-key",
+                "defaultTier": 2,
+                "surface": [
+                    { "path": "SOUL.md", "tier": 0 },
+                    { "path": "memory/", "tier": 2 },
+                    { "path": "scratch/", "tier": 3 }
+                ],
+                "protectedSurface": ["SOUL.md"]
+            }
+        });
+        let text = render_familiar_ward(&body);
+
+        assert!(text.contains("Familiar sage — Ward surface"));
+        assert!(text.contains("/home/x/.coven/familiars/sage"));
+        assert!(text.contains("SHA256:principal-key"));
+        assert!(text.contains("tier 2 (logged)"));
+        assert!(text.contains("protected"));
+        assert!(text.contains("SOUL.md"));
+        assert!(text.contains("free"));
+        assert!(text.contains("scratch/"));
+        assert!(text.contains("protected: SOUL.md"));
     }
 
     #[test]

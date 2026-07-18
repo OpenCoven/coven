@@ -61,6 +61,7 @@ These power `coven status`, `coven familiars`, `coven skills`, `coven memory`, `
 |---|---|---|---|
 | GET | `/api/v1/overview` | Dashboard aggregate: open sessions, roster/skill/research counts. | overview object |
 | GET | `/api/v1/familiars` | Familiar roster from `familiars.toml`. | `FamiliarDto[]` |
+| GET | `/api/v1/familiars/:id/ward` | One familiar's declared Ward surface (tiers, protected paths, principal binding) — the read twin of `/familiars/:id/edits`. | `{ ok, familiarId, workspace, ward }` · `404 familiar_not_found` / `404 ward_not_configured` |
 | GET | `/api/v1/skills` | Installed skills from `~/.coven/skills/`. | `SkillDto[]` |
 | GET | `/api/v1/memory` | Familiar memory files from `~/.coven/memory/`. | memory list |
 | GET | `/api/v1/research` | Research loop log rows. | research list |
