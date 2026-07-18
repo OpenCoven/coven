@@ -628,9 +628,10 @@ fn record_session_exit(
                 } else {
                     result.status
                 };
-            crate::store::update_session_status(
+            crate::store::update_session_status_if_current(
                 &conn,
                 session_id,
+                "running",
                 persisted_status,
                 result.exit_code,
                 &crate::api::current_timestamp(),

@@ -3548,7 +3548,7 @@ exit 0
             Ok(())
         })?;
 
-        let args = std::fs::read_to_string(temp_dir.path().join("args.txt"))?;
+        let args = read_side_effect_file(temp_dir.path().join("args.txt"))?;
         assert!(
             args.contains("exec --json -- -"),
             "unexpected argv: {args:?}"
@@ -3557,7 +3557,7 @@ exit 0
             !args.contains("first line") && !args.contains("second line"),
             "the multiline user prompt must not reach cmd.exe argv: {args:?}"
         );
-        let stdin = std::fs::read_to_string(temp_dir.path().join("stdin.txt"))?;
+        let stdin = read_side_effect_file(temp_dir.path().join("stdin.txt"))?;
         assert!(
             stdin.contains("first line"),
             "missing first stdin line: {stdin:?}"
@@ -3570,6 +3570,29 @@ exit 0
         assert_eq!(outcome.harness_session_id.as_deref(), Some("thread-456"));
         assert!(outcome.error.is_none());
         Ok(())
+    }
+
+    #[cfg(windows)]
+    fn read_side_effect_file(path: PathBuf) -> anyhow::Result<String> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut last_error = None;
+        while Instant::now() < deadline {
+            match std::fs::read_to_string(&path) {
+                Ok(contents) => return Ok(contents),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    last_error = Some(error);
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("failed reading {path:?}"))
+                }
+            }
+        }
+        match last_error {
+            Some(error) => Err(error)
+                .with_context(|| format!("timed out waiting for batch side-effect file {path:?}")),
+            None => anyhow::bail!("timed out waiting for batch side-effect file {path:?}"),
+        }
     }
 
     #[cfg(windows)]
