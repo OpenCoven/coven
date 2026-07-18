@@ -22,6 +22,30 @@ staged proposal so the principal decides with evidence, and (c) keeping the
 principal's explicit approval as the only transition from *held* to *applied*.
 Model-scored probes and any auto-approval are explicitly out of scope for v1.
 
+## Non-goals
+
+The following are stated non-goals for Gate 3 v1 **and for the Ward contract
+generally**. Any future proposal to relax one of these is a Ward-spec-level
+amendment (RFC-0001 change), not an implementation choice at the Gate 3 layer.
+
+- **Model-scored probes as gate inputs.** Probes at Gate 3 may become
+  model-scored in a later version, but their role remains advisory: they
+  inform the principal's decision, they never gate the transition from
+  *held* to *applied* on their own.
+- **Auto-approval on any probe score, at any threshold.** No probe result —
+  deterministic or model-scored, single-probe or aggregate — ever transitions
+  a held proposal to *applied* without an explicit principal decision. The
+  principal is the sole approver of identity and memory changes; this is a
+  property of the Ward, not a tunable of Gate 3.
+- **Probe evidence as a substitute for the principal's read.** Probes surface
+  what a deterministic check can see (parse, size delta, protected-region
+  touch, pattern lint). They do not summarize intent, drift risk, or
+  identity coherence — those remain the principal's judgment.
+- **Ward-side coherence policy.** Gate 3 evaluates whether a change is
+  *reviewable* (probes ran, staleness known, principal decides). It does not
+  encode what *coherent* means for a given familiar — that lives in the
+  familiar's declared surface and the principal's contract with it.
+
 ## Current state (verified on main @ b98504c)
 
 What already exists — Gate 3 must compose with all of it:
@@ -176,10 +200,15 @@ with evidence:
    coherence lane). Alternative: weave Tier-1 surfaces with a distinct
    channel so drift-fraying covers them too — heavier, and it moves the
    design into coven-threads-core territory (new upstream work).
-4. **Future auto-approval.** When model-scored probes arrive, does any probe
-   score ever auto-approve, or do probes remain forever advisory with the
-   principal as the only approver? v1 assumes the latter; recording the
-   intended end-state now prevents contract drift.
+4. **Model-scored probe integration path.** The Non-goals section states
+   that no probe — deterministic or model-scored — ever auto-approves a
+   held proposal; the principal is always the sole approver. The remaining
+   open question is *how* model-scored probes, when they arrive, are
+   surfaced as advisory evidence: as a separate `advisory_probes` block
+   distinct from deterministic `probes` (so principals can see at a glance
+   which evidence is machine-judged vs. deterministic), or interleaved with
+   a `kind: "advisory"` marker per entry. This is a presentation decision,
+   not a policy one — the policy is settled in Non-goals.
 
 ## References
 
