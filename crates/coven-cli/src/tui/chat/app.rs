@@ -2235,7 +2235,12 @@ fn harness_supports_chat_resume(harness: &str) -> bool {
 /// `docs/chat-persistence.md` under "stale-id auto-recovery". Copilot needs
 /// no arm here: chat resumes it through `--session-id`, which re-creates a
 /// fresh session under the same id when the prior one is gone instead of
-/// erroring.
+/// erroring. Grok's `--resume` is strict like claude's (its `--session-id`
+/// refuses ids that already exist, so it can't serve as a self-healing
+/// resume flag), and a missing session fails with "Session does not exist"
+/// on stderr — which shares the harness PTY, so the same output-text
+/// matching covers it even though grok, unlike claude/codex, also exits
+/// non-zero.
 ///
 /// The match is a broad `contains` because callers scope the input
 /// before passing it in. For Stream mode `push_event_message` skips the
@@ -2252,6 +2257,7 @@ fn detect_stale_session(harness: &str, data: &str) -> bool {
         "codex" => {
             data.contains("no rollout found for thread id") || data.contains("thread/resume failed")
         }
+        "grok" => data.contains("Session does not exist"),
         _ => false,
     }
 }
@@ -3801,6 +3807,12 @@ mod tests {
             "copilot",
             "No conversation found with session ID: x"
         ));
+        // Grok's strict `--resume` against a wiped session store.
+        assert!(detect_stale_session(
+            "grok",
+            "Error: Session does not exist"
+        ));
+        assert!(!detect_stale_session("grok", "fake grok reply"));
     }
 
     #[test]

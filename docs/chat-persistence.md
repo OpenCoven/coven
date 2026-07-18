@@ -10,6 +10,7 @@ extend the mechanism to additional harnesses.
 | `claude` | ✅ stream-mode | Long-lived `claude --print --input-format stream-json --output-format stream-json --verbose` daemon process per chat, plus `--session-id <uuid>` on the first turn and `--resume <uuid>` for cross-restart continuation. Turn 1 spawns + sends initial user envelope; turns 2..N pipe a new user envelope into the same stdin (no cold-start). Unix kills the stream process tree with `setsid()` + `kill(-pid, SIGKILL)`; Windows uses a Job Object owned by the daemon. |
 | `codex` | ✅ per-turn | Chat runs plain `codex exec …`; it captures `session id: <uuid>` from output and feeds it back as `codex exec … resume <uuid> <prompt>` on later turns. `coven run codex --stream-json` separately uses Codex's one-shot `exec --json` protocol, but Codex has no long-lived stream mode, so each chat turn cold-starts. |
 | `copilot` | ✅ per-turn | Chat pre-assigns a UUID on turn 1 (`copilot --session-id <uuid> --prompt=…`) and sends the same `--session-id <uuid>` on later turns. Copilot has no long-lived stream mode, so each chat turn cold-starts. `--session-id` resumes an existing session *or* creates a fresh one under that id, so stale ids self-heal instead of erroring. |
+| `grok` (experimental recipe) | ✅ per-turn | Chat pre-assigns a UUID on turn 1 (`grok … --session-id <uuid> --single=…`) and cold-starts later turns with `--resume <uuid>`. Unlike Copilot, the two flags are not interchangeable: `--session-id` refuses an id that already exists ("Session ID … is already in use") and `--resume` refuses an id that doesn't ("Session does not exist"), so stale ids are handled by the auto-recovery arm below rather than self-healing. |
 
 Conversations persist across `coven chat` invocations on a per-project basis:
 on startup the chat seeds its in-memory map from
@@ -144,7 +145,8 @@ CLI's own session API avoids both problems.
 - **Stale ids** — auto-recovered with auto-retry, raw error hidden. If the
   harness CLI rejects our `Resume` because the prior session no longer
   exists (claude: `No conversation found with session ID:`; codex: `no
-  rollout found for thread id` / `thread/resume failed`), the chat detects
+  rollout found for thread id` / `thread/resume failed`; grok: `Session
+  does not exist`), the chat detects
   the message in the output stream, drops the id from both memory and disk,
   re-sends the user's original prompt with no resume hint, **and**
   suppresses every remaining event from the failed daemon session (the
@@ -157,7 +159,9 @@ CLI's own session API avoids both problems.
   Bounded to one auto-retry per user turn — a second stale event in the
   same turn falls back to "Send your message again to start a fresh one."
   so a degenerate loop can't pile up launches. Detection uses output-text
-  matching because both harnesses exit 0 on the stale-id error.
+  matching because claude and codex exit 0 on the stale-id error (grok
+  exits non-zero, but its stderr shares the PTY, so the same matching
+  covers it).
 - **`/attach`ed sessions.** Typing while attached to a session launched by
   `coven run` (not by chat) still forwards to that session's stdin — the
   resume path only applies to sessions chat itself launched.
