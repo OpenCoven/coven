@@ -2750,6 +2750,8 @@ fn familiar_ward_response(coven_home: &Path, familiar_id: &str) -> Result<ApiRes
     )
 }
 
+const DEGRADED_WARD_CONFIG_UNPARSEABLE: &str = "ward-config-unparseable";
+
 fn threads_weaves_response(coven_home: &Path) -> Result<ApiResponse> {
     let conn = store::open_store(&store_path(coven_home))?;
     let mut entries = Vec::new();
@@ -2765,6 +2767,13 @@ fn threads_weaves_response(coven_home: &Path) -> Result<ApiResponse> {
                 );
                 eprintln!("coven daemon: {message}");
                 crate::daemon::append_daemon_recovery_log(coven_home, &message);
+                entries.push(json!({
+                    "degraded": {
+                        "familiarId": familiar.id,
+                        "reason": DEGRADED_WARD_CONFIG_UNPARSEABLE,
+                        "error": sanitize_ward_config_error(&error, &workspace),
+                    }
+                }));
                 continue;
             }
         };
@@ -2785,6 +2794,20 @@ fn threads_weaves_response(coven_home: &Path) -> Result<ApiResponse> {
         entries.push(json!({ "weave": weave, "coherence": coherence }));
     }
     json_response(200, &entries)
+}
+
+fn sanitize_ward_config_error(error: &anyhow::Error, workspace: &Path) -> String {
+    let ward_path = workspace.join(ward::WARD_CONFIG_FILE);
+    let mut sanitized = format!("{error:#}");
+    let ward_path_display = ward_path.display().to_string();
+    if !ward_path_display.is_empty() {
+        sanitized = sanitized.replace(&ward_path_display, ward::WARD_CONFIG_FILE);
+    }
+    let workspace_display = workspace.display().to_string();
+    if !workspace_display.is_empty() {
+        sanitized = sanitized.replace(&workspace_display, ".");
+    }
+    sanitized.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn decide_threads_proposal(
@@ -6771,10 +6794,60 @@ tier = 0
         let entries = body.as_array().expect("weaves response is an array");
         assert_eq!(
             entries.len(),
-            1,
-            "malformed cody ward must not abort or appear"
+            2,
+            "malformed cody ward must not abort healthy weave or vanish"
         );
+        let healthy = entries
+            .iter()
+            .find(|entry| entry.get("weave").is_some())
+            .expect("healthy weave is still listed");
+        assert_eq!(healthy["weave"]["familiar_id"], "sage");
+        let degraded = entries
+            .iter()
+            .find_map(|entry| entry.get("degraded"))
+            .expect("malformed ward appears as a degraded familiar");
+        assert_eq!(degraded["familiarId"], "cody");
+        assert_eq!(degraded["reason"], "ward-config-unparseable");
+        let error = degraded["error"].as_str().expect("error string");
+        assert!(
+            !error.contains('\n'),
+            "error must be single-line: {error:?}"
+        );
+        assert!(
+            error.contains("ward.toml"),
+            "error names ward.toml: {error}"
+        );
+        assert!(
+            !error.contains(&home.display().to_string()),
+            "error must not leak absolute home path: {error}"
+        );
+        assert!(
+            !error.contains("/familiars/cody/ward.toml"),
+            "error must not leak rooted ward path: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn threads_weaves_omits_familiars_without_ward_toml() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_warded_familiar(home)?;
+        let cody_workspace = home.join("familiars").join("cody");
+        std::fs::create_dir_all(&cody_workspace)?;
+        std::fs::write(cody_workspace.join("SOUL.md"), "# Cody\n")?;
+
+        let response = handle_request("GET", "/api/v1/threads/weaves", home, None)?;
+
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        let entries = body.as_array().expect("weaves response is an array");
+        assert_eq!(entries.len(), 1, "no-ward familiar should be skipped");
         assert_eq!(entries[0]["weave"]["familiar_id"], "sage");
+        assert!(
+            entries.iter().all(|entry| entry.get("degraded").is_none()),
+            "no-ward familiar is not degraded: {entries:?}"
+        );
         Ok(())
     }
 
