@@ -44,8 +44,8 @@ What already exists — Gate 3 must compose with all of it:
 - **Audit ledger**: `ward_audit` (append-only, UPDATE/DELETE-abort triggers)
   already carries `proposal_submitted` / `proposal_approved` /
   `proposal_rejected` / `validation_verdict` tags.
-- **Observability**: `GET /familiars/:id/ward` + `coven familiars <id>`
-  (#417) expose the declared surface; `GET /threads/weaves` exposes weave
+- **Observability**: `GET /api/v1/familiars/:id/ward` + `coven familiars <id>`
+  (#417) expose the declared surface; `GET /api/v1/threads/weaves` exposes weave
   state.
 
 ## The gaps
@@ -59,7 +59,7 @@ What already exists — Gate 3 must compose with all of it:
    that checks a proposed identity/memory change against the familiar's
    declared invariants before it is applied.
 3. **No pending-proposal read surface.** `~/.coven/pending/` files and the
-   approve/reject routes exist, but there is no `GET /threads/proposals`
+   approve/reject routes exist, but there is no `GET /api/v1/threads/proposals`
    list, no CLI verb, and no reference doc — a principal cannot discover
    what is waiting without `ls`.
 
@@ -69,7 +69,7 @@ What already exists — Gate 3 must compose with all of it:
 
 When `Ward::apply` would hold a proposal **solely** for
 `RequiresCoherenceReview` (no blocked targets, no Tier-0 targets — those
-already route through the threads gate first), the `/familiars/:id/edits`
+already route through the threads gate first), the `/api/v1/familiars/:id/edits`
 handler stages it at `~/.coven/pending/` using the same `PendingProposal`
 shape, marked so the decide path knows which re-apply primitive to use:
 
@@ -133,7 +133,7 @@ with evidence:
 
 ### Compatibility and invariants
 
-- The write path stays single: `POST /familiars/:id/edits` remains the only
+- The write path stays single: `POST /api/v1/familiars/:id/edits` remains the only
   arbitrary-file write surface; approval routes only re-drive it through the
   Ward's own primitives. No new write authority is created.
 - All-or-nothing holds are preserved: mixed proposals (Tier-0 + Tier-1)
@@ -150,7 +150,7 @@ with evidence:
 ## Implementation decomposition (one PR each)
 
 1. `PendingProposal.review_kind` marker + Tier-1 staging in
-   `/familiars/:id/edits` + `proposal_submitted` audit + tests
+   `/api/v1/familiars/:id/edits` + `proposal_submitted` audit + tests
    (staged/held/mixed shapes).
 2. Probe engine (`ward_probes.rs`): the four deterministic probes +
    `[[probe]]` config parsing + results embedded at staging time + tests.
