@@ -3511,11 +3511,15 @@ exit 0
     fn codex_json_batch_shim_uses_stdin_and_emits_assistant_text() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let batch = temp_dir.path().join("fake-codex.cmd");
+        // Copy stdin with findstr (a native, always-present binary with no
+        // cold start): PowerShell's multi-second startup on loaded runners
+        // outlived even a 10s activity deadline and flaked this test twice
+        // (issue #407).
         std::fs::write(
             &batch,
             concat!(
                 "@echo off\r\n",
-                "\"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -Command \"$inputStream=[Console]::OpenStandardInput(); $outputStream=[IO.File]::Open('stdin.txt',[IO.FileMode]::Create); $inputStream.CopyTo($outputStream); $outputStream.Dispose()\"\r\n",
+                "\"%SystemRoot%\\System32\\findstr.exe\" \"^\" > stdin.txt\r\n",
                 "echo %* > args.txt\r\n",
                 "echo {\"type\":\"thread.started\",\"thread_id\":\"thread-456\"}\r\n",
                 "echo {\"type\":\"item.completed\",\"item\":{\"id\":\"item-1\",\"type\":\"agent_message\",\"text\":\"reply from Codex\"}}\r\n",
@@ -3536,9 +3540,9 @@ exit 0
         };
         let mut assistant = Vec::new();
 
-        // PowerShell can take several seconds to cold-start on a loaded
-        // Windows runner. This test exercises stdin and JSONL framing, not the
-        // activity deadline, so leave enough headroom for process startup.
+        // Generous headroom for shim process startup on a loaded Windows
+        // runner (issue #407). This test exercises stdin and JSONL framing,
+        // not the activity deadline.
         let outcome = stream_codex_json_with_timeout(&command, Duration::from_secs(10), |text| {
             assistant.push(text.to_string());
             Ok(())

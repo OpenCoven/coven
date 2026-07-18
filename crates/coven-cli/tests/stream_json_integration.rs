@@ -512,7 +512,9 @@ description = "Windows Codex regression fixture"
         &fake_codex,
         concat!(
             "@echo off\r\n",
-            "\"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -Command \"$inputStream=[Console]::OpenStandardInput(); $outputStream=[IO.File]::Open('stdin.txt',[IO.FileMode]::Create); $inputStream.CopyTo($outputStream); $outputStream.Dispose()\"\r\n",
+            // findstr copies stdin without PowerShell's multi-second cold
+            // start, which flaked the sibling pty_runner test (issue #407).
+            "\"%SystemRoot%\\System32\\findstr.exe\" \"^\" > stdin.txt\r\n",
             "echo %* > args.txt\r\n",
             "echo {\"type\":\"thread.started\",\"thread_id\":\"thread-789\"}\r\n",
             "echo {\"type\":\"turn.started\"}\r\n",
