@@ -945,14 +945,18 @@ pub fn known_adapter_manifest(adapter_id: &str) -> Option<&'static str> {
 // notices, max-turns) is routed to stderr. That means Coven treats Grok like
 // any other one-shot CLI (Codex, Hermes): no protocol translation needed.
 //
-// Known gap: unlike Codex/Claude/Copilot, Grok is an interactive-first tool
-// that also supports headless use, and Coven has not yet verified what its
-// native permission mode does in headless mode when `--permission` is
-// omitted entirely (every other harness's native default is known to be
-// non-blocking one-shot; Grok's has not been confirmed). Until verified,
-// `docs/harnesses/grok-build.md` tells users to always pass `--permission`
-// explicitly with Grok rather than relying on the omitted-means-Full
-// convention documented on `HarnessLaunchOptions::permission`.
+// Permission caveat: per Grok Build's public source, its headless runner
+// never blocks on approvals — any tool call that would prompt is
+// auto-cancelled and reported to the model, which continues the turn. So
+// with `--permission` omitted, headless Grok stays in its `default` mode
+// and silently cancels every non-auto-approved (i.e. mutating) call —
+// nothing like Full. The omitted-means-Full convention documented on
+// `HarnessLaunchOptions::permission` therefore does not extend to Grok,
+// and `docs/harnesses/grok-build.md` tells users to always pass
+// `--permission` explicitly. (The flag itself only activates
+// `bypassPermissions` and `default`; `plan`/`dontAsk`/`acceptEdits` are
+// accepted for compatibility but are settings-file-only, so those modes
+// are unreachable from a manifest.)
 //
 // Keep this as an opt-in trusted recipe until maintainers promote it into
 // the bundled harness set.
