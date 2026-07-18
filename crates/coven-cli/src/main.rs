@@ -2037,7 +2037,16 @@ fn run_adapter_install(adapter: &str) -> Result<()> {
 
     println!("Next steps:");
     println!("  coven adapter doctor {adapter}");
-    println!("  coven run {adapter} \"what is in this project?\"");
+    // Grok's contract requires an explicit --permission (its headless mode
+    // auto-cancels would-prompt tool calls when `--permission` is omitted,
+    // so the usual omitted-means-full convention doesn't apply — see the
+    // manifest notes in harness.rs and docs/harnesses/grok-build.md). Teach
+    // the documented invocation instead of one the docs call unsupported.
+    if adapter == "grok" {
+        println!("  coven run grok --permission full \"what is in this project?\"");
+    } else {
+        println!("  coven run {adapter} \"what is in this project?\"");
+    }
     Ok(())
 }
 

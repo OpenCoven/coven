@@ -145,8 +145,8 @@ CLI's own session API avoids both problems.
 - **Stale ids** — auto-recovered with auto-retry, raw error hidden. If the
   harness CLI rejects our `Resume` because the prior session no longer
   exists (claude: `No conversation found with session ID:`; codex: `no
-  rollout found for thread id` / `thread/resume failed`; grok: `Session
-  does not exist`), the chat detects
+  rollout found for thread id` / `thread/resume failed`; grok: the full
+  printed line `Error: Session does not exist`), the chat detects
   the message in the output stream, drops the id from both memory and disk,
   re-sends the user's original prompt with no resume hint, **and**
   suppresses every remaining event from the failed daemon session (the

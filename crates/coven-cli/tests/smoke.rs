@@ -834,6 +834,15 @@ fn adapter_install_grok_writes_trusted_manifest() -> anyhow::Result<()> {
 
     assert_success("adapter install grok", &install);
     assert_stdout_contains("adapter install grok", &install, "Installed adapter `grok`");
+    // The suggested first run must carry an explicit --permission: Grok's
+    // documented contract treats an omitted --permission as unsupported
+    // (headless Grok auto-cancels would-prompt tool calls instead of
+    // behaving like `full`).
+    assert_stdout_contains(
+        "adapter install grok",
+        &install,
+        "coven run grok --permission full",
+    );
     let manifest_path = coven_home.join("adapters").join("grok.json");
     let manifest = serde_json::from_str::<Value>(&fs::read_to_string(manifest_path)?)?;
     let adapter = manifest
