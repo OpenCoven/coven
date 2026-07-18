@@ -648,6 +648,13 @@ enum EngineCommand {
 
 #[derive(Subcommand, Debug)]
 enum WardCommand {
+    #[command(about = "List pending Ward proposals awaiting the principal")]
+    Pending {
+        #[arg(help = "Proposal id: show one staged proposal instead of the list")]
+        id: Option<String>,
+        #[arg(long, help = "Print proposals as JSON (machine-readable)")]
+        json: bool,
+    },
     #[command(about = "Migrate Ward v0.1 ward.toml files to Phase-2 WardConfig")]
     Migrate {
         #[arg(long, value_name = "ID", help = "Only migrate the named familiar")]
@@ -2719,6 +2726,9 @@ fn run_daemon_command(command: DaemonCommand) -> Result<()> {
 
 fn run_ward_command(command: WardCommand) -> Result<()> {
     match command {
+        WardCommand::Pending { id, json } => {
+            return observe::run_ward_pending(id.as_deref(), json);
+        }
         WardCommand::Migrate {
             familiar,
             fingerprint,

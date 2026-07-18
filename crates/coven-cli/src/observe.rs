@@ -492,6 +492,105 @@ fn render_research(body: &Value) -> String {
     out
 }
 
+// ── coven ward pending ───────────────────────────────────────────────────────
+
+pub(crate) fn run_ward_pending(id: Option<&str>, json: bool) -> Result<()> {
+    let coven_home = coven_home_dir()?;
+    match id {
+        Some(id) => {
+            let body = api_get(&coven_home, &format!("/api/v1/threads/proposals/{id}"))?;
+            if json {
+                return print_json(&body);
+            }
+            print!("{}", render_ward_proposal(&body["proposal"]));
+        }
+        None => {
+            let body = api_get(&coven_home, "/api/v1/threads/proposals")?;
+            if json {
+                return print_json(&body);
+            }
+            print!("{}", render_ward_pending(&body));
+        }
+    }
+    Ok(())
+}
+
+fn render_ward_pending(body: &Value) -> String {
+    let proposals = body
+        .get("proposals")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if proposals.is_empty() {
+        return "No pending Ward proposals.\n\
+                Held Tier-0/Tier-1 writes stage here for the principal's decision.\n"
+            .to_string();
+    }
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{:<38} {:<12} {:<10} {:<22} targets\n",
+        "proposal", "familiar", "review", "staged"
+    ));
+    for proposal in &proposals {
+        if let Some(degraded) = proposal.get("degraded") {
+            out.push_str(&format!(
+                "{:<38} (degraded: {})\n",
+                str_cell(degraded, "file"),
+                str_cell(degraded, "reason"),
+            ));
+            continue;
+        }
+        out.push_str(&format!(
+            "{:<38} {:<12} {:<10} {:<22} {}\n",
+            str_cell(proposal, "proposalId"),
+            str_cell(proposal, "familiarId"),
+            str_cell(proposal, "reviewKind"),
+            str_cell(proposal, "stagedAt"),
+            proposal
+                .get("targets")
+                .and_then(Value::as_array)
+                .map(|targets| targets
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", "))
+                .unwrap_or_default(),
+        ));
+    }
+    out.push_str(
+        "\nDecide with the daemon API: POST /api/v1/threads/proposals/<id>/approve|reject\n",
+    );
+    out
+}
+
+fn render_ward_proposal(proposal: &Value) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "Ward proposal {}\n\n",
+        str_cell(proposal, "proposalId")
+    ));
+    out.push_str(&format!(
+        "  familiar   {}\n",
+        str_cell(proposal, "familiarId")
+    ));
+    out.push_str(&format!(
+        "  review     {}\n",
+        str_cell(proposal, "reviewKind")
+    ));
+    out.push_str(&format!("  writer     {}\n", str_cell(proposal, "writer")));
+    out.push_str(&format!(
+        "  staged     {}\n",
+        str_cell(proposal, "stagedAt")
+    ));
+    out.push_str("  targets\n");
+    if let Some(targets) = proposal.get("targets").and_then(Value::as_array) {
+        for target in targets.iter().filter_map(Value::as_str) {
+            out.push_str(&format!("    {target}\n"));
+        }
+    }
+    out
+}
+
 // ── coven calls ──────────────────────────────────────────────────────────────
 
 pub(crate) fn run_calls(id: Option<&str>, json: bool) -> Result<()> {

@@ -77,6 +77,21 @@ These power `coven status`, `coven familiars`, `coven skills`, `coven memory`, `
 | PUT | `/api/v1/familiars/:id/icon` | Update a familiar's icon glyph. | updated familiar | `400`, `404` |
 | POST | `/api/v1/familiars/:id/edits` | Ward-adjudicated writes into a familiar home (Gates 1–2, fail-closed, audited). | edit report | `400`, `403` (ward denial), `404` |
 
+## Ward proposals (threads)
+
+Held Ward writes stage at `~/.coven/pending/` for the principal —
+Tier-0 authority degradations and Tier-1 coherence holds, distinguished by
+`reviewKind` (`authority` / `coherence`). See
+[cli-ward](cli-ward.md) and `docs/design/ward-gate3-coherence.md`.
+
+| Method | Path | Purpose | Success | Errors |
+|---|---|---|---|---|
+| GET | `/api/v1/threads/weaves` | Per-familiar weave/authority state (degraded configs reported inline). | weave entries | — |
+| GET | `/api/v1/threads/proposals` | Pending proposals (unparseable files reported as `degraded` entries, newest first). | `{ proposals }` | — |
+| GET | `/api/v1/threads/proposals/:id` | One pending proposal. | `{ proposal }` | `400 invalid_request` / `404 proposal_not_found` |
+| POST | `/api/v1/threads/proposals/:id/approve` | Re-validate and apply a staged authority proposal (coherence approval lands with Gate 3 PR 4). | decision report | `400`, `404`, `409` |
+| POST | `/api/v1/threads/proposals/:id/reject` | Reject and remove a staged proposal (audited). | decision report | `400`, `404`, `409` |
+
 ## Skills: eval-loop
 
 | Method | Path | Purpose | Success | Errors |

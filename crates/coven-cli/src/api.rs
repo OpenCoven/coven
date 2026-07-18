@@ -268,6 +268,20 @@ pub fn handle_request_with_runtime(
             apply_familiar_edits(coven_home, id, body)
         }
         ("GET", "/threads/weaves") => threads_weaves_response(coven_home),
+        ("GET", "/threads/proposals") => threads_proposals_response(coven_home, None),
+        ("GET", path) if path.starts_with("/threads/proposals/") => {
+            let id = path.trim_start_matches("/threads/proposals/");
+            if id.is_empty() || id.contains('/') {
+                api_error(
+                    400,
+                    "invalid_request",
+                    "Proposal id is required and must not contain '/'.",
+                    None,
+                )
+            } else {
+                threads_proposals_response(coven_home, Some(id))
+            }
+        }
         ("POST", path) if path.starts_with("/threads/proposals/") && path.ends_with("/approve") => {
             let id = path
                 .trim_start_matches("/threads/proposals/")
@@ -2791,6 +2805,101 @@ fn familiar_ward_response(coven_home: &Path, familiar_id: &str) -> Result<ApiRes
 }
 
 const DEGRADED_WARD_CONFIG_UNPARSEABLE: &str = "ward-config-unparseable";
+
+/// `GET /api/v1/threads/proposals[/:id]` — the pending-proposal read surface
+/// (Gate 3 PR 3, `docs/design/ward-gate3-coherence.md` G3.3).
+///
+/// Lists what is waiting at `~/.coven/pending/` for the principal: both
+/// authority-lane (Tier-0 `DegradeToProposal`) and coherence-lane (Tier-1
+/// hold) proposals, distinguished by `reviewKind` (absent in a staged file ⇒
+/// `authority`). A missing directory is an empty list; an unreadable or
+/// corrupt pending file is reported as a `degraded` entry rather than
+/// aborting the fleet read (same posture as `/threads/weaves`).
+fn threads_proposals_response(coven_home: &Path, id: Option<&str>) -> Result<ApiResponse> {
+    let pending_dir = coven_home.join("pending");
+    let entries = match fs::read_dir(&pending_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return match id {
+                None => json_response(200, &json!({ "proposals": [] })),
+                Some(id) => api_error(
+                    404,
+                    "proposal_not_found",
+                    "No pending proposal with that id.",
+                    Some(json!({ "id": id })),
+                ),
+            }
+        }
+        Err(err) => return Err(err).with_context(|| format!("reading {}", pending_dir.display())),
+    };
+
+    let mut proposals = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let parsed: Option<(coven_threads_core::PendingProposal, Value)> =
+            fs::read_to_string(&path).ok().and_then(|raw| {
+                let value: Value = serde_json::from_str(&raw).ok()?;
+                let proposal = serde_json::from_str(&raw).ok()?;
+                Some((proposal, value))
+            });
+        let Some((proposal, raw_value)) = parsed else {
+            proposals.push(json!({
+                "degraded": { "file": file_name, "reason": "proposal-unparseable" },
+            }));
+            continue;
+        };
+        let review_kind = raw_value
+            .get("reviewKind")
+            .and_then(Value::as_str)
+            .unwrap_or("authority")
+            .to_string();
+        let familiar_id = human_familiar_id_for_weave(coven_home, proposal.familiar_id)?;
+        let targets: Vec<String> = proposal
+            .edits
+            .iter()
+            .map(|edit| edit.surface.as_str().to_string())
+            .collect();
+        let format = time::format_description::well_known::Rfc3339;
+        proposals.push(json!({
+            "proposalId": proposal.id.0.to_string(),
+            "familiarId": familiar_id,
+            "reviewKind": review_kind,
+            "writer": proposal.writer.as_str(),
+            "stagedAt": proposal.staged_at.format(&format).ok(),
+            "targets": targets,
+        }));
+    }
+
+    match id {
+        None => {
+            // Stable order for scripts: newest first, degraded entries last.
+            proposals.sort_by(|a, b| {
+                let staged = |v: &Value| v["stagedAt"].as_str().map(str::to_owned);
+                staged(b).cmp(&staged(a))
+            });
+            json_response(200, &json!({ "proposals": proposals }))
+        }
+        Some(id) => match proposals
+            .into_iter()
+            .find(|proposal| proposal["proposalId"] == id)
+        {
+            Some(proposal) => json_response(200, &json!({ "proposal": proposal })),
+            None => api_error(
+                404,
+                "proposal_not_found",
+                "No pending proposal with that id.",
+                Some(json!({ "id": id })),
+            ),
+        },
+    }
+}
 
 fn threads_weaves_response(coven_home: &Path) -> Result<ApiResponse> {
     let conn = store::open_store(&store_path(coven_home))?;
@@ -6380,6 +6489,59 @@ tier = 2
             let body: serde_json::Value = serde_json::from_str(&response.body)?;
             assert_eq!(body["error"]["code"], "invalid_request");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn threads_proposals_lists_staged_coherence_proposal() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_warded_familiar(home)?;
+
+        // Empty state first: missing pending/ is an empty list, not an error.
+        let response = handle_request("GET", "/api/v1/threads/proposals", home, None)?;
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["proposals"], serde_json::json!([]));
+
+        // Stage a Tier-1 coherence proposal through the write path.
+        let staged = post_edits(
+            home,
+            r#"{"edits":[{"target":"reviewed/skill.md","contents":"tweak"}]}"#,
+        )?;
+        let staged_body: serde_json::Value = serde_json::from_str(&staged.body)?;
+        let proposal_id = staged_body["proposalId"].as_str().expect("id").to_string();
+
+        // The list surfaces it with lane, familiar, and targets.
+        let response = handle_request("GET", "/api/v1/threads/proposals", home, None)?;
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        let listed = &body["proposals"][0];
+        assert_eq!(listed["proposalId"], proposal_id.as_str());
+        assert_eq!(listed["familiarId"], "sage");
+        assert_eq!(listed["reviewKind"], "coherence");
+        assert_eq!(listed["targets"][0], "reviewed/skill.md");
+
+        // Detail returns the same record; unknown and malformed ids fail
+        // closed with the structured shapes.
+        let response = handle_request(
+            "GET",
+            &format!("/api/v1/threads/proposals/{proposal_id}"),
+            home,
+            None,
+        )?;
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["proposal"]["reviewKind"], "coherence");
+
+        let response = handle_request(
+            "GET",
+            "/api/v1/threads/proposals/00000000-0000-0000-0000-000000000000",
+            home,
+            None,
+        )?;
+        assert_eq!(response.status, 404);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "proposal_not_found");
         Ok(())
     }
 
