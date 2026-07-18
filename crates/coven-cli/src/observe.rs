@@ -522,9 +522,11 @@ fn render_ward_pending(body: &Value) -> String {
         .cloned()
         .unwrap_or_default();
     if proposals.is_empty() {
-        return "No pending Ward proposals.\n\
-                Held Tier-0/Tier-1 writes stage here for the principal's decision.\n"
-            .to_string();
+        return concat!(
+            "No pending Ward proposals.\n",
+            "Held Tier-0/Tier-1 writes stage here for the principal's decision.\n"
+        )
+        .to_string();
     }
     let mut out = String::new();
     out.push_str(&format!(

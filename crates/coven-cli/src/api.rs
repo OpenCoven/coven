@@ -271,12 +271,12 @@ pub fn handle_request_with_runtime(
         ("GET", "/threads/proposals") => threads_proposals_response(coven_home, None),
         ("GET", path) if path.starts_with("/threads/proposals/") => {
             let id = path.trim_start_matches("/threads/proposals/");
-            if id.is_empty() || id.contains('/') {
+            if Uuid::parse_str(id).is_err() {
                 api_error(
                     400,
                     "invalid_request",
-                    "Proposal id is required and must not contain '/'.",
-                    None,
+                    "Proposal id must be a UUID.",
+                    Some(serde_json::json!({ "id": id })),
                 )
             } else {
                 threads_proposals_response(coven_home, Some(id))
@@ -2860,7 +2860,15 @@ fn threads_proposals_response(coven_home: &Path, id: Option<&str>) -> Result<Api
             .and_then(Value::as_str)
             .unwrap_or("authority")
             .to_string();
-        let familiar_id = human_familiar_id_for_weave(coven_home, proposal.familiar_id)?;
+        let Some(familiar_id) = human_familiar_id_for_weave(coven_home, proposal.familiar_id)?
+        else {
+            // A proposal whose familiar vanished from familiars.toml cannot
+            // be decided; degrade it instead of emitting familiarId: null.
+            proposals.push(json!({
+                "degraded": { "file": file_name, "reason": "proposal-familiar-missing" },
+            }));
+            continue;
+        };
         let targets: Vec<String> = proposal
             .edits
             .iter()
@@ -2879,10 +2887,12 @@ fn threads_proposals_response(coven_home: &Path, id: Option<&str>) -> Result<Api
 
     match id {
         None => {
-            // Stable order for scripts: newest first, degraded entries last.
-            proposals.sort_by(|a, b| {
-                let staged = |v: &Value| v["stagedAt"].as_str().map(str::to_owned);
-                staged(b).cmp(&staged(a))
+            // Deterministic order for scripts: newest first, ties broken by
+            // proposal id, degraded entries (no stagedAt) last.
+            proposals.sort_by_cached_key(|value| {
+                let staged = value["stagedAt"].as_str().map(str::to_owned);
+                let id = value["proposalId"].as_str().unwrap_or_default().to_owned();
+                (std::cmp::Reverse(staged), id)
             });
             json_response(200, &json!({ "proposals": proposals }))
         }
@@ -6542,6 +6552,11 @@ tier = 2
         assert_eq!(response.status, 404);
         let body: serde_json::Value = serde_json::from_str(&response.body)?;
         assert_eq!(body["error"]["code"], "proposal_not_found");
+
+        let response = handle_request("GET", "/api/v1/threads/proposals/not-a-uuid", home, None)?;
+        assert_eq!(response.status, 400);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "invalid_request");
         Ok(())
     }
 

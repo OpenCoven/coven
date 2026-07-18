@@ -28,8 +28,8 @@ Two lanes stage here, distinguished by `reviewKind`:
 - `coherence` — a Tier-1 (reviewed) write held for Gate-3 coherence review
   (`docs/design/ward-gate3-coherence.md`).
 
-`--json` output is byte-for-byte the daemon body per the
-[observe contract](cli-observe.md). Unparseable pending files appear as
+`--json` output carries exactly the daemon body's data (pretty-printed) per
+the [observe contract](cli-observe.md). Unparseable pending files appear as
 `degraded` entries instead of aborting the read. Unknown ids fail with
 `proposal_not_found`.
 
