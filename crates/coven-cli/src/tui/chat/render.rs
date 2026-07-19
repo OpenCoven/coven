@@ -332,6 +332,56 @@ fn append_agent_content_lines<'a>(lines: &mut Vec<Line<'a>>, content: &str, wrap
             continue;
         }
 
+        if is_horizontal_rule(line) {
+            // Thematic break: render a full-width dim rule rather than the
+            // literal `---`/`***`/`___` run, which otherwise reads as noise
+            // or gets mistaken for an unclosed table divider.
+            let rule_width = wrap_width.saturating_sub(2).max(1);
+            lines.push(Line::from(Span::styled(
+                format!("  {}", "\u{2500}".repeat(rule_width)),
+                dim_style,
+            )));
+            continue;
+        }
+
+        if let Some(body) = strip_blockquote_prefix(line) {
+            // Blockquotes get a dim left bar like code blocks, but their text
+            // still flows through inline-markdown parsing and wrapping.
+            let bar = "  \u{2502} ";
+            let wrap_target = wrap_width.saturating_sub(bar.chars().count()).max(1);
+            for wl in textwrap::wrap(body, wrap_target) {
+                let mut spans = vec![Span::styled(bar, dim_style)];
+                spans.extend(parse_inline_markdown(&wl, dim_style));
+                lines.push(Line::from(spans));
+            }
+            continue;
+        }
+
+        if let Some((indent, marker, body)) = strip_ordered_prefix(line) {
+            // Ordered list: keep the `N.` marker on the first wrapped line and
+            // indent continuations under the body, mirroring bullet handling
+            // so `1.`/`2.`/`3.` output no longer degrades to plain wrapped text.
+            let max_indent = wrap_width.saturating_sub(6) / 3;
+            let pad = " ".repeat(indent.min(max_indent));
+            let indent_first = format!("  {pad}{marker} ");
+            let indent_cont = format!("  {pad}{} ", " ".repeat(marker.chars().count()));
+            let wrap_target = wrap_width
+                .saturating_sub(indent_first.chars().count())
+                .max(1);
+            let mut wrapped = textwrap::wrap(body, wrap_target).into_iter();
+            if let Some(first) = wrapped.next() {
+                let mut spans = vec![Span::styled(indent_first.clone(), text_style)];
+                spans.extend(parse_inline_markdown(&first, text_style));
+                lines.push(Line::from(spans));
+            }
+            for cont in wrapped {
+                let mut spans = vec![Span::styled(indent_cont.clone(), text_style)];
+                spans.extend(parse_inline_markdown(&cont, text_style));
+                lines.push(Line::from(spans));
+            }
+            continue;
+        }
+
         if let Some((indent, marker, body)) = strip_bullet_prefix(line) {
             // Preserve the source indent so nested bullets stay visually
             // distinct, but clamp it so very deep nesting still leaves the
@@ -420,6 +470,72 @@ fn strip_bullet_prefix(line: &str) -> Option<(usize, &'static str, &str)> {
     None
 }
 
+/// Ordered-list detection: a run of ASCII digits followed by `.` or `)` and a
+/// space (e.g. `1. `, `12) `). Returns the source indent, the normalized
+/// `N.` marker (owned via the caller reusing the slice), and the body. The
+/// marker keeps the author's number so `3. ` stays `3.` rather than being
+/// renumbered.
+fn strip_ordered_prefix(line: &str) -> Option<(usize, String, &str)> {
+    let trimmed = line.trim_start();
+    let indent = leading_whitespace_columns(line, line.len() - trimmed.len());
+    let digits_end = trimmed.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digits_end == 0 || digits_end > 9 {
+        return None;
+    }
+    let after_digits = &trimmed[digits_end..];
+    let sep = after_digits.as_bytes().first().copied();
+    if sep != Some(b'.') && sep != Some(b')') {
+        return None;
+    }
+    let rest = &after_digits[1..];
+    let body = rest.strip_prefix(' ')?;
+    let marker = format!("{}.", &trimmed[..digits_end]);
+    Some((indent, marker, body))
+}
+
+/// Blockquote detection: a leading `> ` (after any indent). Returns the quoted
+/// body with the marker stripped. A bare `>` with no following space is
+/// treated as an empty quoted line.
+fn strip_blockquote_prefix(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("> ") {
+        return Some(rest);
+    }
+    if trimmed == ">" {
+        return Some("");
+    }
+    None
+}
+
+/// Horizontal-rule detection: a line made only of three or more `-`, `*`, or
+/// `_` characters (optionally space-separated), per commonmark thematic
+/// breaks. Excludes table dividers, which start with `|`.
+fn is_horizontal_rule(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.len() < 3 {
+        return false;
+    }
+    let mut marker: Option<char> = None;
+    let mut count = 0usize;
+    for ch in trimmed.chars() {
+        match ch {
+            '-' | '*' | '_' => {
+                if let Some(m) = marker {
+                    if m != ch {
+                        return false;
+                    }
+                } else {
+                    marker = Some(ch);
+                }
+                count += 1;
+            }
+            ' ' => {}
+            _ => return false,
+        }
+    }
+    count >= 3
+}
+
 fn leading_whitespace_columns(line: &str, byte_len: usize) -> usize {
     line[..byte_len]
         .chars()
@@ -439,8 +555,8 @@ fn is_table_row(line: &str) -> bool {
 }
 
 /// Walk a single line of text and split it into styled spans so common
-/// markdown inline markers — `` `code` ``, `**bold**`, and `*italic*` —
-/// render with the right modifier instead of leaving their literal
+/// markdown inline markers — `` `code` ``, `**bold**`, `*italic*`, and
+/// `[text](url)` links — render with the right modifier instead of leaving their literal
 /// punctuation in the chat. The parser is intentionally lite: it never
 /// nests across lines, ignores escapes, and only treats `*`/`**` as
 /// emphasis when the marker is hugging a non-whitespace char (so
@@ -464,6 +580,32 @@ fn parse_inline_markdown<'a>(text: &str, default_style: Style) -> Vec<Span<'a>> 
                     spans.push(Span::styled(body, code_style));
                     i += 1 + end + 1;
                     continue;
+                }
+            }
+
+            if *byte == b'[' {
+                // Inline link `[text](url)`: render the visible `text` in the
+                // default style and append the URL dimmed in parentheses so
+                // the destination stays visible but de-emphasized. Falls back
+                // to literal text if the shape doesn't fully close.
+                if let Some(close_text) = rest[1..].find(']') {
+                    let after_text = &rest[1 + close_text + 1..];
+                    if let Some(url_part) = after_text.strip_prefix('(') {
+                        if let Some(close_url) = url_part.find(')') {
+                            let label = &rest[1..1 + close_text];
+                            let url = &url_part[..close_url];
+                            if !label.is_empty() && !url.is_empty() {
+                                flush_inline_buf(&mut spans, &mut buf, default_style);
+                                let link_style =
+                                    default_style.add_modifier(Modifier::UNDERLINED);
+                                spans.push(Span::styled(label.to_string(), link_style));
+                                let url_style = theme::ratatui_style(TEXT_DIM);
+                                spans.push(Span::styled(format!(" ({url})"), url_style));
+                                i += 1 + close_text + 1 + 1 + close_url + 1;
+                                continue;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -2110,5 +2252,100 @@ mod tests {
     fn input_line_count_includes_trailing_empty_line() {
         assert_eq!(input_line_count("first\nsecond\n"), 3);
         assert_eq!(input_line_count(""), 1);
+    }
+
+    /// Flatten rendered lines to plain strings for content assertions.
+    fn flatten_lines(lines: &[Line<'_>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn agent_lines_render_ordered_list_markers() {
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        append_agent_content_lines(&mut lines, "1. first\n2. second\n10) tenth", 40);
+        let rendered = flatten_lines(&lines);
+        assert!(rendered.iter().any(|l| l.contains("1. first")));
+        assert!(rendered.iter().any(|l| l.contains("2. second")));
+        // `)` separator is accepted and normalized to `N.`
+        assert!(rendered.iter().any(|l| l.contains("10. tenth")));
+    }
+
+    #[test]
+    fn agent_lines_ordered_marker_kept_and_body_wraps_under_it() {
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        append_agent_content_lines(&mut lines, "1. alpha beta gamma delta epsilon zeta", 20);
+        let rendered = flatten_lines(&lines);
+        // First row carries the marker; a continuation row exists without it.
+        assert!(rendered[0].contains("1."));
+        assert!(rendered.len() >= 2, "body should wrap, got {rendered:#?}");
+        assert!(!rendered[1].contains("1."));
+    }
+
+    #[test]
+    fn agent_lines_non_ordered_numbers_stay_plain() {
+        // `1.5` and `3.14` must not be mistaken for list markers.
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        append_agent_content_lines(&mut lines, "3.14 is pi", 40);
+        let rendered = flatten_lines(&lines);
+        assert!(rendered.iter().any(|l| l.contains("3.14 is pi")));
+    }
+
+    #[test]
+    fn agent_lines_render_blockquote_with_bar() {
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        append_agent_content_lines(&mut lines, "> quoted wisdom", 40);
+        let rendered = flatten_lines(&lines);
+        assert!(rendered
+            .iter()
+            .any(|l| l.contains("\u{2502}") && l.contains("quoted wisdom")));
+        // The `> ` marker itself is consumed, not rendered literally.
+        assert!(!rendered.iter().any(|l| l.contains("> quoted")));
+    }
+
+    #[test]
+    fn agent_lines_render_horizontal_rule() {
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        append_agent_content_lines(&mut lines, "above\n---\nbelow", 20);
+        let rendered = flatten_lines(&lines);
+        assert!(rendered.iter().any(|l| l.contains("\u{2500}\u{2500}\u{2500}")));
+        assert!(!rendered.iter().any(|l| l.trim() == "---"));
+    }
+
+    #[test]
+    fn horizontal_rule_detects_variants_but_not_tables() {
+        assert!(is_horizontal_rule("---"));
+        assert!(is_horizontal_rule("***"));
+        assert!(is_horizontal_rule("___"));
+        assert!(is_horizontal_rule("- - -"));
+        assert!(!is_horizontal_rule("--"));
+        assert!(!is_horizontal_rule("-*-"));
+        assert!(!is_horizontal_rule("| a | b |"));
+        assert!(!is_horizontal_rule("text"));
+    }
+
+    #[test]
+    fn inline_markdown_parses_link_label_and_url() {
+        let style = theme::ratatui_style(TEXT);
+        let spans = parse_inline_markdown("see [docs](https://x.io) now", style);
+        let joined: String = spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(joined.contains("docs"));
+        assert!(joined.contains("(https://x.io)"));
+        // The raw `[docs](...)` bracket syntax should not survive.
+        assert!(!joined.contains("[docs]"));
+        // The label span carries the UNDERLINED modifier.
+        assert!(spans
+            .iter()
+            .any(|s| s.content == "docs" && s.style.add_modifier.contains(Modifier::UNDERLINED)));
+    }
+
+    #[test]
+    fn inline_markdown_leaves_incomplete_link_literal() {
+        let style = theme::ratatui_style(TEXT);
+        let spans = parse_inline_markdown("a [broken](oops here", style);
+        let joined: String = spans.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(joined, "a [broken](oops here");
     }
 }
