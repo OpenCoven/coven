@@ -241,6 +241,91 @@ pub struct EventsQueryOptions {
     pub limit: Option<i64>,
 }
 
+fn load_ward_audit_schema_sql(conn: &Connection) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT group_concat(sql, char(10))
+         FROM (
+             SELECT sql
+             FROM sqlite_master
+             WHERE sql IS NOT NULL
+               AND (
+                   (type = 'table' AND name = 'ward_audit')
+                   OR (type = 'trigger' AND tbl_name = 'ward_audit')
+               )
+             ORDER BY type, name
+         )",
+        [],
+        |row| row.get(0),
+    )
+    .context("failed to inspect ward_audit schema")
+}
+
+fn load_ward_audit_component_version(conn: &Connection) -> Result<Option<i64>> {
+    let metadata_exists = conn
+        .query_row(
+            "SELECT 1
+             FROM sqlite_master
+             WHERE type = 'table' AND name = 'ward_schema_meta'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .context("failed to inspect ward_schema_meta")?
+        .is_some();
+    if !metadata_exists {
+        return Ok(None);
+    }
+
+    conn.query_row(
+        "SELECT version
+         FROM ward_schema_meta
+         WHERE component = 'ward_audit'",
+        [],
+        |row| row.get(0),
+    )
+    .optional()
+    .context("failed to read ward_audit component version")
+}
+
+fn ensure_ward_audit_schema(conn: &Connection) -> Result<()> {
+    use coven_threads_core::{
+        ward_audit_migration_sql, ward_audit_schema_action, WardAuditSchemaAction,
+        WARD_AUDIT_SCHEMA_SQL, WARD_AUDIT_SCHEMA_VERSION, WARD_AUDIT_STAMP_V020_SQL,
+    };
+
+    let schema_sql = load_ward_audit_schema_sql(conn)?;
+    let component_version = load_ward_audit_component_version(conn)?;
+    match ward_audit_schema_action(schema_sql.as_deref(), component_version) {
+        WardAuditSchemaAction::InitializeFresh => {
+            conn.execute_batch(WARD_AUDIT_SCHEMA_SQL)
+                .context("failed to initialize ward_audit schema")?;
+            conn.execute_batch(WARD_AUDIT_STAMP_V020_SQL)
+                .context("failed to stamp ward_audit schema version")?;
+        }
+        WardAuditSchemaAction::MigrateLegacyWithoutDetail => {
+            conn.execute_batch(&ward_audit_migration_sql(false))
+                .context("failed to migrate pre-detail ward_audit schema")?;
+        }
+        WardAuditSchemaAction::MigrateLegacyWithDetail => {
+            conn.execute_batch(&ward_audit_migration_sql(true))
+                .context("failed to migrate ward_audit schema with detail")?;
+        }
+        WardAuditSchemaAction::StampCurrent => {
+            conn.execute_batch(WARD_AUDIT_STAMP_V020_SQL)
+                .context("failed to stamp current ward_audit schema")?;
+        }
+        WardAuditSchemaAction::UnsupportedNewerVersion => {
+            anyhow::bail!(
+                "unsupported ward_audit schema version {}; daemon supports at most {}",
+                component_version.unwrap_or_default(),
+                WARD_AUDIT_SCHEMA_VERSION
+            );
+        }
+        WardAuditSchemaAction::None => {}
+    }
+    Ok(())
+}
+
 pub fn open_store(path: &Path) -> Result<Connection> {
     if let Some(parent) = path
         .parent()
@@ -482,8 +567,7 @@ pub fn open_store(path: &Path) -> Result<Connection> {
     // The coven-threads gate layer's daemon-owned tables: the append-only
     // ward.audit ledger (single audit store — PHASE-0-DESIGN §3.4, RFC-0001
     // §5.6) and the per-familiar surface baseline manifest. Both idempotent.
-    conn.execute_batch(coven_threads_core::WARD_AUDIT_SCHEMA_SQL)
-        .context("failed to initialize ward_audit schema")?;
+    ensure_ward_audit_schema(&conn)?;
     conn.execute_batch(crate::threads_gate::WARD_MANIFEST_SCHEMA_SQL)
         .context("failed to initialize ward_manifest schema")?;
     ensure_exit_code_column(&conn)?;
@@ -2714,6 +2798,287 @@ pub fn artifact_payload(record: &SensitiveArtifactRecord) -> EncryptedPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const LEGACY_WARD_AUDIT_WITHOUT_DETAIL_SQL: &str = r#"
+        CREATE TABLE ward_audit (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type    TEXT    NOT NULL,
+            proposal_id   TEXT,
+            familiar_id   TEXT    NOT NULL,
+            ward_version  TEXT,
+            ward_hash     BLOB    NOT NULL,
+            tier          TEXT,
+            decision      TEXT    NOT NULL,
+            approver      TEXT,
+            diff_hash     BLOB,
+            files_touched TEXT    NOT NULL,
+            channel       TEXT,
+            thread_id     TEXT,
+            submitted_at  TEXT    NOT NULL,
+            decided_at    TEXT    NOT NULL,
+            recorded_at   TEXT    NOT NULL
+        );
+    "#;
+
+    const LEGACY_WARD_AUDIT_WITH_DETAIL_SQL: &str = r#"
+        CREATE TABLE ward_audit (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type    TEXT    NOT NULL,
+            proposal_id   TEXT,
+            familiar_id   TEXT    NOT NULL,
+            ward_version  TEXT,
+            ward_hash     BLOB    NOT NULL,
+            tier          TEXT,
+            decision      TEXT    NOT NULL,
+            approver      TEXT,
+            diff_hash     BLOB,
+            detail        TEXT,
+            files_touched TEXT    NOT NULL,
+            channel       TEXT,
+            thread_id     TEXT,
+            submitted_at  TEXT    NOT NULL,
+            decided_at    TEXT    NOT NULL,
+            recorded_at   TEXT    NOT NULL
+        );
+    "#;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct LegacyWardAuditRow {
+        id: i64,
+        event_type: String,
+        proposal_id: Option<String>,
+        familiar_id: String,
+        ward_version: Option<String>,
+        ward_hash: Vec<u8>,
+        tier: Option<String>,
+        decision: String,
+        approver: Option<String>,
+        diff_hash: Option<Vec<u8>>,
+        detail: Option<String>,
+        files_touched: String,
+        channel: Option<String>,
+        thread_id: Option<String>,
+        submitted_at: String,
+        decided_at: String,
+        recorded_at: String,
+    }
+
+    fn ward_audit_component_version(conn: &Connection) -> Result<i64> {
+        conn.query_row(
+            "SELECT version FROM ward_schema_meta WHERE component = 'ward_audit'",
+            [],
+            |row| row.get(0),
+        )
+        .context("ward_audit component version is missing")
+    }
+
+    fn insert_legacy_ward_audit_row(conn: &Connection, detail: Option<&str>) -> Result<()> {
+        if let Some(detail) = detail {
+            conn.execute(
+                "INSERT INTO ward_audit (
+                    id, event_type, proposal_id, familiar_id, ward_version, ward_hash,
+                    tier, decision, approver, diff_hash, detail, files_touched,
+                    channel, thread_id, submitted_at, decided_at, recorded_at
+                 ) VALUES (
+                    7, 'proposal_submitted', NULL, 'sage', 'legacy-v1', ?1,
+                    'reviewed', 'pending', NULL, ?2, ?4, ?3,
+                    'mutation', 'thread-legacy', '2026-07-01T00:00:00Z',
+                    '2026-07-01T00:00:01Z', '2026-07-01T00:00:02Z'
+                 )",
+                params![
+                    vec![0x11_u8; 32],
+                    vec![0x22_u8; 32],
+                    r#"["SOUL.md"]"#,
+                    detail
+                ],
+            )?;
+        } else {
+            conn.execute(
+                "INSERT INTO ward_audit (
+                    id, event_type, proposal_id, familiar_id, ward_version, ward_hash,
+                    tier, decision, approver, diff_hash, files_touched,
+                    channel, thread_id, submitted_at, decided_at, recorded_at
+                 ) VALUES (
+                    7, 'proposal_submitted', NULL, 'sage', 'legacy-v1', ?1,
+                    'reviewed', 'pending', NULL, ?2, ?3,
+                    'mutation', 'thread-legacy', '2026-07-01T00:00:00Z',
+                    '2026-07-01T00:00:01Z', '2026-07-01T00:00:02Z'
+                 )",
+                params![vec![0x11_u8; 32], vec![0x22_u8; 32], r#"["SOUL.md"]"#],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn assert_legacy_ward_audit_row(
+        conn: &Connection,
+        expected_detail: Option<&str>,
+    ) -> Result<()> {
+        let row = conn.query_row(
+            "SELECT id, event_type, proposal_id, familiar_id, ward_version, ward_hash,
+                    tier, decision, approver, diff_hash, detail, files_touched,
+                    channel, thread_id, submitted_at, decided_at, recorded_at
+             FROM ward_audit WHERE id = 7",
+            [],
+            |row| {
+                Ok(LegacyWardAuditRow {
+                    id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    proposal_id: row.get(2)?,
+                    familiar_id: row.get(3)?,
+                    ward_version: row.get(4)?,
+                    ward_hash: row.get(5)?,
+                    tier: row.get(6)?,
+                    decision: row.get(7)?,
+                    approver: row.get(8)?,
+                    diff_hash: row.get(9)?,
+                    detail: row.get(10)?,
+                    files_touched: row.get(11)?,
+                    channel: row.get(12)?,
+                    thread_id: row.get(13)?,
+                    submitted_at: row.get(14)?,
+                    decided_at: row.get(15)?,
+                    recorded_at: row.get(16)?,
+                })
+            },
+        )?;
+        assert_eq!(
+            row,
+            LegacyWardAuditRow {
+                id: 7,
+                event_type: "proposal_submitted".to_string(),
+                proposal_id: None,
+                familiar_id: "sage".to_string(),
+                ward_version: Some("legacy-v1".to_string()),
+                ward_hash: vec![0x11; 32],
+                tier: Some("reviewed".to_string()),
+                decision: "pending".to_string(),
+                approver: None,
+                diff_hash: Some(vec![0x22; 32]),
+                detail: expected_detail.map(str::to_string),
+                files_touched: r#"["SOUL.md"]"#.to_string(),
+                channel: Some("mutation".to_string()),
+                thread_id: Some("thread-legacy".to_string()),
+                submitted_at: "2026-07-01T00:00:00Z".to_string(),
+                decided_at: "2026-07-01T00:00:01Z".to_string(),
+                recorded_at: "2026-07-01T00:00:02Z".to_string(),
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ward_audit_fresh_store_is_stamped_at_current_component_version() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("coven.db"))?;
+
+        assert_eq!(
+            ward_audit_component_version(&conn)?,
+            coven_threads_core::WARD_AUDIT_SCHEMA_VERSION
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ward_audit_legacy_schema_without_detail_migrates_without_losing_history() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("coven.db");
+        let conn = Connection::open(&path)?;
+        conn.execute_batch(LEGACY_WARD_AUDIT_WITHOUT_DETAIL_SQL)?;
+        insert_legacy_ward_audit_row(&conn, None)?;
+        drop(conn);
+
+        let conn = open_store(&path)?;
+
+        assert_legacy_ward_audit_row(&conn, None)?;
+        assert_eq!(
+            ward_audit_component_version(&conn)?,
+            coven_threads_core::WARD_AUDIT_SCHEMA_VERSION
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ward_audit_legacy_schema_with_detail_preserves_detail_payload() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("coven.db");
+        let conn = Connection::open(&path)?;
+        conn.execute_batch(LEGACY_WARD_AUDIT_WITH_DETAIL_SQL)?;
+        let detail = r#"{"legacy":true}"#;
+        insert_legacy_ward_audit_row(&conn, Some(detail))?;
+        drop(conn);
+
+        let conn = open_store(&path)?;
+
+        assert_legacy_ward_audit_row(&conn, Some(detail))?;
+        assert_eq!(
+            ward_audit_component_version(&conn)?,
+            coven_threads_core::WARD_AUDIT_SCHEMA_VERSION
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ward_audit_current_unversioned_schema_is_stamped_without_rebuild() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("coven.db");
+        let conn = open_store(&path)?;
+        conn.execute(
+            "DELETE FROM ward_schema_meta WHERE component = 'ward_audit'",
+            [],
+        )?;
+        drop(conn);
+
+        let conn = open_store(&path)?;
+
+        assert_eq!(
+            ward_audit_component_version(&conn)?,
+            coven_threads_core::WARD_AUDIT_SCHEMA_VERSION
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ward_audit_current_version_is_idempotent_across_reopen() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("coven.db");
+        drop(open_store(&path)?);
+
+        let conn = open_store(&path)?;
+
+        assert_eq!(
+            ward_audit_component_version(&conn)?,
+            coven_threads_core::WARD_AUDIT_SCHEMA_VERSION
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ward_audit_newer_component_version_fails_closed() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("coven.db");
+        let conn = Connection::open(&path)?;
+        conn.execute_batch(LEGACY_WARD_AUDIT_WITH_DETAIL_SQL)?;
+        conn.execute_batch(
+            "CREATE TABLE ward_schema_meta (
+                component TEXT PRIMARY KEY NOT NULL,
+                version INTEGER NOT NULL
+             );
+             INSERT INTO ward_schema_meta (component, version)
+             VALUES ('ward_audit', 21);",
+        )?;
+        drop(conn);
+
+        let error = open_store(&path).expect_err("newer Ward schema must fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported ward_audit schema version"),
+            "unexpected error: {error:#}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn inserts_and_lists_sessions() -> Result<()> {

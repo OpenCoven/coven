@@ -186,6 +186,7 @@ pub fn gate_protected_edits(conn: &Connection, req: &GateRequest<'_>) -> Result<
             surface: threads::SurfaceId::new(target.clone()),
             writer: request_writer.clone(),
             channel: threads::Channel::Mutation,
+            identity_context: None,
         };
         let verdict = threads::validate_fail_closed(&weave, &request);
         append_audit_row(

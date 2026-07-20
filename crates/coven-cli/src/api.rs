@@ -3099,6 +3099,7 @@ fn decide_threads_proposal(
                 approver: Some(&pending.writer),
                 files_touched: &targets,
                 decision: "rejected",
+                approval_rationale: None,
             },
         )?;
         fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
@@ -3119,6 +3120,7 @@ fn decide_threads_proposal(
             surface: coven_threads_core::SurfaceId::new(target.clone()),
             writer: pending.writer.clone(),
             channel: coven_threads_core::Channel::Mutation,
+            identity_context: None,
         };
         let verdict = coven_threads_core::validate_fail_closed(&state.weave, &request);
         crate::threads_gate::append_audit_row(
@@ -3179,6 +3181,7 @@ fn decide_threads_proposal(
             approver: Some(&pending.writer),
             files_touched: &targets,
             decision: "approved",
+            approval_rationale: note.as_deref(),
         },
     )?;
     fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
@@ -3266,13 +3269,14 @@ fn append_proposal_refusal_audit(
     append_proposal_decision_audit(
         conn,
         ProposalDecisionAudit {
-            event_type: coven_threads_core::AuditEventType::ProposalRejected,
+            event_type: coven_threads_core::AuditEventType::ValidationVerdict,
             proposal_id,
             familiar_id,
             weave_hash,
             approver: Some(approver),
             files_touched,
             decision: "proposal-revalidation-failed",
+            approval_rationale: None,
         },
     )
 }
@@ -3285,6 +3289,7 @@ struct ProposalDecisionAudit<'a> {
     approver: Option<&'a coven_threads_core::WriterId>,
     files_touched: &'a [String],
     decision: &'a str,
+    approval_rationale: Option<&'a str>,
 }
 
 fn append_proposal_decision_audit(
@@ -3292,14 +3297,24 @@ fn append_proposal_decision_audit(
     audit: ProposalDecisionAudit<'_>,
 ) -> Result<()> {
     let files_touched = serde_json::to_string(audit.files_touched)?;
+    let detail = match audit.event_type {
+        coven_threads_core::AuditEventType::ProposalApproved => Some(serde_json::to_string(
+            &coven_threads_core::ProposalApprovalAuditDetail {
+                approval_path_label: "human_review".to_string(),
+                rationale: audit.approval_rationale.map(str::to_string),
+                window_close: None,
+            },
+        )?),
+        _ => None,
+    };
     let now =
         time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
     conn.execute(
         "INSERT INTO ward_audit (
             event_type, proposal_id, familiar_id, ward_version, ward_hash,
-            tier, decision, approver, diff_hash, files_touched, channel,
-            thread_id, submitted_at, decided_at
-        ) VALUES (?1, ?2, ?3, NULL, ?4, NULL, ?5, ?6, NULL, ?7, ?8, NULL, ?9, ?9)",
+            tier, decision, approver, diff_hash, detail, files_touched,
+            channel, thread_id, submitted_at, decided_at
+        ) VALUES (?1, ?2, ?3, NULL, ?4, NULL, ?5, ?6, NULL, ?7, ?8, ?9, NULL, ?10, ?10)",
         rusqlite::params![
             audit.event_type.tag(),
             audit.proposal_id,
@@ -3307,6 +3322,7 @@ fn append_proposal_decision_audit(
             audit.weave_hash,
             audit.decision,
             audit.approver.map(|w| w.as_str().to_string()),
+            detail,
             files_touched,
             format!("{:?}", coven_threads_core::Channel::Mutation).to_lowercase(),
             now,
@@ -7125,12 +7141,21 @@ tier = 0
         );
         assert!(!pending.exists(), "approved proposal must be removed");
         let conn = store::open_store(&home.join("coven.sqlite3"))?;
-        let event_type: String = conn.query_row(
-            "SELECT event_type FROM ward_audit WHERE proposal_id = ?1 ORDER BY id DESC LIMIT 1",
+        let (event_type, detail): (String, String) = conn.query_row(
+            "SELECT event_type, detail
+             FROM ward_audit
+             WHERE proposal_id = ?1
+             ORDER BY id DESC
+             LIMIT 1",
             [&proposal_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         assert_eq!(event_type, "proposal_approved");
+        let detail: coven_threads_core::ProposalApprovalAuditDetail =
+            serde_json::from_str(&detail)?;
+        assert_eq!(detail.approval_path_label, "human_review");
+        assert_eq!(detail.rationale.as_deref(), Some("principal reviewed"));
+        assert_eq!(detail.window_close, None);
         Ok(())
     }
 
@@ -7274,6 +7299,18 @@ tier = 0
             |row| row.get(0),
         )?;
         assert_eq!(approved_count, 0);
+        let terminal_count: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM ward_audit
+             WHERE proposal_id = ?1
+               AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            terminal_count, 0,
+            "a retryable refusal must not close the proposal lifecycle"
+        );
 
         std::fs::write(workspace.join("SOUL.md"), "# Sage\n")?;
         let retry = handle_request_with_body(
