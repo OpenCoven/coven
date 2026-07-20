@@ -3271,9 +3271,24 @@ fn revalidate_scheduled_materialized_before(
 }
 
 fn proposal_revision(authority_value: &Value) -> Result<String> {
-    let bytes =
-        serde_json::to_vec(authority_value).context("serializing proposal revision authority")?;
-    Ok(blake3::hash(&bytes).to_hex().to_string())
+    fn canonicalize(value: &Value) -> Value {
+        match value {
+            Value::Array(values) => Value::Array(values.iter().map(canonicalize).collect()),
+            Value::Object(values) => {
+                let sorted: std::collections::BTreeMap<_, _> = values
+                    .iter()
+                    .map(|(key, value)| (key.clone(), canonicalize(value)))
+                    .collect();
+                serde_json::to_value(sorted).expect("canonical JSON map is serializable")
+            }
+            value => value.clone(),
+        }
+    }
+
+    let bytes = serde_json::to_vec(&canonicalize(authority_value))
+        .context("serializing canonical proposal revision authority")?;
+    let digest = Sha256::digest(bytes);
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 fn ward_tier_number(tier: ward::Tier) -> u8 {
