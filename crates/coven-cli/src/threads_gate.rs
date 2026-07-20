@@ -249,9 +249,30 @@ pub(crate) fn build_weave_state(
     extra_targets: &[String],
     bootstrap_missing_baselines: bool,
 ) -> Result<WeaveState> {
+    build_weave_state_for_writer(
+        conn,
+        familiar_id,
+        workspace,
+        config,
+        extra_targets,
+        bootstrap_missing_baselines,
+        None,
+    )
+}
+
+pub(crate) fn build_weave_state_for_writer(
+    conn: &Connection,
+    familiar_id: &str,
+    workspace: &Path,
+    config: &ward::WardConfig,
+    extra_targets: &[String],
+    bootstrap_missing_baselines: bool,
+    writer: Option<&threads::WriterId>,
+) -> Result<WeaveState> {
     let familiar_uuid = familiar_weave_id(familiar_id);
-    let principal_writer =
-        threads::WriterId::new(format!("principal:{}", config.principal_key_fingerprint));
+    let principal_writer = writer.cloned().unwrap_or_else(|| {
+        threads::WriterId::new(format!("principal:{}", config.principal_key_fingerprint))
+    });
 
     // Weave one thread per protected surface: the literal (non-glob) tier-0
     // declarations plus any resolved protected targets being replayed.
@@ -374,7 +395,7 @@ pub(crate) fn familiar_weave_id(familiar_id: &str) -> threads::FamiliarId {
 /// `..`/`.` segments, no symlinks anywhere in the path (intermediate
 /// directories included), and the read is capped so a pathological
 /// declaration cannot balloon memory.
-fn read_surface(workspace: &Path, surface: &str) -> Result<Vec<u8>> {
+pub(crate) fn read_surface(workspace: &Path, surface: &str) -> Result<Vec<u8>> {
     const MAX_SURFACE_BYTES: u64 = 16 * 1024 * 1024;
 
     if surface.starts_with('/') || surface.starts_with('\\') {
@@ -465,7 +486,11 @@ fn load_or_create_manifest_id(conn: &Connection, familiar_id: &str) -> Result<th
     }
 }
 
-fn load_baseline(conn: &Connection, familiar_id: &str, surface: &str) -> Result<Option<Vec<u8>>> {
+pub(crate) fn load_baseline(
+    conn: &Connection,
+    familiar_id: &str,
+    surface: &str,
+) -> Result<Option<Vec<u8>>> {
     conn.query_row(
         "SELECT entry_hash FROM ward_manifest WHERE familiar_id = ?1 AND surface = ?2",
         params![familiar_id, surface],
@@ -506,10 +531,24 @@ pub(crate) fn advance_surface_baseline(
     workspace: &Path,
     surface: &str,
 ) -> Result<()> {
+    let disk = read_surface(workspace, surface)?;
+    advance_surface_baseline_from_bytes(conn, familiar_id, workspace, surface, &disk)
+}
+
+pub(crate) fn advance_surface_baseline_from_bytes(
+    conn: &Connection,
+    familiar_id: &str,
+    workspace: &Path,
+    surface: &str,
+    expected_bytes: &[u8],
+) -> Result<()> {
     let manifest_id = load_or_create_manifest_id(conn, familiar_id)?;
     let surface_id = threads::SurfaceId::new(surface.to_string());
     let disk = read_surface(workspace, surface)?;
-    let entry_hash = threads::manifest_entry_hash(&surface_id, &disk);
+    if disk != expected_bytes {
+        anyhow::bail!("surface `{surface}` changed after approved apply; baseline not advanced");
+    }
+    let entry_hash = threads::manifest_entry_hash(&surface_id, expected_bytes);
     store_baseline(conn, familiar_id, surface, &manifest_id, &entry_hash)
 }
 

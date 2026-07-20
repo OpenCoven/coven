@@ -145,8 +145,16 @@ impl ScheduledProposal {
         &self.classification
     }
 
+    pub(crate) fn materialized_diff(&self) -> &threads::MaterializedDiff {
+        &self.materialized_diff
+    }
+
     pub(crate) fn earliest_close(&self) -> Option<OffsetDateTime> {
         self.earliest_close
+    }
+
+    pub(crate) fn veto_deadline(&self) -> Option<OffsetDateTime> {
+        self.veto_deadline
     }
 }
 

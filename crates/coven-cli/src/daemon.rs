@@ -1865,6 +1865,29 @@ pub fn append_daemon_recovery_log(coven_home: &Path, msg: &str) {
     }
 }
 
+fn start_threads_proposal_scheduler(coven_home: &Path) -> Result<()> {
+    if let Err(error) = crate::api::process_due_threads_proposals(coven_home) {
+        append_daemon_recovery_log(
+            coven_home,
+            &format!("threads scheduler startup pass failed: {error:#}"),
+        );
+    }
+    let home = coven_home.to_path_buf();
+    std::thread::Builder::new()
+        .name("coven-threads-scheduler".into())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            if let Err(error) = crate::api::process_due_threads_proposals(&home) {
+                append_daemon_recovery_log(
+                    &home,
+                    &format!("threads scheduler pass failed: {error:#}"),
+                );
+            }
+        })
+        .context("failed to spawn threads proposal scheduler")?;
+    Ok(())
+}
+
 /// Cleans up the Unix-domain socket file and `daemon.json` when the daemon
 /// exits via any path that runs destructors — normal return, `Err` propagation,
 /// or panic unwinding. This is what prevents orphaned `~/.coven/coven.sock`
@@ -2073,6 +2096,7 @@ pub fn serve_forever(
     let runtime = Arc::new(LiveSessionRuntime::with_coven_home(
         coven_home.to_path_buf(),
     ));
+    start_threads_proposal_scheduler(coven_home)?;
 
     if let Some(addr) = tcp_addr {
         let tcp_listener = bind_tcp_listener(addr)?;
@@ -2583,6 +2607,7 @@ pub fn serve_forever(
     let runtime = Arc::new(LiveSessionRuntime::with_coven_home(
         coven_home.to_path_buf(),
     ));
+    start_threads_proposal_scheduler(coven_home)?;
 
     const MAX_INFLIGHT: usize = 64;
     let inflight = Arc::new(AtomicUsize::new(0));

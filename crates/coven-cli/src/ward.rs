@@ -66,9 +66,13 @@
 //! also point the Gate 4 pre-write audit read at an attacker-chosen readable
 //! file, affecting only the recorded `prev_sha256` — never where bytes land.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::ffi::CString;
 use std::fs::OpenOptions;
 use std::io::{ErrorKind, Write};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -724,6 +728,7 @@ impl Ward {
         &self,
         edits: &[FileEdit],
         authorization: &Authorization,
+        expected_before: &BTreeMap<String, Vec<u8>>,
     ) -> Result<ApplyReport> {
         let proposal = Proposal {
             targets: edits.iter().map(|e| e.target.clone()).collect(),
@@ -751,16 +756,12 @@ impl Ward {
             .home
             .canonicalize()
             .with_context(|| format!("ward home `{}` is not resolvable", self.home.display()))?;
-        let mut changes = Vec::with_capacity(edits.len());
-        for (edit, decision) in edits.iter().zip(outcome.decisions) {
-            let abs = join_resolved(&canonical_home, &decision.resolved);
-            let audit = write_atomic(&canonical_home, &abs, &edit.new_contents, &decision)?;
-            changes.push(AppliedChange {
-                decision,
-                disposition: Disposition::Applied,
-                audit,
-            });
-        }
+        let changes = write_atomically_if_unchanged(
+            &canonical_home,
+            edits,
+            outcome.decisions,
+            expected_before,
+        )?;
         Ok(ApplyReport { changes })
     }
 }
@@ -854,6 +855,387 @@ fn write_atomic(
         bytes_written: contents.len(),
     });
     Ok(audit)
+}
+
+struct PreparedConditionalWrite {
+    path: PathBuf,
+    staged: Option<PathBuf>,
+    already_applied: bool,
+    expected_before: Vec<u8>,
+    new_contents: Vec<u8>,
+    decision: Decision,
+}
+
+/// Commit an approved proposal only while every target still has the exact
+/// before-image reviewed by the scheduler.
+///
+/// Existing targets are exchanged atomically with randomized sibling staging
+/// files. The displaced inode is then compared with the approved before-image;
+/// a mismatch swaps it back and rolls back every earlier edit in the batch.
+/// Already-applied bytes are accepted so crash recovery remains idempotent.
+fn write_atomically_if_unchanged(
+    canonical_home: &Path,
+    edits: &[FileEdit],
+    decisions: Vec<Decision>,
+    expected_before: &BTreeMap<String, Vec<u8>>,
+) -> Result<Vec<AppliedChange>> {
+    let mut prepared = Vec::with_capacity(edits.len());
+    let mut preparation_error = None;
+    for (edit, decision) in edits.iter().zip(decisions) {
+        let result = (|| -> Result<PreparedConditionalWrite> {
+            let expected = expected_before
+                .get(&edit.target)
+                .with_context(|| format!("missing approved before-image for `{}`", edit.target))?
+                .clone();
+            let resolved = join_resolved(canonical_home, &decision.resolved);
+            let parent = resolved
+                .parent()
+                .ok_or_else(|| anyhow!("target has no parent directory: {}", resolved.display()))?;
+            let name = resolved
+                .file_name()
+                .ok_or_else(|| anyhow!("target has no file name: {}", resolved.display()))?;
+            let canonical_parent = prepare_staging_parent(canonical_home, parent)?;
+            let path = canonical_parent.join(name);
+            let current = std::fs::read(&path)
+                .with_context(|| format!("reading approved target {}", path.display()))?;
+            let already_applied = current == edit.new_contents;
+            if current != expected && !already_applied {
+                bail!(
+                    "approved target `{}` changed after review; refusing to overwrite it",
+                    edit.target
+                );
+            }
+            Ok(PreparedConditionalWrite {
+                path,
+                staged: None,
+                already_applied,
+                expected_before: expected,
+                new_contents: edit.new_contents.clone(),
+                decision,
+            })
+        })();
+        match result {
+            Ok(write) => prepared.push(write),
+            Err(error) => {
+                if preparation_error.is_none() {
+                    preparation_error = Some(error);
+                }
+            }
+        }
+    }
+    if let Some(error) = preparation_error {
+        return fail_after_conditional_rollback(&prepared, &[], error);
+    }
+
+    for index in 0..prepared.len() {
+        if prepared[index].already_applied {
+            continue;
+        }
+        match stage_contents(&prepared[index].path, &prepared[index].new_contents) {
+            Ok(staged) => prepared[index].staged = Some(staged),
+            Err(error) => return fail_after_conditional_rollback(&prepared, &[], error),
+        }
+    }
+
+    let mut swapped = Vec::new();
+    for (index, write) in prepared.iter().enumerate() {
+        let Some(staged) = &write.staged else {
+            continue;
+        };
+        if let Err(error) = maybe_run_conditional_write_hook(&write.path) {
+            return fail_after_conditional_rollback(&prepared, &swapped, error);
+        }
+        if let Err(error) = atomic_exchange(staged, &write.path) {
+            return fail_after_conditional_rollback(
+                &prepared,
+                &swapped,
+                error.context(format!(
+                    "committing approved write to {}",
+                    write.path.display()
+                )),
+            );
+        }
+        swapped.push(index);
+
+        let verification = (|| -> Result<()> {
+            let displaced = std::fs::read(staged)
+                .with_context(|| format!("reading displaced target {}", staged.display()))?;
+            let installed = std::fs::read(&write.path)
+                .with_context(|| format!("verifying approved write {}", write.path.display()))?;
+            if displaced != write.expected_before || installed != write.new_contents {
+                bail!(
+                    "approved target `{}` changed during commit",
+                    write.decision.target
+                );
+            }
+            Ok(())
+        })();
+        if let Err(error) = verification {
+            return fail_after_conditional_rollback(&prepared, &swapped, error);
+        }
+    }
+
+    let final_verification = (|| -> Result<()> {
+        for write in &prepared {
+            let current = std::fs::read(&write.path).with_context(|| {
+                format!("revalidating approved target {}", write.path.display())
+            })?;
+            if current != write.new_contents {
+                bail!(
+                    "approved target `{}` changed before batch finalization",
+                    write.decision.target
+                );
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = final_verification {
+        return fail_after_conditional_rollback(&prepared, &swapped, error);
+    }
+
+    for write in &prepared {
+        if let Some(staged) = &write.staged {
+            std::fs::remove_file(staged)
+                .with_context(|| format!("removing approved-write backup {}", staged.display()))?;
+        }
+    }
+
+    Ok(prepared
+        .into_iter()
+        .map(|write| {
+            let audit = (write.decision.tier == Tier::Logged).then(|| AuditRecord {
+                target: write.decision.target.clone(),
+                resolved: write.decision.resolved.clone(),
+                tier: write.decision.tier,
+                prev_sha256: Some(sha256_hex(&write.expected_before)),
+                next_sha256: sha256_hex(&write.new_contents),
+                bytes_written: write.new_contents.len(),
+            });
+            AppliedChange {
+                decision: write.decision,
+                disposition: Disposition::Applied,
+                audit,
+            }
+        })
+        .collect())
+}
+
+fn rollback_conditional_writes(
+    prepared: &[PreparedConditionalWrite],
+    swapped: &[usize],
+) -> Result<()> {
+    let mut errors = Vec::new();
+    for &index in swapped.iter().rev() {
+        let write = &prepared[index];
+        let staged = write
+            .staged
+            .as_ref()
+            .context("swapped conditional write has no staging path")?;
+        if let Err(error) = restore_swapped_write(write, staged) {
+            errors.push(format!("{}: {error:#}", write.decision.target));
+        }
+    }
+    for write in prepared.iter().rev().filter(|write| write.already_applied) {
+        if write.expected_before != write.new_contents {
+            errors.push(format!(
+                "{}: approved bytes predated this apply attempt; ownership is unproven, so \
+                 recovery left them in place",
+                write.decision.target
+            ));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        bail!("conditional rollback failed: {}", errors.join("; "))
+    }
+}
+
+fn fail_after_conditional_rollback(
+    prepared: &[PreparedConditionalWrite],
+    swapped: &[usize],
+    error: anyhow::Error,
+) -> Result<Vec<AppliedChange>> {
+    let rollback = rollback_conditional_writes(prepared, swapped);
+    match rollback {
+        Ok(()) => {
+            cleanup_conditional_staging(prepared);
+            Err(error.context("approved proposal was rolled back"))
+        }
+        Err(rollback_error) => Err(anyhow!(
+            "{error:#}; conditional rollback also failed: {rollback_error:#}"
+        )),
+    }
+}
+
+fn restore_swapped_write(write: &PreparedConditionalWrite, staged: &Path) -> Result<()> {
+    let restore_bytes = std::fs::read(staged)
+        .with_context(|| format!("reading rollback source {}", staged.display()))?;
+    atomic_exchange(staged, &write.path).with_context(|| {
+        format!(
+            "restoring approved target {} from {}",
+            write.path.display(),
+            staged.display()
+        )
+    })?;
+    let verification = verify_rollback_exchange(write, staged, &restore_bytes);
+    if let Err(error) = verification {
+        atomic_exchange(staged, &write.path).with_context(|| {
+            format!(
+                "putting concurrent bytes back at {} after rollback verification failed: \
+                 {error:#}",
+                write.path.display()
+            )
+        })?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn verify_rollback_exchange(
+    write: &PreparedConditionalWrite,
+    displaced: &Path,
+    expected_restored: &[u8],
+) -> Result<()> {
+    let displaced = std::fs::read(displaced).with_context(|| {
+        format!(
+            "reading rollback-displaced bytes for {}",
+            write.path.display()
+        )
+    })?;
+    let restored = std::fs::read(&write.path)
+        .with_context(|| format!("verifying rollback of {}", write.path.display()))?;
+    if displaced != write.new_contents || restored != expected_restored {
+        bail!(
+            "target changed while rolling back approved write {}",
+            write.path.display()
+        );
+    }
+    Ok(())
+}
+
+fn cleanup_conditional_staging(prepared: &[PreparedConditionalWrite]) {
+    for write in prepared {
+        if let Some(staged) = &write.staged {
+            let _ = std::fs::remove_file(staged);
+        }
+    }
+}
+
+pub(crate) const fn supports_atomic_approved_writes() -> bool {
+    cfg!(any(target_os = "linux", target_os = "macos"))
+}
+
+fn stage_contents(path: &Path, contents: &[u8]) -> Result<PathBuf> {
+    let (staged, mut file) = create_staging_file(path)?;
+    let result = (|| -> Result<()> {
+        file.write_all(contents)
+            .with_context(|| format!("staging write to {}", staged.display()))?;
+        file.sync_all()
+            .with_context(|| format!("syncing staged write to {}", staged.display()))?;
+        Ok(())
+    })();
+    drop(file);
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&staged);
+        return Err(error);
+    }
+    Ok(staged)
+}
+
+#[cfg(test)]
+type ConditionalWriteHook = std::sync::Mutex<BTreeMap<PathBuf, Vec<(PathBuf, Vec<u8>)>>>;
+
+#[cfg(test)]
+fn conditional_write_hook() -> &'static ConditionalWriteHook {
+    static HOOK: std::sync::OnceLock<ConditionalWriteHook> = std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn set_conditional_write_hook(path: PathBuf, replacement: Vec<u8>) {
+    set_conditional_write_actions(path.clone(), vec![(path, replacement)]);
+}
+
+#[cfg(test)]
+fn set_conditional_write_actions(trigger: PathBuf, actions: Vec<(PathBuf, Vec<u8>)>) {
+    conditional_write_hook()
+        .lock()
+        .expect("conditional write hook lock poisoned")
+        .insert(trigger, actions);
+}
+
+#[cfg(test)]
+fn maybe_run_conditional_write_hook(path: &Path) -> Result<()> {
+    let mut hook = conditional_write_hook()
+        .lock()
+        .expect("conditional write hook lock poisoned");
+    if let Some(actions) = hook.remove(path) {
+        for (target, replacement) in actions {
+            std::fs::write(&target, replacement).with_context(|| {
+                format!(
+                    "running conditional write test hook for {}",
+                    target.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn maybe_run_conditional_write_hook(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn atomic_exchange(left: &Path, right: &Path) -> Result<()> {
+    const RENAME_SWAP: u32 = 0x0000_0002;
+    unsafe extern "C" {
+        fn renamex_np(
+            from: *const libc::c_char,
+            to: *const libc::c_char,
+            flags: u32,
+        ) -> libc::c_int;
+    }
+
+    let left = CString::new(left.as_os_str().as_bytes()).context("staging path contains NUL")?;
+    let right = CString::new(right.as_os_str().as_bytes()).context("target path contains NUL")?;
+    // SAFETY: both C strings are NUL-terminated and remain alive for the call.
+    let result = unsafe { renamex_np(left.as_ptr(), right.as_ptr(), RENAME_SWAP) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error()).context("atomically exchanging approved target")
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn atomic_exchange(left: &Path, right: &Path) -> Result<()> {
+    const RENAME_EXCHANGE: libc::c_uint = 1 << 1;
+    let left = CString::new(left.as_os_str().as_bytes()).context("staging path contains NUL")?;
+    let right = CString::new(right.as_os_str().as_bytes()).context("target path contains NUL")?;
+    // SAFETY: both C strings are NUL-terminated and remain alive for the syscall.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            left.as_ptr(),
+            libc::AT_FDCWD,
+            right.as_ptr(),
+            RENAME_EXCHANGE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error()).context("atomically exchanging approved target")
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn atomic_exchange(_left: &Path, _right: &Path) -> Result<()> {
+    bail!("atomic approved-write exchange is unsupported on this platform")
 }
 
 /// Create a fresh sibling staging file for an atomic write.
@@ -1483,6 +1865,170 @@ tier = 2
             Verdict::AuthorizedProtectedChange
         );
         assert!(!tmp.path().join("SOUL.md").exists());
+    }
+
+    #[test]
+    fn approved_apply_rolls_back_batch_if_target_changes_immediately_before_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::write(tmp.path().join("SOUL.md"), b"old soul").unwrap();
+        fs::write(tmp.path().join("IDENTITY.md"), b"old identity").unwrap();
+        let edits = vec![
+            FileEdit::new("SOUL.md", b"new soul".to_vec()),
+            FileEdit::new("IDENTITY.md", b"new identity".to_vec()),
+        ];
+        let expected = BTreeMap::from([
+            ("SOUL.md".to_string(), b"old soul".to_vec()),
+            ("IDENTITY.md".to_string(), b"old identity".to_vec()),
+        ]);
+        set_conditional_write_hook(
+            tmp.path().canonicalize().unwrap().join("IDENTITY.md"),
+            b"concurrent identity".to_vec(),
+        );
+
+        let error = ward
+            .apply_after_threads_approval(
+                &edits,
+                &Authorization::signed_by("SHA256:principal-key"),
+                &expected,
+            )
+            .expect_err("concurrent target replacement must fail closed");
+
+        assert!(
+            format!("{error:#}").contains("changed during commit"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(fs::read(tmp.path().join("SOUL.md")).unwrap(), b"old soul");
+        assert_eq!(
+            fs::read(tmp.path().join("IDENTITY.md")).unwrap(),
+            b"concurrent identity"
+        );
+        assert_eq!(staging_litter(tmp.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn approved_recovery_does_not_claim_ownership_of_same_byte_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::write(tmp.path().join("SOUL.md"), b"new soul").unwrap();
+        fs::write(tmp.path().join("IDENTITY.md"), b"concurrent identity").unwrap();
+        let edits = vec![
+            FileEdit::new("SOUL.md", b"new soul".to_vec()),
+            FileEdit::new("IDENTITY.md", b"new identity".to_vec()),
+        ];
+        let expected = BTreeMap::from([
+            ("SOUL.md".to_string(), b"old soul".to_vec()),
+            ("IDENTITY.md".to_string(), b"old identity".to_vec()),
+        ]);
+
+        let error = ward
+            .apply_after_threads_approval(
+                &edits,
+                &Authorization::signed_by("SHA256:principal-key"),
+                &expected,
+            )
+            .expect_err("diverged recovery target must fail the whole batch");
+
+        assert!(
+            format!("{error:#}").contains("ownership is unproven"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(fs::read(tmp.path().join("SOUL.md")).unwrap(), b"new soul");
+        assert_eq!(
+            fs::read(tmp.path().join("IDENTITY.md")).unwrap(),
+            b"concurrent identity"
+        );
+        assert_eq!(staging_litter(tmp.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn approved_recovery_revalidates_already_applied_entries_before_finalizing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::write(tmp.path().join("SOUL.md"), b"new soul").unwrap();
+        fs::write(tmp.path().join("IDENTITY.md"), b"old identity").unwrap();
+        let edits = vec![
+            FileEdit::new("SOUL.md", b"new soul".to_vec()),
+            FileEdit::new("IDENTITY.md", b"new identity".to_vec()),
+        ];
+        let expected = BTreeMap::from([
+            ("SOUL.md".to_string(), b"old soul".to_vec()),
+            ("IDENTITY.md".to_string(), b"old identity".to_vec()),
+        ]);
+        let canonical_home = tmp.path().canonicalize().unwrap();
+        set_conditional_write_actions(
+            canonical_home.join("IDENTITY.md"),
+            vec![(canonical_home.join("SOUL.md"), b"concurrent soul".to_vec())],
+        );
+
+        let error = ward
+            .apply_after_threads_approval(
+                &edits,
+                &Authorization::signed_by("SHA256:principal-key"),
+                &expected,
+            )
+            .expect_err("already-applied targets must be revalidated");
+
+        assert!(
+            format!("{error:#}").contains("changed before batch finalization"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            fs::read(tmp.path().join("SOUL.md")).unwrap(),
+            b"concurrent soul"
+        );
+        assert_eq!(
+            fs::read(tmp.path().join("IDENTITY.md")).unwrap(),
+            b"old identity"
+        );
+    }
+
+    #[test]
+    fn approved_rollback_preserves_bytes_changed_during_rollback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::write(tmp.path().join("SOUL.md"), b"old soul").unwrap();
+        fs::write(tmp.path().join("IDENTITY.md"), b"old identity").unwrap();
+        let edits = vec![
+            FileEdit::new("SOUL.md", b"new soul".to_vec()),
+            FileEdit::new("IDENTITY.md", b"new identity".to_vec()),
+        ];
+        let expected = BTreeMap::from([
+            ("SOUL.md".to_string(), b"old soul".to_vec()),
+            ("IDENTITY.md".to_string(), b"old identity".to_vec()),
+        ]);
+        let canonical_home = tmp.path().canonicalize().unwrap();
+        set_conditional_write_actions(
+            canonical_home.join("IDENTITY.md"),
+            vec![
+                (canonical_home.join("SOUL.md"), b"concurrent soul".to_vec()),
+                (
+                    canonical_home.join("IDENTITY.md"),
+                    b"concurrent identity".to_vec(),
+                ),
+            ],
+        );
+
+        let error = ward
+            .apply_after_threads_approval(
+                &edits,
+                &Authorization::signed_by("SHA256:principal-key"),
+                &expected,
+            )
+            .expect_err("rollback must not overwrite a concurrent target");
+
+        assert!(
+            format!("{error:#}").contains("conditional rollback also failed"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            fs::read(tmp.path().join("SOUL.md")).unwrap(),
+            b"concurrent soul"
+        );
+        assert_eq!(
+            fs::read(tmp.path().join("IDENTITY.md")).unwrap(),
+            b"concurrent identity"
+        );
     }
 
     #[test]
