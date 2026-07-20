@@ -35,6 +35,7 @@ mod pc;
 mod privacy;
 mod project;
 mod prompt_refs;
+mod proposal_scheduler;
 mod pty_runner;
 mod repos_config;
 mod settings;

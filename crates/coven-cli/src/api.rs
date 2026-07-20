@@ -2843,23 +2843,63 @@ fn threads_proposals_response(coven_home: &Path, id: Option<&str>) -> Result<Api
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let parsed: Option<(coven_threads_core::PendingProposal, Value)> =
-            fs::read_to_string(&path).ok().and_then(|raw| {
-                let value: Value = serde_json::from_str(&raw).ok()?;
-                let proposal = serde_json::from_str(&raw).ok()?;
-                Some((proposal, value))
-            });
-        let Some((proposal, raw_value)) = parsed else {
+        let Some(raw) = fs::read_to_string(&path).ok() else {
             proposals.push(json!({
                 "degraded": { "file": file_name, "reason": "proposal-unparseable" },
             }));
             continue;
         };
-        let review_kind = raw_value
-            .get("reviewKind")
-            .and_then(Value::as_str)
-            .unwrap_or("authority")
-            .to_string();
+        let Some(raw_value) = serde_json::from_str::<Value>(&raw).ok() else {
+            proposals.push(json!({
+                "degraded": { "file": file_name, "reason": "proposal-unparseable" },
+            }));
+            continue;
+        };
+        let phase5_shape = [
+            "schema",
+            "pending",
+            "classification",
+            "materialized_diff",
+            "region_evidence",
+            "lifecycle",
+            "veto_deadline",
+            "earliest_close",
+        ]
+        .iter()
+        .any(|field| raw_value.get(field).is_some());
+        let scheduled = if phase5_shape {
+            match serde_json::from_value::<crate::proposal_scheduler::ScheduledProposal>(
+                raw_value.clone(),
+            ) {
+                Ok(scheduled) => Some(scheduled),
+                Err(_) => {
+                    proposals.push(json!({
+                        "degraded": { "file": file_name, "reason": "proposal-unparseable" },
+                    }));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let legacy = if scheduled.is_none() {
+            match serde_json::from_value::<coven_threads_core::PendingProposal>(raw_value.clone()) {
+                Ok(proposal) => Some(proposal),
+                Err(_) => {
+                    proposals.push(json!({
+                        "degraded": { "file": file_name, "reason": "proposal-unparseable" },
+                    }));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let proposal = scheduled
+            .as_ref()
+            .map(crate::proposal_scheduler::ScheduledProposal::pending)
+            .or(legacy.as_ref())
+            .expect("scheduled or legacy proposal parsed");
         let Some(familiar_id) = human_familiar_id_for_weave(coven_home, proposal.familiar_id)?
         else {
             // A proposal whose familiar vanished from familiars.toml cannot
@@ -2875,14 +2915,58 @@ fn threads_proposals_response(coven_home: &Path, id: Option<&str>) -> Result<Api
             .map(|edit| edit.surface.as_str().to_string())
             .collect();
         let format = time::format_description::well_known::Rfc3339;
-        proposals.push(json!({
+        let mut view = json!({
             "proposalId": proposal.id.0.to_string(),
             "familiarId": familiar_id,
-            "reviewKind": review_kind,
             "writer": proposal.writer.as_str(),
             "stagedAt": proposal.staged_at.format(&format).ok(),
             "targets": targets,
-        }));
+        });
+        if let Some(scheduled) = &scheduled {
+            let approval_path = coven_threads_core::ApprovalPathWireEnvelope::from_classification(
+                scheduled.classification(),
+                Some(proposal.staged_at),
+            )
+            .map_err(anyhow::Error::msg)
+            .context("building approval path wire envelope")?;
+            let affected_regions: Vec<&str> = scheduled
+                .classification()
+                .affected_regions
+                .iter()
+                .map(coven_threads_core::SurfaceRegionId::as_str)
+                .collect();
+            let view = view
+                .as_object_mut()
+                .expect("proposal view is always a JSON object");
+            view.insert(
+                "approvalPath".to_string(),
+                serde_json::to_value(approval_path)?,
+            );
+            let lifecycle = serde_json::to_value(scheduled.lifecycle())?;
+            view.insert(
+                "lifecycle".to_string(),
+                lifecycle.get("state").cloned().unwrap_or(Value::Null),
+            );
+            if let Some(reason) = lifecycle.get("reason") {
+                view.insert("blockedReason".to_string(), reason.clone());
+            }
+            view.insert(
+                "earliestClose".to_string(),
+                json!(scheduled
+                    .earliest_close()
+                    .and_then(|value| value.format(&format).ok())),
+            );
+            view.insert("affectedRegions".to_string(), json!(affected_regions));
+        } else {
+            let review_kind = raw_value
+                .get("reviewKind")
+                .and_then(Value::as_str)
+                .unwrap_or("authority");
+            view.as_object_mut()
+                .expect("proposal view is always a JSON object")
+                .insert("reviewKind".to_string(), json!(review_kind));
+        }
+        proposals.push(view);
     }
 
     match id {
@@ -6573,6 +6657,107 @@ tier = 2
         assert_eq!(response.status, 400);
         let body: serde_json::Value = serde_json::from_str(&response.body)?;
         assert_eq!(body["error"]["code"], "invalid_request");
+        Ok(())
+    }
+
+    #[test]
+    fn threads_proposals_renders_validated_phase5_scheduler_state() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_warded_familiar(home)?;
+        let proposal_id = coven_threads_core::ProposalId::new();
+        let familiar_id = crate::threads_gate::familiar_weave_id("sage");
+        let surface = coven_threads_core::SurfaceId::new("TOOLS.md");
+        let staged_at = time::OffsetDateTime::from_unix_timestamp(1_700_000_000)?;
+        let pending = coven_threads_core::PendingProposal {
+            id: proposal_id,
+            familiar_id,
+            writer: coven_threads_core::WriterId::new("principal:fpr-val"),
+            channel: coven_threads_core::Channel::Mutation,
+            thread_id: coven_threads_core::ThreadId::new(),
+            fray: coven_threads_core::FrayOrSnap::Frayed {
+                strand: None,
+                channel: coven_threads_core::Channel::Mutation,
+                reason: coven_threads_core::FrayReason::Other("phase-5 fixture".to_string()),
+            },
+            edits: vec![coven_threads_core::StagedEdit {
+                surface: surface.clone(),
+                contents: coven_threads_core::StagedContents::from_bytes(b"tweak"),
+            }],
+            staged_at,
+        };
+        let diff =
+            coven_threads_core::MaterializedDiff::try_new(vec![coven_threads_core::SurfaceDiff {
+                surface: surface.clone(),
+                before: None,
+                after: Some(b"tweak".to_vec()),
+            }])
+            .map_err(anyhow::Error::msg)?;
+        let evidence =
+            coven_threads_core::SurfaceRegionRegistry::default_registry().classify_all(&diff);
+        let classification = coven_threads_core::ProposalClassification {
+            proposal_id,
+            familiar_id,
+            channel: coven_threads_core::Channel::Mutation,
+            affected_surfaces: vec![surface],
+            affected_regions: evidence.iter().map(|item| item.region_id.clone()).collect(),
+            path_tier_floor: 1,
+            approval_path: coven_threads_core::ApprovalPath::FamiliarCoherence {
+                veto: coven_threads_core::VetoWindow::new(
+                    std::time::Duration::from_secs(300),
+                    std::time::Duration::from_secs(60),
+                ),
+            },
+            evidence_replay_hash: coven_threads_core::evidence_replay_hash(&diff, &evidence),
+            classified_at: staged_at,
+        };
+        let scheduled =
+            crate::proposal_scheduler::ScheduledProposal::try_new(pending, classification, diff)?;
+        let pending_dir = home.join("pending");
+        std::fs::create_dir_all(&pending_dir)?;
+        std::fs::write(
+            pending_dir.join(format!("{familiar_id}-{proposal_id}.json")),
+            serde_json::to_vec_pretty(&scheduled)?,
+        )?;
+
+        let response = handle_request("GET", "/api/v1/threads/proposals", home, None)?;
+
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        let listed = &body["proposals"][0];
+        assert_eq!(listed["proposalId"], proposal_id.to_string());
+        assert_eq!(listed["familiarId"], "sage");
+        assert_eq!(listed["approvalPath"]["variant"], "familiar_coherence");
+        assert_eq!(listed["approvalPath"]["label"], "familiar_review");
+        assert_eq!(
+            listed["approvalPath"]["veto_deadline"],
+            "2023-11-14T22:18:20Z"
+        );
+        assert_eq!(listed["lifecycle"], "veto_window_open");
+        assert_eq!(listed["earliestClose"], "2023-11-14T22:14:20Z");
+        assert_eq!(listed["affectedRegions"][0], "tool_defaults");
+        assert!(listed.get("reviewKind").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn threads_proposals_does_not_fallback_malformed_phase5_to_legacy() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending_path, _) = stage_pending_protected_edit(home)?;
+        let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(&pending_path)?)?;
+        value["classification"] = serde_json::json!({});
+        std::fs::write(&pending_path, serde_json::to_vec_pretty(&value)?)?;
+
+        let response = handle_request("GET", "/api/v1/threads/proposals", home, None)?;
+
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(
+            body["proposals"][0]["degraded"]["reason"],
+            "proposal-unparseable"
+        );
+        assert!(body["proposals"][0].get("proposalId").is_none());
         Ok(())
     }
 
