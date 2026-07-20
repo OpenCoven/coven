@@ -865,11 +865,14 @@ fn cleanup_unreachable_duplicate_daemons(coven_home: &Path, active_pid: u32) {
         .processes()
         .iter()
         .filter_map(|(pid, process)| {
-            let pid_u32 = pid.as_u32();
-            if pid_u32 == active_pid
-                || !process_is_coven_daemon_serve(process.cmd())
-                || !process_coven_home_matches(process.environ(), coven_home)
-            {
+            if !process_is_unreachable_duplicate_daemon_candidate(
+                pid.as_u32(),
+                active_pid,
+                process.thread_kind(),
+                process.cmd(),
+                process.environ(),
+                coven_home,
+            ) {
                 return None;
             }
             Some((*pid, process.start_time(), process.cmd().to_vec()))
@@ -883,8 +886,14 @@ fn cleanup_unreachable_duplicate_daemons(coven_home: &Path, active_pid: u32) {
         };
         if process.start_time() != start_time
             || process.cmd() != cmd.as_slice()
-            || !process_is_coven_daemon_serve(process.cmd())
-            || !process_coven_home_matches(process.environ(), coven_home)
+            || !process_is_unreachable_duplicate_daemon_candidate(
+                pid.as_u32(),
+                active_pid,
+                process.thread_kind(),
+                process.cmd(),
+                process.environ(),
+                coven_home,
+            )
         {
             continue;
         }
@@ -907,6 +916,21 @@ fn cleanup_unreachable_duplicate_daemons(coven_home: &Path, active_pid: u32) {
             ),
         }
     }
+}
+
+#[cfg(unix)]
+fn process_is_unreachable_duplicate_daemon_candidate(
+    pid: u32,
+    active_pid: u32,
+    thread_kind: Option<sysinfo::ThreadKind>,
+    cmd: &[std::ffi::OsString],
+    environ: &[std::ffi::OsString],
+    coven_home: &Path,
+) -> bool {
+    pid != active_pid
+        && thread_kind.is_none()
+        && process_is_coven_daemon_serve(cmd)
+        && process_coven_home_matches(environ, coven_home)
 }
 
 #[cfg(unix)]
@@ -2764,6 +2788,38 @@ mod tests {
         let _second =
             acquire_serve_lock(home.path()).expect("lock should be reacquirable once released");
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn duplicate_daemon_candidate_rejects_threads_but_accepts_processes() {
+        use std::ffi::OsString;
+        use sysinfo::ThreadKind;
+
+        let coven_home = Path::new("/home/coven");
+        let cmd = [
+            OsString::from("coven"),
+            OsString::from("daemon"),
+            OsString::from("serve"),
+        ];
+        let environ = [OsString::from("COVEN_HOME=/home/coven")];
+
+        assert!(process_is_unreachable_duplicate_daemon_candidate(
+            42, 41, None, &cmd, &environ, coven_home,
+        ));
+        for thread_kind in [ThreadKind::Userland, ThreadKind::Kernel] {
+            assert!(
+                !process_is_unreachable_duplicate_daemon_candidate(
+                    42,
+                    41,
+                    Some(thread_kind),
+                    &cmd,
+                    &environ,
+                    coven_home,
+                ),
+                "{thread_kind:?} thread must not be a duplicate-daemon candidate"
+            );
+        }
     }
 
     #[test]
