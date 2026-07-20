@@ -57,6 +57,13 @@
 //! - **Hard-linked targets** are harmless by construction: `rename` replaces
 //!   the directory entry and never writes through the linked inode.
 //!
+//! Phase 5 approved writes additionally preserve the file actually displaced by
+//! the atomic commit. Linux and macOS exchange the staged and target entries;
+//! Windows uses `ReplaceFileW` with a distinct randomized sibling backup. The
+//! displaced before-image and installed bytes are verified before the batch can
+//! finalize, and rollback uses the same primitive in reverse so concurrent
+//! target bytes are preserved rather than overwritten.
+//!
 //! Residual risk (accepted): a same-privilege process that can already write
 //! inside the familiar home can still swap path components in the window
 //! between the per-component verification and the final `rename`. The check
@@ -73,6 +80,8 @@ use std::fs::OpenOptions;
 use std::io::{ErrorKind, Write};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -857,9 +866,21 @@ fn write_atomic(
     Ok(audit)
 }
 
+struct ApprovedWritePaths {
+    staged: PathBuf,
+    displaced: PathBuf,
+}
+
+impl ApprovedWritePaths {
+    fn new(target: &Path, staged: PathBuf) -> Result<Self> {
+        let displaced = approved_write_displaced_path(target, &staged)?;
+        Ok(Self { staged, displaced })
+    }
+}
+
 struct PreparedConditionalWrite {
     path: PathBuf,
-    staged: Option<PathBuf>,
+    paths: Option<ApprovedWritePaths>,
     already_applied: bool,
     expected_before: Vec<u8>,
     new_contents: Vec<u8>,
@@ -869,9 +890,10 @@ struct PreparedConditionalWrite {
 /// Commit an approved proposal only while every target still has the exact
 /// before-image reviewed by the scheduler.
 ///
-/// Existing targets are exchanged atomically with randomized sibling staging
-/// files. The displaced inode is then compared with the approved before-image;
-/// a mismatch swaps it back and rolls back every earlier edit in the batch.
+/// Existing targets are atomically replaced from randomized sibling staging
+/// files while preserving the displaced target at a known sibling path. The
+/// displaced bytes are then compared with the approved before-image; a mismatch
+/// restores them and rolls back every earlier edit owned by this apply attempt.
 /// Already-applied bytes are accepted so crash recovery remains idempotent.
 fn write_atomically_if_unchanged(
     canonical_home: &Path,
@@ -907,7 +929,7 @@ fn write_atomically_if_unchanged(
             }
             Ok(PreparedConditionalWrite {
                 path,
-                staged: None,
+                paths: None,
                 already_applied,
                 expected_before: expected,
                 new_contents: edit.new_contents.clone(),
@@ -932,20 +954,25 @@ fn write_atomically_if_unchanged(
             continue;
         }
         match stage_contents(&prepared[index].path, &prepared[index].new_contents) {
-            Ok(staged) => prepared[index].staged = Some(staged),
+            Ok(paths) => prepared[index].paths = Some(paths),
             Err(error) => return fail_after_conditional_rollback(&prepared, &[], error),
         }
     }
 
     let mut swapped = Vec::new();
     for (index, write) in prepared.iter().enumerate() {
-        let Some(staged) = &write.staged else {
+        let Some(paths) = &write.paths else {
             continue;
         };
         if let Err(error) = maybe_run_conditional_write_hook(&write.path) {
             return fail_after_conditional_rollback(&prepared, &swapped, error);
         }
-        if let Err(error) = atomic_exchange(staged, &write.path) {
+        if let Err(error) =
+            atomic_replace_preserving_target(&write.path, &paths.staged, &paths.displaced)
+        {
+            if failed_replace_displaced_target(&paths.displaced) {
+                swapped.push(index);
+            }
             return fail_after_conditional_rollback(
                 &prepared,
                 &swapped,
@@ -958,8 +985,9 @@ fn write_atomically_if_unchanged(
         swapped.push(index);
 
         let verification = (|| -> Result<()> {
-            let displaced = std::fs::read(staged)
-                .with_context(|| format!("reading displaced target {}", staged.display()))?;
+            let displaced = std::fs::read(&paths.displaced).with_context(|| {
+                format!("reading displaced target {}", paths.displaced.display())
+            })?;
             let installed = std::fs::read(&write.path)
                 .with_context(|| format!("verifying approved write {}", write.path.display()))?;
             if displaced != write.expected_before || installed != write.new_contents {
@@ -994,9 +1022,13 @@ fn write_atomically_if_unchanged(
     }
 
     for write in &prepared {
-        if let Some(staged) = &write.staged {
-            std::fs::remove_file(staged)
-                .with_context(|| format!("removing approved-write backup {}", staged.display()))?;
+        if let Some(paths) = &write.paths {
+            std::fs::remove_file(&paths.displaced).with_context(|| {
+                format!(
+                    "removing approved-write backup {}",
+                    paths.displaced.display()
+                )
+            })?;
         }
     }
 
@@ -1027,11 +1059,11 @@ fn rollback_conditional_writes(
     let mut errors = Vec::new();
     for &index in swapped.iter().rev() {
         let write = &prepared[index];
-        let staged = write
-            .staged
+        let paths = write
+            .paths
             .as_ref()
-            .context("swapped conditional write has no staging path")?;
-        if let Err(error) = restore_swapped_write(write, staged) {
+            .context("swapped conditional write has no approved-write paths")?;
+        if let Err(error) = restore_swapped_write(write, paths) {
             errors.push(format!("{}: {error:#}", write.decision.target));
         }
     }
@@ -1068,25 +1100,31 @@ fn fail_after_conditional_rollback(
     }
 }
 
-fn restore_swapped_write(write: &PreparedConditionalWrite, staged: &Path) -> Result<()> {
-    let restore_bytes = std::fs::read(staged)
-        .with_context(|| format!("reading rollback source {}", staged.display()))?;
-    atomic_exchange(staged, &write.path).with_context(|| {
-        format!(
-            "restoring approved target {} from {}",
-            write.path.display(),
-            staged.display()
-        )
-    })?;
-    let verification = verify_rollback_exchange(write, staged, &restore_bytes);
-    if let Err(error) = verification {
-        atomic_exchange(staged, &write.path).with_context(|| {
+fn restore_swapped_write(
+    write: &PreparedConditionalWrite,
+    paths: &ApprovedWritePaths,
+) -> Result<()> {
+    let restore_bytes = std::fs::read(&paths.displaced)
+        .with_context(|| format!("reading rollback source {}", paths.displaced.display()))?;
+    atomic_replace_preserving_target(&write.path, &paths.displaced, &paths.staged).with_context(
+        || {
             format!(
-                "putting concurrent bytes back at {} after rollback verification failed: \
-                 {error:#}",
-                write.path.display()
+                "restoring approved target {} from {}",
+                write.path.display(),
+                paths.displaced.display()
             )
-        })?;
+        },
+    )?;
+    let verification = verify_rollback_exchange(write, &paths.staged, &restore_bytes);
+    if let Err(error) = verification {
+        atomic_replace_preserving_target(&write.path, &paths.staged, &paths.displaced)
+            .with_context(|| {
+                format!(
+                    "putting concurrent bytes back at {} after rollback verification failed: \
+                     {error:#}",
+                    write.path.display()
+                )
+            })?;
         return Err(error);
     }
     Ok(())
@@ -1116,17 +1154,20 @@ fn verify_rollback_exchange(
 
 fn cleanup_conditional_staging(prepared: &[PreparedConditionalWrite]) {
     for write in prepared {
-        if let Some(staged) = &write.staged {
-            let _ = std::fs::remove_file(staged);
+        if let Some(paths) = &write.paths {
+            let _ = std::fs::remove_file(&paths.staged);
+            if paths.displaced != paths.staged {
+                let _ = std::fs::remove_file(&paths.displaced);
+            }
         }
     }
 }
 
 pub(crate) const fn supports_atomic_approved_writes() -> bool {
-    cfg!(any(target_os = "linux", target_os = "macos"))
+    cfg!(any(target_os = "linux", target_os = "macos", windows))
 }
 
-fn stage_contents(path: &Path, contents: &[u8]) -> Result<PathBuf> {
+fn stage_contents(path: &Path, contents: &[u8]) -> Result<ApprovedWritePaths> {
     let (staged, mut file) = create_staging_file(path)?;
     let result = (|| -> Result<()> {
         file.write_all(contents)
@@ -1140,7 +1181,13 @@ fn stage_contents(path: &Path, contents: &[u8]) -> Result<PathBuf> {
         let _ = std::fs::remove_file(&staged);
         return Err(error);
     }
-    Ok(staged)
+    match ApprovedWritePaths::new(path, staged.clone()) {
+        Ok(paths) => Ok(paths),
+        Err(error) => {
+            let _ = std::fs::remove_file(staged);
+            Err(error)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1189,7 +1236,14 @@ fn maybe_run_conditional_write_hook(_path: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn atomic_exchange(left: &Path, right: &Path) -> Result<()> {
+fn atomic_replace_preserving_target(
+    target: &Path,
+    replacement: &Path,
+    displaced: &Path,
+) -> Result<()> {
+    if replacement != displaced {
+        bail!("macOS approved-write exchange requires a shared replacement/backup path");
+    }
     const RENAME_SWAP: u32 = 0x0000_0002;
     unsafe extern "C" {
         fn renamex_np(
@@ -1199,10 +1253,11 @@ fn atomic_exchange(left: &Path, right: &Path) -> Result<()> {
         ) -> libc::c_int;
     }
 
-    let left = CString::new(left.as_os_str().as_bytes()).context("staging path contains NUL")?;
-    let right = CString::new(right.as_os_str().as_bytes()).context("target path contains NUL")?;
+    let replacement = CString::new(replacement.as_os_str().as_bytes())
+        .context("replacement path contains NUL")?;
+    let target = CString::new(target.as_os_str().as_bytes()).context("target path contains NUL")?;
     // SAFETY: both C strings are NUL-terminated and remain alive for the call.
-    let result = unsafe { renamex_np(left.as_ptr(), right.as_ptr(), RENAME_SWAP) };
+    let result = unsafe { renamex_np(replacement.as_ptr(), target.as_ptr(), RENAME_SWAP) };
     if result == 0 {
         Ok(())
     } else {
@@ -1211,18 +1266,26 @@ fn atomic_exchange(left: &Path, right: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn atomic_exchange(left: &Path, right: &Path) -> Result<()> {
+fn atomic_replace_preserving_target(
+    target: &Path,
+    replacement: &Path,
+    displaced: &Path,
+) -> Result<()> {
+    if replacement != displaced {
+        bail!("Linux approved-write exchange requires a shared replacement/backup path");
+    }
     const RENAME_EXCHANGE: libc::c_uint = 1 << 1;
-    let left = CString::new(left.as_os_str().as_bytes()).context("staging path contains NUL")?;
-    let right = CString::new(right.as_os_str().as_bytes()).context("target path contains NUL")?;
+    let replacement = CString::new(replacement.as_os_str().as_bytes())
+        .context("replacement path contains NUL")?;
+    let target = CString::new(target.as_os_str().as_bytes()).context("target path contains NUL")?;
     // SAFETY: both C strings are NUL-terminated and remain alive for the syscall.
     let result = unsafe {
         libc::syscall(
             libc::SYS_renameat2,
             libc::AT_FDCWD,
-            left.as_ptr(),
+            replacement.as_ptr(),
             libc::AT_FDCWD,
-            right.as_ptr(),
+            target.as_ptr(),
             RENAME_EXCHANGE,
         )
     };
@@ -1233,9 +1296,134 @@ fn atomic_exchange(left: &Path, right: &Path) -> Result<()> {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn atomic_exchange(_left: &Path, _right: &Path) -> Result<()> {
+#[cfg(windows)]
+fn atomic_replace_preserving_target(
+    target: &Path,
+    replacement: &Path,
+    displaced: &Path,
+) -> Result<()> {
+    use windows_sys::Win32::Foundation::ERROR_UNABLE_TO_MOVE_REPLACEMENT_2;
+    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+
+    let target_wide = windows_path(target, "target")?;
+    let replacement_wide = windows_path(replacement, "replacement")?;
+    let displaced_wide = windows_path(displaced, "displaced")?;
+    // REPLACEFILE_WRITE_THROUGH is documented as unsupported. The staged file
+    // is synced before this call, and no ignore flags are used.
+    let result = unsafe {
+        ReplaceFileW(
+            target_wide.as_ptr(),
+            replacement_wide.as_ptr(),
+            displaced_wide.as_ptr(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if result != 0 {
+        Ok(())
+    } else {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 as i32) {
+            if let Err(recovery_error) =
+                restore_displaced_target_after_partial_replace(target, displaced)
+            {
+                return Err(anyhow!(
+                    "atomically replacing approved target failed: {error}; restoring the \
+                     documented partial replacement also failed: {recovery_error:#}"
+                ));
+            }
+        }
+        Err(error).context("atomically replacing approved target while preserving displaced bytes")
+    }
+}
+
+#[cfg(windows)]
+fn windows_path(path: &Path, label: &str) -> Result<Vec<u16>> {
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if wide.contains(&0) {
+        bail!("{label} path contains NUL");
+    }
+    wide.push(0);
+    Ok(wide)
+}
+
+#[cfg(windows)]
+fn restore_displaced_target_after_partial_replace(target: &Path, displaced: &Path) -> Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+
+    let target = windows_path(target, "target")?;
+    let displaced = windows_path(displaced, "displaced")?;
+    let result =
+        unsafe { MoveFileExW(displaced.as_ptr(), target.as_ptr(), MOVEFILE_WRITE_THROUGH) };
+    if result != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+            .context("atomically restoring the target after a partial Windows file replacement")
+    }
+}
+
+#[cfg(windows)]
+fn failed_replace_displaced_target(displaced: &Path) -> bool {
+    match std::fs::symlink_metadata(displaced) {
+        Ok(_) => true,
+        Err(error) if error.kind() == ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
+#[cfg(not(windows))]
+fn failed_replace_displaced_target(_displaced: &Path) -> bool {
+    false
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn atomic_replace_preserving_target(
+    _target: &Path,
+    _replacement: &Path,
+    _displaced: &Path,
+) -> Result<()> {
     bail!("atomic approved-write exchange is unsupported on this platform")
+}
+
+#[cfg(windows)]
+fn approved_write_displaced_path(target: &Path, _staged: &Path) -> Result<PathBuf> {
+    // Use an independent random name so observing the staged entry does not
+    // disclose the backup path before the atomic ReplaceFileW call.
+    for _ in 0..16 {
+        let displaced = displaced_path(target);
+        match std::fs::symlink_metadata(&displaced) {
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(displaced),
+            Ok(_) => continue,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "checking approved-write backup path {}",
+                        displaced.display()
+                    )
+                })
+            }
+        }
+    }
+    bail!(
+        "could not select a fresh approved-write backup beside {}",
+        target.display()
+    )
+}
+
+#[cfg(not(windows))]
+fn approved_write_displaced_path(_target: &Path, staged: &Path) -> Result<PathBuf> {
+    Ok(staged.to_path_buf())
+}
+
+#[cfg(windows)]
+fn displaced_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    path.with_file_name(format!(".{name}.ward-displaced-{}", uuid::Uuid::new_v4()))
 }
 
 /// Create a fresh sibling staging file for an atomic write.
@@ -1452,6 +1640,9 @@ mod tests {
     use super::*;
     use std::fs;
 
+    #[cfg(windows)]
+    const _: () = assert!(supports_atomic_approved_writes());
+
     fn sample_config() -> WardConfig {
         WardConfig {
             principal_key_fingerprint: "SHA256:principal-key".to_string(),
@@ -1490,17 +1681,96 @@ mod tests {
         Ward::new(dir.to_path_buf(), sample_config()).expect("valid ward")
     }
 
-    /// Directory entries that look like staging files (randomized names make
-    /// exact-path existence checks meaningless — scan for the marker instead).
+    /// Directory entries that look like approved-write working files (randomized
+    /// names make exact-path existence checks meaningless).
     fn staging_litter(dir: &Path) -> Vec<String> {
         match fs::read_dir(dir) {
             Ok(entries) => entries
                 .filter_map(|entry| entry.ok())
                 .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                .filter(|name| name.contains(".ward-staged"))
+                .filter(|name| name.contains(".ward-staged") || name.contains(".ward-displaced"))
                 .collect(),
             Err(_) => Vec::new(),
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn unix_approved_write_paths_reuse_staging_path_for_exchange() {
+        let staged = PathBuf::from(".SOUL.md.ward-staged-test");
+        let paths = ApprovedWritePaths::new(Path::new("SOUL.md"), staged.clone()).unwrap();
+
+        assert_eq!(paths.staged, staged);
+        assert_eq!(paths.displaced, staged);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_approved_write_paths_select_distinct_displaced_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("SOUL.md");
+        let staged = tmp.path().join(".SOUL.md.ward-staged-test");
+        let paths = ApprovedWritePaths::new(&target, staged.clone()).unwrap();
+
+        assert_eq!(paths.staged, staged);
+        assert_ne!(paths.displaced, paths.staged);
+        assert_eq!(paths.displaced.parent(), target.parent());
+        assert!(paths
+            .displaced
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains(".ward-displaced-"));
+        assert!(!paths.displaced.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_atomic_replace_preserves_displaced_bytes_for_commit_and_rollback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("SOUL.md");
+        let staged = tmp.path().join(".SOUL.md.ward-staged-test");
+        fs::write(&target, b"old soul").unwrap();
+        fs::write(&staged, b"new soul").unwrap();
+        let paths = ApprovedWritePaths::new(&target, staged).unwrap();
+
+        atomic_replace_preserving_target(&target, &paths.staged, &paths.displaced).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"new soul");
+        assert_eq!(fs::read(&paths.displaced).unwrap(), b"old soul");
+        assert!(!paths.staged.exists());
+
+        atomic_replace_preserving_target(&target, &paths.displaced, &paths.staged).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"old soul");
+        assert_eq!(fs::read(&paths.staged).unwrap(), b"new soul");
+        assert!(!paths.displaced.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_partial_replace_state_requires_rollback_before_cleanup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let displaced = tmp.path().join(".SOUL.md.ward-displaced-test");
+
+        assert!(!failed_replace_displaced_target(&displaced));
+        fs::write(&displaced, b"old soul").unwrap();
+        assert!(failed_replace_displaced_target(&displaced));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_partial_replace_recovery_restores_target_without_consuming_staged_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("SOUL.md");
+        let staged = tmp.path().join(".SOUL.md.ward-staged-test");
+        let displaced = tmp.path().join(".SOUL.md.ward-displaced-test");
+        fs::write(&staged, b"new soul").unwrap();
+        fs::write(&displaced, b"old soul").unwrap();
+
+        restore_displaced_target_after_partial_replace(&target, &displaced).unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"old soul");
+        assert_eq!(fs::read(&staged).unwrap(), b"new soul");
+        assert!(!displaced.exists());
     }
 
     #[test]
