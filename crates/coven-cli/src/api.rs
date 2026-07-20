@@ -2999,9 +2999,11 @@ fn threads_proposals_response(coven_home: &Path, id: Option<&str>) -> Result<Api
         let mut view = json!({
             "proposalId": proposal.id.0.to_string(),
             "familiarId": familiar_id,
+            "familiarUuid": proposal.familiar_id.0.to_string(),
             "writer": proposal.writer.as_str(),
             "stagedAt": proposal.staged_at.format(&format).ok(),
             "targets": targets,
+            "proposalRevision": proposal_revision(&proposal_value)?,
         });
         if let Some(scheduled) = &scheduled {
             let approval_path = coven_threads_core::ApprovalPathWireEnvelope::from_classification(
@@ -3268,6 +3270,12 @@ fn revalidate_scheduled_materialized_before(
     Ok(())
 }
 
+fn proposal_revision(authority_value: &Value) -> Result<String> {
+    let bytes =
+        serde_json::to_vec(authority_value).context("serializing proposal revision authority")?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+}
+
 fn ward_tier_number(tier: ward::Tier) -> u8 {
     match tier {
         ward::Tier::Protected => 0,
@@ -3283,6 +3291,25 @@ pub(crate) fn decide_threads_proposal(
     decision: &str,
     body: Option<&str>,
 ) -> Result<ApiResponse> {
+    decide_threads_proposal_inner(coven_home, proposal_id, decision, body, true)
+}
+
+fn decide_threads_proposal_automatic(
+    coven_home: &Path,
+    proposal_id: &str,
+    decision: &str,
+    body: Option<&str>,
+) -> Result<ApiResponse> {
+    decide_threads_proposal_inner(coven_home, proposal_id, decision, body, false)
+}
+
+fn decide_threads_proposal_inner(
+    coven_home: &Path,
+    proposal_id: &str,
+    decision: &str,
+    body: Option<&str>,
+    revision_required: bool,
+) -> Result<ApiResponse> {
     let _decision_guard = proposal_decision_lock()
         .lock()
         .map_err(|_| anyhow::anyhow!("proposal decision lock poisoned"))?;
@@ -3295,15 +3322,28 @@ pub(crate) fn decide_threads_proposal(
             )
         }
     };
-    let note = match parse_body(body) {
-        Ok(payload) => match payload.get("note") {
-            None | Some(Value::Null) => None,
-            Some(Value::String(note)) => Some(note.clone()),
-            Some(_) => {
-                return json_response(400, &json!({ "blocked": true, "why": "invalid-note" }))
-            }
-        },
+    let payload = match parse_body(body) {
+        Ok(payload) => payload,
         Err(_) => return json_response(400, &json!({ "blocked": true, "why": "invalid-json" })),
+    };
+    let note = match payload.get("note") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(note)) => Some(note.clone()),
+        Some(_) => return json_response(400, &json!({ "blocked": true, "why": "invalid-note" })),
+    };
+    let expected_revision = match payload.get("expectedRevision") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(revision))
+            if revision.len() == 64 && revision.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+        {
+            Some(revision.to_ascii_lowercase())
+        }
+        Some(_) => {
+            return json_response(
+                400,
+                &json!({ "blocked": true, "why": "invalid-proposal-revision" }),
+            )
+        }
     };
     let conn = store::open_store(&store_path(coven_home))?;
     if let Some(terminal) = proposal_terminal_event(&conn, proposal_id)? {
@@ -3335,30 +3375,42 @@ pub(crate) fn decide_threads_proposal(
             }),
         );
     }
-    let mut claim =
-        match PendingDecisionClaim::acquire(coven_home, proposal_uuid, decision, note.as_deref()) {
-            Ok(Some(claim)) => claim,
-            Ok(None) => {
-                return json_response(
-                    404,
-                    &json!({ "blocked": true, "why": "proposal-not-found" }),
-                )
-            }
-            Err(error)
-                if error
-                    .chain()
-                    .any(|cause| cause.downcast_ref::<serde_json::Error>().is_some()) =>
-            {
-                return json_response(409, &json!({ "blocked": true, "why": "proposal-corrupt" }))
-            }
-            Err(error) if error.to_string().contains("already claimed") => {
-                return json_response(
-                    409,
-                    &json!({ "blocked": true, "why": "proposal-decision-in-progress" }),
-                )
-            }
-            Err(error) => return Err(error),
-        };
+    let mut claim = match PendingDecisionClaim::acquire(
+        coven_home,
+        proposal_uuid,
+        decision,
+        note.as_deref(),
+        expected_revision.as_deref(),
+        revision_required,
+    ) {
+        Ok(Some(claim)) => claim,
+        Ok(None) => {
+            return json_response(
+                404,
+                &json!({ "blocked": true, "why": "proposal-not-found" }),
+            )
+        }
+        Err(error)
+            if error
+                .chain()
+                .any(|cause| cause.downcast_ref::<serde_json::Error>().is_some()) =>
+        {
+            return json_response(409, &json!({ "blocked": true, "why": "proposal-corrupt" }))
+        }
+        Err(error) if error.to_string().contains("already claimed") => {
+            return json_response(
+                409,
+                &json!({ "blocked": true, "why": "proposal-decision-in-progress" }),
+            )
+        }
+        Err(error) if error.downcast_ref::<ProposalRevisionMismatch>().is_some() => {
+            return json_response(
+                409,
+                &json!({ "blocked": true, "why": "proposal-revision-mismatch" }),
+            )
+        }
+        Err(error) => return Err(error),
+    };
     if claim.recovery {
         claim.preserve();
     }
@@ -3391,6 +3443,12 @@ pub(crate) fn decide_threads_proposal(
                 &json!({ "blocked": true, "why": "proposal-recovery-request-conflict" }),
             );
         }
+        if expected_revision.is_some() && expected_revision != request.expected_revision {
+            return json_response(
+                409,
+                &json!({ "blocked": true, "why": "proposal-recovery-request-conflict" }),
+            );
+        }
     }
     let note = durable_request
         .as_ref()
@@ -3406,6 +3464,31 @@ pub(crate) fn decide_threads_proposal(
         object.remove("decisionRequest");
     }
     let phase5_shape = is_phase5_proposal_shape(&authority_value);
+    let actual_revision = proposal_revision(&authority_value)?;
+    if let Some(request) = durable_request.as_ref() {
+        if request
+            .expected_revision
+            .as_ref()
+            .is_some_and(|expected| expected != &actual_revision)
+        {
+            if applying_state.is_none() {
+                claim.restore_pending(&mut raw_value)?;
+            }
+            return json_response(
+                409,
+                &json!({ "blocked": true, "why": "proposal-revision-mismatch" }),
+            );
+        }
+        if phase5_shape && request.revision_required && request.expected_revision.is_none() {
+            if applying_state.is_none() {
+                claim.restore_pending(&mut raw_value)?;
+            }
+            return json_response(
+                409,
+                &json!({ "blocked": true, "why": "proposal-revision-required" }),
+            );
+        }
+    }
     let scheduled = if phase5_shape {
         match serde_json::from_value::<crate::proposal_scheduler::ScheduledProposal>(
             authority_value.clone(),
@@ -4047,7 +4130,7 @@ pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> 
                 let body = request
                     .rationale
                     .map(|note| json!({ "note": note }).to_string());
-                let response = decide_threads_proposal(
+                let response = decide_threads_proposal_automatic(
                     coven_home,
                     &proposal.pending().id.0.to_string(),
                     &request.decision,
@@ -4068,7 +4151,7 @@ pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> 
             if !due {
                 return Ok(false);
             }
-            let response = decide_threads_proposal(
+            let response = decide_threads_proposal_automatic(
                 coven_home,
                 &proposal.pending().id.0.to_string(),
                 "approve",
@@ -4127,7 +4210,7 @@ fn recover_proposal_claim(coven_home: &Path, claim_path: &Path) -> Result<bool> 
         .and_then(|state| state.rationale)
         .or_else(|| request.and_then(|request| request.rationale))
         .map(|note| json!({ "note": note }).to_string());
-    let response = decide_threads_proposal(
+    let response = decide_threads_proposal_automatic(
         coven_home,
         &proposal_id.to_string(),
         decision,
@@ -4229,12 +4312,25 @@ struct PendingDecisionClaim {
     recovery: bool,
 }
 
+#[derive(Debug)]
+struct ProposalRevisionMismatch;
+
+impl std::fmt::Display for ProposalRevisionMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("proposal revision does not match inspected revision")
+    }
+}
+
+impl std::error::Error for ProposalRevisionMismatch {}
+
 impl PendingDecisionClaim {
     fn acquire(
         coven_home: &Path,
         proposal_id: Uuid,
         decision: &str,
         rationale: Option<&str>,
+        expected_revision: Option<&str>,
+        revision_required: bool,
     ) -> Result<Option<Self>> {
         if let Some((path, claimed_decision)) =
             find_any_pending_decision_claim(coven_home, &proposal_id.to_string())
@@ -4271,6 +4367,16 @@ impl PendingDecisionClaim {
         let mut value: Value =
             serde_json::from_str(&raw).context("parsing pending proposal before decision claim")?;
         if proposal_decision_request(&value)?.is_none() {
+            let mut authority_value = value.clone();
+            if let Some(object) = authority_value.as_object_mut() {
+                object.remove("decisionState");
+                object.remove("decisionRequest");
+            }
+            if let Some(expected_revision) = expected_revision {
+                if proposal_revision(&authority_value)? != expected_revision {
+                    return Err(ProposalRevisionMismatch.into());
+                }
+            }
             value
                 .as_object_mut()
                 .context("pending proposal must be a JSON object")?
@@ -4280,6 +4386,8 @@ impl PendingDecisionClaim {
                         decision: decision.to_string(),
                         rationale: rationale.map(str::to_string),
                         claimed_at: time::OffsetDateTime::now_utc(),
+                        expected_revision: expected_revision.map(str::to_string),
+                        revision_required,
                     })?,
                 );
         }
@@ -4346,6 +4454,10 @@ struct ProposalDecisionRequest {
     decision: String,
     rationale: Option<String>,
     claimed_at: time::OffsetDateTime,
+    #[serde(default)]
+    expected_revision: Option<String>,
+    #[serde(default)]
+    revision_required: bool,
 }
 
 fn proposal_decision_request(raw_value: &Value) -> Result<Option<ProposalDecisionRequest>> {
@@ -8242,6 +8354,8 @@ tier = 2
         let listed = &body["proposals"][0];
         assert_eq!(listed["proposalId"], proposal_id.to_string());
         assert_eq!(listed["familiarId"], "sage");
+        assert_eq!(listed["familiarUuid"], familiar_id.0.to_string());
+        assert_eq!(listed["proposalRevision"].as_str().map(str::len), Some(64));
         assert_eq!(listed["approvalPath"]["variant"], "familiar_coherence");
         assert_eq!(listed["approvalPath"]["label"], "familiar_review");
         assert_eq!(
@@ -8906,6 +9020,30 @@ tier = 0
         Ok((path, proposal_id.to_string()))
     }
 
+    fn scheduled_decision_body(
+        home: &Path,
+        proposal_id: &str,
+        note: Option<&str>,
+    ) -> Result<String> {
+        let listed = handle_request("GET", "/api/v1/threads/proposals", home, None)?;
+        let body: Value = serde_json::from_str(&listed.body)?;
+        let proposal = body["proposals"]
+            .as_array()
+            .and_then(|proposals| {
+                proposals
+                    .iter()
+                    .find(|proposal| proposal["proposalId"] == proposal_id)
+            })
+            .context("scheduled proposal is listed")?;
+        let revision = proposal["proposalRevision"]
+            .as_str()
+            .context("scheduled proposal carries a revision")?;
+        Ok(match note {
+            Some(note) => json!({ "note": note, "expectedRevision": revision }).to_string(),
+            None => json!({ "expectedRevision": revision }).to_string(),
+        })
+    }
+
     #[test]
     fn threads_scheduled_human_required_enforces_rationale_and_applies() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -8915,13 +9053,14 @@ tier = 0
             coven_threads_core::ApprovalPath::HumanApprovalWithRationale,
             time::OffsetDateTime::now_utc(),
         )?;
+        let missing_rationale_body = scheduled_decision_body(home, &proposal_id, None)?;
 
         let missing_rationale = handle_request_with_body(
             "POST",
             &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
             home,
             None,
-            Some("{}"),
+            Some(&missing_rationale_body),
         )?;
         assert_eq!(
             missing_rationale.status, 409,
@@ -8932,12 +9071,14 @@ tier = 0
         assert_eq!(body["why"], "proposal-rationale-required");
         assert!(pending.exists());
 
+        let approved_body =
+            scheduled_decision_body(home, &proposal_id, Some("reviewed semantic change"))?;
         let approved = handle_request_with_body(
             "POST",
             &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
             home,
             None,
-            Some(r#"{"note":"reviewed semantic change"}"#),
+            Some(&approved_body),
         )?;
         assert_eq!(approved.status, 200, "got {}", approved.body);
         assert_eq!(
@@ -8963,6 +9104,54 @@ tier = 0
     }
 
     #[test]
+    fn threads_scheduled_manual_decision_requires_matching_revision() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc(),
+        )?;
+
+        let missing = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+        assert_eq!(missing.status, 409);
+        assert!(missing.body.contains("proposal-revision-required"));
+        assert!(pending.exists());
+
+        let mismatch = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&json!({ "expectedRevision": "0".repeat(64) }).to_string()),
+        )?;
+        assert_eq!(mismatch.status, 409);
+        assert!(mismatch.body.contains("proposal-revision-mismatch"));
+        assert!(pending.exists());
+
+        let listed = handle_request("GET", "/api/v1/threads/proposals", home, None)?;
+        let body: Value = serde_json::from_str(&listed.body)?;
+        let revision = body["proposals"][0]["proposalRevision"]
+            .as_str()
+            .context("proposal list carries revision")?;
+        let approved = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&json!({ "expectedRevision": revision }).to_string()),
+        )?;
+        assert_eq!(approved.status, 200, "got {}", approved.body);
+        Ok(())
+    }
+
+    #[test]
     fn threads_scheduled_audits_preserve_committed_channel() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let home = temp.path();
@@ -8972,13 +9161,14 @@ tier = 0
             time::OffsetDateTime::now_utc(),
             coven_threads_core::Channel::Serialization,
         )?;
+        let decision_body = scheduled_decision_body(home, &proposal_id, None)?;
 
         let approved = handle_request_with_body(
             "POST",
             &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
             home,
             None,
-            Some("{}"),
+            Some(&decision_body),
         )?;
         assert_eq!(approved.status, 200, "got {}", approved.body);
         let conn = store::open_store(&home.join("coven.sqlite3"))?;
@@ -9035,13 +9225,14 @@ tier = 0
             coven_threads_core::ApprovalPath::FamiliarCoherence { veto },
             time::OffsetDateTime::now_utc(),
         )?;
+        let premature_body = scheduled_decision_body(home, &proposal_id, None)?;
 
         let premature = handle_request_with_body(
             "POST",
             &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
             home,
             None,
-            Some("{}"),
+            Some(&premature_body),
         )?;
         assert_eq!(premature.status, 409, "got {}", premature.body);
         let body: Value = serde_json::from_str(&premature.body)?;
@@ -9051,12 +9242,13 @@ tier = 0
             "before"
         );
 
+        let veto_body = scheduled_decision_body(home, &proposal_id, Some("familiar objected"))?;
         let vetoed = handle_request_with_body(
             "POST",
             &format!("/api/v1/threads/proposals/{proposal_id}/reject"),
             home,
             None,
-            Some(r#"{"note":"familiar objected"}"#),
+            Some(&veto_body),
         )?;
         assert_eq!(vetoed.status, 200, "got {}", vetoed.body);
         let body: Value = serde_json::from_str(&vetoed.body)?;
@@ -9090,13 +9282,14 @@ tier = 0
             coven_threads_core::ApprovalPath::FamiliarCoherence { veto },
             time::OffsetDateTime::now_utc() - time::Duration::minutes(10),
         )?;
+        let decision_body = scheduled_decision_body(home, &proposal_id, None)?;
 
         let approved = handle_request_with_body(
             "POST",
             &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
             home,
             None,
-            Some("{}"),
+            Some(&decision_body),
         )?;
 
         assert_eq!(approved.status, 200, "got {}", approved.body);
@@ -9133,13 +9326,14 @@ tier = 0
         )?;
         let target = home.join("familiars/sage/reviewed/skill.md");
         std::fs::write(&target, "concurrent")?;
+        let decision_body = scheduled_decision_body(home, &proposal_id, None)?;
 
         let response = handle_request_with_body(
             "POST",
             &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
             home,
             None,
-            Some("{}"),
+            Some(&decision_body),
         )?;
 
         assert_eq!(response.status, 409, "got {}", response.body);
@@ -9178,13 +9372,14 @@ tier = 0
                 "path = \"reviewed/skill.md\"\ntier = 0",
             );
         std::fs::write(&ward_path, ward)?;
+        let decision_body = scheduled_decision_body(home, &proposal_id, None)?;
 
         let response = handle_request_with_body(
             "POST",
             &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
             home,
             None,
-            Some("{}"),
+            Some(&decision_body),
         )?;
 
         assert_eq!(response.status, 409, "got {}", response.body);
@@ -9211,12 +9406,13 @@ tier = 0
             ProposalDecisionFailpoint::ApplyBeforeAudit,
             proposal_id.clone(),
         )));
+        let decision_body = scheduled_decision_body(home, &proposal_id, Some("durable rationale"))?;
         let interrupted = handle_request_with_body(
             "POST",
             &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
             home,
             None,
-            Some(r#"{"note":"durable rationale"}"#),
+            Some(&decision_body),
         );
         assert!(interrupted.is_err());
 
@@ -9339,12 +9535,14 @@ tier = 0
             ProposalDecisionFailpoint::ApplyBeforeAudit,
             proposal_id.clone(),
         )));
+        let decision_body =
+            scheduled_decision_body(home, &proposal_id, Some("scheduler recovery"))?;
         let interrupted = handle_request_with_body(
             "POST",
             &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
             home,
             None,
-            Some(r#"{"note":"scheduler recovery"}"#),
+            Some(&decision_body),
         );
         assert!(interrupted.is_err());
 
@@ -9376,12 +9574,14 @@ tier = 0
             ProposalDecisionFailpoint::ClaimBeforeValidation,
             proposal_id.clone(),
         )));
+        let decision_body =
+            scheduled_decision_body(home, &proposal_id, Some("claim-time rationale"))?;
         let interrupted = handle_request_with_body(
             "POST",
             &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
             home,
             None,
-            Some(r#"{"note":"claim-time rationale"}"#),
+            Some(&decision_body),
         );
         assert!(interrupted.is_err());
 
@@ -9417,12 +9617,13 @@ tier = 0
             ProposalDecisionFailpoint::ClaimBeforeValidation,
             proposal_id.clone(),
         )));
+        let decision_body = scheduled_decision_body(home, &proposal_id, Some("timely veto"))?;
         let interrupted = handle_request_with_body(
             "POST",
             &format!("/api/v1/threads/proposals/{proposal_id}/reject"),
             home,
             None,
-            Some(r#"{"note":"timely veto"}"#),
+            Some(&decision_body),
         );
         assert!(interrupted.is_err());
         std::thread::sleep(std::time::Duration::from_millis(2_100));
@@ -9452,13 +9653,14 @@ tier = 0
             time::OffsetDateTime::now_utc(),
             coven_threads_core::Channel::Mutation,
         )?;
+        let decision_body = scheduled_decision_body(home, &proposal_id, None)?;
 
         let rejected = handle_request_with_body(
             "POST",
             &format!("/api/v1/threads/proposals/{proposal_id}/reject"),
             home,
             None,
-            Some("{}"),
+            Some(&decision_body),
         )?;
         assert_eq!(rejected.status, 409);
         assert!(rejected.body.contains("proposal-not-human-decidable"));
