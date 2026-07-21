@@ -148,9 +148,15 @@ impl<'a> HarnessLaunchOptions<'a> {
 /// external manifests fail to load (the launch path will surface that error
 /// with full context).
 fn declared_capabilities(harness_id: &str) -> Capabilities {
-    configured_harness_specs()
-        .unwrap_or_else(|_| built_in_harness_specs())
-        .into_iter()
+    declared_capabilities_in(
+        &configured_harness_specs().unwrap_or_else(|_| built_in_harness_specs()),
+        harness_id,
+    )
+}
+
+fn declared_capabilities_in(specs: &[HarnessCommandSpec], harness_id: &str) -> Capabilities {
+    specs
+        .iter()
         .find(|spec| spec.id == harness_id)
         .map(|spec| spec.capabilities)
         .unwrap_or(Capabilities::BASELINE)
@@ -750,14 +756,46 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
     ]
 }
 
+/// Snapshot of the process-environment inputs that drive external adapter
+/// resolution. Production takes the snapshot once via [`AdapterEnv::from_process`];
+/// tests construct values directly so they never mutate process env
+/// (`set_var`/`remove_var` race with every other env read in the binary).
+#[derive(Debug, Default)]
+struct AdapterEnv {
+    /// Resolved Coven home (root of the trusted `adapters/` directory).
+    coven_home: Option<PathBuf>,
+    /// Value of [`EXTERNAL_ADAPTER_MANIFEST_ENV`].
+    manifest_path: Option<std::ffi::OsString>,
+    /// Value of [`EXTERNAL_ADAPTER_DIRS_ENV`].
+    adapter_dirs: Option<std::ffi::OsString>,
+}
+
+impl AdapterEnv {
+    fn from_process() -> Self {
+        Self {
+            coven_home: coven_home_from_process_env(),
+            manifest_path: env::var_os(EXTERNAL_ADAPTER_MANIFEST_ENV),
+            adapter_dirs: env::var_os(EXTERNAL_ADAPTER_DIRS_ENV),
+        }
+    }
+}
+
 pub fn configured_harness_specs() -> Result<Vec<HarnessCommandSpec>> {
+    configured_harness_specs_from(&AdapterEnv::from_process())
+}
+
+fn configured_harness_specs_from(adapter_env: &AdapterEnv) -> Result<Vec<HarnessCommandSpec>> {
     let mut specs = built_in_harness_specs();
-    specs.extend(external_harness_specs()?);
+    specs.extend(external_harness_specs(adapter_env)?);
     Ok(specs)
 }
 
 pub fn configured_harnesses() -> Result<Vec<HarnessSummary>> {
-    Ok(configured_harness_specs()?
+    configured_harnesses_from(&AdapterEnv::from_process())
+}
+
+fn configured_harnesses_from(adapter_env: &AdapterEnv) -> Result<Vec<HarnessSummary>> {
+    Ok(configured_harness_specs_from(adapter_env)?
         .into_iter()
         .map(HarnessSummary::from_spec)
         .collect())
@@ -791,12 +829,12 @@ or set {EXTERNAL_ADAPTER_MANIFEST_ENV} / {EXTERNAL_ADAPTER_DIRS_ENV} before star
     )
 }
 
-fn external_harness_specs() -> Result<Vec<HarnessCommandSpec>> {
+fn external_harness_specs(adapter_env: &AdapterEnv) -> Result<Vec<HarnessCommandSpec>> {
     let built_ins = built_in_harness_specs();
     let mut specs = Vec::new();
     let mut ids: HashSet<String> = built_ins.iter().map(|spec| spec.id.clone()).collect();
 
-    for manifest in external_adapter_manifest_sources() {
+    for manifest in external_adapter_manifest_sources(adapter_env) {
         for spec in manifest.load_specs(&built_ins)? {
             if !ids.insert(spec.id.clone()) {
                 // First manifest wins. A repeated id (the same adapter
@@ -842,19 +880,19 @@ impl AdapterManifestSource {
     }
 }
 
-fn external_adapter_manifest_sources() -> Vec<AdapterManifestSource> {
+fn external_adapter_manifest_sources(adapter_env: &AdapterEnv) -> Vec<AdapterManifestSource> {
     let mut sources = Vec::new();
 
-    if let Some(coven_home) = coven_home_from_process_env() {
-        sources.extend(trusted_adapter_manifest_sources(&coven_home));
+    if let Some(coven_home) = adapter_env.coven_home.as_deref() {
+        sources.extend(trusted_adapter_manifest_sources(coven_home));
     }
 
-    if let Some(manifest_path) = env::var_os(EXTERNAL_ADAPTER_MANIFEST_ENV) {
+    if let Some(manifest_path) = adapter_env.manifest_path.as_deref() {
         sources.push(AdapterManifestSource::Path(PathBuf::from(manifest_path)));
     }
 
-    if let Some(dir_list) = env::var_os(EXTERNAL_ADAPTER_DIRS_ENV) {
-        for dir in env::split_paths(&dir_list) {
+    if let Some(dir_list) = adapter_env.adapter_dirs.as_deref() {
+        for dir in env::split_paths(dir_list) {
             sources.extend(
                 adapter_manifest_paths_in_dir(&dir)
                     .into_iter()
@@ -1288,19 +1326,27 @@ fn valid_adapter_id(value: &str) -> bool {
         })
 }
 
+/// Test-only convenience: hermetic command construction against the built-in
+/// spec set, with bypass off and identity program resolution, so unit tests
+/// never read process env (COVEN_HARNESS_ADAPTER_*, COVEN_CLAUDE_BYPASS_*,
+/// PATH/engine resolution).
 #[cfg(test)]
 pub fn command_parts_for_harness(
     harness_id: &str,
     prompt: &str,
     mode: HarnessLaunchMode,
 ) -> Result<(String, Vec<String>)> {
-    command_parts_for_harness_with_conversation(
+    command_parts_with_specs(
+        &built_in_harness_specs(),
         harness_id,
         prompt,
         mode,
         None,
         None,
         HarnessLaunchOptions::default(),
+        false,
+        false,
+        |executable| executable.to_string(),
     )
 }
 
@@ -1313,10 +1359,6 @@ pub fn claude_permission_bypass_enabled() -> bool {
     claude_permission_bypass_enabled_from_value(
         env::var(CLAUDE_BYPASS_PERMISSIONS_ENV).ok().as_deref(),
     )
-}
-
-fn with_claude_permission_flags(harness_id: &str, args: Vec<String>) -> Vec<String> {
-    with_claude_permission_flags_enabled(harness_id, args, claude_permission_bypass_enabled())
 }
 
 fn claude_permission_bypass_enabled_from_value(value: Option<&str>) -> bool {
@@ -1395,7 +1437,37 @@ fn command_parts_for_harness_with_conversation_inner(
     options: HarnessLaunchOptions<'_>,
     codex_json: bool,
 ) -> Result<(String, Vec<String>)> {
-    let specs = configured_harness_specs()?;
+    command_parts_with_specs(
+        &configured_harness_specs()?,
+        harness_id,
+        prompt,
+        mode,
+        hint,
+        familiar,
+        options,
+        codex_json,
+        claude_permission_bypass_enabled(),
+        spawn_executable_for_platform,
+    )
+}
+
+/// Environment-free core of command construction. The three env-dependent
+/// inputs — the resolved spec set, the Claude permission-bypass decision, and
+/// executable resolution — are supplied by the caller, so the argv logic
+/// itself never consults process env and tests can inject all three.
+#[allow(clippy::too_many_arguments)]
+fn command_parts_with_specs(
+    specs: &[HarnessCommandSpec],
+    harness_id: &str,
+    prompt: &str,
+    mode: HarnessLaunchMode,
+    hint: Option<&ConversationHint>,
+    familiar: Option<&FamiliarContext>,
+    options: HarnessLaunchOptions<'_>,
+    codex_json: bool,
+    claude_bypass_enabled: bool,
+    resolve_program: impl Fn(&str) -> String,
+) -> Result<(String, Vec<String>)> {
     let configured_ids = specs
         .iter()
         .map(|spec| spec.id.as_str())
@@ -1405,7 +1477,7 @@ fn command_parts_for_harness_with_conversation_inner(
         .find(|spec| spec.id == harness_id)
         .cloned()
         .ok_or_else(|| anyhow!(unsupported_harness_message(harness_id, &configured_ids)))?;
-    let program = spawn_executable_for_platform(&spec.executable);
+    let program = resolve_program(&spec.executable);
 
     // Model selection forwards to the harness's native flag as a normal option
     // ahead of the prompt positional. Adapters that declare no model mechanism
@@ -1451,7 +1523,7 @@ fn command_parts_for_harness_with_conversation_inner(
             }
             return Ok((
                 program,
-                with_claude_permission_flags(
+                with_claude_permission_flags_enabled(
                     harness_id,
                     sanitize_argv_for_platform(prepend_launch_args(
                         &model_args,
@@ -1460,6 +1532,7 @@ fn command_parts_for_harness_with_conversation_inner(
                         &launch_option_args,
                         args,
                     )),
+                    claude_bypass_enabled,
                 ),
             ));
         }
@@ -1470,7 +1543,7 @@ fn command_parts_for_harness_with_conversation_inner(
         }
         return Ok((
             program,
-            with_claude_permission_flags(
+            with_claude_permission_flags_enabled(
                 harness_id,
                 sanitize_argv_for_platform(prepend_launch_args(
                     &model_args,
@@ -1479,6 +1552,7 @@ fn command_parts_for_harness_with_conversation_inner(
                     &launch_option_args,
                     args,
                 )),
+                claude_bypass_enabled,
             ),
         ));
     }
@@ -1510,7 +1584,10 @@ fn command_parts_for_harness_with_conversation_inner(
                     })
                     .collect(),
             ));
-            return Ok((program, with_claude_permission_flags(harness_id, args)));
+            return Ok((
+                program,
+                with_claude_permission_flags_enabled(harness_id, args, claude_bypass_enabled),
+            ));
         }
     }
 
@@ -1526,7 +1603,7 @@ fn command_parts_for_harness_with_conversation_inner(
     }
     Ok((
         program,
-        with_claude_permission_flags(
+        with_claude_permission_flags_enabled(
             harness_id,
             sanitize_argv_for_platform(prepend_launch_args(
                 &model_args,
@@ -1535,6 +1612,7 @@ fn command_parts_for_harness_with_conversation_inner(
                 &launch_option_args,
                 args,
             )),
+            claude_bypass_enabled,
         ),
     ))
 }
@@ -1722,11 +1800,17 @@ fn executable_exists(executable: &str) -> bool {
 /// `coven-code` is also available when the managed engine resolver finds it
 /// (e.g. `~/.coven/engine/<ver>/coven-code` not on PATH).
 fn harness_available(executable: &str) -> bool {
+    harness_available_with(executable, || crate::engine::resolve().is_some())
+}
+
+/// `engine_resolves` is injected so tests can drive the managed-engine branch
+/// without touching process env (COVEN_ENGINE_BIN / PATH / HOME).
+fn harness_available_with(executable: &str, engine_resolves: impl FnOnce() -> bool) -> bool {
     if executable == crate::engine::ENGINE_HARNESS_ID {
-        // engine::resolve() already checks PATH (and the legacy dir); the
+        // The engine resolver already checks PATH (and the legacy dir); the
         // extra executable_exists is a cheap safety valve for the rare case
         // where PATH changed between here and an eventual spawn.
-        return crate::engine::resolve().is_some() || executable_exists(executable);
+        return engine_resolves() || executable_exists(executable);
     }
     executable_exists(executable)
 }
@@ -1885,24 +1969,55 @@ fn executable_candidates<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_env::{lock_env, EnvVarGuard};
     use std::fs;
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    fn restore_adapter_manifest_env(previous: Option<std::ffi::OsString>) {
-        match previous {
-            Some(value) => env::set_var(EXTERNAL_ADAPTER_MANIFEST_ENV, value),
-            None => env::remove_var(EXTERNAL_ADAPTER_MANIFEST_ENV),
-        }
+    /// Hermetic command construction against an injected spec set — bypass
+    /// off, identity program resolution — so tests never read process env
+    /// (COVEN_HARNESS_ADAPTER_*, COVEN_CLAUDE_BYPASS_*, PATH/engine state).
+    fn command_parts_in_specs(
+        specs: &[HarnessCommandSpec],
+        harness_id: &str,
+        prompt: &str,
+        mode: HarnessLaunchMode,
+        hint: Option<&ConversationHint>,
+        familiar: Option<&FamiliarContext>,
+        options: HarnessLaunchOptions<'_>,
+    ) -> Result<(String, Vec<String>)> {
+        command_parts_with_specs(
+            specs,
+            harness_id,
+            prompt,
+            mode,
+            hint,
+            familiar,
+            options,
+            false,
+            false,
+            |executable| executable.to_string(),
+        )
     }
 
-    fn restore_adapter_dirs_env(previous: Option<std::ffi::OsString>) {
-        match previous {
-            Some(value) => env::set_var(EXTERNAL_ADAPTER_DIRS_ENV, value),
-            None => env::remove_var(EXTERNAL_ADAPTER_DIRS_ENV),
-        }
+    /// [`command_parts_in_specs`] against the built-in spec set.
+    fn command_parts_with_built_ins(
+        harness_id: &str,
+        prompt: &str,
+        mode: HarnessLaunchMode,
+        hint: Option<&ConversationHint>,
+        familiar: Option<&FamiliarContext>,
+        options: HarnessLaunchOptions<'_>,
+    ) -> Result<(String, Vec<String>)> {
+        command_parts_in_specs(
+            &built_in_harness_specs(),
+            harness_id,
+            prompt,
+            mode,
+            hint,
+            familiar,
+            options,
+        )
     }
 
     #[test]
@@ -2075,9 +2190,6 @@ mod tests {
 
     #[test]
     fn command_parts_for_known_harnesses_append_interactive_prompt() -> anyhow::Result<()> {
-        // Spec resolution reads the adapter env vars; hold the shared env
-        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
-        let _guard = lock_env();
         assert_eq!(
             command_parts_for_harness("codex", "fix tests", HarnessLaunchMode::Interactive)?,
             (
@@ -2097,9 +2209,6 @@ mod tests {
 
     #[test]
     fn command_parts_for_known_harnesses_use_noninteractive_entrypoints() -> anyhow::Result<()> {
-        // Spec resolution reads the adapter env vars; hold the shared env
-        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
-        let _guard = lock_env();
         assert_eq!(
             command_parts_for_harness("codex", "fix tests", HarnessLaunchMode::NonInteractive)?,
             (
@@ -2130,9 +2239,6 @@ mod tests {
 
     #[test]
     fn dash_prefixed_prompts_stay_positional_behind_double_dash() -> anyhow::Result<()> {
-        // Spec resolution reads the adapter env vars; hold the shared env
-        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
-        let _guard = lock_env();
         // A prompt starting with `-` must never parse as harness flags.
         for mode in [
             HarnessLaunchMode::Interactive,
@@ -2194,16 +2300,7 @@ mod tests {
     }
 
     #[test]
-    fn command_parts_reject_unknown_harnesses() -> anyhow::Result<()> {
-        // Spec resolution reads ambient adapter config: the external manifest
-        // and dirs env vars plus the COVEN_HOME trust store. Neutralize all
-        // three under the shared env lock so an adapter installed on the host
-        // (e.g. a real hermes manifest) cannot make these lookups succeed.
-        let _guard = lock_env();
-        let temp_dir = tempfile::tempdir()?;
-        let _manifest = EnvVarGuard::remove(EXTERNAL_ADAPTER_MANIFEST_ENV);
-        let _dirs = EnvVarGuard::remove(EXTERNAL_ADAPTER_DIRS_ENV);
-        let _home = EnvVarGuard::set("COVEN_HOME", temp_dir.path().join("empty-coven-home"));
+    fn command_parts_reject_unknown_harnesses() {
         assert!(
             command_parts_for_harness("shell", "hello", HarnessLaunchMode::Interactive)
                 .unwrap_err()
@@ -2216,7 +2313,6 @@ mod tests {
                 .to_string()
                 .contains("unsupported harness")
         );
-        Ok(())
     }
 
     #[test]
@@ -2333,10 +2429,10 @@ mod tests {
             GROK_BUILD_ADAPTER_MANIFEST,
         )?;
 
-        let _guard = lock_env();
-        let _manifest_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_MANIFEST_ENV);
-        let _dirs_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_DIRS_ENV);
-        let _coven_home_guard = EnvVarGuard::set("COVEN_HOME", &coven_home);
+        let specs = configured_harness_specs_from(&AdapterEnv {
+            coven_home: Some(coven_home),
+            ..Default::default()
+        })?;
         let familiar = FamiliarContext {
             id: "charm".to_string(),
             display_name: "Charm".to_string(),
@@ -2346,7 +2442,8 @@ mod tests {
             id: "11111111-2222-4333-8444-555555555555".to_string(),
         };
 
-        let parts = command_parts_for_harness_with_conversation(
+        let parts = command_parts_in_specs(
+            &specs,
             "grok",
             "fix tests",
             HarnessLaunchMode::NonInteractive,
@@ -2401,12 +2498,13 @@ mod tests {
             GROK_BUILD_ADAPTER_MANIFEST,
         )?;
 
-        let _guard = lock_env();
-        let _manifest_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_MANIFEST_ENV);
-        let _dirs_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_DIRS_ENV);
-        let _coven_home_guard = EnvVarGuard::set("COVEN_HOME", &coven_home);
+        let specs = configured_harness_specs_from(&AdapterEnv {
+            coven_home: Some(coven_home),
+            ..Default::default()
+        })?;
 
-        let (_, args) = command_parts_for_harness_with_conversation(
+        let (_, args) = command_parts_in_specs(
+            &specs,
             "grok",
             "fix tests",
             HarnessLaunchMode::NonInteractive,
@@ -2441,12 +2539,19 @@ mod tests {
             }"#,
         )?;
 
-        let _guard = lock_env();
-        let previous = env::var_os(EXTERNAL_ADAPTER_MANIFEST_ENV);
-        env::set_var(EXTERNAL_ADAPTER_MANIFEST_ENV, &manifest);
-        let parts =
-            command_parts_for_harness("hermes", "audit repo", HarnessLaunchMode::NonInteractive);
-        restore_adapter_manifest_env(previous);
+        let specs = configured_harness_specs_from(&AdapterEnv {
+            manifest_path: Some(manifest.into()),
+            ..Default::default()
+        })?;
+        let parts = command_parts_in_specs(
+            &specs,
+            "hermes",
+            "audit repo",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            None,
+            HarnessLaunchOptions::default(),
+        );
 
         assert_eq!(
             parts?,
@@ -2502,12 +2607,15 @@ mod tests {
         let manifest = temp_dir.path().join("streamy.json");
         fs::write(&manifest, STREAMY_ADAPTER_MANIFEST)?;
 
-        let _guard = lock_env();
-        let previous = env::var_os(EXTERNAL_ADAPTER_MANIFEST_ENV);
-        env::set_var(EXTERNAL_ADAPTER_MANIFEST_ENV, &manifest);
-        let supports_stream = harness_supports_stream_mode("streamy");
-        let supports_session = harness_supports_preassigned_session_id("streamy");
-        let parts = command_parts_for_harness_with_conversation(
+        let specs = configured_harness_specs_from(&AdapterEnv {
+            manifest_path: Some(manifest.into()),
+            ..Default::default()
+        })?;
+        let capabilities = declared_capabilities_in(&specs, "streamy");
+        let supports_stream = capabilities.stream;
+        let supports_session = capabilities.preassigned_session_id;
+        let parts = command_parts_in_specs(
+            &specs,
             "streamy",
             "hello",
             HarnessLaunchMode::Stream,
@@ -2520,7 +2628,6 @@ mod tests {
                 ..Default::default()
             },
         );
-        restore_adapter_manifest_env(previous);
 
         assert!(supports_stream, "declared stream capability must gate in");
         assert!(supports_session);
@@ -2799,19 +2906,20 @@ mod tests {
             }"#,
         )?;
 
-        let _guard = lock_env();
-        let previous_manifest = env::var_os(EXTERNAL_ADAPTER_MANIFEST_ENV);
-        let previous_dirs = env::var_os(EXTERNAL_ADAPTER_DIRS_ENV);
-        env::remove_var(EXTERNAL_ADAPTER_MANIFEST_ENV);
-        env::set_var(EXTERNAL_ADAPTER_DIRS_ENV, temp_dir.path());
+        let specs = configured_harness_specs_from(&AdapterEnv {
+            adapter_dirs: Some(temp_dir.path().into()),
+            ..Default::default()
+        })?;
+        let launch = command_parts_in_specs(
+            &specs,
+            "codex",
+            "hello",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            None,
+            HarnessLaunchOptions::default(),
+        );
 
-        let specs = configured_harness_specs();
-        let launch = command_parts_for_harness("codex", "hello", HarnessLaunchMode::NonInteractive);
-
-        restore_adapter_manifest_env(previous_manifest);
-        restore_adapter_dirs_env(previous_dirs);
-
-        let specs = specs?;
         let codex = specs
             .iter()
             .find(|spec| spec.id == "codex")
@@ -2855,21 +2963,10 @@ mod tests {
             manifest_for("Second"),
         )?;
 
-        let _guard = lock_env();
-        let previous_manifest = env::var_os(EXTERNAL_ADAPTER_MANIFEST_ENV);
-        let previous_dirs = env::var_os(EXTERNAL_ADAPTER_DIRS_ENV);
-        env::remove_var(EXTERNAL_ADAPTER_MANIFEST_ENV);
-        env::set_var(
-            EXTERNAL_ADAPTER_DIRS_ENV,
-            env::join_paths([first_dir.path(), second_dir.path()])?,
-        );
-
-        let specs = configured_harness_specs();
-
-        restore_adapter_manifest_env(previous_manifest);
-        restore_adapter_dirs_env(previous_dirs);
-
-        let specs = specs?;
+        let specs = configured_harness_specs_from(&AdapterEnv {
+            adapter_dirs: Some(env::join_paths([first_dir.path(), second_dir.path()])?),
+            ..Default::default()
+        })?;
         let sidecars: Vec<&HarnessCommandSpec> =
             specs.iter().filter(|spec| spec.id == "sidecar").collect();
         assert_eq!(sidecars.len(), 1, "duplicate id must collapse to one spec");
@@ -2904,13 +3001,13 @@ mod tests {
             }"#,
         )?;
 
-        let _guard = lock_env();
-        let previous_manifest = env::var_os(EXTERNAL_ADAPTER_MANIFEST_ENV);
-        let previous_dirs = env::var_os(EXTERNAL_ADAPTER_DIRS_ENV);
-        env::set_var(EXTERNAL_ADAPTER_MANIFEST_ENV, &manifest);
-        env::remove_var(EXTERNAL_ADAPTER_DIRS_ENV);
+        let specs = configured_harness_specs_from(&AdapterEnv {
+            manifest_path: Some(manifest.into()),
+            ..Default::default()
+        })?;
 
-        let init = command_parts_for_harness_with_conversation(
+        let init = command_parts_in_specs(
+            &specs,
             "threaded",
             "hello",
             HarnessLaunchMode::NonInteractive,
@@ -2920,7 +3017,8 @@ mod tests {
             None,
             HarnessLaunchOptions::default(),
         );
-        let resume = command_parts_for_harness_with_conversation(
+        let resume = command_parts_in_specs(
+            &specs,
             "threaded",
             "again",
             HarnessLaunchMode::NonInteractive,
@@ -2930,9 +3028,6 @@ mod tests {
             None,
             HarnessLaunchOptions::default(),
         );
-
-        restore_adapter_manifest_env(previous_manifest);
-        restore_adapter_dirs_env(previous_dirs);
 
         assert_eq!(
             init?,
@@ -2988,13 +3083,13 @@ mod tests {
             }"#,
         )?;
 
-        let _guard = lock_env();
-        let previous_manifest = env::var_os(EXTERNAL_ADAPTER_MANIFEST_ENV);
-        let previous_dirs = env::var_os(EXTERNAL_ADAPTER_DIRS_ENV);
-        env::set_var(EXTERNAL_ADAPTER_MANIFEST_ENV, &manifest);
-        env::remove_var(EXTERNAL_ADAPTER_DIRS_ENV);
+        let specs = configured_harness_specs_from(&AdapterEnv {
+            manifest_path: Some(manifest.into()),
+            ..Default::default()
+        })?;
 
-        let init = command_parts_for_harness_with_conversation(
+        let init = command_parts_in_specs(
+            &specs,
             "resume-only",
             "first",
             HarnessLaunchMode::NonInteractive,
@@ -3004,7 +3099,8 @@ mod tests {
             None,
             HarnessLaunchOptions::default(),
         );
-        let resume = command_parts_for_harness_with_conversation(
+        let resume = command_parts_in_specs(
+            &specs,
             "resume-only",
             "again",
             HarnessLaunchMode::NonInteractive,
@@ -3014,9 +3110,6 @@ mod tests {
             None,
             HarnessLaunchOptions::default(),
         );
-
-        restore_adapter_manifest_env(previous_manifest);
-        restore_adapter_dirs_env(previous_dirs);
 
         assert_eq!(
             init?,
@@ -3078,10 +3171,7 @@ mod tests {
     /// `stream_args()` produced, now read from its declared `stream_args`.
     #[test]
     fn claude_stream_launch_args_unchanged_after_declaration() -> anyhow::Result<()> {
-        // Spec resolution reads the adapter env vars; hold the shared env
-        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
-        let _guard = lock_env();
-        let (program, args) = command_parts_for_harness_with_conversation(
+        let (program, args) = command_parts_with_built_ins(
             "claude",
             "hello",
             HarnessLaunchMode::Stream,
@@ -3130,16 +3220,10 @@ mod tests {
             }"#,
         )?;
 
-        let _guard = lock_env();
-        let previous_manifest = env::var_os(EXTERNAL_ADAPTER_MANIFEST_ENV);
-        let previous_dirs = env::var_os(EXTERNAL_ADAPTER_DIRS_ENV);
-        env::remove_var(EXTERNAL_ADAPTER_MANIFEST_ENV);
-        env::set_var(EXTERNAL_ADAPTER_DIRS_ENV, &manifest_dir);
-
-        let specs = configured_harness_specs()?;
-
-        restore_adapter_manifest_env(previous_manifest);
-        restore_adapter_dirs_env(previous_dirs);
+        let specs = configured_harness_specs_from(&AdapterEnv {
+            adapter_dirs: Some(manifest_dir.into()),
+            ..Default::default()
+        })?;
 
         let custom = specs
             .iter()
@@ -3152,18 +3236,22 @@ mod tests {
 
     #[test]
     fn hermes_recipe_forwards_selected_models_before_the_shim_prompt() -> anyhow::Result<()> {
+        // DI port of the #443 coverage: load the bundled hermes recipe from a
+        // trusted COVEN_HOME adapter dir via an injected AdapterEnv, then run
+        // command construction against those specs — no process env involved.
         let temp_dir = tempfile::tempdir()?;
         let coven_home = temp_dir.path().join("coven-home");
         let adapter_dir = coven_home.join("adapters");
         fs::create_dir_all(&adapter_dir)?;
         fs::write(adapter_dir.join("hermes.json"), HERMES_ADAPTER_MANIFEST)?;
 
-        let _guard = lock_env();
-        let _manifest_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_MANIFEST_ENV);
-        let _dirs_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_DIRS_ENV);
-        let _coven_home_guard = EnvVarGuard::set("COVEN_HOME", &coven_home);
+        let specs = configured_harness_specs_from(&AdapterEnv {
+            coven_home: Some(coven_home),
+            ..Default::default()
+        })?;
 
-        let selected = command_parts_for_harness_with_conversation(
+        let selected = command_parts_in_specs(
+            &specs,
             "hermes",
             "hello from Coven",
             HarnessLaunchMode::NonInteractive,
@@ -3189,7 +3277,8 @@ mod tests {
             ]
         );
 
-        let inherited = command_parts_for_harness_with_conversation(
+        let inherited = command_parts_in_specs(
+            &specs,
             "hermes",
             "hello from Coven",
             HarnessLaunchMode::NonInteractive,
@@ -3212,12 +3301,10 @@ mod tests {
         fs::create_dir_all(&adapter_dir)?;
         fs::write(adapter_dir.join("hermes.json"), HERMES_ADAPTER_MANIFEST)?;
 
-        let _guard = lock_env();
-        let _manifest_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_MANIFEST_ENV);
-        let _dirs_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_DIRS_ENV);
-        let _coven_home_guard = EnvVarGuard::set("COVEN_HOME", &coven_home);
-
-        let specs = configured_harness_specs()?;
+        let specs = configured_harness_specs_from(&AdapterEnv {
+            coven_home: Some(coven_home),
+            ..Default::default()
+        })?;
 
         let hermes = specs
             .iter()
@@ -3302,12 +3389,10 @@ mod tests {
             }"#,
         )?;
 
-        let _guard = lock_env();
-        let _manifest_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_MANIFEST_ENV);
-        let _dirs_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_DIRS_ENV);
-        let _coven_home_guard = EnvVarGuard::set("COVEN_HOME", &coven_home);
-
-        let specs = configured_harness_specs()?;
+        let specs = configured_harness_specs_from(&AdapterEnv {
+            coven_home: Some(coven_home),
+            ..Default::default()
+        })?;
 
         assert!(specs.iter().all(|spec| spec.id != "hermes"));
         Ok(())
@@ -3360,16 +3445,14 @@ mod tests {
             }"#,
         )?;
 
-        let _guard = lock_env();
-        let _manifest_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_MANIFEST_ENV);
-        let _dirs_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_DIRS_ENV);
-        let _coven_home_guard =
-            EnvVarGuard::set("COVEN_HOME", temp_dir.path().join("empty-coven-home"));
-        let _home_guard = EnvVarGuard::set("HOME", temp_dir.path().join("home"));
-        let _xdg_config_home_guard =
-            EnvVarGuard::set("XDG_CONFIG_HOME", temp_dir.path().join("config"));
-
-        let specs = configured_harness_specs()?;
+        // AdapterEnv carries no HOME/XDG_CONFIG_HOME inputs at all, so implicit
+        // per-user adapter directories are unreachable by construction. Resolve
+        // with only an (empty) COVEN_HOME configured and verify the implicit
+        // manifests written above stay unloaded.
+        let specs = configured_harness_specs_from(&AdapterEnv {
+            coven_home: Some(temp_dir.path().join("empty-coven-home")),
+            ..Default::default()
+        })?;
 
         assert!(!specs.iter().any(|spec| spec.id == "home-implicit"));
         assert!(!specs.iter().any(|spec| spec.id == "xdg-implicit"));
@@ -3397,16 +3480,10 @@ mod tests {
             }"#,
         )?;
 
-        let _guard = lock_env();
-        let previous_manifest = env::var_os(EXTERNAL_ADAPTER_MANIFEST_ENV);
-        let previous_dirs = env::var_os(EXTERNAL_ADAPTER_DIRS_ENV);
-        env::set_var(EXTERNAL_ADAPTER_MANIFEST_ENV, &manifest);
-        env::remove_var(EXTERNAL_ADAPTER_DIRS_ENV);
-
-        let harnesses = configured_harnesses()?;
-
-        restore_adapter_manifest_env(previous_manifest);
-        restore_adapter_dirs_env(previous_dirs);
+        let harnesses = configured_harnesses_from(&AdapterEnv {
+            manifest_path: Some(manifest.as_os_str().to_os_string()),
+            ..Default::default()
+        })?;
 
         let codex = harnesses
             .iter()
@@ -3431,13 +3508,10 @@ mod tests {
 
     #[test]
     fn claude_init_hint_attaches_session_id_flag_in_print_mode() -> anyhow::Result<()> {
-        // Spec resolution reads the adapter env vars; hold the shared env
-        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
-        let _guard = lock_env();
         let hint = ConversationHint::Init {
             id: "abc-123".to_string(),
         };
-        let parts = command_parts_for_harness_with_conversation(
+        let parts = command_parts_with_built_ins(
             "claude",
             "hello",
             HarnessLaunchMode::NonInteractive,
@@ -3463,13 +3537,10 @@ mod tests {
 
     #[test]
     fn claude_resume_hint_attaches_resume_flag_in_print_mode() -> anyhow::Result<()> {
-        // Spec resolution reads the adapter env vars; hold the shared env
-        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
-        let _guard = lock_env();
         let hint = ConversationHint::Resume {
             id: "abc-123".to_string(),
         };
-        let parts = command_parts_for_harness_with_conversation(
+        let parts = command_parts_with_built_ins(
             "claude",
             "follow up",
             HarnessLaunchMode::NonInteractive,
@@ -3495,18 +3566,10 @@ mod tests {
 
     #[test]
     fn coven_code_init_hint_attaches_session_id_flag_in_print_mode() -> anyhow::Result<()> {
-        // `spawn_executable_for_platform("coven-code")` consults engine::resolve(),
-        // which reads HOME/USERPROFILE. Pin env (and clear any managed-engine home)
-        // so this deterministic-argv test does not race the managed-engine test.
-        let _guard = lock_env();
-        let empty = tempfile::tempdir()?;
-        let _home_guard = EnvVarGuard::set("HOME", empty.path());
-        #[cfg(windows)]
-        let _userprofile_guard = EnvVarGuard::set("USERPROFILE", empty.path());
         let hint = ConversationHint::Init {
             id: "cc-session-42".to_string(),
         };
-        let parts = command_parts_for_harness_with_conversation(
+        let parts = command_parts_with_built_ins(
             "coven-code",
             "hello",
             HarnessLaunchMode::NonInteractive,
@@ -3517,7 +3580,7 @@ mod tests {
         assert_eq!(
             parts,
             (
-                spawn_executable_for_platform("coven-code"),
+                "coven-code".to_string(),
                 vec![
                     "--print".to_string(),
                     "--session-id".to_string(),
@@ -3532,15 +3595,10 @@ mod tests {
 
     #[test]
     fn coven_code_resume_hint_attaches_resume_flag_in_print_mode() -> anyhow::Result<()> {
-        let _guard = lock_env();
-        let empty = tempfile::tempdir()?;
-        let _home_guard = EnvVarGuard::set("HOME", empty.path());
-        #[cfg(windows)]
-        let _userprofile_guard = EnvVarGuard::set("USERPROFILE", empty.path());
         let hint = ConversationHint::Resume {
             id: "cc-session-42".to_string(),
         };
-        let parts = command_parts_for_harness_with_conversation(
+        let parts = command_parts_with_built_ins(
             "coven-code",
             "follow up",
             HarnessLaunchMode::NonInteractive,
@@ -3551,7 +3609,7 @@ mod tests {
         assert_eq!(
             parts,
             (
-                spawn_executable_for_platform("coven-code"),
+                "coven-code".to_string(),
                 vec![
                     "--print".to_string(),
                     "--resume".to_string(),
@@ -3566,13 +3624,10 @@ mod tests {
 
     #[test]
     fn interactive_mode_ignores_conversation_hint() -> anyhow::Result<()> {
-        // Spec resolution reads the adapter env vars; hold the shared env
-        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
-        let _guard = lock_env();
         let hint = ConversationHint::Init {
             id: "abc-123".to_string(),
         };
-        let parts = command_parts_for_harness_with_conversation(
+        let parts = command_parts_with_built_ins(
             "claude",
             "hello",
             HarnessLaunchMode::Interactive,
@@ -3593,13 +3648,10 @@ mod tests {
     #[test]
     fn codex_init_hint_falls_through_to_default_args_so_codex_can_assign_its_own_id(
     ) -> anyhow::Result<()> {
-        // Spec resolution reads the adapter env vars; hold the shared env
-        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
-        let _guard = lock_env();
         let hint = ConversationHint::Init {
             id: "abc-123".to_string(),
         };
-        let parts = command_parts_for_harness_with_conversation(
+        let parts = command_parts_with_built_ins(
             "codex",
             "fix tests",
             HarnessLaunchMode::NonInteractive,
@@ -3626,13 +3678,10 @@ mod tests {
 
     #[test]
     fn codex_resume_hint_uses_exec_resume_subcommand_with_id() -> anyhow::Result<()> {
-        // Spec resolution reads the adapter env vars; hold the shared env
-        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
-        let _guard = lock_env();
         let hint = ConversationHint::Resume {
             id: "019e5998-7130-7872-8d96-a6b67c5b6406".to_string(),
         };
-        let parts = command_parts_for_harness_with_conversation(
+        let parts = command_parts_with_built_ins(
             "codex",
             "follow up",
             HarnessLaunchMode::NonInteractive,
@@ -3661,10 +3710,7 @@ mod tests {
 
     #[test]
     fn claude_stream_mode_preserves_permission_prompts_by_default() -> anyhow::Result<()> {
-        // Spec resolution reads the adapter env vars; hold the shared env
-        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
-        let _guard = lock_env();
-        let (program, args) = command_parts_for_harness_with_conversation(
+        let (program, args) = command_parts_with_built_ins(
             "claude",
             "hello",
             HarnessLaunchMode::Stream,
@@ -3705,9 +3751,6 @@ mod tests {
 
     #[test]
     fn non_claude_harnesses_do_not_get_permission_bypass() -> anyhow::Result<()> {
-        // Spec resolution reads the adapter env vars; hold the shared env
-        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
-        let _guard = lock_env();
         let (_, args) =
             command_parts_for_harness("codex", "fix tests", HarnessLaunchMode::NonInteractive)?;
         assert!(!args
@@ -3718,10 +3761,11 @@ mod tests {
 
     #[test]
     fn preassigned_session_id_support_is_per_harness() {
-        assert!(harness_supports_preassigned_session_id("claude"));
-        assert!(!harness_supports_preassigned_session_id("codex"));
-        assert!(!harness_supports_preassigned_session_id("hermes"));
-        assert!(!harness_supports_preassigned_session_id("unknown"));
+        let specs = built_in_harness_specs();
+        assert!(declared_capabilities_in(&specs, "claude").preassigned_session_id);
+        assert!(!declared_capabilities_in(&specs, "codex").preassigned_session_id);
+        assert!(!declared_capabilities_in(&specs, "hermes").preassigned_session_id);
+        assert!(!declared_capabilities_in(&specs, "unknown").preassigned_session_id);
     }
 
     #[test]
@@ -3762,15 +3806,16 @@ mod tests {
     /// manifest loader learns to read `capabilities` (integration.md, PR 2).
     #[test]
     fn built_in_capabilities_match_former_string_checks() {
-        let claude = declared_capabilities("claude");
+        let specs = built_in_harness_specs();
+        let claude = declared_capabilities_in(&specs, "claude");
         assert!(claude.stream);
         assert!(claude.preassigned_session_id);
         assert!(claude.think);
         assert!(claude.speed);
 
-        assert!(declared_capabilities("codex").is_baseline());
-        assert!(declared_capabilities("hermes").is_baseline());
-        assert!(declared_capabilities("unknown").is_baseline());
+        assert!(declared_capabilities_in(&specs, "codex").is_baseline());
+        assert!(declared_capabilities_in(&specs, "hermes").is_baseline());
+        assert!(declared_capabilities_in(&specs, "unknown").is_baseline());
     }
 
     #[test]
@@ -3790,10 +3835,7 @@ mod tests {
 
     #[test]
     fn codex_forwards_model_before_prompt_with_prefix_stripped() -> anyhow::Result<()> {
-        // Spec resolution reads the adapter env vars; hold the shared env
-        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
-        let _guard = lock_env();
-        let (program, args) = command_parts_for_harness_with_conversation(
+        let (program, args) = command_parts_with_built_ins(
             "codex",
             "fix tests",
             HarnessLaunchMode::NonInteractive,
@@ -3832,7 +3874,8 @@ mod tests {
         // before the real `exec` subcommand, while the prompt is protected by
         // the trailing `--` separator. JSON mode must be constructed from the
         // harness spec, never by scanning those user-controlled entries.
-        let (_, args) = command_parts_for_codex_json_with_conversation(
+        let (_, args) = command_parts_with_specs(
+            &built_in_harness_specs(),
             "codex",
             "--json",
             HarnessLaunchMode::NonInteractive,
@@ -3842,6 +3885,9 @@ mod tests {
                 model: Some("openai/exec"),
                 ..Default::default()
             },
+            true,
+            false,
+            |executable| executable.to_string(),
         )?;
         assert_eq!(
             args,
@@ -3862,10 +3908,7 @@ mod tests {
 
     #[test]
     fn claude_forwards_model_with_prefix_stripped() -> anyhow::Result<()> {
-        // Spec resolution reads the adapter env vars; hold the shared env
-        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
-        let _guard = lock_env();
-        let (_, args) = command_parts_for_harness_with_conversation(
+        let (_, args) = command_parts_with_built_ins(
             "claude",
             "hi",
             HarnessLaunchMode::NonInteractive,
@@ -3891,10 +3934,7 @@ mod tests {
 
     #[test]
     fn claude_think_maps_to_effort_high() -> anyhow::Result<()> {
-        // Spec resolution reads the adapter env vars; hold the shared env
-        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
-        let _guard = lock_env();
-        let (_, args) = command_parts_for_harness_with_conversation(
+        let (_, args) = command_parts_with_built_ins(
             "claude",
             "hi",
             HarnessLaunchMode::NonInteractive,
@@ -3920,10 +3960,7 @@ mod tests {
 
     #[test]
     fn claude_speed_maps_to_effort_levels() -> anyhow::Result<()> {
-        // Spec resolution reads the adapter env vars; hold the shared env
-        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
-        let _guard = lock_env();
-        let (_, fast_args) = command_parts_for_harness_with_conversation(
+        let (_, fast_args) = command_parts_with_built_ins(
             "claude",
             "hi",
             HarnessLaunchMode::NonInteractive,
@@ -3934,7 +3971,7 @@ mod tests {
                 ..Default::default()
             },
         )?;
-        let (_, thorough_args) = command_parts_for_harness_with_conversation(
+        let (_, thorough_args) = command_parts_with_built_ins(
             "claude",
             "hi",
             HarnessLaunchMode::NonInteractive,
@@ -3953,10 +3990,7 @@ mod tests {
 
     #[test]
     fn codex_ignores_think_and_speed_launch_hints() -> anyhow::Result<()> {
-        // Spec resolution reads the adapter env vars; hold the shared env
-        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
-        let _guard = lock_env();
-        let with_hints = command_parts_for_harness_with_conversation(
+        let with_hints = command_parts_with_built_ins(
             "codex",
             "fix tests",
             HarnessLaunchMode::NonInteractive,
@@ -3977,10 +4011,7 @@ mod tests {
 
     #[test]
     fn no_model_leaves_args_unchanged() -> anyhow::Result<()> {
-        // Spec resolution reads the adapter env vars; hold the shared env
-        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
-        let _guard = lock_env();
-        let with_model = command_parts_for_harness_with_conversation(
+        let with_model = command_parts_with_built_ins(
             "codex",
             "fix tests",
             HarnessLaunchMode::NonInteractive,
@@ -3988,7 +4019,7 @@ mod tests {
             None,
             HarnessLaunchOptions::default(),
         )?;
-        let blank_model = command_parts_for_harness_with_conversation(
+        let blank_model = command_parts_with_built_ins(
             "codex",
             "fix tests",
             HarnessLaunchMode::NonInteractive,
@@ -4119,11 +4150,8 @@ mod tests {
 
     #[test]
     fn codex_forwards_add_dirs_before_prompt() -> anyhow::Result<()> {
-        // Spec resolution reads the adapter env vars; hold the shared env
-        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
-        let _guard = lock_env();
         let add_dirs = vec!["/tmp/roots/a".to_string(), "/tmp/roots/b".to_string()];
-        let (_, args) = command_parts_for_harness_with_conversation(
+        let (_, args) = command_parts_with_built_ins(
             "codex",
             "fix tests",
             HarnessLaunchMode::NonInteractive,
@@ -4154,14 +4182,11 @@ mod tests {
 
     #[test]
     fn claude_stream_mode_forwards_add_dirs() -> anyhow::Result<()> {
-        // Spec resolution reads the adapter env vars; hold the shared env
-        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
-        let _guard = lock_env();
         // Blank entries are skipped; real dirs forward as repeated
         // `--add-dir <DIR>` pairs ahead of the declared stream args,
         // matching the non-stream path (`HarnessCommandSpec::add_dir_args`).
         let add_dirs = vec!["/tmp/roots/a".to_string(), "  ".to_string()];
-        let (_, args) = command_parts_for_harness_with_conversation(
+        let (_, args) = command_parts_with_built_ins(
             "claude",
             "hello prompt",
             HarnessLaunchMode::Stream,
@@ -4193,11 +4218,8 @@ mod tests {
 
     #[test]
     fn claude_forwards_add_dirs_after_permission() -> anyhow::Result<()> {
-        // Spec resolution reads the adapter env vars; hold the shared env
-        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
-        let _guard = lock_env();
         let add_dirs = vec!["/tmp/roots/a".to_string()];
-        let (_, args) = command_parts_for_harness_with_conversation(
+        let (_, args) = command_parts_with_built_ins(
             "claude",
             "hi",
             HarnessLaunchMode::NonInteractive,
@@ -4227,7 +4249,7 @@ mod tests {
     #[test]
     fn blank_add_dirs_leave_args_unchanged() -> anyhow::Result<()> {
         let blank = vec!["   ".to_string(), String::new()];
-        let with_blank_dirs = command_parts_for_harness_with_conversation(
+        let with_blank_dirs = command_parts_with_built_ins(
             "codex",
             "fix tests",
             HarnessLaunchMode::NonInteractive,
@@ -4261,10 +4283,7 @@ mod tests {
 
     #[test]
     fn codex_forwards_permission_before_prompt() -> anyhow::Result<()> {
-        // Spec resolution reads the adapter env vars; hold the shared env
-        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
-        let _guard = lock_env();
-        let (_, args) = command_parts_for_harness_with_conversation(
+        let (_, args) = command_parts_with_built_ins(
             "codex",
             "fix tests",
             HarnessLaunchMode::NonInteractive,
@@ -4288,10 +4307,7 @@ mod tests {
 
     #[test]
     fn claude_forwards_permission_full_maps_to_bypass() -> anyhow::Result<()> {
-        // Spec resolution reads the adapter env vars; hold the shared env
-        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
-        let _guard = lock_env();
-        let (_, args) = command_parts_for_harness_with_conversation(
+        let (_, args) = command_parts_with_built_ins(
             "claude",
             "hi",
             HarnessLaunchMode::NonInteractive,
@@ -4317,10 +4333,7 @@ mod tests {
 
     #[test]
     fn no_permission_leaves_args_unchanged() -> anyhow::Result<()> {
-        // Spec resolution reads the adapter env vars; hold the shared env
-        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
-        let _guard = lock_env();
-        let with_opt = command_parts_for_harness_with_conversation(
+        let with_opt = command_parts_with_built_ins(
             "codex",
             "fix tests",
             HarnessLaunchMode::NonInteractive,
@@ -4355,10 +4368,12 @@ mod tests {
             }"#,
         )?;
 
-        let _guard = lock_env();
-        let previous = env::var_os(EXTERNAL_ADAPTER_MANIFEST_ENV);
-        env::set_var(EXTERNAL_ADAPTER_MANIFEST_ENV, &manifest);
-        let parts = command_parts_for_harness_with_conversation(
+        let specs = configured_harness_specs_from(&AdapterEnv {
+            manifest_path: Some(manifest.into()),
+            ..Default::default()
+        })?;
+        let parts = command_parts_in_specs(
+            &specs,
             "templated",
             "do it",
             HarnessLaunchMode::NonInteractive,
@@ -4369,7 +4384,6 @@ mod tests {
                 ..Default::default()
             },
         );
-        restore_adapter_manifest_env(previous);
 
         assert_eq!(
             parts?,
@@ -4407,15 +4421,17 @@ mod tests {
             }"#,
         )?;
 
-        let _guard = lock_env();
-        let previous = env::var_os(EXTERNAL_ADAPTER_MANIFEST_ENV);
-        env::set_var(EXTERNAL_ADAPTER_MANIFEST_ENV, &manifest);
-        let spec = configured_harness_specs()?
-            .into_iter()
+        let specs = configured_harness_specs_from(&AdapterEnv {
+            manifest_path: Some(manifest.into()),
+            ..Default::default()
+        })?;
+        let spec = specs
+            .iter()
             .find(|s| s.id == "plainadapter")
             .expect("adapter should load");
         // Passing a model must NOT inject any args (the run layer warns instead).
-        let parts = command_parts_for_harness_with_conversation(
+        let parts = command_parts_in_specs(
+            &specs,
             "plainadapter",
             "do it",
             HarnessLaunchMode::NonInteractive,
@@ -4426,7 +4442,6 @@ mod tests {
                 ..Default::default()
             },
         );
-        restore_adapter_manifest_env(previous);
 
         assert!(!spec.supports_model());
         assert!(spec.model_args("openai/gpt-5.5").is_empty());
@@ -4442,10 +4457,7 @@ mod tests {
 
     #[test]
     fn none_hint_matches_legacy_command_parts() -> anyhow::Result<()> {
-        // Spec resolution reads the adapter env vars; hold the shared env
-        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
-        let _guard = lock_env();
-        let with_none = command_parts_for_harness_with_conversation(
+        let with_none = command_parts_with_built_ins(
             "claude",
             "hello",
             HarnessLaunchMode::NonInteractive,
@@ -4521,7 +4533,7 @@ mod tests {
 
     #[test]
     fn coven_code_think_maps_to_effort_high() -> anyhow::Result<()> {
-        let (_, args) = command_parts_for_harness_with_conversation(
+        let (_, args) = command_parts_with_built_ins(
             "coven-code",
             "hi",
             HarnessLaunchMode::NonInteractive,
@@ -4548,9 +4560,6 @@ mod tests {
 
     #[test]
     fn copilot_noninteractive_uses_prompt_flag_equals_form() -> anyhow::Result<()> {
-        // Spec resolution reads the adapter env vars; hold the shared env
-        // lock so a concurrent test's tempdir manifest never vanishes mid-read.
-        let _guard = lock_env();
         assert_eq!(
             command_parts_for_harness("copilot", "fix tests", HarnessLaunchMode::NonInteractive)?,
             (
@@ -4563,7 +4572,6 @@ mod tests {
 
     #[test]
     fn copilot_interactive_uses_interactive_flag_equals_form() -> anyhow::Result<()> {
-        let _guard = lock_env();
         assert_eq!(
             command_parts_for_harness("copilot", "polish ui", HarnessLaunchMode::Interactive)?,
             (
@@ -4576,7 +4584,6 @@ mod tests {
 
     #[test]
     fn copilot_dash_prefixed_prompt_stays_inside_flag_value() -> anyhow::Result<()> {
-        let _guard = lock_env();
         // A prompt starting with `-` must never parse as harness flags; the
         // `=` form binds it as the prompt flag's value.
         let (_, args) = command_parts_for_harness(
@@ -4594,10 +4601,9 @@ mod tests {
 
     #[test]
     fn copilot_stream_mode_falls_back_to_noninteractive_one_shot() -> anyhow::Result<()> {
-        let _guard = lock_env();
         // Copilot has no stream-json stdin mode; a Stream request must build
         // the one-shot non-interactive command instead.
-        assert!(!harness_supports_stream_mode("copilot"));
+        assert!(!declared_capabilities_in(&built_in_harness_specs(), "copilot").stream);
         assert_eq!(
             command_parts_for_harness("copilot", "hi", HarnessLaunchMode::Stream)?,
             (
@@ -4610,12 +4616,13 @@ mod tests {
 
     #[test]
     fn copilot_init_hint_preassigns_session_id_with_prompt_flag() -> anyhow::Result<()> {
-        let _guard = lock_env();
-        assert!(harness_supports_preassigned_session_id("copilot"));
+        assert!(
+            declared_capabilities_in(&built_in_harness_specs(), "copilot").preassigned_session_id
+        );
         let hint = ConversationHint::Init {
             id: "11111111-2222-4333-8444-555555555555".to_string(),
         };
-        let parts = command_parts_for_harness_with_conversation(
+        let parts = command_parts_with_built_ins(
             "copilot",
             "hello",
             HarnessLaunchMode::NonInteractive,
@@ -4640,7 +4647,6 @@ mod tests {
 
     #[test]
     fn copilot_resume_hint_reuses_session_id_flag() -> anyhow::Result<()> {
-        let _guard = lock_env();
         // Copilot's `--resume` only binds its value as `--resume=<id>`, which
         // the token-pair continuity form can't emit; `--session-id <id>`
         // resumes the same session (and self-heals to a fresh session with
@@ -4648,7 +4654,7 @@ mod tests {
         let hint = ConversationHint::Resume {
             id: "11111111-2222-4333-8444-555555555555".to_string(),
         };
-        let parts = command_parts_for_harness_with_conversation(
+        let parts = command_parts_with_built_ins(
             "copilot",
             "follow up",
             HarnessLaunchMode::NonInteractive,
@@ -4693,9 +4699,8 @@ mod tests {
 
     #[test]
     fn copilot_launch_options_prepend_model_permission_dirs_and_effort() -> anyhow::Result<()> {
-        let _guard = lock_env();
         let add_dirs = vec!["/tmp/extra".to_string()];
-        let (_, args) = command_parts_for_harness_with_conversation(
+        let (_, args) = command_parts_with_built_ins(
             "copilot",
             "hi",
             HarnessLaunchMode::NonInteractive,
@@ -4731,7 +4736,6 @@ mod tests {
 
     #[test]
     fn copilot_identity_preamble_rides_inside_prompt_flag_value() -> anyhow::Result<()> {
-        let _guard = lock_env();
         // Copilot has no system-prompt flag, so familiar identity is injected
         // as a bracketed preamble inside the prompt flag's value.
         let familiar = FamiliarContext {
@@ -4739,7 +4743,7 @@ mod tests {
             display_name: "Charm".to_string(),
             role: None,
         };
-        let (_, args) = command_parts_for_harness_with_conversation(
+        let (_, args) = command_parts_with_built_ins(
             "copilot",
             "do the task",
             HarnessLaunchMode::NonInteractive,
@@ -4780,17 +4784,19 @@ mod tests {
         }
         fs::write(home.path().join(".coven/engine/current"), "0.6.1").unwrap();
 
-        // Drive resolution deterministically on every platform via the
-        // COVEN_ENGINE_BIN override. `dirs_next::home_dir()` on Windows consults
-        // the SHGetKnownFolderPath API, which a USERPROFILE/HOME env override does
-        // not reliably change — so the managed-home path is not test-controllable
-        // cross-platform. The override exercises the same is_executable() gate and
-        // the same harness_available() code path.
-        let _guard = lock_env();
-        let _override_guard = EnvVarGuard::set("COVEN_ENGINE_BIN", &bin);
+        // Drive resolution deterministically on every platform by injecting
+        // the engine-bin override (the value COVEN_ENGINE_BIN would carry)
+        // straight into the resolver instead of mutating process env.
+        // `dirs_next::home_dir()` on Windows consults the SHGetKnownFolderPath
+        // API, which a USERPROFILE/HOME env override does not reliably change —
+        // so the managed-home path is not test-controllable cross-platform. The
+        // override exercises the same is_executable() gate and the same
+        // harness_available_with() code path.
+        let engine_resolves =
+            || crate::engine::resolve_from(Some(bin.as_os_str()), None, None).is_some();
 
         assert!(
-            harness_available("coven-code"),
+            harness_available_with("coven-code", engine_resolves),
             "should be available via managed engine"
         );
     }
