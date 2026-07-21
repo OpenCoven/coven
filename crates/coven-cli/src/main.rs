@@ -1327,6 +1327,7 @@ fn run_engine_passthrough(lead: Option<&str>, args: &[OsString]) -> Result<()> {
 /// that cannot succeed on a normal installation.
 fn run_auth_command(args: &[OsString]) -> Result<()> {
     if auth_login_requested(args)
+        && !auth_help_requested(args)
         && !configured_oauth_client_id(
             std::env::var_os(COVEN_CODE_ANTHROPIC_OAUTH_CLIENT_ID).as_deref(),
         )
@@ -1339,6 +1340,11 @@ fn run_auth_command(args: &[OsString]) -> Result<()> {
 
 fn auth_login_requested(args: &[OsString]) -> bool {
     matches!(args.first().and_then(|arg| arg.to_str()), Some("login"))
+}
+
+fn auth_help_requested(args: &[OsString]) -> bool {
+    args.iter()
+        .any(|arg| matches!(arg.to_str(), Some("--help") | Some("-h")))
 }
 
 fn configured_oauth_client_id(client_id: Option<&OsStr>) -> bool {
@@ -5807,6 +5813,22 @@ mod tests {
         assert!(!auth_login_requested(&[]));
         assert!(!auth_login_requested(&[OsString::from("status")]));
         assert!(!auth_login_requested(&[OsString::from("--help")]));
+    }
+
+    #[test]
+    fn auth_login_help_is_forwarded_without_oauth_configuration() {
+        assert!(auth_login_requested(&[
+            OsString::from("login"),
+            OsString::from("--help"),
+        ]));
+        assert!(auth_help_requested(&[
+            OsString::from("login"),
+            OsString::from("--help"),
+        ]));
+        assert!(auth_help_requested(&[
+            OsString::from("login"),
+            OsString::from("-h"),
+        ]));
     }
 
     #[test]
