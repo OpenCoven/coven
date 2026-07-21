@@ -1326,8 +1326,14 @@ fn run_engine_passthrough(lead: Option<&str>, args: &[OsString]) -> Result<()> {
 /// checking it here prevents the wrapper from launching a browser-bound flow
 /// that cannot succeed on a normal installation.
 fn run_auth_command(args: &[OsString]) -> Result<()> {
+    if auth_login_requested(args) && auth_help_requested(args) {
+        // The pinned engine accepts raw auth args and would otherwise treat
+        // `--help` as a login request, so answer this wrapper-level help here.
+        println!("{}", anthropic_oauth_login_help_message());
+        return Ok(());
+    }
+
     if auth_login_requested(args)
-        && !auth_help_requested(args)
         && !configured_oauth_client_id(
             std::env::var_os(COVEN_CODE_ANTHROPIC_OAUTH_CLIENT_ID).as_deref(),
         )
@@ -1364,6 +1370,16 @@ Use one of these supported paths instead:\n\
   - ChatGPT/Codex: run `coven code codex login`.\n\n\
 If you operate a registered Coven Code OAuth client, set \
 COVEN_CODE_ANTHROPIC_OAUTH_CLIENT_ID and run `coven auth login` again."
+    )
+}
+
+fn anthropic_oauth_login_help_message() -> String {
+    format!(
+        "Usage: coven auth login [--console] [--label <name>]\n\n\
+Authenticate Coven Code through Anthropic OAuth. This requires a registered Coven Code OAuth \
+client ID in {COVEN_CODE_ANTHROPIC_OAUTH_CLIENT_ID}.\n\n\
+  --console       Use the Anthropic Console OAuth flow.\n\
+  --label <name>  Give the authenticated account profile a name."
     )
 }
 
@@ -5816,7 +5832,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_login_help_is_forwarded_without_oauth_configuration() {
+    fn auth_login_help_lists_login_options() {
         assert!(auth_login_requested(&[
             OsString::from("login"),
             OsString::from("--help"),
@@ -5829,6 +5845,11 @@ mod tests {
             OsString::from("login"),
             OsString::from("-h"),
         ]));
+        let help = anthropic_oauth_login_help_message();
+        assert!(help.contains("Usage: coven auth login"));
+        assert!(help.contains(COVEN_CODE_ANTHROPIC_OAUTH_CLIENT_ID));
+        assert!(help.contains("--console"));
+        assert!(help.contains("--label"));
     }
 
     #[test]
