@@ -6849,7 +6849,19 @@ mod tests {
     #[test]
     fn launch_request_with_unknown_harness_returns_400_upfront_no_session_row() -> anyhow::Result<()>
     {
+        // Harness validation reads ambient adapter config: the external
+        // manifest/dirs env vars plus the COVEN_HOME trust store. Neutralize
+        // all three under the crate-wide env lock so a host with a real
+        // hermes adapter installed cannot turn this 400 into a 201.
+        let _env = crate::test_env::lock_env();
+        let _manifest =
+            crate::test_env::EnvVarGuard::remove(crate::harness::EXTERNAL_ADAPTER_MANIFEST_ENV);
+        let _dirs = crate::test_env::EnvVarGuard::remove(crate::harness::EXTERNAL_ADAPTER_DIRS_ENV);
         let temp_dir = tempfile::tempdir()?;
+        let _home = crate::test_env::EnvVarGuard::set(
+            "COVEN_HOME",
+            temp_dir.path().join("empty-coven-home"),
+        );
         let project_root = temp_dir.path().join("repo");
         std::fs::create_dir_all(&project_root)?;
         let runtime = RecordingRuntime::default();
