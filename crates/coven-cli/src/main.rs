@@ -1265,10 +1265,13 @@ fn legacy_tui_instructions(shell: TargetShell) -> &'static str {
 /// `COVEN_LEGACY_TUI=1` (or `=true`) opts back into the in-process tui::shell.
 /// This is a transitional escape hatch, not the supported path.
 fn legacy_tui_opted_in() -> bool {
-    matches!(
-        std::env::var("COVEN_LEGACY_TUI").as_deref(),
-        Ok("1") | Ok("true")
-    )
+    legacy_tui_value_opts_in(std::env::var("COVEN_LEGACY_TUI").ok().as_deref())
+}
+
+/// Pure predicate behind [`legacy_tui_opted_in`], split out so tests can pin
+/// the opt-in rules without mutating process-global environment variables.
+fn legacy_tui_value_opts_in(value: Option<&str>) -> bool {
+    matches!(value, Some("1") | Some("true"))
 }
 
 /// Locate the engine binary via the managed-engine resolver.
@@ -5518,20 +5521,15 @@ mod tests {
 
     #[test]
     fn legacy_tui_opt_in_respects_env_var() {
-        // SAFETY: tests in this crate run on a single thread by default; if
-        // that ever changes, gate this behind a serial mutex.
-        let prev = std::env::var("COVEN_LEGACY_TUI").ok();
-        std::env::set_var("COVEN_LEGACY_TUI", "1");
-        assert!(legacy_tui_opted_in());
-        std::env::set_var("COVEN_LEGACY_TUI", "true");
-        assert!(legacy_tui_opted_in());
-        std::env::set_var("COVEN_LEGACY_TUI", "0");
-        assert!(!legacy_tui_opted_in());
-        std::env::remove_var("COVEN_LEGACY_TUI");
-        assert!(!legacy_tui_opted_in());
-        if let Some(v) = prev {
-            std::env::set_var("COVEN_LEGACY_TUI", v);
-        }
+        // Exercises the pure predicate instead of mutating COVEN_LEGACY_TUI in
+        // the process env: tests run multi-threaded by default, so unguarded
+        // set_var/remove_var races with every other env read in the binary.
+        assert!(legacy_tui_value_opts_in(Some("1")));
+        assert!(legacy_tui_value_opts_in(Some("true")));
+        assert!(!legacy_tui_value_opts_in(Some("0")));
+        assert!(!legacy_tui_value_opts_in(Some("TRUE")));
+        assert!(!legacy_tui_value_opts_in(Some("")));
+        assert!(!legacy_tui_value_opts_in(None));
     }
 
     #[test]

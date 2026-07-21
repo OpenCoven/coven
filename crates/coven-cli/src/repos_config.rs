@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -75,15 +76,22 @@ impl ReposConfig {
 }
 
 fn expand_tilde(path: &Path) -> PathBuf {
+    expand_tilde_with_home(path, std::env::var_os("HOME"))
+}
+
+/// Injectable core of [`expand_tilde`], so tests can pin the expansion rules
+/// without swapping the process-global `HOME` variable.
+fn expand_tilde_with_home(path: &Path, home: Option<OsString>) -> PathBuf {
     let Some(s) = path.to_str() else {
         return path.to_path_buf();
     };
+    let home = home.filter(|v| !v.is_empty());
     if let Some(rest) = s.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        if let Some(home) = home {
             return PathBuf::from(home).join(rest);
         }
     } else if s == "~" {
-        if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        if let Some(home) = home {
             return PathBuf::from(home);
         }
     }
@@ -141,18 +149,32 @@ path = "~/projects/example"
 "#,
         )?;
 
-        let prior_home = std::env::var_os("HOME");
-        // Safety: tests in this crate run single-threaded enough for HOME swap.
-        std::env::set_var("HOME", "/tmp/fake-home");
-        let resolved = load(temp.path())?.resolve("home_relative");
-        match prior_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
-        }
+        // Inject HOME instead of swapping the process env: set_var races with
+        // parallel tests and a panic before restore leaks the fake value.
+        let config = load(temp.path())?;
+        let raw = &config
+            .repos
+            .get("home_relative")
+            .expect("entry parsed")
+            .path;
+        let home = || Some(OsString::from("/tmp/fake-home"));
 
         assert_eq!(
-            resolved,
-            Some(PathBuf::from("/tmp/fake-home/projects/example"))
+            expand_tilde_with_home(raw, home()),
+            PathBuf::from("/tmp/fake-home/projects/example")
+        );
+        assert_eq!(
+            expand_tilde_with_home(Path::new("~"), home()),
+            PathBuf::from("/tmp/fake-home")
+        );
+        // Missing or empty HOME leaves the path untouched.
+        assert_eq!(
+            expand_tilde_with_home(raw, None),
+            Path::new("~/projects/example")
+        );
+        assert_eq!(
+            expand_tilde_with_home(raw, Some(OsString::new())),
+            Path::new("~/projects/example")
         );
         Ok(())
     }
