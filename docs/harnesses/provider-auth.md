@@ -14,7 +14,7 @@ Coven supervises harness PTYs. It never reads, proxies, persists, or mints provi
 
 - Provider tokens live wherever the harness already puts them — typically `~/.codex/`, `~/.config/anthropic/`, `~/.copilot/`, or a system keychain managed by that CLI.
 - The Coven daemon never reads them, never stores them in SQLite, never forwards them over the socket API, and never logs them into the event ledger.
-- `coven doctor` only checks whether the harness binary exists; it does **not** test provider credentials. Each harness already ships its own `login` / `doctor` for that.
+- `coven doctor` reports the Coven Code engine's login state, but only checks whether each external harness binary exists; it does **not** test provider credentials for those harnesses. Each harness already ships its own `login` / `doctor` for that.
 - Treat Coven as having **zero** knowledge of provider auth state. The boundary is intentional.
 
 ## Why Coven refuses to own credentials
