@@ -12,7 +12,13 @@ Hermes can be used as a research target for the generic external adapter system 
 
 ## Install the local adapter recipe
 
-Use the bundled recipe instead of hand-writing a manifest:
+Hermes receives task text through its `-q/--query` flag, while Coven sends
+ordinary adapter prompts after `--`. Install the maintained `hermes-coven` shim
+from [`coven-runtimes`](https://github.com/OpenCoven/coven-runtimes/tree/main/shims)
+into a directory on `PATH` before installing the bundled recipe. The shim
+rewrites only the prompt; selected `--model` arguments pass through unchanged.
+
+Then use the bundled recipe instead of hand-writing a manifest:
 
 ```sh
 coven adapter install hermes

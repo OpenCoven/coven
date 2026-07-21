@@ -999,11 +999,12 @@ const HERMES_ADAPTER_MANIFEST: &str = r#"{
     {
       "id": "hermes",
       "label": "Hermes Agent",
-      "executable": "hermes",
-      "interactive_prompt_prefix_args": ["chat", "--source", "coven", "-q"],
-      "non_interactive_prompt_prefix_args": ["chat", "--source", "coven", "-Q", "-q"],
-      "install_hint": "Install Hermes Agent, add it to PATH, and complete Hermes setup before using this adapter.",
-      "system_prompt_flag": null
+      "executable": "hermes-coven",
+      "interactive_prompt_prefix_args": ["chat", "--source", "coven"],
+      "non_interactive_prompt_prefix_args": ["chat", "--source", "coven", "-Q"],
+      "install_hint": "Install Hermes Agent, add it to PATH, install the hermes-coven shim, and complete Hermes setup before using this adapter.",
+      "system_prompt_flag": null,
+      "model_flag": "--model"
     }
   ]
 }
@@ -3180,6 +3181,60 @@ mod tests {
     }
 
     #[test]
+    fn hermes_recipe_forwards_selected_models_before_the_shim_prompt() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let coven_home = temp_dir.path().join("coven-home");
+        let adapter_dir = coven_home.join("adapters");
+        fs::create_dir_all(&adapter_dir)?;
+        fs::write(adapter_dir.join("hermes.json"), HERMES_ADAPTER_MANIFEST)?;
+
+        let _guard = env_lock().lock().unwrap();
+        let _manifest_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_MANIFEST_ENV);
+        let _dirs_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_DIRS_ENV);
+        let _coven_home_guard = EnvVarGuard::set("COVEN_HOME", &coven_home);
+
+        let selected = command_parts_for_harness_with_conversation(
+            "hermes",
+            "hello from Coven",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            None,
+            HarnessLaunchOptions {
+                model: Some("openai/gpt-5.6-terra"),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(selected.0, "hermes-coven");
+        assert_eq!(
+            selected.1,
+            vec![
+                "--model",
+                "gpt-5.6-terra",
+                "chat",
+                "--source",
+                "coven",
+                "-Q",
+                "--",
+                "hello from Coven",
+            ]
+        );
+
+        let inherited = command_parts_for_harness_with_conversation(
+            "hermes",
+            "hello from Coven",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            None,
+            HarnessLaunchOptions::default(),
+        )?;
+        assert_eq!(
+            inherited.1,
+            vec!["chat", "--source", "coven", "-Q", "--", "hello from Coven"]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn configured_harness_specs_load_trusted_coven_home_adapter_directory() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let coven_home = temp_dir.path().join("coven-home");
@@ -3246,7 +3301,7 @@ mod tests {
             .find(|spec| spec.id == "hermes")
             .expect("trusted source should parse bundled hermes recipe");
 
-        assert_eq!(hermes.executable, "hermes");
+        assert_eq!(hermes.executable, "hermes-coven");
         assert_eq!(
             hermes.manifest_path.as_deref(),
             Some(manifest_path.to_string_lossy().as_ref())
