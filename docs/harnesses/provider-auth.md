@@ -44,6 +44,27 @@ The arrow that matters is the missing one: the daemon has no dotted line into th
 
 `coven run codex|claude <prompt>` launches the harness with an empty argument vector apart from the validated prompt and adapter prefix args. It does not inject `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or any token-bearing env var. If the harness needs a credential, it reads it the same way it would when launched directly from your shell.
 
+### Coven Code engine
+
+`coven auth ...` is a convenience pass-through to the separate Coven Code
+engine. It is not a daemon credential store and it does not change the
+credential boundary for `coven run` harness sessions.
+
+`coven auth login` specifically starts Coven Code's **Anthropic OAuth** flow.
+That flow is available only when the operator has registered a Coven Code OAuth
+client and set its client ID in `COVEN_CODE_ANTHROPIC_OAUTH_CLIENT_ID`. A normal
+installation should not set an arbitrary client ID just to make the command run.
+
+Without that OAuth configuration, use one of the supported alternatives:
+
+- Set `ANTHROPIC_API_KEY` for a direct Anthropic API account, then start Coven
+  Code.
+- Authenticate the official Claude Code CLI and use `coven run claude <prompt>`.
+- Run `coven code codex login` for ChatGPT/Codex authentication.
+
+`coven doctor` reports the engine's login state and points to these alternatives
+instead of suggesting an OAuth login that cannot succeed.
+
 ### Daemon API
 
 `POST /api/v1/sessions` accepts a project root, cwd, harness id, prompt, and optional title. There is no field for an API key, OAuth token, refresh token, account id, or organization id. The schema is documented in [API contract](/API-CONTRACT) — none of those fields exist.
