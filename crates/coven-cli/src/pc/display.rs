@@ -76,11 +76,17 @@ fn print_human(snap: &SystemSnapshot, format: &OutputFormat) {
     println!("  ⏱  Uptime   {}", format_uptime(snap.uptime_secs));
 
     println!("\n── Disk ────────────────────────────────────");
+    if snap.disks.is_empty() {
+        println!("  No disks detected.");
+    }
     for disk in &snap.disks {
         print_disk(disk);
     }
 
     println!("\n── Top Processes (by CPU) ──────────────────");
+    if snap.processes.is_empty() {
+        println!("  No processes to show.");
+    }
     for proc in snap.processes.iter().take(10) {
         print_proc(proc, format);
     }
@@ -115,6 +121,9 @@ pub fn print_top(snap: &SystemSnapshot, n: usize, format: &OutputFormat) {
         return;
     }
     println!("── Top {} Processes (by CPU) ────────────────", n);
+    if snap.processes.is_empty() {
+        println!("  No processes to show.");
+    }
     for proc in snap.processes.iter().take(n) {
         print_proc(proc, format);
     }
@@ -126,6 +135,9 @@ pub fn print_disk_usage(snap: &SystemSnapshot, format: &OutputFormat) {
         return;
     }
     println!("── Disk Usage ──────────────────────────────");
+    if snap.disks.is_empty() {
+        println!("  No disks detected.");
+    }
     for disk in &snap.disks {
         print_disk(disk);
     }

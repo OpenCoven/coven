@@ -1100,6 +1100,7 @@ fn run_sessions_search(query: &str, json: bool) -> Result<()> {
     // `transcript_indexed_at` is set the ingest function is a no-op.
     let coven_home = coven_home_dir()?;
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    let mut ingest_warned = false;
     match store::list_uningest_external_sessions(&conn) {
         Ok(pending) => {
             for (session_id, _transcript_path) in pending {
@@ -1111,13 +1112,21 @@ fn run_sessions_search(query: &str, json: bool) -> Result<()> {
                         "warning: run_sessions_search: failed to ingest transcript for session \
                          {session_id}: {e}"
                     );
+                    ingest_warned = true;
                 }
             }
         }
         Err(e) => {
             // Non-fatal: fall through to search without transcript data.
             eprintln!("warning: run_sessions_search: failed to list un-ingested sessions: {e}");
+            ingest_warned = true;
         }
+    }
+    if ingest_warned {
+        eprintln!(
+            "note: fresh TUI session transcripts may not be searchable until ingest completes; \
+             rerun the search in a moment"
+        );
     }
 
     let hits = store::search_events(&conn, query)?;
@@ -2198,14 +2207,18 @@ fn run_patch(
     let git_state = openclaw_repo::inspect_git_state(&detected_repo.root)?;
     let issue = match joined_optional_issue(issue)? {
         Some(issue) => issue,
-        None if non_interactive => anyhow::bail!("issue text is required with --non-interactive"),
+        None if non_interactive => anyhow::bail!(
+            "issue text is required with --non-interactive; pass it as arguments, e.g. `coven patch openclaw \"fix the failing test\" --non-interactive --harness codex`"
+        ),
         None => {
             prompt_for_required_line(&format!("What is broken in {}? ", detected_repo.repo_name))?
         }
     };
     let harness_id = match harness {
         Some(harness) => patch::HarnessId::parse(&harness)?,
-        None if non_interactive => anyhow::bail!("--harness is required with --non-interactive"),
+        None if non_interactive => anyhow::bail!(
+            "--harness is required with --non-interactive; add `--harness codex` (or claude, or copilot)"
+        ),
         None => choose_default_harness()?,
     };
     let verification_profile = patch::VerificationProfile::parse(verify.as_deref())?;
@@ -2313,7 +2326,9 @@ fn joined_optional_issue(issue: Vec<String>) -> Result<Option<String>> {
     }
     let joined = issue.join(" ").trim().to_string();
     if joined.is_empty() {
-        anyhow::bail!("issue text must not be empty when provided");
+        anyhow::bail!(
+            "issue text must not be empty when provided; describe what is broken, e.g. `coven patch openclaw \"fix the failing gateway auth test\"`"
+        );
     }
     Ok(Some(joined))
 }
@@ -2327,7 +2342,7 @@ fn prompt_for_required_line(prompt: &str) -> Result<String> {
         .context("failed to read input")?;
     let line = line.trim().to_string();
     if line.is_empty() {
-        anyhow::bail!("a response is required");
+        anyhow::bail!("a response is required; type a non-empty answer, or press Ctrl-C to cancel");
     }
     Ok(line)
 }
@@ -2856,7 +2871,9 @@ fn run_ward_command(command: WardCommand) -> Result<()> {
             )?;
             ward_migrate::print_report(&report);
             if report.has_errors() {
-                bail!("one or more Ward migrations failed or were unmigratable");
+                bail!(
+                    "one or more Ward migrations failed or were unmigratable; see the report above for per-familiar details"
+                );
             }
         }
     }
@@ -3008,7 +3025,7 @@ fn run_session(
     };
 
     if prompt_args.is_empty() && continue_session.is_none() {
-        anyhow::bail!("nothing to do: pass a prompt, or use --continue [ID] to resume a session");
+        anyhow::bail!("nothing to do; pass a prompt, or use --continue [ID] to resume a session");
     }
 
     let selected_harness = selected_available_harness(harness_id)?;
@@ -3161,7 +3178,10 @@ fn run_session(
                 r.updated_at = now.clone();
                 (r, true)
             }
-            None => anyhow::bail!("session {} not found in local store", id),
+            None => anyhow::bail!(
+                "session `{}` not found in local store; run `coven sessions --all` to list session ids",
+                id
+            ),
         }
     } else {
         let r = store::SessionRecord {
@@ -3694,7 +3714,9 @@ pub(crate) fn summon_only_command(session_id: &str) -> Result<store::SessionReco
         store::summon_session(&conn, &session_id, &current_timestamp())?;
         eprintln!("summoned session from the archive");
         let Some(session) = store::get_session(&conn, &session_id)? else {
-            anyhow::bail!("session `{session_id}` not found");
+            anyhow::bail!(
+                "session `{session_id}` not found; run `coven sessions --all` to list session ids"
+            );
         };
         return Ok(session);
     }
@@ -3768,7 +3790,9 @@ fn post_session_kill(coven_home: &Path, session_id: &str) -> Result<()> {
             "the daemon has no live process for session `{session_id}`; {}",
             STALE_RUNNING_HINT
         ),
-        status => anyhow::bail!("Coven daemon rejected the kill with HTTP {status}"),
+        status => anyhow::bail!(
+            "Coven daemon rejected the kill with HTTP {status}; check `coven daemon status` and `coven sessions` for session state"
+        ),
     }
 }
 
@@ -3880,7 +3904,9 @@ fn send_session_input(coven_home: &Path, session_id: &str, data: &str) -> Result
     if (200..300).contains(&status) {
         Ok(())
     } else {
-        anyhow::bail!("Coven daemon rejected input with HTTP {status}")
+        anyhow::bail!(
+            "Coven daemon rejected input with HTTP {status}; check `coven daemon status` and `coven sessions` for session state"
+        )
     }
 }
 
@@ -3959,7 +3985,9 @@ fn joined_prompt(prompt_args: &[String]) -> Result<String> {
     let prompt = prompt_args.join(" ");
     let prompt = prompt.trim();
     if prompt.is_empty() {
-        anyhow::bail!("prompt must not be empty");
+        anyhow::bail!(
+            "prompt must not be empty; quote a task string, e.g. `coven run codex \"fix the failing tests\"`"
+        );
     }
     Ok(prompt.to_string())
 }
