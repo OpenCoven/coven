@@ -145,6 +145,27 @@ fn migrate_one(
 
     let phase2_error = match WardConfig::from_toml_str(&raw) {
         Ok(_) => {
+            // A-1 guard: WardConfig tolerates unknown fields, so a file can
+            // parse as valid Phase-2 while still carrying a v0.1
+            // `[protected].invariants` remnant. Phase-2 has no invariants
+            // surface — blessing such a hybrid as AlreadyMigrated would
+            // silently ignore identity declarations. Fail closed instead.
+            let remnants = v01_invariant_remnants(&raw);
+            if let Some(remnants) = remnants {
+                return Ok(MigrationEntry {
+                    familiar_id: familiar_id.to_string(),
+                    workspace: workspace.to_path_buf(),
+                    status: MigrationStatus::Unmigratable,
+                    protected_files: Vec::new(),
+                    editable_paths: Vec::new(),
+                    translated_globs: Vec::new(),
+                    invariant_dispositions: Vec::new(),
+                    generated_toml: None,
+                    message: format!(
+                        "ward.toml parses as Phase-2 but retains a v0.1 [protected].invariants remnant ({remnants} declaration(s)); Phase-2 has no invariants surface, so these would be silently inert — remove the remnant or restore the v0.1 file and re-run migration"
+                    ),
+                });
+            }
             return Ok(MigrationEntry {
                 familiar_id: familiar_id.to_string(),
                 workspace: workspace.to_path_buf(),
@@ -186,7 +207,7 @@ fn migrate_one(
             protected_files: Vec::new(),
             editable_paths: Vec::new(),
             translated_globs: Vec::new(),
-                invariant_dispositions: Vec::new(),
+            invariant_dispositions: Vec::new(),
             generated_toml: None,
             message: format!(
                 "unmigratable ward.toml: not Phase-2 ({phase2_error:#}) and not recognized Ward v0.1"
@@ -233,7 +254,7 @@ fn migrate_one(
         .collect();
     if !rejection_reasons.is_empty() {
         let message = format!(
-            "v0.1 [protected].invariants rejected explicitly ({} of {} declarations): {}",
+            "v0.1 [protected].invariants rejected explicitly ({} rejection(s) across {} declaration(s)): {}",
             rejection_reasons.len(),
             legacy_invariants.len(),
             rejection_reasons.join("; "),
@@ -361,6 +382,18 @@ fn migrate_one(
             "migrated Ward v0.1{}",
             invariant_summary_suffix(&invariant_dispositions)
         ),
+    })
+}
+
+/// Detects a v0.1 `[protected].invariants` remnant in a raw ward.toml
+/// document. Returns `Some(declaration_count)` when the key is present
+/// (a non-array value counts as one remnant), `None` when absent.
+fn v01_invariant_remnants(raw: &str) -> Option<usize> {
+    let value: toml::Value = toml::from_str(raw).ok()?;
+    let invariants = value.get("protected")?.get("invariants")?;
+    Some(match invariants.as_array() {
+        Some(array) => array.len(),
+        None => 1,
     })
 }
 
@@ -733,7 +766,7 @@ paths = ["notes/"]
         assert_eq!(entry.status, MigrationStatus::Unmigratable);
         assert!(entry
             .message
-            .contains("v0.1 [protected].invariants rejected explicitly (2 of 2 declarations)"));
+            .contains("v0.1 [protected].invariants rejected explicitly (2 rejection(s) across 2 declaration(s))"));
         assert!(entry.message.contains("invariant[0]"));
         assert!(entry.message.contains("invariant[1]"));
         assert!(entry
@@ -835,6 +868,47 @@ paths = ["notes/"]
         assert_eq!(entry.status, MigrationStatus::Migrated);
         assert!(entry.invariant_dispositions.is_empty());
         assert!(!entry.message.contains("identity invariant"));
+        Ok(())
+    }
+
+    #[test]
+    fn hybrid_phase2_ward_with_v01_invariant_remnant_fails_closed() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let workspace = seed_familiars(temp.path())?;
+        fs::write(workspace.join("ward.toml"), synthetic_v01())?;
+        run_migration(
+            temp.path(),
+            WardMigrateOptions {
+                familiar: Some("nova".to_string()),
+                fingerprint: "SHA256:test-principal".to_string(),
+                apply: true,
+            },
+        )?;
+
+        // Graft a v0.1 invariants remnant onto the migrated Phase-2 file;
+        // WardConfig tolerates unknown fields, so it still parses as Phase-2.
+        let migrated = fs::read_to_string(workspace.join("ward.toml"))?;
+        let hybrid =
+            format!("{migrated}\n[protected]\ninvariants = [\"familiar.name == 'Nova'\"]\n");
+        fs::write(workspace.join("ward.toml"), &hybrid)?;
+
+        let report = run_migration(
+            temp.path(),
+            WardMigrateOptions {
+                familiar: Some("nova".to_string()),
+                fingerprint: "SHA256:test-principal".to_string(),
+                apply: true,
+            },
+        )?;
+
+        assert!(report.has_errors());
+        let entry = &report.entries[0];
+        assert_eq!(entry.status, MigrationStatus::Unmigratable);
+        assert!(entry
+            .message
+            .contains("retains a v0.1 [protected].invariants remnant (1 declaration(s))"));
+        // Fail closed: hybrid file left untouched for the principal to fix.
+        assert_eq!(fs::read_to_string(workspace.join("ward.toml"))?, hybrid);
         Ok(())
     }
 
