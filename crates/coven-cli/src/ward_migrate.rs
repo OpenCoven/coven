@@ -336,10 +336,7 @@ fn migrate_one(
             translated_globs,
             invariant_dispositions: invariant_dispositions.clone(),
             generated_toml: Some(generated_toml),
-            message: format!(
-                "would migrate Ward v0.1{}",
-                invariant_summary_suffix(&invariant_dispositions)
-            ),
+message: "would migrate Ward v0.1".to_string(),
         });
     }
 
