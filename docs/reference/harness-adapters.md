@@ -1,5 +1,5 @@
 ---
-summary: "The adapter shape Codex and Claude Code use today."
+summary: "The adapter shape Codex, Claude Code, and GitHub Copilot CLI use today."
 read_when:
   - Looking up adapter expectations
 title: "Harness adapters"

@@ -18,8 +18,8 @@ description: "Showcase landing for Coven: a local-first runtime that supervises 
 ## Highlights
 
 <Columns>
-  <Card title="Codex and Claude Code today" icon="layers" href="/harnesses">
-    Two supported harnesses, more on the way through the adapter spec.
+  <Card title="Codex, Claude Code, and Copilot CLI today" icon="layers" href="/harnesses">
+    Three supported harnesses, more on the way through the adapter spec.
   </Card>
   <Card title="Session JSON records" icon="braces" href="/sessions/comux-json">
     Session shape that CastCodes and advanced clients can replay.

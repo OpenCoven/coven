@@ -87,15 +87,15 @@ Shipped:
 - `coven doctor` setup checks.
 - Local daemon lifecycle: `coven daemon start/status/restart/stop`.
 - Project-root and cwd boundary guard.
-- Built-in Codex and Claude Code harness adapters.
-- PTY-backed `coven run codex|claude <prompt>` sessions.
+- Built-in Codex, Claude Code, and GitHub Copilot CLI harness adapters.
+- PTY-backed `coven run codex|claude|copilot <prompt>` sessions.
 - SQLite-backed session metadata and event log.
 - Session browser and rituals: **Rejoin**, **View Log**, **Summon**, **Archive**, **Sacrifice**.
 - Scriptable and human session output: `coven sessions`, `--plain`, and `--all`.
 - Local HTTP-over-Unix-socket API for CastCodes and advanced local clients.
 - Versioned `coven.daemon.v1` API contract with named apiVersion, machine-readable capabilities, structured errors, and monotonic event cursors. See [`docs/API-CONTRACT.md`](/API-CONTRACT).
 - Compatibility tests for the external OpenClaw bridge against versioned daemon responses.
-- First-run recovery hints for missing Codex or Claude Code CLIs.
+- First-run recovery hints for missing Codex, Claude Code, or GitHub Copilot CLIs.
 - Real CLI smoke coverage for daemon restart, attach replay, kill, archive, summon, and sacrifice flows.
 - Install verification and release wiring for macOS, Linux x64, and Windows x64 npm package paths.
 - Published npm wrapper packages:

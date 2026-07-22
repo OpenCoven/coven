@@ -12,13 +12,14 @@ description: "Reference for coven run: one-shot harness execution that spawns a 
 coven run <harness> <prompt> [flags]
 ```
 
-`<harness>` is a configured harness id such as `codex` or `claude`.
+`<harness>` is a configured harness id such as `codex`, `claude`, or `copilot`.
 
 ## Common Flags
 
 | Flag | Behavior |
 |---|---|
 | `--cwd <path>` | Launch from a directory inside the resolved project root. |
+| `--add-dir <path>` | Grant the harness access to an additional directory beyond its cwd; repeat the flag for multiple directories. Maps to each harness's native trust flag (`--add-dir` for codex, claude, copilot, and coven-code). Harnesses with no add-dir mechanism warn and continue. |
 | `--title <text>` | Store a readable session title. |
 | `--model <id>` | Forward a model override to harnesses that declare model support. Namespaced ids such as `anthropic/claude-sonnet-4` are forwarded to the harness as the bare model id. |
 | `--think` | Request deeper reasoning. Claude maps this to `--effort high`; unsupported harnesses warn and continue. |

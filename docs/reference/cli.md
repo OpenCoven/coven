@@ -95,7 +95,7 @@ flowchart TB
 | `coven doctor` | Check local setup; exits 1 when a blocking problem is found. `--json` emits a `{ ok, blocking, checks, nextSteps }` envelope. |
 | `coven status` | Ecosystem overview: daemon, sessions, familiars, skills, research, hub. Alias: `coven overview`. |
 | `coven daemon start/status/restart/stop` | Manage the local daemon. |
-| `coven run <harness> <prompt>` | Launch a project-scoped harness session. Current harness ids: `codex`, `claude`. |
+| `coven run <harness> <prompt>` | Launch a project-scoped harness session. Current harness ids: `codex`, `claude`, `copilot`. |
 | `coven sessions` | Open the session browser; supports `--plain`, `--json`, `--all`, and `--manage`. |
 | `coven sessions search <query>` | Full-text search recorded event payloads. |
 | `coven sessions show/events/log <session-id>` | Inspect one session without attaching; see [cli-observe](cli-observe.md). |
