@@ -3158,7 +3158,7 @@ mod tests {
         fs::create_dir_all(&adapter_dir)?;
         fs::write(adapter_dir.join("hermes.json"), HERMES_ADAPTER_MANIFEST)?;
 
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let _manifest_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_MANIFEST_ENV);
         let _dirs_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_DIRS_ENV);
         let _coven_home_guard = EnvVarGuard::set("COVEN_HOME", &coven_home);
