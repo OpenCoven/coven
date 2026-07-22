@@ -41,6 +41,8 @@ mod repos_config;
 mod settings;
 mod store;
 mod stream_json;
+#[cfg(test)]
+mod test_env;
 mod theme;
 mod tui;
 mod verification;
@@ -4023,6 +4025,7 @@ fn coven_store_path_if_exists() -> Result<Option<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env::{lock_env, EnvVarGuard};
     use crate::tui::cast::{
         build_plan, parse_spell, CastHarness, CastIntent, CastRisk, CastStepKind, SafetyDecision,
     };
@@ -4041,44 +4044,6 @@ mod tests {
         MagicalTuiMove, MagicalTuiRequest, MAGICAL_TUI_MAX_INNER_WIDTH,
     };
     use crossterm::event::KeyEventKind;
-    use std::sync::{Mutex, OnceLock};
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    fn restore_env_var(name: &str, previous: Option<OsString>) {
-        match previous {
-            Some(value) => std::env::set_var(name, value),
-            None => std::env::remove_var(name),
-        }
-    }
-
-    struct EnvVarGuard {
-        name: &'static str,
-        previous: Option<OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(name: &'static str, value: impl AsRef<OsStr>) -> Self {
-            let previous = std::env::var_os(name);
-            std::env::set_var(name, value);
-            Self { name, previous }
-        }
-
-        fn remove(name: &'static str) -> Self {
-            let previous = std::env::var_os(name);
-            std::env::remove_var(name);
-            Self { name, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            restore_env_var(self.name, self.previous.clone());
-        }
-    }
 
     #[test]
     fn tui_launcher_and_session_browser_are_owned_by_tui_modules() {
@@ -5200,7 +5165,7 @@ mod tests {
     fn coven_home_uses_userprofile_when_home_is_missing() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let user_profile = temp_dir.path().join("windows-user");
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let _coven_home = EnvVarGuard::remove("COVEN_HOME");
         let _home = EnvVarGuard::remove("HOME");
         let _user_profile = EnvVarGuard::set("USERPROFILE", &user_profile);
