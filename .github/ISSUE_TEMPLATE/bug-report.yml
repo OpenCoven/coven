@@ -1,0 +1,61 @@
+name: "Bug report"
+description: "Report a reproducible bug in Coven (CLI, daemon, or packages)."
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. Before you start, run `coven doctor` and collect
+        the local state it reports — most reports need it. The
+        [Filing issues](https://github.com/OpenCoven/coven/blob/main/docs/help/filing-issues.md)
+        guide covers what to include and what to redact (no provider tokens,
+        private prompts, or sensitive paths).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: "What happened"
+      description: "The exact command that failed and the actual behavior. Include platform (macOS, Linux, Windows, WSL2, container) and install route (npm wrapper, cargo, source checkout, Docker, ...)."
+    validations:
+      required: true
+  - type: textarea
+    id: steps-to-reproduce
+    attributes:
+      label: "Steps to reproduce"
+      description: "Numbered steps a maintainer can follow to hit the bug."
+      placeholder: |
+        1. coven daemon start
+        2. coven run codex "say hello from coven"
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: "Expected behavior"
+      description: "What you expected instead."
+  - type: input
+    id: coven-version
+    attributes:
+      label: "Coven version"
+      placeholder: "`coven --version` output"
+  - type: dropdown
+    id: harness
+    attributes:
+      label: "Harness involved"
+      description: "Which harness the bug involves, if any."
+      options:
+        - codex
+        - claude
+        - copilot
+        - other or none
+  - type: textarea
+    id: doctor-output
+    attributes:
+      label: "coven doctor output"
+      description: "Paste the output of `coven doctor`. Redact sensitive paths with `<project>` or `<home>`."
+      render: shell
+  - type: textarea
+    id: anything-else
+    attributes:
+      label: "Anything else"
+      description: "Daemon logs, `coven sessions --plain --all` output, a redacted diagnostics bundle, or other context."

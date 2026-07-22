@@ -7,6 +7,23 @@
 
 Coven is built as a small, boring Rust authority layer with TypeScript integration packages around it. The development loop should keep that boundary clear.
 
+OpenCoven is MIT licensed and community-driven. We want contributing to be easy, open, and safe for everyone.
+
+## How to Contribute
+
+1. Fork the repository (or branch directly if you have push access).
+2. Create one branch per change, named for the concern it addresses in the same
+   conventional-commit style used for subjects (`feat:`, `fix:`, `docs:`,
+   `chore:`, `refactor:`) — for example `fix/448-cli-help-text`.
+3. Make your changes with signed-off commits: `git commit -s`. Sign-off is
+   required for every commit — see
+   [OpenCoven DCO and Patent Terms](#opencoven-dco-and-patent-terms) below.
+4. Open a pull request with a clear description and fill in the PR template.
+
+For larger changes, start from an issue first and include the readiness packet
+requested by the PR template. AI agents should also read [AGENTS.md](AGENTS.md)
+for the claim registry and worktree workflow layered on top of this guide.
+
 ## Prerequisites
 
 - Rust stable toolchain
@@ -101,8 +118,12 @@ OpenCoven docs should be public, direct, and concrete:
 
 ## Pull Request Workflow
 
-1. Keep changes scoped and reviewable.
-2. Run the relevant checks:
+1. For larger changes, start from an issue and include the readiness packet
+   requested by the PR template.
+2. Keep changes scoped and reviewable.
+3. Sign off every commit (`git commit -s`); see
+   [OpenCoven DCO and Patent Terms](#opencoven-dco-and-patent-terms).
+4. Run the relevant checks:
 
 ```bash
 cargo fmt --check
@@ -111,27 +132,12 @@ cargo test --workspace --locked
 python scripts/check-secrets.py
 ```
 
-3. Include smoke-test notes for runtime or API changes.
-4. Update docs when command behavior, API behavior, or trust boundaries change.
-
-## Maintainer Checklist Before Release
-
-```bash
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --locked
-python scripts/check-secrets.py
-```
-
-For package releases, also verify package contents with a dry run and attach checksums for native binaries.
-
----
+5. Include smoke-test notes for runtime or API changes.
+6. Update docs when command behavior, API behavior, or trust boundaries change.
 
 ## OpenCoven DCO and Patent Terms
 
-Thank you for your interest in contributing. OpenCoven is MIT licensed and community-driven. We want contributing to be easy, open, and safe for everyone.
-
-## Developer Certificate of Origin (DCO)
+### Developer Certificate of Origin (DCO)
 
 OpenCoven uses the **Developer Certificate of Origin (DCO) v1.1** for all contributions. This is a lightweight mechanism — not a CLA — that asks you to certify that you have the right to submit what you're submitting.
 
@@ -177,13 +183,17 @@ By contributing, you additionally agree not to assert any patent claims — now 
 
 OpenCoven is not a contribution vehicle for proprietary forks. If you are building a closed-source derivative of OpenCoven's architecture, please do not use contribution as a means to learn implementation details that are not yet public. We welcome genuine collaborators.
 
-## Getting Started
+## Maintainer Checklist Before Release
 
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feature/your-feature`
-3. Make your changes with signed-off commits: `git commit -s`
-4. Open a pull request with a clear description
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --locked
+python scripts/check-secrets.py
+```
+
+For package releases, also verify package contents with a dry run and attach checksums for native binaries.
 
 ## Questions?
 
-Join the Discord: https://discord.gg/OpenCoven
+Join the Discord: https://discord.gg/opencoven
