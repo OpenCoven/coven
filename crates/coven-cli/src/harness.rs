@@ -900,10 +900,13 @@ pub fn trusted_adapter_manifest_matches_recipe(path: &Path, adapter_id: &str) ->
     if !metadata.file_type().is_file() {
         return false;
     }
-    if metadata.len() != expected.len() as u64 {
-        return false;
-    }
-    fs::read_to_string(path).is_ok_and(|actual| actual == expected)
+    fs::read_to_string(path).is_ok_and(|actual| {
+        actual == expected
+            // `coven adapter install hermes` wrote this pre-registry recipe.
+            // Keep recognizing that exact historical document, but execute the
+            // current platform recipe instead of trusting arbitrary edits.
+            || (adapter_id == "hermes" && actual == LEGACY_HERMES_ADAPTER_MANIFEST)
+    })
 }
 
 fn coven_home_from_process_env() -> Option<PathBuf> {
@@ -929,12 +932,17 @@ fn adapter_manifest_paths_in_dir(dir: &Path) -> Vec<PathBuf> {
     paths
 }
 
-pub fn known_adapter_manifest(adapter_id: &str) -> Option<&'static str> {
+fn known_adapter_manifest_for_platform(adapter_id: &str, is_windows: bool) -> Option<&'static str> {
     match adapter_id {
         "grok" => Some(GROK_BUILD_ADAPTER_MANIFEST),
-        "hermes" => Some(HERMES_ADAPTER_MANIFEST),
+        "hermes" if is_windows => Some(HERMES_WINDOWS_ADAPTER_MANIFEST),
+        "hermes" => Some(HERMES_POSIX_ADAPTER_MANIFEST),
         _ => None,
     }
+}
+
+pub fn known_adapter_manifest(adapter_id: &str) -> Option<&'static str> {
+    known_adapter_manifest_for_platform(adapter_id, cfg!(windows))
 }
 
 // Grok Build's CLI is documented at https://docs.x.ai/build/cli/reference.
@@ -994,7 +1002,7 @@ const GROK_BUILD_ADAPTER_MANIFEST: &str = r#"{
 }
 "#;
 
-const HERMES_ADAPTER_MANIFEST: &str = r#"{
+const LEGACY_HERMES_ADAPTER_MANIFEST: &str = r#"{
   "adapters": [
     {
       "id": "hermes",
@@ -1005,6 +1013,78 @@ const HERMES_ADAPTER_MANIFEST: &str = r#"{
       "install_hint": "Install Hermes Agent, add it to PATH, install the hermes-coven shim, and complete Hermes setup before using this adapter.",
       "system_prompt_flag": null,
       "model_flag": "--model"
+    }
+  ]
+}
+"#;
+
+// This is the current coven-runtimes recipe. Keep accepting the legacy
+// manifest above so existing `coven adapter install hermes` installs continue
+// to work after upgrading; trusted sources always execute this current recipe.
+const HERMES_POSIX_ADAPTER_MANIFEST: &str = r#"{
+  "adapters": [
+    {
+      "id": "hermes",
+      "label": "Hermes Agent",
+      "executable": "hermes-coven",
+      "interactive_prompt_prefix_args": [
+        "chat",
+        "--source",
+        "coven"
+      ],
+      "non_interactive_prompt_prefix_args": [
+        "chat",
+        "--source",
+        "coven",
+        "-Q"
+      ],
+      "install_hint": "Install Hermes Agent, add it to PATH, install the hermes-coven shim, and complete Hermes setup before using this adapter.",
+      "model_flag": "--model",
+      "capabilities": {
+        "stream": false,
+        "preassigned_session_id": false,
+        "think": false,
+        "speed": false
+      },
+      "version": "1.0.2",
+      "description": "Hermes adapter with native model forwarding. Uses the hermes-coven shim so the harness trailing positional prompt is remapped to hermes chat -q/--query without changing model arguments."
+    }
+  ]
+}
+"#;
+
+// Hermes ships as a native executable on Windows; the POSIX `hermes-coven`
+// shell shim cannot launch there. The prompt flags bind untrusted text as one
+// argv value rather than feeding it through cmd.exe parsing.
+const HERMES_WINDOWS_ADAPTER_MANIFEST: &str = r#"{
+  "adapters": [
+    {
+      "id": "hermes",
+      "label": "Hermes Agent",
+      "executable": "hermes",
+      "interactive_prompt_prefix_args": [
+        "chat",
+        "--source",
+        "coven"
+      ],
+      "non_interactive_prompt_prefix_args": [
+        "chat",
+        "--source",
+        "coven",
+        "-Q"
+      ],
+      "install_hint": "Install Hermes Agent, add it to PATH, and complete Hermes setup before using this adapter.",
+      "model_flag": "--model",
+      "capabilities": {
+        "stream": false,
+        "preassigned_session_id": false,
+        "think": false,
+        "speed": false
+      },
+      "version": "1.0.2",
+      "description": "Hermes adapter with native model forwarding and prompt-flag routing for Windows.",
+      "prompt_flag": "-q",
+      "interactive_prompt_flag": "-q"
     }
   ]
 }
@@ -3156,7 +3236,10 @@ mod tests {
         let coven_home = temp_dir.path().join("coven-home");
         let adapter_dir = coven_home.join("adapters");
         fs::create_dir_all(&adapter_dir)?;
-        fs::write(adapter_dir.join("hermes.json"), HERMES_ADAPTER_MANIFEST)?;
+        fs::write(
+            adapter_dir.join("hermes.json"),
+            HERMES_POSIX_ADAPTER_MANIFEST,
+        )?;
 
         let _guard = lock_env();
         let _manifest_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_MANIFEST_ENV);
@@ -3210,7 +3293,10 @@ mod tests {
         let coven_home = temp_dir.path().join("coven-home");
         let adapter_dir = coven_home.join("adapters");
         fs::create_dir_all(&adapter_dir)?;
-        fs::write(adapter_dir.join("hermes.json"), HERMES_ADAPTER_MANIFEST)?;
+        fs::write(
+            adapter_dir.join("hermes.json"),
+            HERMES_POSIX_ADAPTER_MANIFEST,
+        )?;
 
         let _guard = lock_env();
         let _manifest_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_MANIFEST_ENV);
@@ -3232,14 +3318,75 @@ mod tests {
     }
 
     #[test]
-    fn trusted_adapter_manifest_rejects_size_mismatches_before_content_match() -> anyhow::Result<()>
-    {
+    fn hermes_trusted_recipe_uses_native_prompt_flags_on_windows() -> anyhow::Result<()> {
+        let built_ins = built_in_harness_specs();
+        let windows = parse_external_harness_specs(
+            known_adapter_manifest_for_platform("hermes", true).expect("Windows recipe"),
+            Path::new("hermes.json"),
+            &built_ins,
+        )?;
+        let windows = windows
+            .into_iter()
+            .find(|spec| spec.id == "hermes")
+            .expect("Windows Hermes spec");
+        assert_eq!(windows.executable, "hermes");
+        assert_eq!(windows.prompt_flag.as_deref(), Some("-q"));
+        assert_eq!(windows.interactive_prompt_flag.as_deref(), Some("-q"));
+
+        let posix = parse_external_harness_specs(
+            known_adapter_manifest_for_platform("hermes", false).expect("POSIX recipe"),
+            Path::new("hermes.json"),
+            &built_ins,
+        )?;
+        let posix = posix
+            .into_iter()
+            .find(|spec| spec.id == "hermes")
+            .expect("POSIX Hermes spec");
+        assert_eq!(posix.executable, "hermes-coven");
+        assert_eq!(posix.prompt_flag, None);
+        assert_eq!(posix.interactive_prompt_flag, None);
+        Ok(())
+    }
+
+    #[test]
+    fn trusted_legacy_hermes_manifest_upgrades_to_the_current_recipe() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let adapters_dir = temp_dir.path().join("adapters");
+        fs::create_dir_all(&adapters_dir)?;
+        let manifest_path = adapters_dir.join("hermes.json");
+        fs::write(&manifest_path, LEGACY_HERMES_ADAPTER_MANIFEST)?;
+
+        assert!(trusted_adapter_manifest_matches_recipe(
+            &manifest_path,
+            "hermes"
+        ));
+        let mut sources = trusted_adapter_manifest_sources(temp_dir.path());
+        assert_eq!(sources.len(), 1);
+        let hermes = sources
+            .remove(0)
+            .load_specs(&built_in_harness_specs())?
+            .into_iter()
+            .find(|spec| spec.id == "hermes")
+            .expect("current trusted Hermes recipe");
+        assert_eq!(
+            hermes.executable,
+            if cfg!(windows) {
+                "hermes"
+            } else {
+                "hermes-coven"
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn trusted_adapter_manifest_rejects_noncanonical_content() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let coven_home = temp_dir.path().join("coven-home");
         let adapter_dir = coven_home.join("adapters");
         fs::create_dir_all(&adapter_dir)?;
         let manifest_path = adapter_dir.join("hermes.json");
-        fs::write(&manifest_path, format!("{HERMES_ADAPTER_MANIFEST}\n"))?;
+        fs::write(&manifest_path, format!("{HERMES_POSIX_ADAPTER_MANIFEST}\n"))?;
 
         assert!(!trusted_adapter_manifest_matches_recipe(
             &manifest_path,
@@ -3256,7 +3403,7 @@ mod tests {
         let adapter_dir = coven_home.join("adapters");
         fs::create_dir_all(&adapter_dir)?;
         let manifest_path = adapter_dir.join("hermes.json");
-        fs::write(&manifest_path, HERMES_ADAPTER_MANIFEST)?;
+        fs::write(&manifest_path, HERMES_POSIX_ADAPTER_MANIFEST)?;
 
         let mut sources = trusted_adapter_manifest_sources(&coven_home);
         assert_eq!(sources.len(), 1);
