@@ -11,7 +11,7 @@ description: "Feature reference for the Coven runtime: project-rooted launches, 
     Every session pins a canonical project root. Cwd must canonicalize inside that root.
   </Card>
   <Card title="Harness-neutral PTYs" icon="terminal">
-    Codex and Claude Code today; Hermes, Aider, Gemini, Cline tomorrow.
+    Codex, Claude Code, and GitHub Copilot CLI today; Hermes, Aider, Gemini, Cline tomorrow.
   </Card>
   <Card title="Append-only event log" icon="scroll">
     Output, exit, and metadata events stored in SQLite for replay.

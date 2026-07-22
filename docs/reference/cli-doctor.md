@@ -81,14 +81,16 @@ coven run claude "explain this repo in 5 bullets"
 
 ## Missing harness output
 
-When neither supported harness is visible, `doctor` prints install hints for
-Codex and Claude Code:
+When no supported harness is visible, `doctor` prints a per-harness install
+hint. For Codex, Claude Code, and GitHub Copilot CLI those hints boil down to:
 
 ```sh
 npm install -g @openai/codex
 codex login
 npm install -g @anthropic-ai/claude-code
 claude doctor
+npm install -g @github/copilot
+copilot login
 coven doctor
 ```
 

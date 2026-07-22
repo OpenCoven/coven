@@ -19,7 +19,7 @@ description: "Coven powers CastCodes with local-first project-scoped harness ses
   <div>
     <p class="home-intro-kicker"><strong>Coven powers CastCodes.</strong></p>
     <p><strong>CastCodes is the local-first AI coding workspace users open. Coven is the local runtime underneath: project-scoped harness sessions, append-only events, logs, artifacts, and authority boundaries.</strong></p>
-    <p>Run Codex, Claude Code, and future harnesses as visible CastCodes lanes. Inspect the work, preserve context, verify changes, and merge with confidence.</p>
+    <p>Run Codex, Claude Code, GitHub Copilot CLI, and future harnesses as visible CastCodes lanes. Inspect the work, preserve context, verify changes, and merge with confidence.</p>
   </div>
 </div>
 
@@ -31,7 +31,7 @@ description: "Coven powers CastCodes with local-first project-scoped harness ses
     Daemon, PTY supervision, project-root validation, sessions, events, and local socket authority.
   </Card>
   <Card title="CLI reference" href="/reference/cli" icon="terminal">
-    Current `coven` commands: run, sessions, attach, daemon, doctor, archive, summon, and sacrifice.
+    Core verbs — doctor, daemon, run, sessions, attach — plus the archive, summon, and sacrifice rituals and the rest of the command surface.
   </Card>
 </Columns>
 
@@ -44,7 +44,7 @@ Coven is a **local-first runtime substrate**: a single Rust daemon that owns har
 **What makes it different today?**
 
 - **Local-first** — the daemon, the store, and the socket all live under `$COVEN_HOME`. No cloud relay, no daemon OAuth.
-- **Harness-neutral** — Codex and Claude Code today, with a documented adapter bar for future harnesses. Same lifecycle, same rituals.
+- **Harness-neutral** — Codex, Claude Code, and GitHub Copilot CLI today, with a documented adapter bar for future harnesses. Same lifecycle, same rituals.
 - **Project-rooted** — every launch carries an explicit project root and canonicalized working directory. The Rust daemon revalidates each request.
 - **Inspectable** — sessions and events are SQLite rows you can browse with `coven sessions`, replay with `coven attach`, or sacrifice when you no longer need them.
 - **MIT licensed** — packaged for early adopters under `@opencoven/*`, command always `coven`.
@@ -60,6 +60,7 @@ flowchart LR
   C["Advanced / legacy clients"] -.-> B
   B --> F["Codex PTY"]
   B --> G["Claude Code PTY"]
+  B --> L["Copilot CLI PTY"]
   B --> H["Future harness PTYs"]
   B --> I[("SQLite session ledger")]
   B --> J[("Append-only event log")]
@@ -71,7 +72,7 @@ The daemon is the single source of truth for sessions, PTY lifecycle, and capabi
 
 <Columns>
   <Card title="Harness-neutral runtime" icon="layers" href="/HARNESS-ADAPTERS">
-    Codex and Claude Code launched through one supervised PTY layer.
+    Codex, Claude Code, and GitHub Copilot CLI launched through one supervised PTY layer.
   </Card>
   <Card title="Project-scoped sessions" icon="folder-tree" href="/SESSION-LIFECYCLE">
     Every session pins a canonical project root and refuses to wander.
@@ -103,7 +104,7 @@ The daemon is the single source of truth for sessions, PTY lifecycle, and capabi
     ```bash
     coven doctor
     ```
-    `doctor` reports whether `codex` and `claude` are on `PATH`, whether the daemon socket can bind, and what to install next.
+    `doctor` reports whether harness CLIs such as `codex`, `claude`, and `copilot` are on `PATH`, whether the daemon socket can bind, and what to install next.
   </Step>
   <Step title="Start the daemon">
     ```bash

@@ -5,6 +5,8 @@ description: "End-to-end product and engineering plan for the Coven MVP: a Rust-
 
 # Coven MVP Product + Implementation Plan
 
+> **Historical planning document.** This plan is preserved for context and is no longer the source of current direction. For where Coven is heading now, see the [public roadmap](/ROADMAP) (`docs/ROADMAP.md`) and the [roadmap reference page](/reference/roadmap) (`docs/reference/roadmap.md`).
+
 > **Historical framing note:** This plan captured the first Coven MVP path when comux was the proving cockpit. Current public product direction is CastCodes as the primary proof surface and Coven as the runtime that powers it. See [CastCodes and Coven integration](/CASTCODES-INTEGRATION) and [Roadmap](/ROADMAP) for current positioning.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

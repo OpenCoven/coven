@@ -70,7 +70,7 @@ const COVEN_CODE_ANTHROPIC_OAUTH_CLIENT_ID: &str = "COVEN_CODE_ANTHROPIC_OAUTH_C
 #[command(name = "coven")]
 #[command(about = "Run project-scoped coding agents without memorizing harness commands")]
 #[command(
-    long_about = "Coven runs Codex, Claude Code, and future harnesses inside a local, project-scoped session ledger. Run `coven` with no arguments to open the interactive Coven UI (requires the coven-code front-end), or pass a free-text task to plan and run it directly."
+    long_about = "Coven runs Codex, Claude Code, GitHub Copilot CLI, and future harnesses inside a local, project-scoped session ledger. Run `coven` with no arguments to open the interactive Coven UI (requires the coven-code front-end), or pass a free-text task to plan and run it directly."
 )]
 #[command(after_help = "Common first steps:
   coven doctor                    check your local setup and harnesses
@@ -132,6 +132,14 @@ enum Command {
         command: EngineCommand,
     },
     #[command(about = "Manage the local Coven daemon")]
+    #[command(
+        long_about = "Manage the local Coven daemon that hosts live sessions and the local socket API. `daemon start` launches the hidden `coven daemon serve` entrypoint in the background; serve is the internal foreground server process and is not meant to be run by hand."
+    )]
+    #[command(after_help = "Examples:
+  coven daemon start     start the daemon if it is not already running
+  coven daemon status    check daemon health, pid, and socket
+  coven daemon restart   restart after upgrading coven
+  coven daemon stop      stop the daemon")]
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
@@ -141,16 +149,23 @@ enum Command {
         #[command(subcommand)]
         command: WardCommand,
     },
+    #[command(about = "Run Coven jobs on this machine for a remote hub")]
     #[command(
-        about = "Stateless executor-node protocol commands (hub-dispatched over SSH/private network)"
+        long_about = "Run Coven jobs on this machine for a remote hub. These are the stateless executor-node protocol commands: a hub dispatches them over SSH or a private network, so they are normally invoked by the hub rather than typed by hand."
     )]
     Executor {
         #[command(subcommand)]
         command: ExecutorCommand,
     },
     #[command(about = "Launch a project-scoped harness session")]
+    #[command(after_help = "Examples:
+  coven run codex \"fix the failing tests\"            run a one-shot task in a recorded session
+  coven run claude \"audit this branch\" --think       ask for deeper reasoning
+  coven run copilot \"write docs\" --detach            record the session without launching
+  coven run codex --continue                         resume this project's latest active session
+  coven run claude \"survey\" --permission read-only   keep the harness read-only")]
     Run {
-        #[arg(help = "Harness to run: codex or claude")]
+        #[arg(help = "Harness to run: codex, claude, or copilot")]
         harness: String,
         #[arg(help = "Task for the harness", required = false, num_args = 0..)]
         prompt: Vec<String>,
@@ -195,7 +210,7 @@ enum Command {
         #[arg(
             long,
             value_name = "ID",
-            help = "Model to run the harness on. Accepts a namespaced id (e.g. openai/gpt-5.5, anthropic/claude-...); Coven strips the provider/ prefix and forwards the bare id to the harness's native model flag (codex/claude --model). Adapters that declare no model mechanism warn and continue. Echoed back in the stream-json system.init `model` field."
+            help = "Model to run the harness on. Accepts a namespaced id (e.g. openai/gpt-5.5, anthropic/claude-...); Coven strips the provider/ prefix and forwards the bare id to the harness's native model flag (codex/claude/copilot --model). Adapters that declare no model mechanism warn and continue. Echoed back in the stream-json system.init `model` field."
         )]
         model: Option<String>,
         #[arg(
@@ -220,7 +235,7 @@ enum Command {
         #[arg(
             long = "add-dir",
             value_name = "DIR",
-            help = "Additional directory the harness may access beyond its cwd; repeat the flag for multiple directories. Maps to each harness's native trust flag (codex/claude/coven-code --add-dir). Harnesses with no add-dir mechanism warn and continue."
+            help = "Additional directory the harness may access beyond its cwd; repeat the flag for multiple directories. Maps to each harness's native trust flag (codex/claude/copilot/coven-code --add-dir). Harnesses with no add-dir mechanism warn and continue."
         )]
         add_dir: Vec<String>,
         #[arg(
@@ -236,6 +251,12 @@ enum Command {
         stream_json_input: bool,
     },
     #[command(about = "List or search recent Coven sessions", alias = "session")]
+    #[command(after_help = "Examples:
+  coven sessions                        browse sessions in the interactive browser
+  coven sessions --all --plain          list every session, archived included, as a table
+  coven sessions search \"auth OR jwt\"   full-text search recorded events
+  coven sessions show <id>              show one session's record
+  coven sessions log <id>               print a session's log lines without attaching")]
     Sessions {
         #[command(subcommand)]
         command: Option<SessionsCommand>,
@@ -260,6 +281,12 @@ enum Command {
         alias = "worktree",
         alias = "worktrees"
     )]
+    #[command(after_help = "Examples:
+  coven wt fix/output-polish           create or re-enter a worktree for the branch
+  cd \"$(coven wt fix/output-polish)\"   the printed path is made for command substitution
+  coven wt --list                      list worktrees with claim and dirty state
+  coven wt --doctor                    check protocol layout and hooks
+  coven wt --prune-merged              remove clean worktrees merged into the primary branch")]
     Wt {
         #[arg(
             help = "Branch to create or enter in the sibling <repo>.wt directory",
@@ -323,6 +350,12 @@ enum Command {
         session_id: String,
     },
     #[command(about = "Guided repair flow for a registered repo")]
+    #[command(after_help = "Examples:
+  coven patch openclaw                                     guided repair for the registered repo
+  coven patch openclaw \"fix failing gateway auth test\"     describe the issue up front
+  coven patch openclaw \"fix auth\" --harness codex          pick the harness explicitly
+  coven patch openclaw \"fix auth\" --dry-run                print the plan without launching
+  coven patch openclaw \"fix auth\" --verify targeted-test   choose the verification profile")]
     Patch {
         #[arg(help = "Registered repo name (default: from ~/.coven/repos.toml, else `openclaw`)")]
         name: Option<String>,
@@ -330,7 +363,7 @@ enum Command {
         issue: Vec<String>,
         #[arg(long, help = "Override the repo path for this run")]
         repo: Option<PathBuf>,
-        #[arg(long, help = "Harness to use: codex or claude")]
+        #[arg(long, help = "Harness to use: codex, claude, or copilot")]
         harness: Option<String>,
         #[arg(
             long,
@@ -398,7 +431,10 @@ enum Command {
         #[arg(long, help = "Print calls as JSON (machine-readable)")]
         json: bool,
     },
-    #[command(about = "Inspect the multi-host hub control plane (read-only)")]
+    #[command(about = "Inspect hub status, nodes, jobs, and routing (read-only)")]
+    #[command(
+        long_about = "Inspect hub status, nodes, jobs, and routing (read-only). These are read-only views over the multi-host hub control plane: hub role and queue depth, registered executor nodes, job and dispatch records, and the job-to-node routing table."
+    )]
     Hub {
         #[command(subcommand)]
         command: HubCommand,
@@ -432,7 +468,10 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
-    #[command(about = "Run any Coven engine subcommand directly (escape hatch)")]
+    #[command(about = "Run any Coven engine subcommand directly")]
+    #[command(
+        long_about = "Run any Coven engine subcommand directly. The arguments are passed to the Coven engine unchanged — an escape hatch for engine features that have no dedicated `coven` command."
+    )]
     Code {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
@@ -1063,6 +1102,7 @@ fn run_sessions_search(query: &str, json: bool) -> Result<()> {
     // `transcript_indexed_at` is set the ingest function is a no-op.
     let coven_home = coven_home_dir()?;
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    let mut ingest_warned = false;
     match store::list_uningest_external_sessions(&conn) {
         Ok(pending) => {
             for (session_id, _transcript_path) in pending {
@@ -1074,13 +1114,21 @@ fn run_sessions_search(query: &str, json: bool) -> Result<()> {
                         "warning: run_sessions_search: failed to ingest transcript for session \
                          {session_id}: {e}"
                     );
+                    ingest_warned = true;
                 }
             }
         }
         Err(e) => {
             // Non-fatal: fall through to search without transcript data.
             eprintln!("warning: run_sessions_search: failed to list un-ingested sessions: {e}");
+            ingest_warned = true;
         }
+    }
+    if ingest_warned {
+        eprintln!(
+            "note: fresh TUI session transcripts may not be searchable until ingest completes; \
+             rerun the search in a moment"
+        );
     }
 
     let hits = store::search_events(&conn, query)?;
@@ -1799,7 +1847,7 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
         DoctorCheck::fail(
             "harnesses",
             "no harness is available",
-            Some("install codex or claude, then rerun coven doctor".to_string()),
+            Some("install codex, claude, or copilot, then rerun coven doctor".to_string()),
         )
     });
 
@@ -2161,14 +2209,18 @@ fn run_patch(
     let git_state = openclaw_repo::inspect_git_state(&detected_repo.root)?;
     let issue = match joined_optional_issue(issue)? {
         Some(issue) => issue,
-        None if non_interactive => anyhow::bail!("issue text is required with --non-interactive"),
+        None if non_interactive => anyhow::bail!(
+            "issue text is required with --non-interactive; pass it as arguments, e.g. `coven patch openclaw \"fix the failing test\" --non-interactive --harness codex`"
+        ),
         None => {
             prompt_for_required_line(&format!("What is broken in {}? ", detected_repo.repo_name))?
         }
     };
     let harness_id = match harness {
         Some(harness) => patch::HarnessId::parse(&harness)?,
-        None if non_interactive => anyhow::bail!("--harness is required with --non-interactive"),
+        None if non_interactive => anyhow::bail!(
+            "--harness is required with --non-interactive; add `--harness codex` (or claude, or copilot)"
+        ),
         None => choose_default_harness()?,
     };
     let verification_profile = patch::VerificationProfile::parse(verify.as_deref())?;
@@ -2276,7 +2328,9 @@ fn joined_optional_issue(issue: Vec<String>) -> Result<Option<String>> {
     }
     let joined = issue.join(" ").trim().to_string();
     if joined.is_empty() {
-        anyhow::bail!("issue text must not be empty when provided");
+        anyhow::bail!(
+            "issue text must not be empty when provided; describe what is broken, e.g. `coven patch openclaw \"fix the failing gateway auth test\"`"
+        );
     }
     Ok(Some(joined))
 }
@@ -2290,7 +2344,7 @@ fn prompt_for_required_line(prompt: &str) -> Result<String> {
         .context("failed to read input")?;
     let line = line.trim().to_string();
     if line.is_empty() {
-        anyhow::bail!("a response is required");
+        anyhow::bail!("a response is required; type a non-empty answer, or press Ctrl-C to cancel");
     }
     Ok(line)
 }
@@ -2819,7 +2873,9 @@ fn run_ward_command(command: WardCommand) -> Result<()> {
             )?;
             ward_migrate::print_report(&report);
             if report.has_errors() {
-                bail!("one or more Ward migrations failed or were unmigratable");
+                bail!(
+                    "one or more Ward migrations failed or were unmigratable; see the report above for per-familiar details"
+                );
             }
         }
     }
@@ -2971,7 +3027,7 @@ fn run_session(
     };
 
     if prompt_args.is_empty() && continue_session.is_none() {
-        anyhow::bail!("nothing to do: pass a prompt, or use --continue [ID] to resume a session");
+        anyhow::bail!("nothing to do; pass a prompt, or use --continue [ID] to resume a session");
     }
 
     let selected_harness = selected_available_harness(harness_id)?;
@@ -3124,7 +3180,10 @@ fn run_session(
                 r.updated_at = now.clone();
                 (r, true)
             }
-            None => anyhow::bail!("session {} not found in local store", id),
+            None => anyhow::bail!(
+                "session `{}` not found in local store; run `coven sessions --all` to list session ids",
+                id
+            ),
         }
     } else {
         let r = store::SessionRecord {
@@ -3657,7 +3716,9 @@ pub(crate) fn summon_only_command(session_id: &str) -> Result<store::SessionReco
         store::summon_session(&conn, &session_id, &current_timestamp())?;
         eprintln!("summoned session from the archive");
         let Some(session) = store::get_session(&conn, &session_id)? else {
-            anyhow::bail!("session `{session_id}` not found");
+            anyhow::bail!(
+                "session `{session_id}` not found; run `coven sessions --all` to list session ids"
+            );
         };
         return Ok(session);
     }
@@ -3731,7 +3792,9 @@ fn post_session_kill(coven_home: &Path, session_id: &str) -> Result<()> {
             "the daemon has no live process for session `{session_id}`; {}",
             STALE_RUNNING_HINT
         ),
-        status => anyhow::bail!("Coven daemon rejected the kill with HTTP {status}"),
+        status => anyhow::bail!(
+            "Coven daemon rejected the kill with HTTP {status}; check `coven daemon status` and `coven sessions` for session state"
+        ),
     }
 }
 
@@ -3843,7 +3906,9 @@ fn send_session_input(coven_home: &Path, session_id: &str, data: &str) -> Result
     if (200..300).contains(&status) {
         Ok(())
     } else {
-        anyhow::bail!("Coven daemon rejected input with HTTP {status}")
+        anyhow::bail!(
+            "Coven daemon rejected input with HTTP {status}; check `coven daemon status` and `coven sessions` for session state"
+        )
     }
 }
 
@@ -3922,7 +3987,9 @@ fn joined_prompt(prompt_args: &[String]) -> Result<String> {
     let prompt = prompt_args.join(" ");
     let prompt = prompt.trim();
     if prompt.is_empty() {
-        anyhow::bail!("prompt must not be empty");
+        anyhow::bail!(
+            "prompt must not be empty; quote a task string, e.g. `coven run codex \"fix the failing tests\"`"
+        );
     }
     Ok(prompt.to_string())
 }

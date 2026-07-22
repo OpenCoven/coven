@@ -3,3 +3,6 @@ contact_links:
   - name: "OpenCoven contribution guide"
     url: https://github.com/OpenCoven/coven/blob/main/CONTRIBUTING.md
     about: "Read the contribution guide before opening larger issues or pull requests."
+  - name: "OpenCoven Discord"
+    url: https://discord.gg/opencoven
+    about: "Ask setup or exploratory questions in Discord before filing an issue."

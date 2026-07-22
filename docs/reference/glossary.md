@@ -7,6 +7,8 @@ title: "Glossary"
 description: "Glossary of Coven and OpenCoven terms: CastCodes, ACP, coven.daemon.v1, harness, adapter, familiar, ritual, project root, archive, sacrifice, and capability."
 ---
 
+> **See also:** the repo-root [Coven glossary](/GLOSSARY) (`docs/GLOSSARY.md`) is the fuller canonical term list; this reference page is a condensed view that adds future orchestration terms.
+
 ## ACP
 
 Agent Client Protocol. In this repo, ACP appears as an integration surface for external agent runtimes and OpenClaw compatibility. Coven itself is not an ACP implementation; the external OpenClaw plugin maps between OpenClaw runtime events and Coven sessions.

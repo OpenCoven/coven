@@ -9,6 +9,8 @@ description: "Definitions for Coven terms: CastCodes, ACP, API version, archive,
 
 # Glossary
 
+> **See also:** the condensed [reference glossary](/reference/glossary), which additionally defines future orchestration terms (affinity, handoff, harness capability, router). This repo-root page is the fuller canonical term list.
+
 How the terms fit together at a glance:
 
 ```mermaid
