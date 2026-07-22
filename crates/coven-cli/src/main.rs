@@ -68,7 +68,7 @@ const COVEN_CODE_ANTHROPIC_OAUTH_CLIENT_ID: &str = "COVEN_CODE_ANTHROPIC_OAUTH_C
 #[command(name = "coven")]
 #[command(about = "Run project-scoped coding agents without memorizing harness commands")]
 #[command(
-    long_about = "Coven runs Codex, Claude Code, and future harnesses inside a local, project-scoped session ledger. Run `coven` with no arguments to open the interactive Coven UI (requires the coven-code front-end), or pass a free-text task to plan and run it directly."
+    long_about = "Coven runs Codex, Claude Code, GitHub Copilot CLI, and future harnesses inside a local, project-scoped session ledger. Run `coven` with no arguments to open the interactive Coven UI (requires the coven-code front-end), or pass a free-text task to plan and run it directly."
 )]
 #[command(after_help = "Common first steps:
   coven doctor                    check your local setup and harnesses
@@ -130,6 +130,14 @@ enum Command {
         command: EngineCommand,
     },
     #[command(about = "Manage the local Coven daemon")]
+    #[command(
+        long_about = "Manage the local Coven daemon that hosts live sessions and the local socket API. `daemon start` launches the hidden `coven daemon serve` entrypoint in the background; serve is the internal foreground server process and is not meant to be run by hand."
+    )]
+    #[command(after_help = "Examples:
+  coven daemon start     start the daemon if it is not already running
+  coven daemon status    check daemon health, pid, and socket
+  coven daemon restart   restart after upgrading coven
+  coven daemon stop      stop the daemon")]
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
@@ -139,16 +147,23 @@ enum Command {
         #[command(subcommand)]
         command: WardCommand,
     },
+    #[command(about = "Run Coven jobs on this machine for a remote hub")]
     #[command(
-        about = "Stateless executor-node protocol commands (hub-dispatched over SSH/private network)"
+        long_about = "Run Coven jobs on this machine for a remote hub. These are the stateless executor-node protocol commands: a hub dispatches them over SSH or a private network, so they are normally invoked by the hub rather than typed by hand."
     )]
     Executor {
         #[command(subcommand)]
         command: ExecutorCommand,
     },
     #[command(about = "Launch a project-scoped harness session")]
+    #[command(after_help = "Examples:
+  coven run codex \"fix the failing tests\"            run a one-shot task in a recorded session
+  coven run claude \"audit this branch\" --think       ask for deeper reasoning
+  coven run copilot \"write docs\" --detach            record the session without launching
+  coven run codex --continue                         resume this project's latest active session
+  coven run claude \"survey\" --permission read-only   keep the harness read-only")]
     Run {
-        #[arg(help = "Harness to run: codex or claude")]
+        #[arg(help = "Harness to run: codex, claude, or copilot")]
         harness: String,
         #[arg(help = "Task for the harness", required = false, num_args = 0..)]
         prompt: Vec<String>,
@@ -193,7 +208,7 @@ enum Command {
         #[arg(
             long,
             value_name = "ID",
-            help = "Model to run the harness on. Accepts a namespaced id (e.g. openai/gpt-5.5, anthropic/claude-...); Coven strips the provider/ prefix and forwards the bare id to the harness's native model flag (codex/claude --model). Adapters that declare no model mechanism warn and continue. Echoed back in the stream-json system.init `model` field."
+            help = "Model to run the harness on. Accepts a namespaced id (e.g. openai/gpt-5.5, anthropic/claude-...); Coven strips the provider/ prefix and forwards the bare id to the harness's native model flag (codex/claude/copilot --model). Adapters that declare no model mechanism warn and continue. Echoed back in the stream-json system.init `model` field."
         )]
         model: Option<String>,
         #[arg(
@@ -218,7 +233,7 @@ enum Command {
         #[arg(
             long = "add-dir",
             value_name = "DIR",
-            help = "Additional directory the harness may access beyond its cwd; repeat the flag for multiple directories. Maps to each harness's native trust flag (codex/claude/coven-code --add-dir). Harnesses with no add-dir mechanism warn and continue."
+            help = "Additional directory the harness may access beyond its cwd; repeat the flag for multiple directories. Maps to each harness's native trust flag (codex/claude/copilot/coven-code --add-dir). Harnesses with no add-dir mechanism warn and continue."
         )]
         add_dir: Vec<String>,
         #[arg(
@@ -234,6 +249,12 @@ enum Command {
         stream_json_input: bool,
     },
     #[command(about = "List or search recent Coven sessions", alias = "session")]
+    #[command(after_help = "Examples:
+  coven sessions                        browse sessions in the interactive browser
+  coven sessions --all --plain          list every session, archived included, as a table
+  coven sessions search \"auth OR jwt\"   full-text search recorded events
+  coven sessions show <id>              show one session's record
+  coven sessions log <id>               print a session's log lines without attaching")]
     Sessions {
         #[command(subcommand)]
         command: Option<SessionsCommand>,
@@ -258,6 +279,12 @@ enum Command {
         alias = "worktree",
         alias = "worktrees"
     )]
+    #[command(after_help = "Examples:
+  coven wt fix/output-polish           create or re-enter a worktree for the branch
+  cd \"$(coven wt fix/output-polish)\"   the printed path is made for command substitution
+  coven wt --list                      list worktrees with claim and dirty state
+  coven wt --doctor                    check protocol layout and hooks
+  coven wt --prune-merged              remove clean worktrees merged into the primary branch")]
     Wt {
         #[arg(
             help = "Branch to create or enter in the sibling <repo>.wt directory",
@@ -321,6 +348,12 @@ enum Command {
         session_id: String,
     },
     #[command(about = "Guided repair flow for a registered repo")]
+    #[command(after_help = "Examples:
+  coven patch openclaw                                     guided repair for the registered repo
+  coven patch openclaw \"fix failing gateway auth test\"     describe the issue up front
+  coven patch openclaw \"fix auth\" --harness codex          pick the harness explicitly
+  coven patch openclaw \"fix auth\" --dry-run                print the plan without launching
+  coven patch openclaw \"fix auth\" --verify targeted-test   choose the verification profile")]
     Patch {
         #[arg(help = "Registered repo name (default: from ~/.coven/repos.toml, else `openclaw`)")]
         name: Option<String>,
@@ -328,7 +361,7 @@ enum Command {
         issue: Vec<String>,
         #[arg(long, help = "Override the repo path for this run")]
         repo: Option<PathBuf>,
-        #[arg(long, help = "Harness to use: codex or claude")]
+        #[arg(long, help = "Harness to use: codex, claude, or copilot")]
         harness: Option<String>,
         #[arg(
             long,
@@ -396,7 +429,10 @@ enum Command {
         #[arg(long, help = "Print calls as JSON (machine-readable)")]
         json: bool,
     },
-    #[command(about = "Inspect the multi-host hub control plane (read-only)")]
+    #[command(about = "Inspect hub status, nodes, jobs, and routing (read-only)")]
+    #[command(
+        long_about = "Inspect hub status, nodes, jobs, and routing (read-only). These are read-only views over the multi-host hub control plane: hub role and queue depth, registered executor nodes, job and dispatch records, and the job-to-node routing table."
+    )]
     Hub {
         #[command(subcommand)]
         command: HubCommand,
@@ -430,7 +466,10 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
-    #[command(about = "Run any Coven engine subcommand directly (escape hatch)")]
+    #[command(about = "Run any Coven engine subcommand directly")]
+    #[command(
+        long_about = "Run any Coven engine subcommand directly. The arguments are passed to the Coven engine unchanged — an escape hatch for engine features that have no dedicated `coven` command."
+    )]
     Code {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
@@ -1797,7 +1836,7 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
         DoctorCheck::fail(
             "harnesses",
             "no harness is available",
-            Some("install codex or claude, then rerun coven doctor".to_string()),
+            Some("install codex, claude, or copilot, then rerun coven doctor".to_string()),
         )
     });
 

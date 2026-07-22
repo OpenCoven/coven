@@ -1919,7 +1919,8 @@ fn run_guided_harness_session() -> Result<()> {
     println!("{primary_strong}Run an agent in this project{reset}");
     println!("Coven will create a session record, validate the project root, then attach to the harness.\n");
     let default_harness = default_harness_id().unwrap_or_else(|| "codex".to_string());
-    let harness_prompt = format!("Harness [default: {default_harness}; options: codex, claude]: ");
+    let harness_prompt =
+        format!("Harness [default: {default_harness}; options: codex, claude, copilot]: ");
     let harness =
         prompt_for_optional_line(&harness_prompt)?.unwrap_or_else(|| default_harness.to_string());
     let prompt = prompt_for_required_line("Task for the agent: ")?;
