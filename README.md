@@ -6,7 +6,7 @@
 
 **Local harness substrate for project-scoped agent sessions**
 
-Run Codex, Claude Code, and future coding harnesses inside explicit local project boundaries.
+Run Codex, Claude Code, GitHub Copilot CLI, and future coding harnesses inside explicit local project boundaries.
 Launch, observe, attach, and coordinate agent work through one neutral runtime substrate.
 
 [![MIT License](https://img.shields.io/badge/license-MIT-9A8ECD?style=flat-square)](LICENSE)
@@ -62,7 +62,7 @@ Coven is the local harness substrate for the [OpenCoven](https://github.com/Open
 
 Coven doesn't replace your coding agent, your UI, or other clients. It acts as a neutral runtime layer:
 
-- **You choose the harness** — Codex, Claude Code, or future adapters.
+- **You choose the harness** — Codex, Claude Code, GitHub Copilot CLI, or future adapters.
 - **Coven owns the session** — project-scoped boundaries, PTY execution, event logging, SQLite persistence.
 - **Clients present the work** — CastCodes, the CLI/TUI, comux, or your own integration over the local socket API.
 
@@ -106,7 +106,7 @@ The Rust daemon is the authority boundary. All clients — including the CLI its
 | **Git**                      | Required                                                                    |
 | **macOS, Linux, or Windows x64** | Native npm packages are published for all three platforms                  |
 | **Node.js 18+**              | Required only for npm wrapper or package/plugin development                 |
-| **At least one harness CLI** | Codex and/or Claude Code (see below)                                        |
+| **At least one harness CLI** | Codex, Claude Code, and/or GitHub Copilot CLI (see below)                    |
 
 ### Installing harness CLIs
 
@@ -126,6 +126,15 @@ codex login
 npm install -g @anthropic-ai/claude-code
 claude doctor
 ```
+
+**GitHub Copilot CLI (GitHub):**
+
+```bash
+npm install -g @github/copilot
+# or: brew install --cask copilot-cli
+```
+
+Per-harness setup detail lives in [`docs/harnesses/`](docs/harnesses/index.md).
 
 After installing and authenticating, run `coven doctor` again to confirm the harness is detected. If `doctor` still reports missing, ensure the harness binary is on your `PATH`.
 
@@ -222,76 +231,26 @@ Choose a repo, choose a harness, get a verified patch.
 
 ## Commands Reference
 
-### Core commands
+The full command surface — every subcommand, flag, and JSON output shape — lives in [`docs/reference/cli.md`](docs/reference/cli.md), with dedicated per-command pages under [`docs/reference/`](docs/reference/). The core verbs:
 
-| Command          | Action                                                          |
-| ---------------- | --------------------------------------------------------------- |
-| `coven`          | Open the interactive Coven UI (engine auto-installed on first run) |
-| `coven "<task>"` | Plan and run a free-text task in a recorded session (Cast flow) |
-| `coven chat`     | Explicitly open the interactive Coven UI                        |
-| `coven tui`      | Same as `coven chat`                                            |
-| `coven doctor`   | Detect supported harness CLIs and print install hints           |
-| `coven status`   | Ecosystem overview: daemon, sessions, familiars, skills, research, hub (alias: `coven overview`) |
-| `coven completions <shell>` | Generate shell completions (bash, zsh, fish, elvish, powershell) |
+| Command | Action | Details |
+| --- | --- | --- |
+| `coven` / `coven chat` | Open the interactive Coven UI (engine auto-installed on first run); `coven "<task>"` plans and runs a free-text task | [`cli-coven.md`](docs/reference/cli-coven.md) |
+| `coven doctor` | Detect supported harness CLIs and print install hints | [`cli-doctor.md`](docs/reference/cli-doctor.md) |
+| `coven daemon start/status/restart/stop` | Manage the local daemon | [`cli-daemon.md`](docs/reference/cli-daemon.md) |
+| `coven run <harness> <prompt>` | Launch a project-scoped harness session (`--cwd`, `--title`, `--model`, `--continue`, `--stream-json`, …) | [`cli-run.md`](docs/reference/cli-run.md) |
+| `coven sessions` | Browse, search, and inspect sessions (`--plain`, `--json`, `--all`, `search`, `show`, `events`, `log`) | [`cli-sessions.md`](docs/reference/cli-sessions.md) |
+| `coven attach <id>` | Replay/follow session output and forward input | [`cli-attach.md`](docs/reference/cli-attach.md) |
+| `coven archive` / `summon` / `sacrifice` / `kill` | Session rituals (see below) | [`cli-archive.md`](docs/reference/cli-archive.md), [`cli-summon.md`](docs/reference/cli-summon.md), [`cli-sacrifice.md`](docs/reference/cli-sacrifice.md), [`cli-kill.md`](docs/reference/cli-kill.md) |
+| `coven adapter list/doctor/install` | Inspect harness adapters; opt into trusted adapter recipes (e.g. `coven adapter install grok`) | [`docs/HARNESS-ADAPTERS.md`](docs/HARNESS-ADAPTERS.md) |
+| `coven status` / `familiars` / `skills` / `memory` / `research` / `calls` / `hub` | Read-only observability with `--json`, mirroring the daemon API routes | [`cli-observe.md`](docs/reference/cli-observe.md) |
+| `coven wt` / `claim` / `hooks` | Parallel work protocol: worktrees, TTL-bounded claims, git hooks | [`cli-wt.md`](docs/reference/cli-wt.md), [`cli-claim.md`](docs/reference/cli-claim.md) |
+| `coven pc` | macOS-first system diagnostics; write operations require `--confirm` | [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) |
+| `coven patch openclaw` / `logs prune` / `vacuum` | OpenClaw rescue loop, log-retention pruning, store repair | [`cli-patch.md`](docs/reference/cli-patch.md), [`cli-logs.md`](docs/reference/cli-logs.md), [`cli-vacuum.md`](docs/reference/cli-vacuum.md) |
+| `coven completions <shell>` | Generate shell completions (bash, zsh, fish, elvish, powershell) | [`docs/reference/cli.md`](docs/reference/cli.md) |
 
-### Harness adapters
-
-| Command                       | Action                                        |
-| ----------------------------- | --------------------------------------------- |
-| `coven adapter list`          | List configured harness adapters              |
-| `coven adapter list --json`   | Adapter reports as JSON                       |
-| `coven adapter doctor [id]`   | Diagnose all adapters, or one adapter id      |
-| `coven adapter install <id>`  | Install a trusted local adapter recipe        |
-
-Experimental opt-in recipe: `coven adapter install grok` adds the [Grok Build adapter](docs/harnesses/grok-build.md) without promoting it into Coven's bundled default harness set.
-
-### Daemon lifecycle
-
-| Command                | Action                                         |
-| ---------------------- | ---------------------------------------------- |
-| `coven daemon start`   | Start the local Coven daemon                   |
-| `coven daemon status`  | Show daemon health, PID, and socket path       |
-| `coven daemon restart` | Restart the local daemon and rebind the socket |
-| `coven daemon stop`    | Stop the local daemon                          |
-
-### Session management
-
-| Command                                        | Action                                                           |
-| ---------------------------------------------- | ---------------------------------------------------------------- |
-| `coven run <harness> <prompt>`                 | Launch a project-scoped harness session                          |
-| `coven run <harness> <prompt> --cwd <path>`    | Launch from a cwd inside the project root                        |
-| `coven run <harness> <prompt> --title <title>` | Set a readable session title                                     |
-| `coven run <harness> <prompt> --model <id>`    | Forward a model override to the harness                          |
-| `coven run <harness> <prompt> --think`         | Request deeper reasoning when the harness supports it            |
-| `coven run <harness> <prompt> --speed <level>` | Set a latency/reasoning hint: `fast`, `balanced`, or `thorough`  |
-| `coven run <harness> <prompt> --add-dir <dir>` | Trust an additional directory (repeatable); maps to the harness's native `--add-dir` flag |
-| `coven run <harness> --continue`               | Resume the latest active session for this project                |
-| `coven run <harness> --continue <id>`          | Resume a specific session by id                                  |
-| `coven run <harness> <prompt> --detach`        | Create the session record without launching the harness          |
-| `coven run <harness> <prompt> --labels <l>`    | Attach comma-separated labels to the session                     |
-| `coven run <harness> <prompt> --visibility <v>`| Set visibility: `private` (default), `workspace`, or `shared`   |
-| `coven run <harness> <prompt> --archive`       | Auto-archive the session when the run completes                  |
-| `coven run <harness> <prompt> --familiar <id>` | Inject a familiar identity preamble (e.g. `--familiar charm`)    |
-| `coven run <harness> <prompt> --stream-json`   | Emit JSONL events on stdout (for tooling/piping)                 |
-| `coven run claude <p> --stream-json --stream-json-input` | Also read JSONL user messages from stdin             |
-| `coven sessions`                               | Open the session browser in a terminal; print a table when piped |
-| `coven sessions --all`                         | Browse active and archived sessions; print all when piped        |
-| `coven sessions --manage`                      | Force the interactive session browser                            |
-| `coven sessions --plain`                       | Force plain table output for scripts or copying                  |
-| `coven sessions --json`                        | Output sessions as JSON                                          |
-| `coven sessions --json --all`                  | Output all sessions (including archived) as JSON                 |
-| `coven sessions search <query>`                | Full-text search recorded event payloads (`--json` for scripts)  |
-| `coven sessions show <session-id>`             | Show one session's record without attaching (`--json` for scripts) |
-| `coven sessions events <session-id>`           | List recorded events; `--after-seq`/`--limit` page the cursor    |
-| `coven sessions log <session-id>`              | Print a session's log lines without attaching                    |
-| `coven attach <session-id>`                    | Replay/follow session output and forward input                   |
-| `coven summon <session-id>`                    | Restore an archived session, then replay/follow it               |
-| `coven archive <session-id>`                   | Hide a non-running session while preserving its events           |
-| `coven sacrifice <session-id> --yes`           | Permanently delete a non-running session and its events          |
-| `coven kill <session-id>`                      | Kill a running session's process (its event log is kept)         |
-
-> `attach`, `summon`, `archive`, `sacrifice`, `kill`, and the `sessions
-> show/events/log` subcommands accept a unique prefix of the session id
+> Session-id arguments (`attach`, `summon`, `archive`, `sacrifice`, `kill`, and
+> the `sessions show/events/log` subcommands) accept a unique prefix of the id
 > (e.g. `coven attach 9099`), so you don't have to paste full UUIDs.
 
 > **Session rituals are intentionally explicit.** Archive is reversible and keeps the full event ledger. Summon brings an archived session back. Sacrifice is destructive, refuses live sessions, and requires `--yes` so beginners don't delete work by accident.
@@ -303,101 +262,13 @@ Experimental opt-in recipe: `coven adapter install grok` adds the [Grok Build ad
 | **Sacrifice** | ❌ No       | Non-running sessions | Permanently deletes session and all events; requires `--yes` |
 | **Rejoin**    | N/A         | Live sessions        | Reattaches to running session                                |
 
-### System diagnostics (`coven pc`, macOS-first)
-
-| Command                          | Action                                                                |
-| -------------------------------- | --------------------------------------------------------------------- |
-| `coven pc`                       | Full system report: CPU, memory, disk, top processes                  |
-| `coven pc status`                | One-line health summary with 🟢/🟡/🔴 indicators                      |
-| `coven pc status --json`         | Machine-readable health summary                                       |
-| `coven pc top --n 10`            | Top-N processes by CPU usage                                          |
-| `coven pc disk`                  | Disk usage breakdown                                                  |
-| `coven pc kill <pid> --confirm`  | SIGTERM with PID identity re-check (requires `--confirm`)             |
-| `coven pc cache clear --confirm` | Clear `~/Library/Caches` and `/Library/Caches` (requires `--confirm`) |
-
-> All read operations are side-effect-free. Write operations (kill, cache clear) require `--confirm` and cannot be bypassed. Termination is SIGTERM only — no SIGKILL.
-
-### Coven observability (Cave parity from the terminal)
-
-Everything the CovenCave dashboard reads is also visible from the CLI. All of
-these are read-only, work without a running daemon, and take `--json` for
-machine-readable output that carries the same body as the daemon API route.
-
-| Command                        | Action                                                    | API route              |
-| ------------------------------ | --------------------------------------------------------- | ---------------------- |
-| `coven status`                 | Daemon, sessions, familiars, skills, research, hub at a glance | `/api/v1/health` + `/api/v1/overview` |
-| `coven familiars`              | Familiar roster from `~/.coven/familiars.toml`            | `/api/v1/familiars`           |
-| `coven skills`                 | Installed skills from `~/.coven/skills/`                  | `/api/v1/skills`              |
-| `coven memory`                 | Familiar memory files from `~/.coven/memory/`             | `/api/v1/memory`              |
-| `coven research`               | Research loop log from `~/.coven/research/results.tsv`    | `/api/v1/research`            |
-| `coven calls [<id>]`           | Coven Calls delegation ledger (list or one call)          | `/api/v1/coven-calls[/:id]`   |
-| `coven hub status`             | Hub role, node availability, queue depth                  | `/api/v1/hub/status`          |
-| `coven hub nodes`              | Registered executor nodes                                 | `/api/v1/hub/nodes`           |
-| `coven hub jobs [--state <s>]` | Hub jobs, optionally filtered by state                    | `/api/v1/hub/jobs`            |
-| `coven hub routing`            | Job→node routing decisions                                | `/api/v1/hub/routing`         |
-
-### Parallel work protocol (worktrees, claims, hooks)
-
-| Command                     | Action                                                        |
-| --------------------------- | ------------------------------------------------------------- |
-| `coven wt <branch>`         | Create or enter a worktree in the sibling `<repo>.wt` dir     |
-| `coven wt --list`           | List worktrees with claim and dirty state                     |
-| `coven wt --doctor`         | Report protocol layout and hook issues                        |
-| `coven wt --prune-merged`   | Remove clean worktrees whose branches are merged              |
-| `coven claim acquire <b>`   | Claim a branch for the current agent (TTL-bounded)            |
-| `coven claim release <b>`   | Release this agent's claim for a branch                       |
-| `coven claim heartbeat <b>` | Extend this agent's claim TTL for a branch                    |
-| `coven claim status`        | Show active and expired claims for this repository            |
-| `coven hooks install`       | Install the protocol's pre-commit and pre-push git hooks      |
-
-### Other
-
-| Command                | Action                                                  |
-| ---------------------- | ------------------------------------------------------- |
-| `coven patch openclaw` | Open the OpenClaw repair rescue loop                    |
-| `coven logs prune`     | Manually prune session logs and raw encrypted artifacts |
-| `coven vacuum`         | Repair and compact the local Coven session store        |
-
 ---
 
 ## Local API
 
 The daemon exposes a versioned HTTP API over a Unix socket. The current public contract is `coven.daemon.v1` (prefix: `/api/v1`).
 
-### Endpoint reference
-
-| Endpoint                                 | Method | Purpose                                                     |
-| ---------------------------------------- | ------ | ----------------------------------------------------------- |
-| `/api/v1/health`                         | `GET`  | Daemon health, API version, and capability catalog          |
-| `/api/v1/api-version`                    | `GET`  | Active and supported API versions                           |
-| `/api/v1/capabilities`                   | `GET`  | Machine-readable capability catalog for clients             |
-| `/api/v1/capabilities/harnesses`         | `GET`  | Harness-native capability manifests plus Coven skills       |
-| `/api/v1/sessions`                       | `GET`  | List sessions                                               |
-| `/api/v1/sessions`                       | `POST` | Launch a session                                            |
-| `/api/v1/sessions/:id`                   | `GET`  | Fetch one session                                           |
-| `/api/v1/events`                         | `GET`  | Read session events (supports `afterSeq` cursor pagination) |
-| `/api/v1/sessions/:id/events`            | `GET`  | Session-scoped events alias                                 |
-| `/api/v1/sessions/:id/log`               | `GET`  | Redacted log preview for a session                          |
-| `/api/v1/sessions/:id/input`             | `POST` | Forward input to a live session                             |
-| `/api/v1/sessions/:id/kill`              | `POST` | Kill a live session                                         |
-| `/api/v1/overview`                       | `GET`  | Ecosystem counts (sessions, familiars, skills, research)    |
-| `/api/v1/familiars`                      | `GET`  | Familiar roster (`coven familiars`)                         |
-| `/api/v1/skills`                         | `GET`  | Installed skills (`coven skills`)                           |
-| `/api/v1/memory`                         | `GET`  | Familiar memory files (`coven memory`)                      |
-| `/api/v1/research`                       | `GET`  | Research loop log (`coven research`)                        |
-| `/api/v1/coven-calls`                    | `GET`  | Coven Calls delegation ledger (`coven calls`)               |
-| `/api/v1/hub/status`                     | `GET`  | Hub role, node availability, queue depth (`coven hub status`) |
-| `/api/v1/hub/nodes`                      | `GET`  | Registered executor nodes (`coven hub nodes`)               |
-| `/api/v1/hub/jobs`                       | `GET`  | Hub jobs, `?state=` filter (`coven hub jobs`)               |
-| `/api/v1/hub/routing`                    | `GET`  | Job→node routing table (`coven hub routing`)                |
-| `/api/v1/actions`                        | `POST` | Route a control-plane action (advanced clients)             |
-| `/api/v1/travel/profiles`                | `POST` | Generate a read-only travel profile for offline laptop work |
-| `/api/v1/travel/deltas`                  | `POST` | Upload offline travel results for hub reconciliation        |
-| `/api/v1/travel/state`                   | `GET`  | Read hub/travel handoff state for a client                  |
-| `/api/v1/scheduler/decisions`            | `POST` | Choose a node for a multi-host job                          |
-| `/api/v1/scheduler/decisions/:id`        | `GET`  | Fetch a persisted scheduler decision                        |
-| `/api/v1/scheduler/redispatch`           | `POST` | Redispatch or pause a loop after executor failure           |
-| `/api/v1/scheduler/loops/:loopId`        | `GET`  | Recover persisted scheduler loop state                      |
+The complete endpoint index — contract discovery, sessions and events, observability reads, travel, scheduler, and the hub control plane — lives in [`docs/reference/api.md`](docs/reference/api.md). [`docs/API.md`](docs/API.md) covers the architecture and auth posture, and [`docs/API-CONTRACT.md`](docs/API-CONTRACT.md) is the full versioned contract: shapes, error codes, cursor pagination, and compatibility rules.
 
 ### Recommended client handshake
 
@@ -408,29 +279,6 @@ All API clients should start with a health negotiation:
 curl --unix-socket ~/.coven/coven.sock http://localhost/api/v1/health
 ```
 
-Example response:
-
-```json
-{
-  "ok": true,
-  "apiVersion": "coven.daemon.v1",
-  "covenVersion": "0.0.10",
-  "capabilities": {
-    "sessions": true,
-    "events": true,
-    "travel": true,
-    "scheduler": true,
-    "eventCursor": "sequence",
-    "structuredErrors": true
-  },
-  "daemon": {
-    "pid": 12345,
-    "startedAt": "2026-05-09T06:43:00Z",
-    "socket": "/Users/alice/.coven/coven.sock"
-  }
-}
-```
-
 **Before depending on any other endpoint:**
 
 1. Call `GET /api/v1/health`
@@ -438,19 +286,9 @@ Example response:
 3. Check `capabilities.eventCursor === "sequence"` before using `afterSeq` pagination
 4. Only then depend on the documented `v1` sessions/events shapes
 
-All API errors use a structured envelope. Branch on `error.code`, never on `error.message`:
+All API errors use a structured `{ "error": { "code", "message", "details" } }` envelope. Branch on `error.code`, never on `error.message`.
 
-```json
-{
-  "error": {
-    "code": "session_not_found",
-    "message": "Session was not found.",
-    "details": { "sessionId": "abc-123" }
-  }
-}
-```
-
-Treat the socket API as the product contract. Clients may validate for better UX, but the Rust daemon remains the authority boundary. See [`docs/API-CONTRACT.md`](docs/API-CONTRACT.md) for the full versioned contract including error codes, cursor pagination, session shapes, and compatibility rules.
+Treat the socket API as the product contract. Clients may validate for better UX, but the Rust daemon remains the authority boundary.
 
 ---
 
@@ -502,7 +340,7 @@ The Rust daemon validates every request before acting:
 
 1. `projectRoot` must be explicit — no fallback
 2. `cwd` must canonicalize inside the declared project root
-3. Harness ID must be allowlisted (`codex`, `claude`)
+3. Harness ID must be allowlisted (`codex`, `claude`, `copilot`)
 4. Session IDs must exist and be in the expected state
 5. All harness commands are built with argv APIs — never `sh -c`
 
@@ -574,51 +412,19 @@ coven/
 
 ## Configuration
 
-### Environment variables
+Coven works with zero configuration. State lives under `COVEN_HOME` (default `~/.coven`); privacy and retention knobs are optional. The deep detail lives in the docs:
 
-| Variable                      | Default    | Description                                                                              |
-| ----------------------------- | ---------- | ---------------------------------------------------------------------------------------- |
-| `COVEN_HOME`                  | `~/.coven` | Root directory for all daemon state: SQLite database, Unix socket, logs, encryption keys |
-| `COVEN_PERSIST_RAW_ARTIFACTS` | `0`        | Set to `1` to enable local encrypted storage of raw session artifact payloads (advanced) |
+| Surface                              | What it controls                                                                          | Reference                                                        |
+| ------------------------------------ | ------------------------------------------------------------------------------------------ | ---------------------------------------------------------------- |
+| `COVEN_HOME`                         | Root directory for all daemon state: SQLite database, Unix socket, logs, encryption keys | [`docs/daemon/coven-home.md`](docs/daemon/coven-home.md)         |
+| Daemon environment and `privacy.toml` | Raw-artifact persistence (`COVEN_PERSIST_RAW_ARTIFACTS`), retention windows, redaction     | [`docs/daemon/configuration.md`](docs/daemon/configuration.md)   |
+| `~/.config/coven/settings.json`      | CLI settings under `covenCli.*`: repo registry, privacy keys, fuzzy paths                  | [`docs/SETTINGS.md`](docs/SETTINGS.md)                           |
 
 > **Tip:** If you run Coven in CI or need isolated environments, set `COVEN_HOME` to a unique path per environment. Coven will create the directory if it doesn't exist.
 
-### Configuration file
+Retention defaults (30 days for redacted event logs, 7 days for optional raw encrypted artifacts) and manual pruning via `coven logs prune` are covered in [`docs/reference/cli-logs.md`](docs/reference/cli-logs.md).
 
-Local privacy and storage settings live in `<COVEN_HOME>/privacy.toml`:
-
-| Key                     | Default | Description                                             |
-| ----------------------- | ------- | ------------------------------------------------------- |
-| `persist_raw_artifacts` | `false` | Enable local encrypted storage of raw session artifacts |
-
-When enabled, raw artifacts are encrypted using a local key at `<COVEN_HOME>/keys/session-artifacts.key`. This file is generated automatically with private permissions and is never stored in the repository or SQLite database.
-
-### What should never enter your repository
-
-```
-.coven/          # Daemon state directory — local only
-*.sqlite         # SQLite database files
-*.sqlite3
-*.db
-*.sock           # Unix socket files
-.env*            # Environment variable files
-*.key            # Encryption key files
-```
-
-These patterns are covered by `.gitignore`. Before submitting any PR or publishing documentation, run the secret scanner:
-
-```bash
-python scripts/check-secrets.py
-```
-
-If the scan fails, remove the secret from your working tree. If a secret entered git history, rotate the credential before rewriting history or publishing.
-
-### Data retention defaults
-
-| Data type                            | Default retention | Manual control     |
-| ------------------------------------ | ----------------- | ------------------ |
-| Redacted session event logs          | 30 days           | `coven logs prune` |
-| Raw encrypted artifacts (if enabled) | 7 days            | `coven logs prune` |
+Never commit runtime state: `.coven/`, `*.sqlite*`, `*.db`, `*.sock`, `.env*`, and `*.key` are covered by `.gitignore`. Before submitting any PR, run the secret scanner (`python scripts/check-secrets.py`) — see [Security](#security).
 
 ---
 

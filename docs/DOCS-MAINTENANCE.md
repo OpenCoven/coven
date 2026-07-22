@@ -93,6 +93,10 @@ Prefer relative repo links for internal docs:
 
 Use full URLs only for external resources and public community links.
 
+## Translations
+
+`docs/es/` (Spanish) and `docs/ru/` (Russian) are partial translations of the English tree. They lag behind English (last synced around 2026-06-24) and are updated in dedicated translation-sync passes, not with every English change. The English pages are authoritative whenever a translation disagrees.
+
 ## Diagrams
 
 Mermaid diagrams are allowed. Keep them small enough to read in GitHub's Markdown renderer.

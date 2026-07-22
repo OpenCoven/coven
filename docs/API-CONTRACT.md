@@ -9,6 +9,8 @@ description: "The versioned coven.daemon.v1 contract under /api/v1: health negot
 
 # Coven local API contract
 
+> **See also:** the condensed [API contract reference](reference/api-contract.md), which summarizes versioning and links per-topic pages under `docs/daemon/`. This page is the fuller single-page contract.
+
 The Coven daemon socket API is a public compatibility boundary for comux and external clients such as external OpenClaw bridge plugin.
 
 ## Current stable version
