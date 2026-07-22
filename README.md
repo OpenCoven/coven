@@ -669,7 +669,7 @@ comux is a standalone terminal cockpit that proved the tmux-cockpit model for pa
 | [Public roadmap](docs/ROADMAP.md)                       | Shipped, now, next, and later milestones                              |
 | [Product spec](docs/PRODUCT-SPEC.md)                    | Product requirements and design decisions                             |
 | [MVP plan](docs/MVP-PLAN.md)                            | Current MVP scope and checklist                                       |
-| [Future harnesses](docs/FUTURE-HARNESSES.md)            | Research notes for upcoming adapter work                              |
+| [Future harnesses](docs/reference/future-harnesses.md)  | Research notes for upcoming adapter work                              |
 | [Brand assets](docs/BRAND.md)                           | Logo, colors, and usage guidance                                      |
 | [Design system](DESIGN.md)                              | Full brand reference: palette, typography, iconography                |
 | [Brand adherence checklist](docs/BRANDING-ADHERENCE.md) | Checklist for brand-compliant contributions                           |

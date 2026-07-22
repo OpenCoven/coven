@@ -267,7 +267,7 @@ coven adapter doctor claude
 
 ## Adding a new adapter
 
-1. Start with a research note in `docs/FUTURE-HARNESSES.md` or a dedicated `docs/harnesses/<id>.md` page.
+1. Start with a research note in `docs/reference/future-harnesses.md` or a dedicated `docs/harnesses/<id>.md` page.
 2. Document the exact CLI contract: install, auth/setup, interactive launch, one-shot prompt launch, quiet/programmatic output mode, resume/session behavior, and unsupported modes.
 3. Add command-construction tests before changing user-facing docs to say the harness is supported.
 4. Add `coven adapter doctor` / `coven doctor` detection and setup hints.
