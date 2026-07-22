@@ -9620,13 +9620,16 @@ tier = 0
         let temp = tempfile::tempdir()?;
         let home = temp.path();
         let veto = coven_threads_core::VetoWindow::new(
-            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(300),
             std::time::Duration::ZERO,
         );
-        let (_, proposal_id) = stage_scheduled_reviewed_edit(
+        // Stage in the past so the veto deadline (staged_at + 300s) has
+        // already elapsed by the time recovery runs — no wall-clock sleep.
+        let staged_at = time::OffsetDateTime::now_utc() - time::Duration::minutes(10);
+        let (pending_path, proposal_id) = stage_scheduled_reviewed_edit(
             home,
             coven_threads_core::ApprovalPath::FamiliarCoherence { veto },
-            time::OffsetDateTime::now_utc(),
+            staged_at,
         )?;
         set_proposal_decision_failpoint(Some((
             ProposalDecisionFailpoint::ClaimBeforeValidation,
@@ -9641,7 +9644,26 @@ tier = 0
             Some(&decision_body),
         );
         assert!(interrupted.is_err());
-        std::thread::sleep(std::time::Duration::from_millis(2_100));
+
+        // The interrupted claim durably recorded claimed_at = wall-clock now,
+        // which is after the backdated deadline. Recovery judges veto
+        // timeliness by the durable claimed_at alone, so pin it inside the
+        // window to model a claim that landed before the deadline. This keeps
+        // the scenario — timely claim, post-deadline replay — deterministic
+        // instead of racing a real clock (flaky on slow CI runners, #455).
+        let raw = std::fs::read_to_string(&pending_path)?;
+        let mut value: Value = serde_json::from_str(&raw)?;
+        let mut request = proposal_decision_request(&value)?
+            .context("interrupted reject left a durable decision request")?;
+        request.claimed_at = staged_at + time::Duration::seconds(1);
+        value
+            .as_object_mut()
+            .context("pending proposal is a JSON object")?
+            .insert(
+                "decisionRequest".to_string(),
+                serde_json::to_value(&request)?,
+            );
+        std::fs::write(&pending_path, serde_json::to_vec_pretty(&value)?)?;
 
         let recovered = process_due_threads_proposals(home)?;
         assert_eq!(recovered, 1);
