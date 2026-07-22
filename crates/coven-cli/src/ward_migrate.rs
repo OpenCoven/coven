@@ -36,15 +36,19 @@ pub struct MigrationEntry {
     pub protected_files: Vec<String>,
     pub editable_paths: Vec<String>,
     pub translated_globs: Vec<(String, String)>,
-    /// Per-declaration disposition for v0.1 `[protected].invariants`:
-    /// each retired declaration either compiled deterministically into a
-    /// typed identity invariant or was rejected explicitly. Never silent.
+    /// Fidelity records for v0.1 `[protected].invariants`: each entry is
+    /// either a compiled typed-fact disposition or an explicit rejection
+    /// reason. Rejections may be per-declaration or set-level (e.g. missing
+    /// mandatory fields, duplicate facts). Never silent.
     pub invariant_dispositions: Vec<InvariantDisposition>,
     pub generated_toml: Option<String>,
     pub message: String,
 }
 
-/// Fidelity record for one retired v0.1 invariant declaration.
+/// Fidelity record for a v0.1 `[protected].invariants` entry or compile
+/// result. A `Rejected` variant may represent either a per-declaration
+/// failure or a set-level compiler error (e.g. missing mandatory field,
+/// duplicate fact); inspect `reason` for details.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InvariantDisposition {
     /// Compiled deterministically by `coven-threads-core`. Records the
@@ -259,9 +263,8 @@ fn migrate_one(
         .collect();
     if !rejection_reasons.is_empty() {
         let message = format!(
-            "v0.1 [protected].invariants rejected explicitly ({} rejection(s) across {} declaration(s)): {}",
+            "v0.1 [protected].invariants rejected explicitly ({} rejection(s)): {}",
             rejection_reasons.len(),
-            legacy_invariants.len(),
             rejection_reasons.join("; "),
         );
         return Ok(MigrationEntry {
@@ -336,7 +339,17 @@ fn migrate_one(
             translated_globs,
             invariant_dispositions: invariant_dispositions.clone(),
             generated_toml: Some(generated_toml),
-message: "would migrate Ward v0.1".to_string(),
+            message: format!(
+                "would migrate Ward v0.1{}",
+                if invariant_dispositions.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "; {} retired identity invariant(s) compiled deterministically (dry-run: backup not written, not carried into Phase-2 ward.toml)",
+                        invariant_dispositions.len()
+                    )
+                }
+            ),
         });
     }
 
@@ -768,7 +781,7 @@ paths = ["notes/"]
         assert_eq!(entry.status, MigrationStatus::Unmigratable);
         assert!(entry
             .message
-            .contains("v0.1 [protected].invariants rejected explicitly (2 rejection(s) across 2 declaration(s))"));
+            .contains("v0.1 [protected].invariants rejected explicitly (2 rejection(s))"));
         assert!(entry.message.contains("invariant[0]"));
         assert!(entry.message.contains("invariant[1]"));
         assert!(entry
