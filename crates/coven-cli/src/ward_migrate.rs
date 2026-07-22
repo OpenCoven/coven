@@ -162,7 +162,12 @@ fn migrate_one(
                     invariant_dispositions: Vec::new(),
                     generated_toml: None,
                     message: format!(
-                        "ward.toml parses as Phase-2 but retains a v0.1 [protected].invariants remnant ({remnants} declaration(s)); Phase-2 has no invariants surface, so these would be silently inert — remove the remnant or restore the v0.1 file and re-run migration"
+                        "ward.toml parses as Phase-2 but retains a v0.1 [protected].invariants remnant ({}); Phase-2 has no invariants surface, so these would be silently inert — remove the remnant or restore the v0.1 file and re-run migration",
+                        if remnants == 0 {
+                            "empty list".to_string()
+                        } else {
+                            format!("{remnants} declaration(s)")
+                        }
                     ),
                 });
             }
