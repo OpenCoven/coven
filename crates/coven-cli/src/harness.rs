@@ -3231,14 +3231,14 @@ mod tests {
     }
 
     #[test]
-    fn hermes_recipe_forwards_selected_models_before_the_shim_prompt() -> anyhow::Result<()> {
+    fn hermes_recipe_forwards_selected_models_and_prompts() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let coven_home = temp_dir.path().join("coven-home");
         let adapter_dir = coven_home.join("adapters");
         fs::create_dir_all(&adapter_dir)?;
         fs::write(
             adapter_dir.join("hermes.json"),
-            HERMES_POSIX_ADAPTER_MANIFEST,
+            known_adapter_manifest("hermes").expect("current Hermes recipe"),
         )?;
 
         let _guard = lock_env();
@@ -3257,19 +3257,38 @@ mod tests {
                 ..Default::default()
             },
         )?;
-        assert_eq!(selected.0, "hermes-coven");
+        assert_eq!(
+            selected.0,
+            if cfg!(windows) {
+                "hermes"
+            } else {
+                "hermes-coven"
+            }
+        );
         assert_eq!(
             selected.1,
-            vec![
-                "--model",
-                "gpt-5.6-terra",
-                "chat",
-                "--source",
-                "coven",
-                "-Q",
-                "--",
-                "hello from Coven",
-            ]
+            if cfg!(windows) {
+                vec![
+                    "--model",
+                    "gpt-5.6-terra",
+                    "chat",
+                    "--source",
+                    "coven",
+                    "-Q",
+                    "-q=hello from Coven",
+                ]
+            } else {
+                vec![
+                    "--model",
+                    "gpt-5.6-terra",
+                    "chat",
+                    "--source",
+                    "coven",
+                    "-Q",
+                    "--",
+                    "hello from Coven",
+                ]
+            }
         );
 
         let inherited = command_parts_for_harness_with_conversation(
@@ -3282,7 +3301,11 @@ mod tests {
         )?;
         assert_eq!(
             inherited.1,
-            vec!["chat", "--source", "coven", "-Q", "--", "hello from Coven"]
+            if cfg!(windows) {
+                vec!["chat", "--source", "coven", "-Q", "-q=hello from Coven"]
+            } else {
+                vec!["chat", "--source", "coven", "-Q", "--", "hello from Coven"]
+            }
         );
         Ok(())
     }
@@ -3295,7 +3318,7 @@ mod tests {
         fs::create_dir_all(&adapter_dir)?;
         fs::write(
             adapter_dir.join("hermes.json"),
-            HERMES_POSIX_ADAPTER_MANIFEST,
+            known_adapter_manifest("hermes").expect("current Hermes recipe"),
         )?;
 
         let _guard = lock_env();
@@ -3403,7 +3426,10 @@ mod tests {
         let adapter_dir = coven_home.join("adapters");
         fs::create_dir_all(&adapter_dir)?;
         let manifest_path = adapter_dir.join("hermes.json");
-        fs::write(&manifest_path, HERMES_POSIX_ADAPTER_MANIFEST)?;
+        fs::write(
+            &manifest_path,
+            known_adapter_manifest("hermes").expect("current Hermes recipe"),
+        )?;
 
         let mut sources = trusted_adapter_manifest_sources(&coven_home);
         assert_eq!(sources.len(), 1);
@@ -3418,7 +3444,14 @@ mod tests {
             .find(|spec| spec.id == "hermes")
             .expect("trusted source should parse bundled hermes recipe");
 
-        assert_eq!(hermes.executable, "hermes-coven");
+        assert_eq!(
+            hermes.executable,
+            if cfg!(windows) {
+                "hermes"
+            } else {
+                "hermes-coven"
+            }
+        );
         assert_eq!(
             hermes.manifest_path.as_deref(),
             Some(manifest_path.to_string_lossy().as_ref())
