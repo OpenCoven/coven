@@ -137,6 +137,24 @@ mod tests {
     }
 
     #[test]
+    fn coven_home_from_env_uses_userprofile_when_home_is_missing() -> Result<()> {
+        let path = coven_home_from_env(
+            None,
+            None,
+            Some(OsString::from("/tmp/windows-user")),
+            None,
+            None,
+            None,
+        )?;
+
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/windows-user").join(DEFAULT_COVEN_HOME_DIR)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn coven_home_from_env_ignores_empty_values() -> Result<()> {
         let path = coven_home_from_env(
             Some(OsString::new()),

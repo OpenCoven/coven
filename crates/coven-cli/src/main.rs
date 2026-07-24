@@ -41,8 +41,6 @@ mod repos_config;
 mod settings;
 mod store;
 mod stream_json;
-#[cfg(test)]
-mod test_env;
 mod theme;
 mod tui;
 mod verification;
@@ -4025,7 +4023,6 @@ fn coven_store_path_if_exists() -> Result<Option<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_env::{lock_env, EnvVarGuard};
     use crate::tui::cast::{
         build_plan, parse_spell, CastHarness, CastIntent, CastRisk, CastStepKind, SafetyDecision,
     };
@@ -5159,22 +5156,6 @@ mod tests {
             }) => assert_eq!(adapter, "hermes"),
             other => panic!("expected adapter install command, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn coven_home_uses_userprofile_when_home_is_missing() -> anyhow::Result<()> {
-        let temp_dir = tempfile::tempdir()?;
-        let user_profile = temp_dir.path().join("windows-user");
-        let _guard = lock_env();
-        let _coven_home = EnvVarGuard::remove("COVEN_HOME");
-        let _home = EnvVarGuard::remove("HOME");
-        let _user_profile = EnvVarGuard::set("USERPROFILE", &user_profile);
-
-        assert_eq!(
-            coven_home_dir()?,
-            user_profile.join(paths::DEFAULT_COVEN_HOME_DIR)
-        );
-        Ok(())
     }
 
     #[test]
