@@ -1291,7 +1291,10 @@ impl App {
 
     fn archive_session(&mut self, session_id: &str) {
         match self.client.archive_session(session_id) {
-            Ok(()) => self.push_system_message(&format!("Archived session {session_id}.")),
+            Ok(()) => {
+                self.remove_session_from_list(session_id);
+                self.push_system_message(&format!("Archived session {session_id}."));
+            }
             Err(error) => self.push_system_message(&format!("Archive failed: {error}")),
         }
     }
@@ -1323,6 +1326,7 @@ impl App {
     fn sacrifice_session(&mut self, session_id: &str) {
         match self.client.sacrifice_session(session_id) {
             Ok(()) => {
+                self.remove_session_from_list(session_id);
                 if self.active_session_id.as_deref() == Some(session_id) {
                     self.active_session_id = None;
                     self.active_session_harness = None;
@@ -1332,6 +1336,20 @@ impl App {
             }
             Err(error) => self.push_system_message(&format!("Sacrifice failed: {error}")),
         }
+    }
+
+    /// Drop a session from the in-memory `/sessions` overlay list after a
+    /// mutation that removes it from the daemon's default listing (sacrifice
+    /// deletes the row; archive hides it behind the `archived_at IS NULL`
+    /// filter in [`crate::store::list_sessions`]).
+    ///
+    /// The mutation paths write to the store directly while
+    /// [`Self::refresh_sessions`] needs a daemon round-trip, so mirroring the
+    /// removal locally keeps an open overlay honest even when the daemon is
+    /// down (#451: a sacrificed session kept rendering until the next overlay
+    /// toggle, and re-sacrificing it reported "session not found").
+    fn remove_session_from_list(&mut self, session_id: &str) {
+        self.sessions.retain(|session| session.id != session_id);
     }
 
     pub(super) fn refresh_sessions(&mut self) {
@@ -4659,6 +4677,91 @@ mod tests {
             .messages
             .iter()
             .any(|message| message.content.contains("Sacrificed session session-1")));
+    }
+
+    #[test]
+    fn sacrificing_a_session_removes_it_from_the_open_sessions_overlay() {
+        // #451: the overlay list is an in-memory mirror; sacrifice used to
+        // delete the store row but keep rendering the stale entry until the
+        // next overlay toggle, and re-sacrificing it reported "session not
+        // found".
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "codex",
+            "Existing",
+            "completed",
+        ));
+        let (mut app, _) = app_with_client(client);
+        app.refresh_sessions();
+        app.show_session_overlay = true;
+        assert!(app.sessions.iter().any(|s| s.id == "session-1"));
+
+        app.input = "/sacrifice session-1".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        app.input = "accept".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+
+        assert!(
+            !app.sessions.iter().any(|s| s.id == "session-1"),
+            "sacrificed session must leave the overlay list immediately"
+        );
+    }
+
+    #[test]
+    fn archiving_a_session_removes_it_from_the_open_sessions_overlay() {
+        // Archived sessions leave the daemon's default listing (`archived_at
+        // IS NULL` filter), so the overlay mirror has to drop them too.
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "codex",
+            "Existing",
+            "completed",
+        ));
+        let (mut app, _) = app_with_client(client);
+        app.refresh_sessions();
+        app.show_session_overlay = true;
+        assert!(app.sessions.iter().any(|s| s.id == "session-1"));
+
+        app.input = "/archive session-1".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+
+        assert!(
+            !app.sessions.iter().any(|s| s.id == "session-1"),
+            "archived session must leave the overlay list immediately"
+        );
+    }
+
+    #[test]
+    fn failed_sacrifice_keeps_the_session_in_the_overlay_list() {
+        // The mirror removal only applies on success: a failed sacrifice
+        // must not eat the row from the overlay.
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "codex",
+            "Existing",
+            "completed",
+        ));
+        let (mut app, _) = app_with_client(client);
+        app.refresh_sessions();
+
+        app.input = "/sacrifice nope".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        app.input = "accept".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+
+        assert!(app
+            .messages
+            .iter()
+            .any(|message| message.content.contains("Sacrifice failed")));
+        assert!(
+            app.sessions.iter().any(|s| s.id == "session-1"),
+            "failed sacrifice must leave the overlay list untouched"
+        );
     }
 
     #[test]
