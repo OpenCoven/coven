@@ -1771,7 +1771,12 @@ impl App {
                 if let (Some(call_id), Some(home)) =
                     (self.active_call_id.take(), self.coven_home.as_deref())
                 {
-                    let call_status = if status == "0" || status == "success" {
+                    // The daemon's exit event writes `status` as
+                    // `"completed"` / `"failed"` (pty_runner wait results via
+                    // `record_exit_event`), so match that vocabulary exactly
+                    // (#467). Anything other than a clean completion counts
+                    // as failed.
+                    let call_status = if status == "completed" {
                         crate::coven_calls::CovenCallStatus::Completed
                     } else {
                         crate::coven_calls::CovenCallStatus::Failed
@@ -3544,6 +3549,99 @@ mod tests {
         assert!(
             !app.stream_json_buffers.contains_key(&session_id),
             "exit must drop the per-session JSON buffer so it doesn't leak across the chat"
+        );
+    }
+
+    /// Regression for #467: the daemon's exit event writes `status` as
+    /// `"completed"` / `"failed"` (see `record_exit_event` in daemon.rs), so
+    /// the delegation-call resolution must key off that vocabulary. It used
+    /// to compare against `"0"` / `"success"`, which never match — every
+    /// cleanly-completed delegated call was recorded as failed.
+    #[test]
+    fn completed_exit_resolves_delegation_call_as_completed() {
+        let coven_home = tempfile::tempdir().unwrap();
+        let call_id = crate::coven_calls::emit_running(
+            coven_home.path(),
+            "caller-familiar",
+            "callee-familiar",
+            "do the task",
+            None,
+        )
+        .expect("seed running call");
+
+        let client = RecordingChatClient::default();
+        let agents = vec![agent("codex", true), agent("claude", true)];
+        let mut app = App::new_with_state(
+            agents,
+            Some(0),
+            Box::new(client),
+            Some(coven_home.path().to_path_buf()),
+        );
+        app.active_call_id = Some(call_id.clone());
+
+        app.push_event_message(&EventRecord {
+            seq: 1,
+            id: "event-exit".to_string(),
+            session_id: "session-1".to_string(),
+            kind: "exit".to_string(),
+            payload_json: serde_json::json!({ "status": "completed" }).to_string(),
+            created_at: "2026-05-19T00:00:00Z".to_string(),
+        });
+
+        let calls = crate::coven_calls::load_calls(coven_home.path()).expect("load calls");
+        let record = calls
+            .iter()
+            .find(|call| call.id == call_id)
+            .expect("call record survives");
+        assert_eq!(
+            record.status, "completed",
+            "a status:\"completed\" exit event must resolve the delegation call as completed"
+        );
+        assert!(
+            record.ended_at.is_some(),
+            "terminal resolution must stamp ended_at"
+        );
+    }
+
+    #[test]
+    fn failed_exit_resolves_delegation_call_as_failed() {
+        let coven_home = tempfile::tempdir().unwrap();
+        let call_id = crate::coven_calls::emit_running(
+            coven_home.path(),
+            "caller-familiar",
+            "callee-familiar",
+            "do the task",
+            None,
+        )
+        .expect("seed running call");
+
+        let client = RecordingChatClient::default();
+        let agents = vec![agent("codex", true), agent("claude", true)];
+        let mut app = App::new_with_state(
+            agents,
+            Some(0),
+            Box::new(client),
+            Some(coven_home.path().to_path_buf()),
+        );
+        app.active_call_id = Some(call_id.clone());
+
+        app.push_event_message(&EventRecord {
+            seq: 1,
+            id: "event-exit".to_string(),
+            session_id: "session-1".to_string(),
+            kind: "exit".to_string(),
+            payload_json: serde_json::json!({ "status": "failed" }).to_string(),
+            created_at: "2026-05-19T00:00:00Z".to_string(),
+        });
+
+        let calls = crate::coven_calls::load_calls(coven_home.path()).expect("load calls");
+        let record = calls
+            .iter()
+            .find(|call| call.id == call_id)
+            .expect("call record survives");
+        assert_eq!(
+            record.status, "failed",
+            "a status:\"failed\" exit event must resolve the delegation call as failed"
         );
     }
 
