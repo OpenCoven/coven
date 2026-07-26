@@ -2804,15 +2804,33 @@ fn apply_familiar_edits(
     // also land in the append-only ward_audit ledger, so applied writes stay
     // observable across daemon restarts. Persist before advancing protected
     // baselines so a post-write failure is less likely to leave an audit gap.
+    // On persistence failure, return a structured 500 that includes the applied
+    // changes so clients can distinguish "write applied, audit failed" from a
+    // full failure and avoid blind retries that would produce duplicate writes.
     {
         let mut conn = store::open_store(&store_path(coven_home))?;
-        crate::threads_gate::persist_apply_audit_records(
+        if let Err(err) = crate::threads_gate::persist_apply_audit_records(
             &mut conn,
             familiar_id,
             &workspace,
             &config,
             &report,
-        )?;
+        ) {
+            return json_response(
+                500,
+                &json!({
+                    "error": {
+                        "code": "audit_persist_failed",
+                        "message": format!(
+                            "The file write was applied but the audit ledger \
+                             could not be updated: {err:#}"
+                        ),
+                        "details": { "writeApplied": true },
+                    },
+                    "changes": changes,
+                }),
+            );
+        }
     }
     advance_applied_protected_baselines(coven_home, familiar_id, &workspace, &report.changes)?;
     json_response(
