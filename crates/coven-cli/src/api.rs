@@ -2800,10 +2800,10 @@ fn apply_familiar_edits(
             }),
         );
     }
-    advance_applied_protected_baselines(coven_home, familiar_id, &workspace, &report.changes)?;
     // Gate 4 persistence (#414): the audit records returned to the client
     // also land in the append-only ward_audit ledger, so applied writes stay
-    // observable across daemon restarts.
+    // observable across daemon restarts. Persist before advancing protected
+    // baselines so a post-write failure is less likely to leave an audit gap.
     {
         let mut conn = store::open_store(&store_path(coven_home))?;
         crate::threads_gate::persist_apply_audit_records(
@@ -2814,6 +2814,7 @@ fn apply_familiar_edits(
             &report,
         )?;
     }
+    advance_applied_protected_baselines(coven_home, familiar_id, &workspace, &report.changes)?;
     json_response(
         200,
         &json!({
@@ -2958,7 +2959,21 @@ fn familiar_audit_response(
             }
         },
     };
-    let event = query.and_then(|q| query_param(q, "event"));
+    let event = match query.and_then(|q| query_param(q, "event")) {
+        Some(event) => {
+            if let Err(message) = validate_ward_audit_event_tag(event) {
+                let message = message.to_string();
+                return api_error(
+                    400,
+                    "invalid_request",
+                    &message,
+                    Some(json!({ "event": event })),
+                );
+            }
+            Some(event)
+        }
+        None => None,
+    };
 
     let conn = store::open_store(&store_path(coven_home))?;
     let mut sql = String::from(
@@ -2981,26 +2996,53 @@ fn familiar_audit_response(
             .ok()
             .filter(Value::is_array)
             .unwrap_or_else(|| json!([]));
-        Ok(json!({
-            "id": row.get::<_, i64>(0)?,
-            "eventType": row.get::<_, String>(1)?,
-            "proposalId": row.get::<_, Option<String>>(2)?,
-            "wardVersion": row.get::<_, Option<String>>(3)?,
-            "wardHash": hex_string(&ward_hash),
-            "tier": row.get::<_, Option<String>>(5)?,
-            "decision": row.get::<_, String>(6)?,
-            "approver": row.get::<_, Option<String>>(7)?,
-            "diffSha256": diff_hash.as_deref().map(hex_string),
-            "detail": detail
-                .as_deref()
-                .map(|raw| serde_json::from_str(raw).unwrap_or(Value::Null)),
-            "filesTouched": files_touched,
-            "channel": row.get::<_, Option<String>>(11)?,
-            "threadId": row.get::<_, Option<String>>(12)?,
-            "submittedAt": row.get::<_, String>(13)?,
-            "decidedAt": row.get::<_, String>(14)?,
-            "recordedAt": row.get::<_, String>(15)?,
-        }))
+        let (detail, detail_raw) = match detail {
+            Some(raw) => match serde_json::from_str::<Value>(&raw) {
+                Ok(parsed) => (parsed, None),
+                Err(_) => (Value::Null, Some(raw)),
+            },
+            None => (Value::Null, None),
+        };
+        let mut record = serde_json::Map::from_iter([
+            ("id".to_string(), json!(row.get::<_, i64>(0)?)),
+            ("eventType".to_string(), json!(row.get::<_, String>(1)?)),
+            (
+                "proposalId".to_string(),
+                json!(row.get::<_, Option<String>>(2)?),
+            ),
+            (
+                "wardVersion".to_string(),
+                json!(row.get::<_, Option<String>>(3)?),
+            ),
+            ("wardHash".to_string(), json!(hex_string(&ward_hash))),
+            ("tier".to_string(), json!(row.get::<_, Option<String>>(5)?)),
+            ("decision".to_string(), json!(row.get::<_, String>(6)?)),
+            (
+                "approver".to_string(),
+                json!(row.get::<_, Option<String>>(7)?),
+            ),
+            (
+                "diffSha256".to_string(),
+                json!(diff_hash.as_deref().map(hex_string)),
+            ),
+            ("detail".to_string(), detail),
+            ("filesTouched".to_string(), files_touched),
+            (
+                "channel".to_string(),
+                json!(row.get::<_, Option<String>>(11)?),
+            ),
+            (
+                "threadId".to_string(),
+                json!(row.get::<_, Option<String>>(12)?),
+            ),
+            ("submittedAt".to_string(), json!(row.get::<_, String>(13)?)),
+            ("decidedAt".to_string(), json!(row.get::<_, String>(14)?)),
+            ("recordedAt".to_string(), json!(row.get::<_, String>(15)?)),
+        ]);
+        if let Some(raw) = detail_raw {
+            record.insert("detailRaw".to_string(), Value::String(raw));
+        }
+        Ok(Value::Object(record))
     };
     let records: Vec<Value> = match event {
         Some(event) => statement
@@ -3018,6 +3060,17 @@ fn familiar_audit_response(
             "records": records,
         }),
     )
+}
+
+pub(crate) fn validate_ward_audit_event_tag(event: &str) -> Result<()> {
+    anyhow::ensure!(
+        !event.is_empty()
+            && event
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'),
+        "Query parameter `event` must be a lowercase ASCII event tag containing only lowercase letters, digits, and `_`."
+    );
+    Ok(())
 }
 
 /// Lowercase hex of raw hash bytes for API payloads.
@@ -8894,6 +8947,32 @@ tier = 1
     }
 
     #[test]
+    fn familiar_audit_route_preserves_malformed_detail_as_detail_raw() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_warded_familiar(home)?;
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        conn.execute(
+            "INSERT INTO ward_audit (
+                event_type, familiar_id, ward_hash, decision, detail, files_touched,
+                submitted_at, decided_at
+             ) VALUES ('apply_audit', 'sage', ?1, 'applied', ?2, '[]', ?3, ?3)",
+            rusqlite::params![
+                vec![0x11_u8; 32],
+                "{malformed detail",
+                "2026-07-26T00:00:00Z"
+            ],
+        )?;
+
+        let response = handle_request("GET", "/api/v1/familiars/sage/audit", home, None)?;
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert!(body["records"][0]["detail"].is_null());
+        assert_eq!(body["records"][0]["detailRaw"], "{malformed detail");
+        Ok(())
+    }
+
+    #[test]
     fn familiar_audit_route_fails_closed_on_unknown_and_bad_limit() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let home = temp.path();
@@ -8908,6 +8987,9 @@ tier = 1
             "/api/v1/familiars/sage/audit?limit=0",
             "/api/v1/familiars/sage/audit?limit=1001",
             "/api/v1/familiars/sage/audit?limit=abc",
+            "/api/v1/familiars/sage/audit?event=",
+            "/api/v1/familiars/sage/audit?event=ApplyAudit",
+            "/api/v1/familiars/sage/audit?event=apply%20audit",
         ] {
             let response = handle_request("GET", path, home, None)?;
             assert_eq!(response.status, 400, "path {path} got {}", response.body);

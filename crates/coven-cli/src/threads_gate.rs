@@ -698,8 +698,8 @@ fn hex_to_bytes(hex: &str) -> Result<Vec<u8>> {
     if !hex.is_ascii() {
         anyhow::bail!("non-ASCII hex digest `{hex}`");
     }
-    if !hex.len().is_multiple_of(2) {
-        anyhow::bail!("odd-length hex digest `{hex}`");
+    if hex.len() != 64 {
+        anyhow::bail!("expected 64-character SHA-256 hex digest, got `{hex}`");
     }
     (0..hex.len())
         .step_by(2)
@@ -909,6 +909,12 @@ tier = 2
     fn hex_to_bytes_rejects_non_ascii_without_panicking() {
         let error = hex_to_bytes("0éx").expect_err("non-ASCII hex must be rejected");
         assert!(error.to_string().contains("non-ASCII"), "{error:#}");
+    }
+
+    #[test]
+    fn hex_to_bytes_rejects_non_sha256_lengths() {
+        let error = hex_to_bytes("abcd").expect_err("non-SHA-256 digest must be rejected");
+        assert!(error.to_string().contains("64-character"), "{error:#}");
     }
 
     #[test]

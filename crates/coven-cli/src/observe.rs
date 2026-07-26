@@ -618,13 +618,8 @@ fn ward_audit_path(familiar_id: &str, limit: Option<u32>, event: Option<&str>) -
         params.push(format!("limit={limit}"));
     }
     if let Some(event) = event {
-        anyhow::ensure!(
-            !event.is_empty()
-                && event
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'),
-            "--event must be a lowercase ASCII event tag containing only letters, digits, and `_`"
-        );
+        crate::api::validate_ward_audit_event_tag(event)
+            .map_err(|_| anyhow::anyhow!("--event must be a lowercase ASCII event tag containing only lowercase letters, digits, and `_`"))?;
         params.push(format!("event={event}"));
     }
     if !params.is_empty() {
