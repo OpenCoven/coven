@@ -679,6 +679,11 @@ impl App {
         self.scroll_offset = 0;
         self.harness_conversation_ids.clear();
         self.kill_all_stream_sessions();
+        // Held PTY line fragments belong to the transcript the user just
+        // wiped — keeping them would let pre-clear text resurface on the
+        // session's exit flush (#489). `kill_all_stream_sessions` only
+        // covers stream sessions, so PTY buffers are dropped here.
+        self.pty_line_buffers.clear();
         self.clear_persisted_conversations();
         self.push_system_message("Chat cleared.");
     }
@@ -688,6 +693,11 @@ impl App {
     /// a fresh thread (next message will create a new harness session) but
     /// keep the prior exchange visible for their own reference. Tears down
     /// any long-lived stream sessions for the same reason as `/clear`.
+    ///
+    /// Unlike `/clear` this keeps held PTY line fragments: the transcript
+    /// stays visible and PTY sessions aren't killed, so a held fragment is
+    /// the head of an in-flight line still streaming into that transcript
+    /// — dropping it would render the line's tail without its head (#489).
     pub(super) fn start_new_conversation(&mut self) {
         self.harness_conversation_ids.clear();
         self.kill_all_stream_sessions();
@@ -5302,6 +5312,83 @@ mod tests {
         assert!(
             agent_text.contains("Resume"),
             "exit must flush the held fragment as a complete prose line: {agent_text}"
+        );
+    }
+
+    /// Regression for #489: `/clear` wipes the transcript, so a PTY line
+    /// fragment held from before the clear must not resurface when the
+    /// session later exits and flushes it.
+    #[test]
+    fn clear_transcript_drops_held_pty_line_fragments() {
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "copilot",
+            "Existing",
+            "running",
+        ));
+        client
+            .events
+            .borrow_mut()
+            .push(output_event(1, "session-1", "All done.\r\nResume"));
+        let (mut app, _) = app_with_client(client);
+
+        app.handle_slash_command("/attach session-1");
+        assert!(
+            app.pty_line_buffers.contains_key("session-1"),
+            "the stats-shaped fragment must be held before the clear"
+        );
+
+        app.clear_transcript();
+        assert!(
+            !app.pty_line_buffers.contains_key("session-1"),
+            "/clear must drop held PTY line fragments, as it drops stream JSON buffers"
+        );
+
+        app.push_event_message(&EventRecord {
+            seq: 2,
+            id: "event-exit".to_string(),
+            session_id: "session-1".to_string(),
+            kind: "exit".to_string(),
+            payload_json: serde_json::json!({ "status": "completed" }).to_string(),
+            created_at: "2026-05-19T00:00:00Z".to_string(),
+        });
+
+        assert!(
+            !app.messages
+                .iter()
+                .any(|message| message.content.contains("Resume")),
+            "a pre-clear fragment must not land in the cleared transcript: {:?}",
+            app.messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// `/new` keeps the transcript visible on purpose, and it does not kill
+    /// PTY sessions — so a held fragment there belongs to an in-flight line
+    /// that is still streaming into that same visible transcript. Dropping
+    /// it would lose the head of a line, so `/new` must keep it (#489).
+    #[test]
+    fn start_new_conversation_keeps_held_pty_line_fragments() {
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "copilot",
+            "Existing",
+            "running",
+        ));
+        client
+            .events
+            .borrow_mut()
+            .push(output_event(1, "session-1", "All done.\r\nResume"));
+        let (mut app, _) = app_with_client(client);
+
+        app.handle_slash_command("/attach session-1");
+        app.start_new_conversation();
+
+        assert!(
+            app.pty_line_buffers.contains_key("session-1"),
+            "/new keeps the transcript, so an in-flight line's head must survive"
         );
     }
 
