@@ -35,6 +35,9 @@ Two patterns, both keeping the API on loopback:
   stays on loopback; Tailscale remains the boundary.
 
 Never bind `--tcp` to a non-loopback or public address to achieve remote access
-— the API is unauthenticated. Let SSH or Tailscale be the boundary.
+— the API is unauthenticated. Let SSH or Tailscale be the boundary. A
+first-class authenticated remote listener (paired devices, TLS, scoped tokens)
+is designed in
+[Authenticated remote listener](/design/remote-listener-auth) (#463).
 
 See [Daemon overview](/daemon/index) and [Safety model](/daemon/safety-model).
