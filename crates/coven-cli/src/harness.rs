@@ -1799,7 +1799,7 @@ fn executable_exists(executable: &str) -> bool {
 /// Availability check for a harness: most harnesses rely on PATH only, but
 /// `coven-code` is also available when the managed engine resolver finds it
 /// (e.g. `~/.coven/engine/<ver>/coven-code` not on PATH).
-fn harness_available(executable: &str) -> bool {
+pub(crate) fn harness_available(executable: &str) -> bool {
     harness_available_with(executable, || crate::engine::resolve().is_some())
 }
 

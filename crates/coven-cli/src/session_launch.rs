@@ -67,11 +67,27 @@ pub enum HarnessCheck {
 }
 
 /// Validate the requested harness against the configured adapter set and
-/// return its summary. Both the CLI and the API validate through this
+/// return its command spec. Both the CLI and the API validate through this
 /// function, so the supported-harness id set and the unsupported-harness
 /// message cannot drift between the two surfaces.
-pub fn validate_harness(harness_id: &str, check: HarnessCheck) -> Result<harness::HarnessSummary> {
-    let harnesses = harness::configured_harnesses()?;
+pub fn validate_harness(
+    harness_id: &str,
+    check: HarnessCheck,
+) -> Result<harness::HarnessCommandSpec> {
+    validate_harness_specs(
+        harness_id,
+        check,
+        harness::configured_harness_specs()?,
+        harness::harness_available,
+    )
+}
+
+fn validate_harness_specs(
+    harness_id: &str,
+    check: HarnessCheck,
+    harnesses: Vec<harness::HarnessCommandSpec>,
+    is_available: impl Fn(&str) -> bool,
+) -> Result<harness::HarnessCommandSpec> {
     let configured_ids = harnesses
         .iter()
         .map(|harness| harness.id.as_str())
@@ -82,7 +98,9 @@ pub fn validate_harness(harness_id: &str, check: HarnessCheck) -> Result<harness
         .cloned();
 
     match selected {
-        Some(harness) if check == HarnessCheck::Configured || harness.available => Ok(harness),
+        Some(harness) if check == HarnessCheck::Configured || is_available(&harness.executable) => {
+            Ok(harness)
+        }
         Some(harness) => Err(anyhow::anyhow!(
             "harness `{}` is not available. {}",
             harness.id,
@@ -229,6 +247,19 @@ mod tests {
             matches!(error, Err(LaunchPathError::ProjectRoot(_))),
             "a missing root must be a ProjectRoot error"
         );
+    }
+
+    #[test]
+    fn configured_harness_validation_does_not_probe_executables() -> Result<()> {
+        let selected = validate_harness_specs(
+            "codex",
+            HarnessCheck::Configured,
+            harness::configured_harness_specs()?,
+            |_| panic!("configured-only validation must not probe executable availability"),
+        )?;
+
+        assert_eq!(selected.id, "codex");
+        Ok(())
     }
 
     #[test]
