@@ -57,6 +57,18 @@ struct PtyLineBuffer {
     head_emitted: bool,
 }
 
+/// Whether an appended chunk of agent output starts a new assistant
+/// segment. Stream-JSON dispatch marks every assistant event (and each
+/// text block within one) as a `NewSegment` so prose around tool calls
+/// gets a paragraph break instead of gluing together (#470). PTY chunks
+/// are `Continuation`s — they carry their own newlines and arbitrary
+/// split points, so no separator may ever be injected between them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SegmentBoundary {
+    Continuation,
+    NewSegment,
+}
+
 #[derive(Clone, Debug)]
 pub struct ChatMessage {
     pub role: MessageRole,
@@ -432,9 +444,17 @@ impl App {
         });
     }
 
-    fn push_or_append_agent_message(&mut self, agent_name: &str, content: &str) {
+    fn push_or_append_agent_message(
+        &mut self,
+        agent_name: &str,
+        content: &str,
+        boundary: SegmentBoundary,
+    ) {
         if let Some(last) = self.messages.last_mut() {
             if matches!(last.role, MessageRole::Agent) && last.sender == agent_name {
+                if boundary == SegmentBoundary::NewSegment {
+                    last.content.push_str(segment_separator(&last.content));
+                }
                 last.content.push_str(content);
                 return;
             }
@@ -445,9 +465,19 @@ impl App {
     /// Stash agent output until the session completes (batched mode). Keyed by
     /// sender so a mid-stream agent switch doesn't merge two voices into one
     /// bubble.
-    fn buffer_pending_agent_output(&mut self, agent_name: &str, content: &str) {
+    fn buffer_pending_agent_output(
+        &mut self,
+        agent_name: &str,
+        content: &str,
+        boundary: SegmentBoundary,
+    ) {
         match self.pending_agent_buffer.as_mut() {
-            Some((sender, buffer)) if sender == agent_name => buffer.push_str(content),
+            Some((sender, buffer)) if sender == agent_name => {
+                if boundary == SegmentBoundary::NewSegment {
+                    buffer.push_str(segment_separator(buffer));
+                }
+                buffer.push_str(content);
+            }
             Some(_) => {
                 self.flush_pending_agent_buffer();
                 self.pending_agent_buffer = Some((agent_name.to_string(), content.to_string()));
@@ -474,10 +504,13 @@ impl App {
     /// to the streaming mode: live appends progressively, batched holds it
     /// back until the turn completes.
     fn emit_stream_assistant_text(&mut self, sender: &str, chunk: &str) {
+        // Every flushed chunk is a whole assistant segment (chunks are cut
+        // at assistant-event and tool_use boundaries), so it starts a new
+        // segment in the sink (#470).
         if self.streaming_mode.is_live() {
-            self.push_or_append_agent_message(sender, chunk);
+            self.push_or_append_agent_message(sender, chunk, SegmentBoundary::NewSegment);
         } else {
-            self.buffer_pending_agent_output(sender, chunk);
+            self.buffer_pending_agent_output(sender, chunk, SegmentBoundary::NewSegment);
         }
     }
 
@@ -1703,6 +1736,13 @@ impl App {
                                 if let Some(text) =
                                     block.get("text").and_then(serde_json::Value::as_str)
                                 {
+                                    if text.is_empty() {
+                                        continue;
+                                    }
+                                    // Text blocks within one event are
+                                    // separate segments — paragraph-break
+                                    // them (#470).
+                                    chunk.push_str(segment_separator(&chunk));
                                     chunk.push_str(text);
                                 }
                             }
@@ -1875,14 +1915,15 @@ impl App {
         matches!(self.active_session_harness.as_deref(), None | Some("codex"))
     }
 
-    /// Route visible agent text through the live/batched display split
-    /// used by both the stream-JSON and PTY output paths.
+    /// Route visible PTY text through the live/batched display split.
+    /// PTY chunks split at arbitrary byte boundaries and already carry
+    /// their own newlines, so they never start a new segment (#470).
     fn emit_agent_text(&mut self, text: &str) {
         let sender = self.active_agent_label().to_string();
         if self.streaming_mode.is_live() {
-            self.push_or_append_agent_message(&sender, text);
+            self.push_or_append_agent_message(&sender, text, SegmentBoundary::Continuation);
         } else {
-            self.buffer_pending_agent_output(&sender, text);
+            self.buffer_pending_agent_output(&sender, text, SegmentBoundary::Continuation);
         }
     }
 
@@ -2680,6 +2721,21 @@ fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
     let mut truncated: String = text.chars().take(max_chars.saturating_sub(1)).collect();
     truncated.push('\u{2026}');
     truncated
+}
+
+/// Separator that tops `existing` up to a blank line before a new
+/// assistant segment is appended (#470): nothing when the content is
+/// empty (no leading separator) or already ends with a blank line, one
+/// newline when it ends mid-paragraph on a single newline, otherwise a
+/// full paragraph break.
+fn segment_separator(existing: &str) -> &'static str {
+    if existing.is_empty() || existing.ends_with("\n\n") {
+        ""
+    } else if existing.ends_with('\n') {
+        "\n"
+    } else {
+        "\n\n"
+    }
 }
 
 fn clean_terminal_output(data: &str) -> Option<String> {
@@ -4255,6 +4311,225 @@ mod tests {
                 .iter()
                 .any(|m| m.content.contains("Hello from split.")),
             "rejoined line must parse and render after the trailing newline arrives"
+        );
+    }
+
+    /// Regression for #470: assistant prose from before and after a tool
+    /// call arrives as two `assistant` events. They must be joined with a
+    /// paragraph break, not glued into "…the file.Now I see…".
+    #[test]
+    fn stream_json_separate_assistant_events_get_a_paragraph_break() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        let first =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"I'll read the file."}]}}"#
+                .to_string()
+                + "\n";
+        let second =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Now I see the issue."}]}}"#
+                .to_string()
+                + "\n";
+        app.push_event_message(&output_event(1, &session_id, &first));
+        app.push_event_message(&output_event(2, &session_id, &second));
+
+        let agent_messages: Vec<_> = app
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, MessageRole::Agent))
+            .collect();
+        assert_eq!(agent_messages.len(), 1, "both segments share one bubble");
+        assert_eq!(
+            agent_messages[0].content, "I'll read the file.\n\nNow I see the issue.",
+            "separate assistant events must be separated by a blank line"
+        );
+    }
+
+    /// The first segment of a bubble must render exactly as sent — the
+    /// segment boundary must not inject a leading separator (#470).
+    #[test]
+    fn stream_json_first_segment_gets_no_leading_separator() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        let chunk =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Only segment."}]}}"#
+                .to_string() + "\n";
+        app.push_event_message(&output_event(1, &session_id, &chunk));
+
+        let agent = app
+            .messages
+            .iter()
+            .find(|m| matches!(m.role, MessageRole::Agent))
+            .expect("assistant text must render");
+        assert_eq!(agent.content, "Only segment.");
+    }
+
+    /// Multiple text blocks inside ONE assistant event are separate
+    /// segments and need the same paragraph break (#470).
+    #[test]
+    fn stream_json_text_blocks_within_one_assistant_event_get_a_paragraph_break() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        let chunk = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"First thought."},{"type":"text","text":"Second thought."}]}}"#
+            .to_string()
+            + "\n";
+        app.push_event_message(&output_event(1, &session_id, &chunk));
+
+        let agent = app
+            .messages
+            .iter()
+            .find(|m| matches!(m.role, MessageRole::Agent))
+            .expect("assistant text must render");
+        assert_eq!(agent.content, "First thought.\n\nSecond thought.");
+    }
+
+    /// Prose around an inline tool_use block renders as two separate
+    /// bubbles split by the ⚒ indicator (#472) — still no gluing (#470).
+    #[test]
+    fn stream_json_prose_around_inline_tool_use_stays_split_by_the_indicator() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        let chunk = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"First thought."},{"type":"tool_use","name":"read_file","input":{}},{"type":"text","text":"Second thought."}]}}"#
+            .to_string()
+            + "\n";
+        app.push_event_message(&output_event(1, &session_id, &chunk));
+
+        let rendered: Vec<(&MessageRole, &str)> = app
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, MessageRole::Agent | MessageRole::Tool))
+            .map(|m| (&m.role, m.content.as_str()))
+            .collect();
+        assert_eq!(rendered.len(), 3, "agent, tool indicator, agent");
+        assert!(matches!(rendered[0].0, MessageRole::Agent));
+        assert_eq!(rendered[0].1, "First thought.");
+        assert!(matches!(rendered[1].0, MessageRole::Tool));
+        assert!(rendered[1].1.starts_with('\u{2692}'));
+        assert!(matches!(rendered[2].0, MessageRole::Agent));
+        assert_eq!(rendered[2].1, "Second thought.");
+    }
+
+    /// If a segment already ends with a blank line, the boundary must not
+    /// stack more newlines on top of it (#470).
+    #[test]
+    fn stream_json_segment_break_is_not_duplicated_when_text_already_ends_blank() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        let first =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Intro.\n\n"}]}}"#
+                .to_string()
+                + "\n";
+        let second =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Next."}]}}"#
+                .to_string()
+                + "\n";
+        app.push_event_message(&output_event(1, &session_id, &first));
+        app.push_event_message(&output_event(2, &session_id, &second));
+
+        let agent = app
+            .messages
+            .iter()
+            .find(|m| matches!(m.role, MessageRole::Agent))
+            .expect("assistant text must render");
+        assert_eq!(agent.content, "Intro.\n\nNext.");
+    }
+
+    /// Batched mode buffers events instead of appending to a live bubble;
+    /// the flushed message needs the same paragraph break between
+    /// assistant events as the live path (#470).
+    #[test]
+    fn batched_stream_json_assistant_events_get_a_paragraph_break() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.handle_slash_command("/stream off");
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        let first =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"I'll read the file."}]}}"#
+                .to_string()
+                + "\n";
+        let second =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Now I see the issue."}]}}"#
+                .to_string()
+                + "\n";
+        app.push_event_message(&output_event(1, &session_id, &first));
+        app.push_event_message(&output_event(2, &session_id, &second));
+
+        let result_chunk =
+            r#"{"type":"result","subtype":"success","is_error":false}"#.to_string() + "\n";
+        app.push_event_message(&output_event(3, &session_id, &result_chunk));
+
+        let agent = app
+            .messages
+            .iter()
+            .find(|m| matches!(m.role, MessageRole::Agent))
+            .expect("batched output must flush on the result event");
+        assert_eq!(
+            agent.content, "I'll read the file.\n\nNow I see the issue.",
+            "batched events must get the same blank-line separator as live ones"
+        );
+    }
+
+    /// PTY chunks carry their own newlines; the #470 segment separator is
+    /// a stream-JSON concern and must never leak into PTY appends.
+    #[test]
+    fn pty_output_appends_get_no_segment_separator() {
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "codex",
+            "Existing",
+            "running",
+        ));
+        client.events.borrow_mut().extend([
+            output_event(1, "session-1", "Hello"),
+            output_event(2, "session-1", " world"),
+        ]);
+        let (mut app, _) = app_with_client(client);
+
+        app.handle_slash_command("/attach session-1");
+
+        let agent_messages: Vec<_> = app
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, MessageRole::Agent))
+            .collect();
+        assert_eq!(agent_messages.len(), 1);
+        assert_eq!(
+            agent_messages[0].content, "Hello world",
+            "PTY appends must coalesce verbatim, without injected separators"
         );
     }
 
