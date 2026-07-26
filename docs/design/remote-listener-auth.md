@@ -73,7 +73,7 @@ What already exists — the remote listener composes with all of it:
 ### 1. Opt-in listener
 
 ```sh
-coven daemon serve --remote 0.0.0.0:7443        # explicit flag, or
+coven daemon start --remote 0.0.0.0:7443        # explicit flag, or
 # settings.json: { "daemon": { "remote": { "bind": "0.0.0.0:7443" } } }
 ```
 
