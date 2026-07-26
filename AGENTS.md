@@ -16,7 +16,7 @@ Coven is a small, boring **Rust authority layer** with TypeScript integration
 packages around it. The development loop must keep that boundary clear: core
 logic stays in Rust; the npm packages are thin integration surface.
 
-## Claim your work first — parallel sessions duplicate otherwise
+## Check, enter a worktree, then claim it
 
 Multiple agent sessions (Codex, Claude Code, familiars) frequently run against
 **the same checkout at once**, each in its own worktree. Worktrees keep git
@@ -34,7 +34,15 @@ PRs that a session then has to close. Before you touch code:
    ```
    If the issue is claimed or already has a PR, pick different work or coordinate.
 
-2. **Claim it with a shared, issue-keyed token** — not your working branch name,
+2. **Create or enter the task worktree.** The automatic fallback identity is
+   worktree-scoped, so enter the worktree before acquiring the claim:
+   ```sh
+   git fetch origin main
+   git worktree add -b <branch> /tmp/coven-<branch> origin/main
+   cd /tmp/coven-<branch>
+   ```
+
+3. **Claim it with a shared, issue-keyed token** — not your working branch name,
    which no other session can predict:
    ```sh
    coven claim acquire issue-<N>     # e.g. issue-311; a TTL-bounded lock
@@ -43,22 +51,22 @@ PRs that a session then has to close. Before you touch code:
    worktree and session sees them. For long tasks, extend the TTL with
    `coven claim heartbeat issue-<N>`.
 
-3. **Release when your PR merges or you stop:** `coven claim release issue-<N>`.
+4. **Release from the same worktree when your PR merges or you stop:**
+   `coven claim release issue-<N>`.
 
 This step is cheap and it is the single thing that prevents duplicate-PR churn.
+Without an explicit `COVEN_AGENT_ID`, Coven identifies the owner as
+`$USER@<worktree-slug>`. Set distinct explicit IDs only when multiple agents
+must share one worktree.
 
 ## Branch & PR workflow (all agents)
 
-- **Claim the issue first** (see above) — `coven claim status` + `gh pr list`
-  before starting, then `coven claim acquire issue-<N>`.
+- **Coordinate before editing** (see above) — check `coven claim status` and
+  `gh pr list`, enter a fresh worktree, then acquire `issue-<N>` from inside it.
 - **Never push to `main`.** Every change lands via a PR with green CI. Branch
   from current `origin/main`.
-- **Fresh branch per task.** If multiple sessions may touch this repo, work in a
-  git worktree so operations don't race:
-  ```sh
-  git fetch origin main
-  git worktree add -b <branch> /tmp/coven-<branch> origin/main
-  ```
+- **Fresh branch per task.** If multiple sessions may touch this repo, use the
+  task worktree created before claim acquisition so operations don't race.
 - Keep the diff **scoped to one concern**; no drive-by refactors in a feature PR.
 - Conventional-commit subjects: `feat:`, `fix:`, `docs:`, `chore:`, `refactor:`.
 - For larger changes, **start from an issue** and include the readiness packet

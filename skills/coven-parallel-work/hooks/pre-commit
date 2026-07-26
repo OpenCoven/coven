@@ -14,11 +14,29 @@
 
 set -euo pipefail
 
+slug_worktree() {
+  printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '-' | sed -e 's/^-*//' -e 's/-*$//'
+}
+
 repo_root=$(git rev-parse --show-toplevel)
 git_common=$(git rev-parse --git-common-dir)
 primary=${COVEN_PRIMARY_BRANCH:-main}
 branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
-agent=${COVEN_AGENT_ID:-${USER:-unknown}}
+worktree_name=${repo_root##*/}
+worktree_slug=$(slug_worktree "$worktree_name")
+[ -n "$worktree_slug" ] || worktree_slug=worktree
+nonblank() {
+  [ -n "$(printf '%s' "$1" | tr -d '[:space:]')" ]
+}
+base_user=${USER:-}
+if ! nonblank "$base_user"; then
+  base_user=unknown-agent
+fi
+fallback_agent=${base_user}@${worktree_slug}
+agent=${COVEN_AGENT_ID:-}
+if ! nonblank "$agent"; then
+  agent=$fallback_agent
+fi
 
 red()    { printf '\033[31m%s\033[0m\n' "$*" >&2; }
 yellow() { printf '\033[33m%s\033[0m\n' "$*" >&2; }

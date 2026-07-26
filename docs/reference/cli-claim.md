@@ -14,7 +14,7 @@ the same issue.
 
 ```sh
 coven claim status              # what is already taken?
-coven claim acquire issue-42    # claim before touching code
+coven claim acquire issue-42    # run inside the task worktree before editing
 coven claim heartbeat issue-42  # extend the TTL on long tasks
 coven claim release issue-42    # release when the PR merges or you stop
 ```
@@ -26,8 +26,12 @@ over working-branch names, which other sessions cannot predict.
 
 Claims are files under `<git-common-dir>/agent-claims/`, so every worktree of
 the repository sees the same registry. The claiming identity comes from
-`COVEN_AGENT_ID` (falling back to `USER`). A claim expires after one hour by
-default; override with `COVEN_CLAIM_TTL_SECONDS`.
+an explicit `COVEN_AGENT_ID`, or defaults to
+`$USER@<worktree-slug>` when that variable is unset. Enter the task worktree
+before acquiring, then heartbeat and release from the same worktree. If `USER`
+is also blank or unset, its component becomes `unknown-agent`. Multiple agents
+sharing one worktree must set distinct explicit IDs. A claim expires after one
+hour by default; override with `COVEN_CLAIM_TTL_SECONDS`.
 
 - `acquire` fails while another agent's claim is active. The claim file is
   created exclusively, so when several sessions race for the same free or
@@ -51,7 +55,7 @@ coven claim status --json
   "claims": [
     {
       "branch": "issue-42",
-      "agent_id": "buns",
+      "agent_id": "buns@fix-42",
       "state": "active",
       "acquired_at": 1784078000,
       "acquired_at_rfc3339": "2026-07-15T01:53:20Z",

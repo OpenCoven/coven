@@ -199,7 +199,8 @@ Coven Parallel Work Protocol for multi-agent repositories.
 
 - `coven wt <branch>` creates or enters `<repo>.wt/<branch-slug>/`.
 - `coven claim acquire <branch>` writes a TTL-bounded branch claim under git's
-  common directory. Set `COVEN_AGENT_ID` to a stable agent name.
+  common directory. Run it inside the task worktree; the owner defaults to
+  `$USER@<worktree-slug>`, while an explicit `COVEN_AGENT_ID` overrides it.
 - `coven hooks install` installs `pre-commit` and `pre-push` hooks. Existing
   hooks are chained through `<hook>.local`; tracked `core.hooksPath`
   directories are left untouched.

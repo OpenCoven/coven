@@ -82,7 +82,7 @@ to modify it automatically and prints integration options.
 | `COVEN_PRIMARY_BRANCH` | `main` | Primary branch protected by pre-commit and pre-push. |
 | `COVEN_PROTECTED_REGEX` | `^(release\|hotfix)/` | Additional protected branch names for pre-push. |
 | `COVEN_MERGE_PHRASE` | `Enchant merge to main.` | Required exact text in `.git/MERGE_INTENT` before protected pushes. |
-| `COVEN_AGENT_ID` | `$USER` | Stable agent identity for claim ownership. |
+| `COVEN_AGENT_ID` | `$USER@<worktree-slug>` | Stable agent identity for claim ownership. |
 | `COVEN_CLAIM_TTL_SECONDS` | `3600` | Claim lifetime before another agent may acquire it. |
 | `COVEN_ALLOW_PRIMARY_COMMIT` | unset | Set to `1` only for explicit human-approved primary commits. |
 
@@ -100,3 +100,7 @@ share the same protocol state:
 
 Claim files use simple `key=value` fields so shell hooks can read them without a
 runtime dependency.
+
+The fallback identity is scoped to the current worktree. Run `claim acquire`,
+`heartbeat`, and `release` from that worktree. If multiple agents intentionally
+share one worktree, give each a distinct explicit `COVEN_AGENT_ID`.

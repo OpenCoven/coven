@@ -86,7 +86,7 @@ pub(crate) fn run_wt_command(
 
 pub(crate) fn claim_acquire(branch: &str) -> Result<()> {
     let repo = Repo::discover()?;
-    let agent_id = agent_id();
+    let agent_id = agent_id(&repo);
 
     // Creating the claim file is the only step that decides the race, so it
     // has to be the same step that tests for a free slot: a separate
@@ -164,7 +164,7 @@ pub(crate) fn claim_acquire(branch: &str) -> Result<()> {
 
 pub(crate) fn claim_release(branch: &str) -> Result<()> {
     let repo = Repo::discover()?;
-    let agent_id = agent_id();
+    let agent_id = agent_id(&repo);
     match read_claim(&repo, branch)? {
         ClaimFileState::Parsed(existing) => {
             if existing.is_active(unix_now()) && existing.agent_id != agent_id {
@@ -193,7 +193,7 @@ pub(crate) fn claim_release(branch: &str) -> Result<()> {
 
 pub(crate) fn claim_heartbeat(branch: &str) -> Result<()> {
     let repo = Repo::discover()?;
-    let agent_id = agent_id();
+    let agent_id = agent_id(&repo);
     let now = unix_now();
     let mut claim = match read_claim(&repo, branch)? {
         ClaimFileState::Parsed(claim) => claim,
@@ -1078,12 +1078,25 @@ fn primary_branch() -> String {
     std::env::var("COVEN_PRIMARY_BRANCH").unwrap_or_else(|_| DEFAULT_PRIMARY_BRANCH.to_string())
 }
 
-fn agent_id() -> String {
-    std::env::var("COVEN_AGENT_ID")
+fn agent_id(repo: &Repo) -> String {
+    if let Some(agent_id) = std::env::var("COVEN_AGENT_ID")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| std::env::var("USER").ok())
-        .unwrap_or_else(|| "unknown-agent".to_string())
+    {
+        return agent_id;
+    }
+
+    let user = std::env::var("USER")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "unknown-agent".to_string());
+    let worktree = repo
+        .root
+        .file_name()
+        .map(|name| branch_slug(&name.to_string_lossy()))
+        .filter(|slug| !slug.is_empty())
+        .unwrap_or_else(|| "worktree".to_string());
+    format!("{user}@{worktree}")
 }
 
 fn claim_ttl_seconds() -> u64 {
@@ -1117,7 +1130,22 @@ claim_value() {
 
 branch="$(git symbolic-ref --quiet --short HEAD || true)"
 primary="${COVEN_PRIMARY_BRANCH:-main}"
-agent="${COVEN_AGENT_ID:-${USER:-unknown-agent}}"
+repo_root="$(git rev-parse --show-toplevel)"
+worktree_name="${repo_root##*/}"
+worktree_slug="$(slug_branch "$worktree_name")"
+[ -n "$worktree_slug" ] || worktree_slug="worktree"
+nonblank() {
+  [ -n "$(printf '%s' "$1" | tr -d '[:space:]')" ]
+}
+base_user="${USER:-}"
+if ! nonblank "$base_user"; then
+  base_user="unknown-agent"
+fi
+fallback_agent="${base_user}@${worktree_slug}"
+agent="${COVEN_AGENT_ID:-}"
+if ! nonblank "$agent"; then
+  agent="$fallback_agent"
+fi
 common_dir="$(git rev-parse --git-common-dir)"
 
 if [ "$branch" = "$primary" ] && [ "${COVEN_ALLOW_PRIMARY_COMMIT:-}" != "1" ]; then
@@ -1152,7 +1180,6 @@ if [ -f "$canary" ] && [ -n "$branch" ]; then
   fi
 fi
 
-repo_root="$(git rev-parse --show-toplevel)"
 privacy_guard="$repo_root/scripts/check-coven-privacy.py"
 if [ -f "$privacy_guard" ]; then
   if command -v python3 >/dev/null 2>&1; then

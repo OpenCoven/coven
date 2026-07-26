@@ -67,6 +67,105 @@ fn claim_acquire_blocks_other_agent_until_release() -> anyhow::Result<()> {
 }
 
 #[test]
+fn default_claim_identity_blocks_same_user_in_another_worktree() -> anyhow::Result<()> {
+    let repo = TestRepo::new()?;
+    let first_worktree = repo.add_worktree("first-session", "feature/first-session")?;
+    let second_worktree = repo.add_worktree("second-session", "feature/second-session")?;
+
+    let acquired = repo.coven_in_with_env(
+        &first_worktree,
+        ["claim", "acquire", "issue-demo"],
+        [("USER", "val")],
+    )?;
+    assert_success("claim acquire from first worktree", &acquired);
+
+    let blocked = repo.coven_in_with_env(
+        &second_worktree,
+        ["claim", "acquire", "issue-demo"],
+        [("USER", "val")],
+    )?;
+    assert_failure("claim acquire from second worktree", &blocked);
+    assert_stderr_contains(
+        "claim acquire from second worktree",
+        &blocked,
+        "already claimed by val@first-session",
+    );
+    assert_eq!(
+        repo.claim_field("issue-demo", "agent_id")?,
+        "val@first-session"
+    );
+    Ok(())
+}
+
+#[test]
+fn default_claim_identity_supports_same_worktree_lifecycle() -> anyhow::Result<()> {
+    let repo = TestRepo::new()?;
+    let worktree = repo.add_worktree("one-session", "feature/one-session")?;
+    let env = [("USER", "val")];
+
+    let acquired = repo.coven_in_with_env(&worktree, ["claim", "acquire", "issue-demo"], env)?;
+    assert_success("claim acquire with fallback identity", &acquired);
+    assert_eq!(
+        repo.claim_field("issue-demo", "agent_id")?,
+        "val@one-session"
+    );
+
+    let heartbeat = repo.coven_in_with_env(&worktree, ["claim", "heartbeat", "issue-demo"], env)?;
+    assert_success("claim heartbeat with fallback identity", &heartbeat);
+
+    let released = repo.coven_in_with_env(&worktree, ["claim", "release", "issue-demo"], env)?;
+    assert_success("claim release with fallback identity", &released);
+    assert!(
+        !repo.claim_path("issue-demo")?.exists(),
+        "release should remove the claim"
+    );
+    Ok(())
+}
+
+#[test]
+fn default_claim_identity_handles_blank_user() -> anyhow::Result<()> {
+    let repo = TestRepo::new()?;
+    let worktree = repo.add_worktree("one-session", "feature/one-session")?;
+    let env = [("USER", "   "), ("COVEN_AGENT_ID", "   ")];
+
+    let acquired = repo.coven_in_with_env(&worktree, ["claim", "acquire", "issue-demo"], env)?;
+    assert_success("claim acquire with blank user", &acquired);
+    assert_eq!(
+        repo.claim_field("issue-demo", "agent_id")?,
+        "unknown-agent@one-session"
+    );
+
+    let heartbeat = repo.coven_in_with_env(&worktree, ["claim", "heartbeat", "issue-demo"], env)?;
+    assert_success("claim heartbeat with blank user", &heartbeat);
+
+    let released = repo.coven_in_with_env(&worktree, ["claim", "release", "issue-demo"], env)?;
+    assert_success("claim release with blank user", &released);
+    assert!(
+        !repo.claim_path("issue-demo")?.exists(),
+        "release should remove the claim"
+    );
+    Ok(())
+}
+
+#[test]
+fn explicit_agent_identity_remains_authoritative_across_worktrees() -> anyhow::Result<()> {
+    let repo = TestRepo::new()?;
+    let first_worktree = repo.add_worktree("first-session", "feature/first-session")?;
+    let second_worktree = repo.add_worktree("second-session", "feature/second-session")?;
+    let env = [("COVEN_AGENT_ID", "cody")];
+
+    let acquired =
+        repo.coven_in_with_env(&first_worktree, ["claim", "acquire", "issue-demo"], env)?;
+    assert_success("claim acquire with explicit identity", &acquired);
+
+    let refreshed =
+        repo.coven_in_with_env(&second_worktree, ["claim", "acquire", "issue-demo"], env)?;
+    assert_success("claim refresh with explicit identity", &refreshed);
+    assert_eq!(repo.claim_field("issue-demo", "agent_id")?, "cody");
+    Ok(())
+}
+
+#[test]
 fn concurrent_claim_acquire_yields_exactly_one_winner() -> anyhow::Result<()> {
     let repo = TestRepo::new()?;
 
@@ -391,6 +490,61 @@ fn installed_hooks_block_primary_commits_and_claim_conflicts() -> anyhow::Result
 }
 
 #[test]
+fn managed_hook_uses_worktree_scoped_default_identity() -> anyhow::Result<()> {
+    let repo = TestRepo::new()?;
+    let install = repo.coven(["hooks", "install"])?;
+    assert_success("hooks install", &install);
+
+    repo.git(["checkout", "-b", "feature/demo"])?;
+    let owner_env = [("USER", "val")];
+    let claim = repo.coven_with_env(["claim", "acquire", "feature/demo"], owner_env)?;
+    assert_success("claim feature/demo with fallback identity", &claim);
+    assert_eq!(repo.claim_field("feature/demo", "agent_id")?, "val@project");
+
+    fs::write(repo.path.join("main.txt"), "allowed\n")?;
+    let allowed = repo.git_output(["commit", "-am", "allowed by fallback owner"], owner_env)?;
+    assert_success("commit with fallback owning identity", &allowed);
+
+    let released = repo.coven_with_env(["claim", "release", "feature/demo"], owner_env)?;
+    assert_success("release fallback-owned claim", &released);
+    let other_worktree = repo.add_worktree("other-session", "feature/other-session")?;
+    let other_claim = repo.coven_in_with_env(
+        &other_worktree,
+        ["claim", "acquire", "feature/demo"],
+        owner_env,
+    )?;
+    assert_success("claim from another worktree", &other_claim);
+
+    fs::write(repo.path.join("main.txt"), "blocked\n")?;
+    let blocked = repo.git_output(["commit", "-am", "blocked by other worktree"], owner_env)?;
+    assert_failure("commit against another worktree's claim", &blocked);
+    assert_stderr_contains(
+        "commit against another worktree's claim",
+        &blocked,
+        "claimed by val@other-session",
+    );
+    Ok(())
+}
+
+#[test]
+fn managed_hook_treats_blank_explicit_agent_id_as_unset() -> anyhow::Result<()> {
+    let repo = TestRepo::new()?;
+    let install = repo.coven(["hooks", "install"])?;
+    assert_success("hooks install", &install);
+
+    repo.git(["checkout", "-b", "feature/demo"])?;
+    let env = [("USER", "val"), ("COVEN_AGENT_ID", "   ")];
+    let claim = repo.coven_with_env(["claim", "acquire", "feature/demo"], env)?;
+    assert_success("claim with blank explicit identity", &claim);
+    assert_eq!(repo.claim_field("feature/demo", "agent_id")?, "val@project");
+
+    fs::write(repo.path.join("main.txt"), "allowed\n")?;
+    let allowed = repo.git_output(["commit", "-am", "allowed by fallback owner"], env)?;
+    assert_success("commit with blank explicit identity", &allowed);
+    Ok(())
+}
+
+#[test]
 fn installed_pre_push_requires_merge_intent_for_primary_and_consumes_it() -> anyhow::Result<()> {
     let repo = TestRepo::new()?;
     let remote_dir = tempfile::tempdir()?;
@@ -450,10 +604,19 @@ impl TestRepo {
         args: [&str; N],
         env: [(&str, &str); M],
     ) -> anyhow::Result<Output> {
+        self.coven_in_with_env(&self.path, args, env)
+    }
+
+    fn coven_in_with_env<const N: usize, const M: usize>(
+        &self,
+        cwd: &Path,
+        args: [&str; N],
+        env: [(&str, &str); M],
+    ) -> anyhow::Result<Output> {
         let mut command = Command::new(coven_bin());
         command
             .args(args)
-            .current_dir(&self.path)
+            .current_dir(cwd)
             .env("COVEN_HOME", self.path.join(".coven-home"))
             .env_remove("COVEN_AGENT_ID")
             .env_remove("COVEN_ALLOW_PRIMARY_COMMIT");
@@ -461,6 +624,13 @@ impl TestRepo {
             command.env(key, value);
         }
         command.output().map_err(Into::into)
+    }
+
+    fn add_worktree(&self, name: &str, branch: &str) -> anyhow::Result<PathBuf> {
+        let path = self._temp.path().join(name);
+        let output = self.git_os(["worktree", "add", "-b", branch], [&path])?;
+        assert_success("git worktree add", &output);
+        Ok(path)
     }
 
     fn git<const N: usize>(&self, args: [&str; N]) -> anyhow::Result<String> {
@@ -504,7 +674,7 @@ impl TestRepo {
         Ok(self.git_common_dir()?.join("agent-claims"))
     }
 
-    fn claim_field(&self, branch: &str, key: &str) -> anyhow::Result<String> {
+    fn claim_path(&self, branch: &str) -> anyhow::Result<PathBuf> {
         let slug: String = branch
             .chars()
             .map(|ch| {
@@ -515,7 +685,11 @@ impl TestRepo {
                 }
             })
             .collect();
-        let path = self.claims_dir()?.join(slug.trim_matches('-'));
+        Ok(self.claims_dir()?.join(slug.trim_matches('-')))
+    }
+
+    fn claim_field(&self, branch: &str, key: &str) -> anyhow::Result<String> {
+        let path = self.claim_path(branch)?;
         let contents = fs::read_to_string(&path)
             .map_err(|err| anyhow::anyhow!("reading {}: {err}", path.display()))?;
         contents

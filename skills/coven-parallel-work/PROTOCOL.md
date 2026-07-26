@@ -45,8 +45,8 @@ on the same FS path. Mitigations layered on top of git can.
    `core.hooksPath` set, secret-scanning hooks, husky, etc. must keep
    working. The protocol chains, never silently replaces.
 6. **Identifiable.** Each participant has a stable, opaque identity
-   (`COVEN_AGENT_ID`). Defaults to `$USER` if unset, so the protocol
-   degrades gracefully on machines with one human and one AI.
+   (`COVEN_AGENT_ID`). Without an explicit value, identity defaults to
+   `$USER@<worktree-slug>` so same-user sibling worktrees remain distinct.
 
 ## 3. Concepts
 
@@ -80,10 +80,14 @@ absolute path elsewhere) are non-conforming for protocol purposes.
 
 `$COVEN_AGENT_ID` — short, stable, opaque string that identifies the
 agent occupying a shell. Examples: `nova`, `codex-a`, `claude-code`,
-`hermes`. If unset, identity falls back to `$USER`.
+`hermes`. If unset, identity falls back to `$USER@<worktree-slug>`, where the
+slug is the sanitized basename of the current worktree root. A blank or unset
+`USER` becomes `unknown-agent`.
 
 Agents SHOULD set this once at session start (in their familiar's startup
-file, harness config, or shell rc).
+file, harness config, or shell rc) when multiple agents share one worktree.
+Otherwise, they SHOULD enter the task worktree before acquiring and run later
+heartbeat/release commands there.
 
 ### 3.3 Branch claims
 
@@ -98,7 +102,7 @@ the repo's git common dir:
 Claim file format (key=value lines):
 
 ```
-agent=<COVEN_AGENT_ID>
+agent=<effective-agent-id>
 branch=<branch>
 acquired=<unix-seconds>
 ttl_until=<unix-seconds>
@@ -155,7 +159,8 @@ A conforming pre-commit hook MUST refuse the commit if any of:
 1. **Primary-branch guard.** Current branch equals the primary branch
    AND `$COVEN_ALLOW_PRIMARY_COMMIT` is not `1`.
 2. **Claim conflict.** A claim file exists for the current branch, the
-   claim is unexpired, and `agent=` differs from `$COVEN_AGENT_ID`.
+   claim is unexpired, and `agent=` differs from the effective agent identity
+   (explicit `COVEN_AGENT_ID`, otherwise `$USER@<worktree-slug>`).
 3. **HEAD canary.** Canary file exists, the recorded HEAD differs from
    current HEAD, and recorded HEAD is not an ancestor of current HEAD.
 
@@ -214,7 +219,7 @@ than refusing.
 | `COVEN_PRIMARY_BRANCH` | `main` | repo or session | Protected primary branch name |
 | `COVEN_PROTECTED_REGEX` | `^(release\|hotfix)/` | repo or session | Other protected branch pattern (POSIX ERE) |
 | `COVEN_MERGE_PHRASE` | `Enchant merge to main.` | repo or session | Canonical user intent phrase, exact match |
-| `COVEN_AGENT_ID` | `$USER` | session | Stable agent identity |
+| `COVEN_AGENT_ID` | `$USER@<worktree-slug>` | session | Stable agent identity; set explicitly for multiple agents in one worktree |
 | `COVEN_REPO_ROOT` | autodetect | session | Override primary repo root |
 | `COVEN_ALLOW_PRIMARY_COMMIT` | unset | session | Allow commits on primary (rare) |
 

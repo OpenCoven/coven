@@ -90,9 +90,9 @@ cv-claim canary  feat/my-thing      # snapshots HEAD for the canary check
 
 Set `COVEN_AGENT_ID` per familiar (e.g. `nova`, `cody`, `kitty`,
 `charm`, `astra`, `echo`). For OpenClaw familiars, this should be in
-your familiar's config or shell rc. If unset, identity falls back to
-`$USER`, which is fine on a single-human-one-AI machine but fails the
-moment you have multiple AIs.
+your familiar's config or shell rc when multiple familiars share one
+worktree. If unset, identity falls back to `$USER@<worktree-slug>`, so enter
+the worktree before acquiring and run heartbeat/release commands there.
 
 ### During long sessions
 
