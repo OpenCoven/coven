@@ -31,9 +31,12 @@ default; override with `COVEN_CLAIM_TTL_SECONDS`.
 
 - `acquire` fails while another agent's claim is active. The claim file is
   created exclusively, so when several sessions race for the same free or
-  expired token, exactly one of them is told it succeeded.
+  expired token, exactly one of them is told it succeeded. A partial claim
+  abandoned during creation remains contended for 30 seconds, then becomes
+  eligible for the same locked takeover path as an expired claim.
 - `release` refuses to remove another agent's active claim.
 - `heartbeat` re-acquires or extends your own claim for another TTL window.
+  Both `release` and `heartbeat` fail closed on a fresh incomplete claim.
 - `canary <branch>` records the current HEAD in `<git-common-dir>/AGENT_HEAD_AT_START`
   so the managed pre-commit hook can detect history rewrites.
 

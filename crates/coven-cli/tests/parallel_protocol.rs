@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::SystemTime;
 
 #[test]
 fn wt_creates_sibling_worktree_and_lists_protocol_state() -> anyhow::Result<()> {
@@ -182,6 +183,72 @@ fn claim_acquire_does_not_steal_an_incomplete_claim() -> anyhow::Result<()> {
         "contended",
     );
     assert_eq!(fs::read(&claim_path)?, b"");
+    Ok(())
+}
+
+#[test]
+fn claim_acquire_recovers_an_abandoned_incomplete_claim() -> anyhow::Result<()> {
+    let repo = TestRepo::new()?;
+    let claims_dir = repo.claims_dir()?;
+    fs::create_dir_all(&claims_dir)?;
+    let claim_path = claims_dir.join("feature-demo");
+    fs::write(&claim_path, "")?;
+    fs::File::options()
+        .write(true)
+        .open(&claim_path)?
+        .set_times(
+            fs::FileTimes::new()
+                .set_accessed(SystemTime::UNIX_EPOCH)
+                .set_modified(SystemTime::UNIX_EPOCH),
+        )?;
+
+    let acquire = repo.coven_with_env(
+        ["claim", "acquire", "feature/demo"],
+        [("COVEN_AGENT_ID", "sage")],
+    )?;
+    assert_success("claim acquire after abandoned initial write", &acquire);
+    assert_eq!(repo.claim_field("feature/demo", "agent_id")?, "sage");
+    Ok(())
+}
+
+#[test]
+fn claim_release_rejects_an_incomplete_claim() -> anyhow::Result<()> {
+    let repo = TestRepo::new()?;
+    fs::create_dir_all(repo.claims_dir()?)?;
+    fs::write(repo.claims_dir()?.join("feature-demo"), "")?;
+
+    let release = repo.coven_with_env(
+        ["claim", "release", "feature/demo"],
+        [("COVEN_AGENT_ID", "sage")],
+    )?;
+    assert_failure("claim release while initial write is incomplete", &release);
+    assert_stderr_contains(
+        "claim release while initial write is incomplete",
+        &release,
+        "incomplete",
+    );
+    Ok(())
+}
+
+#[test]
+fn claim_heartbeat_rejects_an_incomplete_claim() -> anyhow::Result<()> {
+    let repo = TestRepo::new()?;
+    fs::create_dir_all(repo.claims_dir()?)?;
+    fs::write(repo.claims_dir()?.join("feature-demo"), "")?;
+
+    let heartbeat = repo.coven_with_env(
+        ["claim", "heartbeat", "feature/demo"],
+        [("COVEN_AGENT_ID", "sage")],
+    )?;
+    assert_failure(
+        "claim heartbeat while initial write is incomplete",
+        &heartbeat,
+    );
+    assert_stderr_contains(
+        "claim heartbeat while initial write is incomplete",
+        &heartbeat,
+        "incomplete",
+    );
     Ok(())
 }
 

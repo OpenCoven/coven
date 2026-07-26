@@ -14,6 +14,10 @@ const CLAIM_ACQUIRE_ATTEMPTS: usize = 8;
 /// A takeover holds its lock for two syscalls, so anything older than this was
 /// abandoned by a process that died mid-takeover.
 const TAKEOVER_LOCK_STALE: Duration = Duration::from_secs(30);
+/// Initial claim writes normally finish within one syscall-sized critical
+/// window. An incomplete file older than this was abandoned by a process that
+/// died after `create_new` published the directory entry.
+const INCOMPLETE_CLAIM_STALE: Duration = Duration::from_secs(30);
 const DEFAULT_PRIMARY_BRANCH: &str = "main";
 const MANAGED_HOOK_MARKER: &str = "Coven Parallel Work Protocol managed hook";
 
@@ -30,6 +34,13 @@ struct Claim {
     acquired_at: u64,
     expires_at: u64,
     head: Option<String>,
+}
+
+#[derive(Debug)]
+enum ClaimFileState {
+    Missing,
+    Incomplete,
+    Parsed(Claim),
 }
 
 #[derive(Debug)]
@@ -99,14 +110,26 @@ pub(crate) fn claim_acquire(branch: &str) -> Result<()> {
         // Someone holds the slot. Re-read to decide whether it is ours to
         // refresh, someone else's to respect, or expired and up for grabs.
         match read_claim(&repo, branch)? {
-            None => {
-                // `create_new` publishes the directory entry before the
-                // winner finishes writing the claim body. An empty or partial
-                // file is therefore contended, not abandoned: retrying gives
-                // the writer time to finish without letting a loser steal it.
+            ClaimFileState::Missing => {
+                // A takeover lock may temporarily protect a missing slot, or
+                // the owner may change between the failed create and this
+                // read. Retry without treating either state as free.
                 std::thread::sleep(Duration::from_millis(20));
             }
-            Some(existing) if existing.is_active(now) && existing.agent_id != agent_id => {
+            ClaimFileState::Incomplete => {
+                // A fresh partial file belongs to a writer still publishing
+                // its exclusive-create win. Once stale, recover it under the
+                // same lock used for expired-claim takeover.
+                if incomplete_claim_is_stale(&repo, branch) && try_takeover(&repo, branch, &claim)?
+                {
+                    println!("claimed {branch} for {agent_id} until {}", claim.expires_at);
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            ClaimFileState::Parsed(existing)
+                if existing.is_active(now) && existing.agent_id != agent_id =>
+            {
                 anyhow::bail!(
                     "{} is already claimed by {} until {}",
                     branch,
@@ -114,7 +137,7 @@ pub(crate) fn claim_acquire(branch: &str) -> Result<()> {
                     existing.expires_at
                 );
             }
-            Some(existing) if existing.is_active(now) => {
+            ClaimFileState::Parsed(existing) if existing.is_active(now) => {
                 // Our own live claim: extend it in place rather than
                 // reporting a conflict against ourselves.
                 debug_assert_eq!(existing.agent_id, agent_id);
@@ -126,7 +149,7 @@ pub(crate) fn claim_acquire(branch: &str) -> Result<()> {
             // lock: unlike a free slot, this transition cannot be arbitrated
             // by `create_new` (the file already exists), and it must never
             // leave the slot empty or a concurrent creator could slip in.
-            Some(_) => {
+            ClaimFileState::Parsed(_) => {
                 if try_takeover(&repo, branch, &claim)? {
                     println!("claimed {branch} for {agent_id} until {}", claim.expires_at);
                     return Ok(());
@@ -142,20 +165,28 @@ pub(crate) fn claim_acquire(branch: &str) -> Result<()> {
 pub(crate) fn claim_release(branch: &str) -> Result<()> {
     let repo = Repo::discover()?;
     let agent_id = agent_id();
-    if let Some(existing) = read_claim(&repo, branch)? {
-        if existing.is_active(unix_now()) && existing.agent_id != agent_id {
+    match read_claim(&repo, branch)? {
+        ClaimFileState::Parsed(existing) => {
+            if existing.is_active(unix_now()) && existing.agent_id != agent_id {
+                anyhow::bail!(
+                    "{} is claimed by {}; {} cannot release it",
+                    branch,
+                    existing.agent_id,
+                    agent_id
+                );
+            }
+            fs::remove_file(claim_path(&repo, branch))
+                .with_context(|| format!("failed to release claim for {branch}"))?;
+            println!("released {branch}");
+        }
+        ClaimFileState::Incomplete => {
             anyhow::bail!(
-                "{} is claimed by {}; {} cannot release it",
-                branch,
-                existing.agent_id,
-                agent_id
+                "claim file for {branch} is incomplete; refusing to release ambiguous ownership"
             );
         }
-        fs::remove_file(claim_path(&repo, branch))
-            .with_context(|| format!("failed to release claim for {branch}"))?;
-        println!("released {branch}");
-    } else {
-        println!("no claim for {branch}");
+        ClaimFileState::Missing => {
+            println!("no claim for {branch}");
+        }
     }
     Ok(())
 }
@@ -164,13 +195,21 @@ pub(crate) fn claim_heartbeat(branch: &str) -> Result<()> {
     let repo = Repo::discover()?;
     let agent_id = agent_id();
     let now = unix_now();
-    let mut claim = read_claim(&repo, branch)?.unwrap_or_else(|| Claim {
-        branch: branch.to_string(),
-        agent_id: agent_id.clone(),
-        acquired_at: now,
-        expires_at: now,
-        head: current_head().ok(),
-    });
+    let mut claim = match read_claim(&repo, branch)? {
+        ClaimFileState::Parsed(claim) => claim,
+        ClaimFileState::Missing => Claim {
+            branch: branch.to_string(),
+            agent_id: agent_id.clone(),
+            acquired_at: now,
+            expires_at: now,
+            head: current_head().ok(),
+        },
+        ClaimFileState::Incomplete => {
+            anyhow::bail!(
+                "claim file for {branch} is incomplete; refusing to heartbeat ambiguous ownership"
+            );
+        }
+    };
     if claim.is_active(now) && claim.agent_id != agent_id {
         anyhow::bail!(
             "{} is claimed by {}; {} cannot heartbeat it",
@@ -210,7 +249,7 @@ pub(crate) fn claim_status(json: bool) -> Result<()> {
                 let path = entry.path();
                 read_claim_file(&path)
                     .ok()
-                    .flatten()
+                    .and_then(ClaimFileState::into_parsed)
                     .filter(|claim| claim_path(&repo, &claim.branch) == path)
             })
             .collect::<Vec<_>>()
@@ -334,7 +373,8 @@ fn wt_list(repo: &Repo, json: bool) -> Result<()> {
         let claimed_by = worktree
             .branch
             .as_deref()
-            .and_then(|branch| read_claim(repo, branch).ok().flatten())
+            .and_then(|branch| read_claim(repo, branch).ok())
+            .and_then(ClaimFileState::into_parsed)
             .filter(|claim| claim.is_active(now))
             .map(|claim| claim.agent_id);
         rows.push(WorktreeRow {
@@ -632,7 +672,7 @@ fn create_claim_exclusive(repo: &Repo, claim: &Claim) -> Result<bool> {
             takeover_lock.display()
         )
     })? {
-        if lock_is_stale(&takeover_lock) {
+        if path_is_stale(&takeover_lock, TAKEOVER_LOCK_STALE) {
             let _ = fs::remove_file(&takeover_lock);
         } else {
             // A releaser can remove an expired claim while its winner holds
@@ -754,10 +794,16 @@ fn try_takeover(repo: &Repo, branch: &str, claim: &Claim) -> Result<bool> {
     // changed while we were contending for it.
     let now = unix_now();
     match read_claim(repo, branch)? {
-        Some(existing) if existing.is_active(now) && existing.agent_id != claim.agent_id => {
+        ClaimFileState::Parsed(existing)
+            if existing.is_active(now) && existing.agent_id != claim.agent_id =>
+        {
             Ok(false)
         }
-        Some(_) => {
+        ClaimFileState::Parsed(_) => {
+            replace_claim(repo, claim)?;
+            Ok(true)
+        }
+        ClaimFileState::Incomplete if incomplete_claim_is_stale(repo, branch) => {
             replace_claim(repo, claim)?;
             Ok(true)
         }
@@ -765,7 +811,7 @@ fn try_takeover(repo: &Repo, branch: &str, claim: &Claim) -> Result<bool> {
         // to take it over. With no file left to replace, drop the lock and let
         // the next free-slot acquisition use `create_new`; recreating it here
         // would race that path and could report two winners.
-        None => Ok(false),
+        ClaimFileState::Missing | ClaimFileState::Incomplete => Ok(false),
     }
 }
 
@@ -787,7 +833,7 @@ impl TakeoverLock {
                 // The critical section is two syscalls long, so a lock this
                 // old belongs to a process that died holding it. Breaking it
                 // only returns us to contending for the same lock.
-                if lock_is_stale(&path) {
+                if path_is_stale(&path, TAKEOVER_LOCK_STALE) {
                     let _ = fs::remove_file(&path);
                 }
                 Ok(None)
@@ -805,7 +851,7 @@ impl Drop for TakeoverLock {
     }
 }
 
-fn lock_is_stale(path: &Path) -> bool {
+fn path_is_stale(path: &Path, stale_after: Duration) -> bool {
     let Ok(modified) = fs::metadata(path).and_then(|meta| meta.modified()) else {
         return false;
     };
@@ -813,7 +859,7 @@ fn lock_is_stale(path: &Path) -> bool {
     // is the safe direction: we wait instead of breaking someone's lock.
     SystemTime::now()
         .duration_since(modified)
-        .map(|age| age > TAKEOVER_LOCK_STALE)
+        .map(|age| age > stale_after)
         .unwrap_or(false)
 }
 
@@ -829,16 +875,24 @@ fn write_claim(repo: &Repo, claim: &Claim) -> Result<()> {
     replace_claim(repo, claim)
 }
 
-fn read_claim(repo: &Repo, branch: &str) -> Result<Option<Claim>> {
+fn incomplete_claim_is_stale(repo: &Repo, branch: &str) -> bool {
+    path_is_stale(&claim_path(repo, branch), INCOMPLETE_CLAIM_STALE)
+}
+
+fn read_claim(repo: &Repo, branch: &str) -> Result<ClaimFileState> {
     read_claim_file(&claim_path(repo, branch))
 }
 
-fn read_claim_file(path: &Path) -> Result<Option<Claim>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("failed to read claim {}", path.display()))?;
+fn read_claim_file(path: &Path) -> Result<ClaimFileState> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ClaimFileState::Missing);
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read claim {}", path.display()));
+        }
+    };
     let value = |key: &str| -> Option<String> {
         contents.lines().find_map(|line| {
             line.split_once('=')
@@ -846,21 +900,19 @@ fn read_claim_file(path: &Path) -> Result<Option<Claim>> {
                 .map(|(_, value)| value.to_string())
         })
     };
-    let branch = value("branch").unwrap_or_else(|| {
-        path.file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unknown".to_string())
-    });
-    let Some(agent_id) = value("agent_id") else {
-        return Ok(None);
+    let Some(branch) = value("branch").filter(|value| !value.trim().is_empty()) else {
+        return Ok(ClaimFileState::Incomplete);
     };
-    let acquired_at = value("acquired_at")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let expires_at = value("expires_at")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    Ok(Some(Claim {
+    let Some(agent_id) = value("agent_id").filter(|value| !value.trim().is_empty()) else {
+        return Ok(ClaimFileState::Incomplete);
+    };
+    let Some(acquired_at) = value("acquired_at").and_then(|value| value.parse().ok()) else {
+        return Ok(ClaimFileState::Incomplete);
+    };
+    let Some(expires_at) = value("expires_at").and_then(|value| value.parse().ok()) else {
+        return Ok(ClaimFileState::Incomplete);
+    };
+    Ok(ClaimFileState::Parsed(Claim {
         branch,
         agent_id,
         acquired_at,
@@ -878,6 +930,15 @@ fn claim_path(repo: &Repo, branch: &str) -> PathBuf {
 impl Claim {
     fn is_active(&self, now: u64) -> bool {
         self.expires_at > now
+    }
+}
+
+impl ClaimFileState {
+    fn into_parsed(self) -> Option<Claim> {
+        match self {
+            Self::Parsed(claim) => Some(claim),
+            Self::Missing | Self::Incomplete => None,
+        }
     }
 }
 
@@ -1244,6 +1305,7 @@ mod tests {
 
         let stored = read_claim(&repo, &replacement.branch)
             .expect("read replacement")
+            .into_parsed()
             .expect("claim exists");
         assert_eq!(stored.agent_id, replacement.agent_id);
         assert_eq!(stored.expires_at, replacement.expires_at);
