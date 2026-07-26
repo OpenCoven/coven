@@ -36,7 +36,7 @@ RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
             r"[^\s\"']*"
         ),
     ),
-    ("phone_number", re.compile(r"\+1\d{10}")),
+    ("phone_number", re.compile(r"(?<!\d)\+[1-9]\d{1,14}(?!\d)")),
     (
         "invite_or_handoff_url",
         re.compile(r"https?://[^\s\"']*(?:invite|handoff|ts\.net)[^\s\"']*token[^\s\"']*"),
@@ -76,7 +76,7 @@ def nul_paths(data: bytes) -> list[str]:
 
 def staged_files() -> list[tuple[str, bytes]]:
     names = nul_paths(
-        git("diff", "--cached", "--name-only", "--diff-filter=ACM", "-z", text=False)
+        git("diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z", text=False)
     )
     return [(name, git("show", f":{name}", text=False)) for name in names]
 
@@ -86,7 +86,7 @@ def changed_files(revision_range: str) -> list[tuple[str, bytes]]:
         git(
             "diff",
             "--name-only",
-            "--diff-filter=ACM",
+            "--diff-filter=ACMR",
             "-z",
             revision_range,
             text=False,
@@ -123,7 +123,7 @@ def scan_files(files: list[tuple[str, bytes]]) -> list[tuple[str, int, str]]:
 
 def usage() -> int:
     print(
-        "usage: check-coven-privacy.py --staged | --range BASE...HEAD | --files PATH...",
+        "usage: check-coven-privacy.py --staged | --range REVISION_RANGE | --files PATH...",
         file=sys.stderr,
     )
     return 2
