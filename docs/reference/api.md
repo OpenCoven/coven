@@ -62,6 +62,7 @@ These power `coven status`, `coven familiars`, `coven skills`, `coven memory`, `
 | GET | `/api/v1/overview` | Dashboard aggregate: open sessions, roster/skill/research counts. | overview object |
 | GET | `/api/v1/familiars` | Familiar roster from `familiars.toml`. | `FamiliarDto[]` |
 | GET | `/api/v1/familiars/:id/ward` | One familiar's declared Ward surface (tiers, protected paths, principal binding) — the read twin of `/familiars/:id/edits`. | `{ ok, familiarId, workspace, ward }` · `400 invalid_request` / `404 familiar_not_found` / `404 ward_not_configured` / `500 ward_config_invalid` |
+| GET | `/api/v1/familiars/:id/audit` | The append-only `ward_audit` ledger for one familiar, newest first — where `/edits` persists its Gate 4 apply records. `?limit=N` (default 100, max 1000), `?event=TYPE` (e.g. `apply_audit`). | `{ ok, familiarId, records }` · `400 invalid_request` / `404 familiar_not_found` |
 | GET | `/api/v1/skills` | Installed skills from `~/.coven/skills/`. | `SkillDto[]` |
 | GET | `/api/v1/memory` | Familiar memory files from `~/.coven/memory/`. | memory list |
 | GET | `/api/v1/research` | Research loop log rows. | research list |
@@ -75,7 +76,7 @@ These power `coven status`, `coven familiars`, `coven skills`, `coven memory`, `
 |---|---|---|---|---|
 | POST | `/api/v1/cast` | Submit a cast line (status/delegation shorthand) to the cockpit session. | `202 { accepted, cast_id, echo }` | `400 invalid_request` |
 | PUT | `/api/v1/familiars/:id/icon` | Update a familiar's icon glyph. | updated familiar | `400`, `404` |
-| POST | `/api/v1/familiars/:id/edits` | Ward-adjudicated writes into a familiar home (Gates 1–2, fail-closed, audited). | edit report | `400`, `403` (ward denial), `404` |
+| POST | `/api/v1/familiars/:id/edits` | Ward-adjudicated writes into a familiar home (Gates 1–2, fail-closed, audited). Applied writes append `apply_audit` rows to the `ward_audit` ledger (Gate 4 persistence). | edit report | `400`, `403` (ward denial), `404` |
 
 ## Ward proposals (threads)
 

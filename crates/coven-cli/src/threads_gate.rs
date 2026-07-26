@@ -606,6 +606,98 @@ pub(crate) fn append_audit_row(
     Ok(())
 }
 
+/// Persist the Ward's Gate-4 apply records into the append-only `ward_audit`
+/// ledger (#414; RFC-0001 §5.6, coven-threads#5).
+///
+/// One `apply_audit` row per written change that carries an
+/// [`ward::AuditRecord`] (Tier-2 logged writes). Following the upstream
+/// `WardAuditRecord::for_apply` contract, `diff_hash` carries the post-write
+/// SHA-256 and the pre-write hash plus byte count ride in the `detail` JSON
+/// (`{"prev_sha256":…,"bytes_written":…}`). The weave view is read-only:
+/// persisting audit rows must not bootstrap baselines.
+pub fn persist_apply_audit_records(
+    conn: &Connection,
+    familiar_id: &str,
+    workspace: &Path,
+    config: &ward::WardConfig,
+    report: &ward::ApplyReport,
+) -> Result<()> {
+    let mut records = report.audit_records().peekable();
+    if records.peek().is_none() {
+        return Ok(());
+    }
+    let state = build_weave_state(conn, familiar_id, workspace, config, &[], false)?;
+    let now = time::OffsetDateTime::now_utc();
+    let format = time::format_description::well_known::Rfc3339;
+    let now_text = now.format(&format)?;
+    for audit in records {
+        let prev = audit
+            .prev_sha256
+            .as_deref()
+            .map(hex_to_bytes)
+            .transpose()
+            .context("decoding apply-audit prev_sha256")?;
+        let next = hex_to_bytes(&audit.next_sha256).context("decoding apply-audit next_sha256")?;
+        let record = threads::WardAuditRecord::for_apply(
+            state.familiar_uuid,
+            state.weave.weave_hash(),
+            threads::SurfaceId::new(audit.resolved.clone()),
+            &format!("tier_{}", u8::from(audit.tier)),
+            prev.as_deref(),
+            Some(&next),
+            audit.bytes_written as u64,
+            Some(threads::Channel::Mutation),
+            now,
+            now,
+        );
+        let files_touched = serde_json::to_string(
+            &record
+                .files_touched
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>(),
+        )?;
+        conn.execute(
+            "INSERT INTO ward_audit (
+                event_type, proposal_id, familiar_id, ward_version, ward_hash,
+                tier, decision, approver, diff_hash, detail, files_touched,
+                channel, submitted_at, decided_at
+            ) VALUES (?1, NULL, ?2, NULL, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10, ?10)",
+            params![
+                record.event_type.tag(),
+                // Human-readable familiar id in the store; the uuid rides in
+                // the JSON record shape for cross-system correlation.
+                familiar_id,
+                record.ward_hash,
+                record.tier,
+                record.decision,
+                record.diff_hash,
+                record.detail,
+                files_touched,
+                record.channel.map(|c| format!("{c:?}").to_lowercase()),
+                now_text,
+            ],
+        )
+        .context("appending apply_audit row")?;
+    }
+    Ok(())
+}
+
+/// Decode a hex digest into raw bytes. The Ward emits SHA-256 hex strings;
+/// the `ward_audit` ledger stores raw bytes (`diff_hash BLOB`).
+fn hex_to_bytes(hex: &str) -> Result<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) {
+        anyhow::bail!("odd-length hex digest `{hex}`");
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&hex[i..i + 2], 16)
+                .with_context(|| format!("invalid hex digest `{hex}`"))
+        })
+        .collect()
+}
+
 /// Stage a proposal held **solely** for Gate-3 coherence review (Tier-1
 /// targets) as a pending proposal beside the Tier-0 authority lane
 /// (`docs/design/ward-gate3-coherence.md` G3.1).
