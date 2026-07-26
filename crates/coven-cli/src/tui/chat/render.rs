@@ -168,13 +168,25 @@ fn render_messages(f: &mut Frame, app: &mut App, area: Rect) {
             MessageRole::User => (theme::ratatui_style(USER_LABEL).bold(), "\u{25B6} You"),
             MessageRole::Agent => (theme::ratatui_style(AGENT_LABEL).bold(), ""),
             MessageRole::System => (theme::ratatui_style(PRIMARY).italic(), "\u{2731} "),
+            // Tool-activity lines are body-only (no sender header) and dim.
+            MessageRole::Tool => (theme::ratatui_style(TEXT_DIM), ""),
         };
 
         let sender_text = match msg.role {
             MessageRole::User => prefix.to_string(),
             MessageRole::Agent => format!("\u{2736} {}", msg.sender),
-            MessageRole::System => format!("{prefix}{}", msg.content),
+            MessageRole::System | MessageRole::Tool => format!("{prefix}{}", msg.content),
         };
+
+        if matches!(msg.role, MessageRole::Tool) {
+            for content_line in msg.content.lines() {
+                lines.push(Line::from(Span::styled(
+                    format!("  {content_line}"),
+                    sender_style,
+                )));
+            }
+            continue;
+        }
 
         if matches!(msg.role, MessageRole::System) {
             for (idx, content_line) in msg.content.lines().enumerate() {

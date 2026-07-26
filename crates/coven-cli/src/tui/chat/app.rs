@@ -30,6 +30,9 @@ pub enum MessageRole {
     User,
     Agent,
     System,
+    /// Compact tool-activity lines (⚒ indicators, ⚠ failures) rendered dim,
+    /// without a sender header (#472).
+    Tool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -157,6 +160,10 @@ pub(super) struct App {
     /// `dispatch_stream_json_output` only ever tries to parse complete
     /// newline-terminated lines.
     stream_json_buffers: HashMap<String, String>,
+    /// Tool names keyed by `tool_use` block id, so a later `tool_result`
+    /// frame can name the tool that failed. Entries are consumed by the
+    /// matching result and cleared wholesale on session teardown (#472).
+    stream_tool_names: HashMap<String, String>,
     client: Box<dyn ChatClient>,
     /// Optional familiar id for the session owner (e.g. `"sage"`). When set,
     /// delegation events are emitted to `cave-coven-calls.json` whenever
@@ -343,6 +350,7 @@ impl App {
             suppressed_session_ids: HashSet::new(),
             harness_stream_session_ids: HashMap::new(),
             stream_json_buffers: HashMap::new(),
+            stream_tool_names: HashMap::new(),
             familiar_id: None,
             active_call_id: None,
             client,
@@ -391,6 +399,15 @@ impl App {
         });
     }
 
+    fn push_tool_message(&mut self, content: &str) {
+        self.messages.push(ChatMessage {
+            role: MessageRole::Tool,
+            sender: "tool".into(),
+            content: content.to_string(),
+            timestamp: timestamp_now(),
+        });
+    }
+
     fn push_or_append_agent_message(&mut self, agent_name: &str, content: &str) {
         if let Some(last) = self.messages.last_mut() {
             if matches!(last.role, MessageRole::Agent) && last.sender == agent_name {
@@ -427,6 +444,17 @@ impl App {
             return;
         }
         self.push_agent_message(&sender, &buffer);
+    }
+
+    /// Route a stream-JSON assistant text chunk to the transcript according
+    /// to the streaming mode: live appends progressively, batched holds it
+    /// back until the turn completes.
+    fn emit_stream_assistant_text(&mut self, sender: &str, chunk: &str) {
+        if self.streaming_mode.is_live() {
+            self.push_or_append_agent_message(sender, chunk);
+        } else {
+            self.buffer_pending_agent_output(sender, chunk);
+        }
     }
 
     pub(super) fn streaming_mode(&self) -> StreamingMode {
@@ -659,6 +687,9 @@ impl App {
             }
         }
         self.harness_stream_session_ids.clear();
+        // Any tool_use ids from the torn-down sessions will never see a
+        // tool_result — drop them so the map can't grow unbounded.
+        self.stream_tool_names.clear();
     }
 
     pub(super) fn handle_slash_command(&mut self, input: &str) -> SlashCommandResult {
@@ -1634,23 +1665,95 @@ impl App {
                     else {
                         continue;
                     };
+                    // Process blocks in order so ⚒ indicators land between
+                    // the text that precedes and follows a tool call (#472).
                     let mut chunk = String::new();
                     for block in content {
-                        if block.get("type").and_then(serde_json::Value::as_str) == Some("text") {
-                            if let Some(text) =
-                                block.get("text").and_then(serde_json::Value::as_str)
-                            {
-                                chunk.push_str(text);
+                        match block.get("type").and_then(serde_json::Value::as_str) {
+                            Some("text") => {
+                                if let Some(text) =
+                                    block.get("text").and_then(serde_json::Value::as_str)
+                                {
+                                    chunk.push_str(text);
+                                }
                             }
+                            Some("tool_use") => {
+                                let Some(name) =
+                                    block.get("name").and_then(serde_json::Value::as_str)
+                                else {
+                                    continue;
+                                };
+                                if let Some(id) =
+                                    block.get("id").and_then(serde_json::Value::as_str)
+                                {
+                                    self.stream_tool_names
+                                        .insert(id.to_string(), name.to_string());
+                                }
+                                if !chunk.is_empty() {
+                                    self.emit_stream_assistant_text(&sender, &chunk);
+                                    chunk.clear();
+                                }
+                                // Indicators are progress feedback; batched
+                                // mode holds output until the turn completes,
+                                // so they are suppressed there (tool errors
+                                // still surface via the tool_result arm).
+                                if self.streaming_mode.is_live() {
+                                    let indicator = match summarize_tool_input(block.get("input")) {
+                                        Some(summary) => format!("\u{2692} {name}: {summary}"),
+                                        None => format!("\u{2692} {name}"),
+                                    };
+                                    self.push_tool_message(&indicator);
+                                }
+                            }
+                            _ => {}
                         }
                     }
                     if !chunk.is_empty() {
-                        if self.streaming_mode.is_live() {
-                            self.push_or_append_agent_message(&sender, &chunk);
-                        } else {
-                            self.buffer_pending_agent_output(&sender, &chunk);
-                        }
+                        self.emit_stream_assistant_text(&sender, &chunk);
                     }
+                }
+                "tool_result" => {
+                    let name = value
+                        .get("tool_use_id")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|id| self.stream_tool_names.remove(id));
+                    let is_error = value
+                        .get("is_error")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    if !is_error {
+                        continue;
+                    }
+                    // A failed tool call was previously invisible (#472).
+                    // Surface it in both streaming modes — in batched mode
+                    // flush the held-back text first so the transcript
+                    // reads in arrival order.
+                    let detail = value
+                        .get("content")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|blocks| {
+                            blocks
+                                .iter()
+                                .filter_map(|block| {
+                                    block.get("text").and_then(serde_json::Value::as_str)
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .and_then(|text| clean_terminal_output(&text))
+                        .and_then(|text| {
+                            text.lines()
+                                .map(str::trim)
+                                .find(|line| !line.is_empty())
+                                .map(|line| truncate_with_ellipsis(line, 160))
+                        });
+                    self.flush_pending_agent_buffer();
+                    let label = name.as_deref().unwrap_or("tool");
+                    let notice = match detail {
+                        Some(detail) => format!("\u{26A0} {label} failed: {detail}"),
+                        None => format!("\u{26A0} {label} failed."),
+                    };
+                    self.push_tool_message(&notice);
                 }
                 "result" => {
                     self.flush_pending_agent_buffer();
@@ -1943,6 +2046,7 @@ impl App {
                 MessageRole::User => "**You**",
                 MessageRole::Agent => &format!("**{}**", msg.sender),
                 MessageRole::System => "*system*",
+                MessageRole::Tool => "*tool*",
             };
             content.push_str(&format!(
                 "{} ({})\n{}\n\n---\n\n",
@@ -2385,6 +2489,42 @@ fn event_payload_text(event: &store::EventRecord, field: &str) -> Option<String>
         .get(field)?
         .as_str()
         .map(ToOwned::to_owned)
+}
+
+/// Pick a one-line human summary of a `tool_use` input for the ⚒ indicator.
+/// Prefers the conventional argument keys harnesses use; otherwise falls
+/// back to the first string value. Never returns raw JSON (#472).
+fn summarize_tool_input(input: Option<&serde_json::Value>) -> Option<String> {
+    const SUMMARY_KEYS: &[&str] = &[
+        "command",
+        "file_path",
+        "path",
+        "pattern",
+        "description",
+        "url",
+        "query",
+    ];
+    let object = input?.as_object()?;
+    let raw = SUMMARY_KEYS
+        .iter()
+        .find_map(|key| object.get(*key).and_then(serde_json::Value::as_str))
+        .or_else(|| object.values().find_map(serde_json::Value::as_str))?;
+    let flat = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.is_empty() {
+        return None;
+    }
+    Some(truncate_with_ellipsis(&flat, 80))
+}
+
+/// Truncate to `max_chars` characters, replacing the tail with a single `…`.
+/// Char-based so multi-byte input can't split a codepoint.
+fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut truncated: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    truncated.push('\u{2026}');
+    truncated
 }
 
 fn clean_terminal_output(data: &str) -> Option<String> {
@@ -3581,6 +3721,226 @@ mod tests {
         assert!(
             agent_idx < failure_idx,
             "partial output must appear before the failure notice"
+        );
+    }
+
+    /// Regression for #472: tool_use blocks were skipped entirely, so long
+    /// tool phases showed only a spinner. A compact dim indicator must
+    /// appear — never the raw input JSON.
+    #[test]
+    fn stream_tool_use_shows_compact_indicator() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        let chunk = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Let me check."},{"type":"tool_use","id":"tu_1","name":"bash","input":{"command":"cargo test --workspace"}}]}}"#
+            .to_string()
+            + "\n";
+        app.push_event_message(&output_event(1, &session_id, &chunk));
+
+        let text_idx = app
+            .messages
+            .iter()
+            .position(|m| {
+                matches!(m.role, MessageRole::Agent) && m.content.contains("Let me check.")
+            })
+            .expect("assistant text must still render");
+        let tool_idx = app
+            .messages
+            .iter()
+            .position(|m| {
+                matches!(m.role, MessageRole::Tool)
+                    && m.content.contains("\u{2692} bash")
+                    && m.content.contains("cargo test --workspace")
+            })
+            .expect(
+                "tool_use must render a compact indicator with the tool name and input summary",
+            );
+        assert!(
+            text_idx < tool_idx,
+            "indicator must follow the text block that preceded it"
+        );
+        let indicator = &app.messages[tool_idx].content;
+        assert!(
+            !indicator.contains("\"command\"") && !indicator.contains('{'),
+            "indicator must summarize input, never dump raw JSON: {indicator}"
+        );
+    }
+
+    #[test]
+    fn stream_tool_use_indicator_truncates_long_input() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        let long_command = "x".repeat(300);
+        let chunk = format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"tu_1","name":"bash","input":{{"command":"{long_command}"}}}}]}}}}"#
+        ) + "\n";
+        app.push_event_message(&output_event(1, &session_id, &chunk));
+
+        let indicator = app
+            .messages
+            .iter()
+            .find(|m| matches!(m.role, MessageRole::Tool))
+            .expect("indicator must render");
+        assert!(
+            indicator.content.chars().count() < 100,
+            "long tool input must be truncated, got {} chars",
+            indicator.content.chars().count()
+        );
+        assert!(
+            indicator.content.ends_with('\u{2026}'),
+            "truncated summary must end with an ellipsis: {}",
+            indicator.content
+        );
+    }
+
+    /// Regression for #472: failed tool results (is_error:true) were
+    /// completely invisible — the user must see that a tool call failed.
+    #[test]
+    fn stream_tool_result_error_surfaces_failure() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        let use_chunk = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_1","name":"bash","input":{"command":"cargo build"}}]}}"#
+            .to_string()
+            + "\n";
+        app.push_event_message(&output_event(1, &session_id, &use_chunk));
+        let result_chunk = r#"{"type":"tool_result","tool_use_id":"tu_1","is_error":true,"content":[{"type":"text","text":"error: could not compile `coven-cli`"}]}"#
+            .to_string()
+            + "\n";
+        app.push_event_message(&output_event(2, &session_id, &result_chunk));
+
+        assert!(
+            app.messages.iter().any(|m| {
+                matches!(m.role, MessageRole::Tool)
+                    && m.content.contains('\u{26A0}')
+                    && m.content.contains("bash failed")
+                    && m.content.contains("could not compile")
+            }),
+            "error tool_result must surface the tool name and detail: {:?}",
+            app.messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn stream_tool_result_error_without_known_name_still_surfaces() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        // No prior tool_use event (e.g. it was lost) — the failure must
+        // still be visible under a generic label.
+        let result_chunk = r#"{"type":"tool_result","tool_use_id":"tu_unknown","is_error":true,"content":[{"type":"text","text":"permission denied"}]}"#
+            .to_string()
+            + "\n";
+        app.push_event_message(&output_event(1, &session_id, &result_chunk));
+
+        assert!(
+            app.messages.iter().any(|m| {
+                matches!(m.role, MessageRole::Tool)
+                    && m.content.contains("tool failed")
+                    && m.content.contains("permission denied")
+            }),
+            "error tool_result without a known name must still surface"
+        );
+    }
+
+    #[test]
+    fn stream_tool_result_success_stays_silent() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        let use_chunk = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_1","name":"bash","input":{"command":"ls"}}]}}"#
+            .to_string()
+            + "\n";
+        app.push_event_message(&output_event(1, &session_id, &use_chunk));
+        let before = app.messages.len();
+
+        let result_chunk = r#"{"type":"tool_result","tool_use_id":"tu_1","is_error":false,"content":[{"type":"text","text":"Cargo.toml\nsrc"}]}"#
+            .to_string()
+            + "\n";
+        app.push_event_message(&output_event(2, &session_id, &result_chunk));
+
+        assert_eq!(
+            app.messages.len(),
+            before,
+            "successful tool results must not add transcript noise beyond the indicator"
+        );
+    }
+
+    /// Batched mode holds back progressive output, so ⚒ indicators are
+    /// suppressed — but tool *errors* must still surface immediately, after
+    /// flushing any held-back text so the transcript reads in order.
+    #[test]
+    fn batched_mode_suppresses_indicators_but_surfaces_tool_errors() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.handle_slash_command("/stream off");
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        let chunk = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"partial answer"},{"type":"tool_use","id":"tu_1","name":"bash","input":{"command":"ls"}}]}}"#
+            .to_string()
+            + "\n";
+        app.push_event_message(&output_event(1, &session_id, &chunk));
+
+        assert!(
+            !app.messages
+                .iter()
+                .any(|m| matches!(m.role, MessageRole::Tool) && m.content.contains('\u{2692}')),
+            "batched mode must not stream tool indicators"
+        );
+
+        let result_chunk = r#"{"type":"tool_result","tool_use_id":"tu_1","is_error":true,"content":[{"type":"text","text":"boom"}]}"#
+            .to_string()
+            + "\n";
+        app.push_event_message(&output_event(2, &session_id, &result_chunk));
+
+        let agent_idx = app
+            .messages
+            .iter()
+            .position(|m| {
+                matches!(m.role, MessageRole::Agent) && m.content.contains("partial answer")
+            })
+            .expect("held-back text must flush before the tool failure surfaces");
+        let warn_idx = app
+            .messages
+            .iter()
+            .position(|m| matches!(m.role, MessageRole::Tool) && m.content.contains("bash failed"))
+            .expect("tool error must surface even in batched mode");
+        assert!(
+            agent_idx < warn_idx,
+            "flushed text must appear before the tool failure notice"
         );
     }
 
