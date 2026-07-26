@@ -602,24 +602,36 @@ pub(crate) fn run_ward_audit(
     json: bool,
 ) -> Result<()> {
     let coven_home = coven_home_dir()?;
-    let mut path = format!("/api/v1/familiars/{familiar_id}/audit");
-    let mut params = Vec::new();
-    if let Some(limit) = limit {
-        params.push(format!("limit={limit}"));
-    }
-    if let Some(event) = event {
-        params.push(format!("event={event}"));
-    }
-    if !params.is_empty() {
-        path.push('?');
-        path.push_str(&params.join("&"));
-    }
+    let path = ward_audit_path(familiar_id, limit, event)?;
     let body = api_get(&coven_home, &path)?;
     if json {
         return print_json(&body);
     }
     print!("{}", render_ward_audit(&body));
     Ok(())
+}
+
+fn ward_audit_path(familiar_id: &str, limit: Option<u32>, event: Option<&str>) -> Result<String> {
+    let mut path = format!("/api/v1/familiars/{familiar_id}/audit");
+    let mut params = Vec::new();
+    if let Some(limit) = limit {
+        params.push(format!("limit={limit}"));
+    }
+    if let Some(event) = event {
+        anyhow::ensure!(
+            !event.is_empty()
+                && event
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'),
+            "--event must be a lowercase ASCII event tag containing only letters, digits, and `_`"
+        );
+        params.push(format!("event={event}"));
+    }
+    if !params.is_empty() {
+        path.push('?');
+        path.push_str(&params.join("&"));
+    }
+    Ok(path)
 }
 
 fn render_ward_audit(body: &Value) -> String {
@@ -1454,6 +1466,20 @@ fn resolve_full_session_id(reference: &str) -> Result<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn ward_audit_path_rejects_ambiguous_event_query_values() {
+        for event in [
+            "apply_audit&limit=1",
+            "apply_audit=1",
+            "apply audit",
+            "äpply",
+        ] {
+            let error = ward_audit_path("sage", Some(10), Some(event))
+                .expect_err("unsafe event query value must be rejected");
+            assert!(error.to_string().contains("--event"), "{event}: {error:#}");
+        }
+    }
 
     #[test]
     fn render_table_pads_columns_and_trims_trailing_space() {

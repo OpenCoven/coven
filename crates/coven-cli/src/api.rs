@@ -2805,9 +2805,9 @@ fn apply_familiar_edits(
     // also land in the append-only ward_audit ledger, so applied writes stay
     // observable across daemon restarts.
     {
-        let conn = store::open_store(&store_path(coven_home))?;
+        let mut conn = store::open_store(&store_path(coven_home))?;
         crate::threads_gate::persist_apply_audit_records(
-            &conn,
+            &mut conn,
             familiar_id,
             &workspace,
             &config,
@@ -2977,6 +2977,10 @@ fn familiar_audit_response(
         let diff_hash: Option<Vec<u8>> = row.get(8)?;
         let detail: Option<String> = row.get(9)?;
         let files_touched: String = row.get(10)?;
+        let files_touched = serde_json::from_str::<Value>(&files_touched)
+            .ok()
+            .filter(Value::is_array)
+            .unwrap_or_else(|| json!([]));
         Ok(json!({
             "id": row.get::<_, i64>(0)?,
             "eventType": row.get::<_, String>(1)?,
@@ -2990,8 +2994,7 @@ fn familiar_audit_response(
             "detail": detail
                 .as_deref()
                 .map(|raw| serde_json::from_str(raw).unwrap_or(Value::Null)),
-            "filesTouched": serde_json::from_str::<Value>(&files_touched)
-                .unwrap_or(Value::Null),
+            "filesTouched": files_touched,
             "channel": row.get::<_, Option<String>>(11)?,
             "threadId": row.get::<_, Option<String>>(12)?,
             "submittedAt": row.get::<_, String>(13)?,
@@ -8862,6 +8865,31 @@ tier = 1
         )?;
         let body: Value = serde_json::from_str(&limited.body)?;
         assert_eq!(body["records"].as_array().map(Vec::len), Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn familiar_audit_route_keeps_files_touched_an_array_for_malformed_legacy_json() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_warded_familiar(home)?;
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        conn.execute(
+            "INSERT INTO ward_audit (
+                event_type, familiar_id, ward_hash, decision, files_touched,
+                submitted_at, decided_at
+             ) VALUES ('apply_audit', 'sage', ?1, 'applied', ?2, ?3, ?3)",
+            rusqlite::params![
+                vec![0x11_u8; 32],
+                "{malformed legacy json",
+                "2026-07-26T00:00:00Z"
+            ],
+        )?;
+
+        let response = handle_request("GET", "/api/v1/familiars/sage/audit", home, None)?;
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["records"][0]["filesTouched"], serde_json::json!([]));
         Ok(())
     }
 

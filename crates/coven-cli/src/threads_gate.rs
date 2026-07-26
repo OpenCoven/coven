@@ -616,7 +616,7 @@ pub(crate) fn append_audit_row(
 /// (`{"prev_sha256":…,"bytes_written":…}`). The weave view is read-only:
 /// persisting audit rows must not bootstrap baselines.
 pub fn persist_apply_audit_records(
-    conn: &Connection,
+    conn: &mut Connection,
     familiar_id: &str,
     workspace: &Path,
     config: &ward::WardConfig,
@@ -630,62 +630,74 @@ pub fn persist_apply_audit_records(
     let now = time::OffsetDateTime::now_utc();
     let format = time::format_description::well_known::Rfc3339;
     let now_text = now.format(&format)?;
-    for audit in records {
-        let prev = audit
-            .prev_sha256
-            .as_deref()
-            .map(hex_to_bytes)
-            .transpose()
-            .context("decoding apply-audit prev_sha256")?;
-        let next = hex_to_bytes(&audit.next_sha256).context("decoding apply-audit next_sha256")?;
-        let record = threads::WardAuditRecord::for_apply(
-            state.familiar_uuid,
-            state.weave.weave_hash(),
-            threads::SurfaceId::new(audit.resolved.clone()),
-            &format!("tier_{}", u8::from(audit.tier)),
-            prev.as_deref(),
-            Some(&next),
-            audit.bytes_written as u64,
-            Some(threads::Channel::Mutation),
-            now,
-            now,
-        );
-        let files_touched = serde_json::to_string(
-            &record
-                .files_touched
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>(),
-        )?;
-        conn.execute(
+    let transaction = conn
+        .transaction()
+        .context("starting apply-audit batch transaction")?;
+    {
+        let mut statement = transaction.prepare(
             "INSERT INTO ward_audit (
                 event_type, proposal_id, familiar_id, ward_version, ward_hash,
                 tier, decision, approver, diff_hash, detail, files_touched,
                 channel, submitted_at, decided_at
             ) VALUES (?1, NULL, ?2, NULL, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10, ?10)",
-            params![
-                record.event_type.tag(),
-                // Human-readable familiar id in the store; the uuid rides in
-                // the JSON record shape for cross-system correlation.
-                familiar_id,
-                record.ward_hash,
-                record.tier,
-                record.decision,
-                record.diff_hash,
-                record.detail,
-                files_touched,
-                record.channel.map(|c| format!("{c:?}").to_lowercase()),
-                now_text,
-            ],
-        )
-        .context("appending apply_audit row")?;
+        )?;
+        for audit in records {
+            let prev = audit
+                .prev_sha256
+                .as_deref()
+                .map(hex_to_bytes)
+                .transpose()
+                .context("decoding apply-audit prev_sha256")?;
+            let next =
+                hex_to_bytes(&audit.next_sha256).context("decoding apply-audit next_sha256")?;
+            let record = threads::WardAuditRecord::for_apply(
+                state.familiar_uuid,
+                state.weave.weave_hash(),
+                threads::SurfaceId::new(audit.resolved.clone()),
+                &format!("tier_{}", u8::from(audit.tier)),
+                prev.as_deref(),
+                Some(&next),
+                audit.bytes_written as u64,
+                Some(threads::Channel::Mutation),
+                now,
+                now,
+            );
+            let files_touched = serde_json::to_string(
+                &record
+                    .files_touched
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>(),
+            )?;
+            statement
+                .execute(params![
+                    record.event_type.tag(),
+                    // Human-readable familiar id in the store; the uuid rides in
+                    // the JSON record shape for cross-system correlation.
+                    familiar_id,
+                    record.ward_hash,
+                    record.tier,
+                    record.decision,
+                    record.diff_hash,
+                    record.detail,
+                    files_touched,
+                    record.channel.map(|c| format!("{c:?}").to_lowercase()),
+                    now_text,
+                ])
+                .context("appending apply_audit row")?;
+        }
     }
-    Ok(())
+    transaction
+        .commit()
+        .context("committing apply-audit batch transaction")
 }
 
 /// Decode a hex digest into raw bytes. The Ward emits SHA-256 hex strings;
 /// the `ward_audit` ledger stores raw bytes (`diff_hash BLOB`).
 fn hex_to_bytes(hex: &str) -> Result<Vec<u8>> {
+    if !hex.is_ascii() {
+        anyhow::bail!("non-ASCII hex digest `{hex}`");
+    }
     if !hex.len().is_multiple_of(2) {
         anyhow::bail!("odd-length hex digest `{hex}`");
     }
@@ -891,6 +903,53 @@ tier = 2
 
     fn signed() -> ward::Authorization {
         ward::Authorization::signed_by("fp-val-1")
+    }
+
+    #[test]
+    fn hex_to_bytes_rejects_non_ascii_without_panicking() {
+        let error = hex_to_bytes("0éx").expect_err("non-ASCII hex must be rejected");
+        assert!(error.to_string().contains("non-ASCII"), "{error:#}");
+    }
+
+    #[test]
+    fn persist_apply_audit_records_rolls_back_the_batch_on_insert_failure() {
+        let mut f = fixture();
+        let config = ward_config();
+        let ward = ward::Ward::new(f.workspace.clone(), config.clone()).unwrap();
+        let report = ward
+            .apply(
+                &[
+                    ward::FileEdit::new("notes/a.md", "one"),
+                    ward::FileEdit::new("notes/b.md", "two"),
+                ],
+                &ward::Authorization::unsigned(),
+            )
+            .unwrap();
+        f.conn
+            .execute_batch(
+                r#"
+                CREATE TRIGGER fail_second_apply_audit
+                BEFORE INSERT ON ward_audit
+                WHEN NEW.files_touched = '["notes/b.md"]'
+                BEGIN
+                    SELECT RAISE(ABORT, 'injected second-row failure');
+                END;
+                "#,
+            )
+            .unwrap();
+
+        let result =
+            persist_apply_audit_records(&mut f.conn, "sage", &f.workspace, &config, &report);
+        assert!(result.is_err(), "injected insert failure must surface");
+        let count: i64 = f
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM ward_audit WHERE event_type = 'apply_audit'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "the failed batch must leave no partial rows");
     }
 
     fn soul_edit() -> Vec<ward::FileEdit> {
