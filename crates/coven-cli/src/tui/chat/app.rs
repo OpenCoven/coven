@@ -1592,10 +1592,11 @@ impl App {
     /// Parse a chunk of stream-mode harness output (newline-delimited JSON)
     /// and turn it into chat-visible messages. Each line is one JSON event:
     /// `assistant.message.content[].text` becomes an agent message; the
-    /// `result` event marks the turn complete and clears `is_responding`;
-    /// other event types (system init, rate_limit_event, …) are ignored
-    /// for now. Malformed lines are silently dropped — stream-mode is too
-    /// noisy to surface every parse error.
+    /// `result` event marks the turn complete, clears `is_responding`, and
+    /// surfaces a failure notice when the turn errored (#468); other event
+    /// types (system init, rate_limit_event, …) are ignored for now.
+    /// Malformed lines are silently dropped — stream-mode is too noisy to
+    /// surface every parse error.
     fn dispatch_stream_json_output(&mut self, session_id: &str, data: &str) {
         let sender = self.active_agent_label().to_string();
         // Daemon output events come from raw 8KiB reads, so a JSON line
@@ -1654,6 +1655,32 @@ impl App {
                 "result" => {
                     self.flush_pending_agent_buffer();
                     self.is_responding = false;
+                    // A turn can die (rate limit, auth expiry, max-turns
+                    // abort) — surface why instead of letting the spinner
+                    // vanish silently (#468). Clean the harness-supplied
+                    // detail before rendering: it may carry control codes.
+                    let is_error = value
+                        .get("is_error")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    if is_error {
+                        let subtype = value
+                            .get("subtype")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|s| !s.trim().is_empty())
+                            .unwrap_or("error");
+                        let detail = value
+                            .get("error")
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(clean_terminal_output)
+                            .map(|text| text.trim().to_string())
+                            .filter(|text| !text.is_empty());
+                        let notice = match detail {
+                            Some(detail) => format!("Reply failed ({subtype}): {detail}"),
+                            None => format!("Reply failed ({subtype})."),
+                        };
+                        self.push_system_message(&notice);
+                    }
                 }
                 "system" => {
                     // Daemon wraps stream-mode child stderr in
@@ -3423,6 +3450,133 @@ mod tests {
             r#"{"type":"result","subtype":"success","is_error":false}"#.to_string() + "\n";
         app.push_event_message(&output_event(2, &session_id, &result_chunk));
         assert!(!app.is_responding, "result event must clear is_responding");
+    }
+
+    /// Regression for #468: a stream turn that dies (rate limit, auth expiry,
+    /// max-turns abort) emits `{"type":"result","is_error":true,...}` — the
+    /// user must see why the reply stopped, not just a spinner that quietly
+    /// disappears.
+    #[test]
+    fn stream_error_result_surfaces_failure_to_the_user() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        let result_chunk = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"error":"rate limited by upstream"}"#
+            .to_string()
+            + "\n";
+        app.push_event_message(&output_event(1, &session_id, &result_chunk));
+
+        assert!(!app.is_responding, "error result must clear is_responding");
+        assert!(
+            app.messages.iter().any(|m| {
+                matches!(m.role, MessageRole::System)
+                    && m.content.contains("Reply failed")
+                    && m.content.contains("error_during_execution")
+                    && m.content.contains("rate limited by upstream")
+            }),
+            "error result must surface the failure subtype and detail: {:?}",
+            app.messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn stream_error_result_without_detail_still_reports_the_subtype() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        let result_chunk =
+            r#"{"type":"result","subtype":"error_max_turns","is_error":true}"#.to_string() + "\n";
+        app.push_event_message(&output_event(1, &session_id, &result_chunk));
+
+        assert!(
+            app.messages.iter().any(|m| {
+                matches!(m.role, MessageRole::System)
+                    && m.content.contains("Reply failed")
+                    && m.content.contains("error_max_turns")
+            }),
+            "error result without an error field must still name the subtype"
+        );
+    }
+
+    #[test]
+    fn stream_success_result_adds_no_transcript_noise() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+        let before = app.messages.len();
+
+        let result_chunk = r#"{"type":"result","subtype":"success","is_error":false,"error":null}"#
+            .to_string()
+            + "\n";
+        app.push_event_message(&output_event(1, &session_id, &result_chunk));
+
+        assert!(!app.is_responding);
+        assert_eq!(
+            app.messages.len(),
+            before,
+            "a clean result must stay silent — no per-turn transcript noise"
+        );
+    }
+
+    /// Batched mode: the held-back partial output must flush BEFORE the
+    /// failure notice so the user reads what arrived, then why it stopped.
+    #[test]
+    fn batched_error_result_flushes_partial_output_before_the_failure_notice() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.handle_slash_command("/stream off");
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        let text_chunk =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"partial answer"}]}}"#
+                .to_string()
+                + "\n";
+        app.push_event_message(&output_event(1, &session_id, &text_chunk));
+
+        let result_chunk =
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"error":"boom"}"#
+                .to_string() + "\n";
+        app.push_event_message(&output_event(2, &session_id, &result_chunk));
+
+        let agent_idx = app
+            .messages
+            .iter()
+            .position(|m| {
+                matches!(m.role, MessageRole::Agent) && m.content.contains("partial answer")
+            })
+            .expect("batched output must flush on the error result");
+        let failure_idx = app
+            .messages
+            .iter()
+            .position(|m| {
+                matches!(m.role, MessageRole::System) && m.content.contains("Reply failed")
+            })
+            .expect("failure notice must be pushed");
+        assert!(
+            agent_idx < failure_idx,
+            "partial output must appear before the failure notice"
+        );
     }
 
     #[test]
