@@ -164,6 +164,45 @@ fn claim_acquire_by_the_same_agent_extends_its_own_claim() -> anyhow::Result<()>
 }
 
 #[test]
+fn claim_acquire_does_not_steal_an_incomplete_claim() -> anyhow::Result<()> {
+    let repo = TestRepo::new()?;
+    let claims_dir = repo.claims_dir()?;
+    fs::create_dir_all(&claims_dir)?;
+    let claim_path = claims_dir.join("feature-demo");
+    fs::write(&claim_path, "")?;
+
+    let acquire = repo.coven_with_env(
+        ["claim", "acquire", "feature/demo"],
+        [("COVEN_AGENT_ID", "sage")],
+    )?;
+    assert_failure("claim acquire while initial write is incomplete", &acquire);
+    assert_stderr_contains(
+        "claim acquire while initial write is incomplete",
+        &acquire,
+        "contended",
+    );
+    assert_eq!(fs::read(&claim_path)?, b"");
+    Ok(())
+}
+
+#[test]
+fn claim_acquire_respects_live_takeover_lock_when_claim_is_missing() -> anyhow::Result<()> {
+    let repo = TestRepo::new()?;
+    let claims_dir = repo.claims_dir()?;
+    fs::create_dir_all(&claims_dir)?;
+    fs::write(claims_dir.join("@feature-demo.takeover"), "")?;
+
+    let acquire = repo.coven_with_env(
+        ["claim", "acquire", "feature/demo"],
+        [("COVEN_AGENT_ID", "sage")],
+    )?;
+    assert_failure("claim acquire during takeover", &acquire);
+    assert_stderr_contains("claim acquire during takeover", &acquire, "contended");
+    assert!(!claims_dir.join("feature-demo").exists());
+    Ok(())
+}
+
+#[test]
 fn claim_status_ignores_leftover_internal_files() -> anyhow::Result<()> {
     let repo = TestRepo::new()?;
     let acquired = repo.coven_with_env(
@@ -172,12 +211,12 @@ fn claim_status_ignores_leftover_internal_files() -> anyhow::Result<()> {
     )?;
     assert_success("claim acquire by cody", &acquired);
 
-    // Staging and lock files are dot-prefixed siblings of the claim; a crash
+    // Staging and lock files use the reserved `@`-prefixed namespace; a crash
     // mid-takeover can leave one behind and it must not read as a claim.
     let claims_dir = repo.claims_dir()?;
-    fs::write(claims_dir.join(".feature-demo.takeover"), "")?;
+    fs::write(claims_dir.join("@feature-demo.takeover"), "")?;
     fs::write(
-        claims_dir.join(".feature-demo.write.1.2"),
+        claims_dir.join("@feature-demo.write.1.2"),
         "branch=feature/demo\nagent_id=stale\nacquired_at=0\nexpires_at=0\n",
     )?;
 
@@ -216,6 +255,22 @@ fn claim_status_lists_real_dot_prefixed_claims() -> anyhow::Result<()> {
         stdout.contains("dotty"),
         "claim status should show the dot-prefixed claim owner, got:\n{stdout}"
     );
+    Ok(())
+}
+
+#[test]
+fn claim_status_lists_real_claim_matching_staging_filename_shape() -> anyhow::Result<()> {
+    let repo = TestRepo::new()?;
+    let acquired = repo.coven_with_env(
+        ["claim", "acquire", ".feature.write.123.456"],
+        [("COVEN_AGENT_ID", "dotty")],
+    )?;
+    assert_success("claim acquire by dotty", &acquired);
+
+    let status = repo.coven(["claim", "status"])?;
+    assert_success("claim status", &status);
+    assert_stdout_contains("claim status", &status, ".feature.write.123.456");
+    assert_stdout_contains("claim status", &status, "dotty");
     Ok(())
 }
 

@@ -99,6 +99,13 @@ pub(crate) fn claim_acquire(branch: &str) -> Result<()> {
         // Someone holds the slot. Re-read to decide whether it is ours to
         // refresh, someone else's to respect, or expired and up for grabs.
         match read_claim(&repo, branch)? {
+            None => {
+                // `create_new` publishes the directory entry before the
+                // winner finishes writing the claim body. An empty or partial
+                // file is therefore contended, not abandoned: retrying gives
+                // the writer time to finish without letting a loser steal it.
+                std::thread::sleep(Duration::from_millis(20));
+            }
             Some(existing) if existing.is_active(now) && existing.agent_id != agent_id => {
                 anyhow::bail!(
                     "{} is already claimed by {} until {}",
@@ -115,12 +122,11 @@ pub(crate) fn claim_acquire(branch: &str) -> Result<()> {
                 println!("claimed {branch} for {agent_id} until {}", claim.expires_at);
                 return Ok(());
             }
-            // Expired, or too corrupt to identify an owner. Contend for the
-            // takeover under a lock: unlike a free slot, this transition
-            // cannot be arbitrated by `create_new` (the file already exists),
-            // and it must never leave the slot empty or a concurrent
-            // `create_new` would slip into the gap and mint a second winner.
-            _ => {
+            // An expired claim is eligible for takeover. Contend under a
+            // lock: unlike a free slot, this transition cannot be arbitrated
+            // by `create_new` (the file already exists), and it must never
+            // leave the slot empty or a concurrent creator could slip in.
+            Some(_) => {
                 if try_takeover(&repo, branch, &claim)? {
                     println!("claimed {branch} for {agent_id} until {}", claim.expires_at);
                     return Ok(());
@@ -200,8 +206,13 @@ pub(crate) fn claim_status(json: bool) -> Result<()> {
     let mut claims = if claims_dir.exists() {
         fs::read_dir(&claims_dir)?
             .filter_map(|entry| entry.ok())
-            .filter(|entry| !is_temp_claim_file(&entry.path()))
-            .filter_map(|entry| read_claim_file(&entry.path()).ok().flatten())
+            .filter_map(|entry| {
+                let path = entry.path();
+                read_claim_file(&path)
+                    .ok()
+                    .flatten()
+                    .filter(|claim| claim_path(&repo, &claim.branch) == path)
+            })
             .collect::<Vec<_>>()
     } else {
         Vec::new()
@@ -614,6 +625,22 @@ fn create_claim_exclusive(repo: &Repo, claim: &Claim) -> Result<bool> {
     let claims_dir = repo.common_dir.join("agent-claims");
     fs::create_dir_all(&claims_dir)?;
     let path = claim_path(repo, &claim.branch);
+    let takeover_lock = takeover_lock_path(&path);
+    if takeover_lock.try_exists().with_context(|| {
+        format!(
+            "failed to inspect takeover lock {}",
+            takeover_lock.display()
+        )
+    })? {
+        if lock_is_stale(&takeover_lock) {
+            let _ = fs::remove_file(&takeover_lock);
+        } else {
+            // A releaser can remove an expired claim while its winner holds
+            // the takeover lock. Do not let that temporary empty slot admit
+            // a second winner before the takeover publishes its replacement.
+            return Ok(false);
+        }
+    }
     match fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -640,9 +667,8 @@ fn replace_claim(repo: &Repo, claim: &Claim) -> Result<()> {
     fs::write(&staging, render_claim(claim))
         .with_context(|| format!("failed to stage claim {}", staging.display()))?;
     replace_claim_file(&staging, &path)
-        .map_err(|err| {
+        .inspect_err(|_| {
             let _ = fs::remove_file(&staging);
-            err
         })
         .with_context(|| format!("failed to publish claim {}", path.display()))?;
     Ok(())
@@ -691,15 +717,16 @@ fn replace_claim_file(staging: &Path, path: &Path) -> std::io::Result<()> {
 }
 
 /// Sibling path for staged and cleared claim files. Kept in the same directory
-/// so the rename stays within one filesystem, and dot-prefixed so
-/// `claim status` skips it if a crash leaves one behind.
+/// so the rename stays within one filesystem. The `@` prefix is reserved for
+/// protocol internals because `branch_slug` never preserves `@`, so no valid
+/// claim filename can collide with staging or lock state.
 fn temp_claim_path(path: &Path, kind: &str) -> PathBuf {
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| "claim".to_string());
     let unique = format!(
-        ".{name}.{kind}.{}.{}",
+        "@{name}.{kind}.{}.{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -730,10 +757,15 @@ fn try_takeover(repo: &Repo, branch: &str, claim: &Claim) -> Result<bool> {
         Some(existing) if existing.is_active(now) && existing.agent_id != claim.agent_id => {
             Ok(false)
         }
-        _ => {
+        Some(_) => {
             replace_claim(repo, claim)?;
             Ok(true)
         }
+        // A concurrent release may remove the expired claim after we decide
+        // to take it over. With no file left to replace, drop the lock and let
+        // the next free-slot acquisition use `create_new`; recreating it here
+        // would race that path and could report two winners.
+        None => Ok(false),
     }
 }
 
@@ -790,41 +822,7 @@ fn takeover_lock_path(path: &Path) -> PathBuf {
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| "claim".to_string());
-    path.with_file_name(format!(".{name}.takeover"))
-}
-
-fn is_temp_claim_file(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    is_staged_claim_file(name) || is_takeover_lock_file(path, name)
-}
-
-fn is_staged_claim_file(name: &str) -> bool {
-    let Some(rest) = name.strip_prefix('.') else {
-        return false;
-    };
-    let Some((prefix, nanos)) = rest.rsplit_once('.') else {
-        return false;
-    };
-    let Some((prefix, pid)) = prefix.rsplit_once('.') else {
-        return false;
-    };
-    prefix.ends_with(".write")
-        && !pid.is_empty()
-        && pid.bytes().all(|byte| byte.is_ascii_digit())
-        && !nanos.is_empty()
-        && nanos.bytes().all(|byte| byte.is_ascii_digit())
-}
-
-fn is_takeover_lock_file(path: &Path, name: &str) -> bool {
-    let Some(rest) = name.strip_prefix('.') else {
-        return false;
-    };
-    let Some(claim_name) = rest.strip_suffix(".takeover") else {
-        return false;
-    };
-    !claim_name.is_empty() && path.with_file_name(claim_name).exists()
+    path.with_file_name(format!("@{name}.takeover"))
 }
 
 fn write_claim(repo: &Repo, claim: &Claim) -> Result<()> {
@@ -1228,18 +1226,54 @@ mod tests {
     }
 
     #[test]
-    fn temp_claim_file_detection_is_specific() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let claim = temp.path().join(".foo");
-        let staged = temp.path().join(".foo.write.123.456");
-        let lock = temp.path().join(".foo.takeover");
+    fn replace_claim_overwrites_existing_claim() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let repo = Repo {
+            root: temp.path().to_path_buf(),
+            common_dir: temp.path().to_path_buf(),
+        };
+        let original = sample_claim();
+        assert!(create_claim_exclusive(&repo, &original).expect("create original claim"));
 
-        assert!(!is_temp_claim_file(&claim));
-        assert!(is_temp_claim_file(&staged));
-        assert!(!is_temp_claim_file(&lock));
+        let replacement = Claim {
+            agent_id: "agent-b".to_string(),
+            expires_at: original.expires_at + 3600,
+            ..original.clone()
+        };
+        replace_claim(&repo, &replacement).expect("replace existing claim");
 
-        fs::write(temp.path().join("foo"), "").expect("seed claim");
-        assert!(is_temp_claim_file(&lock));
+        let stored = read_claim(&repo, &replacement.branch)
+            .expect("read replacement")
+            .expect("claim exists");
+        assert_eq!(stored.agent_id, replacement.agent_id);
+        assert_eq!(stored.expires_at, replacement.expires_at);
+    }
+
+    #[test]
+    fn takeover_does_not_recreate_a_released_claim() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let repo = Repo {
+            root: temp.path().to_path_buf(),
+            common_dir: temp.path().to_path_buf(),
+        };
+        fs::create_dir_all(repo.common_dir.join("agent-claims")).expect("claims dir");
+        let claim = sample_claim();
+
+        assert!(!try_takeover(&repo, &claim.branch, &claim).expect("try takeover"));
+        assert!(!claim_path(&repo, &claim.branch).exists());
+    }
+
+    #[test]
+    fn internal_claim_paths_use_unrepresentable_prefix() {
+        let claim = PathBuf::from("feature-demo");
+        let staged = temp_claim_path(&claim, "write");
+        let lock = takeover_lock_path(&claim);
+
+        for internal in [staged, lock] {
+            let name = internal.file_name().unwrap().to_string_lossy();
+            assert!(name.starts_with('@'));
+            assert_ne!(branch_slug(&name), name);
+        }
     }
 
     #[test]
