@@ -202,6 +202,37 @@ pub fn harness_supports_preassigned_session_id(harness_id: &str) -> bool {
     declared_capabilities(harness_id).preassigned_session_id
 }
 
+/// Whether a chat turn launched against this harness can reuse the prior
+/// turn's conversation via the harness CLI's session-resume mechanism. See
+/// `docs/chat-persistence.md` for the per-harness mechanics.
+///
+/// Data-driven off the configured spec's declared `continuity_args`
+/// (built-ins and installed adapter manifests alike): resume needs a
+/// declared resume launch shape plus a way to learn the session id — either
+/// pre-assignment via `session_id_flag` (claude, copilot, grok) or codex's
+/// chat-side capture of the `session id:` banner from first-turn output.
+///
+/// The engine (`coven-code`) is carved out even though it declares
+/// continuity args: those serve resume-by-*engine-assigned* id (`coven run`
+/// flows), but per ENGINE-CONTRACT.md its `--session-id` is a tracking tag,
+/// not a persistence key — sessions never become loadable under a
+/// pre-assigned id, so chat's pick-the-id-up-front flow cannot resume it.
+/// Verified empirically against engine 0.7.0.
+pub fn harness_supports_chat_resume(harness_id: &str) -> bool {
+    if harness_id == crate::engine::ENGINE_HARNESS_ID {
+        return false;
+    }
+    configured_harness_specs()
+        .unwrap_or_else(|_| built_in_harness_specs())
+        .into_iter()
+        .find(|spec| spec.id == harness_id)
+        .and_then(|spec| spec.continuity_args)
+        .is_some_and(|continuity| {
+            continuity.has_resume_launch()
+                && (continuity.session_id_flag().is_some() || harness_id == "codex")
+        })
+}
+
 pub fn harness_supports_think(harness_id: &str) -> bool {
     declared_capabilities(harness_id).think
 }
@@ -971,6 +1002,7 @@ pub fn known_adapter_manifest(adapter_id: &str) -> Option<&'static str> {
     match adapter_id {
         "grok" => Some(GROK_BUILD_ADAPTER_MANIFEST),
         "hermes" => Some(HERMES_ADAPTER_MANIFEST),
+        "opencode" => Some(OPENCODE_ADAPTER_MANIFEST),
         _ => None,
     }
 }
@@ -1048,8 +1080,46 @@ const HERMES_ADAPTER_MANIFEST: &str = r#"{
 }
 "#;
 
+// OpenCode's adapter recipe, kept byte-identical to the accepted
+// `coven-runtimes` registry manifest (`registry/runtimes/opencode/0.1.0.json`)
+// so a Cave-installed `$COVEN_HOME/adapters/opencode.json` passes the
+// byte-equality trust check (`trusted_adapter_manifest_matches_recipe`) and
+// `coven adapter install opencode` produces the same artifact the Cave does.
+// Update both places together when the registry accepts a new version.
+//
+// OpenCode runs one-shot through `opencode run` and keeps all project
+// configuration (system prompts, tools) in its own config files, so the
+// recipe declares no system-prompt flag, no sandbox mapping, and no
+// continuity args — chat resume is intentionally unavailable (see
+// `docs/chat-persistence.md`).
+const OPENCODE_ADAPTER_MANIFEST: &str = r#"{
+  "adapters": [
+    {
+      "id": "opencode",
+      "label": "OpenCode",
+      "executable": "opencode",
+      "interactive_prompt_prefix_args": [],
+      "non_interactive_prompt_prefix_args": [
+        "run"
+      ],
+      "install_hint": "Install OpenCode from https://opencode.ai/docs/cli (e.g. `npm i -g opencode-ai`) and ensure `opencode` resolves on PATH. Verify with `opencode run --help` — the similarly-named Go app some package managers ship has no `run` subcommand and will not work.",
+      "model_flag": "--model",
+      "capabilities": {
+        "stream": false,
+        "preassigned_session_id": false,
+        "think": false,
+        "speed": false
+      },
+      "version": "0.1.0",
+      "homepage": "https://opencode.ai",
+      "description": "OpenCode runtime adapter for Coven. Drives `opencode run` in non-interactive mode; system prompts and tools are configured via the OpenCode project config (AGENTS.md / opencode.json), not via CLI flags."
+    }
+  ]
+}
+"#;
+
 pub fn known_adapter_recipe_names() -> &'static [&'static str] {
-    &["grok", "hermes"]
+    &["grok", "hermes", "opencode"]
 }
 
 fn load_external_harness_specs(
@@ -2335,10 +2405,18 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_opencode_message_points_to_trusted_recipe() {
+        let message = unsupported_harness_message("opencode", &["codex", "claude"]);
+
+        assert!(message.contains("coven adapter install opencode"));
+        assert!(message.contains("coven adapter doctor opencode"));
+    }
+
+    #[test]
     fn unsupported_message_for_an_unknown_harness_lists_every_recipe() {
         let message = unsupported_harness_message("not-a-real-harness", &["codex"]);
 
-        assert!(message.contains("Known installable adapter recipes: grok, hermes."));
+        assert!(message.contains("Known installable adapter recipes: grok, hermes, opencode."));
     }
 
     #[test]
@@ -2515,6 +2593,175 @@ mod tests {
 
         assert!(!args.contains(&"--permission-mode".to_string()));
         assert!(!args.contains(&"--sandbox".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn opencode_recipe_matches_registry_contract() -> anyhow::Result<()> {
+        let specs = parse_external_harness_specs(
+            OPENCODE_ADAPTER_MANIFEST,
+            Path::new("opencode.json"),
+            &built_in_harness_specs(),
+        )?;
+        let opencode = specs
+            .iter()
+            .find(|spec| spec.id == "opencode")
+            .expect("OpenCode recipe should parse");
+
+        assert_eq!(opencode.label, "OpenCode");
+        assert_eq!(opencode.executable, "opencode");
+        // OpenCode keeps system prompts and tools in its own project config
+        // (AGENTS.md / opencode.json); there is no flag surface for them.
+        assert_eq!(opencode.prompt_flag, None);
+        assert_eq!(opencode.system_prompt_flag, None);
+        assert_eq!(
+            opencode.model_args("anthropic/claude-sonnet-4-5"),
+            ["--model", "claude-sonnet-4-5"]
+        );
+        // Non-interactive one-shots ride `opencode run` with the prompt as a
+        // positional behind the options terminator.
+        assert_eq!(
+            opencode.prompt_args("fix tests", HarnessLaunchMode::NonInteractive),
+            ["run", "--", "fix tests"]
+        );
+        assert!(!opencode.capabilities.stream);
+        assert!(!opencode.capabilities.preassigned_session_id);
+        assert!(!opencode.capabilities.think);
+        assert!(!opencode.capabilities.speed);
+        // No sandbox mapping declared: permission requests yield no argv.
+        assert!(opencode.sandbox_args(Permission::Full).is_empty());
+        assert!(opencode.sandbox_args(Permission::ReadOnly).is_empty());
+        // No continuity args declared: conversation hints yield no argv, so
+        // chat resume stays off for OpenCode.
+        assert_eq!(
+            continuity_args(
+                opencode,
+                HarnessLaunchMode::NonInteractive,
+                &ConversationHint::Init {
+                    id: "11111111-2222-4333-8444-555555555555".to_string(),
+                },
+            ),
+            None
+        );
+        assert_eq!(
+            continuity_args(
+                opencode,
+                HarnessLaunchMode::NonInteractive,
+                &ConversationHint::Resume {
+                    id: "11111111-2222-4333-8444-555555555555".to_string(),
+                },
+            ),
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn opencode_recipe_is_byte_identical_to_its_installed_form() {
+        // `trusted_adapter_manifest_matches_recipe` trusts a
+        // `$COVEN_HOME/adapters/opencode.json` only when it byte-equals the
+        // embedded recipe, and the Cave installs the registry manifest
+        // verbatim — so the recipe must parse cleanly and round-trip as-is.
+        assert_eq!(
+            known_adapter_manifest("opencode"),
+            Some(OPENCODE_ADAPTER_MANIFEST)
+        );
+        assert!(OPENCODE_ADAPTER_MANIFEST.ends_with("}\n"));
+    }
+
+    #[test]
+    fn installed_opencode_recipe_constructs_complete_launch_argv() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let coven_home = temp_dir.path().join("coven-home");
+        let adapter_dir = trusted_adapter_dir(&coven_home);
+        fs::create_dir_all(&adapter_dir)?;
+        fs::write(
+            trusted_adapter_manifest_path(&coven_home, "opencode"),
+            OPENCODE_ADAPTER_MANIFEST,
+        )?;
+
+        let _guard = lock_env();
+        let _manifest_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_MANIFEST_ENV);
+        let _dirs_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_DIRS_ENV);
+        let _coven_home_guard = EnvVarGuard::set("COVEN_HOME", &coven_home);
+        let familiar = FamiliarContext {
+            id: "charm".to_string(),
+            display_name: "Charm".to_string(),
+            role: None,
+        };
+
+        let parts = command_parts_for_harness_with_conversation(
+            "opencode",
+            "fix tests",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            Some(&familiar),
+            HarnessLaunchOptions {
+                model: Some("anthropic/claude-sonnet-4-5"),
+                permission: Some(Permission::ReadOnly),
+                ..Default::default()
+            },
+        )?;
+
+        // No system-prompt flag: identity prepends to the prompt. No sandbox
+        // mapping: the permission request forwards no argv (the run layer
+        // warns instead).
+        assert_eq!(
+            parts,
+            (
+                "opencode".to_string(),
+                vec![
+                    "--model".to_string(),
+                    "claude-sonnet-4-5".to_string(),
+                    "run".to_string(),
+                    "--".to_string(),
+                    format!(
+                        "{preamble}\n\nfix tests",
+                        preamble = familiar.identity_preamble()
+                    ),
+                ],
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn chat_resume_support_is_driven_by_declared_continuity() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let coven_home = temp_dir.path().join("coven-home");
+        let adapter_dir = trusted_adapter_dir(&coven_home);
+        fs::create_dir_all(&adapter_dir)?;
+        fs::write(
+            trusted_adapter_manifest_path(&coven_home, "grok"),
+            GROK_BUILD_ADAPTER_MANIFEST,
+        )?;
+        fs::write(
+            trusted_adapter_manifest_path(&coven_home, "opencode"),
+            OPENCODE_ADAPTER_MANIFEST,
+        )?;
+
+        let _guard = lock_env();
+        let _manifest_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_MANIFEST_ENV);
+        let _dirs_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_DIRS_ENV);
+        let _coven_home_guard = EnvVarGuard::set("COVEN_HOME", &coven_home);
+
+        // Built-ins: claude/copilot pre-assign ids, codex captures its id
+        // from first-turn output.
+        assert!(harness_supports_chat_resume("claude"));
+        assert!(harness_supports_chat_resume("codex"));
+        assert!(harness_supports_chat_resume("copilot"));
+        // The engine declares continuity args for `coven run` flows, but its
+        // `--session-id` is a tracking tag, not a persistence key, so chat
+        // resume stays off (see the carve-out on the function).
+        assert!(!harness_supports_chat_resume(
+            crate::engine::ENGINE_HARNESS_ID
+        ));
+        // Installed adapters follow their declared continuity args.
+        assert!(harness_supports_chat_resume("grok"));
+        assert!(!harness_supports_chat_resume("opencode"));
+        // Unknown / not-installed ids resolve to no spec, hence no resume.
+        assert!(!harness_supports_chat_resume("hermes"));
+        assert!(!harness_supports_chat_resume("not-a-real-harness"));
         Ok(())
     }
 

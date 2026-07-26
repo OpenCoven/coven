@@ -1134,7 +1134,7 @@ impl App {
         // making the user retype.
         self.last_chat_prompt = Some(prompt.to_string());
 
-        // Fast path for stream-mode harnesses (today: claude). If we
+        // Fast path for stream-mode harnesses (claude, coven-code). If we
         // already have a long-lived stream session for this harness, send
         // the next user message into it instead of cold-starting a new
         // daemon session.
@@ -1202,8 +1202,8 @@ impl App {
 
     /// Decide whether a launch for `harness` should ride a resumable chat
     /// session, and if so produce the right hint. For harnesses where we can
-    /// pre-assign the session id (claude/copilot `--session-id`) the first
-    /// turn sends
+    /// pre-assign the session id (claude/copilot/grok `--session-id`) the
+    /// first turn sends
     /// `Init` with a freshly generated UUID. For harnesses that auto-assign
     /// (codex) the first turn sends no hint and the id is captured from
     /// output afterwards via `maybe_capture_codex_session_id`.
@@ -1211,7 +1211,7 @@ impl App {
         &mut self,
         harness: &str,
     ) -> Option<harness::ConversationHint> {
-        if !harness_supports_chat_resume(harness) {
+        if !harness::harness_supports_chat_resume(harness) {
             return None;
         }
         if let Some(id) = self.harness_conversation_ids.get(harness) {
@@ -1482,7 +1482,10 @@ impl App {
             .resolved_coven_home()
             .map(|home| home.display().to_string())
             .unwrap_or_else(|| "unresolved — set COVEN_HOME".to_string());
-        let harnesses = harness::built_in_harnesses();
+        // Configured = built-ins plus installed adapter manifests; fall back
+        // to built-ins on a manifest load error (the launch path surfaces it).
+        let harnesses =
+            harness::configured_harnesses().unwrap_or_else(|_| harness::built_in_harnesses());
         let mut lines = vec![
             "Doctor".to_string(),
             format!("  Store    {store_path}"),
@@ -1519,16 +1522,16 @@ impl App {
         let home = std::env::var("HOME")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
-        for (harness_id, label) in &[
-            ("codex", "Codex"),
-            ("claude", "Claude"),
-            ("copilot", "Copilot"),
-        ] {
-            let m = match *harness_id {
+        for harness in &harnesses {
+            let m = match harness.id.as_str() {
                 "codex" => crate::capabilities::scan_codex_capabilities(&home),
                 "claude" => crate::capabilities::scan_claude_capabilities(&home),
+                "coven-code" => crate::capabilities::scan_coven_code_capabilities(&home),
                 "copilot" => crate::capabilities::scan_copilot_capabilities(&home),
-                other => unreachable!("unhandled capabilities row for harness `{other}`"),
+                "opencode" => crate::capabilities::scan_opencode_capabilities(&home),
+                // Adapters without a capability scanner (grok, hermes, …)
+                // have no instructions/skills/plugins convention to inspect.
+                _ => continue,
             };
             let instr = if m.global_instructions.present {
                 "✓"
@@ -1537,6 +1540,7 @@ impl App {
             };
             let skills_n = m.skills.len();
             let plugins_n = m.plugins.len();
+            let label = &harness.label;
             lines.push(format!(
                 "    {label:<11} instructions {instr}  automations {skills_n}  plugins {plugins_n}"
             ));
@@ -2511,10 +2515,15 @@ fn is_api_mismatch_error(message: &str) -> bool {
     message.contains("Coven daemon API mismatch")
 }
 
-// ── Discover agents from built-in harnesses ────────────────────────────────
+// ── Discover agents from configured harnesses ──────────────────────────────
 
 pub(super) fn discover_agents() -> Vec<AgentInfo> {
-    harness::built_in_harnesses()
+    // Configured = built-ins plus installed adapter manifests (grok, hermes,
+    // opencode, …), so every runtime `coven run` accepts is selectable in
+    // chat. A manifest load error falls back to built-ins only — the launch
+    // path re-reads the manifests and surfaces the error with full context.
+    harness::configured_harnesses()
+        .unwrap_or_else(|_| harness::built_in_harnesses())
         .into_iter()
         .map(|h| AgentInfo {
             id: h.id.to_string(),
@@ -2579,13 +2588,6 @@ fn short_session_id(session_id: &str) -> String {
 fn should_keep_launch_inline(plan: &CastPlan) -> bool {
     !matches!(plan.intent, CastIntent::NaturalSpell { .. })
         || !matches!(plan.risk(), CastRisk::Safe)
-}
-
-/// Whether a chat turn launched against this harness should reuse the prior
-/// turn's conversation via the harness CLI's session-resume mechanism. See
-/// `docs/chat-persistence.md` for the per-harness mechanics.
-fn harness_supports_chat_resume(harness: &str) -> bool {
-    matches!(harness, "claude" | "codex" | "copilot" | "grok")
 }
 
 /// Whether `data` (a chunk of harness output) indicates the harness rejected
@@ -5018,14 +5020,11 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn chat_resume_covers_all_built_in_pty_harnesses() {
-        assert!(harness_supports_chat_resume("claude"));
-        assert!(harness_supports_chat_resume("codex"));
-        assert!(harness_supports_chat_resume("copilot"));
-        assert!(harness_supports_chat_resume("grok"));
-        assert!(!harness_supports_chat_resume("hermes"));
-    }
+    // Chat-resume support moved to `harness::harness_supports_chat_resume`,
+    // driven by each configured spec's declared continuity args; the
+    // hermetic coverage (built-ins, installed grok/opencode adapters, the
+    // coven-code carve-out) lives in `harness.rs`'s
+    // `chat_resume_support_is_driven_by_declared_continuity`.
 
     #[test]
     fn copilot_stats_lines_hide_from_chat_transcript() {

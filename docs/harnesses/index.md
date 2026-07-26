@@ -26,6 +26,9 @@ A **harness** is an external coding-agent CLI that Coven can launch and supervis
   <Card title="Grok Build (experimental)" href="/harnesses/grok-build" icon="terminal">
     Trusted xAI Grok Build recipe. Installable harness id `grok`.
   </Card>
+  <Card title="OpenCode (recipe)" href="/harnesses/opencode" icon="code">
+    Trusted OpenCode registry recipe. Installable harness id `opencode`.
+  </Card>
   <Card title="Future harnesses" href="/FUTURE-HARNESSES" icon="compass">
     Hermes, Aider, Gemini CLI, Cline — adapter direction and roadmap signals.
   </Card>
@@ -40,6 +43,7 @@ flowchart LR
   Adapter --> ClaudeAdapter[Claude adapter]
   Adapter --> CopilotAdapter[Copilot adapter]
   Adapter -. recipe .-> GrokAdapter[Grok Build adapter]
+  Adapter -. recipe .-> OpenCodeAdapter[OpenCode adapter]
   Adapter -. future .-> Future[Hermes / Aider / Gemini]
   OpenClaw[OpenClaw] --> Bridge["OpenClaw bridge plugin"]
   Bridge --> Coven
@@ -47,6 +51,7 @@ flowchart LR
   ClaudeAdapter --> ClaudePty[Claude Code PTY]
   CopilotAdapter --> CopilotPty[Copilot CLI PTY]
   GrokAdapter --> GrokPty[Grok Build PTY]
+  OpenCodeAdapter --> OpenCodePty[OpenCode PTY]
 ```
 
 ## What every harness has in common
@@ -100,5 +105,6 @@ Grok Build is an experimental opt-in recipe rather than a bundled default. See [
 - [Provider auth boundary](/harnesses/provider-auth)
 - [OpenClaw bridge](/harnesses/openclaw)
 - [Grok Build adapter](/harnesses/grok-build)
+- [OpenCode adapter](/harnesses/opencode)
 - [Harness adapter guide](/HARNESS-ADAPTERS)
 - [Future harness notes](/FUTURE-HARNESSES)

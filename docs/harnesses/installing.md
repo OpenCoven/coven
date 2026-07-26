@@ -37,6 +37,8 @@ Other CLIs (Hermes, Aider, Gemini CLI, Cline, custom commands) are **not** bundl
 
 Grok Build has a reviewed **experimental recipe** but is not bundled by default. Install the Grok CLI and authenticate first, then run `coven adapter install grok`; see [Grok Build](/harnesses/grok-build) for the complete setup and permission mapping.
 
+OpenCode has an accepted **registry recipe** and is likewise not bundled. Install the OpenCode CLI (`npm i -g opencode-ai`) first, then run `coven adapter install opencode`; see [OpenCode](/harnesses/opencode) for the adapter contract and chat behavior.
+
 ## Step-by-step install
 
 <Steps>
