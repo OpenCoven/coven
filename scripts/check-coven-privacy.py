@@ -81,6 +81,14 @@ def staged_files() -> list[tuple[str, bytes]]:
 
 
 def changed_files(revision_range: str) -> list[tuple[str, bytes]]:
+    if "..." in revision_range:
+        end_rev = revision_range.rsplit("...", 1)[1]
+    elif ".." in revision_range:
+        end_rev = revision_range.rsplit("..", 1)[1]
+    else:
+        raise ValueError("--range requires START..END or START...END")
+    end_rev = end_rev.strip() or "HEAD"
+
     names = nul_paths(
         git(
             "diff",
@@ -91,20 +99,7 @@ def changed_files(revision_range: str) -> list[tuple[str, bytes]]:
             text=False,
         )
     )
-    end_rev = revision_range
-    if "..." in end_rev:
-        end_rev = end_rev.rsplit("...", 1)[1]
-    elif ".." in end_rev:
-        end_rev = end_rev.rsplit("..", 1)[1]
-    end_rev = end_rev.strip() or "HEAD"
-
-    files: list[tuple[str, bytes]] = []
-    for name in names:
-        try:
-            files.append((name, git("show", f"{end_rev}:{name}", text=False)))
-        except subprocess.CalledProcessError:
-            continue
-    return files
+    return [(name, git("show", f"{end_rev}:{name}", text=False)) for name in names]
 
 
 def working_files(names: list[str]) -> list[tuple[str, bytes]]:
@@ -126,7 +121,8 @@ def scan_files(files: list[tuple[str, bytes]]) -> list[tuple[str, int, str]]:
 
 def usage() -> int:
     print(
-        "usage: check-coven-privacy.py --staged | --range REVISION_RANGE | --files PATH...",
+        "usage: check-coven-privacy.py --staged | "
+        "--range START..END|START...END | --files PATH...",
         file=sys.stderr,
     )
     return 2

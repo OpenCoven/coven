@@ -5,6 +5,7 @@ import contextlib
 import importlib.util
 import io
 import pathlib
+import subprocess
 import unittest
 import unittest.mock
 
@@ -123,6 +124,27 @@ class CovenPrivacyPatternTests(unittest.TestCase):
             ],
         )
 
+    def test_range_scan_rejects_single_revision(self) -> None:
+        with unittest.mock.patch.object(check_coven_privacy, "git") as git:
+            with self.assertRaisesRegex(ValueError, r"START\.\.END"):
+                check_coven_privacy.changed_files("HEAD^")
+
+        git.assert_not_called()
+
+    def test_range_scan_fails_when_a_changed_file_cannot_be_read(self) -> None:
+        def fake_git(*args: str, text: bool = True) -> str | bytes:
+            if args[:2] == ("diff", "--name-only"):
+                return b"docs/missing.md\0"
+            if args == ("show", "after:docs/missing.md"):
+                raise subprocess.CalledProcessError(128, ["git", *args])
+            raise AssertionError(f"unexpected git call: {args!r}")
+
+        with unittest.mock.patch.object(
+            check_coven_privacy, "git", side_effect=fake_git
+        ):
+            with self.assertRaises(subprocess.CalledProcessError):
+                check_coven_privacy.changed_files("before..after")
+
     def test_private_session_identifier_is_blocked(self) -> None:
         text = ":".join(["agent", "example", "telegram", "direct", "123456789"])
 
@@ -203,15 +225,14 @@ class CovenPrivacyPatternTests(unittest.TestCase):
 
         self.assertEqual(hits, [("docs/example.md", 1, "phone_number")])
 
-    def test_range_usage_accepts_any_git_revision_range(self) -> None:
+    def test_range_usage_documents_explicit_range_shapes(self) -> None:
         stderr = io.StringIO()
 
         with contextlib.redirect_stderr(stderr):
             result = check_coven_privacy.usage()
 
         self.assertEqual(result, 2)
-        self.assertIn("--range REVISION_RANGE", stderr.getvalue())
-        self.assertNotIn("BASE...HEAD", stderr.getvalue())
+        self.assertIn("--range START..END|START...END", stderr.getvalue())
 
     def test_scan_files_scans_undecodable_bytes(self) -> None:
         private_path = b"/" + b"/".join(
