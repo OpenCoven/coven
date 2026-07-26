@@ -106,8 +106,9 @@ def working_files(names: list[str]) -> list[tuple[str, bytes]]:
     files: list[tuple[str, bytes]] = []
     for name in names:
         path = ROOT / name
-        if path.is_file():
-            files.append((name, path.read_bytes()))
+        if not path.is_file():
+            raise ValueError(f"--files path is missing or not a regular file: {name}")
+        files.append((name, path.read_bytes()))
     return files
 
 
@@ -129,17 +130,21 @@ def usage() -> int:
 
 
 def main(argv: list[str]) -> int:
-    if argv == ["--staged"]:
-        files = staged_files()
-        mode = "staged"
-    elif len(argv) == 2 and argv[0] == "--range":
-        files = changed_files(argv[1])
-        mode = f"range {argv[1]}"
-    elif len(argv) >= 2 and argv[0] == "--files":
-        files = working_files(argv[1:])
-        mode = "explicit files"
-    else:
-        return usage()
+    try:
+        if argv == ["--staged"]:
+            files = staged_files()
+            mode = "staged"
+        elif len(argv) == 2 and argv[0] == "--range":
+            files = changed_files(argv[1])
+            mode = f"range {argv[1]}"
+        elif len(argv) >= 2 and argv[0] == "--files":
+            files = working_files(argv[1:])
+            mode = "explicit files"
+        else:
+            return usage()
+    except ValueError as error:
+        print(f"Coven privacy guard failed: {error}", file=sys.stderr)
+        return 2
 
     hits = scan_files(files)
     if hits:

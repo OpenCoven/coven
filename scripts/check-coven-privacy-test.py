@@ -234,6 +234,17 @@ class CovenPrivacyPatternTests(unittest.TestCase):
         self.assertEqual(result, 2)
         self.assertIn("--range START..END|START...END", stderr.getvalue())
 
+    def test_explicit_file_scan_rejects_missing_path(self) -> None:
+        stderr = io.StringIO()
+
+        with contextlib.redirect_stderr(stderr):
+            result = check_coven_privacy.main(
+                ["--files", "docs/does-not-exist.md"]
+            )
+
+        self.assertEqual(result, 2)
+        self.assertIn("missing or not a regular file", stderr.getvalue())
+
     def test_scan_files_scans_undecodable_bytes(self) -> None:
         private_path = b"/" + b"/".join(
             [b"Users", b"privateuser", b"workspace"]
