@@ -1124,7 +1124,9 @@ const OPENCODE_ADAPTER_MANIFEST: &str = r#"{
       "id": "opencode",
       "label": "OpenCode",
       "executable": "opencode",
-      "interactive_prompt_prefix_args": [],
+      "interactive_prompt_prefix_args": [
+        "run"
+      ],
       "non_interactive_prompt_prefix_args": [
         "run"
       ],
