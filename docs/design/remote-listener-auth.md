@@ -21,10 +21,10 @@ and remote reachability is delegated to SSH or Tailscale
 network service and calling it authenticated.
 
 This design adds the "separate auth design" AUTH.md calls for: an **opt-in
-remote listener** (`coven daemon serve --remote <bind>`) that is TLS-wrapped,
-accepts only **paired devices** holding per-device bearer tokens (hashed at
-rest), scopes each device to *observe* or *control*, downgrades
-unauthenticated connections to a redacted `/health`, and supports immediate
+remote listener** (configured via `coven daemon start --remote <bind>` or
+settings) that is TLS-wrapped, accepts only **paired devices** holding
+per-device bearer tokens (hashed at rest), scopes each device to *observe*
+or *control*, downgrades unauthenticated connections to a redacted `/health`, and supports immediate
 revocation. Loopback-only remains the default; nothing changes for existing
 local clients or for the tunnel-based patterns, which stay documented and
 supported.
