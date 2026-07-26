@@ -3059,9 +3059,7 @@ fn run_session(
     // preamble to the prompt here so the integration layer remains harness-agnostic.
     let familiar_ctx = session_launch::resolve_familiar(&coven_home, familiar_id)
         .map_err(session_launch::FamiliarError::into_error)?;
-    let spec = harness::configured_harness_specs()?
-        .into_iter()
-        .find(|s| s.id == selected_harness.id);
+    let spec = Some(selected_harness.clone());
 
     // Resolve the requested model. Cave sends a namespaced id; the harness arg
     // builders strip the provider/ prefix and forward the bare id to the native
