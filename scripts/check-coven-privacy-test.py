@@ -163,6 +163,18 @@ class CovenPrivacyPatternTests(unittest.TestCase):
 
         self.assertEqual(hits, [("docs/example.md", 1, "absolute_home_path")])
 
+    def test_absolute_home_path_with_dotted_username_is_blocked(self) -> None:
+        text = "/" + "/".join(["Users", "private.user", "workspace", "memory.md"])
+
+        hits = check_coven_privacy.scan_text(text, "docs/example.md")
+
+        self.assertEqual(hits, [("docs/example.md", 1, "absolute_home_path")])
+
+    def test_security_docs_match_tokenized_url_rule(self) -> None:
+        security = (SCRIPT.parents[1] / "SECURITY.md").read_text(encoding="utf-8")
+
+        self.assertIn("invite/handoff URLs containing tokens", security)
+
     def test_runtime_internal_path_is_blocked(self) -> None:
         text = "~/." + "/".join(["coven", "workspaces", "example", "memory.md"])
 

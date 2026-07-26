@@ -27,7 +27,7 @@ RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
     (
         "absolute_home_path",
-        re.compile(r"(?:/Users/|/home/)[a-z0-9_-]+/", re.IGNORECASE),
+        re.compile(r"(?:/Users/|/home/)[a-z0-9._-]+/", re.IGNORECASE),
     ),
     (
         "runtime_internal_path",

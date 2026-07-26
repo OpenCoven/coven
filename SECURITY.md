@@ -31,8 +31,9 @@ As of 2026-07-26, Coven uses two explicit scanning tiers:
 2. `scripts/check-coven-privacy.py` fails closed on newly staged and
    pull-request-changed files containing private session identifiers, messenger
    IDs, absolute home paths, runtime-internal paths, phone numbers, or
-   invite/handoff URLs. Managed hooks installed by `coven hooks install` run
-   this guard before commits, and CI is the authoritative enforcement layer.
+   invite/handoff URLs containing tokens. Managed hooks installed by
+   `coven hooks install` run this guard before commits, and CI is the
+   authoritative enforcement layer.
 
 The second tier intentionally applies to new changes while the repository's
 legacy path examples are inventoried and converted to placeholders. This is a

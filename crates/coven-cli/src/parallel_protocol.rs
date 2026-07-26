@@ -835,10 +835,11 @@ privacy_guard="$repo_root/scripts/check-coven-privacy.py"
 if [ -f "$privacy_guard" ]; then
   if command -v python3 >/dev/null 2>&1; then
     python3 "$privacy_guard" --staged
-  elif command -v python >/dev/null 2>&1; then
+  elif command -v python >/dev/null 2>&1 \
+    && python -c 'import sys; sys.exit(sys.version_info[0] != 3)' >/dev/null 2>&1; then
     python "$privacy_guard" --staged
   else
-    echo "Coven privacy guard skipped: python not found (CI enforces it)." >&2
+    echo "Coven privacy guard skipped: Python 3 not found (CI enforces it)." >&2
   fi
 fi
 
@@ -920,6 +921,9 @@ mod tests {
         // Hook must not hard-require python3 (absent in some Windows sh
         // environments); CI remains the authoritative enforcement layer.
         assert!(PRE_COMMIT_HOOK.contains("command -v python3"));
+        assert!(
+            PRE_COMMIT_HOOK.contains("python -c 'import sys; sys.exit(sys.version_info[0] != 3)'")
+        );
         assert!(PRE_COMMIT_HOOK.contains("Coven privacy guard skipped"));
     }
 
