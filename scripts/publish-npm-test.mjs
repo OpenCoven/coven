@@ -55,13 +55,14 @@ async function assertWrapperPreservesSignal(signal) {
     );
     symlinkSync(process.execPath, path.join(nativeBinDir, binaryName));
 
+    let stdout = '';
     let stderr = '';
     wrapperProcess = spawn(
       process.execPath,
       [
         wrapperPath,
         '-e',
-        'process.stdout.write("ready\\n"); setTimeout(() => process.exit(2), 20_000);'
+        'process.stdout.write("rea"); setTimeout(() => process.stdout.write("dy\\n"), 10); setTimeout(() => process.exit(2), 20_000);'
       ],
       { stdio: ['ignore', 'pipe', 'pipe'] }
     );
@@ -72,12 +73,18 @@ async function assertWrapperPreservesSignal(signal) {
 
     await new Promise((resolve, reject) => {
       const timeout = setTimeout(
-        () => reject(new Error(`timed out waiting for fake native child; stderr:\n${stderr}`)),
+        () =>
+          reject(
+            new Error(
+              `timed out waiting for fake native child; stdout:\n${stdout}\nstderr:\n${stderr}`
+            )
+          ),
         10_000
       );
       wrapperProcess.stdout.setEncoding('utf8');
       wrapperProcess.stdout.on('data', (chunk) => {
-        if (chunk.includes('ready')) {
+        stdout += chunk;
+        if (stdout.includes('ready')) {
           clearTimeout(timeout);
           resolve();
         }
@@ -90,7 +97,7 @@ async function assertWrapperPreservesSignal(signal) {
         clearTimeout(timeout);
         reject(
           new Error(
-            `wrapper exited before readiness: code=${code} signal=${exitSignal}; stderr:\n${stderr}`
+            `wrapper exited before readiness: code=${code} signal=${exitSignal}; stdout:\n${stdout}\nstderr:\n${stderr}`
           )
         );
       });
