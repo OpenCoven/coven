@@ -74,6 +74,7 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
 python scripts/check-secrets.py        # secret scan — must be clean
+python scripts/check-coven-privacy.py --staged   # privacy guard on your staged changes
 ```
 
 If you touched the **npm/TypeScript** packages, also:

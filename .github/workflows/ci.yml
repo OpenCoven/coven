@@ -47,6 +47,12 @@ jobs:
         with:
           python-version: '3.x'
       - run: python scripts/check-secrets.py
+      - name: Coven privacy guard (pull request changes)
+        if: github.event_name == 'pull_request'
+        run: python scripts/check-coven-privacy.py --range "${{ github.event.pull_request.base.sha }}...HEAD"
+      - name: Coven privacy guard (pushed commit)
+        if: github.event_name == 'push'
+        run: python scripts/check-coven-privacy.py --range "HEAD^...HEAD"
 
   channels:
     name: Channels package
