@@ -222,11 +222,14 @@ pub fn harness_supports_chat_resume(harness_id: &str) -> bool {
     if harness_id == crate::engine::ENGINE_HARNESS_ID {
         return false;
     }
-    configured_harness_specs()
-        .unwrap_or_else(|_| built_in_harness_specs())
-        .into_iter()
+
+    static SPECS: std::sync::OnceLock<Vec<HarnessCommandSpec>> = std::sync::OnceLock::new();
+    let specs = SPECS.get_or_init(|| configured_harness_specs().unwrap_or_else(|_| built_in_harness_specs()));
+
+    specs
+        .iter()
         .find(|spec| spec.id == harness_id)
-        .and_then(|spec| spec.continuity_args)
+        .and_then(|spec| spec.continuity_args.as_ref())
         .is_some_and(|continuity| {
             continuity.has_resume_launch()
                 && (continuity.session_id_flag().is_some() || harness_id == "codex")
