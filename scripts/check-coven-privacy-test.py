@@ -6,7 +6,7 @@ import importlib.util
 import io
 import pathlib
 import unittest
-from unittest import mock
+import unittest.mock
 
 SCRIPT = pathlib.Path(__file__).with_name("check-coven-privacy.py")
 spec = importlib.util.spec_from_file_location("check_coven_privacy", SCRIPT)
@@ -17,6 +17,14 @@ spec.loader.exec_module(check_coven_privacy)
 
 
 class CovenPrivacyPatternTests(unittest.TestCase):
+    def test_scanner_sources_do_not_match_their_own_rules(self) -> None:
+        sources = [
+            (path.name, path.read_bytes())
+            for path in (SCRIPT, pathlib.Path(__file__))
+        ]
+
+        self.assertEqual(check_coven_privacy.scan_files(sources), [])
+
     def test_ci_scans_pull_request_changed_files(self) -> None:
         workflow = (
             SCRIPT.parents[1] / ".github" / "workflows" / "ci.yml"
@@ -43,7 +51,9 @@ class CovenPrivacyPatternTests(unittest.TestCase):
         self.assertIn("git hash-object -t tree -w --stdin", workflow)
 
     def test_staged_scan_includes_renames_and_copies(self) -> None:
-        with mock.patch.object(check_coven_privacy, "git", return_value=b"") as git:
+        with unittest.mock.patch.object(
+            check_coven_privacy, "git", return_value=b""
+        ) as git:
             self.assertEqual(check_coven_privacy.staged_files(), [])
 
         git.assert_called_once_with(
@@ -56,7 +66,9 @@ class CovenPrivacyPatternTests(unittest.TestCase):
         )
 
     def test_range_scan_includes_renames_and_copies(self) -> None:
-        with mock.patch.object(check_coven_privacy, "git", return_value=b"") as git:
+        with unittest.mock.patch.object(
+            check_coven_privacy, "git", return_value=b""
+        ) as git:
             self.assertEqual(check_coven_privacy.changed_files("before..after"), [])
 
         git.assert_called_once_with(
@@ -85,7 +97,9 @@ class CovenPrivacyPatternTests(unittest.TestCase):
                 return b"safe text"
             raise AssertionError(f"unexpected git call: {args!r}")
 
-        with mock.patch.object(check_coven_privacy, "git", side_effect=fake_git):
+        with unittest.mock.patch.object(
+            check_coven_privacy, "git", side_effect=fake_git
+        ):
             self.assertEqual(
                 check_coven_privacy.changed_files("before..after"),
                 [("docs/example.md", b"safe text")],
@@ -112,7 +126,7 @@ class CovenPrivacyPatternTests(unittest.TestCase):
         text = " ".join(
             [
                 ":".join(["agent", "example", "telegram", "direct", "123456789"]),
-                "telegram:direct:987654321",
+                ":".join(["telegram", "direct", "987654321"]),
             ]
         )
 
@@ -121,14 +135,14 @@ class CovenPrivacyPatternTests(unittest.TestCase):
         self.assertEqual(hits, [("docs/example.md", 1, "coven_session_key")])
 
     def test_standalone_messenger_chat_id_is_blocked(self) -> None:
-        text = "telegram:direct:123456789"
+        text = ":".join(["telegram", "direct", "123456789"])
 
         hits = check_coven_privacy.scan_text(text, "docs/example.md")
 
         self.assertEqual(hits, [("docs/example.md", 1, "messenger_chat_id")])
 
     def test_invite_or_handoff_url_with_token_is_blocked(self) -> None:
-        text = "https://example.com/invite?token=abc123"
+        text = "".join(["https://example.com/in", "vite?to", "ken=abc123"])
 
         hits = check_coven_privacy.scan_text(text, "docs/example.md")
 
@@ -180,8 +194,12 @@ class CovenPrivacyPatternTests(unittest.TestCase):
         self.assertNotIn("BASE...HEAD", stderr.getvalue())
 
     def test_scan_files_scans_undecodable_bytes(self) -> None:
+        private_path = b"/" + b"/".join(
+            [b"Users", b"privateuser", b"workspace"]
+        )
+        phone = b"+" + b"1" + b"415" + b"555" + b"0100"
         hits = check_coven_privacy.scan_files(
-            [("docs/example.md", b"/Users/privateuser/workspace/\xff+14155550100")]
+            [("docs/example.md", private_path + b"/\xff" + phone)]
         )
 
         self.assertEqual(
