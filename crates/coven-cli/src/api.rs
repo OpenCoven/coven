@@ -21,7 +21,7 @@ use crate::{
     daemon::DaemonStatus,
     encrypted_artifacts::SensitiveArtifactStore,
     harness::{ConversationHint, HarnessLaunchMode},
-    privacy, project, store, ward,
+    privacy, session_launch, store, ward,
 };
 
 const MAX_EVENTS_LIMIT: i64 = 1_000;
@@ -1630,12 +1630,10 @@ fn launch_session(
             return api_error(400, "invalid_request", &error.to_string(), None);
         }
     };
-    let familiar_ctx = match launch.familiar_id.as_deref() {
-        Some(familiar_id) => match crate::familiar_identity::resolve(coven_home, familiar_id) {
-            Ok(Some(familiar_ctx)) => Some(familiar_ctx),
-            Ok(None) => {
-                let error =
-                    crate::familiar_identity::unknown_familiar_error(coven_home, familiar_id);
+    let familiar_ctx =
+        match session_launch::resolve_familiar(coven_home, launch.familiar_id.as_deref()) {
+            Ok(familiar_ctx) => familiar_ctx,
+            Err(session_launch::FamiliarError::Unknown { familiar_id, error }) => {
                 return api_error(
                     400,
                     "unknown_familiar",
@@ -1643,32 +1641,25 @@ fn launch_session(
                     Some(json!({ "familiarId": familiar_id })),
                 );
             }
-            Err(error) => {
+            Err(session_launch::FamiliarError::LookupFailed(error)) => {
                 return api_error(500, "familiar_lookup_failed", &error.to_string(), None);
             }
-        },
-        None => None,
-    };
+        };
     launch.familiar_id = familiar_ctx.as_ref().map(|familiar| familiar.id.clone());
     let conn = store::open_store(&store_path(coven_home))?;
     let now = current_timestamp();
-    let record = store::SessionRecord {
+    let record = session_launch::new_session_record(session_launch::NewSessionParams {
         id: launch.id.clone(),
         project_root: launch.project_root.clone(),
         harness: launch.harness.clone(),
         title: launch.title.clone(),
         status: "running".to_string(),
-        exit_code: None,
-        archived_at: None,
-        created_at: now.clone(),
-        updated_at: now,
+        now,
         conversation_id: launch.conversation_id.clone(),
         familiar_id: familiar_ctx.as_ref().map(|familiar| familiar.id.clone()),
         labels: Vec::new(),
-        visibility: "private".to_string(),
-        external: false,
-        transcript_path: None,
-    };
+        visibility: None,
+    });
     store::insert_session(&conn, &record)?;
     if let Err(error) = runtime.launch_session(&launch) {
         // Don't propagate to the accept loop — that crashes the daemon.
@@ -1815,25 +1806,21 @@ fn complete_external_session(
 fn session_launch_from_payload(payload: Value) -> Result<SessionLaunch> {
     let project_root = required_string(&payload, "projectRoot")?;
     let cwd = payload.get("cwd").and_then(Value::as_str);
-    let canonical_project_root = project::canonical_project_root(Path::new(&project_root))
-        .context("failed to resolve projectRoot")?;
-    let canonical_cwd = project::resolve_inside_root(&canonical_project_root, cwd.map(Path::new))?;
+    let paths = session_launch::resolve_launch_paths(Path::new(&project_root), cwd.map(Path::new))
+        .map_err(|error| match error {
+            session_launch::LaunchPathError::ProjectRoot(error) => {
+                error.context("failed to resolve projectRoot")
+            }
+            session_launch::LaunchPathError::Cwd(error) => error,
+        })?;
     let harness = required_string(&payload, "harness")?;
     // Validate against the supported harness set up-front (client error)
     // instead of letting the runtime's arg builder surface it later as a
     // 500. Bonus: rejecting here means we never insert a session row for
-    // a launch that can't possibly succeed.
-    let supported_specs = crate::harness::configured_harness_specs()?;
-    let supported: Vec<&str> = supported_specs
-        .iter()
-        .map(|spec| spec.id.as_str())
-        .collect();
-    if !supported.contains(&harness.as_str()) {
-        anyhow::bail!(
-            "{}",
-            crate::harness::unsupported_harness_message(&harness, &supported)
-        );
-    }
+    // a launch that can't possibly succeed. Availability is deliberately
+    // not required (HarnessCheck::Configured): a configured-but-missing
+    // binary is surfaced by the runtime as a structured launch failure.
+    session_launch::validate_harness(&harness, session_launch::HarnessCheck::Configured)?;
     let launch_mode = launch_mode_from_payload(&payload)?;
     let model = payload
         .get("model")
@@ -1871,8 +1858,8 @@ fn session_launch_from_payload(payload: Value) -> Result<SessionLaunch> {
 
     Ok(SessionLaunch {
         id: Uuid::new_v4().to_string(),
-        project_root: canonical_project_root.to_string_lossy().into_owned(),
-        cwd: canonical_cwd.to_string_lossy().into_owned(),
+        project_root: paths.project_root.to_string_lossy().into_owned(),
+        cwd: paths.cwd.to_string_lossy().into_owned(),
         harness,
         model,
         launch_mode,
@@ -5178,6 +5165,7 @@ pub(crate) fn json_response<T: Serialize>(status: u16, body: &T) -> Result<ApiRe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project;
 
     #[test]
     fn builds_health_response() {

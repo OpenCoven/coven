@@ -38,6 +38,7 @@ mod prompt_refs;
 mod proposal_scheduler;
 mod pty_runner;
 mod repos_config;
+mod session_launch;
 mod settings;
 mod store;
 mod stream_json;
@@ -2393,29 +2394,27 @@ fn default_harness_id() -> Option<String> {
 }
 
 fn launch_patch_session(request: &patch::PatchRequest) -> Result<String> {
-    let selected_harness = selected_available_harness(request.harness_id.as_str())?;
+    let selected_harness = session_launch::validate_harness(
+        request.harness_id.as_str(),
+        session_launch::HarnessCheck::Available,
+    )?;
     let coven_home = coven_home_dir()?;
     let store_path = coven_home.join(STORE_FILE_NAME);
     let conn = store::open_store(&store_path)?;
     let now = current_timestamp();
     let brief = patch::build_repair_brief(request);
-    let record = store::SessionRecord {
+    let record = session_launch::new_session_record(session_launch::NewSessionParams {
         id: Uuid::new_v4().to_string(),
         project_root: request.repo.root.to_string_lossy().into_owned(),
         harness: selected_harness.id.to_string(),
         title: session_title(Some(&format!("Patch {}", request.repo.repo_name)), &brief),
         status: DEFAULT_SESSION_STATUS.to_string(),
-        exit_code: None,
-        archived_at: None,
-        created_at: now.clone(),
-        updated_at: now.clone(),
+        now: now.clone(),
         conversation_id: None,
         familiar_id: None,
         labels: Vec::new(),
-        visibility: "private".to_string(),
-        external: false,
-        transcript_path: None,
-    };
+        visibility: None,
+    });
     store::insert_session(&conn, &record)?;
     let metadata = serde_json::json!({
         "patchTarget": request.repo.repo_name,
@@ -3028,15 +3027,17 @@ fn run_session(
         anyhow::bail!("nothing to do; pass a prompt, or use --continue [ID] to resume a session");
     }
 
-    let selected_harness = selected_available_harness(harness_id)?;
+    let selected_harness =
+        session_launch::validate_harness(harness_id, session_launch::HarnessCheck::Available)?;
     let current_dir = std::env::current_dir().context("failed to read current directory")?;
-    let project_root = project::canonical_project_root(&current_dir).with_context(|| {
-        format!(
-            "failed to resolve project root from {}",
-            current_dir.display()
-        )
-    })?;
-    let cwd = project::resolve_inside_root(&project_root, cwd).context("failed to resolve cwd")?;
+    let session_launch::LaunchPaths { project_root, cwd } =
+        session_launch::resolve_launch_paths(&current_dir, cwd).map_err(|error| match error {
+            session_launch::LaunchPathError::ProjectRoot(error) => error.context(format!(
+                "failed to resolve project root from {}",
+                current_dir.display()
+            )),
+            session_launch::LaunchPathError::Cwd(error) => error.context("failed to resolve cwd"),
+        })?;
     let coven_home = coven_home_dir()?;
     let store_path = coven_store_path()?;
     let conn = store::open_store(&store_path)?;
@@ -3056,7 +3057,8 @@ fn run_session(
     // via that flag in build_harness_command_with_conversation; the prompt stays
     // clean. For harnesses without one (Codex), we prepend a bracketed identity
     // preamble to the prompt here so the integration layer remains harness-agnostic.
-    let familiar_ctx = familiar_identity::resolve_optional(&coven_home, familiar_id)?;
+    let familiar_ctx = session_launch::resolve_familiar(&coven_home, familiar_id)
+        .map_err(session_launch::FamiliarError::into_error)?;
     let spec = harness::configured_harness_specs()?
         .into_iter()
         .find(|s| s.id == selected_harness.id);
@@ -3184,23 +3186,18 @@ fn run_session(
             ),
         }
     } else {
-        let r = store::SessionRecord {
+        let r = session_launch::new_session_record(session_launch::NewSessionParams {
             id: Uuid::new_v4().to_string(),
             project_root: project_root.to_string_lossy().into_owned(),
             harness: selected_harness.id.to_string(),
             title: session_title(title, &prompt),
             status: DEFAULT_SESSION_STATUS.to_string(),
-            exit_code: None,
-            archived_at: None,
-            created_at: now.clone(),
-            updated_at: now,
+            now,
             conversation_id: None,
             familiar_id: familiar_ctx.as_ref().map(|f| f.id.clone()),
             labels,
-            visibility: visibility.unwrap_or("private").to_string(),
-            external: false,
-            transcript_path: None,
-        };
+            visibility: visibility.map(str::to_string),
+        });
         (r, false)
     };
 
@@ -3954,31 +3951,6 @@ fn parse_http_status(response: &str) -> Result<u16> {
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|status| status.parse::<u16>().ok())
         .context("invalid Coven daemon response")
-}
-
-fn selected_available_harness(harness_id: &str) -> Result<harness::HarnessSummary> {
-    let harnesses = harness::configured_harnesses()?;
-    let configured_ids = harnesses
-        .iter()
-        .map(|harness| harness.id.as_str())
-        .collect::<Vec<_>>();
-    let selected = harnesses
-        .iter()
-        .find(|harness| harness.id == harness_id)
-        .cloned();
-
-    match selected {
-        Some(harness) if harness.available => Ok(harness),
-        Some(harness) => Err(anyhow!(
-            "harness `{}` is not available. {}",
-            harness.id,
-            harness.install_hint
-        )),
-        None => Err(anyhow!(
-            "{}",
-            harness::unsupported_harness_message(harness_id, &configured_ids)
-        )),
-    }
 }
 
 fn joined_prompt(prompt_args: &[String]) -> Result<String> {
