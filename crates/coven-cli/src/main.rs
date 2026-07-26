@@ -612,7 +612,7 @@ enum AdapterCommand {
     },
     #[command(about = "Install a trusted local adapter recipe")]
     Install {
-        #[arg(help = "Adapter recipe to install (grok, hermes, or opencode)")]
+        #[arg(help = "Adapter recipe to install")]
         adapter: String,
     },
 }
