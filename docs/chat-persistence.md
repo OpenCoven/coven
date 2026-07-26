@@ -10,8 +10,8 @@ extend the mechanism to additional harnesses.
 | `claude` | ✅ stream-mode | Long-lived `claude --print --input-format stream-json --output-format stream-json --verbose` daemon process per chat, plus `--session-id <uuid>` on the first turn and `--resume <uuid>` for cross-restart continuation. Turn 1 spawns + sends initial user envelope; turns 2..N pipe a new user envelope into the same stdin (no cold-start). Unix kills the stream process tree with `setsid()` + `kill(-pid, SIGKILL)`; Windows uses a Job Object owned by the daemon. |
 | `codex` | ✅ per-turn | Chat runs plain `codex exec …`; it captures `session id: <uuid>` from output and feeds it back as `codex exec … resume <uuid> <prompt>` on later turns. `coven run codex --stream-json` separately uses Codex's one-shot `exec --json` protocol, but Codex has no long-lived stream mode, so each chat turn cold-starts. |
 | `copilot` | ✅ per-turn | Chat pre-assigns a UUID on turn 1 (`copilot --session-id <uuid> --prompt=…`) and sends the same `--session-id <uuid>` on later turns. Copilot has no long-lived stream mode, so each chat turn cold-starts. `--session-id` resumes an existing session *or* creates a fresh one under that id, so stale ids self-heal instead of erroring. |
-| `coven-code` | ⚠️ in-chat only | Stream-mode keeps the conversation alive within one `coven chat` (turns 2..N ride the long-lived engine process's stdin), but there is no cross-restart resume: the engine's `--session-id` is a tracking tag, not a persistence key — sessions only become loadable under *engine-assigned* ids (see ENGINE-CONTRACT.md) — so chat's pre-assign flow can never reclaim a prior thread, and `harness::harness_supports_chat_resume` carves the engine out explicitly. |
-| `grok` (experimental recipe) | ✅ per-turn | Chat pre-assigns a UUID on turn 1 (`grok … --session-id <uuid> --single=…`) and cold-starts later turns with `--resume <uuid>`. Unlike Copilot, the two flags are not interchangeable: `--session-id` refuses an id that already exists ("Session ID … is already in use") and `--resume` refuses an id that doesn't ("Session does not exist"), so stale ids are handled by the auto-recovery arm below rather than self-healing. Note: chat launches pass no `--permission` (true of every harness), which leaves Grok in its auto-cancel default — chat turns are read-and-answer only; see `docs/harnesses/grok-build.md`. |
+| `coven-code` | ⚠️ in-chat only | Stream-mode keeps the conversation alive within one `coven chat` (turns 2..N ride the long-lived engine process's stdin), but there is no cross-restart resume: the engine's `--session-id` is a tracking tag, not a persistence key — sessions only become loadable under *engine-assigned* ids (see [ENGINE-CONTRACT.md](ENGINE-CONTRACT.md)) — so chat's pre-assign flow can never reclaim a prior thread. The configured-harness discovery predicate records `supports_chat_resume: false` for the engine in the chat agent inventory. |
+| `grok` (experimental recipe) | ✅ per-turn | Chat pre-assigns a UUID on turn 1 (`grok … --session-id <uuid> --single=…`) and cold-starts later turns with `--resume <uuid>`. Unlike Copilot, the two flags are not interchangeable: `--session-id` refuses an id that already exists ("Session ID … is already in use") and `--resume` refuses an id that doesn't ("Session does not exist"), so stale ids are handled by the auto-recovery arm below rather than self-healing. Note: chat launches pass no `--permission` (true of every harness), which leaves Grok in its auto-cancel default — chat turns are read-and-answer only; see the [Grok Build harness guide](harnesses/grok-build.md). |
 | `hermes` (recipe) | ❌ | The Hermes adapter manifest declares no continuity args, so every chat turn is an independent `hermes-coven chat … -Q` one-shot. |
 | `opencode` (recipe) | ❌ | The OpenCode adapter manifest declares no continuity args (`opencode run` one-shots; session state lives in OpenCode's own storage, not behind a resume flag surface), so every chat turn is independent. |
 
@@ -200,14 +200,18 @@ CLI's own session API avoids both problems.
    declarations — there is no per-harness `match` to extend.
 
 3. **Chat picks it up from the declaration.**
-   `harness::harness_supports_chat_resume` derives chat-resume support from
-   the configured spec's declared continuity args — there is no hardcoded
-   id list to edit. Two caveats: auto-assigning harnesses (no
-   `session_id_flag`) also need chat-side output capture before resume can
-   work (step 4) — today that capture is codex-specific, so the function
-   recognizes codex alone among them; and the engine (`coven-code`) is
-   explicitly carved out because its `--session-id` is a tracking tag
-   rather than a persistence key (see the Status table).
+   `harness::configured_chat_harnesses` maps each configured spec through the
+   internal `spec_supports_chat_resume` predicate. `discover_agents()` copies
+   that result into `AgentInfo.supports_chat_resume`, and
+   `conversation_hint_for_harness` consults the in-memory agent inventory on
+   each turn — there is no hardcoded id list or per-turn manifest read. A new
+   chat app reruns discovery and sees updated adapter manifests. Two caveats:
+   auto-assigning harnesses (no `session_id_flag`) also need chat-side output
+   capture before resume can work (step 4) — today that capture is
+   codex-specific, so the predicate recognizes codex alone among them; and
+   the engine (`coven-code`) is explicitly carved out because its
+   `--session-id` is a tracking tag rather than a persistence key (see the
+   Status table).
 
 4. **For auto-assigning harnesses, wire output capture.** Codex uses
    `extract_codex_session_id` (scans for `session id: <uuid>` lines) called
