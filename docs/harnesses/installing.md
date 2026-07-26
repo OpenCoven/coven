@@ -33,11 +33,18 @@ The daemon revalidates the harness id on every launch request. Clients cannot wi
 | `claude` | `claude` | `npm install -g @anthropic-ai/claude-code` | `claude doctor` | [Claude Code harness](/harnesses/claude-code) |
 | `copilot` | `copilot` | `npm install -g @github/copilot` | `copilot login` | [Copilot CLI harness](/harnesses/copilot-cli) |
 
-Other CLIs (Hermes, Aider, Gemini CLI, Cline, custom commands) are **not** bundled in v0. Test them through an explicit manifest and `coven adapter doctor`; see [Future harness notes](/FUTURE-HARNESSES) for the adapter direction.
+Other CLIs (Aider, Gemini CLI, Cline, custom commands) are **not** bundled in
+v0. Test them through an explicit manifest and `coven adapter doctor`; see
+[Future harness notes](/FUTURE-HARNESSES) for the adapter direction.
 
 Grok Build has a reviewed **experimental recipe** but is not bundled by default. Install the Grok CLI and authenticate first, then run `coven adapter install grok`; see [Grok Build](/harnesses/grok-build) for the complete setup and permission mapping.
 
 OpenCode has an accepted **registry recipe** and is likewise not bundled. Install the OpenCode CLI (`npm i -g opencode-ai`) first, then run `coven adapter install opencode`; see [OpenCode](/harnesses/opencode) for the adapter contract and chat behavior.
+
+Hermes has a trusted native **1.0.3 registry recipe** and is likewise not
+bundled. Install and set up Hermes Agent first, then run
+`coven adapter install hermes`; see [Hermes](/harnesses/hermes) for its
+`--query` prompt binding and provider-qualified model behavior.
 
 ## Step-by-step install
 

@@ -179,7 +179,8 @@ pub struct SessionLaunch {
     pub harness: String,
     /// Optional namespaced model id (for example `openai/gpt-5.6-sol`). The
     /// runtime keeps the provider prefix here and lets the harness adapter
-    /// normalize it for the underlying CLI.
+    /// apply its declared strip-provider or preserve transform for the
+    /// underlying CLI.
     pub model: Option<String>,
     pub launch_mode: HarnessLaunchMode,
     pub prompt: String,

@@ -7,7 +7,7 @@ title: "OpenCode (recipe)"
 description: "Install and use Coven's trusted OpenCode adapter recipe without promoting OpenCode to a bundled default harness."
 ---
 
-OpenCode is available through a trusted, installable Coven adapter recipe. It is **not** a bundled default harness: users opt in with `coven adapter install opencode`. The recipe is byte-identical to the accepted [`coven-runtimes`](https://github.com/OpenCoven/coven-runtimes) registry manifest (`registry/runtimes/opencode/0.1.0.json`), so a manifest installed by Coven Cave and one installed by the CLI are the same trusted artifact.
+OpenCode is available through a trusted, installable Coven adapter recipe. It is **not** a bundled default harness: users opt in with `coven adapter install opencode`. Recipe 0.1.1 is byte-identical to the accepted [`coven-runtimes`](https://github.com/OpenCoven/coven-runtimes) registry manifest (`registry/runtimes/opencode/0.1.1.json`), so a manifest installed by Coven Cave and one installed by the CLI are the same trusted artifact.
 
 Coven does not embed or fork OpenCode; it launches the installed CLI's `run` subcommand and reads its output like any other one-shot coding-agent CLI.
 
@@ -35,7 +35,10 @@ The Coven harness id is `opencode`; the executable is `opencode`.
     coven adapter doctor opencode
     ```
 
-    The first command writes the versioned recipe to `COVEN_HOME/adapters/opencode.json`. Coven only loads the file while it exactly matches its bundled trusted recipe.
+    The first command writes the versioned recipe to
+    `COVEN_HOME/adapters/opencode.json`. Coven loads only exact current or
+    recognized historical trusted recipe bytes; historical bytes execute the
+    current recipe in memory.
   </Step>
   <Step title="Run a project-scoped session">
     ```bash
@@ -50,7 +53,7 @@ The Coven harness id is `opencode`; the executable is `opencode`.
 | Coven behavior | OpenCode argv |
 |---|---|
 | One-shot prompt | `run -- <prompt>` |
-| Model selection | `--model <model>` (Coven strips a leading `provider/` namespace before forwarding) |
+| Model selection | `--model <provider/model>` (`model_id_transform: preserve`) |
 | Familiar identity | prepended to the prompt (no system-prompt flag) |
 | Sandbox / permission | none — `coven run opencode --permission …` warns and forwards no flag |
 | Session resume | none — every launch is an independent `opencode run` |

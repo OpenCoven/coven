@@ -17,9 +17,10 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 # Runtime capability model shared with the coven-runtimes registry. Pinned to a
-# release tag; the daemon reads a manifest's declared capabilities through
-# these types instead of hardcoded harness-id checks (integration.md, PR 1).
-coven-runtime-spec = { git = "https://github.com/OpenCoven/coven-runtimes", tag = "v0.1.3", version = "0.1.3" }
+# reviewed immutable revision while the 0.2.0 release tag is pending; the
+# daemon reads manifest-declared capabilities and model-id transforms through
+# these types instead of hardcoded harness-id checks.
+coven-runtime-spec = { git = "https://github.com/OpenCoven/coven-runtimes", rev = "7c093e5f51f0a2a1e2f76cf6b8eef6465b86c8ff", version = "0.2.0" }
 # The authority-boundary gate layer for familiar protected surfaces
 # (PHASE-0-DESIGN.md in OpenCoven/coven-threads; RFC-0001 §5). The daemon is
 # the only caller: familiar-controlled processes never reach this crate.

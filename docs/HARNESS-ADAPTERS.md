@@ -28,9 +28,10 @@ A Coven harness adapter defines:
 - prompt argument shape for interactive mode;
 - prompt argument shape for non-interactive mode;
 - install/authentication hint for `coven doctor`; and
-- optional **declared behavior**: `capabilities`, `sandbox`, `stream_args`,
-  and `continuity_args` (the [coven-runtimes](https://github.com/OpenCoven/coven-runtimes)
-  manifest additions — see below).
+- optional **declared behavior**: `model_id_transform`, `capabilities`,
+  `sandbox`, `stream_args`, and `continuity_args` (the
+  [coven-runtimes](https://github.com/OpenCoven/coven-runtimes) manifest
+  additions — see below).
 
 The current implementation expects the prompt to be the final command argument after any fixed prefix args — either as a positional behind `--`, or bound to a declared `prompt_flag` (`--flag=<prompt>`) for harnesses with no positional prompt slot. Keep that invariant unless the adapter explicitly documents a safer stdin or protocol mode.
 
@@ -134,7 +135,7 @@ adapters deserialize unchanged with everything off):
   `--add-dir`).
 - `prompt_flag` (alias `promptFlag`) names a flag that carries the user
   prompt as its **value** for harnesses with no positional prompt slot (e.g.
-  Copilot's `--prompt`, Hermes' `-q`). Coven appends the bound
+  Copilot's `--prompt`, Hermes' `--query`). Coven appends the bound
   `--flag=<prompt>` form instead of `-- <prompt>`, so `-`-prefixed prompts
   stay data. `interactive_prompt_flag` (alias `interactivePromptFlag`)
   optionally overrides it for interactive launches only (Copilot opens its
@@ -155,13 +156,32 @@ This manifest path is for explicit integration work. It is not a public support 
 
 Two decisions clients must match:
 
-- **Provider-prefix handling — Coven strips it.** Cave stores and sends a namespaced id (e.g. `openai/gpt-5.5`, `anthropic/claude-sonnet-4`). Coven strips the leading `provider/` segment and forwards the **bare** id to the harness (`codex --model gpt-5.5`, `claude --model claude-sonnet-4`), because the native CLIs expect bare model ids. A bare id with no slash is forwarded unchanged. Only the first `/` segment is treated as the provider namespace.
-- **`system.init` echo field — `model`.** When `--stream-json` is set, the `system.init` event carries a `model` field with the id **exactly as requested** on `--model` (namespaced form preserved), or `null` when no `--model` was passed. Echoing the requested id verbatim lets a client confirm acceptance (`applied` vs `pending`) with an exact match against its stored selection, independent of Coven's internal prefix-stripping.
+- **Provider-prefix handling is adapter-declared.** Cave stores and sends a
+  provider-qualified id (e.g. `openai/gpt-5.5`,
+  `anthropic/claude-sonnet-4`). `model_id_transform` (camelCase alias
+  `modelIdTransform`) selects `strip_provider` or `preserve`.
+  `strip_provider`, the default for omitted legacy manifests, removes only the
+  first non-empty `provider/` segment; `preserve` forwards the complete id.
+  Codex, Claude, Copilot, and Grok strip. Coven Code, Hermes 1.0.3, and
+  OpenCode 0.1.1 preserve.
+- **`system.init` echo field — `model`.** When `--stream-json` is set, the
+  `system.init` event carries the id **exactly as requested** on `--model`
+  (provider-qualified form preserved), or `null` when no `--model` was passed.
+  The echo is independent of the adapter's launch transform.
 
-Built-in Codex and Claude adapters both declare `--model`. External adapters declare how they take a model in the manifest:
+Every bundled harness declares `--model`. External adapters declare how they
+take a model in the manifest:
 
-- `model_flag` (alias `modelFlag`): a simple `--flag <value>` pair. Coven forwards `[flag, <bare-model>]`.
-- `model_arg_template` (alias `modelArgTemplate`): for anything else (e.g. Codex's config-override form `-c model=<value>`). The template is split on whitespace into argv tokens and every `{model}` placeholder is substituted with the bare model id — no shell quoting, so write `"-c model={model}"`, not `'-c model="{model}"'`. Takes precedence over `model_flag` when both are set.
+- `model_flag` (alias `modelFlag`): a simple `--flag <value>` pair. Coven
+  forwards `[flag, <transformed-model>]`.
+- `model_arg_template` (alias `modelArgTemplate`): for anything else (e.g.
+  Codex's config-override form `-c model=<value>`). The template is split on
+  whitespace into argv tokens and every `{model}` placeholder is substituted
+  with the transformed model id — no shell quoting. Takes precedence over
+  `model_flag` when both are set.
+- `model_id_transform` (alias `modelIdTransform`): `strip_provider` (default)
+  or `preserve`. Declaring `preserve` without a nonblank `model_flag` or
+  `model_arg_template` is rejected.
 
 An adapter that declares **neither** field makes `--model` a **warned no-op** for that adapter: Coven prints a warning to stderr and continues the run rather than failing.
 
@@ -175,7 +195,8 @@ An adapter that declares **neither** field makes `--model` a **warned no-op** fo
       "interactive_prompt_prefix_args": [],
       "non_interactive_prompt_prefix_args": ["run", "--quiet"],
       "install_hint": "Install Example Harness and make sure `example` is on PATH.",
-      "model_flag": "--model"
+      "model_flag": "--model",
+      "model_id_transform": "preserve"
     }
   ]
 }
@@ -203,7 +224,7 @@ The bundled compatibility adapters are Codex, Claude Code, and GitHub Copilot CL
 - Executable: `codex`
 - Interactive prefix args: none
 - Non-interactive prefix args: `exec --skip-git-repo-check --color never`
-- Model flag: `--model` (the equivalent `-c model=<value>` override is available to external adapters via `model_arg_template`)
+- Model flag: `--model` with `strip_provider`
 
 Setup hint:
 
@@ -218,7 +239,7 @@ codex login
 - Executable: `claude`
 - Interactive prefix args: none
 - Non-interactive prefix args: `--print`
-- Model flag: `--model`
+- Model flag: `--model` with `strip_provider`
 
 Setup hint:
 

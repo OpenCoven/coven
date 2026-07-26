@@ -211,7 +211,7 @@ enum Command {
         #[arg(
             long,
             value_name = "ID",
-            help = "Model to run the harness on. Accepts a namespaced id (e.g. openai/gpt-5.5, anthropic/claude-...); Coven strips the provider/ prefix and forwards the bare id to the harness's native model flag (codex/claude/copilot --model). Adapters that declare no model mechanism warn and continue. Echoed back in the stream-json system.init `model` field."
+            help = "Model to run the harness on. Accepts a provider-qualified id (e.g. openai/gpt-5.5, anthropic/claude-...). Each adapter declares whether to strip the first provider/ segment (`strip_provider`, the legacy default) or preserve the full id (`preserve`). Codex, Claude, and Copilot strip; Coven Code preserves. Adapters that declare no model mechanism warn and continue. Echoed back unchanged in the stream-json system.init `model` field."
         )]
         model: Option<String>,
         #[arg(
@@ -3128,12 +3128,12 @@ fn run_session(
         .map_err(session_launch::FamiliarError::into_error)?;
     let spec = Some(&selected_harness);
 
-    // Resolve the requested model. Cave sends a namespaced id; the harness arg
-    // builders strip the provider/ prefix and forward the bare id to the native
-    // model flag, while `system.init` echoes the requested id verbatim so Cave
-    // can confirm acceptance with an exact match. Adapters that declare no model
-    // mechanism warn (don't error) so a selection degrades gracefully. A blank
-    // value is ignored.
+    // Resolve the requested model. Cave sends a provider-qualified id; the
+    // selected adapter applies its declared strip_provider/preserve transform
+    // before forwarding to the native model mechanism. `system.init` still
+    // echoes the requested id verbatim so Cave can confirm acceptance with an
+    // exact match. Adapters that declare no model mechanism warn (don't error)
+    // so a selection degrades gracefully. A blank value is ignored.
     let requested_model: Option<&str> = model.map(str::trim).filter(|m| !m.is_empty());
     let requested_speed = speed.map(harness::HarnessSpeed::parse).transpose()?;
     // Resolve the requested sandbox/permission policy. It forwards to the

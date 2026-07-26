@@ -808,8 +808,11 @@ fn adapter_install_hermes_writes_trusted_manifest() -> anyhow::Result<()> {
         .as_array()
         .and_then(|adapters| adapters.first())
         .expect("installed Hermes manifest contains one adapter");
-    assert_eq!(adapter["executable"], "hermes-coven");
+    assert_eq!(adapter["executable"], "hermes");
+    assert_eq!(adapter["prompt_flag"], "--query");
     assert_eq!(adapter["model_flag"], "--model");
+    assert_eq!(adapter["model_id_transform"], "preserve");
+    assert_eq!(adapter["version"], "1.0.3");
 
     // Diagnose against an empty PATH so the outcome doesn't depend on
     // whether a real `hermes` happens to be installed on this machine:
@@ -979,7 +982,7 @@ fn adapter_install_hermes_replaces_existing_manifest() -> anyhow::Result<()> {
     assert_eq!(adapter.get("id").and_then(Value::as_str), Some("hermes"));
     assert_eq!(
         adapter.get("executable").and_then(Value::as_str),
-        Some("hermes-coven")
+        Some("hermes")
     );
     Ok(())
 }
@@ -1020,7 +1023,7 @@ fn adapter_install_hermes_replaces_existing_manifest_directory() -> anyhow::Resu
     assert_eq!(adapter.get("id").and_then(Value::as_str), Some("hermes"));
     assert_eq!(
         adapter.get("executable").and_then(Value::as_str),
-        Some("hermes-coven")
+        Some("hermes")
     );
     Ok(())
 }

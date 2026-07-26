@@ -1,24 +1,23 @@
 ---
-summary: "Experimental Hermes adapter notes for the external manifest path."
+summary: "Trusted Hermes adapter recipe for running the native Hermes CLI through Coven."
 read_when:
-  - Tracking the Hermes adapter roadmap
-title: "Hermes (experimental)"
-description: "Experimental Hermes adapter notes for Coven's trusted local adapter recipe. Hermes is not a built-in Coven harness."
+  - Installing the Hermes adapter
+  - Reviewing Hermes model and prompt forwarding
+title: "Hermes (recipe)"
+description: "Install and use Coven's trusted Hermes 1.0.3 adapter recipe. Hermes is not a bundled default harness."
 ---
 
-Hermes is **not** a built-in Coven harness today. Do not describe it as supported by default fallback selection, CastCodes slash commands, or OpenClaw's default agent mapping.
-
-Hermes can be used as a research target for the generic external adapter system once a maintainer has a real Hermes install to smoke test.
+Hermes is available through a trusted, installable adapter recipe. It is
+**not** a bundled default harness: install it explicitly with
+`coven adapter install hermes`.
 
 ## Install the local adapter recipe
 
-Hermes receives task text through its `-q/--query` flag, while Coven sends
-ordinary adapter prompts after `--`. Install the maintained `hermes-coven` shim
-from [`coven-runtimes`](https://github.com/OpenCoven/coven-runtimes/tree/main/shims)
-into a directory on `PATH` before installing the bundled recipe. The shim
-rewrites only the prompt; selected `--model` arguments pass through unchanged.
+Install and complete setup for
+[Hermes Agent](https://github.com/NousResearch/hermes-agent), then ensure the
+native `hermes` executable resolves on `PATH`.
 
-Then use the bundled recipe instead of hand-writing a manifest:
+Install the trusted recipe instead of hand-writing a manifest:
 
 ```sh
 coven adapter install hermes
@@ -26,13 +25,15 @@ coven adapter doctor hermes
 coven run hermes "what is in this project?"
 ```
 
-`coven adapter install hermes` writes a trusted manifest to `COVEN_HOME/adapters/hermes.json`. Coven loads manifests from that Coven-owned trust store automatically, plus any manifests explicitly named with `COVEN_HARNESS_ADAPTER_MANIFEST` or `COVEN_HARNESS_ADAPTER_DIRS`.
+`coven adapter install hermes` writes canonical recipe 1.0.3 to
+`COVEN_HOME/adapters/hermes.json`. Its bytes match
+`coven-runtimes/registry/runtimes/hermes/1.0.3.json`, including the native
+executable and provider-qualified model behavior used by Cave.
 
 If Hermes is installed outside the daemon's `PATH`, add its directory to
-`PATH` before starting Coven. For example, a Raspberry Pi install at
-`/home/o/.local/bin/hermes` should expose `/home/o/.local/bin` to the Coven
-daemon; adapter manifests intentionally take executable names, not absolute
-paths.
+`PATH` before starting Coven. For example, an install at
+`$HOME/.local/bin/hermes` should expose `$HOME/.local/bin` to the Coven daemon;
+adapter manifests intentionally take executable names, not absolute paths.
 
 ```sh
 export PATH="$HOME/.local/bin:$PATH"
@@ -41,14 +42,29 @@ coven adapter doctor hermes
 coven run hermes "what is in this project?"
 ```
 
+## Adapter contract
+
+| Coven behavior | Hermes argv |
+|---|---|
+| Native executable | `hermes` on Windows, macOS, and Linux |
+| One-shot prompt | `chat --source coven -Q --query=<prompt>` |
+| Interactive prompt | `chat --source coven --query=<prompt>` |
+| Model selection | `--model <provider/model>` (`model_id_transform: preserve`) |
+| Stream / continuity | none — every turn is an independent process |
+
+The native `--query` binding replaces the historical `hermes-coven` POSIX
+shim and works consistently on every platform. Coven still recognizes the
+exact legacy trusted manifest and executes the current 1.0.3 recipe in memory;
+modified legacy bytes are not trusted.
+
 ## Promotion checklist
 
 Before Hermes becomes public support, finish:
 
-- command construction tests against the final CLI contract;
 - client compatibility notes for OpenClaw and CastCodes;
 - `coven doctor` behavior that is backed by a real install path;
 - a real-install smoke test for launch, event capture, and exit handling;
-- a clear decision about one-shot, interactive, and resume behavior.
+- a clear decision about resume behavior.
 
-Until then, keep Hermes documentation in research/experimental language and avoid scattered `hermes` string checks in product code.
+Until then, describe Hermes as an opt-in recipe rather than a bundled default,
+and avoid scattered `hermes` string checks in product code.

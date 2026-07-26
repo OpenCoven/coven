@@ -394,8 +394,9 @@ Unknown action ids return `400` and fail closed:
 ## `POST /api/v1/sessions`
 
 Launches a daemon-managed harness session. `model` is optional; when present,
-the daemon forwards the namespaced id through the selected harness adapter.
-Clients that omit it retain the harness's own default model.
+the daemon forwards the provider-qualified id through the selected harness
+adapter's declared `strip_provider` or `preserve` transform. Clients that omit
+it retain the harness's own default model.
 
 ```json
 {

@@ -86,7 +86,7 @@ The Rust daemon is the authority boundary. All clients — including the CLI its
 ## Features
 
 - **🏠 Project-root boundaries** — Every launch is tied to an explicit repository or project root. The daemon rejects working directories that escape the declared boundary.
-- **🔌 Harness-neutral runtime** — supported harnesses are Codex, Claude Code, and GitHub Copilot CLI, with a clean adapter path for future harnesses (Hermes, Aider, Gemini, and user-defined CLIs).
+- **🔌 Harness-neutral runtime** — bundled support stays focused on Codex, Claude Code, and GitHub Copilot CLI; trusted opt-in recipes cover Grok Build, Hermes, and OpenCode through the same adapter path used by future harnesses.
 - **🖥️ Interactive session browser** — Live and completed work can be selected, rejoined, viewed, archived, restored, or sacrificed without memorizing IDs.
 - **📡 Attachable PTY sessions** — Live sessions can be replayed or followed from explicit CLI verbs.
 - **🔌 Local daemon API** — CastCodes, comux, and the OpenClaw plugin coordinate through one versioned socket contract (`coven.daemon.v1`).

@@ -24,13 +24,16 @@ A **harness** is an external coding-agent CLI that Coven can launch and supervis
     External ACP runtime bridge through external OpenClaw bridge plugin.
   </Card>
   <Card title="Grok Build (experimental)" href="/harnesses/grok-build" icon="terminal">
-    Trusted xAI Grok Build recipe. Installable harness id `grok`.
+    Trusted xAI Grok Build 1.0.0 recipe. Installable harness id `grok`.
+  </Card>
+  <Card title="Hermes (recipe)" href="/harnesses/hermes" icon="terminal">
+    Trusted native Hermes 1.0.3 recipe. Installable harness id `hermes`.
   </Card>
   <Card title="OpenCode (recipe)" href="/harnesses/opencode" icon="code">
-    Trusted OpenCode registry recipe. Installable harness id `opencode`.
+    Trusted OpenCode 0.1.1 registry recipe. Installable harness id `opencode`.
   </Card>
   <Card title="Future harnesses" href="/FUTURE-HARNESSES" icon="compass">
-    Hermes, Aider, Gemini CLI, Cline — adapter direction and roadmap signals.
+    Aider, Gemini CLI, Cline — adapter direction and roadmap signals.
   </Card>
 </Columns>
 
@@ -43,14 +46,16 @@ flowchart LR
   Adapter --> ClaudeAdapter[Claude adapter]
   Adapter --> CopilotAdapter[Copilot adapter]
   Adapter -. recipe .-> GrokAdapter[Grok Build adapter]
+  Adapter -. recipe .-> HermesAdapter[Hermes adapter]
   Adapter -. recipe .-> OpenCodeAdapter[OpenCode adapter]
-  Adapter -. future .-> Future[Hermes / Aider / Gemini]
+  Adapter -. future .-> Future[Aider / Gemini / Cline]
   OpenClaw[OpenClaw] --> Bridge["OpenClaw bridge plugin"]
   Bridge --> Coven
   CodexAdapter --> CodexPty[Codex PTY]
   ClaudeAdapter --> ClaudePty[Claude Code PTY]
   CopilotAdapter --> CopilotPty[Copilot CLI PTY]
   GrokAdapter --> GrokPty[Grok Build PTY]
+  HermesAdapter --> HermesPty[Hermes PTY]
   OpenCodeAdapter --> OpenCodePty[OpenCode PTY]
 ```
 
@@ -100,11 +105,15 @@ If `coven doctor` reports a harness as missing, see [Installing harness CLIs](/h
 
 Grok Build is an experimental opt-in recipe rather than a bundled default. See [Grok Build](/harnesses/grok-build) for its separate CLI and adapter installation steps.
 
+Hermes and OpenCode are opt-in registry recipes rather than bundled defaults.
+See [Hermes](/harnesses/hermes) and [OpenCode](/harnesses/opencode).
+
 ## Related
 
 - [Provider auth boundary](/harnesses/provider-auth)
 - [OpenClaw bridge](/harnesses/openclaw)
 - [Grok Build adapter](/harnesses/grok-build)
+- [Hermes adapter](/harnesses/hermes)
 - [OpenCode adapter](/harnesses/opencode)
 - [Harness adapter guide](/HARNESS-ADAPTERS)
 - [Future harness notes](/FUTURE-HARNESSES)
