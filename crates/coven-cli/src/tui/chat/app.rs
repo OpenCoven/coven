@@ -2361,10 +2361,31 @@ fn clean_terminal_output(data: &str) -> Option<String> {
     while let Some(ch) = chars.next() {
         match ch {
             '\x1b' => skip_escape_sequence(&mut chars),
-            '\r' => {}
+            '\r' => match chars.peek() {
+                // `\r\n` is a plain line ending — normalize to `\n`.
+                Some('\n') => {
+                    chars.next();
+                    output.push('\n');
+                }
+                // A bare `\r` returns to column 0 so the next frame
+                // overwrites the current line (progress bars, spinners).
+                // Keep only the final frame by discarding the current
+                // line (#469).
+                Some(_) => match output.rfind('\n') {
+                    Some(idx) => output.truncate(idx + 1),
+                    None => output.clear(),
+                },
+                // A chunk-final `\r` may be half of a `\r\n` split across
+                // PTY reads — drop it rather than eat the line.
+                None => {}
+            },
             '\n' | '\t' => output.push(ch),
             '\x08' => {
-                output.pop();
+                // Backspace never crosses a line boundary on a real
+                // terminal — keep `\n` intact (#469).
+                if !output.is_empty() && !output.ends_with('\n') {
+                    output.pop();
+                }
             }
             ch if ch.is_control() => {}
             ch => output.push(ch),
@@ -4956,6 +4977,50 @@ mod tests {
         let cleaned =
             clean_terminal_output("Hello\x08\x08world").expect("non-empty after sanitization");
         assert_eq!(cleaned, "Helworld");
+    }
+
+    /// Regression for #469: backspace never crosses a line boundary on a
+    /// real terminal — it must not pop a `\n` and merge two lines.
+    #[test]
+    fn clean_terminal_output_backspace_stops_at_line_start() {
+        let cleaned = clean_terminal_output("ab\n\x08\x08c").expect("non-empty after sanitization");
+        assert_eq!(cleaned, "ab\nc");
+    }
+
+    /// Regression for #469: a bare `\r` means "return to column 0 and
+    /// overwrite" — progress output must keep only the final frame instead
+    /// of concatenating every frame into run-on garbage.
+    #[test]
+    fn clean_terminal_output_keeps_only_the_final_cr_overwrite_frame() {
+        let cleaned = clean_terminal_output("Downloading 10%\rDownloading 55%\rDownloading 100%\n")
+            .expect("non-empty after sanitization");
+        assert_eq!(cleaned, "Downloading 100%\n");
+    }
+
+    #[test]
+    fn clean_terminal_output_cr_overwrite_only_affects_the_current_line() {
+        let cleaned = clean_terminal_output("done line\nprogress 1\rprogress 2\n")
+            .expect("non-empty after sanitization");
+        assert_eq!(cleaned, "done line\nprogress 2\n");
+    }
+
+    #[test]
+    fn clean_terminal_output_normalizes_crlf_line_endings() {
+        // `\r\n` is a plain line ending, not an overwrite — the text before
+        // it must survive.
+        let cleaned =
+            clean_terminal_output("first\r\nsecond\r\n").expect("non-empty after sanitization");
+        assert_eq!(cleaned, "first\nsecond\n");
+    }
+
+    #[test]
+    fn clean_terminal_output_keeps_text_before_a_chunk_final_cr() {
+        // A `\r` as the chunk's last char may be half of a `\r\n` split
+        // across PTY reads — truncating here would eat the whole line, so
+        // the trailing CR is dropped instead.
+        let cleaned =
+            clean_terminal_output("partial line\r").expect("non-empty after sanitization");
+        assert_eq!(cleaned, "partial line");
     }
 
     #[test]
