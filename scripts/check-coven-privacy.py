@@ -68,7 +68,7 @@ def git(*args: str, text: bool = True) -> str | bytes:
 
 def nul_paths(data: bytes) -> list[str]:
     return [
-        value.decode("utf-8")
+        value.decode("utf-8", errors="surrogateescape")
         for value in data.split(b"\0")
         if value
     ]
@@ -92,10 +92,17 @@ def changed_files(revision_range: str) -> list[tuple[str, bytes]]:
             text=False,
         )
     )
+    end_rev = revision_range
+    if "..." in end_rev:
+        end_rev = end_rev.rsplit("...", 1)[1]
+    elif ".." in end_rev:
+        end_rev = end_rev.rsplit("..", 1)[1]
+    end_rev = end_rev.strip() or "HEAD"
+
     files: list[tuple[str, bytes]] = []
     for name in names:
         try:
-            files.append((name, git("show", f"HEAD:{name}", text=False)))
+            files.append((name, git("show", f"{end_rev}:{name}", text=False)))
         except subprocess.CalledProcessError:
             continue
     return files

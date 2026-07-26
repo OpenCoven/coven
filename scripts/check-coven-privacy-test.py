@@ -68,6 +68,39 @@ class CovenPrivacyPatternTests(unittest.TestCase):
             text=False,
         )
 
+    def test_git_paths_accept_non_utf8_bytes(self) -> None:
+        self.assertEqual(
+            check_coven_privacy.nul_paths(b"docs/\xffexample.md\0"),
+            ["docs/\udcffexample.md"],
+        )
+
+    def test_range_scan_reads_files_from_range_end_revision(self) -> None:
+        calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+        def fake_git(*args: str, text: bool = True) -> str | bytes:
+            calls.append((args, {"text": text}))
+            if args[:2] == ("diff", "--name-only"):
+                return b"docs/example.md\0"
+            if args == ("show", "after:docs/example.md"):
+                return b"safe text"
+            raise AssertionError(f"unexpected git call: {args!r}")
+
+        with mock.patch.object(check_coven_privacy, "git", side_effect=fake_git):
+            self.assertEqual(
+                check_coven_privacy.changed_files("before..after"),
+                [("docs/example.md", b"safe text")],
+            )
+        self.assertEqual(
+            calls,
+            [
+                (
+                    ("diff", "--name-only", "--diff-filter=ACMR", "-z", "before..after"),
+                    {"text": False},
+                ),
+                (("show", "after:docs/example.md"), {"text": False}),
+            ],
+        )
+
     def test_private_session_identifier_is_blocked(self) -> None:
         text = ":".join(["agent", "example", "telegram", "direct", "123456789"])
 
