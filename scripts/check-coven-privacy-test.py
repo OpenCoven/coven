@@ -21,6 +21,24 @@ class CovenPrivacyPatternTests(unittest.TestCase):
 
         self.assertIn("scripts/check-coven-privacy.py --range", workflow)
 
+    def test_ci_scans_the_entire_push_range(self) -> None:
+        workflow = (
+            SCRIPT.parents[1] / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("BEFORE_SHA: ${{ github.event.before }}", workflow)
+        self.assertIn("AFTER_SHA: ${{ github.sha }}", workflow)
+        self.assertIn('--range "${BEFORE_SHA}..${AFTER_SHA}"', workflow)
+        self.assertNotIn("HEAD^...HEAD", workflow)
+
+    def test_ci_scans_the_full_tree_when_push_before_is_unavailable(self) -> None:
+        workflow = (
+            SCRIPT.parents[1] / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('git cat-file -e "${BEFORE_SHA}^{commit}"', workflow)
+        self.assertIn("git hash-object -t tree -w --stdin", workflow)
+
     def test_private_session_identifier_is_blocked(self) -> None:
         text = ":".join(["agent", "example", "telegram", "direct", "123456789"])
 
