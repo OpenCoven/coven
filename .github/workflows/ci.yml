@@ -49,7 +49,7 @@ jobs:
       - run: python scripts/check-secrets.py
       - name: Coven privacy guard (pull request changes)
         if: github.event_name == 'pull_request'
-        run: python scripts/check-coven-privacy.py --range "${{ github.event.pull_request.base.sha }}...HEAD"
+        run: python scripts/check-coven-privacy.py --range "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}"
       - name: Coven privacy guard (pushed changes)
         if: github.event_name == 'push'
         env:

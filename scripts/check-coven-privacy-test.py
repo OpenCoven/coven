@@ -30,7 +30,15 @@ class CovenPrivacyPatternTests(unittest.TestCase):
             SCRIPT.parents[1] / ".github" / "workflows" / "ci.yml"
         ).read_text(encoding="utf-8")
 
-        self.assertIn("scripts/check-coven-privacy.py --range", workflow)
+        self.assertIn(
+            '--range "${{ github.event.pull_request.base.sha }}...'
+            '${{ github.event.pull_request.head.sha }}"',
+            workflow,
+        )
+        self.assertNotIn(
+            '${{ github.event.pull_request.base.sha }}...HEAD',
+            workflow,
+        )
 
     def test_ci_scans_the_entire_push_range(self) -> None:
         workflow = (
