@@ -4989,6 +4989,28 @@ mod tests {
     }
 
     #[test]
+    fn adapter_install_help_does_not_duplicate_the_recipe_registry() {
+        use clap::CommandFactory;
+
+        let mut cmd = Cli::command();
+        let adapter = cmd
+            .find_subcommand_mut("adapter")
+            .expect("adapter subcommand exists");
+        let install = adapter
+            .find_subcommand_mut("install")
+            .expect("adapter install subcommand exists");
+        let help = install.render_long_help().to_string();
+
+        assert!(help.contains("Adapter recipe to install"));
+        for recipe in harness::known_adapter_recipe_names() {
+            assert!(
+                !help.contains(recipe),
+                "adapter install help must not hardcode recipe `{recipe}`:\n{help}"
+            );
+        }
+    }
+
+    #[test]
     fn cli_accepts_attach_command() {
         let cli = Cli::parse_from(["coven", "attach", "session-1"]);
 

@@ -83,6 +83,7 @@ pub struct AgentInfo {
     pub label: String,
     pub harness: String,
     pub available: bool,
+    pub supports_chat_resume: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1211,7 +1212,12 @@ impl App {
         &mut self,
         harness: &str,
     ) -> Option<harness::ConversationHint> {
-        if !harness::harness_supports_chat_resume(harness) {
+        if !self
+            .agents
+            .iter()
+            .find(|agent| agent.harness == harness)
+            .is_some_and(|agent| agent.supports_chat_resume)
+        {
             return None;
         }
         if let Some(id) = self.harness_conversation_ids.get(harness) {
@@ -1485,10 +1491,8 @@ impl App {
         // Configured = built-ins plus installed adapter manifests; fall back
         // to built-ins on a manifest load error and surface the error so users
         // can diagnose why installed adapters are missing without a launch attempt.
-        let (harnesses, harness_load_err) = match harness::configured_harnesses() {
-            Ok(h) => (h, None),
-            Err(e) => (harness::built_in_harnesses(), Some(e.to_string())),
-        };
+        let (harnesses, harness_load_err) =
+            doctor_harness_inventory(harness::configured_harnesses());
         let mut lines = vec![
             "Doctor".to_string(),
             format!("  Store    {store_path}"),
@@ -2530,16 +2534,26 @@ pub(super) fn discover_agents() -> Vec<AgentInfo> {
     // opencode, …), so every runtime `coven run` accepts is selectable in
     // chat. A manifest load error falls back to built-ins only — the launch
     // path re-reads the manifests and surfaces the error with full context.
-    harness::configured_harnesses()
-        .unwrap_or_else(|_| harness::built_in_harnesses())
+    harness::configured_chat_harnesses()
+        .unwrap_or_else(|_| harness::built_in_chat_harnesses())
         .into_iter()
         .map(|h| AgentInfo {
-            id: h.id.to_string(),
-            label: h.label.to_string(),
-            harness: h.id.to_string(),
-            available: h.available,
+            id: h.summary.id.to_string(),
+            label: h.summary.label.to_string(),
+            harness: h.summary.id.to_string(),
+            available: h.summary.available,
+            supports_chat_resume: h.supports_chat_resume,
         })
         .collect()
+}
+
+fn doctor_harness_inventory(
+    configured: anyhow::Result<Vec<harness::HarnessSummary>>,
+) -> (Vec<harness::HarnessSummary>, Option<String>) {
+    match configured {
+        Ok(harnesses) => (harnesses, None),
+        Err(error) => (harness::built_in_harnesses(), Some(error.to_string())),
+    }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -3076,6 +3090,7 @@ mod tests {
             label: id.to_string(),
             harness: id.to_string(),
             available,
+            supports_chat_resume: matches!(id, "claude" | "codex" | "copilot"),
         }
     }
 
@@ -3372,6 +3387,42 @@ mod tests {
         assert!(
             !transcript.contains("Run `coven doctor`"),
             "doctor should run inline, not hand the user back to the shell:\n{transcript}"
+        );
+    }
+
+    #[test]
+    fn doctor_harness_inventory_preserves_manifest_errors_with_builtin_fallback() {
+        let (harnesses, error) =
+            doctor_harness_inventory(Err(anyhow::anyhow!("manifest.json: invalid JSON")));
+
+        assert!(
+            !harnesses.is_empty(),
+            "built-in fallback must remain available"
+        );
+        assert_eq!(
+            error.as_deref(),
+            Some("manifest.json: invalid JSON"),
+            "doctor must retain the configured-harness error for display"
+        );
+    }
+
+    #[test]
+    fn conversation_hint_uses_discovered_resume_support_without_reloading_manifests() {
+        let mut app = app_with_agents(vec![AgentInfo {
+            id: "custom-resume".to_string(),
+            label: "Custom Resume".to_string(),
+            harness: "custom-resume".to_string(),
+            available: true,
+            supports_chat_resume: true,
+        }]);
+        app.harness_conversation_ids
+            .insert("custom-resume".to_string(), "persisted-session".to_string());
+
+        assert_eq!(
+            app.conversation_hint_for_harness("custom-resume"),
+            Some(harness::ConversationHint::Resume {
+                id: "persisted-session".to_string()
+            })
         );
     }
 
@@ -5028,10 +5079,10 @@ mod tests {
         ));
     }
 
-    // Chat-resume support moved to `harness::harness_supports_chat_resume`,
-    // driven by each configured spec's declared continuity args; the
-    // hermetic coverage (built-ins, installed grok/opencode adapters, the
-    // coven-code carve-out) lives in `harness.rs`'s
+    // Chat-resume support is captured during agent discovery from each
+    // configured spec's declared continuity args; the hermetic coverage
+    // (built-ins, installed grok/opencode adapters, the coven-code carve-out)
+    // lives in `harness.rs`'s
     // `chat_resume_support_is_driven_by_declared_continuity`.
 
     #[test]

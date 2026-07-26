@@ -1340,6 +1340,7 @@ pub(crate) fn render_chat_frame_plain_for_test(width: u16, height: u16) -> Strin
         label: "codex".to_string(),
         harness: "codex".to_string(),
         available: true,
+        supports_chat_resume: true,
     }];
     let mut app = App::new_with_state(
         agents,
@@ -1909,6 +1910,7 @@ mod tests {
             label: "codex".to_string(),
             harness: "codex".to_string(),
             available: true,
+            supports_chat_resume: true,
         }];
         let mut app = App::new_with_state(
             agents,

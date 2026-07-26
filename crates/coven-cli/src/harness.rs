@@ -25,6 +25,12 @@ pub struct HarnessSummary {
     pub manifest_path: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChatHarnessSummary {
+    pub summary: HarnessSummary,
+    pub supports_chat_resume: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HarnessLaunchMode {
     Interactive,
@@ -218,23 +224,15 @@ pub fn harness_supports_preassigned_session_id(harness_id: &str) -> bool {
 /// not a persistence key — sessions never become loadable under a
 /// pre-assigned id, so chat's pick-the-id-up-front flow cannot resume it.
 /// Verified empirically against engine 0.7.0.
-pub fn harness_supports_chat_resume(harness_id: &str) -> bool {
-    if harness_id == crate::engine::ENGINE_HARNESS_ID {
+fn spec_supports_chat_resume(spec: &HarnessCommandSpec) -> bool {
+    if spec.id == crate::engine::ENGINE_HARNESS_ID {
         return false;
     }
 
-    static SPECS: std::sync::OnceLock<Vec<HarnessCommandSpec>> = std::sync::OnceLock::new();
-    let specs = SPECS
-        .get_or_init(|| configured_harness_specs().unwrap_or_else(|_| built_in_harness_specs()));
-
-    specs
-        .iter()
-        .find(|spec| spec.id == harness_id)
-        .and_then(|spec| spec.continuity_args.as_ref())
-        .is_some_and(|continuity| {
-            continuity.has_resume_launch()
-                && (continuity.session_id_flag().is_some() || harness_id == "codex")
-        })
+    spec.continuity_args.as_ref().is_some_and(|continuity| {
+        continuity.has_resume_launch()
+            && (continuity.session_id_flag().is_some() || spec.id == "codex")
+    })
 }
 
 pub fn harness_supports_think(harness_id: &str) -> bool {
@@ -520,6 +518,16 @@ impl HarnessSummary {
             source: spec.source,
             manifest_path: spec.manifest_path,
             capabilities: spec.capabilities,
+        }
+    }
+}
+
+impl ChatHarnessSummary {
+    fn from_spec(spec: HarnessCommandSpec) -> Self {
+        let supports_chat_resume = spec_supports_chat_resume(&spec);
+        Self {
+            summary: HarnessSummary::from_spec(spec),
+            supports_chat_resume,
         }
     }
 }
@@ -834,6 +842,20 @@ fn configured_harnesses_from(adapter_env: &AdapterEnv) -> Result<Vec<HarnessSumm
         .into_iter()
         .map(HarnessSummary::from_spec)
         .collect())
+}
+
+pub(crate) fn configured_chat_harnesses() -> Result<Vec<ChatHarnessSummary>> {
+    Ok(configured_harness_specs()?
+        .into_iter()
+        .map(ChatHarnessSummary::from_spec)
+        .collect())
+}
+
+pub(crate) fn built_in_chat_harnesses() -> Vec<ChatHarnessSummary> {
+    built_in_harness_specs()
+        .into_iter()
+        .map(ChatHarnessSummary::from_spec)
+        .collect()
 }
 
 pub fn unsupported_harness_message(harness_id: &str, configured_ids: &[&str]) -> String {
@@ -2748,24 +2770,29 @@ mod tests {
         let _manifest_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_MANIFEST_ENV);
         let _dirs_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_DIRS_ENV);
         let _coven_home_guard = EnvVarGuard::set("COVEN_HOME", &coven_home);
+        let harnesses = configured_chat_harnesses()?;
+        let supports_resume = |id: &str| {
+            harnesses
+                .iter()
+                .find(|harness| harness.summary.id == id)
+                .is_some_and(|harness| harness.supports_chat_resume)
+        };
 
         // Built-ins: claude/copilot pre-assign ids, codex captures its id
         // from first-turn output.
-        assert!(harness_supports_chat_resume("claude"));
-        assert!(harness_supports_chat_resume("codex"));
-        assert!(harness_supports_chat_resume("copilot"));
+        assert!(supports_resume("claude"));
+        assert!(supports_resume("codex"));
+        assert!(supports_resume("copilot"));
         // The engine declares continuity args for `coven run` flows, but its
         // `--session-id` is a tracking tag, not a persistence key, so chat
         // resume stays off (see the carve-out on the function).
-        assert!(!harness_supports_chat_resume(
-            crate::engine::ENGINE_HARNESS_ID
-        ));
+        assert!(!supports_resume(crate::engine::ENGINE_HARNESS_ID));
         // Installed adapters follow their declared continuity args.
-        assert!(harness_supports_chat_resume("grok"));
-        assert!(!harness_supports_chat_resume("opencode"));
+        assert!(supports_resume("grok"));
+        assert!(!supports_resume("opencode"));
         // Unknown / not-installed ids resolve to no spec, hence no resume.
-        assert!(!harness_supports_chat_resume("hermes"));
-        assert!(!harness_supports_chat_resume("not-a-real-harness"));
+        assert!(!supports_resume("hermes"));
+        assert!(!supports_resume("not-a-real-harness"));
         Ok(())
     }
 
