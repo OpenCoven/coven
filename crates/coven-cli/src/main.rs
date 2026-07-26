@@ -711,7 +711,7 @@ enum WardCommand {
         #[arg(
             long,
             value_name = "TYPE",
-            help = "Only rows with this event type (apply_audit, proposal_submitted, validation_verdict)"
+            help = "Only rows with this event type (proposal_submitted, proposal_window_opened, proposal_approved, proposal_rejected, proposal_vetoed, ward_updated, memory_entry_admitted, principal_authorized_write, validation_verdict, compaction_ledger, apply_audit)"
         )]
         event: Option<String>,
         #[arg(long, help = "Print the ledger as JSON (machine-readable)")]

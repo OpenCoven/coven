@@ -619,9 +619,7 @@ fn ward_audit_path(familiar_id: &str, limit: Option<u32>, event: Option<&str>) -
     }
     if let Some(event) = event {
         crate::api::validate_ward_audit_event_tag(event)
-            .with_context(|| {
-                "--event must be a known lowercase ASCII event tag (`apply_audit`, `proposal_submitted`, or `validation_verdict`)"
-            })?;
+            .with_context(|| "--event must be a known lowercase ASCII ward_audit event tag")?;
         params.push(format!("event={event}"));
     }
     if !params.is_empty() {
@@ -639,7 +637,7 @@ fn render_ward_audit(body: &Value) -> String {
         .unwrap_or_default();
     if records.is_empty() {
         return concat!(
-            "No ward_audit rows for this familiar.\n",
+            "No matching ward_audit rows.\n",
             "Applied Tier-2 writes, gate verdicts, and proposal events land here\n",
             "(append-only, RFC-0001 §5.6).\n"
         )
@@ -1477,6 +1475,13 @@ mod tests {
                 .expect_err("unsafe event query value must be rejected");
             assert!(error.to_string().contains("--event"), "{event}: {error:#}");
         }
+    }
+
+    #[test]
+    fn render_ward_audit_empty_output_is_filter_safe() {
+        let output = render_ward_audit(&json!({ "records": [] }));
+
+        assert!(output.starts_with("No matching ward_audit rows.\n"));
     }
 
     #[test]

@@ -3080,6 +3080,20 @@ fn familiar_audit_response(
     )
 }
 
+pub(crate) const WARD_AUDIT_EVENT_TAGS: &[&str] = &[
+    "proposal_submitted",
+    "proposal_window_opened",
+    "proposal_approved",
+    "proposal_rejected",
+    "proposal_vetoed",
+    "ward_updated",
+    "memory_entry_admitted",
+    "principal_authorized_write",
+    "validation_verdict",
+    "compaction_ledger",
+    "apply_audit",
+];
+
 pub(crate) fn validate_ward_audit_event_tag(event: &str) -> Result<()> {
     anyhow::ensure!(
         !event.is_empty()
@@ -3089,11 +3103,8 @@ pub(crate) fn validate_ward_audit_event_tag(event: &str) -> Result<()> {
         "Query parameter `event` must be a lowercase ASCII event tag containing only lowercase letters, digits, and `_`."
     );
     anyhow::ensure!(
-        matches!(
-            event,
-            "apply_audit" | "proposal_submitted" | "validation_verdict"
-        ),
-        "Query parameter `event` must be one of `apply_audit`, `proposal_submitted`, or `validation_verdict`."
+        WARD_AUDIT_EVENT_TAGS.contains(&event),
+        "Query parameter `event` must be a known ward_audit event tag."
     );
     Ok(())
 }
@@ -9021,6 +9032,32 @@ tier = 1
             assert_eq!(response.status, 400, "path {path} got {}", response.body);
             let body: Value = serde_json::from_str(&response.body)?;
             assert_eq!(body["error"]["code"], "invalid_request");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn familiar_audit_event_filter_accepts_every_ledger_event_type() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_warded_familiar(home)?;
+
+        for event in [
+            "proposal_submitted",
+            "proposal_window_opened",
+            "proposal_approved",
+            "proposal_rejected",
+            "proposal_vetoed",
+            "ward_updated",
+            "memory_entry_admitted",
+            "principal_authorized_write",
+            "validation_verdict",
+            "compaction_ledger",
+            "apply_audit",
+        ] {
+            let path = format!("/api/v1/familiars/sage/audit?event={event}");
+            let response = handle_request("GET", &path, home, None)?;
+            assert_eq!(response.status, 200, "event {event} got {}", response.body);
         }
         Ok(())
     }
