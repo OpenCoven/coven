@@ -43,6 +43,96 @@ enum AgentOutputMode {
     Hidden,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CopilotStatsLine {
+    Changes,
+    Requests,
+    Tokens,
+    Resume,
+}
+
+#[derive(Debug, Default)]
+struct CopilotStatsCandidate {
+    /// Exact cleaned lines, including their newlines. Candidate advancement
+    /// bounds this to the four recognized trailer rows.
+    lines: Vec<String>,
+    /// Copilot may print cosmetic blank spacing after its terminal table.
+    trailing_blank: bool,
+}
+
+impl CopilotStatsCandidate {
+    fn expected(&self) -> Option<CopilotStatsLine> {
+        match self.lines.len() {
+            0 => Some(CopilotStatsLine::Changes),
+            1 => Some(CopilotStatsLine::Requests),
+            2 => Some(CopilotStatsLine::Tokens),
+            3 => Some(CopilotStatsLine::Resume),
+            _ => None,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    fn is_complete(&self) -> bool {
+        self.lines.len() == 4
+    }
+
+    fn clear(&mut self) {
+        self.lines.clear();
+        self.trailing_blank = false;
+    }
+
+    fn take_visible(&mut self) -> String {
+        let mut visible = std::mem::take(&mut self.lines).concat();
+        if std::mem::take(&mut self.trailing_blank) {
+            visible.push('\n');
+        }
+        visible
+    }
+
+    fn push_line(&mut self, raw_line: &str, visible: &mut String) {
+        let marker = raw_line.trim_end_matches('\n').trim();
+        if self.is_complete() && marker.is_empty() {
+            self.trailing_blank = true;
+            return;
+        }
+
+        let kind = copilot_stats_line_kind(marker);
+        if self
+            .expected()
+            .is_some_and(|expected| kind == Some(expected))
+        {
+            self.lines.push(raw_line.to_string());
+            debug_assert!(self.lines.len() <= 4);
+            return;
+        }
+
+        if !self.is_empty() {
+            visible.push_str(&self.take_visible());
+        }
+        if kind == Some(CopilotStatsLine::Changes) {
+            self.lines.push(raw_line.to_string());
+        } else {
+            visible.push_str(raw_line);
+        }
+    }
+
+    /// Normal EOF confirms a complete candidate as the terminal trailer.
+    /// Every incomplete candidate fails open.
+    fn finish_at_exit(&mut self) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        if self.is_complete() {
+            self.clear();
+            return None;
+        }
+        Some(self.take_visible())
+    }
+}
+
 /// Per-PTY-session state for the trailing partial line of the transcript
 /// filter (#471). See the `pty_line_buffers` field.
 #[derive(Debug, Default)]
@@ -54,6 +144,14 @@ struct PtyLineBuffer {
     /// Number of cleaned chars from `tail` already appended to the current
     /// agent bubble. Continuations re-clean `tail` and reconcile this prefix.
     emitted_len: usize,
+    /// Bounded Copilot-only candidate for a terminal usage-stats trailer.
+    copilot_stats: CopilotStatsCandidate,
+}
+
+impl PtyLineBuffer {
+    fn has_pending(&self) -> bool {
+        !self.tail.is_empty() || self.emitted_len > 0 || !self.copilot_stats.is_empty()
+    }
 }
 
 /// Whether an appended chunk of agent output starts a new assistant
@@ -1942,6 +2040,12 @@ impl App {
         matches!(self.active_session_harness.as_deref(), None | Some("codex"))
     }
 
+    /// Copilot is the only supported PTY harness with this terminal stats
+    /// trailer. Unknown and other harnesses fail open.
+    fn active_session_emits_copilot_stats(&self) -> bool {
+        self.active_session_harness.as_deref() == Some("copilot")
+    }
+
     /// Route visible PTY text through the live/batched display split.
     /// PTY chunks split at arbitrary byte boundaries and already carry
     /// their own newlines, so they never start a new segment (#470).
@@ -2011,6 +2115,7 @@ impl App {
     /// held otherwise until its newline or the session's exit.
     fn dispatch_pty_output(&mut self, session_id: &str, data: &str) {
         let codex_markers = self.active_session_emits_codex_markers();
+        let copilot_stats = self.active_session_emits_copilot_stats();
         let mut state = self.pty_line_buffers.remove(session_id).unwrap_or_default();
         let mut visible = String::new();
         let mut force_emit_visible = false;
@@ -2056,11 +2161,13 @@ impl App {
         };
         let complete = std::mem::replace(&mut state.tail, fragment);
         if !complete.is_empty() {
-            let classified = if codex_markers {
-                human_facing_agent_output(&complete, &mut self.agent_output_mode)
-            } else {
-                human_facing_plain_output(&complete, &mut self.agent_output_mode)
-            };
+            let classified = human_facing_pty_output(
+                &complete,
+                &mut self.agent_output_mode,
+                codex_markers,
+                copilot_stats,
+                &mut state.copilot_stats,
+            );
             if let Some(text) = classified {
                 visible.push_str(&text);
             }
@@ -2073,16 +2180,18 @@ impl App {
         if !state.tail.is_empty()
             && self.agent_output_mode != AgentOutputMode::Hidden
             && state.emitted_len == 0
+            && state.copilot_stats.is_empty()
         {
-            let displayable = clean_terminal_output(&state.tail)
-                .filter(|text| !partial_line_may_become_marker(text.trim(), codex_markers));
+            let displayable = clean_terminal_output(&state.tail).filter(|text| {
+                !partial_line_may_become_marker(text.trim(), codex_markers, copilot_stats)
+            });
             if let Some(text) = displayable {
                 visible.push_str(&text);
                 state.emitted_len = text.chars().count();
             }
         }
 
-        if !state.tail.is_empty() || state.emitted_len > 0 {
+        if state.has_pending() {
             self.pty_line_buffers.insert(session_id.to_string(), state);
         }
 
@@ -2095,23 +2204,28 @@ impl App {
     /// be eaten (#471). Kill paths drop the buffer instead (a cancelled
     /// turn's half-line is noise), mirroring `stream_json_buffers`.
     fn flush_pty_line_buffer(&mut self, session_id: &str) {
-        let Some(state) = self.pty_line_buffers.remove(session_id) else {
+        let Some(mut state) = self.pty_line_buffers.remove(session_id) else {
             return;
         };
-        if state.tail.is_empty() {
-            return;
+        let codex_markers = self.active_session_emits_codex_markers();
+        let copilot_stats = self.active_session_emits_copilot_stats();
+        let mut visible = String::new();
+
+        if !state.tail.is_empty() && state.emitted_len == 0 {
+            if let Some(text) = human_facing_pty_output(
+                &state.tail,
+                &mut self.agent_output_mode,
+                codex_markers,
+                copilot_stats,
+                &mut state.copilot_stats,
+            ) {
+                visible.push_str(&text);
+            }
         }
-        if state.emitted_len > 0 {
-            return;
+        if let Some(text) = state.copilot_stats.finish_at_exit() {
+            visible.push_str(&text);
         }
-        let classified = if self.active_session_emits_codex_markers() {
-            human_facing_agent_output(&state.tail, &mut self.agent_output_mode)
-        } else {
-            human_facing_plain_output(&state.tail, &mut self.agent_output_mode)
-        };
-        if let Some(text) = classified {
-            self.emit_agent_text(&text);
-        }
+        self.flush_pty_visible(&mut visible, false);
     }
 
     fn push_event_message(&mut self, event: &store::EventRecord) {
@@ -2914,10 +3028,7 @@ fn human_facing_agent_output(data: &str, mode: &mut AgentOutputMode) -> Option<S
             *mode = AgentOutputMode::Assistant;
             continue;
         }
-        if is_hidden_transcript_marker(marker)
-            || is_codex_metadata_line(marker)
-            || is_copilot_stats_line(marker)
-        {
+        if is_hidden_transcript_marker(marker) || is_codex_metadata_line(marker) {
             *mode = AgentOutputMode::Hidden;
             continue;
         }
@@ -2932,32 +3043,41 @@ fn human_facing_agent_output(data: &str, mode: &mut AgentOutputMode) -> Option<S
     has_structure.then_some(visible)
 }
 
-/// Like `human_facing_agent_output`, but for harnesses that never emit
-/// codex's interleaved role markers (copilot, grok, claude PTY fallback).
-/// Only the copilot stats-block shapes hide; a bare `bash` list item or a
-/// closing `Completed` line is ordinary prose there, and honoring the
-/// codex markers would flip the filter to Hidden with no assistant marker
-/// ever arriving to flip it back (#471).
-fn human_facing_plain_output(data: &str, mode: &mut AgentOutputMode) -> Option<String> {
+/// Harnesses without Codex transcript markers or Copilot's known terminal
+/// trailer are plain terminal prose.
+fn human_facing_plain_output(data: &str) -> Option<String> {
+    clean_terminal_output(data)
+}
+
+fn human_facing_copilot_output(
+    data: &str,
+    candidate: &mut CopilotStatsCandidate,
+) -> Option<String> {
     let cleaned = clean_terminal_output(data)?;
     let mut visible = String::new();
 
     for raw_line in cleaned.split_inclusive('\n') {
-        let marker = raw_line.trim_end_matches('\n').trim();
-
-        if is_copilot_stats_line(marker) {
-            *mode = AgentOutputMode::Hidden;
-            continue;
-        }
-
-        match mode {
-            AgentOutputMode::Assistant | AgentOutputMode::Unknown => visible.push_str(raw_line),
-            AgentOutputMode::Hidden => {}
-        }
+        candidate.push_line(raw_line, &mut visible);
     }
 
     let has_structure = visible.chars().any(|ch| ch == '\n' || !ch.is_whitespace());
     has_structure.then_some(visible)
+}
+
+fn human_facing_pty_output(
+    data: &str,
+    mode: &mut AgentOutputMode,
+    codex_markers: bool,
+    copilot_stats: bool,
+    candidate: &mut CopilotStatsCandidate,
+) -> Option<String> {
+    if codex_markers {
+        human_facing_agent_output(data, mode)
+    } else if copilot_stats {
+        human_facing_copilot_output(data, candidate)
+    } else {
+        human_facing_plain_output(data)
+    }
 }
 
 /// True when `fragment` — the cleaned, trimmed text of a line that hasn't
@@ -2966,7 +3086,11 @@ fn human_facing_plain_output(data: &str, mode: &mut AgentOutputMode) -> Option<S
 /// shown or classified early: judging them as complete lines is exactly
 /// the misread #471 fixes (prose split right after `user` flipped the
 /// filter to Hidden; a `codex` marker split as `cod`/`ex` was missed).
-fn partial_line_may_become_marker(fragment: &str, codex_markers: bool) -> bool {
+fn partial_line_may_become_marker(
+    fragment: &str,
+    codex_markers: bool,
+    copilot_stats: bool,
+) -> bool {
     // A fragment can still come to *start with* `pattern` while it's a
     // prefix of the pattern or already carries the pattern as its head.
     fn may_match_prefix_pattern(fragment: &str, pattern: &str) -> bool {
@@ -2977,21 +3101,22 @@ fn partial_line_may_become_marker(fragment: &str, codex_markers: bool) -> bool {
         }
     }
 
-    // Copilot stats shapes hide for every harness. Hold a label head until
-    // enough of the line is present to rule out the 3+-space gutter that
-    // `is_copilot_stats_line` requires next.
-    const STATS_LABELS: [&str; 4] = ["Changes", "Requests", "Tokens", "Resume"];
-    let stats_open = STATS_LABELS.iter().any(|label| {
-        if fragment.len() < label.len() {
-            label.starts_with(fragment)
-        } else {
-            fragment
-                .strip_prefix(label)
-                .is_some_and(|rest| rest.chars().take(3).all(|c| c == ' '))
+    if copilot_stats {
+        // Hold a Copilot label head until enough of the line is present to
+        // rule out the 3+-space stats gutter.
+        const STATS_LABELS: [&str; 4] = ["Changes", "Requests", "Tokens", "Resume"];
+        let stats_open = STATS_LABELS.iter().any(|label| {
+            if fragment.len() < label.len() {
+                label.starts_with(fragment)
+            } else {
+                fragment
+                    .strip_prefix(label)
+                    .is_some_and(|rest| rest.chars().take(3).all(|c| c == ' '))
+            }
+        });
+        if stats_open {
+            return true;
         }
-    });
-    if stats_open {
-        return true;
     }
     if !codex_markers {
         return false;
@@ -3062,32 +3187,30 @@ fn is_codex_metadata_line(line: &str) -> bool {
         || line.starts_with("session id:")
 }
 
-/// One-shot `copilot --prompt` runs close with a columnar stats block on
-/// stderr (`Changes    +0 -0`, `Requests   1 Premium (8s)`,
-/// `Tokens     ↑ 28.0k … • ↓ 43 …`, `Resume     copilot --resume=<id>`),
-/// which the PTY merges into the transcript. Recognize those exact column
-/// shapes — label, a 3+-space gutter, then a value with a distinctive lead —
-/// so chat stays prose-only. Anything looser risks hiding assistant text
-/// that merely starts with the same word.
-fn is_copilot_stats_line(line: &str) -> bool {
+/// Classify the strict column shape of one row in Copilot's four-line
+/// terminal stats trailer.
+fn copilot_stats_line_kind(line: &str) -> Option<CopilotStatsLine> {
     fn column<'a>(line: &'a str, label: &str) -> Option<&'a str> {
         line.strip_prefix(label)?
             .strip_prefix("   ")
             .map(str::trim_start)
     }
-    if let Some(value) = column(line, "Changes") {
-        return value.starts_with('+');
+
+    if column(line, "Changes").is_some_and(|value| value.starts_with('+')) {
+        return Some(CopilotStatsLine::Changes);
     }
-    if let Some(value) = column(line, "Requests") {
-        return value.chars().next().is_some_and(|c| c.is_ascii_digit());
+    if column(line, "Requests")
+        .is_some_and(|value| value.chars().next().is_some_and(|c| c.is_ascii_digit()))
+    {
+        return Some(CopilotStatsLine::Requests);
     }
-    if let Some(value) = column(line, "Tokens") {
-        return value.starts_with('↑');
+    if column(line, "Tokens").is_some_and(|value| value.starts_with('↑')) {
+        return Some(CopilotStatsLine::Tokens);
     }
-    if let Some(value) = column(line, "Resume") {
-        return value.starts_with("copilot --resume=");
+    if column(line, "Resume").is_some_and(|value| value.starts_with("copilot --resume=")) {
+        return Some(CopilotStatsLine::Resume);
     }
-    false
+    None
 }
 
 fn skip_escape_sequence<I>(chars: &mut std::iter::Peekable<I>)
@@ -3353,6 +3476,20 @@ mod tests {
             kind: "output".to_string(),
             payload_json: serde_json::json!({ "data": data }).to_string(),
             created_at: "2026-05-19T00:00:00Z".to_string(),
+        }
+    }
+
+    fn terminal_event(seq: i64, session_id: &str, kind: &str) -> EventRecord {
+        EventRecord {
+            seq,
+            id: format!("event-{seq}"),
+            session_id: session_id.to_string(),
+            kind: kind.to_string(),
+            payload_json: serde_json::json!({
+                "status": if kind == "exit" { "completed" } else { "killed" }
+            })
+            .to_string(),
+            created_at: "2026-07-26T00:00:00Z".to_string(),
         }
     }
 
@@ -5127,58 +5264,224 @@ mod tests {
         assert!(!harness_supports_chat_resume("hermes"));
     }
 
+    const COPILOT_STATS_TRAILER: &str = concat!(
+        "Changes    +1 -1\n",
+        "Requests   1 Premium (8s)\n",
+        "Tokens     ↑ 28.0k (20.4k cached) • ↓ 32\n",
+        "Resume     copilot --resume=cb845dd4-234f-46a0-8e6a-7f15ce8170be\n",
+    );
+
     #[test]
-    fn copilot_stats_lines_hide_from_chat_transcript() {
-        assert!(is_copilot_stats_line("Changes    +0 -0"));
-        assert!(is_copilot_stats_line("Requests   1 Premium (11s)"));
-        assert!(is_copilot_stats_line(
-            "Tokens     ↑ 28.0k (28.0k written) • ↓ 43 (28 reasoning)"
+    fn copilot_resume_shaped_prose_and_following_reply_stay_visible() {
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "copilot",
+            "Existing",
+            "running",
         ));
-        assert!(is_copilot_stats_line(
-            "Resume     copilot --resume=0ded81e6-36cc-4b36-bc11-42ef4a254c10"
+        client.events.borrow_mut().push(output_event(
+            1,
+            "session-1",
+            concat!(
+                "Use the saved command below.\n",
+                "Resume     copilot --resume=example\n",
+                "Then verify the result.\n",
+            ),
         ));
-        // Assistant prose that merely leads with a stats label must stay
-        // visible: no column gutter, or the wrong value shape.
-        assert!(!is_copilot_stats_line(
-            "Changes to the API are listed below"
-        ));
-        assert!(!is_copilot_stats_line(
-            "Requests should be retried with backoff"
-        ));
-        assert!(!is_copilot_stats_line("Tokens are stored in the keychain"));
-        assert!(!is_copilot_stats_line(
-            "Resume     the deployment afterwards"
-        ));
-        assert!(!is_copilot_stats_line("Resume work on the parser"));
+        let (mut app, _) = app_with_client(client);
+
+        app.handle_slash_command("/attach session-1");
+
+        assert_eq!(
+            agent_text(&app),
+            concat!(
+                "Use the saved command below.\n",
+                "Resume     copilot --resume=example\n",
+                "Then verify the result.\n",
+            )
+        );
+        assert_eq!(app.agent_output_mode, AgentOutputMode::Unknown);
     }
 
     #[test]
-    fn copilot_transcript_keeps_prose_and_drops_stats_block() {
-        let mut mode = AgentOutputMode::Unknown;
+    fn copilot_complete_stats_shape_followed_by_prose_is_visible_verbatim() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+
+        app.push_event_message(&output_event(
+            1,
+            "session-1",
+            &format!("{COPILOT_STATS_TRAILER}Explanation continues.\n"),
+        ));
+
+        assert_eq!(
+            agent_text(&app),
+            format!("{COPILOT_STATS_TRAILER}Explanation continues.\n")
+        );
+    }
+
+    #[test]
+    fn copilot_false_positive_split_across_chunks_stays_visible() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+
+        app.push_event_message(&output_event(1, "session-1", "Res"));
+        app.push_event_message(&output_event(
+            2,
+            "session-1",
+            "ume     copilot --resume=example\nLater prose.\n",
+        ));
+
+        assert_eq!(
+            agent_text(&app),
+            "Resume     copilot --resume=example\nLater prose.\n"
+        );
+    }
+
+    #[test]
+    fn copilot_out_of_order_candidate_flushes_verbatim() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+        let out_of_order = concat!(
+            "Changes    +1 -1\n",
+            "Tokens     ↑ 28.0k (20.4k cached) • ↓ 32\n",
+        );
+
+        app.push_event_message(&output_event(1, "session-1", out_of_order));
+
+        assert_eq!(agent_text(&app), out_of_order);
+    }
+
+    #[test]
+    fn copilot_partial_stats_candidate_flushes_on_exit() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+
+        let partial = concat!("Changes    +1 -1\n", "Requests   1 Premium (8s)\n",);
+        app.push_event_message(&output_event(1, "session-1", partial));
+        assert!(agent_text(&app).is_empty());
+
+        app.push_event_message(&terminal_event(2, "session-1", "exit"));
+
+        assert_eq!(agent_text(&app), partial);
+    }
+
+    #[test]
+    fn copilot_complete_terminal_stats_trailer_is_hidden_on_exit() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+
+        app.push_event_message(&output_event(
+            1,
+            "session-1",
+            &format!("Answer.\n{COPILOT_STATS_TRAILER}"),
+        ));
+        assert_eq!(agent_text(&app), "Answer.\n");
+        assert!(app.pty_line_buffers.contains_key("session-1"));
+
+        app.push_event_message(&terminal_event(2, "session-1", "exit"));
+
+        assert_eq!(agent_text(&app), "Answer.\n");
+        assert!(!app.pty_line_buffers.contains_key("session-1"));
+    }
+
+    #[test]
+    fn stats_shaped_prose_is_visible_for_non_copilot_harnesses() {
+        for harness in ["codex", "claude", "grok", "custom"] {
+            let client = RecordingChatClient::default();
+            let (mut app, _) = app_with_client(client);
+            app.active_session_id = Some(format!("{harness}-session"));
+            app.active_session_harness = Some(harness.to_string());
+            let session_id = app.active_session_id.clone().expect("active session");
+            let transcript =
+                format!("assistant\n{COPILOT_STATS_TRAILER}This belongs to {harness}.\n");
+
+            app.push_event_message(&output_event(1, &session_id, &transcript));
+            app.push_event_message(&terminal_event(2, &session_id, "exit"));
+
+            let visible = agent_text(&app);
+            assert!(
+                visible.contains("Resume     copilot --resume="),
+                "{harness} must not run the Copilot trailer recognizer: {visible:?}"
+            );
+            assert!(
+                visible.contains(&format!("This belongs to {harness}.")),
+                "{harness} prose after stats-shaped text must stay visible: {visible:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn copilot_stats_classifier_requires_strict_row_shapes() {
+        assert_eq!(
+            copilot_stats_line_kind("Changes    +0 -0"),
+            Some(CopilotStatsLine::Changes)
+        );
+        assert_eq!(
+            copilot_stats_line_kind("Requests   1 Premium (11s)"),
+            Some(CopilotStatsLine::Requests)
+        );
+        assert_eq!(
+            copilot_stats_line_kind("Tokens     ↑ 28.0k (28.0k written) • ↓ 43 (28 reasoning)"),
+            Some(CopilotStatsLine::Tokens)
+        );
+        assert_eq!(
+            copilot_stats_line_kind(
+                "Resume     copilot --resume=0ded81e6-36cc-4b36-bc11-42ef4a254c10"
+            ),
+            Some(CopilotStatsLine::Resume)
+        );
+        // Assistant prose that merely leads with a stats label must stay
+        // visible: no column gutter, or the wrong value shape.
+        assert_eq!(
+            copilot_stats_line_kind("Changes to the API are listed below"),
+            None
+        );
+        assert_eq!(
+            copilot_stats_line_kind("Requests should be retried with backoff"),
+            None
+        );
+        assert_eq!(
+            copilot_stats_line_kind("Tokens are stored in the keychain"),
+            None
+        );
+        assert_eq!(
+            copilot_stats_line_kind("Resume     the deployment afterwards"),
+            None
+        );
+        assert_eq!(copilot_stats_line_kind("Resume work on the parser"), None);
+    }
+
+    #[test]
+    fn copilot_output_holds_a_complete_stats_candidate() {
+        let mut candidate = CopilotStatsCandidate::default();
         let transcript = "The fix is in `parser.rs`.\n\nChanges    +1 -1\nRequests   1 Premium (8s)\nTokens     ↑ 28.0k (20.4k cached) • ↓ 32\nResume     copilot --resume=cb845dd4-234f-46a0-8e6a-7f15ce8170be\n";
-        let visible =
-            human_facing_agent_output(transcript, &mut mode).expect("prose must stay visible");
+        let visible = human_facing_copilot_output(transcript, &mut candidate)
+            .expect("prose must stay visible");
         assert!(visible.contains("The fix is in `parser.rs`."));
         assert!(!visible.contains("Premium"));
         assert!(!visible.contains("--resume="));
         assert!(!visible.contains("↑"));
+        assert!(candidate.is_complete());
+        assert_eq!(candidate.finish_at_exit(), None);
     }
 
-    /// Plain-output filter (#471): non-codex harnesses keep marker-shaped
-    /// prose visible but still hide the copilot stats block.
+    /// Plain non-Codex/non-Copilot output has no role or trailer syntax.
     #[test]
-    fn plain_output_keeps_marker_like_prose_and_still_drops_stats_block() {
-        let mut mode = AgentOutputMode::Unknown;
+    fn plain_output_keeps_marker_and_stats_shaped_prose() {
         let transcript = "Run these:\nbash\nCompleted\nuser\nAll good.\nChanges    +1 -1\nRequests   1 Premium (8s)\n";
-        let visible =
-            human_facing_plain_output(transcript, &mut mode).expect("prose must stay visible");
-        assert!(visible.contains("Run these:"));
-        assert!(visible.contains("bash"));
-        assert!(visible.contains("Completed"));
-        assert!(visible.contains("user"));
-        assert!(visible.contains("All good."));
-        assert!(!visible.contains("+1 -1"));
-        assert!(!visible.contains("Premium"));
+        let visible = human_facing_plain_output(transcript).expect("prose must stay visible");
+        assert_eq!(visible, transcript);
     }
 
     /// Hold rules for chunk-split fragments (#471): a fragment is held only
@@ -5187,27 +5490,44 @@ mod tests {
     #[test]
     fn partial_line_hold_rules_cover_markers_stats_and_prose() {
         // Prefixes of codex markers (exact and starts_with shapes) hold.
-        assert!(partial_line_may_become_marker("cod", true));
-        assert!(partial_line_may_become_marker("codex", true));
-        assert!(partial_line_may_become_marker("user", true));
-        assert!(partial_line_may_become_marker("Comp", true));
-        assert!(partial_line_may_become_marker("succeeded in 0", true));
-        assert!(partial_line_may_become_marker("hook", true));
-        assert!(partial_line_may_become_marker("", true));
+        assert!(partial_line_may_become_marker("cod", true, false));
+        assert!(partial_line_may_become_marker("codex", true, false));
+        assert!(partial_line_may_become_marker("user", true, false));
+        assert!(partial_line_may_become_marker("Comp", true, false));
+        assert!(partial_line_may_become_marker(
+            "succeeded in 0",
+            true,
+            false
+        ));
+        assert!(partial_line_may_become_marker("hook", true, false));
+        assert!(partial_line_may_become_marker("", true, false));
         // Once the fragment can no longer match, it is shown immediately.
-        assert!(!partial_line_may_become_marker("codexy", true));
-        assert!(!partial_line_may_become_marker("user data", true));
-        assert!(!partial_line_may_become_marker("hello from daemon", true));
-        assert!(!partial_line_may_become_marker("successfully parsed", true));
-        // Stats labels hold for every harness until the gutter is ruled out.
-        assert!(partial_line_may_become_marker("Resume", false));
-        assert!(partial_line_may_become_marker("Changes   ", false));
-        assert!(partial_line_may_become_marker("Tokens    ↑ 2", false));
-        assert!(!partial_line_may_become_marker("Resume work", false));
-        assert!(!partial_line_may_become_marker("Tokens are stored", false));
-        // Codex markers do not hold for non-codex harnesses.
-        assert!(!partial_line_may_become_marker("cod", false));
-        assert!(!partial_line_may_become_marker("user", false));
+        assert!(!partial_line_may_become_marker("codexy", true, false));
+        assert!(!partial_line_may_become_marker("user data", true, false));
+        assert!(!partial_line_may_become_marker(
+            "hello from daemon",
+            true,
+            false
+        ));
+        assert!(!partial_line_may_become_marker(
+            "successfully parsed",
+            true,
+            false
+        ));
+        // Stats labels hold only for Copilot until the gutter is ruled out.
+        assert!(partial_line_may_become_marker("Resume", false, true));
+        assert!(partial_line_may_become_marker("Changes   ", false, true));
+        assert!(partial_line_may_become_marker("Tokens    ↑ 2", false, true));
+        assert!(!partial_line_may_become_marker("Resume work", false, true));
+        assert!(!partial_line_may_become_marker(
+            "Tokens are stored",
+            false,
+            true
+        ));
+        // Neither syntax holds for an unrelated harness.
+        assert!(!partial_line_may_become_marker("cod", false, false));
+        assert!(!partial_line_may_become_marker("user", false, false));
+        assert!(!partial_line_may_become_marker("Resume", false, false));
     }
 
     /// Regression for #471: copilot's PTY never emits codex-style role
