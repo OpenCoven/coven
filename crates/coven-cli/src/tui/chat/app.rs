@@ -43,6 +43,20 @@ enum AgentOutputMode {
     Hidden,
 }
 
+/// Per-PTY-session state for the trailing partial line of the transcript
+/// filter (#471). See the `pty_line_buffers` field.
+#[derive(Debug, Default)]
+struct PtyLineBuffer {
+    /// Raw text of the current line that hasn't seen its newline yet and
+    /// couldn't be shown: it might still turn into a marker/stats line.
+    tail: String,
+    /// True when the head of the current line was already shown as prose
+    /// (it could no longer become a marker line). The rest of that line
+    /// must then be shown verbatim when it completes — re-classifying the
+    /// remainder as a line of its own would misread it.
+    head_emitted: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct ChatMessage {
     pub role: MessageRole,
@@ -164,6 +178,15 @@ pub(super) struct App {
     /// frame can name the tool that failed. Entries are consumed by the
     /// matching result and cleared wholesale on session teardown (#472).
     stream_tool_names: HashMap<String, String>,
+    /// PTY analogue of `stream_json_buffers` (#471): PTY output events are
+    /// raw 8KiB reads too, so a chunk's last line usually lacks its
+    /// newline. `dispatch_pty_output` holds that trailing fragment here so
+    /// the transcript filter only classifies complete lines — a prose line
+    /// split right after `user` must not flip the filter to Hidden, and a
+    /// `codex` marker split as `cod`/`ex` must still be recognized.
+    /// Flushed through the classifier on session exit (EOF ends the line),
+    /// dropped on kill, mirroring the stream buffer teardown.
+    pty_line_buffers: HashMap<String, PtyLineBuffer>,
     client: Box<dyn ChatClient>,
     /// Optional familiar id for the session owner (e.g. `"sage"`). When set,
     /// delegation events are emitted to `cave-coven-calls.json` whenever
@@ -351,6 +374,7 @@ impl App {
             harness_stream_session_ids: HashMap::new(),
             stream_json_buffers: HashMap::new(),
             stream_tool_names: HashMap::new(),
+            pty_line_buffers: HashMap::new(),
             familiar_id: None,
             active_call_id: None,
             client,
@@ -1299,6 +1323,9 @@ impl App {
                 self.chat_owns_active_session = false;
                 self.last_event_seq = None;
                 self.agent_output_mode = AgentOutputMode::Unknown;
+                // Events replay from seq 0 on attach; a leftover fragment
+                // from an earlier attach would double-buffer (#471).
+                self.pty_line_buffers.remove(&session.id);
                 self.reset_event_poll_failures();
                 self.push_system_message(&format!(
                     "Attached to daemon session {} ({}, {})",
@@ -1340,6 +1367,8 @@ impl App {
                 self.chat_owns_active_session = false;
                 self.last_event_seq = None;
                 self.agent_output_mode = AgentOutputMode::Unknown;
+                // Same replay-from-zero hygiene as /attach (#471).
+                self.pty_line_buffers.remove(&session.id);
                 self.reset_event_poll_failures();
                 self.push_system_message(&format!(
                     "Attached to daemon session {} ({}, {})",
@@ -1835,6 +1864,130 @@ impl App {
         }
     }
 
+    /// Whether the active session's harness emits codex's non-interactive
+    /// transcript, whose interleaved role markers (`user`, `codex`,
+    /// `exec`, …) drive the Hidden/Assistant mode machine. No other
+    /// supported harness prints those markers, so honoring them elsewhere
+    /// lets ordinary prose flip the filter to Hidden with nothing to flip
+    /// it back (#471). An unknown harness keeps the historical
+    /// conservative behavior.
+    fn active_session_emits_codex_markers(&self) -> bool {
+        matches!(self.active_session_harness.as_deref(), None | Some("codex"))
+    }
+
+    /// Route visible agent text through the live/batched display split
+    /// used by both the stream-JSON and PTY output paths.
+    fn emit_agent_text(&mut self, text: &str) {
+        let sender = self.active_agent_label().to_string();
+        if self.streaming_mode.is_live() {
+            self.push_or_append_agent_message(&sender, text);
+        } else {
+            self.buffer_pending_agent_output(&sender, text);
+        }
+    }
+
+    /// PTY analogue of `dispatch_stream_json_output`'s buffering (#471):
+    /// output events are raw 8KiB PTY reads, so a chunk's last line
+    /// usually lacks its newline. Classifying that fragment as a complete
+    /// line misreads it — prose split right after `user` flipped the
+    /// filter to Hidden, and a `codex` marker split as `cod`/`ex` was
+    /// missed, eating the rest of the reply. Classify only complete
+    /// lines; a trailing fragment is shown immediately once it can no
+    /// longer become a marker line (so live streaming stays live), and
+    /// held otherwise until its newline or the session's exit.
+    fn dispatch_pty_output(&mut self, session_id: &str, data: &str) {
+        let codex_markers = self.active_session_emits_codex_markers();
+        let mut state = self.pty_line_buffers.remove(session_id).unwrap_or_default();
+        let mut visible = String::new();
+        let mut rest = data;
+
+        // A line whose head was already shown is known prose: emit the
+        // remainder up to its newline verbatim, then resume classifying.
+        if state.head_emitted {
+            match rest.find('\n') {
+                Some(idx) => {
+                    if let Some(text) = clean_terminal_output(&rest[..=idx]) {
+                        visible.push_str(&text);
+                    }
+                    state.head_emitted = false;
+                    rest = &rest[idx + 1..];
+                }
+                None => {
+                    if let Some(text) = clean_terminal_output(rest) {
+                        visible.push_str(&text);
+                    }
+                    rest = "";
+                }
+            }
+        }
+
+        state.tail.push_str(rest);
+        let fragment = match state.tail.rfind('\n') {
+            Some(idx) => state.tail.split_off(idx + 1),
+            None => std::mem::take(&mut state.tail),
+        };
+        let complete = std::mem::replace(&mut state.tail, fragment);
+        if !complete.is_empty() {
+            let classified = if codex_markers {
+                human_facing_agent_output(&complete, &mut self.agent_output_mode)
+            } else {
+                human_facing_plain_output(&complete, &mut self.agent_output_mode)
+            };
+            if let Some(text) = classified {
+                visible.push_str(&text);
+            }
+        }
+
+        // Show the fragment now if it provably can't become a marker line;
+        // otherwise hold it for the next chunk (or the exit flush). A fragment
+        // ending in a bare `\r` is also held: it may be half of a split `\r\n`
+        // or a progress frame the next chunk overwrites, and emitting its head
+        // now would glue the discarded frame onto the final one.
+        if !state.tail.is_empty()
+            && !state.tail.ends_with('\r')
+            && self.agent_output_mode != AgentOutputMode::Hidden
+        {
+            let displayable = clean_terminal_output(&state.tail)
+                .filter(|text| !partial_line_may_become_marker(text.trim(), codex_markers));
+            if let Some(text) = displayable {
+                visible.push_str(&text);
+                state.tail.clear();
+                state.head_emitted = true;
+            }
+        }
+
+        if !state.tail.is_empty() || state.head_emitted {
+            self.pty_line_buffers.insert(session_id.to_string(), state);
+        }
+
+        let has_structure = visible.chars().any(|ch| ch == '\n' || !ch.is_whitespace());
+        if has_structure {
+            self.emit_agent_text(&visible);
+        }
+    }
+
+    /// A session's exit finalizes its held fragment: EOF ends the line, so
+    /// classify it as a complete line and surface it if it's assistant
+    /// prose — a reply whose final line lacks a trailing newline must not
+    /// be eaten (#471). Kill paths drop the buffer instead (a cancelled
+    /// turn's half-line is noise), mirroring `stream_json_buffers`.
+    fn flush_pty_line_buffer(&mut self, session_id: &str) {
+        let Some(state) = self.pty_line_buffers.remove(session_id) else {
+            return;
+        };
+        if state.tail.is_empty() {
+            return;
+        }
+        let classified = if self.active_session_emits_codex_markers() {
+            human_facing_agent_output(&state.tail, &mut self.agent_output_mode)
+        } else {
+            human_facing_plain_output(&state.tail, &mut self.agent_output_mode)
+        };
+        if let Some(text) = classified {
+            self.emit_agent_text(&text);
+        }
+    }
+
     fn push_event_message(&mut self, event: &store::EventRecord) {
         // Drop events from sessions we've decided to hide (today: failed
         // sessions whose stale-id we already auto-recovered from). Clear
@@ -1843,6 +1996,10 @@ impl App {
         if self.suppressed_session_ids.contains(&event.session_id) {
             if matches!(event.kind.as_str(), "exit" | "kill") {
                 self.suppressed_session_ids.remove(&event.session_id);
+                // The suppressed session may have buffered a partial line
+                // before it was hidden; its terminal event is the last
+                // chance to reclaim that memory (#471).
+                self.pty_line_buffers.remove(&event.session_id);
             }
             return;
         }
@@ -1880,19 +2037,13 @@ impl App {
                         self.dispatch_stream_json_output(&event.session_id, &data);
                         return;
                     }
-                    let sender = self.active_agent_label().to_string();
-                    if let Some(text) =
-                        human_facing_agent_output(&data, &mut self.agent_output_mode)
-                    {
-                        if self.streaming_mode.is_live() {
-                            self.push_or_append_agent_message(&sender, &text);
-                        } else {
-                            self.buffer_pending_agent_output(&sender, &text);
-                        }
-                    }
+                    self.dispatch_pty_output(&event.session_id, &data);
                 }
             }
             "exit" => {
+                // Finalize any held partial line before draining the
+                // batched buffer: EOF completes the line (#471).
+                self.flush_pty_line_buffer(&event.session_id);
                 self.flush_pending_agent_buffer();
                 let status =
                     event_payload_text(event, "status").unwrap_or_else(|| "exited".to_string());
@@ -1939,6 +2090,10 @@ impl App {
                 self.push_system_message(&format!("Session {status}."));
             }
             "kill" => {
+                // A cancelled turn's half-line is noise: drop the held
+                // fragment instead of flushing it (#471), mirroring the
+                // stream-JSON buffer teardown below.
+                self.pty_line_buffers.remove(&event.session_id);
                 self.flush_pending_agent_buffer();
                 // Delegation call was cancelled by a kill event.
                 if let (Some(call_id), Some(home)) =
@@ -2600,6 +2755,108 @@ fn human_facing_agent_output(data: &str, mode: &mut AgentOutputMode) -> Option<S
 
     let has_structure = visible.chars().any(|ch| ch == '\n' || !ch.is_whitespace());
     has_structure.then_some(visible)
+}
+
+/// Like `human_facing_agent_output`, but for harnesses that never emit
+/// codex's interleaved role markers (copilot, grok, claude PTY fallback).
+/// Only the copilot stats-block shapes hide; a bare `bash` list item or a
+/// closing `Completed` line is ordinary prose there, and honoring the
+/// codex markers would flip the filter to Hidden with no assistant marker
+/// ever arriving to flip it back (#471).
+fn human_facing_plain_output(data: &str, mode: &mut AgentOutputMode) -> Option<String> {
+    let cleaned = clean_terminal_output(data)?;
+    let mut visible = String::new();
+
+    for raw_line in cleaned.split_inclusive('\n') {
+        let marker = raw_line.trim_end_matches('\n').trim();
+
+        if is_copilot_stats_line(marker) {
+            *mode = AgentOutputMode::Hidden;
+            continue;
+        }
+
+        match mode {
+            AgentOutputMode::Assistant | AgentOutputMode::Unknown => visible.push_str(raw_line),
+            AgentOutputMode::Hidden => {}
+        }
+    }
+
+    let has_structure = visible.chars().any(|ch| ch == '\n' || !ch.is_whitespace());
+    has_structure.then_some(visible)
+}
+
+/// True when `fragment` — the cleaned, trimmed text of a line that hasn't
+/// seen its newline yet — could still classify as a marker/stats line once
+/// the rest of the line arrives. Such fragments are held back instead of
+/// shown or classified early: judging them as complete lines is exactly
+/// the misread #471 fixes (prose split right after `user` flipped the
+/// filter to Hidden; a `codex` marker split as `cod`/`ex` was missed).
+fn partial_line_may_become_marker(fragment: &str, codex_markers: bool) -> bool {
+    // A fragment can still come to *start with* `pattern` while it's a
+    // prefix of the pattern or already carries the pattern as its head.
+    fn may_match_prefix_pattern(fragment: &str, pattern: &str) -> bool {
+        if fragment.len() < pattern.len() {
+            pattern.starts_with(fragment)
+        } else {
+            fragment.starts_with(pattern)
+        }
+    }
+
+    // Copilot stats shapes hide for every harness. Hold a label head until
+    // enough of the line is present to rule out the 3+-space gutter that
+    // `is_copilot_stats_line` requires next.
+    const STATS_LABELS: [&str; 4] = ["Changes", "Requests", "Tokens", "Resume"];
+    let stats_open = STATS_LABELS.iter().any(|label| {
+        if fragment.len() < label.len() {
+            label.starts_with(fragment)
+        } else {
+            fragment
+                .strip_prefix(label)
+                .is_some_and(|rest| rest.chars().take(3).all(|c| c == ' '))
+        }
+    });
+    if stats_open {
+        return true;
+    }
+    if !codex_markers {
+        return false;
+    }
+
+    // Exact-match markers can only still be reached while the fragment is
+    // a prefix of one (the empty fragment counts — hold until it grows).
+    const EXACT_MARKERS: [&str; 11] = [
+        "codex",
+        "assistant",
+        "user",
+        "exec",
+        "tool",
+        "bash",
+        "shell",
+        "system",
+        "Completed",
+        "tokens used",
+        "--------",
+    ];
+    if EXACT_MARKERS.iter().any(|m| m.starts_with(fragment)) {
+        return true;
+    }
+    const PREFIX_PATTERNS: [&str; 12] = [
+        "hook:",
+        "succeeded in ",
+        "failed in ",
+        "OpenAI Codex v",
+        "workdir:",
+        "model:",
+        "provider:",
+        "approval:",
+        "sandbox:",
+        "reasoning effort:",
+        "reasoning summaries:",
+        "session id:",
+    ];
+    PREFIX_PATTERNS
+        .iter()
+        .any(|p| may_match_prefix_pattern(fragment, p))
 }
 
 fn is_assistant_marker(line: &str) -> bool {
@@ -4502,6 +4759,292 @@ mod tests {
         assert!(!visible.contains("Premium"));
         assert!(!visible.contains("--resume="));
         assert!(!visible.contains("↑"));
+    }
+
+    /// Plain-output filter (#471): non-codex harnesses keep marker-shaped
+    /// prose visible but still hide the copilot stats block.
+    #[test]
+    fn plain_output_keeps_marker_like_prose_and_still_drops_stats_block() {
+        let mut mode = AgentOutputMode::Unknown;
+        let transcript = "Run these:\nbash\nCompleted\nuser\nAll good.\nChanges    +1 -1\nRequests   1 Premium (8s)\n";
+        let visible =
+            human_facing_plain_output(transcript, &mut mode).expect("prose must stay visible");
+        assert!(visible.contains("Run these:"));
+        assert!(visible.contains("bash"));
+        assert!(visible.contains("Completed"));
+        assert!(visible.contains("user"));
+        assert!(visible.contains("All good."));
+        assert!(!visible.contains("+1 -1"));
+        assert!(!visible.contains("Premium"));
+    }
+
+    /// Hold rules for chunk-split fragments (#471): a fragment is held only
+    /// while it could still turn into a marker/stats line once the rest of
+    /// its line arrives.
+    #[test]
+    fn partial_line_hold_rules_cover_markers_stats_and_prose() {
+        // Prefixes of codex markers (exact and starts_with shapes) hold.
+        assert!(partial_line_may_become_marker("cod", true));
+        assert!(partial_line_may_become_marker("codex", true));
+        assert!(partial_line_may_become_marker("user", true));
+        assert!(partial_line_may_become_marker("Comp", true));
+        assert!(partial_line_may_become_marker("succeeded in 0", true));
+        assert!(partial_line_may_become_marker("hook", true));
+        assert!(partial_line_may_become_marker("", true));
+        // Once the fragment can no longer match, it is shown immediately.
+        assert!(!partial_line_may_become_marker("codexy", true));
+        assert!(!partial_line_may_become_marker("user data", true));
+        assert!(!partial_line_may_become_marker("hello from daemon", true));
+        assert!(!partial_line_may_become_marker("successfully parsed", true));
+        // Stats labels hold for every harness until the gutter is ruled out.
+        assert!(partial_line_may_become_marker("Resume", false));
+        assert!(partial_line_may_become_marker("Changes   ", false));
+        assert!(partial_line_may_become_marker("Tokens    ↑ 2", false));
+        assert!(!partial_line_may_become_marker("Resume work", false));
+        assert!(!partial_line_may_become_marker("Tokens are stored", false));
+        // Codex markers do not hold for non-codex harnesses.
+        assert!(!partial_line_may_become_marker("cod", false));
+        assert!(!partial_line_may_become_marker("user", false));
+    }
+
+    /// Regression for #471: copilot's PTY never emits codex-style role
+    /// markers (`codex`/`assistant`), so nothing could ever flip the mode
+    /// machine back to visible. A reply that merely contains a
+    /// marker-shaped line (a bare `bash` list item, a closing `Completed`)
+    /// must not flip the filter to Hidden and eat the rest of the reply.
+    #[test]
+    fn copilot_prose_with_marker_like_lines_stays_visible() {
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "copilot",
+            "Existing",
+            "running",
+        ));
+        client.events.borrow_mut().push(output_event(
+            1,
+            "session-1",
+            "Here is the plan:\r\nbash\r\nrun the tests\r\nCompleted\r\nLet me know if anything fails.\r\n",
+        ));
+        let (mut app, _) = app_with_client(client);
+
+        app.handle_slash_command("/attach session-1");
+
+        let agent_text = app
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, MessageRole::Agent))
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(agent_text.contains("Here is the plan:"));
+        assert!(agent_text.contains("bash"));
+        assert!(agent_text.contains("run the tests"));
+        assert!(agent_text.contains("Completed"));
+        assert!(
+            agent_text.contains("Let me know if anything fails."),
+            "prose after a marker-shaped line must not be eaten: {agent_text}"
+        );
+    }
+
+    /// Regression for #471: PTY output events are raw 8KiB reads, so a
+    /// codex role marker can be split across two chunks. The split marker
+    /// must still be recognized once complete — `cod`/`ex` used to be
+    /// misread as two prose lines, leaving the mode machine stuck Hidden
+    /// after a tool section and eating the rest of the reply.
+    #[test]
+    fn codex_marker_split_across_chunks_is_recognized_once_complete() {
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "codex",
+            "Existing",
+            "running",
+        ));
+        client.events.borrow_mut().extend([
+            output_event(
+                1,
+                "session-1",
+                "codex\r\nFirst answer.\r\nexec\r\n/bin/zsh -lc \"secret tool cmd\"\r\n",
+            ),
+            output_event(2, "session-1", "cod"),
+            output_event(3, "session-1", "ex\r\nSecond answer.\r\n"),
+        ]);
+        let (mut app, _) = app_with_client(client);
+
+        app.handle_slash_command("/attach session-1");
+
+        let agent_text = app
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, MessageRole::Agent))
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(agent_text.contains("First answer."));
+        assert!(
+            agent_text.contains("Second answer."),
+            "split assistant marker must flip the filter back to visible: {agent_text}"
+        );
+        assert!(!agent_text.contains("secret tool cmd"));
+        assert!(
+            !agent_text.contains("cod"),
+            "split marker fragments must not leak into the transcript: {agent_text}"
+        );
+    }
+
+    /// Regression for #471: a prose line split right after a word that
+    /// happens to be a transcript marker (`user …`) must not flip the
+    /// filter to Hidden — only complete lines are classified.
+    #[test]
+    fn prose_split_right_after_user_word_is_not_misread_as_marker() {
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "codex",
+            "Existing",
+            "running",
+        ));
+        client.events.borrow_mut().extend([
+            output_event(1, "session-1", "codex\r\nuser"),
+            output_event(2, "session-1", " data shows steady growth.\r\n"),
+        ]);
+        let (mut app, _) = app_with_client(client);
+
+        app.handle_slash_command("/attach session-1");
+
+        let agent_text = app
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, MessageRole::Agent))
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            agent_text.contains("user data shows steady growth."),
+            "a chunk-split prose line must not be classified as a marker: {agent_text}"
+        );
+    }
+
+    /// Regression for #471: a copilot stats line split across two chunks
+    /// must still be recognized and hidden once complete; classifying the
+    /// halves as two complete lines leaked both fragments as prose.
+    #[test]
+    fn copilot_stats_line_split_across_chunks_is_still_hidden() {
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "copilot",
+            "Existing",
+            "running",
+        ));
+        client.events.borrow_mut().extend([
+            output_event(1, "session-1", "Done.\r\nChanges  "),
+            output_event(2, "session-1", "  +1 -1\r\nRequests   1 Premium (8s)\r\n"),
+        ]);
+        let (mut app, _) = app_with_client(client);
+
+        app.handle_slash_command("/attach session-1");
+
+        let agent_text = app
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, MessageRole::Agent))
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(agent_text.contains("Done."));
+        assert!(
+            !agent_text.contains("+1 -1"),
+            "a chunk-split stats line must still hide once complete: {agent_text}"
+        );
+        assert!(!agent_text.contains("Premium"));
+    }
+
+    /// Regression for #471: a held trailing fragment is finalized by the
+    /// session's exit — EOF ends the line, so it must be classified as a
+    /// complete line and surfaced, mirroring how `stream_json_buffers`
+    /// teardown runs on exit.
+    #[test]
+    fn held_pty_fragment_is_flushed_when_the_session_exits() {
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "copilot",
+            "Existing",
+            "running",
+        ));
+        client
+            .events
+            .borrow_mut()
+            .push(output_event(1, "session-1", "All done.\r\nResume"));
+        let (mut app, _) = app_with_client(client);
+
+        app.handle_slash_command("/attach session-1");
+
+        let agent_text_before_exit = app
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, MessageRole::Agent))
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(agent_text_before_exit.contains("All done."));
+        assert!(
+            !agent_text_before_exit.contains("Resume"),
+            "a fragment that could still become a stats line must be held: {agent_text_before_exit}"
+        );
+
+        app.push_event_message(&EventRecord {
+            seq: 2,
+            id: "event-exit".to_string(),
+            session_id: "session-1".to_string(),
+            kind: "exit".to_string(),
+            payload_json: serde_json::json!({ "status": "completed" }).to_string(),
+            created_at: "2026-05-19T00:00:00Z".to_string(),
+        });
+
+        let agent_text = app
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, MessageRole::Agent))
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            agent_text.contains("Resume"),
+            "exit must flush the held fragment as a complete prose line: {agent_text}"
+        );
+    }
+
+    /// Regression for #471 × #469: a CR-overwrite sequence split across
+    /// two PTY reads must still keep only the final frame. A fragment
+    /// ending in a bare `\r` is held so the overwrite (or a split `\r\n`)
+    /// reassembles before cleaning; showing the head early would glue the
+    /// discarded frame onto the final one.
+    #[test]
+    fn cr_overwrite_split_across_chunks_keeps_only_the_final_frame() {
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "copilot",
+            "Existing",
+            "running",
+        ));
+        client.events.borrow_mut().extend([
+            output_event(1, "session-1", "Downloading 10%\r"),
+            output_event(2, "session-1", "Downloading 100%\r\n"),
+        ]);
+        let (mut app, _) = app_with_client(client);
+
+        app.handle_slash_command("/attach session-1");
+
+        let agent_text = app
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, MessageRole::Agent))
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(agent_text.contains("Downloading 100%"));
+        assert!(
+            !agent_text.contains("10%"),
+            "the overwritten frame must not be glued onto the final one: {agent_text}"
+        );
     }
 
     #[test]
