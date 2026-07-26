@@ -2497,7 +2497,10 @@ fn http_reason_phrase(status: u16) -> &'static str {
         400 => "Bad Request",
         404 => "Not Found",
         409 => "Conflict",
+        413 => "Payload Too Large",
+        422 => "Unprocessable Content",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
         _ => "OK",
     }
 }
@@ -3316,6 +3319,25 @@ mod tests {
         assert_eq!(http_reason_phrase(400), "Bad Request");
     }
 
+    #[test]
+    fn http_reason_phrase_names_memory_detail_failures() {
+        let phrases = [
+            (413, http_reason_phrase(413)),
+            (422, http_reason_phrase(422)),
+            (503, http_reason_phrase(503)),
+        ];
+
+        assert_eq!(
+            phrases,
+            [
+                (413, "Payload Too Large"),
+                (422, "Unprocessable Content"),
+                (503, "Service Unavailable"),
+            ]
+        );
+        assert!(phrases.iter().all(|(_, phrase)| *phrase != "OK"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn handle_http_stream_processes_health_request() {
@@ -3899,7 +3921,7 @@ mod tests {
 
     #[test]
     fn daemon_startup_status_socket_uses_named_pipe_for_windows_platform() {
-        let home = Path::new("C:/Users/Sonic/.coven");
+        let home = Path::new("C:/CovenTest/.coven");
         let socket = daemon_startup_status_socket_for_platform(home, DaemonIpcPlatform::Windows);
 
         assert!(socket.starts_with("coven-daemon-"), "socket={socket}");

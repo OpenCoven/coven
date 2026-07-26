@@ -1,15 +1,29 @@
+use std::collections::HashSet;
+use std::error::Error;
+use std::ffi::OsString;
+use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::Path;
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
+use cap_std::ambient_authority;
+#[cfg(windows)]
+use cap_std::fs::MetadataExt;
+#[cfg(unix)]
+use cap_std::fs::OpenOptionsExt;
+use cap_std::fs::{Dir, File, OpenOptions};
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
 const FAMILIARS_CONFIG_FILE: &str = "familiars.toml";
 const SKILLS_DIR: &str = "skills";
 const MEMORY_DIR: &str = "memory";
 const RESEARCH_TSV: &str = "research/results.tsv";
+pub(crate) const MEMORY_CONTENT_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FamiliarDto {
@@ -334,10 +348,10 @@ struct MemoryRecord {
     id: String,
     familiar_id: String,
     title: String,
+    file_name: String,
     relative_path: String,
     updated_at: String,
     updated_at_iso: String,
-    body: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -423,119 +437,374 @@ fn memory_id(relative_path: &str) -> String {
     uuid::Uuid::new_v5(&MEMORY_ID_NAMESPACE, relative_path.as_bytes()).to_string()
 }
 
-fn scan_memory_records(coven_home: &Path) -> Result<Vec<MemoryRecord>> {
-    let root = coven_home.join(MEMORY_DIR);
-    let root_metadata = match fs::symlink_metadata(&root) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(err).context("failed to inspect memory root"),
-    };
-    if root_metadata.file_type().is_symlink() {
-        anyhow::bail!("refusing to read a symlinked memory root");
-    }
-    if !root_metadata.is_dir() {
-        anyhow::bail!("memory root is not a directory");
-    }
-    let familiar_dirs = match fs::read_dir(&root) {
-        Ok(it) => it,
-        Err(err) => return Err(err).context("failed to read memory root"),
-    };
-    let canonical_home = coven_home
-        .canonicalize()
-        .context("failed to resolve Coven home")?;
-    let canonical_root = root
-        .canonicalize()
-        .context("failed to resolve memory root")?;
-    if !canonical_root.starts_with(&canonical_home) {
-        anyhow::bail!("refusing to read a memory root outside Coven home");
-    }
-    let mut out = Vec::new();
-    for familiar_entry in familiar_dirs {
-        let familiar_entry = familiar_entry?;
-        if !familiar_entry.file_type()?.is_dir() {
-            continue;
-        }
-        let familiar_id = familiar_entry.file_name().to_string_lossy().into_owned();
-        let familiar_dir = familiar_entry.path();
-        let file_iter = fs::read_dir(&familiar_dir)
-            .with_context(|| format!("failed to read familiar memory directory {familiar_id}"))?;
-        for file_entry in file_iter {
-            let file_entry = file_entry?;
-            if !file_entry.file_type()?.is_file() {
-                continue;
+#[derive(Debug)]
+pub(crate) enum MemoryContentError {
+    TooLarge { max_bytes: u64 },
+    InvalidUtf8,
+    MissingOrUnsafe,
+    Unavailable(io::Error),
+}
+
+impl fmt::Display for MemoryContentError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooLarge { max_bytes } => {
+                write!(formatter, "memory content exceeds {max_bytes}-byte limit")
             }
-            let file_path = file_entry.path();
-            if file_path.extension().and_then(|e| e.to_str()) != Some("md") {
-                continue;
-            }
-            let stem = file_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("untitled")
-                .to_string();
-            let file_name = file_path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("untitled.md")
-                .to_string();
-            let relative_path = format!("{familiar_id}/{file_name}");
-            let canonical_file = file_path
-                .canonicalize()
-                .with_context(|| format!("failed to resolve memory entry {relative_path}"))?;
-            if !canonical_file.starts_with(&canonical_root) {
-                continue;
-            }
-            let metadata = file_entry.metadata()?;
-            let modified = metadata.modified().ok();
-            let updated_at = modified
-                .map(relative_time)
-                .unwrap_or_else(|| "—".to_string());
-            let modified_utc: chrono::DateTime<chrono::Utc> =
-                modified.unwrap_or(SystemTime::UNIX_EPOCH).into();
-            let updated_at_iso = modified_utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-            let body = fs::read_to_string(&canonical_file)
-                .with_context(|| format!("failed to read memory entry {relative_path}"))?;
-            out.push(MemoryRecord {
-                id: memory_id(&relative_path),
-                familiar_id: familiar_id.clone(),
-                title: stem,
-                relative_path,
-                updated_at,
-                updated_at_iso,
-                body,
-            });
+            Self::InvalidUtf8 => formatter.write_str("memory content is not valid UTF-8"),
+            Self::MissingOrUnsafe => formatter.write_str("memory content is missing or unsafe"),
+            Self::Unavailable(_) => formatter.write_str("memory content is unavailable"),
         }
     }
-    out.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
-    Ok(out)
+}
+
+impl Error for MemoryContentError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Unavailable(error) => Some(error),
+            Self::TooLarge { .. } | Self::InvalidUtf8 | Self::MissingOrUnsafe => None,
+        }
+    }
+}
+
+struct MemoryRoot {
+    dir: Dir,
+}
+
+impl MemoryRoot {
+    fn open(coven_home: &Path) -> Result<Option<Self>> {
+        let coven_dir = Dir::open_ambient_dir(coven_home, ambient_authority())
+            .context("failed to open Coven home")?;
+        let dir = match coven_dir.open_dir_nofollow(MEMORY_DIR) {
+            Ok(dir) => dir,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .context("refusing to open memory root through a symlink or non-directory");
+            }
+        };
+        let metadata = dir
+            .dir_metadata()
+            .context("failed to inspect opened memory root")?;
+        if !metadata.is_dir() || metadata_is_windows_reparse_point(&metadata) {
+            anyhow::bail!("refusing to open memory root through a reparse point or non-directory");
+        }
+        Ok(Some(Self { dir }))
+    }
+
+    fn open_familiar_dir(&self, familiar_id: &str) -> Result<Option<Dir>> {
+        let metadata = match self.dir.symlink_metadata(familiar_id) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).context("failed to inspect a familiar memory directory");
+            }
+        };
+        if !metadata.is_dir() || metadata_is_windows_reparse_point(&metadata) {
+            return Ok(None);
+        }
+
+        let dir = match self.dir.open_dir_nofollow(familiar_id) {
+            Ok(dir) => dir,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(open_error) => {
+                let current_metadata = match self.dir.symlink_metadata(familiar_id) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                    Err(error) => {
+                        return Err(error).context(
+                            "failed to classify a familiar memory directory after an open failure",
+                        );
+                    }
+                };
+                if !current_metadata.is_dir()
+                    || metadata_is_windows_reparse_point(&current_metadata)
+                {
+                    return Ok(None);
+                }
+                return Err(open_error).context("failed to open a familiar memory directory");
+            }
+        };
+
+        let metadata = match dir.dir_metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).context("failed to inspect an opened familiar memory directory");
+            }
+        };
+        if !metadata.is_dir() || metadata_is_windows_reparse_point(&metadata) {
+            return Ok(None);
+        }
+        Ok(Some(dir))
+    }
+
+    fn enumerate_metadata(&self) -> Result<Vec<MemoryRecord>> {
+        let familiar_entries = self
+            .dir
+            .entries()
+            .context("failed to enumerate memory root")?;
+        let mut records = Vec::new();
+        let mut seen_ids = HashSet::new();
+
+        for familiar_entry in familiar_entries {
+            let familiar_entry = match familiar_entry {
+                Ok(entry) => entry,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).context("failed to enumerate a memory-root entry");
+                }
+            };
+            let Some(familiar_id) = utf8_memory_name(familiar_entry.file_name()) else {
+                continue;
+            };
+            let familiar_type = match familiar_entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).context("failed to inspect a memory-root entry");
+                }
+            };
+            if !familiar_type.is_dir() {
+                continue;
+            }
+            let Some(familiar_dir) = self.open_familiar_dir(&familiar_id)? else {
+                continue;
+            };
+            let file_entries = match familiar_dir.entries() {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).context("failed to enumerate a familiar memory directory");
+                }
+            };
+
+            for file_entry in file_entries {
+                let file_entry = match file_entry {
+                    Ok(entry) => entry,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        return Err(error).context("failed to enumerate a memory-file entry");
+                    }
+                };
+                let Some(file_name) = utf8_memory_name(file_entry.file_name()) else {
+                    continue;
+                };
+                let file_path = Path::new(&file_name);
+                if file_path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    != Some("md")
+                {
+                    continue;
+                }
+                let is_regular_file = match file_entry.file_type() {
+                    Ok(file_type) => file_type.is_file(),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        return Err(error).context("failed to inspect a memory-file entry type");
+                    }
+                };
+                if !is_regular_file {
+                    continue;
+                }
+                let Some(title) = file_path.file_stem().and_then(|stem| stem.to_str()) else {
+                    continue;
+                };
+                let metadata = match familiar_dir.symlink_metadata(&file_name) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        return Err(error).context("failed to inspect memory-file metadata");
+                    }
+                };
+                if !metadata.is_file() || metadata_is_windows_reparse_point(&metadata) {
+                    continue;
+                }
+                let relative_path = format!("{familiar_id}/{file_name}");
+                let id = reserve_memory_id(&mut seen_ids, memory_id(&relative_path))?;
+                let modified = metadata.modified().ok().map(|modified| modified.into_std());
+                let updated_at = modified
+                    .map(relative_time)
+                    .unwrap_or_else(|| "—".to_string());
+                let modified_utc: chrono::DateTime<chrono::Utc> =
+                    modified.unwrap_or(SystemTime::UNIX_EPOCH).into();
+                let updated_at_iso =
+                    modified_utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                records.push(MemoryRecord {
+                    id,
+                    familiar_id: familiar_id.clone(),
+                    title: title.to_string(),
+                    file_name,
+                    relative_path,
+                    updated_at,
+                    updated_at_iso,
+                });
+            }
+        }
+
+        records.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        Ok(records)
+    }
+
+    fn open_record(&self, record: &MemoryRecord) -> std::result::Result<File, MemoryContentError> {
+        let familiar_dir = self
+            .dir
+            .open_dir_nofollow(&record.familiar_id)
+            .map_err(classify_path_open_error)?;
+        let familiar_metadata = familiar_dir
+            .dir_metadata()
+            .map_err(classify_opened_handle_error)?;
+        if !familiar_metadata.is_dir() || metadata_is_windows_reparse_point(&familiar_metadata) {
+            return Err(MemoryContentError::MissingOrUnsafe);
+        }
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .follow(FollowSymlinks::No)
+            .maybe_dir(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NONBLOCK);
+        let file = familiar_dir
+            .open_with(&record.file_name, &options)
+            .map_err(classify_path_open_error)?;
+        let metadata = file.metadata().map_err(classify_opened_handle_error)?;
+        if !metadata.is_file() || metadata_is_windows_reparse_point(&metadata) {
+            return Err(MemoryContentError::MissingOrUnsafe);
+        }
+        Ok(file)
+    }
+}
+
+#[cfg(windows)]
+fn windows_attributes_are_reparse_point(attributes: u32) -> bool {
+    attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(windows)]
+fn metadata_is_windows_reparse_point(metadata: &cap_std::fs::Metadata) -> bool {
+    windows_attributes_are_reparse_point(metadata.file_attributes())
+}
+
+#[cfg(not(windows))]
+fn metadata_is_windows_reparse_point(_metadata: &cap_std::fs::Metadata) -> bool {
+    false
+}
+
+fn utf8_memory_name(name: OsString) -> Option<String> {
+    name.into_string().ok()
+}
+
+fn reserve_memory_id(seen_ids: &mut HashSet<String>, id: String) -> Result<String> {
+    if !seen_ids.insert(id.clone()) {
+        anyhow::bail!("duplicate memory id generated");
+    }
+    Ok(id)
+}
+
+fn read_memory_content(file: &mut File) -> std::result::Result<String, MemoryContentError> {
+    let metadata = file.metadata().map_err(MemoryContentError::Unavailable)?;
+    if metadata.len() > MEMORY_CONTENT_MAX_BYTES {
+        return Err(MemoryContentError::TooLarge {
+            max_bytes: MEMORY_CONTENT_MAX_BYTES,
+        });
+    }
+
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MEMORY_CONTENT_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(MemoryContentError::Unavailable)?;
+    if bytes.len() as u64 > MEMORY_CONTENT_MAX_BYTES {
+        return Err(MemoryContentError::TooLarge {
+            max_bytes: MEMORY_CONTENT_MAX_BYTES,
+        });
+    }
+    String::from_utf8(bytes).map_err(|_| MemoryContentError::InvalidUtf8)
+}
+
+fn classify_path_open_error(error: io::Error) -> MemoryContentError {
+    let missing_or_unsafe = matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory | io::ErrorKind::InvalidData
+    ) || open_record_error_is_platform_symlink_loop(&error);
+
+    if missing_or_unsafe {
+        MemoryContentError::MissingOrUnsafe
+    } else {
+        MemoryContentError::Unavailable(error)
+    }
+}
+
+fn classify_opened_handle_error(error: io::Error) -> MemoryContentError {
+    MemoryContentError::Unavailable(error)
+}
+
+#[cfg(unix)]
+fn open_record_error_is_platform_symlink_loop(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ELOOP)
+}
+
+#[cfg(windows)]
+fn open_record_error_is_platform_symlink_loop(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_STOPPED_ON_SYMLINK as i32)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_record_error_is_platform_symlink_loop(_error: &io::Error) -> bool {
+    false
+}
+
+fn read_record_content(
+    root: &MemoryRoot,
+    record: &MemoryRecord,
+) -> std::result::Result<String, MemoryContentError> {
+    let mut file = root.open_record(record)?;
+    read_memory_content(&mut file)
 }
 
 pub fn scan_memory(coven_home: &Path) -> Result<Vec<MemoryFileDto>> {
-    Ok(scan_memory_records(coven_home)?
-        .into_iter()
-        .map(|record| MemoryFileDto {
+    let Some(root) = MemoryRoot::open(coven_home)? else {
+        return Ok(Vec::new());
+    };
+    let records = root.enumerate_metadata()?;
+    let mut entries = Vec::with_capacity(records.len());
+    for record in records {
+        let excerpt = match read_record_content(&root, &record) {
+            Ok(body) => first_paragraph(&body, 200),
+            Err(_) => String::new(),
+        };
+        entries.push(MemoryFileDto {
             id: record.id,
             familiar_id: record.familiar_id,
             title: record.title,
             path: record.relative_path,
             updated_at: record.updated_at,
             updated_at_iso: record.updated_at_iso,
-            excerpt: first_paragraph(&record.body, 200),
+            excerpt,
             privacy_classification: None,
             reveal_required: None,
             verification_state: "unknown".to_string(),
-        })
-        .collect())
+        });
+    }
+    Ok(entries)
 }
 
 pub fn read_memory_detail(coven_home: &Path, id: &str) -> Result<Option<MemoryDetailDto>> {
     if uuid::Uuid::parse_str(id).is_err() {
         return Ok(None);
     }
-    let record = scan_memory_records(coven_home)?
+    let Some(root) = MemoryRoot::open(coven_home)? else {
+        return Ok(None);
+    };
+    let record = root
+        .enumerate_metadata()?
         .into_iter()
         .find(|record| record.id == id);
-    Ok(record.map(|record| MemoryDetailDto {
+    let Some(record) = record else {
+        return Ok(None);
+    };
+    let content = read_record_content(&root, &record)?;
+    Ok(Some(MemoryDetailDto {
         id: record.id,
         familiar_id: record.familiar_id,
         title: record.title,
@@ -544,7 +813,7 @@ pub fn read_memory_detail(coven_home: &Path, id: &str) -> Result<Option<MemoryDe
             kind: "coven-origin".to_string(),
             label: "Coven origin".to_string(),
         },
-        content: record.body,
+        content,
         content_format: "markdown".to_string(),
         privacy: MemoryPrivacyDto {
             classification: None,
@@ -564,9 +833,10 @@ pub fn read_memory_detail(coven_home: &Path, id: &str) -> Result<Option<MemoryDe
 }
 
 pub fn memory_overview(coven_home: &Path) -> Result<MemoryOverviewDto> {
-    use std::collections::HashSet;
-
-    let records = scan_memory_records(coven_home)?;
+    let records = match MemoryRoot::open(coven_home)? {
+        Some(root) => root.enumerate_metadata()?,
+        None => Vec::new(),
+    };
     let familiars = records
         .iter()
         .map(|record| record.familiar_id.as_str())
@@ -1151,6 +1421,550 @@ description = "..."
     }
 
     #[test]
+    fn memory_id_matches_pinned_vector_across_roots() -> Result<()> {
+        let first = tempfile::tempdir()?;
+        let second = tempfile::tempdir()?;
+        for root in [first.path(), second.path()] {
+            let sage = root.join(MEMORY_DIR).join("sage");
+            fs::create_dir_all(&sage)?;
+            fs::write(sage.join("notes.md"), "Durable fact.")?;
+        }
+
+        assert_eq!(
+            memory_id("sage/notes.md"),
+            "98ef2809-6bc3-5309-add6-0f39d676b52f"
+        );
+        assert_eq!(
+            scan_memory(first.path())?.remove(0).id,
+            scan_memory(second.path())?.remove(0).id
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn memory_overview_does_not_read_invalid_utf8_bodies() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let sage = temp.path().join(MEMORY_DIR).join("sage");
+        fs::create_dir_all(&sage)?;
+        fs::write(sage.join("valid.md"), "Durable fact.")?;
+        fs::write(sage.join("corrupt.md"), [0xff, 0xfe])?;
+
+        let overview = memory_overview(temp.path())?;
+
+        assert_eq!(overview.totals.entries, 2);
+        assert_eq!(overview.totals.unknown, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn memory_detail_reads_only_the_selected_entry() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let sage = temp.path().join(MEMORY_DIR).join("sage");
+        fs::create_dir_all(&sage)?;
+        fs::write(sage.join("valid.md"), "Durable fact.")?;
+        fs::write(sage.join("corrupt.md"), [0xff, 0xfe])?;
+
+        let detail = read_memory_detail(temp.path(), &memory_id("sage/valid.md"))?
+            .expect("valid memory detail");
+
+        assert_eq!(detail.content, "Durable fact.");
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_memory_detail_does_not_read_a_corrupt_neighbor() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let sage = temp.path().join(MEMORY_DIR).join("sage");
+        fs::create_dir_all(&sage)?;
+        fs::write(sage.join("corrupt.md"), [0xff, 0xfe])?;
+
+        let detail = read_memory_detail(temp.path(), "00000000-0000-0000-0000-000000000000")?;
+
+        assert!(detail.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn open_record_error_classification_separates_missing_or_unsafe_from_unavailable() {
+        for kind in [
+            io::ErrorKind::NotFound,
+            io::ErrorKind::NotADirectory,
+            io::ErrorKind::InvalidData,
+        ] {
+            assert!(
+                matches!(
+                    classify_path_open_error(io::Error::new(kind, "test error")),
+                    MemoryContentError::MissingOrUnsafe
+                ),
+                "{kind:?} must be treated as missing or unsafe"
+            );
+        }
+
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::Other] {
+            match classify_path_open_error(io::Error::new(kind, "test error")) {
+                MemoryContentError::Unavailable(error) => assert_eq!(error.kind(), kind),
+                error => panic!("{kind:?} must remain unavailable, got {error:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn post_open_error_classification_keeps_not_found_and_invalid_data_unavailable() {
+        for kind in [io::ErrorKind::NotFound, io::ErrorKind::InvalidData] {
+            match classify_opened_handle_error(io::Error::new(kind, "post-open test error")) {
+                MemoryContentError::Unavailable(error) => assert_eq!(error.kind(), kind),
+                error => panic!("{kind:?} after open must remain unavailable, got {error:?}"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_record_error_classification_distinguishes_eloop_from_eio() {
+        assert!(matches!(
+            classify_path_open_error(io::Error::from_raw_os_error(libc::ELOOP)),
+            MemoryContentError::MissingOrUnsafe
+        ));
+
+        match classify_path_open_error(io::Error::from_raw_os_error(libc::EIO)) {
+            MemoryContentError::Unavailable(error) => {
+                assert_eq!(error.raw_os_error(), Some(libc::EIO));
+            }
+            error => panic!("EIO must remain unavailable, got {error:?}"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn open_record_error_classification_treats_stopped_on_symlink_as_missing_or_unsafe() {
+        use windows_sys::Win32::Foundation::ERROR_STOPPED_ON_SYMLINK;
+
+        assert!(matches!(
+            classify_path_open_error(io::Error::from_raw_os_error(
+                ERROR_STOPPED_ON_SYMLINK as i32
+            )),
+            MemoryContentError::MissingOrUnsafe
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn memory_scan_propagates_permission_denied_familiar_directory() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct PermissionRestore {
+            path: std::path::PathBuf,
+            permissions: Option<fs::Permissions>,
+        }
+
+        impl PermissionRestore {
+            fn restore(mut self) -> io::Result<()> {
+                let permissions = self.permissions.as_ref().expect("permissions").clone();
+                fs::set_permissions(&self.path, permissions)?;
+                self.permissions = None;
+                Ok(())
+            }
+        }
+
+        impl Drop for PermissionRestore {
+            fn drop(&mut self) {
+                if let Some(permissions) = self.permissions.take() {
+                    let _ = fs::set_permissions(&self.path, permissions);
+                }
+            }
+        }
+
+        let temp = tempfile::tempdir()?;
+        let sage = temp.path().join(MEMORY_DIR).join("sage");
+        fs::create_dir_all(&sage)?;
+        fs::write(sage.join("notes.md"), "private")?;
+        let restore = PermissionRestore {
+            path: sage.clone(),
+            permissions: Some(fs::metadata(&sage)?.permissions()),
+        };
+        fs::set_permissions(&sage, fs::Permissions::from_mode(0o000))?;
+
+        let result = scan_memory(temp.path());
+        restore.restore()?;
+        let error = result.expect_err("permission denial must fail the scan");
+
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == io::ErrorKind::PermissionDenied)
+        }));
+        assert!(!format!("{error:#}").contains(temp.path().to_string_lossy().as_ref()));
+        Ok(())
+    }
+
+    #[test]
+    fn memory_list_keeps_a_corrupt_entry_without_losing_valid_neighbors() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let sage = temp.path().join(MEMORY_DIR).join("sage");
+        fs::create_dir_all(&sage)?;
+        fs::write(sage.join("valid.md"), "Durable fact.")?;
+        fs::write(sage.join("corrupt.md"), [0xff, 0xfe])?;
+
+        let entries = scan_memory(temp.path())?;
+
+        assert_eq!(entries.len(), 2);
+        let valid = entries
+            .iter()
+            .find(|entry| entry.path == "sage/valid.md")
+            .expect("valid row");
+        let corrupt = entries
+            .iter()
+            .find(|entry| entry.path == "sage/corrupt.md")
+            .expect("corrupt row");
+        assert_eq!(valid.excerpt, "Durable fact.");
+        assert_eq!(corrupt.excerpt, "");
+        Ok(())
+    }
+
+    #[test]
+    fn memory_list_keeps_an_oversize_entry_without_losing_valid_neighbors() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let sage = temp.path().join(MEMORY_DIR).join("sage");
+        fs::create_dir_all(&sage)?;
+        fs::write(sage.join("valid.md"), "Durable fact.")?;
+        fs::write(
+            sage.join("large.md"),
+            vec![b'x'; MEMORY_CONTENT_MAX_BYTES as usize + 1],
+        )?;
+
+        let entries = scan_memory(temp.path())?;
+
+        assert_eq!(entries.len(), 2);
+        let valid = entries
+            .iter()
+            .find(|entry| entry.path == "sage/valid.md")
+            .expect("valid row");
+        let large = entries
+            .iter()
+            .find(|entry| entry.path == "sage/large.md")
+            .expect("oversize row");
+        assert_eq!(valid.excerpt, "Durable fact.");
+        assert_eq!(large.excerpt, "");
+        Ok(())
+    }
+
+    #[test]
+    fn memory_detail_rejects_entries_over_four_mibibytes() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let sage = temp.path().join(MEMORY_DIR).join("sage");
+        fs::create_dir_all(&sage)?;
+        fs::write(
+            sage.join("large.md"),
+            vec![b'x'; MEMORY_CONTENT_MAX_BYTES as usize + 1],
+        )?;
+
+        let error = read_memory_detail(temp.path(), &memory_id("sage/large.md"))
+            .expect_err("oversize detail must fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("memory content exceeds 4194304-byte limit"),
+            "unexpected error: {error:#}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validated_memory_handle_is_the_handle_that_gets_read() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let sage = temp.path().join(MEMORY_DIR).join("sage");
+        fs::create_dir_all(&sage)?;
+        let path = sage.join("notes.md");
+        fs::write(&path, "validated bytes")?;
+
+        let root = MemoryRoot::open(temp.path())?.expect("memory root");
+        let record = root.enumerate_metadata()?.remove(0);
+        let mut handle = root.open_record(&record)?;
+
+        fs::rename(&path, sage.join("original.md"))?;
+        fs::write(&path, "replacement bytes")?;
+
+        assert_eq!(read_memory_content(&mut handle)?, "validated bytes");
+        Ok(())
+    }
+
+    #[test]
+    fn open_record_rejects_a_non_regular_replacement() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let sage = temp.path().join(MEMORY_DIR).join("sage");
+        fs::create_dir_all(&sage)?;
+        let path = sage.join("notes.md");
+        fs::write(&path, "validated bytes")?;
+
+        let root = MemoryRoot::open(temp.path())?.expect("memory root");
+        let record = root.enumerate_metadata()?.remove(0);
+
+        fs::remove_file(&path)?;
+        fs::create_dir(&path)?;
+
+        assert!(matches!(
+            read_record_content(&root, &record),
+            Err(MemoryContentError::MissingOrUnsafe)
+        ));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_record_content_rejects_a_fifo_replacement_without_blocking() -> Result<()> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::mpsc::RecvTimeoutError;
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir()?;
+        let sage = temp.path().join(MEMORY_DIR).join("sage");
+        fs::create_dir_all(&sage)?;
+        let path = sage.join("notes.md");
+        fs::write(&path, "validated bytes")?;
+
+        let root = MemoryRoot::open(temp.path())?.expect("memory root");
+        let record = root.enumerate_metadata()?.remove(0);
+
+        fs::remove_file(&path)?;
+        let c_path = CString::new(path.as_os_str().as_bytes())?;
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = sender.send(read_record_content(&root, &record));
+        });
+
+        let result = match receiver.recv_timeout(Duration::from_millis(500)) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => {
+                let writer = fs::OpenOptions::new().write(true).open(&path)?;
+                drop(writer);
+                let late_result = receiver
+                    .recv_timeout(Duration::from_secs(2))
+                    .map_err(|error| anyhow::anyhow!("FIFO worker did not finish: {error}"))?;
+                worker
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("FIFO worker panicked"))?;
+                panic!("memory FIFO open blocked before validation; late result: {late_result:?}");
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                worker
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("FIFO worker panicked"))?;
+                panic!("FIFO worker disconnected without a result");
+            }
+        };
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("FIFO worker panicked"))?;
+
+        assert!(matches!(result, Err(MemoryContentError::MissingOrUnsafe)));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_record_rejects_an_external_symlink_replacement_after_enumeration() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        let sage = temp.path().join(MEMORY_DIR).join("sage");
+        fs::create_dir_all(&sage)?;
+        let path = sage.join("notes.md");
+        fs::write(&path, "validated bytes")?;
+        let outside_file = outside.path().join("outside.md");
+        fs::write(&outside_file, "outside private bytes")?;
+
+        let root = MemoryRoot::open(temp.path())?.expect("memory root");
+        let record = root.enumerate_metadata()?.remove(0);
+
+        fs::remove_file(&path)?;
+        symlink(&outside_file, &path)?;
+
+        assert!(matches!(
+            read_record_content(&root, &record),
+            Err(MemoryContentError::MissingOrUnsafe)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_memory_ids_fail_closed() {
+        let mut seen = std::collections::HashSet::new();
+        assert!(reserve_memory_id(&mut seen, "duplicate".to_string()).is_ok());
+        let error = reserve_memory_id(&mut seen, "duplicate".to_string())
+            .expect_err("duplicate ids must fail closed");
+        assert!(error.to_string().contains("duplicate memory id"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn distinct_non_utf8_familiar_names_are_rejected_without_aliasing() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let names = [
+            OsString::from_vec(vec![b'f', 0x80]),
+            OsString::from_vec(vec![b'f', 0x81]),
+        ];
+
+        assert!(names
+            .into_iter()
+            .all(|name| utf8_memory_name(name).is_none()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn distinct_non_utf8_file_names_are_rejected_without_aliasing() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let names = [
+            OsString::from_vec(vec![b'n', 0x80, b'.', b'm', b'd']),
+            OsString::from_vec(vec![b'n', 0x81, b'.', b'm', b'd']),
+        ];
+
+        assert!(names
+            .into_iter()
+            .all(|name| utf8_memory_name(name).is_none()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn distinct_ill_formed_utf16_familiar_names_are_rejected_without_aliasing() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let names = [
+            OsString::from_wide(&[b'f' as u16, 0xd800]),
+            OsString::from_wide(&[b'f' as u16, 0xd801]),
+        ];
+
+        assert!(names
+            .into_iter()
+            .all(|name| utf8_memory_name(name).is_none()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn distinct_ill_formed_utf16_file_names_are_rejected_without_aliasing() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let names = [
+            OsString::from_wide(&[b'n' as u16, 0xd800, b'.' as u16, b'm' as u16, b'd' as u16]),
+            OsString::from_wide(&[b'n' as u16, 0xd801, b'.' as u16, b'm' as u16, b'd' as u16]),
+        ];
+
+        assert!(names
+            .into_iter()
+            .all(|name| utf8_memory_name(name).is_none()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reparse_attribute_gate_rejects_every_reparse_point() {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        };
+
+        assert!(!windows_attributes_are_reparse_point(0));
+        assert!(windows_attributes_are_reparse_point(
+            FILE_ATTRIBUTE_REPARSE_POINT
+        ));
+        assert!(windows_attributes_are_reparse_point(
+            FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scan_memory_skips_distinct_non_utf8_familiar_names_without_aliasing() -> Result<()> {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join(MEMORY_DIR);
+        fs::create_dir_all(&root)?;
+        for name in [
+            OsString::from_vec(vec![b'f', 0x80]),
+            OsString::from_vec(vec![b'f', 0x81]),
+        ] {
+            let familiar = root.join(name);
+            fs::create_dir_all(&familiar)?;
+            fs::write(familiar.join("notes.md"), "private")?;
+        }
+
+        assert!(scan_memory(temp.path())?.is_empty());
+        assert_eq!(memory_overview(temp.path())?.totals.entries, 0);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scan_memory_skips_distinct_non_utf8_file_names_without_aliasing() -> Result<()> {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempfile::tempdir()?;
+        let sage = temp.path().join(MEMORY_DIR).join("sage");
+        fs::create_dir_all(&sage)?;
+        for name in [
+            OsString::from_vec(vec![b'n', 0x80, b'.', b'm', b'd']),
+            OsString::from_vec(vec![b'n', 0x81, b'.', b'm', b'd']),
+        ] {
+            fs::write(sage.join(name), "private")?;
+        }
+
+        assert!(scan_memory(temp.path())?.is_empty());
+        assert_eq!(memory_overview(temp.path())?.totals.entries, 0);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scan_memory_skips_distinct_ill_formed_utf16_familiar_names_without_aliasing() -> Result<()> {
+        use std::os::windows::ffi::OsStringExt;
+
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join(MEMORY_DIR);
+        fs::create_dir_all(&root)?;
+        for name in [
+            OsString::from_wide(&[b'f' as u16, 0xd800]),
+            OsString::from_wide(&[b'f' as u16, 0xd801]),
+        ] {
+            let familiar = root.join(name);
+            fs::create_dir_all(&familiar)?;
+            fs::write(familiar.join("notes.md"), "private")?;
+        }
+
+        assert!(scan_memory(temp.path())?.is_empty());
+        assert_eq!(memory_overview(temp.path())?.totals.entries, 0);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scan_memory_skips_distinct_ill_formed_utf16_file_names_without_aliasing() -> Result<()> {
+        use std::os::windows::ffi::OsStringExt;
+
+        let temp = tempfile::tempdir()?;
+        let sage = temp.path().join(MEMORY_DIR).join("sage");
+        fs::create_dir_all(&sage)?;
+        for name in [
+            OsString::from_wide(&[b'n' as u16, 0xd800, b'.' as u16, b'm' as u16, b'd' as u16]),
+            OsString::from_wide(&[b'n' as u16, 0xd801, b'.' as u16, b'm' as u16, b'd' as u16]),
+        ] {
+            fs::write(sage.join(name), "private")?;
+        }
+
+        assert!(scan_memory(temp.path())?.is_empty());
+        assert_eq!(memory_overview(temp.path())?.totals.entries, 0);
+        Ok(())
+    }
+
+    #[test]
     fn scan_memory_exposes_machine_readable_unknown_metadata() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let sage = temp.path().join(MEMORY_DIR).join("sage");
@@ -1180,6 +1994,7 @@ description = "..."
         symlink(&outside, sage.join("leak.md"))?;
 
         assert!(scan_memory(temp.path())?.is_empty());
+        assert_eq!(memory_overview(temp.path())?.totals.entries, 0);
         Ok(())
     }
 

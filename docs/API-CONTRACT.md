@@ -45,7 +45,7 @@ The Coven daemon socket API is a public compatibility boundary for comux and ext
   "daemon": {
     "pid": 12345,
     "startedAt": "2026-05-09T06:43:00Z",
-    "socket": "/Users/alice/.coven/coven.sock"
+    "socket": "/var/lib/coven/coven.sock"
   },
   "hub": {
     "role": "hub",
@@ -235,6 +235,18 @@ compatibility; it is never absolute. The opaque UUID `id` is stable while the
 relative file identity is stable. Browser-facing adapters should omit `path`
 from their DTOs.
 
+Memory enumeration is metadata-only. It accepts UTF-8 familiar directory names
+and UTF-8 `.md` file names whose directory entries are regular files. Confirmed
+non-UTF-8 names, symlinks, Windows reparse points, non-files/non-directories,
+and entries that disappear during enumeration are excluded. Unexpected
+iterator, directory-open, or entry-metadata errors fail the request instead of
+returning a partial or empty success. If two accepted entries ever produce the
+same opaque id, the request fails closed instead of returning an ambiguous id.
+The list then reads each accepted file through a no-follow,
+directory-relative handle to build its excerpt. If that body is unavailable,
+invalid UTF-8, or larger than 4 MiB, the metadata-valid row remains in the list
+with an empty `excerpt`; other valid rows are still returned.
+
 ```json
 [
   {
@@ -252,7 +264,10 @@ from their DTOs.
 ]
 ```
 
-The overview does not translate unavailable metadata into zero or healthy:
+The overview uses the same metadata-only enumeration and does not read any file
+bodies. A structurally valid entry is therefore counted even when its body is
+invalid UTF-8 or too large for list/detail reads. The overview does not
+translate unavailable metadata into zero or healthy:
 
 ```json
 {
@@ -282,8 +297,10 @@ The overview does not translate unavailable metadata into zero or healthy:
 }
 ```
 
-Detail accepts only a UUID returned by the list. It resolves the entry under
-the daemon-owned memory root and returns content without a path:
+Detail accepts only a UUID returned by the list. It enumerates metadata, opens
+only the matching entry through a no-follow directory-relative handle,
+validates that exact handle as a regular file, and reads from that same handle.
+It returns content without a path:
 
 ```json
 {
@@ -314,11 +331,17 @@ the daemon-owned memory root and returns content without a path:
 }
 ```
 
-Malformed ids return `400 invalid_request`; well-formed ids that do not resolve
-return `404 memory_not_found`. Symlinked markdown files are excluded. Until the
-promotion privacy contract provides a classification, clients must treat
-`classification: null` and `reveal_required: null` as requiring explicit
-reveal.
+Detail content must be UTF-8 and no larger than 4 MiB (4,194,304 bytes).
+Malformed ids return `400 invalid_request`; well-formed ids that do not resolve,
+or entries that disappear or become an unsafe target before the validated
+open, return `404 memory_not_found`. Permission failures, unexpected open
+failures, and metadata/read failures on an already-opened handle return
+`503 memory_content_unavailable`. Its error details contain only `memoryId`;
+filesystem errors and paths are never exposed. Oversize content returns
+`413 memory_content_too_large` with `details.maxBytes`; invalid UTF-8 returns
+`422 memory_content_invalid`. Until the promotion privacy contract provides a
+classification, clients must treat `classification: null` and
+`reveal_required: null` as requiring explicit reveal.
 
 ## Control action shape (`v1`)
 
@@ -814,7 +837,7 @@ Request:
     "host": "compute-primary.internal",
     "user": "coven",
     "port": 22,
-    "identityFile": "/home/coven/.ssh/id_ed25519"
+    "identityFile": "/var/lib/coven/keys/id_ed25519"
   },
   "capabilities": ["gpu", "long-running-loop"],
   "available": true
@@ -828,7 +851,7 @@ Response:
   "nodeId": "compute-primary",
   "role": "compute_executor",
   "transport": "ssh",
-  "transportConfig": { "kind": "ssh", "host": "compute-primary.internal", "user": "coven", "port": 22, "identityFile": "/home/coven/.ssh/id_ed25519" },
+  "transportConfig": { "kind": "ssh", "host": "compute-primary.internal", "user": "coven", "port": 22, "identityFile": "/var/lib/coven/keys/id_ed25519" },
   "capabilities": ["gpu", "long-running-loop"],
   "available": true,
   "queuePressure": 0,

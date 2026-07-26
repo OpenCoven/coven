@@ -511,14 +511,53 @@ pub fn handle_request_with_runtime(
             if id.contains('/') || Uuid::parse_str(id).is_err() {
                 return api_error(400, "invalid_request", "Memory id must be a UUID.", None);
             }
-            match crate::cockpit_sources::read_memory_detail(coven_home, id)? {
-                Some(detail) => json_response(200, &detail),
-                None => api_error(
+            match crate::cockpit_sources::read_memory_detail(coven_home, id) {
+                Ok(Some(detail)) => json_response(200, &detail),
+                Ok(None) => api_error(
                     404,
                     "memory_not_found",
                     "Memory entry was not found.",
                     Some(serde_json::json!({ "memoryId": id })),
                 ),
+                Err(error) => match error
+                    .downcast_ref::<crate::cockpit_sources::MemoryContentError>()
+                {
+                    Some(crate::cockpit_sources::MemoryContentError::TooLarge { max_bytes }) => {
+                        api_error(
+                            413,
+                            "memory_content_too_large",
+                            "Memory entry exceeds the maximum readable size.",
+                            Some(serde_json::json!({
+                                "memoryId": id,
+                                "maxBytes": max_bytes,
+                            })),
+                        )
+                    }
+                    Some(crate::cockpit_sources::MemoryContentError::InvalidUtf8) => api_error(
+                        422,
+                        "memory_content_invalid",
+                        "Memory entry is not valid UTF-8.",
+                        Some(serde_json::json!({ "memoryId": id })),
+                    ),
+                    Some(crate::cockpit_sources::MemoryContentError::MissingOrUnsafe) => api_error(
+                        404,
+                        "memory_not_found",
+                        "Memory entry was not found.",
+                        Some(serde_json::json!({ "memoryId": id })),
+                    ),
+                    Some(crate::cockpit_sources::MemoryContentError::Unavailable(_)) => api_error(
+                        503,
+                        "memory_content_unavailable",
+                        "Memory entry content is temporarily unavailable.",
+                        Some(serde_json::json!({ "memoryId": id })),
+                    ),
+                    None => api_error(
+                        503,
+                        "memory_content_unavailable",
+                        "Memory entry content is temporarily unavailable.",
+                        Some(serde_json::json!({ "memoryId": id })),
+                    ),
+                },
             }
         }
         ("GET", "/memory") => json_response(200, &crate::cockpit_sources::scan_memory(coven_home)?),
@@ -8383,6 +8422,202 @@ description = "digs deep"
             let invalid_body: serde_json::Value = serde_json::from_str(&invalid.body)?;
             assert_eq!(invalid_body["error"]["code"], "invalid_request");
         }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn memory_detail_route_sanitizes_unclassified_root_errors() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        let outside_memory = outside.path().join("private-memory");
+        std::fs::create_dir(&outside_memory)?;
+        symlink(&outside_memory, temp.path().join("memory"))?;
+        let id = "00000000-0000-0000-0000-000000000000";
+
+        let response = handle_request("GET", &format!("/api/v1/memory/{id}"), temp.path(), None)?;
+
+        assert_eq!(response.status, 503);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "memory_content_unavailable");
+        assert_eq!(
+            body["error"]["message"],
+            "Memory entry content is temporarily unavailable."
+        );
+        assert_eq!(
+            body["error"]["details"],
+            serde_json::json!({ "memoryId": id })
+        );
+        assert!(!response
+            .body
+            .contains(temp.path().to_string_lossy().as_ref()));
+        assert!(!response
+            .body
+            .contains(outside.path().to_string_lossy().as_ref()));
+        assert!(!response.body.contains("symlink"));
+        Ok(())
+    }
+
+    #[test]
+    fn memory_detail_route_rejects_content_that_grows_over_the_limit() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let sage = home.join("memory").join("sage");
+        std::fs::create_dir_all(&sage)?;
+        let path = sage.join("notes.md");
+        std::fs::write(&path, "small")?;
+        let list = handle_request("GET", "/api/v1/memory", home, None)?;
+        let entries: serde_json::Value = serde_json::from_str(&list.body)?;
+        let id = entries[0]["id"].as_str().expect("opaque id");
+        std::fs::write(
+            &path,
+            vec![b'x'; crate::cockpit_sources::MEMORY_CONTENT_MAX_BYTES as usize + 1],
+        )?;
+
+        let response = handle_request("GET", &format!("/api/v1/memory/{id}"), home, None)?;
+
+        assert_eq!(response.status, 413);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "memory_content_too_large");
+        assert_eq!(
+            body["error"]["details"]["maxBytes"],
+            crate::cockpit_sources::MEMORY_CONTENT_MAX_BYTES
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn memory_detail_route_rejects_non_utf8_content() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let sage = home.join("memory").join("sage");
+        std::fs::create_dir_all(&sage)?;
+        let path = sage.join("notes.md");
+        std::fs::write(&path, "valid")?;
+        let list = handle_request("GET", "/api/v1/memory", home, None)?;
+        let entries: serde_json::Value = serde_json::from_str(&list.body)?;
+        let id = entries[0]["id"].as_str().expect("opaque id");
+        std::fs::write(&path, [0xff, 0xfe])?;
+
+        let response = handle_request("GET", &format!("/api/v1/memory/{id}"), home, None)?;
+
+        assert_eq!(response.status, 422);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "memory_content_invalid");
+        Ok(())
+    }
+
+    #[test]
+    fn memory_detail_route_returns_path_safe_not_found_after_removal() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let sage = home.join("memory").join("sage");
+        std::fs::create_dir_all(&sage)?;
+        let path = sage.join("notes.md");
+        std::fs::write(&path, "valid")?;
+        let list = handle_request("GET", "/api/v1/memory", home, None)?;
+        let entries: serde_json::Value = serde_json::from_str(&list.body)?;
+        let id = entries[0]["id"].as_str().expect("opaque id");
+        std::fs::remove_file(&path)?;
+
+        let response = handle_request("GET", &format!("/api/v1/memory/{id}"), home, None)?;
+
+        assert_eq!(response.status, 404);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "memory_not_found");
+        assert_eq!(
+            body["error"]["details"],
+            serde_json::json!({ "memoryId": id })
+        );
+        assert!(!response.body.contains(home.to_string_lossy().as_ref()));
+        assert!(!response.body.contains("sage/notes.md"));
+        Ok(())
+    }
+
+    #[test]
+    fn memory_detail_route_returns_path_safe_not_found_for_non_regular_replacement() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let sage = home.join("memory").join("sage");
+        std::fs::create_dir_all(&sage)?;
+        let path = sage.join("notes.md");
+        std::fs::write(&path, "valid")?;
+        let list = handle_request("GET", "/api/v1/memory", home, None)?;
+        let entries: serde_json::Value = serde_json::from_str(&list.body)?;
+        let id = entries[0]["id"].as_str().expect("opaque id");
+        std::fs::remove_file(&path)?;
+        std::fs::create_dir(&path)?;
+
+        let response = handle_request("GET", &format!("/api/v1/memory/{id}"), home, None)?;
+
+        assert_eq!(response.status, 404);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "memory_not_found");
+        assert_eq!(
+            body["error"]["details"],
+            serde_json::json!({ "memoryId": id })
+        );
+        assert!(!response.body.contains(home.to_string_lossy().as_ref()));
+        assert!(!response.body.contains("sage/notes.md"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn memory_detail_route_returns_path_safe_unavailable_after_permission_denial() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct PermissionRestore {
+            path: std::path::PathBuf,
+            permissions: Option<std::fs::Permissions>,
+        }
+
+        impl PermissionRestore {
+            fn restore(mut self) -> std::io::Result<()> {
+                let permissions = self.permissions.as_ref().expect("permissions").clone();
+                std::fs::set_permissions(&self.path, permissions)?;
+                self.permissions = None;
+                Ok(())
+            }
+        }
+
+        impl Drop for PermissionRestore {
+            fn drop(&mut self) {
+                if let Some(permissions) = self.permissions.take() {
+                    let _ = std::fs::set_permissions(&self.path, permissions);
+                }
+            }
+        }
+
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let sage = home.join("memory").join("sage");
+        std::fs::create_dir_all(&sage)?;
+        let path = sage.join("notes.md");
+        std::fs::write(&path, "valid")?;
+        let list = handle_request("GET", "/api/v1/memory", home, None)?;
+        let entries: serde_json::Value = serde_json::from_str(&list.body)?;
+        let id = entries[0]["id"].as_str().expect("opaque id");
+        let restore = PermissionRestore {
+            path: path.clone(),
+            permissions: Some(std::fs::metadata(&path)?.permissions()),
+        };
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))?;
+
+        let response = handle_request("GET", &format!("/api/v1/memory/{id}"), home, None)?;
+        restore.restore()?;
+
+        assert_eq!(response.status, 503);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "memory_content_unavailable");
+        assert_eq!(
+            body["error"]["details"],
+            serde_json::json!({ "memoryId": id })
+        );
+        assert!(!response.body.contains(home.to_string_lossy().as_ref()));
+        assert!(!response.body.contains("sage/notes.md"));
         Ok(())
     }
 

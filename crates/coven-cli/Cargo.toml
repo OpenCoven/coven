@@ -26,6 +26,8 @@ coven-runtime-spec = { git = "https://github.com/OpenCoven/coven-runtimes", tag 
 # Pinned to the reviewed Phase 5 core revision until its 0.2 release tag lands.
 coven-threads-core = { git = "https://github.com/OpenCoven/coven-threads", rev = "6fa360b", version = "0.2.0" }
 blake3 = "1"
+cap-fs-ext = "4.0.2"
+cap-std = "4.0.2"
 time = { version = "0.3", features = ["formatting"] }
 crossterm = "0.29"
 flate2 = "1"

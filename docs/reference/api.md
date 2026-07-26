@@ -66,7 +66,7 @@ These power `coven status`, `coven familiars`, `coven skills`, `coven memory`, `
 | GET | `/api/v1/skills` | Installed skills from `~/.coven/skills/`. | `SkillDto[]` |
 | GET | `/api/v1/memory` | Familiar memory files from `~/.coven/memory/`. | memory list |
 | GET | `/api/v1/memory/overview` | Memory counts plus explicit detail, verification, attestation, supersession, and mutation capability state. | overview object |
-| GET | `/api/v1/memory/:id` | Validated markdown content for an opaque id returned by the memory list. | memory detail · `400 invalid_request` / `404 memory_not_found` |
+| GET | `/api/v1/memory/:id` | Validated markdown content for an opaque id returned by the memory list. | memory detail · `400 invalid_request` / `404 memory_not_found` / `413 memory_content_too_large` / `422 memory_content_invalid` / `503 memory_content_unavailable` |
 | GET | `/api/v1/research` | Research loop log rows. | research list |
 | GET | `/api/v1/coven-calls` | Coven Calls delegation ledger. | `{ ok, calls }` |
 | GET | `/api/v1/coven-calls/:id` | One delegation call. | `{ ok, call }` · `404 call_not_found` |
@@ -74,10 +74,22 @@ These power `coven status`, `coven familiars`, `coven skills`, `coven memory`, `
 
 Memory list `path` values are relative compatibility fields, never absolute
 filesystem paths. Browser-facing clients should remove them from their own
-DTOs. Detail responses contain no path field. Until the promotion privacy and
-verification contracts land, the API reports those capabilities as unavailable
-and returns unknown/null metadata rather than inferring a healthy or public
-state.
+DTOs. Enumeration is metadata-only and excludes non-UTF-8 path entries,
+symlinks, Windows reparse points, non-files/non-directories, and entries that
+disappear during the scan. Unexpected enumeration, directory-open, or metadata
+errors fail the request instead of returning partial data. Overview reads no
+bodies. List reads excerpts and retains a metadata-valid row with an empty
+`excerpt` when its body is unreadable, invalid UTF-8, or larger than 4 MiB.
+Detail reads only the selected entry from its validated no-follow handle;
+content must be UTF-8 and at most 4 MiB (4,194,304 bytes). Detail responses
+contain no path field. A missing or unsafe replacement before the validated
+open returns `404 memory_not_found`; permission failures, unexpected open
+failures, and post-open metadata/read failures return
+`503 memory_content_unavailable`. Both errors expose only `memoryId` in their
+details, never filesystem paths or raw I/O errors. Until the promotion privacy
+and verification contracts land, the API reports those capabilities as
+unavailable and returns unknown/null metadata rather than inferring a healthy
+or public state.
 
 ## Cast and familiar writes
 
