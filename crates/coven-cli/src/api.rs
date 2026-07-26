@@ -3070,6 +3070,13 @@ pub(crate) fn validate_ward_audit_event_tag(event: &str) -> Result<()> {
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'),
         "Query parameter `event` must be a lowercase ASCII event tag containing only lowercase letters, digits, and `_`."
     );
+    anyhow::ensure!(
+        matches!(
+            event,
+            "apply_audit" | "proposal_submitted" | "validation_verdict"
+        ),
+        "Query parameter `event` must be one of `apply_audit`, `proposal_submitted`, or `validation_verdict`."
+    );
     Ok(())
 }
 
@@ -8990,6 +8997,7 @@ tier = 1
             "/api/v1/familiars/sage/audit?event=",
             "/api/v1/familiars/sage/audit?event=ApplyAudit",
             "/api/v1/familiars/sage/audit?event=apply%20audit",
+            "/api/v1/familiars/sage/audit?event=unknown_tag",
         ] {
             let response = handle_request("GET", path, home, None)?;
             assert_eq!(response.status, 400, "path {path} got {}", response.body);

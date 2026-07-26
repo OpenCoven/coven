@@ -619,7 +619,9 @@ fn ward_audit_path(familiar_id: &str, limit: Option<u32>, event: Option<&str>) -
     }
     if let Some(event) = event {
         crate::api::validate_ward_audit_event_tag(event)
-            .map_err(|_| anyhow::anyhow!("--event must be a lowercase ASCII event tag containing only lowercase letters, digits, and `_`"))?;
+            .with_context(|| {
+                "--event must be a known lowercase ASCII event tag (`apply_audit`, `proposal_submitted`, or `validation_verdict`)"
+            })?;
         params.push(format!("event={event}"));
     }
     if !params.is_empty() {
@@ -1469,6 +1471,7 @@ mod tests {
             "apply_audit=1",
             "apply audit",
             "äpply",
+            "unknown_tag",
         ] {
             let error = ward_audit_path("sage", Some(10), Some(event))
                 .expect_err("unsafe event query value must be rejected");

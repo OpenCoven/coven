@@ -696,17 +696,14 @@ pub fn persist_apply_audit_records(
 /// the `ward_audit` ledger stores raw bytes (`diff_hash BLOB`).
 fn hex_to_bytes(hex: &str) -> Result<Vec<u8>> {
     if !hex.is_ascii() {
-        anyhow::bail!("non-ASCII hex digest `{hex}`");
+        anyhow::bail!("non-ASCII hex digest");
     }
     if hex.len() != 64 {
-        anyhow::bail!("expected 64-character SHA-256 hex digest, got `{hex}`");
+        anyhow::bail!("expected 64-character SHA-256 hex digest");
     }
     (0..hex.len())
         .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&hex[i..i + 2], 16)
-                .with_context(|| format!("invalid hex digest `{hex}`"))
-        })
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).context("invalid hex digest"))
         .collect()
 }
 
