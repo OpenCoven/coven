@@ -2,7 +2,7 @@
 
 - **Date:** 2026-07-26
 - **Issue:** [#493](https://github.com/OpenCoven/coven/issues/493)
-- **Status:** design approved; written-spec review pending
+- **Status:** approved for implementation
 
 ## Problem
 
