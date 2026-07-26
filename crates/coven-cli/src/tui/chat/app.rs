@@ -1483,9 +1483,12 @@ impl App {
             .map(|home| home.display().to_string())
             .unwrap_or_else(|| "unresolved — set COVEN_HOME".to_string());
         // Configured = built-ins plus installed adapter manifests; fall back
-        // to built-ins on a manifest load error (the launch path surfaces it).
-        let harnesses =
-            harness::configured_harnesses().unwrap_or_else(|_| harness::built_in_harnesses());
+        // to built-ins on a manifest load error and surface the error so users
+        // can diagnose why installed adapters are missing without a launch attempt.
+        let (harnesses, harness_load_err) = match harness::configured_harnesses() {
+            Ok(h) => (h, None),
+            Err(e) => (harness::built_in_harnesses(), Some(e.to_string())),
+        };
         let mut lines = vec![
             "Doctor".to_string(),
             format!("  Store    {store_path}"),
@@ -1501,6 +1504,11 @@ impl App {
             lines.push(format!(
                 "    {:<11} `{}` is {status}",
                 harness.label, harness.executable
+            ));
+        }
+        if let Some(err) = harness_load_err {
+            lines.push(format!(
+                "  [warn] adapter manifests could not be loaded (showing built-ins only): {err}"
             ));
         }
         let next = harnesses

@@ -224,7 +224,8 @@ pub fn harness_supports_chat_resume(harness_id: &str) -> bool {
     }
 
     static SPECS: std::sync::OnceLock<Vec<HarnessCommandSpec>> = std::sync::OnceLock::new();
-    let specs = SPECS.get_or_init(|| configured_harness_specs().unwrap_or_else(|_| built_in_harness_specs()));
+    let specs = SPECS
+        .get_or_init(|| configured_harness_specs().unwrap_or_else(|_| built_in_harness_specs()));
 
     specs
         .iter()
