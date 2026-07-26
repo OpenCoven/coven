@@ -111,4 +111,4 @@ The following properties are design goals of OpenCoven. If you find a way to vio
 
 ---
 
-*Last updated: 2026-07-04*
+*Last updated: 2026-07-26*
