@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { constants as osConstants } from 'node:os';
 
 const require = createRequire(import.meta.url);
 
@@ -64,6 +65,11 @@ child.on('error', (error) => {
 
 child.on('exit', (code, signal) => {
   if (signal) {
+    if (process.platform === 'win32') {
+      const signalNumber = osConstants.signals[signal];
+      process.exit(signalNumber === undefined ? 1 : 128 + signalNumber);
+    }
+    process.removeAllListeners(signal);
     process.kill(process.pid, signal);
     return;
   }

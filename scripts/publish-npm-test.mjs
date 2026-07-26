@@ -1,5 +1,17 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import {
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -9,6 +21,112 @@ const OIDC_ENV = {
   ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'fake-oidc-token',
   ACTIONS_ID_TOKEN_REQUEST_URL: 'https://token.actions.githubusercontent.com/'
 };
+
+const SIGNAL_TEST_PACKAGES = {
+  'darwin-arm64': ['@opencoven/cli-macos', 'coven'],
+  'linux-x64': ['@opencoven/cli-linux-x64', 'coven']
+};
+
+async function assertWrapperPreservesSignal(signal) {
+  const fixture = mkdtempSync(path.join(tmpdir(), 'coven-wrapper-signal-'));
+  let wrapperProcess;
+  try {
+    const wrapperDir = path.join(fixture, 'wrapper');
+    const wrapperBinDir = path.join(wrapperDir, 'bin');
+    const wrapperPath = path.join(wrapperBinDir, 'coven.js');
+    mkdirSync(wrapperBinDir, { recursive: true });
+    writeFileSync(
+      path.join(wrapperDir, 'package.json'),
+      JSON.stringify({ name: '@opencoven/cli-test', type: 'module' })
+    );
+    copyFileSync(
+      fileURLToPath(new URL('../npm/coven/bin/coven.js', import.meta.url)),
+      wrapperPath
+    );
+
+    const [packageName, binaryName] =
+      SIGNAL_TEST_PACKAGES[`${process.platform}-${process.arch}`];
+    const nativeDir = path.join(wrapperDir, 'node_modules', ...packageName.split('/'));
+    const nativeBinDir = path.join(nativeDir, 'bin');
+    mkdirSync(nativeBinDir, { recursive: true });
+    writeFileSync(
+      path.join(nativeDir, 'package.json'),
+      JSON.stringify({ name: packageName, version: '0.0.0' })
+    );
+    symlinkSync(process.execPath, path.join(nativeBinDir, binaryName));
+
+    let stderr = '';
+    wrapperProcess = spawn(
+      process.execPath,
+      [
+        wrapperPath,
+        '-e',
+        'process.stdout.write("ready\\n"); setTimeout(() => process.exit(2), 30_000);'
+      ],
+      { stdio: ['ignore', 'pipe', 'pipe'] }
+    );
+    wrapperProcess.stderr.setEncoding('utf8');
+    wrapperProcess.stderr.on('data', (chunk) => {
+      stderr += chunk;
+    });
+
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(
+        () => reject(new Error(`timed out waiting for fake native child; stderr:\n${stderr}`)),
+        10_000
+      );
+      wrapperProcess.stdout.setEncoding('utf8');
+      wrapperProcess.stdout.on('data', (chunk) => {
+        if (chunk.includes('ready')) {
+          clearTimeout(timeout);
+          resolve();
+        }
+      });
+      wrapperProcess.once('error', (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+      wrapperProcess.once('exit', (code, exitSignal) => {
+        clearTimeout(timeout);
+        reject(
+          new Error(
+            `wrapper exited before readiness: code=${code} signal=${exitSignal}; stderr:\n${stderr}`
+          )
+        );
+      });
+    });
+
+    const exit = once(wrapperProcess, 'exit');
+    assert.equal(wrapperProcess.kill(signal), true);
+    const [code, exitSignal] = await exit;
+    assert.equal(code, null, `wrapper should not convert ${signal} into exit code ${code}`);
+    assert.equal(exitSignal, signal, `wrapper should terminate with ${signal}`);
+  } finally {
+    if (
+      wrapperProcess &&
+      wrapperProcess.exitCode === null &&
+      wrapperProcess.signalCode === null
+    ) {
+      wrapperProcess.kill('SIGKILL');
+    }
+    rmSync(fixture, { recursive: true, force: true });
+  }
+}
+
+test(
+  'npm wrapper preserves child signal termination',
+  {
+    skip:
+      process.platform === 'win32' ||
+      !SIGNAL_TEST_PACKAGES[`${process.platform}-${process.arch}`],
+    timeout: 30_000
+  },
+  async () => {
+    for (const signal of ['SIGINT', 'SIGTERM']) {
+      await assertWrapperPreservesSignal(signal);
+    }
+  }
+);
 
 test('releaseVersion prefers explicit COVEN_NPM_VERSION and strips a leading v', () => {
   assert.equal(
@@ -88,6 +206,15 @@ test('wrapper binary maps windows x64 to windows native package and exe binary',
   const bin = readFileSync(binPath, 'utf8');
   assert.match(bin, /'win32-x64': '@opencoven\/cli-windows'/);
   assert.match(bin, /process\.platform === 'win32' \? 'coven\.exe' : 'coven'/);
+});
+
+test('wrapper includes conventional Windows signal fallback', () => {
+  const binPath = new URL(['..', 'npm', 'coven', 'bin', 'coven.js'].join('/'), import.meta.url);
+  const bin = readFileSync(binPath, 'utf8');
+  assert.match(bin, /constants as osConstants/);
+  assert.match(bin, /process\.platform === 'win32'/);
+  assert.match(bin, /osConstants\.signals\[signal\]/);
+  assert.match(bin, /128 \+ signalNumber/);
 });
 
 test('install docs do not claim macOS x64 support unless the wrapper maps darwin x64', () => {
