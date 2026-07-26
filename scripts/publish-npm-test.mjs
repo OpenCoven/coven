@@ -61,7 +61,7 @@ async function assertWrapperPreservesSignal(signal) {
       [
         wrapperPath,
         '-e',
-        'process.stdout.write("ready\\n"); setTimeout(() => process.exit(2), 30_000);'
+        'process.stdout.write("ready\\n"); setTimeout(() => process.exit(2), 20_000);'
       ],
       { stdio: ['ignore', 'pipe', 'pipe'] }
     );
