@@ -250,7 +250,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_harness_validation_does_not_probe_executables() -> Result<()> {
+    fn configured_harness_validation_returns_spec_without_probing_executables() -> Result<()> {
         let selected = validate_harness_specs(
             "codex",
             HarnessCheck::Configured,
@@ -259,6 +259,8 @@ mod tests {
         )?;
 
         assert_eq!(selected.id, "codex");
+        assert_eq!(selected.executable, "codex");
+        assert!(selected.supports_model());
         Ok(())
     }
 
