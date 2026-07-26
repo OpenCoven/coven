@@ -29,7 +29,9 @@ the repository sees the same registry. The claiming identity comes from
 `COVEN_AGENT_ID` (falling back to `USER`). A claim expires after one hour by
 default; override with `COVEN_CLAIM_TTL_SECONDS`.
 
-- `acquire` fails while another agent's claim is active.
+- `acquire` fails while another agent's claim is active. The claim file is
+  created exclusively, so when several sessions race for the same free or
+  expired token, exactly one of them is told it succeeded.
 - `release` refuses to remove another agent's active claim.
 - `heartbeat` re-acquires or extends your own claim for another TTL window.
 - `canary <branch>` records the current HEAD in `<git-common-dir>/AGENT_HEAD_AT_START`

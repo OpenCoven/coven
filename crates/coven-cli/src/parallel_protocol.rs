@@ -7,6 +7,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, SecondsFormat};
 const CLAIM_TTL_SECONDS: u64 = 60 * 60;
+/// Passes allowed through the acquire loop. Each pass either settles the claim
+/// or loses a race to another agent, and a loser only re-runs after the winner
+/// has published its claim, so a couple of passes is plenty.
+const CLAIM_ACQUIRE_ATTEMPTS: usize = 8;
+/// A takeover holds its lock for two syscalls, so anything older than this was
+/// abandoned by a process that died mid-takeover.
+const TAKEOVER_LOCK_STALE: Duration = Duration::from_secs(30);
 const DEFAULT_PRIMARY_BRANCH: &str = "main";
 const MANAGED_HOOK_MARKER: &str = "Coven Parallel Work Protocol managed hook";
 
@@ -69,28 +76,61 @@ pub(crate) fn run_wt_command(
 pub(crate) fn claim_acquire(branch: &str) -> Result<()> {
     let repo = Repo::discover()?;
     let agent_id = agent_id();
-    let now = unix_now();
-    if let Some(existing) = read_claim(&repo, branch)? {
-        if existing.is_active(now) && existing.agent_id != agent_id {
-            anyhow::bail!(
-                "{} is already claimed by {} until {}",
-                branch,
-                existing.agent_id,
-                existing.expires_at
-            );
+
+    // Creating the claim file is the only step that decides the race, so it
+    // has to be the same step that tests for a free slot: a separate
+    // read-then-write lets two agents both observe "free" and both write,
+    // which is how one issue ends up with two agents and two PRs.
+    for _ in 0..CLAIM_ACQUIRE_ATTEMPTS {
+        let now = unix_now();
+        let claim = Claim {
+            branch: branch.to_string(),
+            agent_id: agent_id.clone(),
+            acquired_at: now,
+            expires_at: now + claim_ttl_seconds(),
+            head: current_head().ok(),
+        };
+
+        if create_claim_exclusive(&repo, &claim)? {
+            println!("claimed {branch} for {agent_id} until {}", claim.expires_at);
+            return Ok(());
+        }
+
+        // Someone holds the slot. Re-read to decide whether it is ours to
+        // refresh, someone else's to respect, or expired and up for grabs.
+        match read_claim(&repo, branch)? {
+            Some(existing) if existing.is_active(now) && existing.agent_id != agent_id => {
+                anyhow::bail!(
+                    "{} is already claimed by {} until {}",
+                    branch,
+                    existing.agent_id,
+                    existing.expires_at
+                );
+            }
+            Some(existing) if existing.is_active(now) => {
+                // Our own live claim: extend it in place rather than
+                // reporting a conflict against ourselves.
+                debug_assert_eq!(existing.agent_id, agent_id);
+                replace_claim(&repo, &claim)?;
+                println!("claimed {branch} for {agent_id} until {}", claim.expires_at);
+                return Ok(());
+            }
+            // Expired, or too corrupt to identify an owner. Contend for the
+            // takeover under a lock: unlike a free slot, this transition
+            // cannot be arbitrated by `create_new` (the file already exists),
+            // and it must never leave the slot empty or a concurrent
+            // `create_new` would slip into the gap and mint a second winner.
+            _ => {
+                if try_takeover(&repo, branch, &claim)? {
+                    println!("claimed {branch} for {agent_id} until {}", claim.expires_at);
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
     }
 
-    let claim = Claim {
-        branch: branch.to_string(),
-        agent_id: agent_id.clone(),
-        acquired_at: now,
-        expires_at: now + claim_ttl_seconds(),
-        head: current_head().ok(),
-    };
-    write_claim(&repo, &claim)?;
-    println!("claimed {branch} for {agent_id} until {}", claim.expires_at);
-    Ok(())
+    anyhow::bail!("could not acquire claim for {branch}: contended by other agents, retry")
 }
 
 pub(crate) fn claim_release(branch: &str) -> Result<()> {
@@ -160,6 +200,7 @@ pub(crate) fn claim_status(json: bool) -> Result<()> {
     let mut claims = if claims_dir.exists() {
         fs::read_dir(&claims_dir)?
             .filter_map(|entry| entry.ok())
+            .filter(|entry| !is_temp_claim_file(&entry.path()))
             .filter_map(|entry| read_claim_file(&entry.path()).ok().flatten())
             .collect::<Vec<_>>()
     } else {
@@ -552,20 +593,170 @@ fn worktree_path(repo: &Repo, branch: &str) -> Result<PathBuf> {
     Ok(worktree_root(repo)?.join(branch_slug(branch)))
 }
 
-fn write_claim(repo: &Repo, claim: &Claim) -> Result<()> {
+fn render_claim(claim: &Claim) -> String {
+    let mut rendered = String::new();
+    rendered.push_str(&format!("branch={}\n", claim.branch));
+    rendered.push_str(&format!("agent_id={}\n", claim.agent_id));
+    rendered.push_str(&format!("acquired_at={}\n", claim.acquired_at));
+    rendered.push_str(&format!("expires_at={}\n", claim.expires_at));
+    if let Some(head) = &claim.head {
+        rendered.push_str(&format!("head={head}\n"));
+    }
+    rendered
+}
+
+/// Create the claim file, failing rather than overwriting when one exists.
+///
+/// `create_new` is the whole guarantee: the kernel resolves the O_CREAT|O_EXCL
+/// open, so exactly one of any number of racing agents is told it created the
+/// file. Returns `false` when the slot was already taken.
+fn create_claim_exclusive(repo: &Repo, claim: &Claim) -> Result<bool> {
     let claims_dir = repo.common_dir.join("agent-claims");
     fs::create_dir_all(&claims_dir)?;
     let path = claim_path(repo, &claim.branch);
-    let mut file = fs::File::create(&path)
-        .with_context(|| format!("failed to create claim {}", path.display()))?;
-    writeln!(file, "branch={}", claim.branch)?;
-    writeln!(file, "agent_id={}", claim.agent_id)?;
-    writeln!(file, "acquired_at={}", claim.acquired_at)?;
-    writeln!(file, "expires_at={}", claim.expires_at)?;
-    if let Some(head) = &claim.head {
-        writeln!(file, "head={head}")?;
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            file.write_all(render_claim(claim).as_bytes())
+                .with_context(|| format!("failed to write claim {}", path.display()))?;
+            Ok(true)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(err) => Err(err).with_context(|| format!("failed to create claim {}", path.display())),
     }
+}
+
+/// Overwrite an existing claim through a temp file plus rename, so a reader
+/// never observes a half-written claim and two concurrent writers cannot
+/// interleave their lines into one file.
+fn replace_claim(repo: &Repo, claim: &Claim) -> Result<()> {
+    let claims_dir = repo.common_dir.join("agent-claims");
+    fs::create_dir_all(&claims_dir)?;
+    let path = claim_path(repo, &claim.branch);
+    let staging = temp_claim_path(&path, "write");
+    fs::write(&staging, render_claim(claim))
+        .with_context(|| format!("failed to stage claim {}", staging.display()))?;
+    fs::rename(&staging, &path).with_context(|| {
+        let _ = fs::remove_file(&staging);
+        format!("failed to publish claim {}", path.display())
+    })?;
     Ok(())
+}
+
+/// Sibling path for staged and cleared claim files. Kept in the same directory
+/// so the rename stays within one filesystem, and dot-prefixed so
+/// `claim status` skips it if a crash leaves one behind.
+fn temp_claim_path(path: &Path, kind: &str) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "claim".to_string());
+    let unique = format!(
+        ".{name}.{kind}.{}.{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or_default()
+    );
+    path.with_file_name(unique)
+}
+
+/// Take over an expired claim, serialised so exactly one agent can do it.
+///
+/// Replacing an existing claim cannot be arbitrated by `create_new`, so this
+/// is the one transition that needs a lock. The replacement is published with
+/// an atomic rename rather than a delete-then-create, so the slot is never
+/// observed empty: agents that are not holding the lock keep failing their own
+/// `create_new`, re-read, and see the new owner.
+///
+/// Returns `true` when `claim` was published.
+fn try_takeover(repo: &Repo, branch: &str, claim: &Claim) -> Result<bool> {
+    let Some(_lock) = TakeoverLock::try_acquire(repo, branch)? else {
+        return Ok(false);
+    };
+
+    // Re-read under the lock: the state that justified the takeover may have
+    // changed while we were contending for it.
+    let now = unix_now();
+    match read_claim(repo, branch)? {
+        Some(existing) if existing.is_active(now) && existing.agent_id != claim.agent_id => {
+            Ok(false)
+        }
+        _ => {
+            replace_claim(repo, claim)?;
+            Ok(true)
+        }
+    }
+}
+
+/// Exclusive lock guarding the expired-claim takeover, released on drop.
+struct TakeoverLock {
+    path: PathBuf,
+}
+
+impl TakeoverLock {
+    fn try_acquire(repo: &Repo, branch: &str) -> Result<Option<Self>> {
+        let path = takeover_lock_path(&claim_path(repo, branch));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => Ok(Some(Self { path })),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                // The critical section is two syscalls long, so a lock this
+                // old belongs to a process that died holding it. Breaking it
+                // only returns us to contending for the same lock.
+                if lock_is_stale(&path) {
+                    let _ = fs::remove_file(&path);
+                }
+                Ok(None)
+            }
+            Err(err) => {
+                Err(err).with_context(|| format!("failed to lock takeover {}", path.display()))
+            }
+        }
+    }
+}
+
+impl Drop for TakeoverLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn lock_is_stale(path: &Path) -> bool {
+    let Ok(modified) = fs::metadata(path).and_then(|meta| meta.modified()) else {
+        return false;
+    };
+    // A clock skew that puts the lock in the future reads as not-stale, which
+    // is the safe direction: we wait instead of breaking someone's lock.
+    SystemTime::now()
+        .duration_since(modified)
+        .map(|age| age > TAKEOVER_LOCK_STALE)
+        .unwrap_or(false)
+}
+
+fn takeover_lock_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "claim".to_string());
+    path.with_file_name(format!(".{name}.takeover"))
+}
+
+fn is_temp_claim_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with('.'))
+}
+
+fn write_claim(repo: &Repo, claim: &Claim) -> Result<()> {
+    replace_claim(repo, claim)
 }
 
 fn read_claim(repo: &Repo, branch: &str) -> Result<Option<Claim>> {

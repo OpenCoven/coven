@@ -66,6 +66,137 @@ fn claim_acquire_blocks_other_agent_until_release() -> anyhow::Result<()> {
 }
 
 #[test]
+fn concurrent_claim_acquire_yields_exactly_one_winner() -> anyhow::Result<()> {
+    let repo = TestRepo::new()?;
+
+    // A read-then-write acquire lets every racer observe a free slot and
+    // then overwrite the others, so each one is told it holds the claim.
+    let results = repo.race_acquire("feature/demo", &["cody", "sage", "nova", "kitty"], [])?;
+
+    let winners: Vec<&str> = results
+        .iter()
+        .filter(|(_, output)| output.status.success())
+        .map(|(agent, _)| *agent)
+        .collect();
+    assert_eq!(
+        winners.len(),
+        1,
+        "expected exactly one winner, got {winners:?}"
+    );
+
+    // The agent that was told it won must be the one recorded on disk.
+    assert_eq!(repo.claim_field("feature/demo", "agent_id")?, winners[0]);
+
+    for (agent, output) in results.iter().filter(|(agent, _)| *agent != winners[0]) {
+        assert_failure(&format!("claim acquire by {agent}"), output);
+        assert_stderr_contains(
+            &format!("claim acquire by {agent}"),
+            output,
+            "already claimed by",
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn concurrent_takeover_of_expired_claim_yields_exactly_one_winner() -> anyhow::Result<()> {
+    let repo = TestRepo::new()?;
+
+    // Seed a claim that is already expired, so every racer is entitled to
+    // take it over. Replacing an existing file cannot be arbitrated by an
+    // exclusive create, which makes this the path most likely to double-win.
+    let seeded = repo.coven_with_env(
+        ["claim", "acquire", "feature/demo"],
+        [
+            ("COVEN_AGENT_ID", "ghost"),
+            ("COVEN_CLAIM_TTL_SECONDS", "1"),
+        ],
+    )?;
+    assert_success("claim acquire by ghost", &seeded);
+    std::thread::sleep(std::time::Duration::from_millis(1_200));
+
+    let results = repo.race_acquire("feature/demo", &["cody", "sage", "nova", "kitty"], [])?;
+
+    let winners: Vec<&str> = results
+        .iter()
+        .filter(|(_, output)| output.status.success())
+        .map(|(agent, _)| *agent)
+        .collect();
+    assert_eq!(
+        winners.len(),
+        1,
+        "expected exactly one winner taking over the expired claim, got {winners:?}"
+    );
+    assert_eq!(repo.claim_field("feature/demo", "agent_id")?, winners[0]);
+    Ok(())
+}
+
+#[test]
+fn claim_acquire_by_the_same_agent_extends_its_own_claim() -> anyhow::Result<()> {
+    let repo = TestRepo::new()?;
+
+    let first = repo.coven_with_env(
+        ["claim", "acquire", "feature/demo"],
+        [
+            ("COVEN_AGENT_ID", "cody"),
+            ("COVEN_CLAIM_TTL_SECONDS", "60"),
+        ],
+    )?;
+    assert_success("first claim acquire by cody", &first);
+    let first_expiry: u64 = repo.claim_field("feature/demo", "expires_at")?.parse()?;
+
+    let again = repo.coven_with_env(
+        ["claim", "acquire", "feature/demo"],
+        [
+            ("COVEN_AGENT_ID", "cody"),
+            ("COVEN_CLAIM_TTL_SECONDS", "6000"),
+        ],
+    )?;
+    assert_success("re-acquire by the same agent", &again);
+
+    let second_expiry: u64 = repo.claim_field("feature/demo", "expires_at")?.parse()?;
+    assert!(
+        second_expiry > first_expiry,
+        "re-acquiring should extend the owner's claim: {first_expiry} -> {second_expiry}"
+    );
+    assert_eq!(repo.claim_field("feature/demo", "agent_id")?, "cody");
+    Ok(())
+}
+
+#[test]
+fn claim_status_ignores_leftover_internal_files() -> anyhow::Result<()> {
+    let repo = TestRepo::new()?;
+    let acquired = repo.coven_with_env(
+        ["claim", "acquire", "feature/demo"],
+        [("COVEN_AGENT_ID", "cody")],
+    )?;
+    assert_success("claim acquire by cody", &acquired);
+
+    // Staging and lock files are dot-prefixed siblings of the claim; a crash
+    // mid-takeover can leave one behind and it must not read as a claim.
+    let claims_dir = repo.claims_dir()?;
+    fs::write(claims_dir.join(".feature-demo.takeover"), "")?;
+    fs::write(
+        claims_dir.join(".feature-demo.write.1.2"),
+        "branch=feature/demo\nagent_id=stale\nacquired_at=0\nexpires_at=0\n",
+    )?;
+
+    let status = repo.coven(["claim", "status"])?;
+    assert_success("claim status", &status);
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        !stdout.contains("stale"),
+        "claim status must ignore internal files, got:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.lines().filter(|line| line.contains("cody")).count(),
+        1,
+        "expected exactly one claim row, got:\n{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
 fn installed_hooks_block_primary_commits_and_claim_conflicts() -> anyhow::Result<()> {
     let repo = TestRepo::new()?;
 
@@ -222,6 +353,66 @@ impl TestRepo {
             command.env(key, value);
         }
         command.output().map_err(Into::into)
+    }
+
+    fn claims_dir(&self) -> anyhow::Result<PathBuf> {
+        Ok(self.git_common_dir()?.join("agent-claims"))
+    }
+
+    fn claim_field(&self, branch: &str, key: &str) -> anyhow::Result<String> {
+        let slug: String = branch
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+                    ch
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let path = self.claims_dir()?.join(slug.trim_matches('-'));
+        let contents = fs::read_to_string(&path)
+            .map_err(|err| anyhow::anyhow!("reading {}: {err}", path.display()))?;
+        contents
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}=")))
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("no {key} in {}:\n{contents}", path.display()))
+    }
+
+    /// Launch one `claim acquire` per agent as concurrently as processes
+    /// allow, so the acquire path is exercised as a real race rather than a
+    /// sequence. Every child is spawned before any of them is waited on.
+    fn race_acquire<'a, const M: usize>(
+        &self,
+        branch: &str,
+        agents: &[&'a str],
+        env: [(&str, &str); M],
+    ) -> anyhow::Result<Vec<(&'a str, Output)>> {
+        let children = agents
+            .iter()
+            .map(|agent| {
+                let mut command = Command::new(coven_bin());
+                command
+                    .args(["claim", "acquire", branch])
+                    .current_dir(&self.path)
+                    .env("COVEN_HOME", self.path.join(".coven-home"))
+                    .env("COVEN_AGENT_ID", agent)
+                    .env_remove("COVEN_ALLOW_PRIMARY_COMMIT")
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+                for (key, value) in env {
+                    command.env(key, value);
+                }
+                command.spawn().map(|child| (*agent, child))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        children
+            .into_iter()
+            .map(|(agent, child)| child.wait_with_output().map(|output| (agent, output)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     fn git_common_dir(&self) -> anyhow::Result<PathBuf> {
