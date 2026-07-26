@@ -38,8 +38,8 @@ PRs that a session then has to close. Before you touch code:
    worktree-scoped, so enter the worktree before acquiring the claim:
    ```sh
    git fetch origin main
-   git worktree add -b <branch> /tmp/coven-<branch> origin/main
-   cd /tmp/coven-<branch>
+   git worktree add -b <branch> /tmp/coven-<branch-slug> origin/main
+   cd /tmp/coven-<branch-slug>
    ```
 
 3. **Claim it with a shared, issue-keyed token** — not your working branch name,
