@@ -197,6 +197,29 @@ fn claim_status_ignores_leftover_internal_files() -> anyhow::Result<()> {
 }
 
 #[test]
+fn claim_status_lists_real_dot_prefixed_claims() -> anyhow::Result<()> {
+    let repo = TestRepo::new()?;
+    fs::create_dir_all(repo.claims_dir()?)?;
+    fs::write(
+        repo.claims_dir()?.join(".foo"),
+        "branch=.foo\nagent_id=dotty\nacquired_at=0\nexpires_at=9999999999\n",
+    )?;
+
+    let status = repo.coven(["claim", "status"])?;
+    assert_success("claim status", &status);
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        stdout.contains(".foo"),
+        "claim status should list real dot-prefixed claims, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("dotty"),
+        "claim status should show the dot-prefixed claim owner, got:\n{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
 fn installed_hooks_block_primary_commits_and_claim_conflicts() -> anyhow::Result<()> {
     let repo = TestRepo::new()?;
 

@@ -639,11 +639,55 @@ fn replace_claim(repo: &Repo, claim: &Claim) -> Result<()> {
     let staging = temp_claim_path(&path, "write");
     fs::write(&staging, render_claim(claim))
         .with_context(|| format!("failed to stage claim {}", staging.display()))?;
-    fs::rename(&staging, &path).with_context(|| {
-        let _ = fs::remove_file(&staging);
-        format!("failed to publish claim {}", path.display())
-    })?;
+    replace_claim_file(&staging, &path)
+        .map_err(|err| {
+            let _ = fs::remove_file(&staging);
+            err
+        })
+        .with_context(|| format!("failed to publish claim {}", path.display()))?;
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_claim_file(staging: &Path, path: &Path) -> std::io::Result<()> {
+    fs::rename(staging, path)
+}
+
+#[cfg(windows)]
+fn replace_claim_file(staging: &Path, path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+
+    #[link(name = "Kernel32")]
+    extern "system" {
+        #[link_name = "MoveFileExW"]
+        fn move_file_ex_w(existing: *const u16, new: *const u16, flags: u32) -> i32;
+    }
+
+    let existing: Vec<u16> = staging
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let new: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let ok = unsafe {
+        move_file_ex_w(
+            existing.as_ptr(),
+            new.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 /// Sibling path for staged and cleared claim files. Kept in the same directory
@@ -750,9 +794,37 @@ fn takeover_lock_path(path: &Path) -> PathBuf {
 }
 
 fn is_temp_claim_file(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with('.'))
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    is_staged_claim_file(name) || is_takeover_lock_file(path, name)
+}
+
+fn is_staged_claim_file(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix('.') else {
+        return false;
+    };
+    let Some((prefix, nanos)) = rest.rsplit_once('.') else {
+        return false;
+    };
+    let Some((prefix, pid)) = prefix.rsplit_once('.') else {
+        return false;
+    };
+    prefix.ends_with(".write")
+        && !pid.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && !nanos.is_empty()
+        && nanos.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_takeover_lock_file(path: &Path, name: &str) -> bool {
+    let Some(rest) = name.strip_prefix('.') else {
+        return false;
+    };
+    let Some(claim_name) = rest.strip_suffix(".takeover") else {
+        return false;
+    };
+    !claim_name.is_empty() && path.with_file_name(claim_name).exists()
 }
 
 fn write_claim(repo: &Repo, claim: &Claim) -> Result<()> {
@@ -1153,6 +1225,21 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
 
         assert_eq!(value["claims"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn temp_claim_file_detection_is_specific() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let claim = temp.path().join(".foo");
+        let staged = temp.path().join(".foo.write.123.456");
+        let lock = temp.path().join(".foo.takeover");
+
+        assert!(!is_temp_claim_file(&claim));
+        assert!(is_temp_claim_file(&staged));
+        assert!(!is_temp_claim_file(&lock));
+
+        fs::write(temp.path().join("foo"), "").expect("seed claim");
+        assert!(is_temp_claim_file(&lock));
     }
 
     #[test]
