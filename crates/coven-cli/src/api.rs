@@ -2931,6 +2931,15 @@ fn familiar_ward_response(coven_home: &Path, familiar_id: &str) -> Result<ApiRes
 
 const DEGRADED_WARD_CONFIG_UNPARSEABLE: &str = "ward-config-unparseable";
 
+fn normalize_ward_audit_tier(tier: Option<String>) -> Option<String> {
+    tier.map(|value| {
+        value
+            .parse::<u8>()
+            .map(|number| format!("tier_{number}"))
+            .unwrap_or(value)
+    })
+}
+
 /// `GET /familiars/{id}/audit` — the append-only `ward_audit` ledger for one
 /// familiar, newest first (#414; RFC-0001 §5.6).
 ///
@@ -2995,7 +3004,8 @@ fn familiar_audit_response(
 
     let conn = store::open_store(&store_path(coven_home))?;
     let mut sql = String::from(
-        "SELECT id, event_type, proposal_id, ward_version, ward_hash, tier,
+        "SELECT id, event_type, proposal_id, ward_version, ward_hash,
+                CAST(tier AS TEXT),
                 decision, approver, diff_hash, detail, files_touched, channel,
                 thread_id, submitted_at, decided_at, recorded_at
          FROM ward_audit WHERE familiar_id = ?1",
@@ -3007,6 +3017,7 @@ fn familiar_audit_response(
     let mut statement = conn.prepare(&sql)?;
     let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<Value> {
         let ward_hash: Vec<u8> = row.get(4)?;
+        let tier = normalize_ward_audit_tier(row.get(5)?);
         let diff_hash: Option<Vec<u8>> = row.get(8)?;
         let detail: Option<String> = row.get(9)?;
         let files_touched: String = row.get(10)?;
@@ -3033,7 +3044,7 @@ fn familiar_audit_response(
                 json!(row.get::<_, Option<String>>(3)?),
             ),
             ("wardHash".to_string(), json!(hex_string(&ward_hash))),
-            ("tier".to_string(), json!(row.get::<_, Option<String>>(5)?)),
+            ("tier".to_string(), json!(tier)),
             ("decision".to_string(), json!(row.get::<_, String>(6)?)),
             (
                 "approver".to_string(),
@@ -9005,6 +9016,28 @@ tier = 1
         let body: Value = serde_json::from_str(&response.body)?;
         assert!(body["records"][0]["detail"].is_null());
         assert_eq!(body["records"][0]["detailRaw"], "{malformed detail");
+        Ok(())
+    }
+
+    #[test]
+    fn familiar_audit_route_normalizes_numeric_legacy_tier() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_warded_familiar(home)?;
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        conn.execute(
+            "INSERT INTO ward_audit (
+                event_type, familiar_id, ward_hash, tier, decision, files_touched,
+                submitted_at, decided_at
+             ) VALUES ('proposal_submitted', 'sage', ?1, ?2, 'staged:coherence',
+                       '[]', ?3, ?3)",
+            rusqlite::params![vec![0x11_u8; 32], 1_i64, "2026-07-26T00:00:00Z"],
+        )?;
+
+        let response = handle_request("GET", "/api/v1/familiars/sage/audit", home, None)?;
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["records"][0]["tier"], "tier_1");
         Ok(())
     }
 
