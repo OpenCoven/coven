@@ -612,6 +612,17 @@ pub(crate) fn run_ward_audit(
 }
 
 fn ward_audit_path(familiar_id: &str, limit: Option<u32>, event: Option<&str>) -> Result<String> {
+    if familiar_id.is_empty()
+        || familiar_id.bytes().any(|byte| {
+            byte.is_ascii_whitespace()
+                || byte.is_ascii_control()
+                || matches!(byte, b'/' | b'\\' | b'?' | b'#' | b'%')
+        })
+    {
+        bail!(
+            "familiar id must be a non-empty URL path segment without delimiters, whitespace, or control characters"
+        );
+    }
     let mut path = format!("/api/v1/familiars/{familiar_id}/audit");
     let mut params = Vec::new();
     if let Some(limit) = limit {
@@ -1474,6 +1485,25 @@ mod tests {
             let error = ward_audit_path("sage", Some(10), Some(event))
                 .expect_err("unsafe event query value must be rejected");
             assert!(error.to_string().contains("--event"), "{event}: {error:#}");
+        }
+    }
+
+    #[test]
+    fn ward_audit_path_rejects_ambiguous_familiar_path_segments() {
+        for familiar_id in [
+            "",
+            "sa/ge",
+            "sage?limit=1",
+            "sage#fragment",
+            "sage%2Faudit",
+            "sage name",
+        ] {
+            let error = ward_audit_path(familiar_id, None, None)
+                .expect_err("unsafe familiar path segment must be rejected");
+            assert!(
+                error.to_string().contains("familiar id"),
+                "{familiar_id}: {error:#}"
+            );
         }
     }
 
