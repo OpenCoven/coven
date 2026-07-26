@@ -845,7 +845,11 @@ fn configured_harnesses_from(adapter_env: &AdapterEnv) -> Result<Vec<HarnessSumm
 }
 
 pub(crate) fn configured_chat_harnesses() -> Result<Vec<ChatHarnessSummary>> {
-    Ok(configured_harness_specs()?
+    configured_chat_harnesses_from(&AdapterEnv::from_process())
+}
+
+fn configured_chat_harnesses_from(adapter_env: &AdapterEnv) -> Result<Vec<ChatHarnessSummary>> {
+    Ok(configured_harness_specs_from(adapter_env)?
         .into_iter()
         .map(ChatHarnessSummary::from_spec)
         .collect())
@@ -2708,17 +2712,18 @@ mod tests {
             OPENCODE_ADAPTER_MANIFEST,
         )?;
 
-        let _guard = lock_env();
-        let _manifest_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_MANIFEST_ENV);
-        let _dirs_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_DIRS_ENV);
-        let _coven_home_guard = EnvVarGuard::set("COVEN_HOME", &coven_home);
+        let specs = configured_harness_specs_from(&AdapterEnv {
+            coven_home: Some(coven_home),
+            ..Default::default()
+        })?;
         let familiar = FamiliarContext {
             id: "charm".to_string(),
             display_name: "Charm".to_string(),
             role: None,
         };
 
-        let parts = command_parts_for_harness_with_conversation(
+        let parts = command_parts_in_specs(
+            &specs,
             "opencode",
             "fix tests",
             HarnessLaunchMode::NonInteractive,
@@ -2768,11 +2773,10 @@ mod tests {
             OPENCODE_ADAPTER_MANIFEST,
         )?;
 
-        let _guard = lock_env();
-        let _manifest_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_MANIFEST_ENV);
-        let _dirs_guard = EnvVarGuard::remove(EXTERNAL_ADAPTER_DIRS_ENV);
-        let _coven_home_guard = EnvVarGuard::set("COVEN_HOME", &coven_home);
-        let harnesses = configured_chat_harnesses()?;
+        let harnesses = configured_chat_harnesses_from(&AdapterEnv {
+            coven_home: Some(coven_home),
+            ..Default::default()
+        })?;
         let supports_resume = |id: &str| {
             harnesses
                 .iter()
