@@ -62,7 +62,6 @@ def git(*args: str, text: bool = True) -> str | bytes:
         ["git", *args],
         cwd=ROOT,
         text=text,
-        stderr=subprocess.DEVNULL,
     )
 
 
@@ -120,10 +119,7 @@ def working_files(names: list[str]) -> list[tuple[str, bytes]]:
 def scan_files(files: list[tuple[str, bytes]]) -> list[tuple[str, int, str]]:
     hits: list[tuple[str, int, str]] = []
     for path, data in files:
-        try:
-            text = data.decode("utf-8")
-        except UnicodeDecodeError:
-            continue
+        text = data.decode("utf-8", errors="surrogateescape")
         hits.extend(scan_text(text, path))
     return hits
 

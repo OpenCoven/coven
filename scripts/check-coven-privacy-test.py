@@ -108,6 +108,32 @@ class CovenPrivacyPatternTests(unittest.TestCase):
 
         self.assertEqual(hits, [("docs/example.md", 1, "coven_session_key")])
 
+    def test_session_key_suppresses_same_line_messenger_chat_id(self) -> None:
+        text = " ".join(
+            [
+                ":".join(["agent", "example", "telegram", "direct", "123456789"]),
+                "telegram:direct:987654321",
+            ]
+        )
+
+        hits = check_coven_privacy.scan_text(text, "docs/example.md")
+
+        self.assertEqual(hits, [("docs/example.md", 1, "coven_session_key")])
+
+    def test_standalone_messenger_chat_id_is_blocked(self) -> None:
+        text = "telegram:direct:123456789"
+
+        hits = check_coven_privacy.scan_text(text, "docs/example.md")
+
+        self.assertEqual(hits, [("docs/example.md", 1, "messenger_chat_id")])
+
+    def test_invite_or_handoff_url_with_token_is_blocked(self) -> None:
+        text = "https://example.com/invite?token=abc123"
+
+        hits = check_coven_privacy.scan_text(text, "docs/example.md")
+
+        self.assertEqual(hits, [("docs/example.md", 1, "invite_or_handoff_url")])
+
     def test_absolute_home_path_is_blocked(self) -> None:
         text = "/" + "/".join(["Users", "privateuser", "workspace", "memory.md"])
 
@@ -152,6 +178,19 @@ class CovenPrivacyPatternTests(unittest.TestCase):
         self.assertEqual(result, 2)
         self.assertIn("--range REVISION_RANGE", stderr.getvalue())
         self.assertNotIn("BASE...HEAD", stderr.getvalue())
+
+    def test_scan_files_scans_undecodable_bytes(self) -> None:
+        hits = check_coven_privacy.scan_files(
+            [("docs/example.md", b"/Users/privateuser/workspace/\xff+14155550100")]
+        )
+
+        self.assertEqual(
+            hits,
+            [
+                ("docs/example.md", 1, "absolute_home_path"),
+                ("docs/example.md", 1, "phone_number"),
+            ],
+        )
 
     def test_coven_contract_placeholders_are_allowed(self) -> None:
         text = "\n".join(
