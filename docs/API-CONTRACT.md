@@ -230,7 +230,8 @@ The memory read surface is additive to the existing observability list:
 - `GET /api/v1/memory/:id` returns one validated detail row.
 
 The list preserves its original `familiar_id`, `title`, `path`, `updated_at`,
-and `excerpt` fields. `path` is relative to the memory root and exists for CLI
+and `excerpt` fields, and adds the same authoritative `source` object returned
+by detail. `path` is relative to the memory root and exists for CLI
 compatibility; it is never absolute. The opaque UUID `id` is stable while the
 relative file identity is stable. Browser-facing adapters should omit `path`
 from their DTOs.
@@ -257,6 +258,10 @@ with an empty `excerpt`; other valid rows are still returned.
     "updated_at": "4m ago",
     "updated_at_iso": "2026-07-26T09:56:00Z",
     "excerpt": "Durable fact.",
+    "source": {
+      "kind": "coven-origin",
+      "label": "Coven origin"
+    },
     "privacy_classification": null,
     "reveal_required": null,
     "verification_state": "unknown"

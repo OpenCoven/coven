@@ -8385,6 +8385,54 @@ description = "digs deep"
     }
 
     #[test]
+    fn memory_list_route_serializes_authoritative_source_without_absolute_path() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let sage = home.join("memory").join("sage");
+        std::fs::create_dir_all(&sage)?;
+        std::fs::write(sage.join("notes.md"), "Durable fact.")?;
+
+        let response = handle_request("GET", "/api/v1/memory", home, None)?;
+
+        assert_eq!(response.status, 200);
+        let entries: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(
+            entries[0]["source"],
+            serde_json::json!({
+                "kind": "coven-origin",
+                "label": "Coven origin"
+            })
+        );
+        assert!(!response.body.contains(home.to_string_lossy().as_ref()));
+        Ok(())
+    }
+
+    #[test]
+    fn memory_list_and_detail_routes_share_exact_source_metadata() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let sage = home.join("memory").join("sage");
+        std::fs::create_dir_all(&sage)?;
+        std::fs::write(sage.join("notes.md"), "Durable fact.")?;
+
+        let list_response = handle_request("GET", "/api/v1/memory", home, None)?;
+        let entries: serde_json::Value = serde_json::from_str(&list_response.body)?;
+        let id = entries[0]["id"].as_str().expect("opaque id");
+        let list_source = entries[0]["source"].clone();
+
+        let detail_response = handle_request("GET", &format!("/api/v1/memory/{id}"), home, None)?;
+        let detail: serde_json::Value = serde_json::from_str(&detail_response.body)?;
+
+        assert_eq!(detail_response.status, 200);
+        assert_eq!(detail["source"], list_source);
+        assert!(detail.get("path").is_none());
+        assert!(!detail_response
+            .body
+            .contains(home.to_string_lossy().as_ref()));
+        Ok(())
+    }
+
+    #[test]
     fn memory_detail_route_returns_content_and_rejects_invalid_ids() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let home = temp.path();

@@ -338,6 +338,7 @@ pub struct MemoryFileDto {
     pub updated_at: String,
     pub updated_at_iso: String,
     pub excerpt: String,
+    pub source: MemorySourceDto,
     pub privacy_classification: Option<String>,
     pub reveal_required: Option<bool>,
     pub verification_state: String,
@@ -352,6 +353,7 @@ struct MemoryRecord {
     relative_path: String,
     updated_at: String,
     updated_at_iso: String,
+    source: MemorySourceDto,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -639,6 +641,10 @@ impl MemoryRoot {
                     relative_path,
                     updated_at,
                     updated_at_iso,
+                    source: MemorySourceDto {
+                        kind: "coven-origin".to_string(),
+                        label: "Coven origin".to_string(),
+                    },
                 });
             }
         }
@@ -781,6 +787,7 @@ pub fn scan_memory(coven_home: &Path) -> Result<Vec<MemoryFileDto>> {
             updated_at: record.updated_at,
             updated_at_iso: record.updated_at_iso,
             excerpt,
+            source: record.source,
             privacy_classification: None,
             reveal_required: None,
             verification_state: "unknown".to_string(),
@@ -809,10 +816,7 @@ pub fn read_memory_detail(coven_home: &Path, id: &str) -> Result<Option<MemoryDe
         familiar_id: record.familiar_id,
         title: record.title,
         updated_at: record.updated_at_iso,
-        source: MemorySourceDto {
-            kind: "coven-origin".to_string(),
-            label: "Coven origin".to_string(),
-        },
+        source: record.source,
         content,
         content_format: "markdown".to_string(),
         privacy: MemoryPrivacyDto {
