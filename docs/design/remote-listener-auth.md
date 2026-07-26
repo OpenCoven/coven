@@ -17,7 +17,7 @@ Today the daemon's only trust boundary is same-user filesystem access to the
 Unix socket; the optional TCP listener is loopback-only and unauthenticated,
 and remote reachability is delegated to SSH or Tailscale
 ([Remote access](/daemon/remote-access)). That is the deliberate MVP posture —
-[AUTH.md](../AUTH.md) explicitly forbids tunneling the raw socket into a
+[AUTH.md](/AUTH) explicitly forbids tunneling the raw socket into a
 network service and calling it authenticated.
 
 This design adds the "separate auth design" AUTH.md calls for: an **opt-in
@@ -204,7 +204,7 @@ phone plus revoke covers rotation).
 
 - `crates/coven-cli/src/daemon.rs` — TCP transport, loopback guard,
   Host/Origin guard, timeouts, body caps, fail-closed uid checks.
-- [`docs/AUTH.md`](../AUTH.md) — current same-user posture and the explicit
+- [`docs/AUTH.md`](/AUTH) — current same-user posture and the explicit
   requirement that remote surfaces get a separate auth + pairing design.
 - [Remote access](/daemon/remote-access) — the tunnel patterns this design
   complements (and does not replace).
