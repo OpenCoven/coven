@@ -2201,8 +2201,8 @@ impl App {
     /// A session's exit finalizes its held fragment: EOF ends the line, so
     /// classify it as a complete line and surface it if it's assistant
     /// prose — a reply whose final line lacks a trailing newline must not
-    /// be eaten (#471). Kill paths drop the buffer instead (a cancelled
-    /// turn's half-line is noise), mirroring `stream_json_buffers`.
+    /// be eaten (#471). Kill paths surface any complete candidate rows but
+    /// still drop the cancelled turn's unfinished raw line.
     fn flush_pty_line_buffer(&mut self, session_id: &str) {
         let Some(mut state) = self.pty_line_buffers.remove(session_id) else {
             return;
@@ -2228,6 +2228,15 @@ impl App {
         self.flush_pty_visible(&mut visible, false);
     }
 
+    fn flush_pty_candidate_on_kill(&mut self, session_id: &str) {
+        let Some(mut state) = self.pty_line_buffers.remove(session_id) else {
+            return;
+        };
+        if !state.copilot_stats.is_empty() {
+            self.emit_agent_text(&state.copilot_stats.take_visible());
+        }
+    }
+
     fn push_event_message(&mut self, event: &store::EventRecord) {
         // Drop events from sessions we've decided to hide (today: failed
         // sessions whose stale-id we already auto-recovered from). Clear
@@ -2236,9 +2245,9 @@ impl App {
         if self.suppressed_session_ids.contains(&event.session_id) {
             if matches!(event.kind.as_str(), "exit" | "kill") {
                 self.suppressed_session_ids.remove(&event.session_id);
-                // The suppressed session may have buffered a partial line
-                // before it was hidden; its terminal event is the last
-                // chance to reclaim that memory (#471).
+                // The suppressed session may have buffered PTY state before
+                // it was hidden; its terminal event is the last chance to
+                // reclaim that memory (#471).
                 self.pty_line_buffers.remove(&event.session_id);
             }
             return;
@@ -2330,10 +2339,10 @@ impl App {
                 self.push_system_message(&format!("Session {status}."));
             }
             "kill" => {
-                // A cancelled turn's half-line is noise: drop the held
-                // fragment instead of flushing it (#471), mirroring the
-                // stream-JSON buffer teardown below.
-                self.pty_line_buffers.remove(&event.session_id);
+                // A cancelled turn's incomplete raw line is noise, but a
+                // bounded Copilot candidate contains complete cleaned lines
+                // and must fail open instead of disappearing.
+                self.flush_pty_candidate_on_kill(&event.session_id);
                 self.flush_pending_agent_buffer();
                 // Delegation call was cancelled by a kill event.
                 if let (Some(call_id), Some(home)) =
@@ -5396,6 +5405,70 @@ mod tests {
     }
 
     #[test]
+    fn kill_flushes_copilot_candidate_but_drops_the_unfinished_tail() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+        let candidate = concat!("Changes    +1 -1\n", "Requests   1 Premium (8s)\n",);
+
+        app.push_event_message(&output_event(
+            1,
+            "session-1",
+            &format!("{candidate}unfinished"),
+        ));
+        assert!(agent_text(&app).is_empty());
+
+        app.push_event_message(&terminal_event(2, "session-1", "kill"));
+
+        assert_eq!(agent_text(&app), candidate);
+        assert!(!agent_text(&app).contains("unfinished"));
+    }
+
+    #[test]
+    fn batched_kill_flushes_copilot_candidate_through_the_pending_sink() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.handle_slash_command("/stream off");
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+        app.is_responding = true;
+        let candidate = concat!("Changes    +1 -1\n", "Requests   1 Premium (8s)\n",);
+
+        app.push_event_message(&output_event(
+            1,
+            "session-1",
+            &format!("{candidate}unfinished"),
+        ));
+        assert!(agent_text(&app).is_empty());
+
+        app.push_event_message(&terminal_event(2, "session-1", "kill"));
+
+        assert_eq!(agent_text(&app), candidate);
+        assert!(!agent_text(&app).contains("unfinished"));
+    }
+
+    #[test]
+    fn batched_copilot_stats_shaped_prose_fails_open() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.handle_slash_command("/stream off");
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+        app.is_responding = true;
+        let reply = concat!(
+            "Changes    +1 -1\n",
+            "Requests   1 Premium (8s)\n",
+            "This table is part of the answer.\n",
+        );
+
+        app.push_event_message(&output_event(1, "session-1", reply));
+        app.push_event_message(&terminal_event(2, "session-1", "exit"));
+
+        assert_eq!(agent_text(&app), reply);
+    }
+
+    #[test]
     fn stats_shaped_prose_is_visible_for_non_copilot_harnesses() {
         for harness in ["codex", "claude", "grok", "custom"] {
             let client = RecordingChatClient::default();
@@ -5646,38 +5719,30 @@ mod tests {
         );
     }
 
-    /// Regression for #471: a copilot stats line split across two chunks
-    /// must still be recognized and hidden once complete; classifying the
-    /// halves as two complete lines leaked both fragments as prose.
+    /// A genuine terminal Copilot trailer stays hidden even when arbitrary
+    /// PTY read boundaries split its labels and values.
     #[test]
-    fn copilot_stats_line_split_across_chunks_is_still_hidden() {
-        let client = RecordingChatClient::with_session(test_session(
-            "session-1",
-            "copilot",
-            "Existing",
-            "running",
-        ));
-        client.events.borrow_mut().extend([
-            output_event(1, "session-1", "Done.\r\nChanges  "),
-            output_event(2, "session-1", "  +1 -1\r\nRequests   1 Premium (8s)\r\n"),
-        ]);
+    fn copilot_terminal_stats_trailer_is_hidden_across_pty_chunks() {
+        let client = RecordingChatClient::default();
         let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
 
-        app.handle_slash_command("/attach session-1");
+        for (seq, chunk) in [
+            "Answer.\nCha",
+            "nges    +1 -1\nRequests ",
+            "  1 Premium (8s)\nTokens     ↑ 28.0k",
+            " (20.4k cached) • ↓ 32\nRes",
+            "ume     copilot --resume=cb845dd4\n",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            app.push_event_message(&output_event(seq as i64 + 1, "session-1", chunk));
+        }
+        app.push_event_message(&terminal_event(6, "session-1", "exit"));
 
-        let agent_text = app
-            .messages
-            .iter()
-            .filter(|message| matches!(message.role, MessageRole::Agent))
-            .map(|message| message.content.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(agent_text.contains("Done."));
-        assert!(
-            !agent_text.contains("+1 -1"),
-            "a chunk-split stats line must still hide once complete: {agent_text}"
-        );
-        assert!(!agent_text.contains("Premium"));
+        assert_eq!(agent_text(&app), "Answer.\n");
     }
 
     /// Regression for #471: a held trailing fragment is finalized by the
@@ -5735,9 +5800,8 @@ mod tests {
         );
     }
 
-    /// Regression for #489: `/clear` wipes the transcript, so a PTY line
-    /// fragment held from before the clear must not resurface when the
-    /// session later exits and flushes it.
+    /// Regression for #489: `/clear` wipes the transcript, so buffered PTY
+    /// state from before the clear must not resurface on a later exit.
     #[test]
     fn clear_transcript_drops_held_pty_line_fragments() {
         let client = RecordingChatClient::with_session(test_session(
@@ -5749,35 +5813,28 @@ mod tests {
         client
             .events
             .borrow_mut()
-            .push(output_event(1, "session-1", "All done.\r\nResume"));
+            .push(output_event(1, "session-1", "Changes    +1 -1\r\n"));
         let (mut app, _) = app_with_client(client);
 
         app.handle_slash_command("/attach session-1");
         assert!(
             app.pty_line_buffers.contains_key("session-1"),
-            "the stats-shaped fragment must be held before the clear"
+            "the trailer candidate must be held before the clear"
         );
 
         app.clear_transcript();
         assert!(
             !app.pty_line_buffers.contains_key("session-1"),
-            "/clear must drop held PTY line fragments, as it drops stream JSON buffers"
+            "/clear must drop held PTY state, as it drops stream JSON buffers"
         );
 
-        app.push_event_message(&EventRecord {
-            seq: 2,
-            id: "event-exit".to_string(),
-            session_id: "session-1".to_string(),
-            kind: "exit".to_string(),
-            payload_json: serde_json::json!({ "status": "completed" }).to_string(),
-            created_at: "2026-05-19T00:00:00Z".to_string(),
-        });
+        app.push_event_message(&terminal_event(2, "session-1", "exit"));
 
         assert!(
             !app.messages
                 .iter()
-                .any(|message| message.content.contains("Resume")),
-            "a pre-clear fragment must not land in the cleared transcript: {:?}",
+                .any(|message| message.content.contains("Changes    +1 -1")),
+            "a pre-clear candidate must not land in the cleared transcript: {:?}",
             app.messages
                 .iter()
                 .map(|message| message.content.as_str())
@@ -5786,9 +5843,8 @@ mod tests {
     }
 
     /// `/new` keeps the transcript visible on purpose, and it does not kill
-    /// PTY sessions — so a held fragment there belongs to an in-flight line
-    /// that is still streaming into that same visible transcript. Dropping
-    /// it would lose the head of a line, so `/new` must keep it (#489).
+    /// PTY sessions — so buffered output still belongs to that same visible
+    /// transcript and `/new` must keep it (#489).
     #[test]
     fn start_new_conversation_keeps_held_pty_line_fragments() {
         let client = RecordingChatClient::with_session(test_session(
@@ -5800,7 +5856,7 @@ mod tests {
         client
             .events
             .borrow_mut()
-            .push(output_event(1, "session-1", "All done.\r\nResume"));
+            .push(output_event(1, "session-1", "Changes    +1 -1\r\n"));
         let (mut app, _) = app_with_client(client);
 
         app.handle_slash_command("/attach session-1");
@@ -5808,8 +5864,47 @@ mod tests {
 
         assert!(
             app.pty_line_buffers.contains_key("session-1"),
-            "/new keeps the transcript, so an in-flight line's head must survive"
+            "/new keeps the transcript, so the active candidate must survive"
         );
+    }
+
+    #[test]
+    fn suppressed_terminal_event_drops_copilot_candidate_without_displaying_it() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+
+        app.push_event_message(&output_event(1, "session-1", "Changes    +1 -1\n"));
+        assert!(app.pty_line_buffers.contains_key("session-1"));
+        app.suppressed_session_ids.insert("session-1".to_string());
+
+        app.push_event_message(&terminal_event(2, "session-1", "exit"));
+
+        assert!(!app.pty_line_buffers.contains_key("session-1"));
+        assert!(!app.suppressed_session_ids.contains("session-1"));
+        assert!(agent_text(&app).is_empty());
+    }
+
+    #[test]
+    fn copilot_stats_candidate_storage_stays_bounded() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+
+        app.push_event_message(&output_event(
+            1,
+            "session-1",
+            &format!("{COPILOT_STATS_TRAILER}\n\n\n"),
+        ));
+
+        let state = app
+            .pty_line_buffers
+            .get("session-1")
+            .expect("complete trailer candidate");
+        assert_eq!(state.copilot_stats.lines.len(), 4);
+        assert!(state.copilot_stats.trailing_blank);
     }
 
     /// Regression for #471 × #469: a CR-overwrite sequence split across
