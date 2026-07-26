@@ -47,14 +47,13 @@ enum AgentOutputMode {
 /// filter (#471). See the `pty_line_buffers` field.
 #[derive(Debug, Default)]
 struct PtyLineBuffer {
-    /// Raw text of the current line that hasn't seen its newline yet and
-    /// couldn't be shown: it might still turn into a marker/stats line.
+    /// Raw text of the current line, including any head already rendered.
+    /// Keeping the contiguous raw line lets CR, backspace, and ANSI escapes
+    /// re-clean correctly across arbitrary PTY read boundaries (#486/#488).
     tail: String,
-    /// True when the head of the current line was already shown as prose
-    /// (it could no longer become a marker line). The rest of that line
-    /// must then be shown verbatim when it completes — re-classifying the
-    /// remainder as a line of its own would misread it.
-    head_emitted: bool,
+    /// Number of cleaned chars from `tail` already appended to the current
+    /// agent bubble. Continuations re-clean `tail` and reconcile this prefix.
+    emitted_len: usize,
 }
 
 /// Whether an appended chunk of agent output starts a new assistant
@@ -1945,6 +1944,52 @@ impl App {
         }
     }
 
+    fn retract_agent_text(&mut self, chars: usize) {
+        if chars == 0 {
+            return;
+        }
+        let sender = self.active_agent_label().to_string();
+        if self.streaming_mode.is_live() {
+            if let Some(last) = self.messages.last_mut() {
+                if matches!(last.role, MessageRole::Agent) && last.sender == sender {
+                    truncate_suffix_chars(&mut last.content, chars);
+                }
+            }
+        } else if let Some((pending_sender, buffer)) = self.pending_agent_buffer.as_mut() {
+            if pending_sender == &sender {
+                truncate_suffix_chars(buffer, chars);
+            }
+        }
+    }
+
+    fn flush_pty_visible(&mut self, visible: &mut String, force: bool) {
+        let has_structure = visible.chars().any(|ch| ch == '\n' || !ch.is_whitespace());
+        if force || has_structure {
+            self.emit_agent_text(visible);
+        }
+        visible.clear();
+    }
+
+    fn reconcile_pre_emitted_pty_line(
+        &mut self,
+        state: &mut PtyLineBuffer,
+        old_cleaned: &str,
+        new_cleaned: &str,
+        visible: &mut String,
+    ) -> bool {
+        let old_emitted = take_chars(old_cleaned, state.emitted_len);
+        let common = common_prefix_chars(&old_emitted, new_cleaned);
+        if common < state.emitted_len {
+            self.flush_pty_visible(visible, false);
+            self.retract_agent_text(state.emitted_len - common);
+        }
+        let suffix = skip_chars(new_cleaned, common);
+        let emitted_payload = !suffix.is_empty();
+        visible.push_str(&suffix);
+        state.emitted_len = new_cleaned.chars().count();
+        emitted_payload
+    }
+
     /// PTY analogue of `dispatch_stream_json_output`'s buffering (#471):
     /// output events are raw 8KiB PTY reads, so a chunk's last line
     /// usually lacks its newline. Classifying that fragment as a complete
@@ -1958,23 +2003,37 @@ impl App {
         let codex_markers = self.active_session_emits_codex_markers();
         let mut state = self.pty_line_buffers.remove(session_id).unwrap_or_default();
         let mut visible = String::new();
+        let mut force_emit_visible = false;
         let mut rest = data;
 
-        // A line whose head was already shown is known prose: emit the
-        // remainder up to its newline verbatim, then resume classifying.
-        if state.head_emitted {
+        // A pre-emitted line is already known prose. Re-clean the whole raw
+        // line on every continuation so CR/backspace/escape state can rewrite
+        // the already-rendered bubble instead of accumulating frames (#486).
+        if state.emitted_len > 0 {
+            let old_cleaned = clean_terminal_output_text(&state.tail);
             match rest.find('\n') {
                 Some(idx) => {
-                    if let Some(text) = clean_terminal_output(&rest[..=idx]) {
-                        visible.push_str(&text);
-                    }
-                    state.head_emitted = false;
+                    state.tail.push_str(&rest[..=idx]);
+                    let new_cleaned = clean_terminal_output_text(&state.tail);
+                    force_emit_visible |= self.reconcile_pre_emitted_pty_line(
+                        &mut state,
+                        &old_cleaned,
+                        &new_cleaned,
+                        &mut visible,
+                    );
+                    state.tail.clear();
+                    state.emitted_len = 0;
                     rest = &rest[idx + 1..];
                 }
                 None => {
-                    if let Some(text) = clean_terminal_output(rest) {
-                        visible.push_str(&text);
-                    }
+                    state.tail.push_str(rest);
+                    let new_cleaned = clean_terminal_output_text(&state.tail);
+                    force_emit_visible |= self.reconcile_pre_emitted_pty_line(
+                        &mut state,
+                        &old_cleaned,
+                        &new_cleaned,
+                        &mut visible,
+                    );
                     rest = "";
                 }
             }
@@ -1998,31 +2057,26 @@ impl App {
         }
 
         // Show the fragment now if it provably can't become a marker line;
-        // otherwise hold it for the next chunk (or the exit flush). A fragment
-        // ending in a bare `\r` is also held: it may be half of a split `\r\n`
-        // or a progress frame the next chunk overwrites, and emitting its head
-        // now would glue the discarded frame onto the final one.
+        // otherwise hold it for the next chunk (or the exit flush). The raw
+        // tail stays even after pre-emission so a later `\r`, backspace, or
+        // split escape can retract/rewrite this line.
         if !state.tail.is_empty()
-            && !state.tail.ends_with('\r')
             && self.agent_output_mode != AgentOutputMode::Hidden
+            && state.emitted_len == 0
         {
             let displayable = clean_terminal_output(&state.tail)
                 .filter(|text| !partial_line_may_become_marker(text.trim(), codex_markers));
             if let Some(text) = displayable {
                 visible.push_str(&text);
-                state.tail.clear();
-                state.head_emitted = true;
+                state.emitted_len = text.chars().count();
             }
         }
 
-        if !state.tail.is_empty() || state.head_emitted {
+        if !state.tail.is_empty() || state.emitted_len > 0 {
             self.pty_line_buffers.insert(session_id.to_string(), state);
         }
 
-        let has_structure = visible.chars().any(|ch| ch == '\n' || !ch.is_whitespace());
-        if has_structure {
-            self.emit_agent_text(&visible);
-        }
+        self.flush_pty_visible(&mut visible, force_emit_visible);
     }
 
     /// A session's exit finalizes its held fragment: EOF ends the line, so
@@ -2035,6 +2089,9 @@ impl App {
             return;
         };
         if state.tail.is_empty() {
+            return;
+        }
+        if state.emitted_len > 0 {
             return;
         }
         let classified = if self.active_session_emits_codex_markers() {
@@ -2756,7 +2813,37 @@ fn segment_separator(existing: &str) -> &'static str {
     }
 }
 
-fn clean_terminal_output(data: &str) -> Option<String> {
+fn take_chars(text: &str, count: usize) -> String {
+    text.chars().take(count).collect()
+}
+
+fn skip_chars(text: &str, count: usize) -> String {
+    text.chars().skip(count).collect()
+}
+
+fn common_prefix_chars(left: &str, right: &str) -> usize {
+    left.chars()
+        .zip(right.chars())
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn truncate_suffix_chars(text: &mut String, count: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    let char_count = text.chars().count();
+    let remove_count = count.min(char_count);
+    let keep_count = char_count - remove_count;
+    if keep_count == 0 {
+        text.clear();
+    } else if let Some((byte_idx, _)) = text.char_indices().nth(keep_count) {
+        text.truncate(byte_idx);
+    }
+    remove_count
+}
+
+fn clean_terminal_output_text(data: &str) -> String {
     let mut output = String::new();
     let mut chars = data.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -2792,7 +2879,11 @@ fn clean_terminal_output(data: &str) -> Option<String> {
             ch => output.push(ch),
         }
     }
+    output
+}
 
+fn clean_terminal_output(data: &str) -> Option<String> {
+    let output = clean_terminal_output_text(data);
     // Newlines carry paragraph-break structure even when nothing visible
     // surrounds them, so keep any chunk that has a newline OR any
     // non-whitespace char. Drop only space/tab-only or fully empty chunks —
@@ -3253,6 +3344,15 @@ mod tests {
             payload_json: serde_json::json!({ "data": data }).to_string(),
             created_at: "2026-05-19T00:00:00Z".to_string(),
         }
+    }
+
+    fn agent_text(app: &App) -> String {
+        app.messages
+            .iter()
+            .filter(|message| matches!(message.role, MessageRole::Agent))
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Build a stream-json `{"type":"system","subtype":"stderr","text":...}\n`
@@ -5338,6 +5438,166 @@ mod tests {
             !agent_text.contains("10%"),
             "the overwritten frame must not be glued onto the final one: {agent_text}"
         );
+    }
+
+    /// Regression for #486: progress bars commonly write frames as
+    /// `\rFrame N`, so the CR arrives at the start of the next PTY read.
+    #[test]
+    fn cr_leading_progress_frames_retract_pre_emitted_frames() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+
+        for (seq, chunk) in [
+            "\rProgress:  10%",
+            "\rProgress:  50%",
+            "\rProgress: 100%",
+            "\rProgress: done\r\n",
+        ]
+        .iter()
+        .enumerate()
+        {
+            app.push_event_message(&output_event((seq as i64) + 1, "session-1", chunk));
+        }
+
+        assert_eq!(agent_text(&app), "Progress: done\n");
+    }
+
+    /// Regression for #486: a second chunk that starts with CR must replace
+    /// the line head that was already streamed to the agent bubble.
+    #[test]
+    fn cr_at_start_of_second_chunk_retracts_prior_frame() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+
+        app.push_event_message(&output_event(1, "session-1", "Downloading 10%"));
+        app.push_event_message(&output_event(2, "session-1", "\rDownloading 100%\r\n"));
+
+        assert_eq!(agent_text(&app), "Downloading 100%\n");
+    }
+
+    /// Regression for #486: a CR can be isolated in its own PTY read between
+    /// the pre-emitted frame and the replacement frame.
+    #[test]
+    fn cr_alone_between_chunks_retracts_prior_frame() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+
+        app.push_event_message(&output_event(1, "session-1", "Downloading 10%"));
+        app.push_event_message(&output_event(2, "session-1", "\r"));
+        app.push_event_message(&output_event(3, "session-1", "Downloading 100%\n"));
+
+        assert_eq!(agent_text(&app), "Downloading 100%\n");
+    }
+
+    /// Regression for #486: backspaces in a continuation chunk apply to the
+    /// already-rendered head of the same raw line.
+    #[test]
+    fn backspace_across_chunks_retracts_pre_emitted_text() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+
+        app.push_event_message(&output_event(1, "session-1", "helo"));
+        app.push_event_message(&output_event(2, "session-1", "\x08\x08lo\n"));
+
+        assert_eq!(agent_text(&app), "helo\n");
+    }
+
+    /// Regression for #487: spaces-only continuation chunks are payload once
+    /// a line head has already been emitted.
+    #[test]
+    fn whitespace_only_continuation_chunk_is_preserved() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+
+        app.push_event_message(&output_event(1, "session-1", "col1"));
+        app.push_event_message(&output_event(2, "session-1", "   "));
+        app.push_event_message(&output_event(3, "session-1", "col2\n"));
+
+        assert_eq!(agent_text(&app), "col1   col2\n");
+    }
+
+    /// Regression for #488: ANSI escape state must effectively survive PTY
+    /// read boundaries by re-cleaning the whole raw line.
+    #[test]
+    fn split_ansi_escape_does_not_leak_parameter_bytes() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+
+        app.push_event_message(&output_event(1, "session-1", "plain \x1b["));
+        app.push_event_message(&output_event(2, "session-1", "1mBold\x1b[0m\n"));
+
+        assert_eq!(agent_text(&app), "plain Bold\n");
+    }
+
+    /// Regression for #486: the same retraction path must edit the pending
+    /// batched buffer before it is flushed on session exit.
+    #[test]
+    fn batched_streaming_retracts_pre_emitted_pty_line() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.handle_slash_command("/stream off");
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+        app.is_responding = true;
+
+        app.push_event_message(&output_event(1, "session-1", "Downloading 10%"));
+        app.push_event_message(&output_event(2, "session-1", "\rDownloading 100%\n"));
+        app.push_event_message(&EventRecord {
+            seq: 3,
+            id: "event-3".to_string(),
+            session_id: "session-1".to_string(),
+            kind: "exit".to_string(),
+            payload_json: serde_json::json!({ "status": "completed" }).to_string(),
+            created_at: "2026-05-19T00:00:00Z".to_string(),
+        });
+
+        assert_eq!(agent_text(&app), "Downloading 100%\n");
+    }
+
+    /// Regression for #486: retraction is char-based, so multi-byte UTF-8
+    /// frames cannot be split at an invalid byte boundary.
+    #[test]
+    fn multibyte_utf8_retraction_does_not_split_codepoints() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+
+        app.push_event_message(&output_event(1, "session-1", "🧙 progress 10%"));
+        app.push_event_message(&output_event(2, "session-1", "\r✅ done\n"));
+
+        assert_eq!(agent_text(&app), "✅ done\n");
+    }
+
+    /// Regression guard for #471 while fixing #486-#488: marker-shaped
+    /// fragments must still be held instead of pre-emitted.
+    #[test]
+    fn marker_shaped_fragment_is_still_held_until_complete() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("codex".to_string());
+
+        app.push_event_message(&output_event(1, "session-1", "cod"));
+        assert!(
+            agent_text(&app).is_empty(),
+            "marker-shaped head must not be pre-emitted"
+        );
+
+        app.push_event_message(&output_event(2, "session-1", "ex\nVisible answer\n"));
+        assert_eq!(agent_text(&app), "Visible answer\n");
     }
 
     #[test]
