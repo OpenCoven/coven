@@ -1464,7 +1464,7 @@ impl ExternalHarnessAdapterSpec {
         if self
             .model_arg_template
             .as_deref()
-            .is_some_and(|template| !template.contains("{model}"))
+            .is_some_and(|template| !template.trim().is_empty() && !template.contains("{model}"))
         {
             anyhow::bail!(
                 "external harness adapter `{id}` in {} has a model_arg_template \
@@ -4506,6 +4506,28 @@ mod tests {
                 .to_string();
         assert!(error.contains("model_arg_template"), "{error}");
         assert!(error.contains("{model}"), "{error}");
+    }
+
+    #[test]
+    fn external_blank_model_arg_template_is_absent() -> anyhow::Result<()> {
+        let raw = r#"{
+          "adapters": [{
+            "id": "future",
+            "label": "Future",
+            "executable": "future",
+            "interactive_prompt_prefix_args": [],
+            "non_interactive_prompt_prefix_args": [],
+            "install_hint": "Install Future.",
+            "model_arg_template": "   ",
+            "capabilities": {}
+          }]
+        }"#;
+
+        let parsed =
+            parse_external_harness_specs(raw, Path::new("future.json"), &built_in_harness_specs())?;
+        assert!(parsed[0].model_arg_template.is_none());
+        assert!(!parsed[0].supports_model());
+        Ok(())
     }
 
     #[test]
