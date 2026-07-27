@@ -203,7 +203,7 @@ mod tests {
     fn system_event_wire_shape() {
         let event = Event::System(System {
             subtype: "init".into(),
-            cwd: "/Users/example/project".into(),
+            cwd: "/workspace/example-project".into(),
             session_id: "s1".into(),
             tools: vec!["bash".into(), "read_file".into()],
             agent_mode: Some("plan".into()),
@@ -216,7 +216,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(v["type"], "system");
         assert_eq!(v["subtype"], "init");
-        assert_eq!(v["cwd"], "/Users/example/project");
+        assert_eq!(v["cwd"], "/workspace/example-project");
         assert_eq!(v["tools"][0], "bash");
         assert_eq!(v["agent_mode"], "plan");
         assert_eq!(v["model"], "anthropic/claude-sonnet-4");
