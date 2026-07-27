@@ -166,6 +166,15 @@ is covered only by a separate account-activation decision tied to the exact bot
 ID, transport, API root, and config revision. Psyche rejects a missing, stale,
 mismatched, or unknown decision.
 
+An intentional familiar identity change is not an ordinary hot reload. Psyche
+blocks the affected routes when any protected identity input or Ward revision
+changes and requires an audited, Coven-authorized rebind before those routes
+can reactivate. The rebind records the old and new aggregate/input digests,
+Ward revisions, familiar and project bindings, requesting operator, reason,
+and affected conversation set. Existing sessions remain bound to the old
+identity and are never resumed under the new identity; new turns receive new
+conversation/session bindings after the rebind commits.
+
 ## Core journeys
 
 ### First account setup
@@ -432,7 +441,8 @@ for the required 1,000 updates.
 | Gate | Entry evidence | Exit threshold |
 |---|---|---|
 | G0 - Design | These four documents are complete. | Val records explicit design approval on `coven-psy0`. |
-| G1 - Contract | Original Rust schemas, storage migrations, and Coven profile exist. | All schema/contract tests pass; per-effect authorization, identity-digest binding, and idempotent turn adoption pass; unknown and missing capabilities fail closed. |
+| G1a - Contract | Original Rust schemas, storage migrations, and Coven profile exist. | All fake-service schema/contract tests pass; per-effect authorization, identity-digest binding/rebind, and idempotent turn adoption pass; capability-present-but-denied, unknown/missing capability, and Coven mid-flight termination/stall fail closed with no local authority fallback. |
+| G1b - Real-Coven conformance | G1a passes and the required Coven contracts are implemented. | Before `coven-psy2`, the complete profile and negative authority-loss suite pass against a real Coven daemon; merging contract code or passing only the fake service is insufficient. |
 | G2 - Reliability | Fake Telegram and Coven services plus crash injection exist. | 100% durable-ack, ordering, retry, and restart cases pass in 20 consecutive CI runs. |
 | G3 - Live test account | Dedicated non-production bot, DMs, groups, and topics are configured. | Every required parity row marked `L` passes twice on two Telegram client families; zero security-critical findings. |
 | G4 - Canary | One operator-owned account runs Psyche without a shared production token. | Seven consecutive days at the service objectives and at least 1,000 updates with zero unauthorized dispatches. |

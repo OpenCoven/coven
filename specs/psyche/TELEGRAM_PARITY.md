@@ -217,6 +217,8 @@ permissive fallback would create risk.
 | O-14 | Signed/checksummed npm native distribution | Required | I,S,O | Canonical package is `@opencoven/psyche`. |
 | O-15 | Bot API upgrade compatibility gate | Required | U,I,L | Unknown update kinds are classified; new behavior needs review and proof. |
 | O-16 | Coven-minted local operator context | Required | U,I,S,O | CLI sends and local pairing decisions cannot self-assert principal authority. |
+| O-17 | Audited familiar identity rebind | Required | I,C,S,O | Changed protected identity inputs block routes until Coven advertises and adopts a versioned old/new binding migration, fences the old binding, and resolves/quarantines unknown adoptions; old sessions never resume under the new identity. |
+| O-18 | Real-Coven authority-loss conformance gate | Required | I,C,S | Before identity/session integration, capability-present-but-denied and mid-flight Coven termination/stall prove there is no local authority fallback. |
 
 ## Completion rule
 

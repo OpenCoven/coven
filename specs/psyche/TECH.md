@@ -362,6 +362,50 @@ Coven returns the canonical comparison as `coven.identity_binding.v1`:
 Missing or additional protected inputs, digest disagreement, an unknown schema
 version, or a changed Ward revision blocks route activation.
 
+### Familiar identity rebind
+
+An intentional change to any protected familiar identity input is a controlled
+security migration, not a permissive reload. File watching may detect the
+change, but detection only moves every affected route to `blocked` with
+`identity_changed`; it grants no authority to adopt the new identity.
+
+Reactivation requires the operator to invoke the versioned
+`coven.familiar.identityRebind.v1` control action through
+`coven.control.actions` using a current `coven.operatorIdentity.v1` context.
+Coven is authoritative for policy and approval. The request contains:
+
+- canonical familiar ID and project binding;
+- old and proposed `psyche.identity_snapshot.v1` input and aggregate digests;
+- old and proposed Ward revisions;
+- affected route and conversation IDs;
+- every `coven_adoption_unknown` client intent ID under the old binding;
+- a human-supplied reason and client intent ID; and
+- a digest of the exact proposed rebind record.
+
+Psyche first stops new admissions for the affected routes and waits for every
+lane to reach a durable local boundary. A rebind is rejected while a known turn
+submission, output adoption, approval, callback, or Telegram delivery remains
+active. A `delivery_unknown` must first use its normal audited resolution path.
+A `coven_adoption_unknown` row is already a durable local boundary, but it does
+not authorize rebind locally: Coven must atomically resolve or quarantine every
+listed intent, fence the old familiar/identity/Ward binding from new input, and
+guarantee that no adopted old-bound session can continue before allowing the
+rebind. If Coven cannot prove that fence, the route remains blocked.
+
+After Coven returns an adopted allow result bound to every request field and
+the old-binding fence, Psyche atomically archives the old
+route-to-conversation bindings, invalidates pairings and callback nonces whose
+policy/identity binding changed, records the old/new snapshots, intent
+dispositions, and Coven correlation IDs in the audit ledger, and activates the
+new snapshot. Existing Coven sessions remain permanently bound to the old
+identity digest and Ward revision; they may be inspected or terminated but
+never resumed or receive input under the new identity. The next accepted turn
+creates a new conversation generation and session binding.
+
+Lost rebind responses use the same client-intent adoption lookup discipline as
+turns. An inconclusive result leaves the route blocked; Psyche never repeats
+the action with another digest or locally declares the new identity active.
+
 ### Coven turn intent
 
 `psyche.coven_turn.v1` is an internal request record, not a replacement for the
@@ -863,7 +907,7 @@ Psyche never assumes an endpoint is authorized merely because it exists.
 | `coven.sessions.familiarBinding.v1` | Bind and return familiar ID, identity digest, and Ward revision on sessions. |
 | `coven.sessions.idempotency.v1` | Adopt launch/input once by client intent ID and expose adoption lookup. |
 | `coven.psyche.authorize.v1` | Return a per-effect `coven.psyche_decision.v1`; capability presence alone grants nothing. |
-| `coven.control.actions` | Accept only advertised versioned action IDs through the daemon policy boundary. |
+| `coven.control.actions` | Accept only advertised versioned action IDs through the daemon policy boundary, including `coven.familiar.identityRebind.v1`; absence of that action blocks route activation as `coven_capability_missing`. |
 
 The current Coven API exposes familiar reads and familiar-bound session
 records, but not all of these are advertised in the health capability block.
@@ -1460,7 +1504,14 @@ rate limits, media, callbacks, topics, and malformed HTTP responses. A fake
 Coven Unix-socket service verifies health negotiation, capability profiles,
 structured errors, full identity binding, idempotent adoption and lookup,
 per-effect policy decisions, channel-artifact streaming, event cursors, policy
-denials, and approval flows.
+denials, capability-present-but-denied behavior, identity rebind adoption, and
+approval flows. Every denial test asserts that no session, Telegram request, or
+local authority fallback occurs.
+
+Before `coven-psy2` begins, the complete required capability profile and these
+negative authorization cases must pass the same conformance suite against a
+real Coven daemon build. Merging the Coven contract changes or passing only the
+fake service is insufficient evidence for this checkpoint.
 
 ### Crash tests
 
@@ -1472,6 +1523,11 @@ The test runner terminates the process at each durable boundary:
 - during lane lease refresh;
 - before and after Coven session/input adoption, including a lost response and
   adoption lookup;
+- while Coven terminates or stalls after capability discovery, authorization,
+  rebind adoption, and turn/input submission, proving the affected route or lane
+  blocks without local fallback;
+- with a pre-existing `coven_adoption_unknown`, proving Coven either fences and
+  quarantines the old binding before rebind or leaves the route blocked;
 - before and after atomic Coven output-event/effect/cursor adoption;
 - before send, after request write, and after Telegram response;
 - during preview edit/finalize; and
@@ -1552,4 +1608,8 @@ explicit design approval. The technical design is complete when:
 5. identity disagreement blocks dispatch;
 6. non-idempotent Telegram ambiguity is represented honestly;
 7. storage, retention, testing, migration, and rollback are measurable; and
-8. the parity ledger maps every required behavior to test evidence.
+8. the parity ledger maps every required behavior to test evidence;
+9. intentional familiar identity changes use an audited Coven-authorized
+   rebind and never resume an old session under a new identity; and
+10. `coven-psy2` is gated on real-Coven conformance for the complete required
+    capability profile, explicit denials, and mid-flight authority loss.
