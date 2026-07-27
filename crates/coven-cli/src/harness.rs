@@ -444,7 +444,11 @@ impl HarnessCommandSpec {
 /// through unchanged.
 pub fn normalize_model_id(model: &str) -> &str {
     match model.split_once('/') {
-        Some((provider, rest)) if !provider.is_empty() && !rest.is_empty() => rest,
+        Some((provider, rest))
+            if !provider.is_empty() && !rest.is_empty() && !rest.starts_with('/') =>
+        {
+            rest
+        }
         _ => model,
     }
 }
@@ -4394,6 +4398,7 @@ mod tests {
         // Degenerate leading/trailing slash is left as-is rather than emptied.
         assert_eq!(normalize_model_id("/gpt"), "/gpt");
         assert_eq!(normalize_model_id("gpt/"), "gpt/");
+        assert_eq!(normalize_model_id("openai//gpt"), "openai//gpt");
     }
 
     #[test]
