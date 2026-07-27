@@ -34,8 +34,8 @@ pub struct System {
     pub agent_mode: Option<String>,
     /// The model the session was launched on, echoed back so clients (Cave) can
     /// confirm acceptance and render `applied` vs `pending`. Carries the id
-    /// exactly as requested on `coven run --model` (namespaced form preserved,
-    /// e.g. `anthropic/claude-…`); `None` when no `--model` was passed.
+    /// exactly as requested on `coven run --model` (provider-qualified form
+    /// preserved, e.g. `anthropic/claude-…`); `None` when no `--model` was passed.
     pub model: Option<String>,
     /// The sandbox/permission policy the session was launched with, echoed back
     /// so clients (Cave) can confirm the Access chip was enforced. Canonical
