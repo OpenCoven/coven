@@ -385,18 +385,24 @@ impl HarnessCommandSpec {
     /// applying its declared provider-prefix transform first. Returns an empty
     /// vec when the harness declares no model mechanism (caller decides whether
     /// to warn).
-    pub fn model_args(&self, model: &str) -> Vec<String> {
+    pub fn model_args(&self, model: &str) -> Result<Vec<String>> {
         let transformed = match self.model_id_transform {
             ModelIdTransform::StripProvider => normalize_model_id(model),
             ModelIdTransform::Preserve => model,
         };
+        if self.supports_model() && !is_safe_model_arg(transformed) {
+            return Err(anyhow!(
+                "model id is unsafe after adapter transform for harness `{}`",
+                self.id
+            ));
+        }
         if let Some(template) = self.model_arg_template.as_deref() {
-            return expand_model_template(template, transformed);
+            return Ok(expand_model_template(template, transformed));
         }
         if let Some(flag) = self.model_flag.as_deref() {
-            return vec![flag.to_string(), transformed.to_string()];
+            return Ok(vec![flag.to_string(), transformed.to_string()]);
         }
-        Vec::new()
+        Ok(Vec::new())
     }
 
     /// Whether this harness declares any way to enforce a sandbox/permission
@@ -451,6 +457,19 @@ pub fn normalize_model_id(model: &str) -> &str {
         }
         _ => model,
     }
+}
+
+/// Model values are passed as process argv, but some runtimes parse a
+/// flag-shaped value as another option even when it follows `--model`.
+/// Validate after the adapter transform so `provider/--flag` cannot bypass
+/// this boundary by becoming `--flag` only after prefix stripping.
+fn is_safe_model_arg(model: &str) -> bool {
+    let mut chars = model.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_alphanumeric())
+        && !model.contains("..")
+        && chars.all(|ch| {
+            ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | ':' | '/' | '@' | '+' | '-')
+        })
 }
 
 /// Expand a `model_arg_template` into argv tokens: split on whitespace, then
@@ -1784,7 +1803,7 @@ fn command_parts_with_specs(
     // ahead of the prompt positional. Adapters that declare no model mechanism
     // yield no args (the run layer warns); a blank/missing model is a no-op.
     let model_args: Vec<String> = match options.normalized_model() {
-        Some(m) if !m.is_empty() => spec.model_args(m),
+        Some(m) if !m.is_empty() => spec.model_args(m)?,
         _ => Vec::new(),
     };
     // Sandbox/permission policy forwards to the harness's native flag ahead of
@@ -2795,7 +2814,10 @@ mod tests {
         assert_eq!(grok.prompt_flag.as_deref(), Some("--single"));
         assert_eq!(grok.interactive_prompt_flag.as_deref(), Some("--single"));
         assert_eq!(grok.system_prompt_flag.as_deref(), Some("--rules"));
-        assert_eq!(grok.model_args("xai/grok-build"), ["--model", "grok-build"]);
+        assert_eq!(
+            grok.model_args("xai/grok-build")?,
+            ["--model", "grok-build"]
+        );
         assert_eq!(
             grok.prompt_args("fix tests", HarnessLaunchMode::NonInteractive),
             [
@@ -2974,7 +2996,7 @@ mod tests {
         assert_eq!(opencode.prompt_flag, None);
         assert_eq!(opencode.system_prompt_flag, None);
         assert_eq!(
-            opencode.model_args("anthropic/claude-sonnet-4-5"),
+            opencode.model_args("anthropic/claude-sonnet-4-5")?,
             ["--model", "anthropic/claude-sonnet-4-5"]
         );
         // Non-interactive one-shots ride `opencode run` with the prompt as a
@@ -4402,6 +4424,73 @@ mod tests {
     }
 
     #[test]
+    fn transformed_model_ids_cannot_become_runtime_flags() -> anyhow::Result<()> {
+        let specs = built_in_harness_specs();
+        for requested in ["provider/--sandbox", "provider/--allow-all"] {
+            let error = command_parts_in_specs(
+                &specs,
+                "codex",
+                "fix tests",
+                HarnessLaunchMode::NonInteractive,
+                None,
+                None,
+                HarnessLaunchOptions {
+                    model: Some(requested),
+                    ..Default::default()
+                },
+            )
+            .expect_err("a flag-shaped post-transform model must be rejected");
+            assert!(
+                error.to_string().contains("unsafe after adapter transform"),
+                "{requested}: {error}"
+            );
+        }
+
+        let (_, args) = command_parts_in_specs(
+            &specs,
+            "codex",
+            "fix tests",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            None,
+            HarnessLaunchOptions {
+                model: Some("openai//gpt"),
+                ..Default::default()
+            },
+        )?;
+        let model_flag = args
+            .iter()
+            .position(|arg| arg == "--model")
+            .expect("Codex model flag");
+        assert_eq!(args[model_flag + 1], "openai//gpt");
+        Ok(())
+    }
+
+    #[test]
+    fn model_argv_safety_contract_matches_cave() {
+        for model in [
+            "gpt-5.6-sol",
+            "openai/gpt-5.6-sol",
+            "openai//gpt",
+            "provider/team/model@stable+fast:v2",
+        ] {
+            assert!(is_safe_model_arg(model), "{model}");
+        }
+        for model in [
+            "",
+            "--sandbox",
+            "../model",
+            "provider/../model",
+            "model name",
+            "model\n--allow-all",
+            "model=value",
+            "☃",
+        ] {
+            assert!(!is_safe_model_arg(model), "{model:?}");
+        }
+    }
+
+    #[test]
     fn built_in_model_id_transforms_match_runtime_contract() {
         use coven_runtime_spec::ModelIdTransform;
 
@@ -4539,7 +4628,7 @@ mod tests {
                 .unwrap();
             assert!(spec.supports_model(), "{id} should support --model");
             assert_eq!(
-                spec.model_args("anything"),
+                spec.model_args("anything").expect("safe built-in model"),
                 vec!["--model".to_string(), "anything".to_string()]
             );
         }
@@ -4553,7 +4642,8 @@ mod tests {
             .expect("coven-code spec");
 
         assert_eq!(
-            spec.model_args("anthropic/claude-sonnet-4"),
+            spec.model_args("anthropic/claude-sonnet-4")
+                .expect("safe provider-qualified model"),
             ["--model", "anthropic/claude-sonnet-4"]
         );
     }
@@ -5278,7 +5368,7 @@ mod tests {
         );
 
         assert!(!spec.supports_model());
-        assert!(spec.model_args("openai/gpt-5.5").is_empty());
+        assert!(spec.model_args("openai/gpt-5.5")?.is_empty());
         assert_eq!(
             parts?,
             (
