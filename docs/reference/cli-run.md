@@ -22,7 +22,7 @@ coven run <harness> <prompt> [flags]
 | `--add-dir <path>` | Grant the harness access to an additional directory beyond its cwd; repeat the flag for multiple directories. Maps to each harness's native trust flag (`--add-dir` for codex, claude, copilot, and coven-code). Harnesses with no add-dir mechanism warn and continue. |
 | `--title <text>` | Store a readable session title. |
 | `--model <id>` | Forward a model override through the adapter's declared transform. `strip_provider` (the legacy default) removes the first provider segment; `preserve` forwards the provider-qualified id unchanged. |
-| `--think` | Request deeper reasoning. Claude maps this to `--effort high`; unsupported harnesses warn and continue. |
+| `--think` | Request deeper reasoning. Claude, Coven Code, and Copilot map this to `--effort high`; unsupported harnesses warn and continue. |
 | `--speed <level>` | Set a latency/reasoning hint: `fast`, `balanced`, or `thorough`. Claude, Coven Code, and Copilot map these to `--effort low`, `medium`, or `high`; unsupported harnesses warn and continue. |
 | `--detach` | Create the session record without launching the harness. |
 | `--continue [id]` | Resume a specific session, or the latest active session for this project when `id` is omitted. |
