@@ -4,7 +4,10 @@ use std::io::Write;
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex, Weak,
+};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -82,7 +85,7 @@ impl std::error::Error for NotLiveError {}
 #[derive(Default)]
 pub struct LiveSessionRuntime {
     coven_home: Option<PathBuf>,
-    sessions: Mutex<HashMap<String, LiveSessionHandle>>,
+    sessions: Arc<Mutex<HashMap<String, LiveSessionHandle>>>,
 }
 
 /// What kind of underlying process is bound to a registered live session.
@@ -104,15 +107,66 @@ enum LiveSessionKind {
 /// including a concurrent `/kill` to recover).
 struct LiveSessionHandle {
     kind: LiveSessionKind,
-    input: std::sync::Arc<Mutex<Box<dyn Write + Send>>>,
-    killer: std::sync::Arc<Mutex<Box<dyn RuntimeKiller>>>,
+    input: Arc<Mutex<Box<dyn Write + Send>>>,
+    killer: Arc<Mutex<Box<dyn RuntimeKiller>>>,
+    registration: Arc<LiveSessionRegistration>,
+}
+
+#[derive(Default)]
+struct LiveSessionRegistration {
+    exited: AtomicBool,
+}
+
+struct LiveSessionExitCleanup {
+    session_id: String,
+    sessions: Weak<Mutex<HashMap<String, LiveSessionHandle>>>,
+    registration: Arc<LiveSessionRegistration>,
+}
+
+impl LiveSessionExitCleanup {
+    fn mark_exited(&self) {
+        self.mark_exited_with_poison_reporter(|| {
+            eprintln!(
+                "coven daemon: live session registry lock poisoned while reaping `{}`; recovering cleanup",
+                self.session_id
+            );
+        });
+    }
+
+    fn mark_exited_with_poison_reporter(&self, report_poisoned: impl FnOnce()) {
+        // Publish the exit before touching the registry. If the child wins the
+        // race with `register_kind_with_registration`, the registration path
+        // sees this flag and drops the newly inserted handle itself.
+        self.registration.exited.store(true, Ordering::Release);
+
+        let Some(sessions) = self.sessions.upgrade() else {
+            return;
+        };
+        let (mut sessions, was_poisoned) = match sessions.lock() {
+            Ok(sessions) => (sessions, false),
+            Err(poisoned) => (poisoned.into_inner(), true),
+        };
+        let is_current_registration = sessions
+            .get(&self.session_id)
+            .is_some_and(|handle| Arc::ptr_eq(&handle.registration, &self.registration));
+        let removed = if is_current_registration {
+            sessions.remove(&self.session_id)
+        } else {
+            None
+        };
+        drop(sessions);
+        drop(removed);
+        if was_poisoned {
+            report_poisoned();
+        }
+    }
 }
 
 impl LiveSessionRuntime {
     pub fn with_coven_home(coven_home: PathBuf) -> Self {
         Self {
             coven_home: Some(coven_home),
-            sessions: Mutex::default(),
+            sessions: Arc::default(),
         }
     }
 
@@ -133,19 +187,68 @@ impl LiveSessionRuntime {
         input: Box<dyn Write + Send>,
         killer: Box<dyn RuntimeKiller>,
     ) -> Result<()> {
-        use std::sync::Arc;
-        self.sessions
+        self.register_kind_with_registration(
+            session_id,
+            kind,
+            input,
+            killer,
+            Arc::new(LiveSessionRegistration::default()),
+        )
+    }
+
+    fn register_kind_with_registration(
+        &self,
+        session_id: String,
+        kind: LiveSessionKind,
+        input: Box<dyn Write + Send>,
+        killer: Box<dyn RuntimeKiller>,
+        registration: Arc<LiveSessionRegistration>,
+    ) -> Result<()> {
+        let mut sessions = self
+            .sessions
             .lock()
-            .map_err(|_| anyhow::anyhow!("live session registry lock poisoned"))?
-            .insert(
-                session_id,
-                LiveSessionHandle {
-                    kind,
-                    input: Arc::new(Mutex::new(input)),
-                    killer: Arc::new(Mutex::new(killer)),
-                },
-            );
+            .map_err(|_| anyhow::anyhow!("live session registry lock poisoned"))?;
+        let replaced = sessions.insert(
+            session_id.clone(),
+            LiveSessionHandle {
+                kind,
+                input: Arc::new(Mutex::new(input)),
+                killer: Arc::new(Mutex::new(killer)),
+                registration: Arc::clone(&registration),
+            },
+        );
+        let removed = if registration.exited.load(Ordering::Acquire)
+            && sessions
+                .get(&session_id)
+                .is_some_and(|handle| Arc::ptr_eq(&handle.registration, &registration))
+        {
+            sessions.remove(&session_id)
+        } else {
+            None
+        };
+        drop(sessions);
+        drop(replaced);
+        drop(removed);
         Ok(())
+    }
+
+    fn observer_for_session(
+        &self,
+        session_id: String,
+    ) -> (
+        pty_runner::DetachedPtyObserver,
+        Arc<LiveSessionRegistration>,
+    ) {
+        let registration = Arc::new(LiveSessionRegistration::default());
+        let cleanup = LiveSessionExitCleanup {
+            session_id: session_id.clone(),
+            sessions: Arc::downgrade(&self.sessions),
+            registration: Arc::clone(&registration),
+        };
+        (
+            output_observer_with_cleanup(self.coven_home.clone(), session_id, Some(cleanup)),
+            registration,
+        )
     }
 }
 
@@ -264,10 +367,8 @@ impl SessionRuntime for LiveSessionRuntime {
                 ..Default::default()
             },
         )?;
-        let observer = self
-            .coven_home
-            .as_ref()
-            .map(|coven_home| output_observer(coven_home.to_path_buf(), launch.id.clone()));
+        let (observer, registration) = self.observer_for_session(launch.id.clone());
+        let observer = Some(observer);
 
         if launch.launch_mode == crate::harness::HarnessLaunchMode::Stream {
             // Defense in depth: only allow Stream mode for harnesses that
@@ -303,11 +404,12 @@ impl SessionRuntime for LiveSessionRuntime {
                     });
                 }
             }
-            return self.register_kind(
+            return self.register_kind_with_registration(
                 launch.id.clone(),
                 LiveSessionKind::Stream,
                 input,
                 killer_box,
+                registration,
             );
         }
 
@@ -320,11 +422,12 @@ impl SessionRuntime for LiveSessionRuntime {
         if launch.launch_mode == crate::harness::HarnessLaunchMode::NonInteractive {
             let piped = pty_runner::spawn_piped_with_observer(&command, observer, false)?;
             let killer = piped_killer(piped.pid);
-            return self.register_kind(
+            return self.register_kind_with_registration(
                 launch.id.clone(),
                 LiveSessionKind::Pty,
                 piped.input,
                 killer,
+                registration,
             );
         }
 
@@ -339,11 +442,12 @@ impl SessionRuntime for LiveSessionRuntime {
         }
 
         let detached = pty_runner::spawn_detached_with_observer(&command, observer)?;
-        self.register_kind(
+        self.register_kind_with_registration(
             launch.id.clone(),
             LiveSessionKind::Pty,
             detached.input,
             Box::new(detached.killer),
+            registration,
         )
     }
 
@@ -576,7 +680,16 @@ impl RuntimeKiller for Box<dyn portable_pty::ChildKiller + Send + Sync> {
     }
 }
 
+#[cfg(test)]
 fn output_observer(coven_home: PathBuf, session_id: String) -> pty_runner::DetachedPtyObserver {
+    output_observer_with_cleanup(Some(coven_home), session_id, None)
+}
+
+fn output_observer_with_cleanup(
+    coven_home: Option<PathBuf>,
+    session_id: String,
+    cleanup: Option<LiveSessionExitCleanup>,
+) -> pty_runner::DetachedPtyObserver {
     let output_home = coven_home.clone();
     let output_session_id = session_id.clone();
     let exit_home = coven_home;
@@ -593,15 +706,26 @@ fn output_observer(coven_home: PathBuf, session_id: String) -> pty_runner::Detac
             }
             let text = String::from_utf8(chunk)
                 .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned());
-            let _ = record_session_event(
-                &output_home,
-                &output_session_id,
-                "output",
-                json!({ "data": text }),
-            );
+            if let Some(output_home) = output_home.as_deref() {
+                let _ = record_session_event(
+                    output_home,
+                    &output_session_id,
+                    "output",
+                    json!({ "data": text }),
+                );
+            }
         }),
         on_exit: Box::new(move |result| {
-            let _ = record_session_exit(&exit_home, &exit_session_id, result);
+            if let Some(cleanup) = cleanup {
+                cleanup.mark_exited();
+            }
+            if let Some(exit_home) = exit_home.as_deref() {
+                if let Err(error) = record_session_exit(exit_home, &exit_session_id, result) {
+                    eprintln!(
+                        "coven daemon: failed to persist exit for session `{exit_session_id}`: {error:#}"
+                    );
+                }
+            }
         }),
     }
 }
@@ -3166,6 +3290,225 @@ mod tests {
     }
 
     #[test]
+    fn live_runtime_reaps_registered_session_on_observed_exit() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = crate::store::open_store(&temp_dir.path().join("coven.sqlite3"))?;
+        crate::store::insert_session(&conn, &session_record("completed-session"))?;
+        drop(conn);
+
+        let runtime = LiveSessionRuntime::with_coven_home(temp_dir.path().to_path_buf());
+        let (observer, registration) =
+            runtime.observer_for_session("completed-session".to_string());
+        runtime.register_kind_with_registration(
+            "completed-session".to_string(),
+            LiveSessionKind::Pty,
+            Box::new(SharedBuffer::default()),
+            Box::new(RecordingKiller::default()),
+            registration,
+        )?;
+        let (input, killer) = {
+            let sessions = runtime.sessions.lock().unwrap();
+            let handle = sessions.get("completed-session").unwrap();
+            (
+                Arc::downgrade(&handle.input),
+                Arc::downgrade(&handle.killer),
+            )
+        };
+
+        let pty_runner::DetachedPtyObserver { on_exit, .. } = observer;
+        on_exit(pty_runner::PtyRunResult {
+            status: "completed",
+            exit_code: Some(0),
+        });
+
+        assert!(!runtime
+            .sessions
+            .lock()
+            .unwrap()
+            .contains_key("completed-session"));
+        assert!(input.upgrade().is_none(), "child stdin handle was retained");
+        assert!(
+            killer.upgrade().is_none(),
+            "child killer handle was retained"
+        );
+        let conn = crate::store::open_store(&temp_dir.path().join("coven.sqlite3"))?;
+        assert_eq!(
+            crate::store::get_session(&conn, "completed-session")?
+                .unwrap()
+                .status,
+            "completed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn live_runtime_does_not_register_session_after_early_observed_exit() -> Result<()> {
+        let runtime = LiveSessionRuntime::default();
+        let (observer, registration) = runtime.observer_for_session("fast-session".to_string());
+        let pty_runner::DetachedPtyObserver { on_exit, .. } = observer;
+        on_exit(pty_runner::PtyRunResult {
+            status: "completed",
+            exit_code: Some(0),
+        });
+
+        runtime.register_kind_with_registration(
+            "fast-session".to_string(),
+            LiveSessionKind::Pty,
+            Box::new(SharedBuffer::default()),
+            Box::new(RecordingKiller::default()),
+            registration,
+        )?;
+
+        assert!(!runtime
+            .sessions
+            .lock()
+            .unwrap()
+            .contains_key("fast-session"));
+        Ok(())
+    }
+
+    #[test]
+    fn live_runtime_stale_exit_observer_does_not_reap_replacement_registration() -> Result<()> {
+        let runtime = LiveSessionRuntime::default();
+        let (stale_observer, stale_registration) =
+            runtime.observer_for_session("reused-session".to_string());
+        runtime.register_kind_with_registration(
+            "reused-session".to_string(),
+            LiveSessionKind::Pty,
+            Box::new(SharedBuffer::default()),
+            Box::new(RecordingKiller::default()),
+            stale_registration,
+        )?;
+
+        let (_replacement_observer, replacement_registration) =
+            runtime.observer_for_session("reused-session".to_string());
+        runtime.register_kind_with_registration(
+            "reused-session".to_string(),
+            LiveSessionKind::Pty,
+            Box::new(SharedBuffer::default()),
+            Box::new(RecordingKiller::default()),
+            Arc::clone(&replacement_registration),
+        )?;
+
+        let pty_runner::DetachedPtyObserver { on_exit, .. } = stale_observer;
+        on_exit(pty_runner::PtyRunResult {
+            status: "completed",
+            exit_code: Some(0),
+        });
+
+        let sessions = runtime.sessions.lock().unwrap();
+        let handle = sessions.get("reused-session").unwrap();
+        assert!(Arc::ptr_eq(&handle.registration, &replacement_registration));
+        Ok(())
+    }
+
+    #[test]
+    fn live_runtime_replacement_drops_old_handle_after_registry_unlock() -> Result<()> {
+        let runtime = LiveSessionRuntime::default();
+        let dropped_after_unlock = Arc::new(AtomicBool::new(false));
+        runtime.register(
+            "reused-session".to_string(),
+            Box::new(SharedBuffer::default()),
+            Box::new(RegistryLockCheckingKiller {
+                sessions: Arc::downgrade(&runtime.sessions),
+                dropped_after_unlock: Arc::clone(&dropped_after_unlock),
+            }),
+        )?;
+
+        runtime.register(
+            "reused-session".to_string(),
+            Box::new(SharedBuffer::default()),
+            Box::new(RecordingKiller::default()),
+        )?;
+
+        assert!(dropped_after_unlock.load(Ordering::Acquire));
+        Ok(())
+    }
+
+    #[test]
+    fn live_runtime_reaper_recovers_poisoned_registry() -> Result<()> {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        let runtime = LiveSessionRuntime::default();
+        let (observer, registration) = runtime.observer_for_session("poisoned-session".to_string());
+        runtime.register_kind_with_registration(
+            "poisoned-session".to_string(),
+            LiveSessionKind::Pty,
+            Box::new(SharedBuffer::default()),
+            Box::new(RecordingKiller::default()),
+            registration,
+        )?;
+        let input = {
+            let sessions = runtime.sessions.lock().unwrap();
+            Arc::downgrade(&sessions.get("poisoned-session").unwrap().input)
+        };
+
+        let sessions = Arc::clone(&runtime.sessions);
+        assert!(catch_unwind(AssertUnwindSafe(|| {
+            let _guard = sessions.lock().unwrap();
+            panic!("poison live session registry");
+        }))
+        .is_err());
+
+        let pty_runner::DetachedPtyObserver { on_exit, .. } = observer;
+        on_exit(pty_runner::PtyRunResult {
+            status: "completed",
+            exit_code: Some(0),
+        });
+
+        assert!(input.upgrade().is_none(), "child stdin handle was retained");
+        let sessions = match runtime.sessions.lock() {
+            Ok(_) => panic!("live session registry unexpectedly lost its poison state"),
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert!(!sessions.contains_key("poisoned-session"));
+        Ok(())
+    }
+
+    #[test]
+    fn live_runtime_reaper_reports_poison_after_registry_unlock() -> Result<()> {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        let runtime = LiveSessionRuntime::default();
+        let registration = Arc::new(LiveSessionRegistration::default());
+        runtime.register_kind_with_registration(
+            "poison-report-session".to_string(),
+            LiveSessionKind::Pty,
+            Box::new(SharedBuffer::default()),
+            Box::new(RecordingKiller::default()),
+            Arc::clone(&registration),
+        )?;
+        let cleanup = LiveSessionExitCleanup {
+            session_id: "poison-report-session".to_string(),
+            sessions: Arc::downgrade(&runtime.sessions),
+            registration,
+        };
+
+        let sessions = Arc::clone(&runtime.sessions);
+        assert!(catch_unwind(AssertUnwindSafe(|| {
+            let _guard = sessions.lock().unwrap();
+            panic!("poison live session registry");
+        }))
+        .is_err());
+
+        let reported_after_unlock = Arc::new(AtomicBool::new(false));
+        let reported = Arc::clone(&reported_after_unlock);
+        cleanup.mark_exited_with_poison_reporter(|| {
+            let registry_is_unlocked = match sessions.try_lock() {
+                Ok(_) | Err(std::sync::TryLockError::Poisoned(_)) => true,
+                Err(std::sync::TryLockError::WouldBlock) => false,
+            };
+            reported.store(registry_is_unlocked, Ordering::Release);
+        });
+
+        assert!(
+            reported_after_unlock.load(Ordering::Acquire),
+            "poison diagnostic ran while the live session registry was locked"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn live_runtime_writes_input_to_registered_session() -> Result<()> {
         let runtime = LiveSessionRuntime::default();
         let output = SharedBuffer::default();
@@ -3238,6 +3581,28 @@ mod tests {
         fn kill(&mut self) -> Result<()> {
             *self.killed.lock().unwrap() = true;
             Ok(())
+        }
+    }
+
+    struct RegistryLockCheckingKiller {
+        sessions: Weak<Mutex<HashMap<String, LiveSessionHandle>>>,
+        dropped_after_unlock: Arc<AtomicBool>,
+    }
+
+    impl RuntimeKiller for RegistryLockCheckingKiller {
+        fn kill(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Drop for RegistryLockCheckingKiller {
+        fn drop(&mut self) {
+            let dropped_after_unlock = match self.sessions.upgrade() {
+                Some(sessions) => sessions.try_lock().is_ok(),
+                None => true,
+            };
+            self.dropped_after_unlock
+                .store(dropped_after_unlock, Ordering::Release);
         }
     }
 
