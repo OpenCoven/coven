@@ -558,27 +558,35 @@ class SecretGuardExceptionScopeTests(unittest.TestCase):
 
                 self.assertEqual(hits, [])
 
-    def test_reserved_example_url_rejects_operator_payload(self) -> None:
+    def test_reserved_example_url_rejects_literal_payload(self) -> None:
         value = "hunter2" * 3
-        text = (
-            '"https://private-gateway.example.test/'
-            f'session?token=fakegatewaytoken123" + "{value}"'
-        )
+        cases = [
+            (
+                '"https://private-gateway.example.test/'
+                f'session?token=fakegatewaytoken123" + "{value}"'
+            ),
+            (
+                '"https://private-gateway.example.test/'
+                f'session?token=fakegatewaytoken123" {value}'
+            ),
+        ]
 
-        hits = check_secrets.scan_text(
-            text, "crates/coven-cli/src/privacy.rs"
-        )
-
-        self.assertEqual(
-            hits,
-            [
-                (
-                    "crates/coven-cli/src/privacy.rs",
-                    1,
-                    "generic_assignment",
+        for text in cases:
+            with self.subTest(text=text):
+                hits = check_secrets.scan_text(
+                    text, "crates/coven-cli/src/privacy.rs"
                 )
-            ],
-        )
+
+                self.assertEqual(
+                    hits,
+                    [
+                        (
+                            "crates/coven-cli/src/privacy.rs",
+                            1,
+                            "generic_assignment",
+                        )
+                    ],
+                )
 
     def test_safe_generic_values_allow_only_syntax_suffixes(self) -> None:
         cases = [
@@ -639,10 +647,80 @@ class SecretGuardExceptionScopeTests(unittest.TestCase):
         )
 
     def test_quoted_and_call_safe_values_reject_appended_payloads(self) -> None:
+        short_mixed = "AbCdEfGh" + "IjKlMnOp" + "QrStUvWx"
+        hex_value = "deadbeef" * 4
+        punctuated = ":".join(["hunter2"] * 3)
+        password = "P@ssw0rd!" * 2
+        segmented = [
+            separator.join(["hunter2"] * 3)
+            for separator in ("_", ".", "/", "-")
+        ]
         cases = [
             'api_key="<secret-value>"hunter2hunter2hunter2',
+            'api_key="<secret-value>" hunter2hunter2hunter2',
+            f'api_key="<secret-value>" {short_mixed}',
+            f'api_key="<secret-value>" {hex_value}',
+            f'api_key="<secret-value>" {punctuated}',
+            f'api_key="<secret-value>" {password}',
+            'api_key="<secret-value>" "hunter2 hunter2 hunter2"',
+            (
+                'api_key="<secret-value>" '
+                '"correct horse battery staple"'
+            ),
+            (
+                'api_key="<secret-value>" '
+                '"hunter2" "hunter2" "hunter2"'
+            ),
+            'api_key="<secret-value>" "hunter2 hunter2 hunter2',
+            (
+                "api_key=\"<secret-value>\" "
+                "'correct horse battery staple"
+            ),
+            'api_key="<secret-value>" a"hunter2 hunter2"b',
+            (
+                'api_key="<secret-value>" '
+                "[hunter2hunter2hunter2]"
+                "(https://github.com/OpenCoven/coven)"
+            ),
+            (
+                'api_key="<secret-value>" '
+                "[P@ssw0rd!P@ssw0rd!]"
+                "(https://github.com/OpenCoven/coven)"
+            ),
+            (
+                'api_key="<secret-value>" '
+                "[correcthorsebatterystaple]"
+                "(https://github.com/OpenCoven/coven)"
+            ),
+            (
+                'api_key="<secret-value>" '
+                "[correct-horse-battery-staple]"
+                "(https://github.com/OpenCoven/coven)"
+            ),
+            (
+                'api_key="<secret-value>" '
+                "# correct horse battery staple"
+            ),
+            f'api_key="<secret-value>" # {short_mixed}',
+            (
+                f'api_key="<secret-value>" [{short_mixed}]'
+                "(https://github.com/OpenCoven/coven)"
+            ),
+            'api_key="<secret-value>" hunter2\\ hunter2\\ hunter2',
+            'api_key="<secret-value>" hunter2/hunter2',
+            (
+                'api_key="<secret-value>" '
+                "https://github.com/OpenCoven/coven/"
+                "hunter2hunter2hunter2"
+            ),
+            *[
+                f'api_key="<secret-value>" {value}'
+                for value in segmented
+            ],
             'api_key="${API_KEY}"hunter2hunter2hunter2',
+            'api_key="${API_KEY}" hunter2hunter2hunter2',
             'api_key=os.environ.get("API_KEY")+hunter2hunter2hunter2',
+            'api_key=os.environ.get("API_KEY") hunter2hunter2hunter2',
             'api_key=std::env::var("API_KEY")+hunter2hunter2hunter2',
             'api_key="<secret-value>" + hunter2hunter2hunter2',
             'api_key="${API_KEY}" + hunter2hunter2hunter2',
@@ -661,6 +739,110 @@ class SecretGuardExceptionScopeTests(unittest.TestCase):
                 self.assertEqual(
                     hits,
                     [("src/config.example", 1, "generic_assignment")],
+                )
+
+    def test_safe_values_allow_known_nonsecret_trailing_context(self) -> None:
+        cases = [
+            "api_key=<secret-value> docs/reference/api.md",
+            (
+                "api_key=<secret-value> "
+                "https://docs.example.com/configuration"
+            ),
+            "api_key=<secret-value> CONFIG_VALUE_REFERENCE",
+            "api_key=<secret-value> CONFIGURATION_VALUE",
+            "api_key=<secret-value> CONFIGURATION_VALUE:",
+            (
+                "api_key=<secret-value> "
+                "https://github.com/OpenCoven/coven"
+            ),
+            (
+                "api_key=<secret-value> "
+                "(https://github.com/OpenCoven/coven)."
+            ),
+            "api_key=<secret-value> /etc/configuration",
+            "api_key=<secret-value> docs/reference/api.md:",
+            (
+                "api_key=<secret-value> "
+                "https://github.com/advisories/GHSA-rhfx-m35p-ff5j"
+            ),
+            (
+                "api_key=<secret-value> "
+                "https://github.com/OpenCoven/coven/commit/"
+                + ("deadbeef" * 5)
+            ),
+            (
+                "api_key=<secret-value> "
+                "https://www.apple.com/DTDs/PropertyList-1.0.dtd"
+            ),
+            (
+                "api_key=<secret-value> "
+                "https://support-dev.discord.com/hc/en-us/articles/"
+                "6207308062871-What-are-Privileged-Intents"
+            ),
+            'api_key=<secret-value> "$CONFIGURATION_FILE"',
+            'api_key=<secret-value> "${CONFIGURATION_FILE}"',
+            (
+                "api_key=<secret-value> "
+                "[reference](https://github.com/OpenCoven/coven)"
+            ),
+            (
+                "api_key=<secret-value> "
+                "https://github.com/OpenCoven/coven#readme"
+            ),
+            (
+                "api_key=<secret-value> "
+                "[configuration](docs/reference/api.md)"
+            ),
+            (
+                'api_key=<secret-value> '
+                '"$HOME/.config/opencoven/config.toml"'
+            ),
+            (
+                "api_key=<secret-value> "
+                "https://github.com/OpenCoven/coven/"
+                "blob/main/README.md#L10"
+            ),
+            "api_key=<secret-value> # configuration placeholder",
+            "api_key=<secret-value> # configuration placeholder.",
+            (
+                "api_key=<secret-value> "
+                "# don't commit the placeholder"
+            ),
+            "api_key=<secret-value> [Read more](README.md)",
+            (
+                "api_key=<secret-value> "
+                "[configuration](#configuration)"
+            ),
+            (
+                "api_key=<secret-value> "
+                "[configuration]"
+                "(docs/reference/api.md#configuration)"
+            ),
+        ]
+
+        for text in cases:
+            with self.subTest(text=text):
+                hits = check_secrets.scan_text(text, "docs/example.md")
+
+                self.assertEqual(hits, [])
+
+    def test_broad_safe_context_shapes_reject_payloads(self) -> None:
+        password = "P@ssw0rd!" * 2
+        cases = [
+            (
+                f"github.com/advisories/GHSA-{password}",
+                "high_entropy",
+            ),
+            (f"/tmp/a/b/{password}", "generic_assignment"),
+        ]
+
+        for value, expected_rule in cases:
+            with self.subTest(value=value):
+                text = f'api_key="<secret-value>" {value}'
+                hits = check_secrets.scan_text(text, "docs/example.md")
+
+                self.assertEqual(
+                    hits, [("docs/example.md", 1, expected_rule)]
                 )
 
     def test_grep_extended_regex_pattern_assignment_terms_are_safe(self) -> None:
