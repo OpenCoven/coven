@@ -103,7 +103,7 @@ SAFE_ASSIGNMENT_SUFFIX = re.compile(
     (?:
         ["';,.:?)}\]`]+
         |</[A-Za-z][A-Za-z0-9-]*>
-        |\.(?:strip|trim|unwrap_or_default)\(\)
+        |\.(?:strip|to_string|trim|unwrap_or_default)\(\)
     )*
     '''
 )
@@ -118,8 +118,7 @@ ORDERED_ALPHABET_FIXTURES = {
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUV",
 }
 KNOWN_PUBLIC_DOCUMENTATION_TOKENS = {
-    "support-dev.discord.com/hc/en-us/articles/"
-    "6207308062871-What-are-Privileged-Intents",
+    "support-dev.discord.com/hc/en-us/articles/6207308062871-What-are-Privileged-Intents",
 }
 KNOWN_FAKE_PRIVATE_KEY_FIXTURE = re.compile(
     r"-----BEGIN PRIVATE KEY-----\\n(?:fake){3,}\\n-----END PRIVATE KEY-----"
@@ -226,6 +225,7 @@ def is_known_safe_generic_assignment(
 
     if any(
         assignment_is_covered_by_safe_match(assignment, match)
+        and safe_assignment_continuation_is_syntax(line, match)
         for match in RESERVED_EXAMPLE_URL.finditer(line)
     ):
         return True

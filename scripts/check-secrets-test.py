@@ -539,14 +539,46 @@ class SecretGuardExceptionScopeTests(unittest.TestCase):
                 self.assertEqual(hits, [])
 
     def test_reserved_example_url_assignment_is_not_a_secret(self) -> None:
+        cases = [
+            (
+                'let url = "https://private-gateway.example.test/'
+                'session?token=fakegatewaytoken123";'
+            ),
+            (
+                '"https://private-gateway.example.test/'
+                'session?token=fakegatewaytoken123".to_string()'
+            ),
+        ]
+
+        for text in cases:
+            with self.subTest(text=text):
+                hits = check_secrets.scan_text(
+                    text, "crates/coven-cli/src/privacy.rs"
+                )
+
+                self.assertEqual(hits, [])
+
+    def test_reserved_example_url_rejects_operator_payload(self) -> None:
+        value = "hunter2" * 3
         text = (
-            'let url = "https://private-gateway.example.test/'
-            'session?token=fakegatewaytoken123";'
+            '"https://private-gateway.example.test/'
+            f'session?token=fakegatewaytoken123" + "{value}"'
         )
 
-        hits = check_secrets.scan_text(text, "crates/coven-cli/src/privacy.rs")
+        hits = check_secrets.scan_text(
+            text, "crates/coven-cli/src/privacy.rs"
+        )
 
-        self.assertEqual(hits, [])
+        self.assertEqual(
+            hits,
+            [
+                (
+                    "crates/coven-cli/src/privacy.rs",
+                    1,
+                    "generic_assignment",
+                )
+            ],
+        )
 
     def test_safe_generic_values_allow_only_syntax_suffixes(self) -> None:
         cases = [
