@@ -1457,6 +1457,17 @@ impl ExternalHarnessAdapterSpec {
                 manifest_path.display()
             );
         }
+        if self
+            .model_arg_template
+            .as_deref()
+            .is_some_and(|template| !template.contains("{model}"))
+        {
+            anyhow::bail!(
+                "external harness adapter `{id}` in {} has a model_arg_template \
+                 that must contain the `{{model}}` placeholder",
+                manifest_path.display()
+            );
+        }
         let has_model_mechanism = self
             .model_flag
             .as_deref()
@@ -4466,6 +4477,30 @@ mod tests {
             error.contains("model_flag or model_arg_template"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn external_model_arg_template_requires_placeholder() {
+        let raw = r#"{
+          "adapters": [{
+            "id": "future",
+            "label": "Future",
+            "executable": "future",
+            "interactive_prompt_prefix_args": [],
+            "non_interactive_prompt_prefix_args": [],
+            "install_hint": "Install Future.",
+            "model_arg_template": "-c fixed-model",
+            "model_id_transform": "preserve",
+            "capabilities": {}
+          }]
+        }"#;
+
+        let error =
+            parse_external_harness_specs(raw, Path::new("future.json"), &built_in_harness_specs())
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("model_arg_template"), "{error}");
+        assert!(error.contains("{model}"), "{error}");
     }
 
     #[test]

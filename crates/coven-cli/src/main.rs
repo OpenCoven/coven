@@ -211,7 +211,7 @@ enum Command {
         #[arg(
             long,
             value_name = "ID",
-            help = "Model to run the harness on. Accepts a provider-qualified id (e.g. openai/gpt-5.5, anthropic/claude-...). Each adapter declares whether to strip the first provider/ segment (`strip_provider`, the legacy default) or preserve the full id (`preserve`). Codex, Claude, and Copilot strip; Coven Code preserves. Adapters that declare no model mechanism warn and continue. Echoed back unchanged in the stream-json system.init `model` field."
+            help = "Model to run the harness on. Accepts a provider-qualified id (e.g. openai/gpt-5.5, anthropic/claude-...). Each adapter declares whether to strip the first provider/ segment (`strip_provider`, the legacy default) or preserve the full id (`preserve`). Adapters that declare no model mechanism warn and continue. Echoed back unchanged in the stream-json system.init `model` field."
         )]
         model: Option<String>,
         #[arg(

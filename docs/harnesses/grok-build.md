@@ -61,7 +61,7 @@ The Coven harness id is `grok`; the executable is `grok`.
 | Coven behavior | Grok Build argv |
 |---|---|
 | One-shot prompt | `--single=<prompt>` |
-| Model selection | `--model <model>` (`model_id_transform: strip_provider`) |
+| Model selection | `--model <model>` (effective `strip_provider` default; the recipe omits explicit transform metadata) |
 | Familiar identity | `--rules <identity>` |
 | New named conversation | `--session-id <uuid>` |
 | Resume conversation | `--resume <uuid>` |
