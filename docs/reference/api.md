@@ -111,8 +111,8 @@ Tier-0 authority degradations and Tier-1 coherence holds, distinguished by
 | GET | `/api/v1/threads/weaves` | Per-familiar weave/authority state (degraded configs reported inline). | weave entries | — |
 | GET | `/api/v1/threads/proposals` | Pending proposals with compact `probeSummary` evidence (unparseable files reported as `degraded` entries, newest first). | `{ proposals }` | — |
 | GET | `/api/v1/threads/proposals/:id` | One pending proposal with `probeSummary` and full per-surface `probes`. | `{ proposal }` | `400 invalid_request` / `404 proposal_not_found` |
-| POST | `/api/v1/threads/proposals/:id/approve` | Re-validate and atomically apply a staged authority or coherence proposal. | decision report | `400`, `404`, `409` |
-| POST | `/api/v1/threads/proposals/:id/reject` | Reject and remove a staged proposal (audited). | decision report | `400`, `404`, `409` |
+| POST | `/api/v1/threads/proposals/:id/approve` | Re-validate and atomically apply a staged authority or coherence proposal. Pending decisions require `{ expectedRevision, note? }`; take the exact revision from the GET detail response. | decision report | `400`, `404`, `409` |
+| POST | `/api/v1/threads/proposals/:id/reject` | Reject and remove a staged proposal (audited). Pending decisions require `{ expectedRevision, note? }`; take the exact revision from the GET detail response. | decision report | `400`, `404`, `409` |
 
 Probe evidence is additive sidecar data, so the underlying
 `coven_threads_core::PendingProposal` remains backward-readable. A missing

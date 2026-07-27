@@ -1,11 +1,12 @@
 ---
-summary: "Inspect and manage the Ward proposal lifecycle: pending reads, the audit ledger, and config migration."
+summary: "Inspect and manage the Ward proposal lifecycle: pending reads, principal decisions, the audit ledger, and config migration."
 read_when:
   - Looking up ward
   - Reviewing staged (held) Ward proposals
+  - Approving or rejecting a Ward proposal
   - Auditing applied Ward writes
 title: "coven ward"
-description: "Reference for coven ward: list and inspect pending Ward proposals staged for the principal, read the append-only ward_audit ledger, and migrate v0.1 ward.toml files to the Phase-2 WardConfig dialect."
+description: "Reference for coven ward: inspect, approve, or reject pending Ward proposals, read the append-only ward_audit ledger, and migrate v0.1 ward.toml files to the Phase-2 WardConfig dialect."
 ---
 
 `coven ward` groups the Ward's principal-facing lifecycle verbs. Held writes
@@ -17,6 +18,8 @@ is the supported way to see what is waiting.
 coven ward pending             # table of staged proposals, newest first
 coven ward pending <id>        # one proposal in full
 coven ward pending --json      # exact daemon body (GET /api/v1/threads/proposals)
+coven ward approve <id>        # re-validate and atomically apply
+coven ward reject <id> --note "reason" # reject without applying
 coven ward audit <familiar>    # append-only ward_audit ledger, newest first
 coven ward migrate --apply     # migrate v0.1 ward.toml files to Phase-2
 ```
@@ -83,20 +86,36 @@ baseline, Gate-2 path resolution, and declared probe set. Stale, malformed, or
 inconsistent sidecars are demoted to `unscored` and carry
 `probeEvidenceDegraded`; they are never summarized as a pass.
 
-Decisions are daemon-API verbs today
-(`POST /api/v1/threads/proposals/<id>/approve|reject` — see
-[api](api.md)); the CLI wrappers land in the final Gate-3 slice. Coherence
-approval re-runs Gates 1–2 and the probes, skips the threads validator, and
-atomically applies only while the write's before-image matches the re-probed
-baseline. Missing, malformed, stale, or inconsistent evidence returns `409`
-and leaves the proposal pending. A valid `failed` or `unscored` result remains
-advisory and may be explicitly approved. Nothing ever auto-approves — the
-principal is the sole approver (design Non-goals). A first apply also requires
-the exact before-image even when concurrent bytes equal the proposal; only a
-durable recovery intent may accept already-applied bytes, and recovery
-revalidates the persisted Gate-2-resolved surface at the Ward's final
-adjudication. Clean failures clear recovery state; only a write that may have
-committed remains eligible for idempotent replay.
+## Principal decisions
+
+`coven ward approve <id>` and `coven ward reject <id>` are local CLI wrappers
+over the existing daemon API decision routes. Both first read the pending
+proposal and submit its exact `proposalRevision`, so a concurrent change fails
+closed instead of deciding stale bytes. `--note <TEXT>` is available on both
+verbs and is required when an approval's declared path calls for a principal
+rationale. `--json` prints the API decision report.
+
+```sh
+coven ward approve <id> --note "reviewed identity change"
+coven ward reject <id> --note "needs revision"
+coven ward approve <id> --json
+```
+
+Approval re-runs Gates 1–2 and the probes, skips the threads validator for
+coherence proposals, and atomically applies only while the write's before-image
+matches the re-probed baseline. Rejection audits and removes the proposal
+without applying it. Missing, malformed, stale, or inconsistent evidence
+returns `409` and leaves the proposal pending. A valid `failed` or `unscored`
+result remains advisory and may be explicitly approved. Nothing ever
+auto-approves — the principal is the sole approver (design Non-goals).
+
+A first apply also requires the exact before-image even when concurrent bytes
+equal the proposal; only a durable recovery intent may accept already-applied
+bytes, and recovery revalidates the persisted Gate-2-resolved surface at the
+Ward's final adjudication. Clean failures clear recovery state; only a write
+that may have committed remains eligible for idempotent replay. Retrying the
+same CLI decision after a terminal audit is idempotent; attempting the opposite
+decision fails with `proposal-already-decided`.
 
 ## Audit ledger
 

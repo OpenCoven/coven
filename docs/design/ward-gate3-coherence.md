@@ -5,11 +5,12 @@ description: "Design for resolving held Ward proposals: stage Tier-1 holds besid
 
 # Ward Gate 3 — Coherence Review Design
 
-Status: Implemented through G3.4; CLI decision verbs remain in PR 5
+Status: Implemented
 Date: 2026-07-26
-Scope: `crates/coven-cli` (`ward.rs`, `threads_gate.rs`, `api.rs`, `observe.rs`) plus
-reference docs. Composes with — never duplicates — the coven-threads §5 staging
-machinery that already exists. Tracking: #415 (sub-issue of #335).
+Scope: `crates/coven-cli` (`ward.rs`, `threads_gate.rs`, `api.rs`, `observe.rs`,
+`ward_decision.rs`) plus reference docs. Composes with — never duplicates —
+the coven-threads §5 staging machinery that already exists. Tracking: #415
+(sub-issue of #335).
 
 ## Summary
 
@@ -136,7 +137,8 @@ with evidence:
 - CLI: `coven ward pending [--json]` and `coven ward pending <id> [--json]`
   via the observe.rs pattern (`--json` = exact daemon body). Reference page
   `docs/reference/cli-ward.md` documents the lifecycle; `api.md` carries the
-  route rows. The `approve` / `reject` CLI wrappers are the final PR 5 slice.
+  route rows. `coven ward approve|reject` reuses those decision routes and
+  carries the proposal's exact revision into every pending decision.
 
 ### G3.4 — Resolution for coherence proposals
 

@@ -51,6 +51,7 @@ mod ward_probes;
 // coherence approval all compose through the Ward primitives in ward.rs.
 #[allow(dead_code)]
 mod ward;
+mod ward_decision;
 mod ward_migrate;
 // The coven-threads validator call site: typed authority-state gating of
 // protected-surface mutations (OpenCoven/coven-threads Phase 2). Runs before
@@ -144,7 +145,7 @@ enum Command {
         #[command(subcommand)]
         command: DaemonCommand,
     },
-    #[command(about = "Inspect and migrate Ward configuration")]
+    #[command(about = "Inspect and decide Ward proposals or migrate configuration")]
     Ward {
         #[command(subcommand)]
         command: WardCommand,
@@ -696,6 +697,28 @@ enum WardCommand {
         #[arg(help = "Proposal id: show one staged proposal instead of the list")]
         id: Option<String>,
         #[arg(long, help = "Print proposals as JSON (machine-readable)")]
+        json: bool,
+    },
+    #[command(about = "Approve and apply a pending Ward proposal")]
+    Approve {
+        #[arg(help = "Proposal id")]
+        id: String,
+        #[arg(
+            long,
+            value_name = "TEXT",
+            help = "Principal rationale (required by some approval paths)"
+        )]
+        note: Option<String>,
+        #[arg(long, help = "Print the API decision report as JSON")]
+        json: bool,
+    },
+    #[command(about = "Reject a pending Ward proposal without applying it")]
+    Reject {
+        #[arg(help = "Proposal id")]
+        id: String,
+        #[arg(long, value_name = "TEXT", help = "Principal rejection rationale")]
+        note: Option<String>,
+        #[arg(long, help = "Print the API decision report as JSON")]
         json: bool,
     },
     #[command(about = "Show the append-only ward_audit ledger for one familiar")]
@@ -2873,6 +2896,22 @@ fn run_ward_command(command: WardCommand) -> Result<()> {
     match command {
         WardCommand::Pending { id, json } => {
             return observe::run_ward_pending(id.as_deref(), json);
+        }
+        WardCommand::Approve { id, note, json } => {
+            return ward_decision::run(
+                &id,
+                ward_decision::WardDecision::Approve,
+                note.as_deref(),
+                json,
+            );
+        }
+        WardCommand::Reject { id, note, json } => {
+            return ward_decision::run(
+                &id,
+                ward_decision::WardDecision::Reject,
+                note.as_deref(),
+                json,
+            );
         }
         WardCommand::Audit {
             familiar,
@@ -5104,6 +5143,75 @@ mod tests {
                 assert!(apply);
             }
             other => panic!("expected ward migrate command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_ward_approve_options() {
+        let cli = Cli::parse_from([
+            "coven",
+            "ward",
+            "approve",
+            "018f6e9d-4d20-7e42-b9f1-6bdb1bb35165",
+            "--note",
+            "reviewed identity change",
+            "--json",
+        ]);
+
+        match cli.command {
+            Some(Command::Ward {
+                command: WardCommand::Approve { id, note, json },
+            }) => {
+                assert_eq!(id, "018f6e9d-4d20-7e42-b9f1-6bdb1bb35165");
+                assert_eq!(note.as_deref(), Some("reviewed identity change"));
+                assert!(json);
+            }
+            other => panic!("expected ward approve command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_bare_ward_approve() {
+        let cli = Cli::parse_from([
+            "coven",
+            "ward",
+            "approve",
+            "018f6e9d-4d20-7e42-b9f1-6bdb1bb35165",
+        ]);
+
+        match cli.command {
+            Some(Command::Ward {
+                command: WardCommand::Approve { id, note, json },
+            }) => {
+                assert_eq!(id, "018f6e9d-4d20-7e42-b9f1-6bdb1bb35165");
+                assert!(note.is_none());
+                assert!(!json);
+            }
+            other => panic!("expected bare ward approve command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_ward_reject_options() {
+        let cli = Cli::parse_from([
+            "coven",
+            "ward",
+            "reject",
+            "018f6e9d-4d20-7e42-b9f1-6bdb1bb35165",
+            "--note",
+            "needs revision",
+            "--json",
+        ]);
+
+        match cli.command {
+            Some(Command::Ward {
+                command: WardCommand::Reject { id, note, json },
+            }) => {
+                assert_eq!(id, "018f6e9d-4d20-7e42-b9f1-6bdb1bb35165");
+                assert_eq!(note.as_deref(), Some("needs revision"));
+                assert!(json);
+            }
+            other => panic!("expected ward reject command, got {other:?}"),
         }
     }
 

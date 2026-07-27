@@ -563,9 +563,7 @@ fn render_ward_pending(body: &Value) -> String {
                 .unwrap_or_default(),
         ));
     }
-    out.push_str(
-        "\nDecide with the daemon API: POST /api/v1/threads/proposals/<id>/approve|reject\n",
-    );
+    out.push_str("\nDecide: coven ward approve <id> · coven ward reject <id> --note \"reason\"\n");
     out
 }
 
@@ -1560,6 +1558,8 @@ mod tests {
 
         assert!(rendered.contains("probes"), "{rendered}");
         assert!(rendered.contains("failed"), "{rendered}");
+        assert!(rendered.contains("coven ward approve <id>"), "{rendered}");
+        assert!(rendered.contains("coven ward reject <id>"), "{rendered}");
     }
 
     #[test]
