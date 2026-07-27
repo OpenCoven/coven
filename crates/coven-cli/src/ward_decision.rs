@@ -60,9 +60,9 @@ fn decide_at(
     } else if detail_response.status == 404
         && detail.pointer("/error/code").and_then(Value::as_str) == Some("proposal_not_found")
     {
-        // A completed proposal no longer has a pending detail document. Still
-        // call the decision route so its terminal audit can make retries
-        // idempotent (or report an opposite prior decision).
+        // A proposal absent from pending may already be complete. Still call
+        // the decision route so its terminal audit can make completed retries
+        // idempotent; an unknown id remains a not-found error.
         None
     } else {
         return api_failure(&detail_path, detail_response.status, &detail);

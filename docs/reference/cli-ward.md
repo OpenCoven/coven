@@ -19,7 +19,7 @@ coven ward pending             # table of staged proposals, newest first
 coven ward pending <id>        # one proposal in full
 coven ward pending --json      # exact daemon body (GET /api/v1/threads/proposals)
 coven ward approve <id>        # re-validate and atomically apply
-coven ward reject <id> --note "reason" # reject without applying
+coven ward reject <id> [--note "reason"] # reject without applying
 coven ward audit <familiar>    # append-only ward_audit ledger, newest first
 coven ward migrate --apply     # migrate v0.1 ward.toml files to Phase-2
 ```

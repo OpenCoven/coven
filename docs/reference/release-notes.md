@@ -12,7 +12,7 @@ title: "Coven changelog and release notes"
 
 - **Ward proposals can be decided from the CLI.** `coven ward approve <id>`
   re-validates and atomically applies a pending proposal, while
-  `coven ward reject <id> --note "reason"` audits and removes it without
+  `coven ward reject <id> [--note "reason"]` audits and removes it without
   applying. Both wrappers read and submit the proposal's exact revision before
   deciding; `--note` also supports rationale-required approvals, and `--json`
   returns the API decision report. See [Ward commands](/reference/cli-ward) and
