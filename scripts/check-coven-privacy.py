@@ -49,8 +49,8 @@ RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 
-def scannable_line(line: str, path: str) -> str:
-    if pathlib.PurePath(path).name != "pnpm-lock.yaml":
+def scannable_line(line: str, is_pnpm_lock: bool) -> str:
+    if not is_pnpm_lock:
         return line
     return PNPM_SHA512_INTEGRITY_DIGEST.sub(
         r"\g<prefix><integrity-digest>",
@@ -60,8 +60,9 @@ def scannable_line(line: str, path: str) -> str:
 
 def scan_text(text: str, path: str) -> list[tuple[str, int, str]]:
     hits: list[tuple[str, int, str]] = []
+    is_pnpm_lock = pathlib.PurePath(path).name == "pnpm-lock.yaml"
     for line_number, line in enumerate(text.splitlines(), 1):
-        line = scannable_line(line, path)
+        line = scannable_line(line, is_pnpm_lock)
         session_key_hit = False
         for name, pattern in RULES:
             if name == "messenger_chat_id" and session_key_hit:
