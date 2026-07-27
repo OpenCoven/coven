@@ -18,6 +18,11 @@ PNPM_SHA512_INTEGRITY_DIGEST = re.compile(
     r"sha512-[A-Za-z0-9+/]{86}=="
     r"(?=$|[\s},#])"
 )
+PACKAGE_LOCK_SHA512_INTEGRITY_DIGEST = re.compile(
+    r'(?P<prefix>(?:^\s*|[{,]\s*)"integrity"\s*:\s*")'
+    r"sha512-[A-Za-z0-9+/]{86}=="
+    r'(?="(?:\s*[,}])?$)'
+)
 RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "coven_session_key",
@@ -49,20 +54,25 @@ RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 
-def scannable_line(line: str, is_pnpm_lock: bool) -> str:
-    if not is_pnpm_lock:
-        return line
-    return PNPM_SHA512_INTEGRITY_DIGEST.sub(
-        r"\g<prefix><integrity-digest>",
-        line,
-    )
+def scannable_line(line: str, lockfile_name: str) -> str:
+    if lockfile_name == "pnpm-lock.yaml":
+        return PNPM_SHA512_INTEGRITY_DIGEST.sub(
+            r"\g<prefix><integrity-digest>",
+            line,
+        )
+    if lockfile_name == "package-lock.json":
+        return PACKAGE_LOCK_SHA512_INTEGRITY_DIGEST.sub(
+            r"\g<prefix><integrity-digest>",
+            line,
+        )
+    return line
 
 
 def scan_text(text: str, path: str) -> list[tuple[str, int, str]]:
     hits: list[tuple[str, int, str]] = []
-    is_pnpm_lock = pathlib.PurePath(path).name == "pnpm-lock.yaml"
+    lockfile_name = pathlib.PurePath(path).name
     for line_number, line in enumerate(text.splitlines(), 1):
-        line = scannable_line(line, is_pnpm_lock)
+        line = scannable_line(line, lockfile_name)
         session_key_hit = False
         for name, pattern in RULES:
             if name == "messenger_chat_id" and session_key_hit:

@@ -256,6 +256,16 @@ class CovenPrivacyPatternTests(unittest.TestCase):
 
         self.assertEqual(hits, [])
 
+    def test_package_lock_integrity_digest_phone_like_substring_is_allowed(self) -> None:
+        digest = phone_like_sha512_digest()
+        text = f'"integrity": "{digest}",'
+
+        hits = check_coven_privacy.scan_text(
+            text, "packages/example/package-lock.json"
+        )
+
+        self.assertEqual(hits, [])
+
     def test_phone_number_outside_pnpm_integrity_digest_is_blocked(self) -> None:
         digest = phone_like_sha512_digest()
         phone = "+" + "1" + "312" + "555" + "0100"
