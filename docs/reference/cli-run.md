@@ -21,7 +21,7 @@ coven run <harness> <prompt> [flags]
 | `--cwd <path>` | Launch from a directory inside the resolved project root. |
 | `--add-dir <path>` | Grant the harness access to an additional directory beyond its cwd; repeat the flag for multiple directories. Maps to each harness's native trust flag (`--add-dir` for codex, claude, copilot, and coven-code). Harnesses with no add-dir mechanism warn and continue. |
 | `--title <text>` | Store a readable session title. |
-| `--model <id>` | Forward a model override through the adapter's declared transform. `strip_provider` (the legacy default) removes the first provider segment; `preserve` forwards the provider-qualified id unchanged. |
+| `--model <id>` | Forward a model override through the adapter's declared transform. `strip_provider` (the legacy default) removes the first non-empty provider segment when the remainder is non-empty and does not start with `/`; degenerate ids such as `openai//gpt` remain unchanged. `preserve` forwards the provider-qualified id unchanged. Values that are unsafe for process argv after transformation are rejected before launch. |
 | `--think` | Request deeper reasoning. Claude, Coven Code, and Copilot map this to `--effort high`; unsupported harnesses warn and continue. |
 | `--speed <level>` | Set a latency/reasoning hint: `fast`, `balanced`, or `thorough`. Claude, Coven Code, and Copilot map these to `--effort low`, `medium`, or `high`; unsupported harnesses warn and continue. |
 | `--detach` | Create the session record without launching the harness. |

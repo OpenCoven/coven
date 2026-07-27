@@ -36,7 +36,9 @@ version.
    logs/hooks); NOT the same as --resume — does not pin or restore a session
 7. `coven-code --model <id>` / `--append-system-prompt <text>` / `--cwd <dir>` —
    accepted and honored; coven preserves provider-qualified model ids and
-   passes values through unvalidated
+   rejects model values that are unsafe for process argv after the adapter
+   transform; accepted model ids are otherwise passed through without catalog
+   validation
 8. `coven-code --permission-mode {default|accept-edits|bypass-permissions|plan}` —
    accepted and honored; coven passes the value through unvalidated
 9. `coven-code auth status --json` — machine-readable auth state; coven reads only

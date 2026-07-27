@@ -392,8 +392,8 @@ impl HarnessCommandSpec {
         };
         if self.supports_model() && !is_safe_model_arg(transformed) {
             return Err(anyhow!(
-                "model id is unsafe after adapter transform for harness `{}`",
-                self.id
+                "model id is unsafe after adapter transform for harness `{}`: {transformed:?}",
+                self.id,
             ));
         }
         if let Some(template) = self.model_arg_template.as_deref() {
@@ -4442,6 +4442,14 @@ mod tests {
             .expect_err("a flag-shaped post-transform model must be rejected");
             assert!(
                 error.to_string().contains("unsafe after adapter transform"),
+                "{requested}: {error}"
+            );
+            let transformed = requested
+                .split_once('/')
+                .expect("provider-qualified fixture")
+                .1;
+            assert!(
+                error.to_string().contains(&format!("{transformed:?}")),
                 "{requested}: {error}"
             );
         }
