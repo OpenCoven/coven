@@ -170,10 +170,8 @@ pub struct ProbeConfig {
 }
 
 impl ProbeConfig {
-    pub(crate) fn matches_surface(&self, surface: &str) -> Result<bool> {
-        Ok(compile_glob(&self.surface, false)?
-            .compile_matcher()
-            .is_match(surface))
+    pub(crate) fn surface_matcher(&self) -> Result<globset::GlobMatcher> {
+        Ok(compile_glob(&self.surface, false)?.compile_matcher())
     }
 }
 
@@ -1941,10 +1939,9 @@ required = ["(?m)^name:"]
         );
         assert_eq!(config.probe[1].id, ProbeId::PatternLint);
         assert_eq!(config.probe[1].forbidden, vec!["(?i)ignore previous"]);
-        assert!(config.probe[1]
-            .matches_surface("reviewed/SKILL.md")
-            .unwrap());
-        assert!(!config.probe[1].matches_surface("notes/SKILL.md").unwrap());
+        let matcher = config.probe[1].surface_matcher().unwrap();
+        assert!(matcher.is_match("reviewed/SKILL.md"));
+        assert!(!matcher.is_match("notes/SKILL.md"));
     }
 
     #[test]

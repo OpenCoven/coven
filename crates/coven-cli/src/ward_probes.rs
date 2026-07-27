@@ -19,6 +19,7 @@ use crate::ward::{
 
 const PROTECTED_START: &str = "<!-- ward:protected -->";
 const PROTECTED_END: &str = "<!-- /ward:protected -->";
+type CompiledProbeMatcher<'a> = (&'a ProbeConfig, globset::GlobMatcher);
 
 /// One surface's immutable staging-time probe evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,6 +139,7 @@ pub(crate) fn run_at_staging(
     if outcome.decisions.len() != edits.len() {
         bail!("Ward returned an incomplete probe adjudication");
     }
+    let compiled_probes = compile_probe_matchers(config)?;
     let mut targets = std::collections::BTreeSet::new();
     let mut surfaces = std::collections::BTreeSet::new();
     for (edit, decision) in edits.iter().zip(&outcome.decisions) {
@@ -161,7 +163,7 @@ pub(crate) fn run_at_staging(
         .map(|(edit, decision)| {
             run_surface(
                 workspace,
-                config,
+                &compiled_probes,
                 &edit.target,
                 &decision.resolved,
                 &edit.new_contents,
@@ -170,22 +172,30 @@ pub(crate) fn run_at_staging(
         .collect()
 }
 
+fn compile_probe_matchers(config: &WardConfig) -> Result<Vec<CompiledProbeMatcher<'_>>> {
+    config
+        .probe
+        .iter()
+        .map(|probe| {
+            probe
+                .surface_matcher()
+                .with_context(|| format!("invalid probe surface glob `{}`", probe.surface))
+                .map(|matcher| (probe, matcher))
+        })
+        .collect()
+}
+
 fn run_surface(
     workspace: &Path,
-    config: &WardConfig,
+    compiled_probes: &[CompiledProbeMatcher<'_>],
     target: &str,
     surface: &str,
     proposed: &[u8],
 ) -> Result<SurfaceProbeReport> {
-    let matching = config
-        .probe
+    let matching = compiled_probes
         .iter()
-        .filter_map(|probe| match probe.matches_surface(surface) {
-            Ok(true) => Some(Ok(probe)),
-            Ok(false) => None,
-            Err(error) => Some(Err(error)),
-        })
-        .collect::<Result<Vec<_>>>()?;
+        .filter_map(|(probe, matcher)| matcher.is_match(surface).then_some(*probe))
+        .collect::<Vec<_>>();
     let proposed_sha256 = sha256_hex(proposed);
     let baseline = match threads_gate::read_surface_if_exists(workspace, surface) {
         Ok(baseline) => baseline,
@@ -662,6 +672,32 @@ required = ["(?m)^name: sage$"]
 "#,
         )
         .expect("probe config parses")
+    }
+
+    #[test]
+    fn probe_matchers_compile_in_declaration_order_for_reuse() {
+        let config = config_with_all_probes();
+
+        let compiled = compile_probe_matchers(&config).unwrap();
+
+        assert_eq!(compiled.len(), config.probe.len());
+        assert!(compiled
+            .iter()
+            .all(|(_, matcher)| matcher.is_match("reviewed/SKILL.md")));
+        assert!(compiled
+            .iter()
+            .all(|(_, matcher)| !matcher.is_match("notes/SKILL.md")));
+        assert_eq!(
+            compiled
+                .iter()
+                .map(|(probe, _)| probe.id)
+                .collect::<Vec<_>>(),
+            config
+                .probe
+                .iter()
+                .map(|probe| probe.id)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
