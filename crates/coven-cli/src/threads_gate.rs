@@ -431,12 +431,9 @@ pub(crate) fn read_surface_if_exists(workspace: &Path, surface: &str) -> Result<
     // component, so canonicalize the deepest *existing* ancestor and require
     // it to stay inside the canonical workspace (second review pass finding —
     // `linkdir/secret` with `linkdir` pointing outside must refuse).
-    let canonical_workspace = workspace.canonicalize().with_context(|| {
-        format!(
-            "familiar workspace `{}` is not resolvable",
-            workspace.display()
-        )
-    })?;
+    let canonical_workspace = workspace
+        .canonicalize()
+        .with_context(|| format!("familiar workspace for surface `{surface}` is not resolvable"))?;
     let mut ancestor = path.parent();
     let deepest_existing = loop {
         match ancestor {
@@ -855,9 +852,9 @@ fn stage_pending_proposal(
         .with_context(|| format!("creating {}", pending_dir.display()))?;
     let path = pending_dir.join(proposal.file_name());
     let body = {
-        /// On-disk pending-proposal shape: the core type plus the optional
-        /// lane marker (absent ⇒ authority, so existing files and the core
-        /// deserializer keep working unchanged).
+        /// On-disk pending-proposal shape: the core type plus additive lane
+        /// and probe-evidence sidecars. An absent lane still means authority;
+        /// existing files and the core deserializer keep working unchanged.
         #[derive(serde::Serialize)]
         struct StagedProposalFile<'a> {
             #[serde(flatten)]
@@ -1342,6 +1339,20 @@ tier = 0
     #[test]
     fn surface_read_errors_name_only_the_logical_surface() {
         let f = fixture();
+        let missing_workspace = f.workspace.join("missing-workspace");
+        let missing_error = read_surface_if_exists(&missing_workspace, "reviewed/file.md")
+            .expect_err("a missing workspace must refuse");
+        let missing_rendered = format!("{missing_error:#}");
+
+        assert!(
+            missing_rendered.contains("reviewed/file.md"),
+            "{missing_rendered}"
+        );
+        assert!(
+            !missing_rendered.contains(&missing_workspace.display().to_string()),
+            "{missing_rendered}"
+        );
+
         std::os::unix::fs::symlink("loop", f.workspace.join("loop")).unwrap();
 
         let error = read_surface_if_exists(&f.workspace, "loop/file.md")

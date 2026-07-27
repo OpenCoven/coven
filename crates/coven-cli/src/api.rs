@@ -2729,7 +2729,7 @@ fn apply_familiar_edits(
     if let Some(duplicate) = adjudication
         .decisions
         .iter()
-        .find(|decision| !resolved_targets.insert(decision.resolved.as_str()))
+        .find(|decision| !resolved_targets.insert(ward::portable_surface_key(&decision.resolved)))
     {
         return api_error(
             400,
@@ -9462,6 +9462,37 @@ forbidden = ["(?i)ignore previous"]
         let body: serde_json::Value = serde_json::from_str(&response.body)?;
         assert_eq!(body["error"]["code"], "invalid_request");
         assert_eq!(body["error"]["details"]["resolved"], "reviewed/skill.md");
+        assert!(!home.join("pending").exists());
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[
+                {"target":"reviewed/skill.md","contents":"first"},
+                {"target":"reviewed/SKILL.md","contents":"second"}
+            ]}"#,
+        )?;
+
+        assert_eq!(response.status, 400, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "invalid_request");
+        assert_eq!(body["error"]["details"]["resolved"], "reviewed/SKILL.md");
+        assert!(!home.join("pending").exists());
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[
+                {"target":"reviewed/caf\u00e9.md","contents":"first"},
+                {"target":"reviewed/cafe\u0301.md","contents":"second"}
+            ]}"#,
+        )?;
+
+        assert_eq!(response.status, 400, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "invalid_request");
+        assert_eq!(
+            body["error"]["details"]["resolved"],
+            "reviewed/cafe\u{301}.md"
+        );
         assert!(!home.join("pending").exists());
         Ok(())
     }

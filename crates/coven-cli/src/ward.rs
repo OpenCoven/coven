@@ -89,6 +89,7 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
+use unicode_normalization::UnicodeNormalization;
 
 /// Trust tier of a path within a familiar's surface.
 ///
@@ -1733,6 +1734,16 @@ fn to_forward_slashes(path: &Path) -> String {
         })
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// Portable uniqueness key for a Gate-2-resolved surface.
+///
+/// Familiar proposals must not contain case-only aliases: they name one file
+/// on default macOS and Windows filesystems even when they remain distinct on
+/// a case-sensitive checkout. Rejecting them everywhere keeps staged evidence
+/// portable and follows the Ward's existing case-insensitive collision posture.
+pub(crate) fn portable_surface_key(surface: &str) -> String {
+    surface.chars().flat_map(char::to_lowercase).nfc().collect()
 }
 
 #[cfg(test)]

@@ -150,7 +150,7 @@ pub(crate) fn run_at_staging(
         if !targets.insert(edit.target.as_str()) {
             bail!("probe staging requires unique edit targets");
         }
-        if !surfaces.insert(decision.resolved.as_str()) {
+        if !surfaces.insert(crate::ward::portable_surface_key(&decision.resolved)) {
             bail!("probe staging requires unique resolved surfaces");
         }
     }
@@ -916,6 +916,34 @@ required = ["(?m)^name:"]
         assert_eq!(result.status, ProbeStatus::Failed);
         assert_eq!(result.detail["forbiddenMatches"], json!([0]));
         assert_eq!(result.detail["missingRequired"], json!([0]));
+    }
+
+    #[test]
+    fn staging_refuses_nonportable_resolved_surface_aliases() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("reviewed")).unwrap();
+        for (left, right) in [
+            ("reviewed/skill.md", "reviewed/SKILL.md"),
+            ("reviewed/caf\u{e9}.md", "reviewed/cafe\u{301}.md"),
+        ] {
+            let edits = vec![
+                FileEdit::new(left, "---\nname: sage\n---\n"),
+                FileEdit::new(right, "---\nname: sage\n---\n"),
+            ];
+
+            let error = run_at_staging(
+                temp.path(),
+                &config_with_all_probes(),
+                &edits,
+                &Authorization::unsigned(),
+            )
+            .expect_err("nonportable aliases must not produce conflicting probe reports");
+
+            assert!(
+                error.to_string().contains("unique resolved surfaces"),
+                "{error:#}"
+            );
+        }
     }
 
     #[test]
