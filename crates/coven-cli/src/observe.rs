@@ -563,7 +563,10 @@ fn render_ward_pending(body: &Value) -> String {
                 .unwrap_or_default(),
         ));
     }
-    out.push_str("\nDecide: coven ward approve <id> · coven ward reject <id> --note \"reason\"\n");
+    out.push_str(
+        "\nDecide: coven ward approve <id> [--note \"rationale\"] · \
+         coven ward reject <id> [--note \"reason\"]\n",
+    );
     out
 }
 
@@ -1560,6 +1563,14 @@ mod tests {
         assert!(rendered.contains("failed"), "{rendered}");
         assert!(rendered.contains("coven ward approve <id>"), "{rendered}");
         assert!(rendered.contains("coven ward reject <id>"), "{rendered}");
+        assert!(
+            rendered.contains("approve <id> [--note \"rationale\"]"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("reject <id> [--note \"reason\"]"),
+            "{rendered}"
+        );
     }
 
     #[test]
