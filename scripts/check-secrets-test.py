@@ -473,6 +473,67 @@ class SecretGuardExceptionScopeTests(unittest.TestCase):
             [("docs/example.env", 1, "generic_assignment")],
         )
 
+    def test_angle_placeholder_rejects_literal_payload(self) -> None:
+        hits = check_secrets.scan_text(
+            "api_key=<hunter2hunter2hunter2>", "docs/example.env"
+        )
+
+        self.assertEqual(
+            hits, [("docs/example.env", 1, "generic_assignment")]
+        )
+
+    def test_common_angle_placeholder_is_safe(self) -> None:
+        cases = [
+            "api_key=<YOUR_API_KEY>",
+            "api_key=<YOUR_API_KEY_HERE>",
+        ]
+
+        for text in cases:
+            with self.subTest(text=text):
+                hits = check_secrets.scan_text(text, "docs/example.env")
+
+                self.assertEqual(hits, [])
+
+    def test_safe_value_rejects_unquoted_passphrase_continuation(self) -> None:
+        cases = [
+            "api_key=<secret-value> correct horse battery staple",
+            "api_key=<secret-value> correct horse battery",
+            "api_key=<secret-value> hunter2 hunter2 hunter2",
+            "api_key=<secret-value> correct horse battery.",
+            "api_key=<secret-value> correct horse battery;",
+            "api_key=<secret-value> correct horse battery!",
+            "api_key=<secret-value> correct horse battery # note",
+            "api_key=<YOUR_API_KEY> correct horse battery.",
+            "api_key=<secret-value> correct, horse, battery",
+            "api_key=<secret-value> correct: horse: battery",
+            "api_key=<secret-value> correct / horse / battery",
+            "api_key=<secret-value> (correct horse battery)",
+            "api_key=<secret-value> correct horse (battery)",
+            "api_key=<secret-value> [correct horse battery]",
+            "api_key=<secret-value> correct horse battery <b>",
+            "api_key=<secret-value> correct horse and battery",
+            (
+                "api_key=<secret-value> "
+                "# note AbCdEfGhIjKlMnOpQrStUvWx"
+            ),
+            (
+                "api_key=<secret-value> "
+                "[note AbCdEfGhIjKlMnOpQrStUvWx](README.md)"
+            ),
+            (
+                "api_key=<secret-value> "
+                "# replace correct horse battery with actual value"
+            ),
+        ]
+
+        for text in cases:
+            with self.subTest(text=text):
+                hits = check_secrets.scan_text(text, "docs/example.env")
+
+                self.assertEqual(
+                    hits, [("docs/example.env", 1, "generic_assignment")]
+                )
+
     def test_lockfile_exception_is_scoped_to_the_integrity_token(self) -> None:
         digest = (
             "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
@@ -804,6 +865,7 @@ class SecretGuardExceptionScopeTests(unittest.TestCase):
             ),
             "api_key=<secret-value> # configuration placeholder",
             "api_key=<secret-value> # configuration placeholder.",
+            "api_key=<secret-value> # replace with your actual value",
             (
                 "api_key=<secret-value> "
                 "# don't commit the placeholder"
@@ -845,10 +907,93 @@ class SecretGuardExceptionScopeTests(unittest.TestCase):
                     hits, [("docs/example.md", 1, expected_rule)]
                 )
 
+    def test_safe_path_context_rejects_credential_like_segments(self) -> None:
+        token = "".join(
+            ("m9R3tQv7WzK2pL5", "nX8cF1gJ4sD6hY0", "aBEuIqOwPz")
+        )
+        cases = [
+            (f"/tmp/a/b/{token}", "high_entropy"),
+            (
+                "https://github.com/OpenCoven/coven/blob/main/"
+                f"{token}",
+                "high_entropy",
+            ),
+            (
+                "https://github.com/OpenCoven/coven/"
+                f"releases/download/v1/{token}",
+                "high_entropy",
+            ),
+            (f"Library/LaunchAgents/{token}", "high_entropy"),
+            ("/tmp/a/b/hunter2hunter2hunter2", "generic_assignment"),
+            ("/tmp/a/b/abcdefghijklmnopqrst", "generic_assignment"),
+            ("/tmp/a/b/correcthorsebattery", "generic_assignment"),
+            ("/tmp/a/b/hunterhunterhunter", "generic_assignment"),
+            ("/tmp/a/b/CorrectHorseBattery", "generic_assignment"),
+            ("/tmp/a/b/correct/horse/battery", "generic_assignment"),
+            (
+                "https://github.com/OpenCoven/coven/blob/main/"
+                "correcthorsebattery",
+                "generic_assignment",
+            ),
+        ]
+
+        for value, expected_rule in cases:
+            with self.subTest(value=value):
+                hits = check_secrets.scan_text(
+                    f"api_key=<secret-value> {value}",
+                    "docs/example.md",
+                )
+
+                self.assertEqual(
+                    hits, [("docs/example.md", 1, expected_rule)]
+                )
+
+    def test_structured_reference_rejects_credential_like_segments(self) -> None:
+        token = "".join(
+            ("m9R3tQv7WzK2pL5", "nX8cF1gJ4sD6hY0", "aBEuIqOwPz")
+        )
+        sha = "deadbeef" * 5
+        cases = [
+            (
+                f"https://github.com/{token}/repo/commit/{sha}",
+                "high_entropy",
+            ),
+            (
+                f"https://github.com/OpenCoven/{token}/commit/{sha}",
+                "high_entropy",
+            ),
+            (f"actions/{token}@{sha}", "high_entropy"),
+            (
+                f"https://www.apple.com/DTDs/{token}.dtd",
+                "high_entropy",
+            ),
+            (
+                "https://github.com/OpenCoven/coven"
+                "#correcthorsebattery",
+                "generic_assignment",
+            ),
+        ]
+
+        for value, expected_rule in cases:
+            with self.subTest(value=value):
+                hits = check_secrets.scan_text(
+                    f"api_key=<secret-value> {value}",
+                    "docs/example.md",
+                )
+
+                self.assertEqual(
+                    hits, [("docs/example.md", 1, expected_rule)]
+                )
+
     def test_grep_extended_regex_pattern_assignment_terms_are_safe(self) -> None:
         cases = [
             "grep -cE '(token=|key=|secret=|password=)' history",
             "grep -c -E '(token=|key=|secret=|password=)' history",
+            (
+                "COUNT=$(grep -cE "
+                "'(token=|key=|secret=|password=|Bearer [A-Za-z0-9])' "
+                '"$HIST_FILE" 2>/dev/null || true)'
+            ),
         ]
 
         for text in cases:
@@ -890,12 +1035,18 @@ class SecretGuardExceptionScopeTests(unittest.TestCase):
 
 
 class SecretGuardRustLetBindingTests(unittest.TestCase):
-    def test_rust_let_call_bindings_do_not_trigger_generic_assignment(self) -> None:
+    def test_known_rust_runtime_bindings_do_not_trigger_generic_assignment(
+        self,
+    ) -> None:
         text = "\n".join(
             [
                 "    let token = text.split_whitespace().last()?;",
                 "    let token = token.strip_prefix('v').unwrap_or(token);",
                 "    let mut secret = std::env::args().nth(1).unwrap_or_default();",
+                (
+                    "    let token = text.split_whitespace().last()?; "
+                    "// parse runtime token"
+                ),
                 "    let password: String = prompt_hidden(\"Password: \")?;",
                 "    let api_key = format!(\"{prefix}-{suffix}\");",
             ]
@@ -912,6 +1063,76 @@ class SecretGuardRustLetBindingTests(unittest.TestCase):
 
         self.assertEqual(
             hits, [("crates/coven-cli/src/engine.rs", 1, "generic_assignment")]
+        )
+
+    def test_rust_let_call_with_appended_value_still_triggers_generic_assignment(
+        self,
+    ) -> None:
+        cases = [
+            'let token = compute_token() + "hunter2hunter2hunter2";',
+            'let token = compute_token().trim() + "hunter2hunter2hunter2";',
+            "let token = compute_token() || hunter2hunter2hunter2;",
+            'let token = compute_token().unwrap_or("hunter2hunter2hunter2");',
+            "let token = compute_token(hunter2hunter2hunter2);",
+            'let token = compute_token(r#"hunter2hunter2hunter2"#);',
+            'let token = compute_token("hunterhunter");',
+            'let password = prompt_hidden("correct horse battery staple");',
+            'let token = compute_token("abcdefghijklmnop-qrst");',
+            'let token = compute_token("correct horse battery");',
+            'let token = compute_token("Correct Horse Battery Staple");',
+            (
+                "let token = compute_token("
+                '/* ); // */ "hunter2hunter2hunter2");'
+            ),
+            (
+                'let token = compute_token(concat!("hunter2", '
+                '"hunter2", "hunter2"));'
+            ),
+            (
+                'let token = compute_token(format!("{}{}{}", '
+                '"hunter2", "hunter2", "hunter2"));'
+            ),
+            (
+                'let token = compute_token(["hunter2", "hunter2", '
+                '"hunter2"].concat());'
+            ),
+            "let token = compute_token(12345678901234567890.into());",
+            "let token = compute_token(&12345678901234567890);",
+            "let token = compute_token::<12345678901234567890>();",
+            (
+                "let token = text.split_whitespace().last()?; "
+                "// correct horse battery staple"
+            ),
+            (
+                "let token = text.split_whitespace().last()?; "
+                "// note AbCdEfGhIjKlMnOpQrStUvWx"
+            ),
+        ]
+
+        for text in cases:
+            with self.subTest(text=text):
+                hits = check_secrets.scan_text(
+                    text, "crates/coven-cli/src/engine.rs"
+                )
+
+                self.assertEqual(
+                    hits,
+                    [
+                        (
+                            "crates/coven-cli/src/engine.rs",
+                            1,
+                            "generic_assignment",
+                        )
+                    ],
+                )
+
+    def test_rust_let_call_exception_is_scoped_to_rust_files(self) -> None:
+        hits = check_secrets.scan_text(
+            "let token = text.split_whitespace().last()?;", "docs/example.txt"
+        )
+
+        self.assertEqual(
+            hits, [("docs/example.txt", 1, "generic_assignment")]
         )
 
     def test_rust_let_with_bare_blob_still_triggers_generic_assignment(self) -> None:

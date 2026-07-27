@@ -39,7 +39,14 @@ SECRET_RULES: list[tuple[str, re.Pattern[str]]] = [
 GENERIC_ASSIGNMENT_SAFE_VALUE = re.compile(
     r'''(?ix)\b(?:api[_-]?key|secret|token|password|private[_-]?key)\b\s*[:=]\s*["']?'''
     r"(?:"
-    r"<[-A-Za-z0-9_ .]{1,40}>"
+    r"<(?:"
+    r"(?:your|example|placeholder)[-_ ]"
+    r"(?:api[-_ ]?key|private[-_ ]?key|secret|token|password|credential|value)"
+    r"(?:[-_ ](?:value|placeholder|example|here))?"
+    r"|(?:api[-_ ]?key|private[-_ ]?key|secret|token|password|credential)"
+    r"(?:[-_ ](?:value|placeholder|example|here))?"
+    r"|value|placeholder|example"
+    r")>"
     r"|your_[A-Za-z0-9_.-]{1,64}"
     r"|(?:placeholder|example|secret_value)(?:[-_][A-Za-z0-9_.-]{1,64})?"
     r"|op://[A-Za-z0-9_.@/%+-]{1,200}"
@@ -68,14 +75,20 @@ ENV_SECRET_REFERENCE = re.compile(
     r"(?i)\b(?:api[_-]?key|secret|token|password|private[_-]?key)\b\s*[:=]\s*[\"']?"
     r"(?:\$[A-Z0-9_]+|\$\{[A-Z0-9_]+(?:(?::?\?)[^}\"']*)?\})"
 )
-# A Rust `let` binding whose right-hand side begins with a call expression
-# (identifier chain followed by `(`, e.g. `let token = text.split_whitespace()`).
-# The secret-sounding name binds the RESULT of code that runs later; the line
-# cannot contain a credential literal. A quoted or bare-blob RHS does not match
-# this shape and still trips `generic_assignment`.
-RUST_LET_CALL_BINDING = re.compile(
-    r"^\s*let\s+(?:mut\s+)?[A-Za-z_][A-Za-z0-9_]*\s*(?::[^=]{1,64})?=\s*"
-    r"[A-Za-z_][A-Za-z0-9_]*(?:(?:::|\.)[A-Za-z_][A-Za-z0-9_]*)*!?\("
+# History scanning cannot be repaired by renaming these locals at HEAD. Keep
+# the exception to the three proven runtime-derived bindings instead of
+# attempting to recognize arbitrary Rust call expressions.
+RUST_KNOWN_SAFE_RUNTIME_BINDING = re.compile(
+    r"""(?x)
+    ^\s*
+    (?:
+        let\s+token\s*=\s*text\.split_whitespace\(\)\.last\(\)\?;
+        |let\s+token\s*=\s*token\.strip_prefix\('v'\)\.unwrap_or\(token\);
+        |let\s+mut\s+secret\s*=\s*std::env::args\(\)\.nth\(1\)
+            \.unwrap_or_default\(\);
+    )
+    \s*$
+    """
 )
 QUOTED_TEXT = re.compile(r"'[^']*'|\"[^\"]*\"")
 SAFE_SECRET_FIELD_REGEX_PATTERN = re.compile(
@@ -134,6 +147,16 @@ ASSIGNMENT_CONTEXT_MARKDOWN_LINK = re.compile(
 ASSIGNMENT_CONTEXT_PROSE = re.compile(
     r"[A-Za-z][A-Za-z ,.:;()'/-]{0,160}"
 )
+ASSIGNMENT_CONTEXT_GUIDANCE = re.compile(
+    r"""(?ix)
+    (?:
+        replace\s+with\s+(?:your\s+)?actual\s+value
+        |(?:parse|read|load|derive|use)\s+(?:the\s+)?runtime\s+
+            (?:value|token|input|argument)
+    )
+    [.:;]?
+    """
+)
 ASSIGNMENT_CONTEXT_DOC_PATH = re.compile(
     r"(?:[A-Za-z0-9_.-]{1,64}/)*"
     r"[A-Za-z0-9_.-]{1,64}\."
@@ -158,6 +181,44 @@ ORDERED_ALPHABET_FIXTURES = {
 }
 KNOWN_PUBLIC_DOCUMENTATION_TOKENS = {
     "support-dev.discord.com/hc/en-us/articles/6207308062871-What-are-Privileged-Intents",
+}
+KNOWN_SAFE_LONG_PATH_ATOMS = {
+    "ARCHITECTURE",
+    "CONTRIBUTING",
+    "LaunchAgents",
+    "LaunchDaemons",
+    "PropertyList",
+    "TROUBLESHOOTING",
+    "accessibility",
+    "announcements",
+    "architecture",
+    "capabilities",
+    "configuration",
+    "orchestration",
+    "troubleshooting",
+    "verification",
+}
+PATH_CONTEXT_BOUNDARIES = {
+    ".worktrees",
+    "Library",
+    "LaunchAgents",
+    "LaunchDaemons",
+    "OpenCoven",
+    "assets",
+    "blob",
+    "brand",
+    "crates",
+    "docs",
+    "download",
+    "main",
+    "packages",
+    "releases",
+    "scripts",
+    "skills",
+    "specs",
+    "src",
+    "tree",
+    "worktrees",
 }
 KNOWN_FAKE_PRIVATE_KEY_FIXTURE = re.compile(
     r"-----BEGIN PRIVATE KEY-----\\n(?:fake){3,}\\n-----END PRIVATE KEY-----"
@@ -205,7 +266,11 @@ def assignment_is_covered_by_safe_match(
 
 
 def safe_assignment_continuation_is_syntax(
-    path: str, line: str, safe_match: re.Match[str]
+    path: str,
+    line: str,
+    safe_match: re.Match[str],
+    *,
+    reject_unmarked_passphrase: bool = True,
 ) -> bool:
     tail = line[safe_match.end() :]
     immediate_suffix = re.match(r"\S*", tail)
@@ -218,6 +283,13 @@ def safe_assignment_continuation_is_syntax(
         operator, fallback = continuation.groups()
         return operator != "+" and bool(SAFE_FALLBACK_VALUE.fullmatch(fallback))
     trailing_start = safe_match.end() + immediate_suffix.end()
+    trailing_context = line[trailing_start:].strip()
+    if (
+        reject_unmarked_passphrase
+        and not trailing_context.startswith(("#", "//"))
+        and is_likely_unmarked_passphrase(trailing_context)
+    ):
+        return False
     return all(
         assignment_trailing_chunk_is_accounted_for(path, line, chunk_match)
         for chunk_match in ASSIGNMENT_TRAILING_CHUNK.finditer(
@@ -248,8 +320,29 @@ def is_safe_secret_field_regex_assignment(
                 quoted.group(0)[1:-1]
             )
         )
-        and safe_assignment_continuation_is_syntax(path, line, quoted)
+        and safe_assignment_continuation_is_syntax(
+            path,
+            line,
+            quoted,
+            reject_unmarked_passphrase=False,
+        )
         for quoted in QUOTED_TEXT.finditer(line)
+    )
+
+
+def is_known_safe_rust_runtime_binding(
+    path: str, line: str, assignment: re.Match[str]
+) -> bool:
+    code, comment_marker, comment = line.partition("//")
+    if comment_marker and not is_known_safe_assignment_context_prose(
+        comment, allow_empty=True
+    ):
+        return False
+    binding = RUST_KNOWN_SAFE_RUNTIME_BINDING.fullmatch(code)
+    return bool(
+        path.replace("\\", "/").endswith(".rs")
+        and binding
+        and match_is_within(assignment, binding)
     )
 
 
@@ -275,10 +368,7 @@ def is_known_safe_generic_assignment(
     ):
         return True
 
-    rust_binding = RUST_LET_CALL_BINDING.match(line)
-    if rust_binding and match_is_within(
-        assignment, rust_binding, require_end=False
-    ):
+    if is_known_safe_rust_runtime_binding(path, line, assignment):
         return True
 
     if is_safe_secret_field_regex_assignment(path, line, assignment):
@@ -308,16 +398,84 @@ def is_known_safe_lockfile_token(
     )
 
 
-def is_local_path_like_token(token: str) -> bool:
+def is_safe_path_segment(segment: str, *, strict: bool = False) -> bool:
+    if (
+        not segment
+        or len(segment) > 64
+        or not re.fullmatch(r"[A-Za-z0-9_.-]+", segment)
+    ):
+        return False
+    for atom in (part for part in re.split(r"[._-]", segment) if part):
+        if (
+            strict
+            and len(atom) >= 12
+            and atom not in KNOWN_SAFE_LONG_PATH_ATOMS
+        ):
+            return False
+        if len(atom) > 24:
+            return False
+        if len(atom) < 12:
+            continue
+        letters = "".join(char for char in atom if char.isalpha())
+        if any(char.isdigit() for char in atom):
+            return False
+        if (
+            letters
+            and not (letters.islower() or letters.isupper())
+            and not re.fullmatch(r"(?:[A-Z][a-z]+){2,}", letters)
+        ):
+            return False
+    return True
+
+
+def path_segments_are_safe(
+    segments: list[str], *, strict: bool = False
+) -> bool:
+    if any(
+        not is_safe_path_segment(segment, strict=strict)
+        for segment in segments
+    ):
+        return False
+    if not strict:
+        return True
+
+    passphrase_run = 0
+    for segment in segments:
+        if segment in PATH_CONTEXT_BOUNDARIES:
+            passphrase_run = 0
+            continue
+        stem = segment.rsplit(".", 1)[0]
+        if re.fullmatch(r"[A-Za-z0-9]{4,}", stem):
+            passphrase_run += 1
+            if passphrase_run >= 3:
+                return False
+        else:
+            passphrase_run = 0
+    return True
+
+
+def is_known_safe_assignment_context_path(path: str) -> bool:
+    if not (
+        ASSIGNMENT_CONTEXT_PATH.fullmatch(path)
+        or ASSIGNMENT_CONTEXT_DOC_PATH.fullmatch(path)
+    ):
+        return False
+    return path_segments_are_safe(
+        [
+            part
+            for part in path.replace("\\", "/").split("/")
+            if part not in {"", ".", ".."}
+        ],
+        strict=True,
+    )
+
+
+def is_local_path_like_token(token: str, *, strict: bool = False) -> bool:
     normalized = token.strip("/")
     parts = normalized.split("/")
     if len(parts) < 4:
         return False
-    if any(
-        len(part) > 64
-        or not re.fullmatch(r"[A-Za-z0-9_.-]+", part)
-        for part in parts
-    ):
+    if not path_segments_are_safe(parts, strict=strict):
         return False
     if parts[0] in {"Users", "home", "private", "var", "tmp", "Volumes"}:
         return True
@@ -326,7 +484,9 @@ def is_local_path_like_token(token: str) -> bool:
     return ".worktrees" in parts or "worktrees" in parts
 
 
-def is_public_repo_url_like_token(token: str) -> bool:
+def is_public_repo_url_like_token(
+    token: str, *, strict: bool = False
+) -> bool:
     normalized = token.strip("/")
     if not re.fullmatch(
         r"github\.com/OpenCoven/[A-Za-z0-9_.-]+/"
@@ -334,33 +494,32 @@ def is_public_repo_url_like_token(token: str) -> bool:
         normalized,
     ):
         return False
-    if any(len(part) > 64 for part in normalized.split("/")):
+    if not path_segments_are_safe(
+        normalized.split("/"), strict=strict
+    ):
         return False
     if "/blob/" in normalized or "/tree/" in normalized:
         return True
-    # Release-artifact URLs (…/releases/download/<tag>/<artifact>): tags and
-    # artifact filenames are short path segments; cap each so a token-like
-    # blob smuggled into a fake artifact name still trips the entropy rule.
+    # Release-artifact URLs (…/releases/download/<tag>/<artifact>) use the
+    # same segment validation so credential-like artifact names fail closed.
     if "/releases/download/" in normalized:
-        return all(len(part) <= 64 for part in normalized.split("/"))
+        return True
     return False
 
 
-def is_opencoven_repo_relative_path_token(token: str) -> bool:
+def is_opencoven_repo_relative_path_token(
+    token: str, *, strict: bool = False
+) -> bool:
     normalized = token.strip("/")
     if not normalized.startswith("OpenCoven/coven/"):
         return False
-    # Keep this allowlist tight: only permit path-ish characters (no `+`/`@`) and
-    # reject mixed-case-within-a-segment / extremely long segments that look token-like.
+    # Keep this allowlist tight: only permit path-ish characters (no `+`/`@`)
+    # and reject credential-like path segments.
     if not re.fullmatch(r"OpenCoven/coven/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+){1,}", normalized):
         return False
-    for part in normalized.split("/")[2:]:
-        if len(part) > 64:
-            return False
-        letters = "".join(ch for ch in part if ch.isalpha())
-        if letters and not (letters.islower() or letters.isupper()):
-            return False
-    return True
+    return path_segments_are_safe(
+        normalized.split("/")[2:], strict=strict
+    )
 
 
 def is_github_advisory_url_like_token(token: str) -> bool:
@@ -376,24 +535,47 @@ def is_github_advisory_url_like_token(token: str) -> bool:
     )
 
 
-def is_github_commit_url_like_token(token: str) -> bool:
+def is_github_commit_url_like_token(
+    token: str, *, strict: bool = False
+) -> bool:
     normalized = token.strip("/")
-    return bool(re.fullmatch(r"github\.com/[^/\s]+/[^/\s]+/commit/[0-9a-f]{32,64}", normalized))
+    match = re.fullmatch(
+        r"github\.com/(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)"
+        r"/commit/[0-9a-f]{32,64}",
+        normalized,
+    )
+    return bool(
+        match
+        and path_segments_are_safe(
+            [match.group("owner"), match.group("repo")],
+            strict=strict,
+        )
+    )
 
 
 _GITHUB_ACTION_SHA_REF = re.compile(
-    r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+@[0-9a-f]{40}$"
+    r"^(?P<owner>[A-Za-z0-9._-]+)/(?P<repo>[A-Za-z0-9._-]+)"
+    r"@[0-9a-f]{40}$"
 )
 
 
-def is_github_action_sha_ref_token(token: str) -> bool:
+def is_github_action_sha_ref_token(
+    token: str, *, strict: bool = False
+) -> bool:
     """Whether `token` is a GitHub Actions `uses:` reference pinned to a 40-char
     commit SHA, e.g. ``actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd``.
     SHA-pinned refs are an OpenSSF best practice (they prevent action authors
     from silently moving a version tag onto a malicious commit) but the trailing
     40-hex SHA otherwise pushes the workflow line over the entropy threshold.
     """
-    return bool(_GITHUB_ACTION_SHA_REF.match(token))
+    match = _GITHUB_ACTION_SHA_REF.fullmatch(token)
+    return bool(
+        match
+        and path_segments_are_safe(
+            [match.group("owner"), match.group("repo")],
+            strict=strict,
+        )
+    )
 
 
 _MACOS_LIBRARY_PATH_TOKEN = re.compile(
@@ -403,7 +585,9 @@ _MACOS_LIBRARY_PATH_TOKEN = re.compile(
 )
 
 
-def is_macos_library_path_token(token: str) -> bool:
+def is_macos_library_path_token(
+    token: str, *, strict: bool = False
+) -> bool:
     """Whether `token` is a macOS `Library/...` well-known path such as
     ``Library/LaunchAgents/dev.opencoven.hub.plist``. These show up in
     launchd/service documentation and are never credentials, but reverse-DNS
@@ -413,19 +597,31 @@ def is_macos_library_path_token(token: str) -> bool:
     """
     if not _MACOS_LIBRARY_PATH_TOKEN.fullmatch(token):
         return False
-    return all(len(part) <= 64 for part in token.split("/"))
+    return path_segments_are_safe(
+        token.split("/"), strict=strict
+    )
 
 
-_APPLE_DTD_URL_TOKEN = re.compile(r"www\.apple\.com/DTDs/[A-Za-z0-9_.-]{1,64}\.dtd")
+_APPLE_DTD_URL_TOKEN = re.compile(
+    r"www\.apple\.com/DTDs/(?P<name>[A-Za-z0-9_.-]{1,64})\.dtd"
+)
 
 
-def is_apple_dtd_url_token(token: str) -> bool:
+def is_apple_dtd_url_token(
+    token: str, *, strict: bool = False
+) -> bool:
     """Whether `token` is the Apple property-list DTD system identifier
     (``www.apple.com/DTDs/PropertyList-1.0.dtd``) that appears in every plist
     XML doctype. It is public boilerplate, not a secret, but the mixed-case
     host/path combination exceeds the entropy threshold.
     """
-    return bool(_APPLE_DTD_URL_TOKEN.fullmatch(token))
+    match = _APPLE_DTD_URL_TOKEN.fullmatch(token)
+    return bool(
+        match
+        and is_safe_path_segment(
+            match.group("name"), strict=strict
+        )
+    )
 
 
 def is_ordered_alphabet_fixture_token(token: str) -> bool:
@@ -490,17 +686,30 @@ def is_assignment_context_identifier(chunk: str) -> bool:
     return True
 
 
+def is_safe_url_fragment(fragment: str, *, strict: bool = False) -> bool:
+    if not SAFE_URL_FRAGMENT.fullmatch(fragment):
+        return False
+    anchor = fragment[1:]
+    if re.fullmatch(r"L[0-9]{1,7}(?:-L[0-9]{1,7})?", anchor):
+        return True
+    return is_safe_path_segment(anchor, strict=strict)
+
+
 def is_known_safe_assignment_context_url(url: str) -> bool:
     fragment = SAFE_URL_FRAGMENT.search(url)
+    if fragment and not is_safe_url_fragment(
+        fragment.group(0), strict=True
+    ):
+        return False
     base_url = url[: fragment.start()] if fragment else url
     without_scheme = re.sub(r"(?i)^https?://", "", base_url)
     return bool(
         RESERVED_EXAMPLE_URL.fullmatch(base_url)
         or OPEN_COVEN_REPO_ROOT_URL.fullmatch(base_url)
-        or is_public_repo_url_like_token(without_scheme)
+        or is_public_repo_url_like_token(without_scheme, strict=True)
         or is_github_advisory_url_like_token(without_scheme)
-        or is_github_commit_url_like_token(without_scheme)
-        or is_apple_dtd_url_token(without_scheme)
+        or is_github_commit_url_like_token(without_scheme, strict=True)
+        or is_apple_dtd_url_token(without_scheme, strict=True)
         or is_discord_support_article_token(without_scheme)
     )
 
@@ -509,22 +718,59 @@ def is_known_safe_markdown_target(target: str) -> bool:
     if is_known_safe_assignment_context_url(target):
         return True
     if SAFE_URL_FRAGMENT.fullmatch(target):
-        return True
+        return is_safe_url_fragment(target, strict=True)
     fragment = SAFE_URL_FRAGMENT.search(target)
+    if fragment and not is_safe_url_fragment(
+        fragment.group(0), strict=True
+    ):
+        return False
     base_target = target[: fragment.start()] if fragment else target
-    return bool(
-        ASSIGNMENT_CONTEXT_PATH.fullmatch(base_target)
-        or ASSIGNMENT_CONTEXT_DOC_PATH.fullmatch(base_target)
-    )
+    return is_known_safe_assignment_context_path(base_target)
 
 
 def is_likely_passphrase_prose(text: str) -> bool:
     words = re.findall(r"[A-Za-z]+", text)
-    if len(words) == 1:
-        return len(words[0]) >= 20
-    return len(words) >= 4 and all(
+    if any(len(word) >= 20 for word in words):
+        return True
+    return len(words) >= 3 and all(
         len(word) >= 4 and word.islower() for word in words
     )
+
+
+def is_likely_unmarked_passphrase(text: str) -> bool:
+    candidate = re.split(r"\s+(?:#|//)", text, maxsplit=1)[0]
+    candidate = normalize_assignment_context_chunk(candidate.strip())
+    markdown_link = ASSIGNMENT_CONTEXT_MARKDOWN_LINK.fullmatch(candidate)
+    if markdown_link:
+        label, target = markdown_link.groups()
+        if (
+            is_known_safe_assignment_context_prose(label)
+            and is_known_safe_markdown_target(target)
+        ):
+            return False
+    if (
+        is_known_safe_assignment_context_url(candidate)
+        or is_known_safe_assignment_context_path(candidate)
+        or is_assignment_context_identifier(candidate)
+        or ASSIGNMENT_CONTEXT_ENV_REFERENCE.fullmatch(candidate)
+        or ASSIGNMENT_CONTEXT_ENV_PATH.fullmatch(candidate)
+        or is_local_path_like_token(candidate, strict=True)
+        or is_opencoven_repo_relative_path_token(candidate, strict=True)
+        or is_github_action_sha_ref_token(candidate, strict=True)
+        or is_macos_library_path_token(candidate, strict=True)
+        or is_ordered_alphabet_fixture_token(candidate)
+    ):
+        return False
+    if any(
+        name != "generic_assignment" and pattern.search(candidate)
+        for name, pattern in SECRET_RULES
+    ) or any(
+        entropy(token_match.group(0)) >= 4.3
+        for token_match in ENTROPY_TOKEN.finditer(candidate)
+    ):
+        return False
+    words = re.findall(r"[A-Za-z0-9]+", candidate)
+    return sum(len(word) >= 4 for word in words) >= 3
 
 
 def is_known_safe_assignment_context_prose(
@@ -535,7 +781,10 @@ def is_known_safe_assignment_context_prose(
         return allow_empty
     return bool(
         ASSIGNMENT_CONTEXT_PROSE.fullmatch(normalized)
-        and not is_likely_passphrase_prose(normalized)
+        and (
+            ASSIGNMENT_CONTEXT_GUIDANCE.fullmatch(normalized)
+            or not is_likely_passphrase_prose(normalized)
+        )
     )
 
 
@@ -582,14 +831,14 @@ def is_known_safe_assignment_context_chunk(chunk: str) -> bool:
         return True
     if (
         is_known_safe_assignment_context_url(core)
-        or ASSIGNMENT_CONTEXT_PATH.fullmatch(core)
+        or is_known_safe_assignment_context_path(core)
         or is_assignment_context_identifier(core)
         or ASSIGNMENT_CONTEXT_ENV_REFERENCE.fullmatch(core)
         or ASSIGNMENT_CONTEXT_ENV_PATH.fullmatch(core)
-        or is_local_path_like_token(core)
-        or is_opencoven_repo_relative_path_token(core)
-        or is_github_action_sha_ref_token(core)
-        or is_macos_library_path_token(core)
+        or is_local_path_like_token(core, strict=True)
+        or is_opencoven_repo_relative_path_token(core, strict=True)
+        or is_github_action_sha_ref_token(core, strict=True)
+        or is_macos_library_path_token(core, strict=True)
         or is_ordered_alphabet_fixture_token(core)
     ):
         return True
