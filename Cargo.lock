@@ -722,7 +722,7 @@ dependencies = [
 [[package]]
 name = "coven-runtime-spec"
 version = "0.2.0"
-source = "git+https://github.com/OpenCoven/coven-runtimes?rev=7c093e5f51f0a2a1e2f76cf6b8eef6465b86c8ff#7c093e5f51f0a2a1e2f76cf6b8eef6465b86c8ff"
+source = "git+https://github.com/OpenCoven/coven-runtimes?tag=v0.2.0#2f0e068027f36b1dd32d919f54a40a3baede54c2"
 dependencies = [
  "serde",
  "serde_json",
