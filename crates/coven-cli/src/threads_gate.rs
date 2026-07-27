@@ -446,9 +446,8 @@ pub(crate) fn read_surface_if_exists(workspace: &Path, surface: &str) -> Result<
                     ancestor = candidate.parent();
                 }
                 Err(err) => {
-                    return Err(err).with_context(|| {
-                        format!("resolving ancestor of surface {}", path.display())
-                    })
+                    return Err(err)
+                        .with_context(|| format!("resolving ancestor of surface `{surface}`"))
                 }
             },
             None => break None,
@@ -467,9 +466,7 @@ pub(crate) fn read_surface_if_exists(workspace: &Path, surface: &str) -> Result<
         // An absent protected file baselines as empty: creating it later is
         // drift like any other content change.
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            return Err(err).with_context(|| format!("inspecting surface {}", path.display()))
-        }
+        Err(err) => return Err(err).with_context(|| format!("inspecting surface `{surface}`")),
     };
     // Only regular files are hashable surfaces; a symlinked or special-file
     // surface is refused rather than followed out of the workspace.
@@ -483,7 +480,7 @@ pub(crate) fn read_surface_if_exists(workspace: &Path, surface: &str) -> Result<
     }
     std::fs::read(&path)
         .map(Some)
-        .with_context(|| format!("reading surface {}", path.display()))
+        .with_context(|| format!("reading surface `{surface}`"))
 }
 
 fn load_or_create_manifest_id(conn: &Connection, familiar_id: &str) -> Result<threads::ManifestId> {
@@ -1339,6 +1336,23 @@ tier = 0
         )
         .expect_err("symlinked surface must refuse");
         assert!(format!("{err:#}").contains("not a regular file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn surface_read_errors_name_only_the_logical_surface() {
+        let f = fixture();
+        std::os::unix::fs::symlink("loop", f.workspace.join("loop")).unwrap();
+
+        let error = read_surface_if_exists(&f.workspace, "loop/file.md")
+            .expect_err("a symlink loop must refuse");
+        let rendered = format!("{error:#}");
+
+        assert!(rendered.contains("loop/file.md"), "{rendered}");
+        assert!(
+            !rendered.contains(&f.workspace.display().to_string()),
+            "{rendered}"
+        );
     }
 
     #[cfg(unix)]
