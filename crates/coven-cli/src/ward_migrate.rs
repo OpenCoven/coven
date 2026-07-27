@@ -313,6 +313,7 @@ fn migrate_one(
             )
             .collect(),
         default_tier: Tier::Logged,
+        probe: Vec::new(),
     };
     let generated_toml = render_phase2_toml(&config)?;
     if let Err(error) = WardConfig::from_toml_str(&generated_toml) {

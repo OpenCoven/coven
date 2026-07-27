@@ -97,7 +97,7 @@ or public state.
 |---|---|---|---|---|
 | POST | `/api/v1/cast` | Submit a cast line (status/delegation shorthand) to the cockpit session. | `202 { accepted, cast_id, echo }` | `400 invalid_request` |
 | PUT | `/api/v1/familiars/:id/icon` | Update a familiar's icon glyph. | updated familiar | `400`, `404` |
-| POST | `/api/v1/familiars/:id/edits` | Ward-adjudicated writes into a familiar home (Gates 1–2, fail-closed, audited). Applied writes append `apply_audit` rows to the `ward_audit` ledger (Gate 4 persistence). | edit report | `400`, `403` (ward denial), `404` |
+| POST | `/api/v1/familiars/:id/edits` | Ward-adjudicated writes into a familiar home (Gates 1–2, fail-closed, audited). Held writes stage with deterministic Gate-3 probe evidence; applied writes append `apply_audit` rows to the `ward_audit` ledger. | edit report | `400`, `403` (ward denial), `404` |
 
 ## Ward proposals (threads)
 
@@ -109,10 +109,19 @@ Tier-0 authority degradations and Tier-1 coherence holds, distinguished by
 | Method | Path | Purpose | Success | Errors |
 |---|---|---|---|---|
 | GET | `/api/v1/threads/weaves` | Per-familiar weave/authority state (degraded configs reported inline). | weave entries | — |
-| GET | `/api/v1/threads/proposals` | Pending proposals (unparseable files reported as `degraded` entries, newest first). | `{ proposals }` | — |
-| GET | `/api/v1/threads/proposals/:id` | One pending proposal. | `{ proposal }` | `400 invalid_request` / `404 proposal_not_found` |
+| GET | `/api/v1/threads/proposals` | Pending proposals with compact `probeSummary` evidence (unparseable files reported as `degraded` entries, newest first). | `{ proposals }` | — |
+| GET | `/api/v1/threads/proposals/:id` | One pending proposal with `probeSummary` and full per-surface `probes`. | `{ proposal }` | `400 invalid_request` / `404 proposal_not_found` |
 | POST | `/api/v1/threads/proposals/:id/approve` | Re-validate and apply a staged authority proposal (coherence approval lands with Gate 3 PR 4). | decision report | `400`, `404`, `409` |
 | POST | `/api/v1/threads/proposals/:id/reject` | Reject and remove a staged proposal (audited). | decision report | `400`, `404`, `409` |
+
+Probe evidence is additive sidecar data, so the underlying
+`coven_threads_core::PendingProposal` remains backward-readable. A missing
+probe sidecar (older pending files), no matching `[[probe]]`, or a probe
+runtime error is reported as `unscored`; it is never treated as a pass.
+Stale, malformed, or internally inconsistent sidecars are likewise demoted to
+`unscored` with `probeEvidenceDegraded`, after deterministic recomputation
+against staged targets and contents, the current baseline and Gate-2
+resolution, and the declared probe set.
 
 ## Skills: eval-loop
 

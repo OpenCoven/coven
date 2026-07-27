@@ -530,8 +530,8 @@ fn render_ward_pending(body: &Value) -> String {
     }
     let mut out = String::new();
     out.push_str(&format!(
-        "{:<38} {:<12} {:<10} {:<22} targets\n",
-        "proposal", "familiar", "review", "staged"
+        "{:<38} {:<12} {:<10} {:<10} {:<22} targets\n",
+        "proposal", "familiar", "review", "probes", "staged"
     ));
     for proposal in &proposals {
         if let Some(degraded) = proposal.get("degraded") {
@@ -543,10 +543,14 @@ fn render_ward_pending(body: &Value) -> String {
             continue;
         }
         out.push_str(&format!(
-            "{:<38} {:<12} {:<10} {:<22} {}\n",
+            "{:<38} {:<12} {:<10} {:<10} {:<22} {}\n",
             str_cell(proposal, "proposalId"),
             str_cell(proposal, "familiarId"),
             str_cell(proposal, "reviewKind"),
+            proposal
+                .get("probeSummary")
+                .map(|summary| str_cell(summary, "status"))
+                .unwrap_or_else(|| "unscored".to_string()),
             str_cell(proposal, "stagedAt"),
             proposal
                 .get("targets")
@@ -588,6 +592,66 @@ fn render_ward_proposal(proposal: &Value) -> String {
     if let Some(targets) = proposal.get("targets").and_then(Value::as_array) {
         for target in targets.iter().filter_map(Value::as_str) {
             out.push_str(&format!("    {target}\n"));
+        }
+    }
+    out.push_str(&format!(
+        "  probe set  {}\n",
+        proposal
+            .get("probeSummary")
+            .map(|summary| str_cell(summary, "status"))
+            .unwrap_or_else(|| "unscored".to_string())
+    ));
+    if let Some(reason) = proposal
+        .get("probeEvidenceDegraded")
+        .and_then(|degraded| degraded.get("reason"))
+        .and_then(Value::as_str)
+    {
+        out.push_str(&format!("  probe evidence degraded: {reason}\n"));
+    }
+    out.push_str("  probes\n");
+    let probes = proposal
+        .get("probes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if probes.is_empty() {
+        out.push_str("    unscored (no staged probe evidence)\n");
+    }
+    for report in &probes {
+        out.push_str(&format!(
+            "    {} [{}]\n",
+            str_cell(report, "surface"),
+            str_cell(report, "status")
+        ));
+        out.push_str(&format!(
+            "      baseline {}\n",
+            report
+                .get("baselineSha256")
+                .and_then(Value::as_str)
+                .unwrap_or("(absent)")
+        ));
+        out.push_str(&format!(
+            "      proposed {}\n",
+            str_cell(report, "proposedSha256")
+        ));
+        if let Some(error) = report.get("error").and_then(Value::as_str) {
+            out.push_str(&format!("      error    {error}\n"));
+        }
+        for result in report
+            .get("results")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            out.push_str(&format!(
+                "      {} [{}] — {}\n",
+                str_cell(result, "id"),
+                str_cell(result, "status"),
+                str_cell(result, "summary")
+            ));
+            if let Some(detail) = result.get("detail").filter(|detail| !detail.is_null()) {
+                out.push_str(&format!("        {}\n", detail));
+            }
         }
     }
     out
@@ -1474,6 +1538,97 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn ward_pending_renderer_surfaces_probe_summary() {
+        let body = json!({
+            "proposals": [{
+                "proposalId": "proposal-1",
+                "familiarId": "sage",
+                "reviewKind": "coherence",
+                "stagedAt": "2026-07-27T00:00:00Z",
+                "targets": ["reviewed/SKILL.md"],
+                "probeSummary": {
+                    "status": "failed",
+                    "passed": 2,
+                    "failed": 1,
+                    "unscored": 0,
+                    "targets": 1
+                }
+            }]
+        });
+
+        let rendered = render_ward_pending(&body);
+
+        assert!(rendered.contains("probes"), "{rendered}");
+        assert!(rendered.contains("failed"), "{rendered}");
+    }
+
+    #[test]
+    fn ward_proposal_renderer_surfaces_full_probe_evidence() {
+        let proposal = json!({
+            "proposalId": "proposal-1",
+            "familiarId": "sage",
+            "reviewKind": "coherence",
+            "writer": "client:unsigned",
+            "stagedAt": "2026-07-27T00:00:00Z",
+            "targets": ["reviewed/SKILL.md"],
+            "probeSummary": {
+                "status": "passed",
+                "passed": 1,
+                "failed": 0,
+                "unscored": 0,
+                "targets": 1
+            },
+            "probes": [{
+                "surface": "reviewed/SKILL.md",
+                "baselineSha256": null,
+                "proposedSha256": "abc123",
+                "status": "passed",
+                "results": [{
+                    "id": "size-delta",
+                    "configuredSurface": "reviewed/**",
+                    "status": "passed",
+                    "summary": "Size delta calculated.",
+                    "detail": {"beforeBytes": 0, "afterBytes": 12}
+                }]
+            }]
+        });
+
+        let rendered = render_ward_proposal(&proposal);
+
+        assert!(
+            rendered.contains("reviewed/SKILL.md [passed]"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("size-delta [passed]"), "{rendered}");
+        assert!(rendered.contains("beforeBytes"), "{rendered}");
+    }
+
+    #[test]
+    fn ward_proposal_renderer_surfaces_degraded_probe_evidence() {
+        let proposal = json!({
+            "proposalId": "proposal-1",
+            "probeSummary": {
+                "status": "unscored",
+                "passed": 0,
+                "failed": 0,
+                "unscored": 1,
+                "targets": 1
+            },
+            "probeEvidenceDegraded": {
+                "reason": "proposal-probes-inconsistent"
+            },
+            "probes": []
+        });
+
+        let rendered = render_ward_proposal(&proposal);
+
+        assert!(
+            rendered.contains("probe evidence degraded: proposal-probes-inconsistent"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
     fn ward_audit_path_rejects_ambiguous_event_query_values() {
         for event in [
             "apply_audit&limit=1",
@@ -1645,7 +1800,7 @@ mod tests {
         let body = json!({
             "ok": true,
             "familiarId": "sage",
-            "workspace": "/home/x/.coven/familiars/sage",
+            "workspace": "/var/tmp/coven-test/familiars/sage",
             "ward": {
                 "principalKeyFingerprint": "SHA256:principal-key",
                 "defaultTier": 2,
@@ -1660,7 +1815,7 @@ mod tests {
         let text = render_familiar_ward(&body);
 
         assert!(text.contains("Familiar sage — Ward surface"));
-        assert!(text.contains("/home/x/.coven/familiars/sage"));
+        assert!(text.contains("/var/tmp/coven-test/familiars/sage"));
         assert!(text.contains("SHA256:principal-key"));
         assert!(text.contains("tier 2 (logged)"));
         assert!(text.contains("protected"));

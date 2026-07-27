@@ -45,9 +45,10 @@ mod stream_json;
 mod theme;
 mod tui;
 mod verification;
-// Ward identity-layer enforcement (Gates 1-2). Not yet wired into the API
+mod ward_probes;
 // Wired into the daemon router via `POST /familiars/{id}/edits` (api.rs);
-// Gate 3 (coherence review) remains a follow-up — see ward.rs.
+// Gate 3 staging, read surfaces, and deterministic probes are present;
+// coherence approval remains a follow-up — see ward.rs.
 #[allow(dead_code)]
 mod ward;
 mod ward_migrate;
@@ -4562,10 +4563,10 @@ mod tests {
         assert!(frame.contains("/start"));
         assert!(frame.contains("/help"));
         assert!(frame.contains("/run"));
-        // Selection arrow uses the thin guillemet (U+203A), not ASCII `>`.
+        // Selection arrow uses the thin guillemet (Unicode 203A), not ASCII `>`.
         assert!(
             frame.contains('›'),
-            "selected row should render with U+203A"
+            "selected row should render with Unicode 203A"
         );
     }
 
@@ -4690,12 +4691,12 @@ mod tests {
             let allowed = ch == '\n'
                 || ch == '\r'
                 || ch.is_ascii()
-                || ch == '─'   // U+2500 thin horizontal rule
-                || ch == '›'   // U+203A selected-row marker
-                || ch == '·'   // U+00B7 separator
+                || ch == '─'   // Unicode 2500 thin horizontal rule
+                || ch == '›'   // Unicode 203A selected-row marker
+                || ch == '·'   // Unicode 00B7 separator
                 || ch == '↑'
                 || ch == '↓'
-                || ch == '…'; // U+2026 truncation marker from fit_chars
+                || ch == '…'; // Unicode 2026 truncation marker from fit_chars
             assert!(
                 allowed,
                 "unexpected glyph in launcher frame: {ch:?} (U+{code:04X})"

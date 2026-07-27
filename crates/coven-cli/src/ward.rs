@@ -16,12 +16,13 @@
 //!    hardlink, or case collision) to a protected path is caught here and
 //!    classified by its *real* target.
 //! 3. **Identity coherence validation** — Tier 0/1 modifications must pass the
-//!    familiar's probe set. *(Requires model/regression infrastructure; not
-//!    implemented in this module — see [`Verdict::RequiresCoherenceReview`].)*
+//!    familiar's deterministic probe set before an explicit principal decision.
+//!    Probe execution lives in the sibling `ward_probes` module; this module
+//!    continues to represent the hold as [`Verdict::RequiresCoherenceReview`].
 //! 4. **Audit logging** — modifications are recorded to an append-only log.
 //!    [`Ward::apply`] emits a tamper-evident [`AuditRecord`] (before/after
-//!    SHA-256 content hashes) for every Tier 2 write; persisting those records
-//!    to the daemon's store is a follow-up.
+//!    SHA-256 content hashes) for every Tier 2 write, and the daemon persists
+//!    apply records to its audit ledger.
 //!
 //! This module implements the two **deterministic** gates — 1 and 2 — which are
 //! the load-bearing structural checks. It has no dependency on the language
@@ -29,8 +30,9 @@
 //! surface and the proposal. [`Ward::apply`] is the **fail-closed enforcement
 //! boundary**: it routes every write through Gates 1–2, refuses or holds the
 //! whole proposal as a unit if any target is blocked or needs coherence review,
-//! and only then writes — emitting Gate 4 audit records. Gate 3 (coherence)
-//! remains deferred: a change that needs it is *held*, never written.
+//! and only then writes — emitting Gate 4 audit records. Tier 0/1 changes stay
+//! held here; the daemon's staged proposal flow attaches probe evidence for a
+//! separate explicit coherence decision.
 //!
 //! ## Fail-closed posture
 //!
@@ -143,6 +145,56 @@ pub struct SurfaceEntry {
     pub tier: Tier,
 }
 
+/// One deterministic, offline Gate-3 probe declared in `ward.toml`.
+///
+/// The probe matches Gate-2-resolved surface paths. Parameters are deliberately
+/// small and typed: `parse` uses `format`, while `pattern-lint` uses
+/// `forbidden` and `required`. The other v1 probes have no parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProbeConfig {
+    /// Glob over familiar-home-relative, forward-slashed surface paths.
+    pub surface: String,
+    /// Deterministic probe implementation to run.
+    pub id: ProbeId,
+    /// Declared parser for the `parse` probe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<ProbeFormat>,
+    /// Regexes that must not match for `pattern-lint`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forbidden: Vec<String>,
+    /// Regexes that must match for `pattern-lint`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required: Vec<String>,
+}
+
+impl ProbeConfig {
+    pub(crate) fn matches_surface(&self, surface: &str) -> Result<bool> {
+        Ok(compile_glob(&self.surface, false)?
+            .compile_matcher()
+            .is_match(surface))
+    }
+}
+
+/// The four deterministic Gate-3 probes in the v1 contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProbeId {
+    Parse,
+    SizeDelta,
+    ProtectedRegion,
+    PatternLint,
+}
+
+/// Supported declared formats for the deterministic `parse` probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProbeFormat {
+    Toml,
+    Json,
+    MarkdownFrontMatter,
+}
+
 /// A familiar's Ward configuration — the declared surface plus the principal
 /// binding that authorizes Tier 0 changes.
 ///
@@ -167,6 +219,10 @@ pub struct WardConfig {
     /// stays large while unknown edits are still recorded — not frozen.
     #[serde(default = "default_unmatched_tier")]
     pub default_tier: Tier,
+    /// Deterministic, advisory Gate-3 probes. The singular field name maps to
+    /// TOML's repeated `[[probe]]` tables.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub probe: Vec<ProbeConfig>,
 }
 
 fn default_unmatched_tier() -> Tier {
@@ -229,6 +285,50 @@ impl WardConfig {
                  missing from protected_surface: {missing:?}; \
                  not declared tier-0: {extra:?}"
             );
+        }
+
+        for (index, probe) in self.probe.iter().enumerate() {
+            if probe.surface.trim().is_empty() {
+                bail!("probe[{index}] has an empty surface glob");
+            }
+            if probe.surface.starts_with(['/', '\\'])
+                || probe.surface.contains('\\')
+                || probe.surface.contains(':')
+                || probe
+                    .surface
+                    .split('/')
+                    .any(|segment| segment == "." || segment == "..")
+            {
+                bail!(
+                    "probe[{index}] surface `{}` must stay relative to the familiar home",
+                    probe.surface
+                );
+            }
+            compile_glob(&probe.surface, false)
+                .with_context(|| format!("invalid probe[{index}] surface glob"))?;
+
+            let has_patterns = !probe.forbidden.is_empty() || !probe.required.is_empty();
+            match probe.id {
+                ProbeId::Parse if has_patterns => {
+                    bail!("probe[{index}] `parse` does not accept regex parameters")
+                }
+                ProbeId::PatternLint if probe.format.is_some() => {
+                    bail!("probe[{index}] `pattern-lint` does not accept `format`")
+                }
+                ProbeId::SizeDelta | ProbeId::ProtectedRegion
+                    if probe.format.is_some() || has_patterns =>
+                {
+                    bail!(
+                        "probe[{index}] `{}` does not accept parameters",
+                        match probe.id {
+                            ProbeId::SizeDelta => "size-delta",
+                            ProbeId::ProtectedRegion => "protected-region",
+                            _ => unreachable!("guard restricts this branch"),
+                        }
+                    )
+                }
+                _ => {}
+            }
         }
 
         Ok(())
@@ -654,9 +754,9 @@ impl Ward {
     /// - If any target is **Blocked** (Gate 1/2), the proposal is *refused* as a
     ///   unit and nothing is written.
     /// - If any target needs **Gate 3 coherence review** — Tier 1, or a Tier 0
-    ///   change authorized by Gate 1 (Gate 3 is not yet implemented, so an
-    ///   authorized protected change cannot be cleared here) — the proposal is
-    ///   *held* as a unit and nothing is written.
+    ///   change authorized by Gate 1 — the direct apply path *holds* the
+    ///   proposal as a unit. Probe evidence and the principal's decision are
+    ///   handled by the daemon's staged proposal flow.
     /// - Otherwise every edit is Tier 2/3: each is written atomically (staged
     ///   as a randomized `create_new` sibling in the target's re-verified
     ///   directory, then renamed into place) and every Tier 2 write emits a
@@ -777,9 +877,9 @@ impl Ward {
 
 /// Whether a verdict needs Gate 3 coherence review before it can be applied.
 ///
-/// This includes Gate-1 authorized Tier 0 changes: Gate 3 is not yet
-/// implemented, so an authorized protected change cannot be cleared for apply
-/// here. Fail-closed — hold rather than write.
+/// This includes Gate-1 authorized Tier 0 changes. The direct apply path cannot
+/// represent the staged probe evidence and principal decision, so it fails
+/// closed — hold rather than write.
 fn requires_coherence(verdict: &Verdict) -> bool {
     matches!(
         verdict,
@@ -1674,6 +1774,7 @@ mod tests {
             ],
             protected_surface: vec!["SOUL.md".into(), "IDENTITY.md".into(), "USER.md".into()],
             default_tier: Tier::Logged,
+            probe: Vec::new(),
         }
     }
 
@@ -1794,6 +1895,88 @@ tier = 2
         assert_eq!(config.surface.len(), 2);
         assert_eq!(config.surface[0].tier, Tier::Protected);
         assert_eq!(config.default_tier, Tier::Logged);
+        assert!(config.probe.is_empty());
+    }
+
+    #[test]
+    fn parses_deterministic_probe_declarations() {
+        let toml = r#"
+principal_key_fingerprint = "SHA256:abc"
+protected_surface = []
+
+[[surface]]
+path = "reviewed/"
+tier = 1
+
+[[probe]]
+surface = "reviewed/**"
+id = "parse"
+format = "markdown-front-matter"
+
+[[probe]]
+surface = "reviewed/**"
+id = "pattern-lint"
+forbidden = ["(?i)ignore previous"]
+required = ["(?m)^name:"]
+"#;
+
+        let config = WardConfig::from_toml_str(toml).expect("probe config parses");
+
+        assert_eq!(config.probe.len(), 2);
+        assert_eq!(config.probe[0].id, ProbeId::Parse);
+        assert_eq!(
+            config.probe[0].format,
+            Some(ProbeFormat::MarkdownFrontMatter)
+        );
+        assert_eq!(config.probe[1].id, ProbeId::PatternLint);
+        assert_eq!(config.probe[1].forbidden, vec!["(?i)ignore previous"]);
+        assert!(config.probe[1]
+            .matches_surface("reviewed/SKILL.md")
+            .unwrap());
+        assert!(!config.probe[1].matches_surface("notes/SKILL.md").unwrap());
+    }
+
+    #[test]
+    fn validation_rejects_escaping_or_mistyped_probe_parameters() {
+        let escaping = r#"
+principal_key_fingerprint = "SHA256:abc"
+protected_surface = []
+
+[[probe]]
+surface = "../SOUL.md"
+id = "size-delta"
+"#;
+        assert!(WardConfig::from_toml_str(escaping)
+            .unwrap_err()
+            .to_string()
+            .contains("must stay relative"));
+
+        let mistyped = r#"
+principal_key_fingerprint = "SHA256:abc"
+protected_surface = []
+
+[[probe]]
+surface = "reviewed/**"
+id = "size-delta"
+format = "json"
+"#;
+        assert!(WardConfig::from_toml_str(mistyped)
+            .unwrap_err()
+            .to_string()
+            .contains("does not accept parameters"));
+
+        let unknown_parameter = r#"
+principal_key_fingerprint = "SHA256:abc"
+protected_surface = []
+
+[[probe]]
+surface = "reviewed/**"
+id = "parse"
+format = "json"
+formatter = "lenient"
+"#;
+        let error = WardConfig::from_toml_str(unknown_parameter).unwrap_err();
+        assert!(format!("{error:#}").contains("unknown field"));
     }
 
     #[test]

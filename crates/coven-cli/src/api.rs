@@ -2725,6 +2725,22 @@ fn apply_familiar_edits(
             Some(json!({ "changes": changes })),
         );
     }
+    let mut resolved_targets = HashSet::with_capacity(adjudication.decisions.len());
+    if let Some(duplicate) = adjudication
+        .decisions
+        .iter()
+        .find(|decision| !resolved_targets.insert(decision.resolved.as_str()))
+    {
+        return api_error(
+            400,
+            "invalid_request",
+            "Each edit must resolve to a unique familiar surface.",
+            Some(json!({
+                "resolved": duplicate.resolved.as_str(),
+                "target": duplicate.target.as_str(),
+            })),
+        );
+    }
     let gated_targets: Vec<String> = adjudication
         .decisions
         .iter()
@@ -2968,6 +2984,7 @@ fn familiar_ward_response(coven_home: &Path, familiar_id: &str) -> Result<ApiRes
                 "defaultTier": config.default_tier,
                 "surface": config.surface,
                 "protectedSurface": config.protected_surface,
+                "probes": config.probe,
             },
         }),
     )
@@ -3218,6 +3235,17 @@ fn threads_proposals_response(coven_home: &Path, id: Option<&str>) -> Result<Api
             }));
             continue;
         };
+        let (mut probes, mut probe_evidence_degraded) = match raw_value.get("probes") {
+            Some(value) => {
+                match serde_json::from_value::<Vec<crate::ward_probes::SurfaceProbeReport>>(
+                    value.clone(),
+                ) {
+                    Ok(probes) => (Some(probes), None),
+                    Err(_) => (None, Some("proposal-probes-unparseable")),
+                }
+            }
+            None => (None, None),
+        };
         let mut proposal_value = raw_value.clone();
         if let Some(object) = proposal_value.as_object_mut() {
             object.remove("decisionRequest");
@@ -3268,11 +3296,35 @@ fn threads_proposals_response(coven_home: &Path, id: Option<&str>) -> Result<Api
             }));
             continue;
         };
+        if let Some(reports) = probes.as_deref() {
+            let workspace = crate::cockpit_sources::familiar_workspace(coven_home, &familiar_id);
+            let validation = match ward::WardConfig::load(&workspace) {
+                Ok(Some(config)) => crate::ward_probes::validate_staged_reports(
+                    &workspace, &config, proposal, reports,
+                ),
+                Ok(None) | Err(_) => crate::ward_probes::ProbeEvidenceValidation::Inconsistent,
+            };
+            match validation {
+                crate::ward_probes::ProbeEvidenceValidation::Valid => {}
+                crate::ward_probes::ProbeEvidenceValidation::Stale => {
+                    probes = None;
+                    probe_evidence_degraded = Some("proposal-probes-stale");
+                }
+                crate::ward_probes::ProbeEvidenceValidation::Inconsistent => {
+                    probes = None;
+                    probe_evidence_degraded = Some("proposal-probes-inconsistent");
+                }
+            }
+        }
         let targets: Vec<String> = proposal
             .edits
             .iter()
             .map(|edit| edit.surface.as_str().to_string())
             .collect();
+        let probe_summary = probes
+            .as_deref()
+            .map(crate::ward_probes::ProbeSummary::from_reports)
+            .unwrap_or_else(|| crate::ward_probes::ProbeSummary::unscored_targets(targets.len()));
         let format = time::format_description::well_known::Rfc3339;
         let mut view = json!({
             "proposalId": proposal.id.0.to_string(),
@@ -3282,7 +3334,21 @@ fn threads_proposals_response(coven_home: &Path, id: Option<&str>) -> Result<Api
             "stagedAt": proposal.staged_at.format(&format).ok(),
             "targets": targets,
             "proposalRevision": proposal_revision(&proposal_value)?,
+            "probeSummary": probe_summary,
         });
+        if let Some(reason) = probe_evidence_degraded {
+            view.as_object_mut()
+                .expect("proposal view is always a JSON object")
+                .insert(
+                    "probeEvidenceDegraded".to_string(),
+                    json!({ "reason": reason }),
+                );
+        }
+        if id.is_some() {
+            view.as_object_mut()
+                .expect("proposal view is always a JSON object")
+                .insert("probes".to_string(), json!(probes.unwrap_or_default()));
+        }
         if let Some(scheduled) = &scheduled {
             let approval_path = coven_threads_core::ApprovalPathWireEnvelope::from_classification(
                 scheduled.classification(),
@@ -8791,6 +8857,10 @@ tier = 0
 [[surface]]
 path = "memory/"
 tier = 2
+
+[[probe]]
+surface = "memory/**"
+id = "size-delta"
 "#,
         )?;
 
@@ -8809,6 +8879,8 @@ tier = 2
         assert_eq!(body["ward"]["surface"][1]["path"], "memory/");
         assert_eq!(body["ward"]["surface"][1]["tier"], 2);
         assert_eq!(body["ward"]["protectedSurface"][0], "SOUL.md");
+        assert_eq!(body["ward"]["probes"][0]["surface"], "memory/**");
+        assert_eq!(body["ward"]["probes"][0]["id"], "size-delta");
         Ok(())
     }
 
@@ -8868,6 +8940,15 @@ tier = 2
         assert_eq!(listed["familiarId"], "sage");
         assert_eq!(listed["reviewKind"], "coherence");
         assert_eq!(listed["targets"][0], "reviewed/skill.md");
+        assert_eq!(listed["probeSummary"]["status"], "passed");
+        assert_eq!(listed["probeSummary"]["passed"], 2);
+        assert_eq!(listed["probeSummary"]["failed"], 0);
+        assert_eq!(listed["probeSummary"]["unscored"], 0);
+        assert_eq!(listed["probeSummary"]["targets"], 1);
+        assert!(
+            listed.get("probes").is_none(),
+            "the list route must expose only the compact summary"
+        );
 
         // Detail returns the same record; unknown and malformed ids fail
         // closed with the structured shapes.
@@ -8880,6 +8961,17 @@ tier = 2
         assert_eq!(response.status, 200);
         let body: serde_json::Value = serde_json::from_str(&response.body)?;
         assert_eq!(body["proposal"]["reviewKind"], "coherence");
+        assert_eq!(body["proposal"]["probeSummary"]["status"], "passed");
+        assert_eq!(body["proposal"]["probes"][0]["target"], "reviewed/skill.md");
+        assert_eq!(body["proposal"]["probes"][0]["status"], "passed");
+        assert_eq!(
+            body["proposal"]["probes"][0]["results"][0]["id"],
+            "size-delta"
+        );
+        assert_eq!(
+            body["proposal"]["probes"][0]["results"][1]["id"],
+            "pattern-lint"
+        );
 
         let response = handle_request(
             "GET",
@@ -8976,7 +9068,166 @@ tier = 2
         assert_eq!(listed["lifecycle"], "veto_window_open");
         assert_eq!(listed["earliestClose"], "2023-11-14T22:14:20Z");
         assert_eq!(listed["affectedRegions"][0], "tool_defaults");
+        assert_eq!(listed["probeSummary"]["status"], "unscored");
+        assert_eq!(listed["probeSummary"]["unscored"], 1);
         assert!(listed.get("reviewKind").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn threads_proposals_degrades_malformed_probe_evidence() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_warded_familiar(home)?;
+        let staged = post_edits(
+            home,
+            r#"{"edits":[{"target":"reviewed/skill.md","contents":"tweak"}]}"#,
+        )?;
+        let body: serde_json::Value = serde_json::from_str(&staged.body)?;
+        let pending_path = PathBuf::from(body["pendingPath"].as_str().context("pending path")?);
+        let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(&pending_path)?)?;
+        value["probes"] = serde_json::json!({"not": "an array"});
+        std::fs::write(&pending_path, serde_json::to_vec_pretty(&value)?)?;
+
+        let response = handle_request("GET", "/api/v1/threads/proposals", home, None)?;
+
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(
+            body["proposals"][0]["probeEvidenceDegraded"]["reason"],
+            "proposal-probes-unparseable"
+        );
+        assert_eq!(body["proposals"][0]["probeSummary"]["status"], "unscored");
+        assert_eq!(body["proposals"][0]["probeSummary"]["targets"], 1);
+        assert_eq!(body["proposals"][0]["probeSummary"]["unscored"], 1);
+        Ok(())
+    }
+
+    #[test]
+    fn threads_proposals_demotes_inconsistent_probe_evidence_to_unscored() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+        let staged = post_edits(
+            home,
+            r#"{"edits":[{"target":"reviewed/skill.md","contents":"tweak"}]}"#,
+        )?;
+        let body: serde_json::Value = serde_json::from_str(&staged.body)?;
+        let proposal_id = body["proposalId"].as_str().context("proposal id")?;
+        let pending_path = PathBuf::from(body["pendingPath"].as_str().context("pending path")?);
+        let original: serde_json::Value = serde_json::from_slice(&std::fs::read(&pending_path)?)?;
+        let mut wrong_target = original.clone();
+        wrong_target["probes"][0]["target"] = serde_json::json!("reviewed/other.md");
+        let mut wrong_surface = original.clone();
+        wrong_surface["probes"][0]["surface"] = serde_json::json!("reviewed/other.md");
+        let mut wrong_hash = original.clone();
+        wrong_hash["probes"][0]["proposedSha256"] = serde_json::json!("0".repeat(64));
+        let mut wrong_baseline = original.clone();
+        wrong_baseline["probes"][0]["baselineSha256"] = serde_json::json!("0".repeat(64));
+        let mut contradictory_status = original.clone();
+        contradictory_status["probes"][0]["status"] = serde_json::json!("failed");
+        let mut inner_result_tamper = original.clone();
+        inner_result_tamper["probes"][0]["results"][1]["status"] = serde_json::json!("failed");
+        inner_result_tamper["probes"][0]["results"][1]["summary"] =
+            serde_json::json!("Tampered result.");
+        inner_result_tamper["probes"][0]["status"] = serde_json::json!("failed");
+        let cases = [
+            ("empty coverage", {
+                let mut value = original.clone();
+                value["probes"] = serde_json::json!([]);
+                (value, "proposal-probes-inconsistent")
+            }),
+            (
+                "wrong target",
+                (wrong_target, "proposal-probes-inconsistent"),
+            ),
+            (
+                "wrong surface",
+                (wrong_surface, "proposal-probes-inconsistent"),
+            ),
+            (
+                "wrong proposed hash",
+                (wrong_hash, "proposal-probes-inconsistent"),
+            ),
+            (
+                "wrong baseline hash",
+                (wrong_baseline, "proposal-probes-stale"),
+            ),
+            (
+                "contradictory aggregate status",
+                (contradictory_status, "proposal-probes-inconsistent"),
+            ),
+            (
+                "coordinated inner-result tamper",
+                (inner_result_tamper, "proposal-probes-inconsistent"),
+            ),
+        ];
+
+        for (case, (value, expected_reason)) in cases {
+            std::fs::write(&pending_path, serde_json::to_vec_pretty(&value)?)?;
+            let response = handle_request(
+                "GET",
+                &format!("/api/v1/threads/proposals/{proposal_id}"),
+                home,
+                None,
+            )?;
+
+            assert_eq!(response.status, 200, "{case}: got {}", response.body);
+            let body: serde_json::Value = serde_json::from_str(&response.body)?;
+            assert_eq!(
+                body["proposal"]["probeSummary"]["status"], "unscored",
+                "{case}"
+            );
+            assert_eq!(body["proposal"]["probeSummary"]["targets"], 1, "{case}");
+            assert_eq!(body["proposal"]["probeSummary"]["unscored"], 1, "{case}");
+            assert_eq!(
+                body["proposal"]["probeEvidenceDegraded"]["reason"], expected_reason,
+                "{case}"
+            );
+            assert_eq!(body["proposal"]["probes"], serde_json::json!([]), "{case}");
+        }
+
+        std::fs::create_dir_all(workspace.join("reviewed"))?;
+        std::fs::write(workspace.join("reviewed/skill.md"), "drifted baseline")?;
+        std::fs::write(&pending_path, serde_json::to_vec_pretty(&original)?)?;
+        let response = handle_request(
+            "GET",
+            &format!("/api/v1/threads/proposals/{proposal_id}"),
+            home,
+            None,
+        )?;
+        assert_eq!(
+            response.status, 200,
+            "baseline drift: got {}",
+            response.body
+        );
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["proposal"]["probeSummary"]["status"], "unscored");
+        assert_eq!(
+            body["proposal"]["probeEvidenceDegraded"]["reason"],
+            "proposal-probes-stale"
+        );
+
+        std::fs::write(&pending_path, serde_json::to_vec_pretty(&original)?)?;
+        let ward_path = workspace.join("ward.toml");
+        let ward_toml = std::fs::read_to_string(&ward_path)?;
+        let changed_ward_toml =
+            ward_toml.replace("(?i)ignore previous", "(?i)different forbidden pattern");
+        assert_ne!(changed_ward_toml, ward_toml);
+        std::fs::write(&ward_path, changed_ward_toml)?;
+        let response = handle_request(
+            "GET",
+            &format!("/api/v1/threads/proposals/{proposal_id}"),
+            home,
+            None,
+        )?;
+        assert_eq!(response.status, 200, "config drift: got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["proposal"]["probeSummary"]["status"], "unscored");
+        assert_eq!(
+            body["proposal"]["probeEvidenceDegraded"]["reason"],
+            "proposal-probes-inconsistent"
+        );
         Ok(())
     }
 
@@ -9139,6 +9390,15 @@ tier = 0
 [[surface]]
 path = "reviewed/"
 tier = 1
+
+[[probe]]
+surface = "reviewed/**"
+id = "size-delta"
+
+[[probe]]
+surface = "reviewed/**"
+id = "pattern-lint"
+forbidden = ["(?i)ignore previous"]
 "#,
         )?;
         Ok(workspace)
@@ -9181,6 +9441,28 @@ tier = 1
             std::fs::read_to_string(workspace.join("notes/today.md"))?,
             "hello ward"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_rejects_duplicate_resolved_targets() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_warded_familiar(home)?;
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[
+                {"target":"reviewed/skill.md","contents":"first"},
+                {"target":"reviewed/../reviewed/skill.md","contents":"second"}
+            ]}"#,
+        )?;
+
+        assert_eq!(response.status, 400, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "invalid_request");
+        assert_eq!(body["error"]["details"]["resolved"], "reviewed/skill.md");
+        assert!(!home.join("pending").exists());
         Ok(())
     }
 
@@ -11351,6 +11633,9 @@ tier = 0
         let raw = std::fs::read_to_string(&pending_path)?;
         let staged: serde_json::Value = serde_json::from_str(&raw)?;
         assert_eq!(staged["reviewKind"], "coherence");
+        assert_eq!(staged["probes"][0]["surface"], "reviewed/skill.md");
+        assert_eq!(staged["probes"][0]["status"], "passed");
+        assert_eq!(staged["probes"][0]["results"].as_array().unwrap().len(), 2);
         let parsed: coven_threads_core::PendingProposal = serde_json::from_str(&raw)?;
         assert_eq!(parsed.id.0.to_string(), body["proposalId"]);
         assert_eq!(parsed.edits.len(), 1);

@@ -35,6 +35,54 @@ the [observe contract](cli-observe.md). Unparseable pending files appear as
 `degraded` entries instead of aborting the read. Unknown ids fail with
 `proposal_not_found`.
 
+Every newly staged proposal carries deterministic, offline probe evidence.
+The list prints its aggregate `passed`, `failed`, or `unscored` status;
+`coven ward pending <id>` prints each surface, its staging-time baseline and
+proposed SHA-256, and every probe result. `--json` exposes the same data as
+`probeSummary` (list and detail) plus `probes` (detail only).
+
+Declare probes per surface in the familiar's `ward.toml`:
+
+```toml
+[[probe]]
+surface = "reviewed/**"
+id = "parse"
+format = "markdown-front-matter" # also: toml, json
+
+[[probe]]
+surface = "reviewed/**"
+id = "size-delta"
+
+[[probe]]
+surface = "reviewed/**"
+id = "protected-region"
+
+[[probe]]
+surface = "reviewed/**"
+id = "pattern-lint"
+forbidden = ["(?i)ignore previous"]
+required = ["(?m)^name:"]
+```
+
+- `parse` checks TOML, JSON, or a UTF-8 Markdown document whose opening and
+  closing `---` fences contain valid YAML front matter.
+- `size-delta` reports byte and logical-line deltas; v1 has no threshold.
+- `protected-region` requires every block fenced by
+  `<!-- ward:protected -->` and `<!-- /ward:protected -->` to stay
+  byte-for-byte unchanged at the same logical line position.
+- `pattern-lint` runs Rust regular expressions against the proposed UTF-8
+  contents. Forbidden patterns must not match; every required pattern must.
+
+No matching `[[probe]]` declaration is explicitly `unscored`, never a pass.
+Invalid regexes, unreadable baselines, and other probe errors are also
+`unscored`. Failed and unscored results are advisory evidence: neither result
+applies, rejects, or auto-approves a proposal.
+
+The daemon recomputes persisted evidence against the staged edits, current
+baseline, Gate-2 path resolution, and declared probe set. Stale, malformed, or
+inconsistent sidecars are demoted to `unscored` and carry
+`probeEvidenceDegraded`; they are never summarized as a pass.
+
 Decisions are daemon-API verbs today
 (`POST /api/v1/threads/proposals/<id>/approve|reject` — see
 [api](api.md)); approving a `coherence` proposal stays fail-closed until
