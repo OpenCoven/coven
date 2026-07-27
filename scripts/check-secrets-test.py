@@ -631,6 +631,49 @@ class SecretGuardExceptionScopeTests(unittest.TestCase):
                     [("src/config.example", 1, "generic_assignment")],
                 )
 
+    def test_grep_extended_regex_pattern_assignment_terms_are_safe(self) -> None:
+        cases = [
+            "grep -cE '(token=|key=|secret=|password=)' history",
+            "grep -c -E '(token=|key=|secret=|password=)' history",
+        ]
+
+        for text in cases:
+            with self.subTest(text=text):
+                hits = check_secrets.scan_text(text, "scripts/audit.sh")
+
+                self.assertEqual(hits, [])
+
+    def test_grep_exception_is_scoped_to_its_pattern_argument(self) -> None:
+        key_name = "api" + "_key"
+        value = "hunter2" * 3
+        cases = [
+            f'echo "{key_name}={value}" # unrelated grep -E "safe"',
+            f'grep "{key_name}={value}" file # use -E later',
+            f'grep -E "safe" "{key_name}={value}"',
+            f'grep safe; echo -E "{key_name}={value}"',
+            f'grep -E safe "{key_name}={value}"',
+            f'grep -E -f "{key_name}={value}" data',
+            f'echo grep -E "{key_name}={value}"',
+            f'x=$(grep -E safe) echo "{key_name}={value}"',
+            (
+                "grep -E '(token=|key=|secret=|password=''"
+                + value
+                + ")' history"
+            ),
+            f'pattern = "(token=|key=|secret=|password=" + "{value})"',
+            f"grep -E 'token=|bearer [api_key={value}]' history",
+            f"grep -E '(token=|bearer [password={value}])' history",
+        ]
+
+        for text in cases:
+            with self.subTest(text=text):
+                hits = check_secrets.scan_text(text, "scripts/audit.sh")
+
+                self.assertEqual(
+                    hits,
+                    [("scripts/audit.sh", 1, "generic_assignment")],
+                )
+
 
 class SecretGuardRustLetBindingTests(unittest.TestCase):
     def test_rust_let_call_bindings_do_not_trigger_generic_assignment(self) -> None:

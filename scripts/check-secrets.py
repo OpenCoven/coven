@@ -78,6 +78,26 @@ RUST_LET_CALL_BINDING = re.compile(
     r"[A-Za-z_][A-Za-z0-9_]*(?:(?:::|\.)[A-Za-z_][A-Za-z0-9_]*)*!?\("
 )
 QUOTED_TEXT = re.compile(r"'[^']*'|\"[^\"]*\"")
+SAFE_SECRET_FIELD_REGEX_PATTERN = re.compile(
+    r"""(?ix)
+    ^(?P<paren>\()?
+    (?:
+        (?:api[_-]?key|apikey|key|secret|token|password|private[_-]?key|authorization)
+        (?:\s*[:=]|\[=:\])?
+        |bearer(?:\s+\[A-Za-z0-9\])?\s*
+    )
+    (?:
+        \|
+        (?:
+            (?:api[_-]?key|apikey|key|secret|token|password|private[_-]?key|authorization)
+            (?:\s*[:=]|\[=:\])?
+            |bearer(?:\s+\[A-Za-z0-9\])?\s*
+        )
+    )+
+    (?(paren)\)|)
+    $
+    """
+)
 SAFE_ASSIGNMENT_SUFFIX = re.compile(
     r'''(?x)
     (?:
@@ -174,6 +194,21 @@ def has_unsafe_safe_assignment_continuation(line: str) -> bool:
     )
 
 
+def is_safe_secret_field_regex_assignment(
+    line: str, assignment: re.Match[str]
+) -> bool:
+    return any(
+        match_is_within(assignment, quoted)
+        and bool(
+            SAFE_SECRET_FIELD_REGEX_PATTERN.fullmatch(
+                quoted.group(0)[1:-1]
+            )
+        )
+        and safe_assignment_continuation_is_syntax(line, quoted)
+        for quoted in QUOTED_TEXT.finditer(line)
+    )
+
+
 def is_known_safe_generic_assignment(
     line: str, assignment: re.Match[str]
 ) -> bool:
@@ -201,12 +236,8 @@ def is_known_safe_generic_assignment(
     ):
         return True
 
-    if "grep" in line and re.search(r"-[A-Za-z]*E\b", line):
-        if any(
-            match_is_within(assignment, quoted)
-            for quoted in QUOTED_TEXT.finditer(line)
-        ):
-            return True
+    if is_safe_secret_field_regex_assignment(line, assignment):
+        return True
 
     return False
 
