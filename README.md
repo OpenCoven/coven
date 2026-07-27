@@ -105,7 +105,7 @@ The Rust daemon is the authority boundary. All clients — including the CLI its
 | **Rust stable toolchain**    | Required only when building from source                                     |
 | **Git**                      | Required                                                                    |
 | **macOS, Linux, or Windows x64** | Native npm packages are published for all three platforms                  |
-| **Node.js 18+**              | Required only for npm wrapper or package/plugin development                 |
+| **Node.js 18+**              | Required for the npm wrapper; `coven memory open` requires Node.js 24+      |
 | **At least one harness CLI** | Codex, Claude Code, and/or GitHub Copilot CLI (see below)                    |
 
 ### Installing harness CLIs
@@ -151,7 +151,12 @@ Install globally:
 ```bash
 npm install -g @opencoven/cli
 coven doctor
+coven memory open
 ```
+
+The core npm wrapper supports Node.js 18 or newer. The optional memory
+dashboard requires Node.js 24 or newer; on an older runtime, only
+`coven memory open` is blocked and prints an upgrade instruction.
 
 **Available npm packages:**
 
@@ -161,6 +166,7 @@ coven doctor
 | `@opencoven/cli-macos`     | macOS Apple Silicon                            |
 | `@opencoven/cli-linux-x64` | Linux x64                                      |
 | `@opencoven/cli-windows`   | Windows x64                                    |
+| `@opencoven/coven-memory-dashboard` | Optional loopback memory dashboard companion |
 
 ### Build from source (recommended for contributors)
 
@@ -243,7 +249,8 @@ The full command surface — every subcommand, flag, and JSON output shape — l
 | `coven attach <id>` | Replay/follow session output and forward input | [`cli-attach.md`](docs/reference/cli-attach.md) |
 | `coven archive` / `summon` / `sacrifice` / `kill` | Session rituals (see below) | [`cli-archive.md`](docs/reference/cli-archive.md), [`cli-summon.md`](docs/reference/cli-summon.md), [`cli-sacrifice.md`](docs/reference/cli-sacrifice.md), [`cli-kill.md`](docs/reference/cli-kill.md) |
 | `coven adapter list/doctor/install` | Inspect harness adapters; opt into trusted adapter recipes (e.g. `coven adapter install grok`) | [`docs/HARNESS-ADAPTERS.md`](docs/HARNESS-ADAPTERS.md) |
-| `coven status` / `familiars` / `skills` / `memory` / `research` / `calls` / `hub` | Read-only observability with `--json`, mirroring the daemon API routes | [`cli-observe.md`](docs/reference/cli-observe.md) |
+| `coven status` / `familiars` / `skills` / `research` / `calls` / `hub` | Read-only observability with `--json`, mirroring the daemon API routes | [`cli-observe.md`](docs/reference/cli-observe.md) |
+| `coven memory` / `coven memory --json` / `coven memory open` | Preserve the memory list output or launch the private loopback dashboard | [`cli-observe.md`](docs/reference/cli-observe.md) |
 | `coven wt` / `claim` / `hooks` | Parallel work protocol: worktrees, TTL-bounded claims, git hooks | [`cli-wt.md`](docs/reference/cli-wt.md), [`cli-claim.md`](docs/reference/cli-claim.md) |
 | `coven pc` | macOS-first system diagnostics; write operations require `--confirm` | [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) |
 | `coven patch openclaw` / `logs prune` / `vacuum` | OpenClaw rescue loop, log-retention pruning, store repair | [`cli-patch.md`](docs/reference/cli-patch.md), [`cli-logs.md`](docs/reference/cli-logs.md), [`cli-vacuum.md`](docs/reference/cli-vacuum.md) |
@@ -292,6 +299,14 @@ Local dashboards use `GET /api/v1/memory`, `GET /api/v1/memory/overview`,
 and `GET /api/v1/memory/:id`. The daemon resolves and validates memory files;
 clients must not open the archival database, vector index, manifest, or memory
 paths directly.
+
+`coven memory open` delegates to the local
+`@opencoven/coven-memory-dashboard` executable. The npm wrapper supplies only
+the installed Node executable and dashboard entrypoint; memory data and daemon
+transport proofs are never passed through the environment. Direct native
+binary installs can place `coven-memory-dashboard` on `PATH` or install the
+package globally. The dashboard requires Node.js 24 or newer; the rest of the
+npm-wrapped CLI remains available on Node.js 18 or newer.
 
 Treat the socket API as the product contract. Clients may validate for better UX, but the Rust daemon remains the authority boundary.
 

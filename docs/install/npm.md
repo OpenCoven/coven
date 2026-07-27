@@ -18,6 +18,23 @@ coven doctor
 
 The wrapper exposes the `coven` command and selects the native package for the current platform.
 
+The wrapper also declares `@opencoven/coven-memory-dashboard` as an optional
+companion on its own release train. With optional dependencies enabled, launch
+the packaged loopback-only dashboard with:
+
+```sh
+coven memory open
+```
+
+The wrapper passes only the resolved dashboard entrypoint and the current Node
+executable to the native CLI. It does not put memory content, daemon transport
+proofs, or credentials in the environment.
+
+The core npm wrapper supports Node.js 18 or newer. The optional dashboard
+requires Node.js 24 or newer. On Node.js 18–23, `coven memory open` prints an
+upgrade instruction; list output and every other Coven command remain
+available.
+
 ## Supported npm targets
 
 | Platform | Native package |
@@ -35,6 +52,14 @@ coven doctor
 ```
 
 On Linux, use a glibc-based distribution for the prebuilt package. For Alpine or another musl-based environment, use [Install from source](/install/from-source).
+
+If Coven was installed as a direct native binary, install the dashboard
+executable separately and keep it on `PATH`:
+
+```sh
+npm install -g @opencoven/coven-memory-dashboard
+coven memory open
+```
 
 ## Install harness CLIs
 

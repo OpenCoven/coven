@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{SecondsFormat, Utc};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use uuid::Uuid;
 
 mod api;
@@ -26,6 +26,7 @@ mod executor_node;
 mod familiar_identity;
 mod harness;
 mod hub;
+mod memory_dashboard;
 mod observe;
 mod openclaw_repo;
 mod parallel_protocol;
@@ -98,6 +99,28 @@ struct Cli {
         help = "Free-text task to cast when no subcommand is given: Coven plans it, asks you to confirm, then runs it in a session"
     )]
     prompt: Vec<String>,
+}
+
+impl Cli {
+    fn validate(self) -> std::result::Result<Self, clap::Error> {
+        if matches!(
+            self.command,
+            Some(Command::Memory {
+                command: Some(MemoryCommand::Open),
+                json: true,
+            })
+        ) {
+            let mut command = Cli::command();
+            let memory = command
+                .find_subcommand_mut("memory")
+                .expect("derived CLI must contain the memory command");
+            return Err(memory.error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "the argument '--json' cannot be used with 'open'",
+            ));
+        }
+        Ok(self)
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -415,8 +438,10 @@ enum Command {
         #[arg(long, help = "Print skills as JSON (machine-readable)")]
         json: bool,
     },
-    #[command(about = "List familiar memory files from ~/.coven/memory/")]
+    #[command(about = "List familiar memory or open its private local dashboard")]
     Memory {
+        #[command(subcommand)]
+        command: Option<MemoryCommand>,
         #[arg(long, help = "Print memory files as JSON (machine-readable)")]
         json: bool,
     },
@@ -477,6 +502,12 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum MemoryCommand {
+    #[command(about = "Open the private local memory dashboard")]
+    Open,
 }
 
 #[derive(Subcommand, Debug)]
@@ -858,7 +889,7 @@ fn main() -> Result<()> {
         });
     settings::init_cached(loaded);
 
-    let cli = Cli::parse();
+    let cli = Cli::parse().validate().unwrap_or_else(|error| error.exit());
     // Resolve --color before anything renders: theme::mode() caches on
     // first use, so the override must be recorded ahead of any output.
     theme::set_color_choice(match cli.color.as_str() {
@@ -984,7 +1015,10 @@ fn run_cli(cli: Cli) -> Result<()> {
         Some(Command::Status { json }) => observe::run_status(json),
         Some(Command::Familiars { id, json }) => observe::run_familiars(id.as_deref(), json),
         Some(Command::Skills { json }) => observe::run_skills(json),
-        Some(Command::Memory { json }) => observe::run_memory(json),
+        Some(Command::Memory { command, json }) => match command {
+            Some(MemoryCommand::Open) => memory_dashboard::run_open(),
+            None => observe::run_memory(json),
+        },
         Some(Command::Research { json }) => observe::run_research(json),
         Some(Command::Calls { id, json }) => observe::run_calls(id.as_deref(), json),
         Some(Command::Hub { command }) => match command {
@@ -4147,7 +4181,24 @@ mod tests {
         ));
         assert!(matches!(
             Cli::parse_from(["coven", "memory"]).command,
-            Some(Command::Memory { json: false })
+            Some(Command::Memory {
+                command: None,
+                json: false
+            })
+        ));
+        assert!(matches!(
+            Cli::parse_from(["coven", "memory", "--json"]).command,
+            Some(Command::Memory {
+                command: None,
+                json: true
+            })
+        ));
+        assert!(matches!(
+            Cli::parse_from(["coven", "memory", "open"]).command,
+            Some(Command::Memory {
+                command: Some(MemoryCommand::Open),
+                json: false
+            })
         ));
         assert!(matches!(
             Cli::parse_from(["coven", "research"]).command,
@@ -4168,6 +4219,35 @@ mod tests {
             Cli::parse_from(["coven", "doctor", "--json"]).command,
             Some(Command::Doctor { json: true })
         ));
+    }
+
+    #[test]
+    fn memory_open_rejects_list_flags_but_keeps_global_color_placements() {
+        let error = Cli::try_parse_from(["coven", "memory", "--json", "open"])
+            .and_then(Cli::validate)
+            .expect_err("memory open must reject parent list-only --json");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        let error = Cli::try_parse_from(["coven", "memory", "open", "--json"])
+            .expect_err("memory open must reject trailing list-only --json");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+
+        for args in [
+            vec!["coven", "--color=never", "memory", "open"],
+            vec!["coven", "memory", "--color=never", "open"],
+            vec!["coven", "memory", "open", "--color=never"],
+        ] {
+            assert!(matches!(
+                Cli::try_parse_from(args)
+                    .and_then(Cli::validate)
+                    .expect("global --color remains valid around memory open")
+                    .command,
+                Some(Command::Memory {
+                    command: Some(MemoryCommand::Open),
+                    json: false
+                })
+            ));
+        }
     }
 
     #[test]

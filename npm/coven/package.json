@@ -17,6 +17,7 @@
     "url": "git+https://github.com/OpenCoven/coven.git"
   },
   "optionalDependencies": {
+    "@opencoven/coven-memory-dashboard": "^0.1.0",
     "@opencoven/cli-macos": "0.0.0",
     "@opencoven/cli-linux-x64": "0.0.0",
     "@opencoven/cli-windows": "0.0.0"

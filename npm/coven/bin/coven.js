@@ -14,6 +14,7 @@ const PLATFORM_PACKAGES = {
 const binaryName = process.platform === 'win32' ? 'coven.exe' : 'coven';
 const platformKey = `${process.platform}-${process.arch}`;
 const packageName = PLATFORM_PACKAGES[platformKey];
+const MEMORY_DASHBOARD_MIN_NODE_MAJOR = 24;
 
 function resolveBinary() {
   if (!packageName) {
@@ -31,6 +32,33 @@ function resolveBinary() {
   }
 }
 
+function isMemoryOpenInvocation(args) {
+  if (args.includes('--json')) {
+    return false;
+  }
+  const commandPath = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === '--color') {
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith('--color=')) {
+      continue;
+    }
+    commandPath.push(arg);
+    if (commandPath.length === 2) {
+      break;
+    }
+  }
+  return commandPath[0] === 'memory' && commandPath[1] === 'open';
+}
+
+function supportsMemoryDashboard(nodeVersion) {
+  const major = Number.parseInt(nodeVersion.split('.')[0], 10);
+  return Number.isInteger(major) && major >= MEMORY_DASHBOARD_MIN_NODE_MAJOR;
+}
+
 let binary;
 try {
   binary = resolveBinary();
@@ -44,10 +72,34 @@ try {
 // line. (The wrapper previously short-circuited --version to its own
 // package.json version, which shadowed that output for npm installs.)
 const args = process.argv.slice(2);
+const childEnv = { ...process.env };
+const opensMemoryDashboard = isMemoryOpenInvocation(args);
+const requestsHelp = args.some((arg) => arg === '--help' || arg === '-h');
+if (
+  opensMemoryDashboard &&
+  !requestsHelp &&
+  !supportsMemoryDashboard(process.versions.node)
+) {
+  console.error(
+    `coven memory open requires Node.js ${MEMORY_DASHBOARD_MIN_NODE_MAJOR} or newer; current Node.js is ${process.versions.node}. Upgrade Node.js and reinstall @opencoven/cli. Other Coven CLI commands continue to support Node.js 18 or newer.`
+  );
+  process.exit(1);
+}
+if (opensMemoryDashboard) {
+  try {
+    childEnv['COVEN_MEMORY_DASHBOARD_ENTRY'] = require.resolve(
+      '@opencoven/coven-memory-dashboard/bin/coven-memory-dashboard.mjs'
+    );
+    childEnv['COVEN_MEMORY_DASHBOARD_NODE'] = process.execPath;
+  } catch {
+    // The native binary emits the single actionable installation error.
+  }
+}
 
 const child = spawn(binary, args, {
   stdio: 'inherit',
-  windowsHide: false
+  windowsHide: false,
+  env: childEnv
 });
 
 for (const signal of ['SIGINT', 'SIGTERM']) {

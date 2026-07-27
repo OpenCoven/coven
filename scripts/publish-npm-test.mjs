@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import {
+  chmodSync,
   copyFileSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync
@@ -183,6 +185,188 @@ test('wrapper declares linux x64 native package as an optional dependency', () =
   const packageJson = JSON.parse(readFileSync(packagePath, 'utf8'));
   assert.equal(packageJson.optionalDependencies['@opencoven/cli-linux-x64'], '0.0.0');
 });
+
+test('wrapper keeps the dashboard companion on its independent version', () => {
+  const packagePath = new URL(['..', 'npm', 'coven', 'package.json'].join('/'), import.meta.url);
+  const packageJson = JSON.parse(readFileSync(packagePath, 'utf8'));
+  assert.equal(
+    packageJson.optionalDependencies['@opencoven/coven-memory-dashboard'],
+    '^0.1.0'
+  );
+});
+
+test('wrapper declares the installed dashboard entrypoint handoff', () => {
+  const binPath = new URL(['..', 'npm', 'coven', 'bin', 'coven.js'].join('/'), import.meta.url);
+  const bin = readFileSync(binPath, 'utf8');
+  assert.match(bin, /COVEN_MEMORY_DASHBOARD_ENTRY/);
+  assert.match(bin, /COVEN_MEMORY_DASHBOARD_NODE/);
+});
+
+test(
+  'wrapper passes the dashboard handoff for every valid memory open option placement only',
+  {
+    skip:
+      process.platform === 'win32' ||
+      !SIGNAL_TEST_PACKAGES[`${process.platform}-${process.arch}`]
+  },
+  () => {
+    const fixture = mkdtempSync(path.join(tmpdir(), 'coven-wrapper-dashboard-'));
+    try {
+      const wrapperDir = path.join(fixture, 'wrapper');
+      const wrapperBinDir = path.join(wrapperDir, 'bin');
+      const wrapperPath = path.join(wrapperBinDir, 'coven.js');
+      mkdirSync(wrapperBinDir, { recursive: true });
+      writeFileSync(
+        path.join(wrapperDir, 'package.json'),
+        JSON.stringify({ name: '@opencoven/cli-test', type: 'module' })
+      );
+      copyFileSync(
+        fileURLToPath(new URL('../npm/coven/bin/coven.js', import.meta.url)),
+        wrapperPath
+      );
+
+      const [packageName, binaryName] =
+        SIGNAL_TEST_PACKAGES[`${process.platform}-${process.arch}`];
+      const nativeDir = path.join(wrapperDir, 'node_modules', ...packageName.split('/'));
+      const nativeBinDir = path.join(nativeDir, 'bin');
+      const nativePath = path.join(nativeBinDir, binaryName);
+      mkdirSync(nativeBinDir, { recursive: true });
+      writeFileSync(
+        path.join(nativeDir, 'package.json'),
+        JSON.stringify({ name: packageName, version: '0.0.0' })
+      );
+      writeFileSync(
+        nativePath,
+        [
+          '#!/bin/sh',
+          'printf "%s\\n%s\\n" "$COVEN_MEMORY_DASHBOARD_ENTRY" "$COVEN_MEMORY_DASHBOARD_NODE"',
+          ''
+        ].join('\n')
+      );
+      chmodSync(nativePath, 0o755);
+
+      const dashboardDir = path.join(
+        wrapperDir,
+        'node_modules',
+        '@opencoven',
+        'coven-memory-dashboard'
+      );
+      const dashboardBinDir = path.join(dashboardDir, 'bin');
+      const dashboardEntry = path.join(
+        dashboardBinDir,
+        'coven-memory-dashboard.mjs'
+      );
+      mkdirSync(dashboardBinDir, { recursive: true });
+      writeFileSync(
+        path.join(dashboardDir, 'package.json'),
+        JSON.stringify({
+          name: '@opencoven/coven-memory-dashboard',
+          version: '0.0.0',
+          type: 'module'
+        })
+      );
+      writeFileSync(dashboardEntry, '');
+
+      const versionRunner = path.join(fixture, 'run-wrapper-with-node-version.mjs');
+      writeFileSync(
+        versionRunner,
+        [
+          "Object.defineProperty(process.versions, 'node', {",
+          "  value: process.env.TEST_NODE_VERSION",
+          '});',
+          `process.argv = [process.execPath, ${JSON.stringify(wrapperPath)}, ...JSON.parse(process.env.TEST_WRAPPER_ARGS)];`,
+          `await import(${JSON.stringify(pathToFileURL(wrapperPath).href)});`,
+          ''
+        ].join('\n')
+      );
+
+      for (const args of [
+        ['memory', 'open'],
+        ['--color=never', 'memory', 'open'],
+        ['--color', 'never', 'memory', 'open'],
+        ['memory', '--color=never', 'open'],
+        ['memory', '--color', 'never', 'open'],
+        ['memory', 'open', '--color=never'],
+        ['memory', 'open', '--color', 'never']
+      ]) {
+        const result = spawnSync(process.execPath, [wrapperPath, ...args], {
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            COVEN_MEMORY_DASHBOARD_ENTRY: '',
+            COVEN_MEMORY_DASHBOARD_NODE: ''
+          }
+        });
+
+        assert.equal(result.status, 0, `${args.join(' ')}: ${result.stderr}`);
+        assert.deepEqual(
+          result.stdout.trim().split('\n'),
+          [realpathSync(dashboardEntry), process.execPath],
+          args.join(' ')
+        );
+      }
+
+      for (const args of [
+        ['memory'],
+        ['memory', '--json'],
+        ['memory', '--json', 'open'],
+        ['memory', 'open', '--json'],
+        ['--color=never', 'memory', '--json'],
+        ['memory', '--color', 'never', '--json']
+      ]) {
+        const result = spawnSync(process.execPath, [wrapperPath, ...args], {
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            COVEN_MEMORY_DASHBOARD_ENTRY: '',
+            COVEN_MEMORY_DASHBOARD_NODE: ''
+          }
+        });
+
+        assert.equal(result.status, 0, `${args.join(' ')}: ${result.stderr}`);
+        assert.equal(result.stdout, '\n\n', args.join(' '));
+      }
+
+      const unsupportedNode = spawnSync(process.execPath, [versionRunner], {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          COVEN_MEMORY_DASHBOARD_ENTRY: '',
+          COVEN_MEMORY_DASHBOARD_NODE: '',
+          TEST_NODE_VERSION: '23.11.0',
+          TEST_WRAPPER_ARGS: JSON.stringify(['memory', 'open'])
+        }
+      });
+      assert.equal(unsupportedNode.status, 1);
+      assert.equal(unsupportedNode.stdout, '');
+      assert.match(
+        unsupportedNode.stderr,
+        /coven memory open requires Node\.js 24 or newer/
+      );
+
+      for (const args of [
+        ['memory', 'open', '--help'],
+        ['memory', '--json'],
+        ['memory', '--json', 'open'],
+        ['memory', 'open', '--json']
+      ]) {
+        const result = spawnSync(process.execPath, [versionRunner], {
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            COVEN_MEMORY_DASHBOARD_ENTRY: '',
+            COVEN_MEMORY_DASHBOARD_NODE: '',
+            TEST_NODE_VERSION: '23.11.0',
+            TEST_WRAPPER_ARGS: JSON.stringify(args)
+          }
+        });
+        assert.equal(result.status, 0, `${args.join(' ')}: ${result.stderr}`);
+      }
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  }
+);
 
 test('release publishes only the canonical @opencoven/cli wrapper package', () => {
   assert.deepEqual(wrapperPackageNameList(), ['@opencoven/cli']);
@@ -490,6 +674,33 @@ test('prepublish smoke has explicit dry-run version override and registry failur
 
   assert.match(script, /COVEN_NPM_DRY_RUN_VERSION/);
   assert.match(script, /Could not read current \$\{packageName\} version/);
+});
+
+test('prepublish smoke rejects a missing dashboard tarball before running gates', () => {
+  const fixture = mkdtempSync(path.join(tmpdir(), 'coven-dashboard-tarball-'));
+  try {
+    const scriptPath = fileURLToPath(new URL('test-cli-prepublish.mjs', import.meta.url));
+    const missing = path.join(fixture, 'missing-dashboard.tgz');
+    const childEnv = { ...process.env };
+    delete childEnv.NODE_TEST_CONTEXT;
+    const result = spawnSync(
+      process.execPath,
+      [
+        scriptPath,
+        '--target=unsupported-test-target',
+        `--dashboard-tarball=${missing}`
+      ],
+      { encoding: 'utf8', env: childEnv }
+    );
+
+    assert.notEqual(result.status, 0);
+    assert.match(
+      `${result.stdout}\n${result.stderr}`,
+      /dashboard tarball not found/
+    );
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
 });
 
 test('publish-npm entrypoint detection works with filesystem paths', () => {
