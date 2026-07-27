@@ -64,7 +64,11 @@
 //! Windows uses `ReplaceFileW` with a distinct randomized sibling backup. The
 //! displaced before-image and installed bytes are verified before the batch can
 //! finalize, and rollback uses the same primitive in reverse so concurrent
-//! target bytes are preserved rather than overwritten.
+//! target bytes are preserved rather than overwritten. A reviewed file that
+//! was absent at staging is installed with a no-replace hard link to its synced
+//! staging inode; rollback first moves the entry to a randomized no-replace
+//! capture and removes it only when both inode identity and contents still
+//! belong to that apply attempt.
 //!
 //! Residual risk (accepted): a same-privilege process that can already write
 //! inside the familiar home can still swap path components in the window
@@ -501,6 +505,57 @@ pub enum Disposition {
     Refused,
 }
 
+/// Whether a conditional approved write is the first apply or crash recovery.
+///
+/// Only recovery may accept a target that already contains the staged
+/// after-bytes. An initial apply must still observe the exact reviewed
+/// before-image so same-byte concurrent writes cannot be mistaken for our own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApprovedApplyMode {
+    Initial,
+    Recovery,
+}
+
+#[derive(Debug)]
+struct ApprovedApplyError {
+    may_have_committed_write: bool,
+    source: anyhow::Error,
+}
+
+impl std::fmt::Display for ApprovedApplyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:#}", self.source)
+    }
+}
+
+impl std::error::Error for ApprovedApplyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+fn approved_apply_error(source: anyhow::Error, may_have_committed_write: bool) -> anyhow::Error {
+    ApprovedApplyError {
+        may_have_committed_write,
+        source,
+    }
+    .into()
+}
+
+/// Classify an approved-apply error for durable decision recovery.
+///
+/// `Some(false)` means the writer either never changed a target or proved that
+/// its changes were rolled back. `Some(true)` means recovery state must remain
+/// durable because a write may have committed. `None` is an unclassified error
+/// and callers must conservatively preserve recovery state.
+pub(crate) fn approved_apply_error_may_have_committed_write(error: &anyhow::Error) -> Option<bool> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<ApprovedApplyError>()
+            .map(|failure| failure.may_have_committed_write)
+    })
+}
+
 /// A Gate 4 audit record for a change the Ward wrote.
 ///
 /// The before/after content hashes make the record tamper-evident. (The spec
@@ -837,12 +892,16 @@ impl Ward {
         edits: &[FileEdit],
         authorization: &Authorization,
         expected_before: &BTreeMap<String, Vec<u8>>,
+        expected_resolved: &BTreeMap<String, String>,
+        mode: ApprovedApplyMode,
     ) -> Result<ApplyReport> {
         let proposal = Proposal {
             targets: edits.iter().map(|e| e.target.clone()).collect(),
             authorization: authorization.clone(),
         };
         let outcome = self.evaluate(&proposal);
+        ensure_expected_resolutions(&outcome.decisions, expected_resolved)
+            .map_err(|error| approved_apply_error(error, false))?;
         if outcome.is_blocked() {
             let changes = outcome
                 .decisions
@@ -863,15 +922,115 @@ impl Ward {
         let canonical_home = self
             .home
             .canonicalize()
-            .with_context(|| format!("ward home `{}` is not resolvable", self.home.display()))?;
+            .with_context(|| format!("ward home `{}` is not resolvable", self.home.display()))
+            .map_err(|error| approved_apply_error(error, false))?;
+        let expected_before = expected_before
+            .iter()
+            .map(|(target, contents)| (target.clone(), Some(contents.clone())))
+            .collect();
+        let changes = write_atomically_if_unchanged(
+            &canonical_home,
+            edits,
+            outcome.decisions,
+            &expected_before,
+            mode,
+        )?;
+        Ok(ApplyReport { changes })
+    }
+
+    /// Apply edits after an explicit principal coherence decision.
+    ///
+    /// This is deliberately narrower than [`Ward::apply_after_threads_approval`]:
+    /// it clears only [`Verdict::RequiresCoherenceReview`]. A protected target
+    /// remains refused even when it carries valid Gate-1 authorization, and
+    /// Gate-2 or authorization failures remain refused. `expected_before`
+    /// binds the apply to the surface snapshot reviewed by the principal;
+    /// `None` represents a reviewed target that did not exist at staging time.
+    pub(crate) fn apply_after_coherence_approval(
+        &self,
+        edits: &[FileEdit],
+        authorization: &Authorization,
+        expected_before: &BTreeMap<String, Option<Vec<u8>>>,
+        expected_resolved: &BTreeMap<String, String>,
+        mode: ApprovedApplyMode,
+    ) -> Result<ApplyReport> {
+        let proposal = Proposal {
+            targets: edits.iter().map(|edit| edit.target.clone()).collect(),
+            authorization: authorization.clone(),
+        };
+        let outcome = self.evaluate(&proposal);
+        ensure_expected_resolutions(&outcome.decisions, expected_resolved)
+            .map_err(|error| approved_apply_error(error, false))?;
+        let has_reviewed_target = outcome
+            .decisions
+            .iter()
+            .any(|decision| matches!(decision.verdict, Verdict::RequiresCoherenceReview));
+        let refused = !has_reviewed_target
+            || outcome.decisions.iter().any(|decision| {
+                matches!(
+                    decision.verdict,
+                    Verdict::AuthorizedProtectedChange | Verdict::Blocked { .. }
+                )
+            });
+        if refused {
+            let changes = outcome
+                .decisions
+                .into_iter()
+                .map(|decision| AppliedChange {
+                    disposition: Disposition::Refused,
+                    decision,
+                    audit: None,
+                })
+                .collect();
+            return Ok(ApplyReport { changes });
+        }
+
+        let canonical_home = self
+            .home
+            .canonicalize()
+            .with_context(|| format!("ward home `{}` is not resolvable", self.home.display()))
+            .map_err(|error| approved_apply_error(error, false))?;
         let changes = write_atomically_if_unchanged(
             &canonical_home,
             edits,
             outcome.decisions,
             expected_before,
+            mode,
         )?;
         Ok(ApplyReport { changes })
     }
+}
+
+fn ensure_expected_resolutions(
+    decisions: &[Decision],
+    expected_resolved: &BTreeMap<String, String>,
+) -> Result<()> {
+    if decisions.len() != expected_resolved.len() {
+        bail!("approved Gate-2 resolutions do not match the proposed targets");
+    }
+    let mut seen = BTreeSet::new();
+    for decision in decisions {
+        if !seen.insert(decision.target.as_str()) {
+            bail!(
+                "approved proposal contains duplicate target `{}`",
+                decision.target
+            );
+        }
+        let expected = expected_resolved.get(&decision.target).with_context(|| {
+            format!(
+                "missing approved Gate-2 resolution for `{}`",
+                decision.target
+            )
+        })?;
+        if expected != &decision.resolved {
+            bail!(
+                "approved target `{}` changed Gate-2 resolution from `{expected}` to `{}`",
+                decision.target,
+                decision.resolved
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Whether a verdict needs Gate 3 coherence review before it can be applied.
@@ -981,7 +1140,7 @@ struct PreparedConditionalWrite {
     path: PathBuf,
     paths: Option<ApprovedWritePaths>,
     already_applied: bool,
-    expected_before: Vec<u8>,
+    expected_before: Option<Vec<u8>>,
     new_contents: Vec<u8>,
     decision: Decision,
 }
@@ -998,7 +1157,8 @@ fn write_atomically_if_unchanged(
     canonical_home: &Path,
     edits: &[FileEdit],
     decisions: Vec<Decision>,
-    expected_before: &BTreeMap<String, Vec<u8>>,
+    expected_before: &BTreeMap<String, Option<Vec<u8>>>,
+    mode: ApprovedApplyMode,
 ) -> Result<Vec<AppliedChange>> {
     let mut prepared = Vec::with_capacity(edits.len());
     let mut preparation_error = None;
@@ -1017,14 +1177,32 @@ fn write_atomically_if_unchanged(
                 .ok_or_else(|| anyhow!("target has no file name: {}", resolved.display()))?;
             let canonical_parent = prepare_staging_parent(canonical_home, parent)?;
             let path = canonical_parent.join(name);
-            let current = std::fs::read(&path)
-                .with_context(|| format!("reading approved target {}", path.display()))?;
-            let already_applied = current == edit.new_contents;
-            if current != expected && !already_applied {
-                bail!(
-                    "approved target `{}` changed after review; refusing to overwrite it",
-                    edit.target
-                );
+            let current = match std::fs::read(&path) {
+                Ok(current) => Some(current),
+                Err(error) if error.kind() == ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("reading approved target {}", path.display()))
+                }
+            };
+            let already_applied = mode == ApprovedApplyMode::Recovery
+                && current.as_deref() == Some(edit.new_contents.as_slice());
+            match (&expected, &current) {
+                (Some(expected), Some(current)) if current == expected || already_applied => {}
+                (Some(_), _) => {
+                    bail!(
+                        "approved target `{}` changed after review; refusing to overwrite it",
+                        edit.target
+                    );
+                }
+                (None, None) => {}
+                (None, Some(_)) if already_applied => {}
+                (None, Some(_)) => {
+                    bail!(
+                        "approved target `{}` appeared after review; refusing to overwrite it",
+                        edit.target
+                    );
+                }
             }
             Ok(PreparedConditionalWrite {
                 path,
@@ -1066,10 +1244,19 @@ fn write_atomically_if_unchanged(
         if let Err(error) = maybe_run_conditional_write_hook(&write.path) {
             return fail_after_conditional_rollback(&prepared, &swapped, error);
         }
-        if let Err(error) =
+        let commit = if write.expected_before.is_some() {
             atomic_replace_preserving_target(&write.path, &paths.staged, &paths.displaced)
-        {
-            if failed_replace_displaced_target(&paths.displaced) {
+        } else {
+            std::fs::hard_link(&paths.staged, &write.path).with_context(|| {
+                format!(
+                    "approved target `{}` appeared after review; refusing to overwrite it",
+                    write.decision.target
+                )
+            })
+        };
+        if let Err(error) = commit {
+            if write.expected_before.is_some() && failed_replace_displaced_target(&paths.displaced)
+            {
                 swapped.push(index);
             }
             return fail_after_conditional_rollback(
@@ -1084,16 +1271,30 @@ fn write_atomically_if_unchanged(
         swapped.push(index);
 
         let verification = (|| -> Result<()> {
-            let displaced = std::fs::read(&paths.displaced).with_context(|| {
-                format!("reading displaced target {}", paths.displaced.display())
-            })?;
             let installed = std::fs::read(&write.path)
                 .with_context(|| format!("verifying approved write {}", write.path.display()))?;
-            if displaced != write.expected_before || installed != write.new_contents {
-                bail!(
-                    "approved target `{}` changed during commit",
-                    write.decision.target
-                );
+            match &write.expected_before {
+                Some(expected) => {
+                    let displaced = std::fs::read(&paths.displaced).with_context(|| {
+                        format!("reading displaced target {}", paths.displaced.display())
+                    })?;
+                    if displaced != *expected || installed != write.new_contents {
+                        bail!(
+                            "approved target `{}` changed during commit",
+                            write.decision.target
+                        );
+                    }
+                }
+                None => {
+                    if installed != write.new_contents
+                        || !same_file_identity(&write.path, &paths.staged)?
+                    {
+                        bail!(
+                            "approved target `{}` changed during commit",
+                            write.decision.target
+                        );
+                    }
+                }
             }
             Ok(())
         })();
@@ -1122,12 +1323,16 @@ fn write_atomically_if_unchanged(
 
     for write in &prepared {
         if let Some(paths) = &write.paths {
-            std::fs::remove_file(&paths.displaced).with_context(|| {
-                format!(
-                    "removing approved-write backup {}",
-                    paths.displaced.display()
-                )
-            })?;
+            let cleanup = if write.expected_before.is_some() {
+                &paths.displaced
+            } else {
+                &paths.staged
+            };
+            if let Err(error) = std::fs::remove_file(cleanup)
+                .with_context(|| format!("removing approved-write backup {}", cleanup.display()))
+            {
+                return Err(approved_apply_error(error, true));
+            }
         }
     }
 
@@ -1138,7 +1343,7 @@ fn write_atomically_if_unchanged(
                 target: write.decision.target.clone(),
                 resolved: write.decision.resolved.clone(),
                 tier: write.decision.tier,
-                prev_sha256: Some(sha256_hex(&write.expected_before)),
+                prev_sha256: write.expected_before.as_deref().map(sha256_hex),
                 next_sha256: sha256_hex(&write.new_contents),
                 bytes_written: write.new_contents.len(),
             });
@@ -1162,12 +1367,17 @@ fn rollback_conditional_writes(
             .paths
             .as_ref()
             .context("swapped conditional write has no approved-write paths")?;
-        if let Err(error) = restore_swapped_write(write, paths) {
+        let rollback = if write.expected_before.is_some() {
+            restore_swapped_write(write, paths)
+        } else {
+            rollback_created_write(write, paths)
+        };
+        if let Err(error) = rollback {
             errors.push(format!("{}: {error:#}", write.decision.target));
         }
     }
     for write in prepared.iter().rev().filter(|write| write.already_applied) {
-        if write.expected_before != write.new_contents {
+        if write.expected_before.as_deref() != Some(write.new_contents.as_slice()) {
             errors.push(format!(
                 "{}: approved bytes predated this apply attempt; ownership is unproven, so \
                  recovery left them in place",
@@ -1191,10 +1401,14 @@ fn fail_after_conditional_rollback(
     match rollback {
         Ok(()) => {
             cleanup_conditional_staging(prepared);
-            Err(error.context("approved proposal was rolled back"))
+            Err(approved_apply_error(
+                error.context("approved proposal was rolled back"),
+                false,
+            ))
         }
-        Err(rollback_error) => Err(anyhow!(
-            "{error:#}; conditional rollback also failed: {rollback_error:#}"
+        Err(rollback_error) => Err(approved_apply_error(
+            anyhow!("{error:#}; conditional rollback also failed: {rollback_error:#}"),
+            true,
         )),
     }
 }
@@ -1227,6 +1441,205 @@ fn restore_swapped_write(
         return Err(error);
     }
     Ok(())
+}
+
+fn rollback_created_write(
+    write: &PreparedConditionalWrite,
+    paths: &ApprovedWritePaths,
+) -> Result<()> {
+    let captured = rollback_capture_path(&write.path);
+    atomic_move_without_replace(&write.path, &captured).with_context(|| {
+        format!(
+            "capturing created target {} before rollback",
+            write.path.display()
+        )
+    })?;
+    let still_owned = (|| -> Result<bool> {
+        let contents = std::fs::read(&captured)
+            .with_context(|| format!("reading rollback capture {}", captured.display()))?;
+        Ok(contents == write.new_contents && same_file_identity(&captured, &paths.staged)?)
+    })();
+    match still_owned {
+        Ok(true) => {
+            std::fs::remove_file(&captured)
+                .with_context(|| format!("removing created target {}", captured.display()))?;
+            Ok(())
+        }
+        Ok(false) => {
+            restore_unowned_rollback_capture(write, &captured)?;
+            bail!(
+                "created target changed before rollback; restored concurrent bytes and left \
+                 approved-write staging in place"
+            )
+        }
+        Err(identity_error) => {
+            restore_unowned_rollback_capture(write, &captured)?;
+            Err(identity_error.context(
+                "created-target ownership could not be verified; restored captured bytes and \
+                 left approved-write staging in place",
+            ))
+        }
+    }
+}
+
+fn restore_unowned_rollback_capture(
+    write: &PreparedConditionalWrite,
+    captured: &Path,
+) -> Result<()> {
+    atomic_move_without_replace(captured, &write.path).with_context(|| {
+        format!(
+            "created target changed during rollback; concurrent bytes remain preserved at {}",
+            captured.display()
+        )
+    })
+}
+
+fn rollback_capture_path(target: &Path) -> PathBuf {
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    target.with_file_name(format!(".{name}.ward-rollback-{}", uuid::Uuid::new_v4()))
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &Path, right: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let left = std::fs::symlink_metadata(left)
+        .with_context(|| format!("reading file identity {}", left.display()))?;
+    let right = std::fs::symlink_metadata(right)
+        .with_context(|| format!("reading file identity {}", right.display()))?;
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+#[cfg(windows)]
+fn same_file_identity(left: &Path, right: &Path) -> Result<bool> {
+    Ok(windows_file_identity(left)? == windows_file_identity(right)?)
+}
+
+#[cfg(windows)]
+fn windows_file_identity(path: &Path) -> Result<(u64, [u8; 16])> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileIdInfo, GetFileInformationByHandleEx, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
+    };
+
+    let file = std::fs::OpenOptions::new()
+        .access_mode(0)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .with_context(|| format!("opening file identity {}", path.display()))?;
+    let mut info = FILE_ID_INFO::default();
+    // SAFETY: `file` owns a valid handle and `info` is a correctly sized,
+    // writable FILE_ID_INFO buffer that remains alive for the call.
+    let result = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as _,
+            FileIdInfo,
+            std::ptr::addr_of_mut!(info).cast(),
+            u32::try_from(std::mem::size_of::<FILE_ID_INFO>())
+                .expect("FILE_ID_INFO size fits in u32"),
+        )
+    };
+    if result == 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("reading file identity {}", path.display()));
+    }
+    validate_windows_file_identity(info.VolumeSerialNumber, info.FileId.Identifier)
+        .with_context(|| format!("reading file identity {}", path.display()))
+}
+
+#[cfg(any(windows, test))]
+fn validate_windows_file_identity(
+    volume_serial_number: u64,
+    file_id: [u8; 16],
+) -> Result<(u64, [u8; 16])> {
+    if file_id == [0; 16] || file_id == [u8::MAX; 16] {
+        bail!("Windows returned an unusable 128-bit file ID");
+    }
+    Ok((volume_serial_number, file_id))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file_identity(_left: &Path, _right: &Path) -> Result<bool> {
+    bail!("file-identity comparison is unsupported on this platform")
+}
+
+#[cfg(target_os = "macos")]
+fn atomic_move_without_replace(source: &Path, destination: &Path) -> Result<()> {
+    const RENAME_EXCL: u32 = 0x0000_0004;
+    unsafe extern "C" {
+        fn renamex_np(
+            from: *const libc::c_char,
+            to: *const libc::c_char,
+            flags: u32,
+        ) -> libc::c_int;
+    }
+
+    let source = CString::new(source.as_os_str().as_bytes()).context("source path contains NUL")?;
+    let destination = CString::new(destination.as_os_str().as_bytes())
+        .context("destination path contains NUL")?;
+    // SAFETY: both C strings are NUL-terminated and remain alive for the call.
+    let result = unsafe { renamex_np(source.as_ptr(), destination.as_ptr(), RENAME_EXCL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error()).context("atomically moving file without replacement")
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn atomic_move_without_replace(source: &Path, destination: &Path) -> Result<()> {
+    const RENAME_NOREPLACE: libc::c_uint = 1;
+    let source = CString::new(source.as_os_str().as_bytes()).context("source path contains NUL")?;
+    let destination = CString::new(destination.as_os_str().as_bytes())
+        .context("destination path contains NUL")?;
+    // SAFETY: both C strings are NUL-terminated and remain alive for the call.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error()).context("atomically moving file without replacement")
+    }
+}
+
+#[cfg(windows)]
+fn atomic_move_without_replace(source: &Path, destination: &Path) -> Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+
+    let source = windows_path(source, "source")?;
+    let destination = windows_path(destination, "destination")?;
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error()).context("atomically moving file without replacement")
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn atomic_move_without_replace(_source: &Path, _destination: &Path) -> Result<()> {
+    bail!("atomic no-replace move is unsupported on this platform")
 }
 
 fn verify_rollback_exchange(
@@ -1299,7 +1712,7 @@ fn conditional_write_hook() -> &'static ConditionalWriteHook {
 }
 
 #[cfg(test)]
-fn set_conditional_write_hook(path: PathBuf, replacement: Vec<u8>) {
+pub(crate) fn set_conditional_write_hook(path: PathBuf, replacement: Vec<u8>) {
     set_conditional_write_actions(path.clone(), vec![(path, replacement)]);
 }
 
@@ -1789,6 +2202,13 @@ mod tests {
 
     fn ward_in(dir: &Path) -> Ward {
         Ward::new(dir.to_path_buf(), sample_config()).expect("valid ward")
+    }
+
+    fn resolved_as_target(edits: &[FileEdit]) -> BTreeMap<String, String> {
+        edits
+            .iter()
+            .map(|edit| (edit.target.clone(), edit.target.clone()))
+            .collect()
     }
 
     /// Directory entries that look like approved-write working files (randomized
@@ -2314,18 +2734,421 @@ formatter = "lenient"
         let tmp = tempfile::tempdir().unwrap();
         let ward = ward_in(tmp.path());
         let edits = vec![FileEdit::new("SOUL.md", b"new soul".to_vec())];
-        // Valid Gate 1 signature, but Gate 3 (coherence) is unavailable.
+        // Valid Gate 1 signature, but the direct apply path cannot represent
+        // the authority proposal and explicit principal decision.
         let report = ward
             .apply(&edits, &Authorization::signed_by("SHA256:principal-key"))
             .unwrap();
 
-        // Fail-closed: authorized, but cannot be coherence-cleared, so held.
+        // Fail-closed: authorized, but not explicitly approved, so held.
         assert!(report.is_held());
         assert_eq!(
             report.changes[0].decision.verdict,
             Verdict::AuthorizedProtectedChange
         );
         assert!(!tmp.path().join("SOUL.md").exists());
+    }
+
+    #[test]
+    fn coherence_approval_applies_reviewed_and_cleared_edits_as_a_unit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::create_dir(tmp.path().join("scratch")).unwrap();
+        fs::write(tmp.path().join("MEMORY.md"), b"old memory").unwrap();
+        fs::write(tmp.path().join("scratch/notes.txt"), b"old notes").unwrap();
+        let edits = vec![
+            FileEdit::new("MEMORY.md", b"new memory".to_vec()),
+            FileEdit::new("scratch/notes.txt", b"new notes".to_vec()),
+        ];
+        let expected = BTreeMap::from([
+            ("MEMORY.md".to_string(), Some(b"old memory".to_vec())),
+            ("scratch/notes.txt".to_string(), Some(b"old notes".to_vec())),
+        ]);
+
+        let report = ward
+            .apply_after_coherence_approval(
+                &edits,
+                &Authorization::unsigned(),
+                &expected,
+                &resolved_as_target(&edits),
+                ApprovedApplyMode::Initial,
+            )
+            .unwrap();
+
+        assert!(report.is_applied());
+        assert_eq!(
+            fs::read(tmp.path().join("MEMORY.md")).unwrap(),
+            b"new memory"
+        );
+        assert_eq!(
+            fs::read(tmp.path().join("scratch/notes.txt")).unwrap(),
+            b"new notes"
+        );
+    }
+
+    #[test]
+    fn coherence_approval_atomically_creates_a_reviewed_surface() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        let edits = vec![FileEdit::new("MEMORY.md", b"new memory".to_vec())];
+        let expected = BTreeMap::from([("MEMORY.md".to_string(), None)]);
+
+        let report = ward
+            .apply_after_coherence_approval(
+                &edits,
+                &Authorization::unsigned(),
+                &expected,
+                &resolved_as_target(&edits),
+                ApprovedApplyMode::Initial,
+            )
+            .unwrap();
+
+        assert!(report.is_applied());
+        assert_eq!(
+            fs::read(tmp.path().join("MEMORY.md")).unwrap(),
+            b"new memory"
+        );
+        assert_eq!(staging_litter(tmp.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn coherence_approval_never_overwrites_a_concurrent_create() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        let edits = vec![FileEdit::new("MEMORY.md", b"new memory".to_vec())];
+        let expected = BTreeMap::from([("MEMORY.md".to_string(), None)]);
+        set_conditional_write_hook(
+            tmp.path().canonicalize().unwrap().join("MEMORY.md"),
+            b"concurrent memory".to_vec(),
+        );
+
+        let error = ward
+            .apply_after_coherence_approval(
+                &edits,
+                &Authorization::unsigned(),
+                &expected,
+                &resolved_as_target(&edits),
+                ApprovedApplyMode::Initial,
+            )
+            .expect_err("a concurrent create must win without being overwritten");
+
+        assert!(
+            format!("{error:#}").contains("appeared after review"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            fs::read(tmp.path().join("MEMORY.md")).unwrap(),
+            b"concurrent memory"
+        );
+        assert_eq!(staging_litter(tmp.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn coherence_initial_approval_rejects_an_existing_same_byte_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::write(tmp.path().join("MEMORY.md"), b"new memory").unwrap();
+        let edits = vec![FileEdit::new("MEMORY.md", b"new memory".to_vec())];
+        let expected = BTreeMap::from([("MEMORY.md".to_string(), Some(b"old memory".to_vec()))]);
+
+        let error = ward
+            .apply_after_coherence_approval(
+                &edits,
+                &Authorization::unsigned(),
+                &expected,
+                &resolved_as_target(&edits),
+                ApprovedApplyMode::Initial,
+            )
+            .expect_err("an initial apply must not infer recovery from matching after-bytes");
+
+        assert!(
+            format!("{error:#}").contains("changed after review"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            fs::read(tmp.path().join("MEMORY.md")).unwrap(),
+            b"new memory"
+        );
+    }
+
+    #[test]
+    fn coherence_initial_approval_rejects_an_absent_same_byte_create() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::write(tmp.path().join("MEMORY.md"), b"new memory").unwrap();
+        let edits = vec![FileEdit::new("MEMORY.md", b"new memory".to_vec())];
+        let expected = BTreeMap::from([("MEMORY.md".to_string(), None)]);
+
+        let error = ward
+            .apply_after_coherence_approval(
+                &edits,
+                &Authorization::unsigned(),
+                &expected,
+                &resolved_as_target(&edits),
+                ApprovedApplyMode::Initial,
+            )
+            .expect_err("an initial create must not infer recovery from matching after-bytes");
+
+        assert!(
+            format!("{error:#}").contains("appeared after review"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            fs::read(tmp.path().join("MEMORY.md")).unwrap(),
+            b"new memory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn coherence_initial_approval_rejects_a_gate2_retarget() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = sample_config();
+        config.surface.push(SurfaceEntry {
+            path: "reviewed/".to_string(),
+            tier: Tier::Reviewed,
+        });
+        let ward = Ward::new(tmp.path(), config).unwrap();
+        fs::create_dir_all(tmp.path().join("reviewed/a")).unwrap();
+        fs::create_dir_all(tmp.path().join("reviewed/b")).unwrap();
+        fs::write(tmp.path().join("reviewed/a/skill.md"), b"old").unwrap();
+        fs::write(tmp.path().join("reviewed/b/skill.md"), b"old").unwrap();
+        symlink("reviewed/a", tmp.path().join("lane")).unwrap();
+        let edits = vec![FileEdit::new("lane/skill.md", b"new".to_vec())];
+        let expected = BTreeMap::from([("lane/skill.md".to_string(), Some(b"old".to_vec()))]);
+        let initial = ward.evaluate(&Proposal {
+            targets: vec!["lane/skill.md".to_string()],
+            authorization: Authorization::unsigned(),
+        });
+        assert_eq!(initial.decisions[0].resolved, "reviewed/a/skill.md");
+        let expected_resolved = BTreeMap::from([(
+            "lane/skill.md".to_string(),
+            initial.decisions[0].resolved.clone(),
+        )]);
+        fs::remove_file(tmp.path().join("lane")).unwrap();
+        symlink("reviewed/b", tmp.path().join("lane")).unwrap();
+
+        ward.apply_after_coherence_approval(
+            &edits,
+            &Authorization::unsigned(),
+            &expected,
+            &expected_resolved,
+            ApprovedApplyMode::Initial,
+        )
+        .expect_err("the writer must stay bound to the first Gate-2 resolution");
+
+        assert_eq!(
+            fs::read(tmp.path().join("reviewed/a/skill.md")).unwrap(),
+            b"old"
+        );
+        assert_eq!(
+            fs::read(tmp.path().join("reviewed/b/skill.md")).unwrap(),
+            b"old"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn coherence_recovery_rejects_a_gate2_retarget() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = sample_config();
+        config.surface.push(SurfaceEntry {
+            path: "reviewed/".to_string(),
+            tier: Tier::Reviewed,
+        });
+        let ward = Ward::new(tmp.path(), config).unwrap();
+        fs::create_dir_all(tmp.path().join("reviewed/a")).unwrap();
+        fs::create_dir_all(tmp.path().join("reviewed/b")).unwrap();
+        fs::write(tmp.path().join("reviewed/a/skill.md"), b"new").unwrap();
+        fs::write(tmp.path().join("reviewed/b/skill.md"), b"new").unwrap();
+        symlink("reviewed/a", tmp.path().join("lane")).unwrap();
+        let edits = vec![FileEdit::new("lane/skill.md", b"new".to_vec())];
+        let expected = BTreeMap::from([("lane/skill.md".to_string(), Some(b"old".to_vec()))]);
+        let initial = ward.evaluate(&Proposal {
+            targets: vec!["lane/skill.md".to_string()],
+            authorization: Authorization::unsigned(),
+        });
+        assert_eq!(initial.decisions[0].resolved, "reviewed/a/skill.md");
+        let expected_resolved = BTreeMap::from([(
+            "lane/skill.md".to_string(),
+            initial.decisions[0].resolved.clone(),
+        )]);
+        fs::remove_file(tmp.path().join("lane")).unwrap();
+        symlink("reviewed/b", tmp.path().join("lane")).unwrap();
+
+        ward.apply_after_coherence_approval(
+            &edits,
+            &Authorization::unsigned(),
+            &expected,
+            &expected_resolved,
+            ApprovedApplyMode::Recovery,
+        )
+        .expect_err("recovery must stay bound to its persisted Gate-2 resolution");
+
+        assert_eq!(
+            fs::read(tmp.path().join("reviewed/a/skill.md")).unwrap(),
+            b"new"
+        );
+        assert_eq!(
+            fs::read(tmp.path().join("reviewed/b/skill.md")).unwrap(),
+            b"new"
+        );
+    }
+
+    #[test]
+    fn coherence_approval_preserves_a_concurrent_mutation_while_rolling_back_a_create() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::create_dir(tmp.path().join("scratch")).unwrap();
+        fs::write(tmp.path().join("scratch/notes.txt"), b"old notes").unwrap();
+        let edits = vec![
+            FileEdit::new("MEMORY.md", b"new memory".to_vec()),
+            FileEdit::new("scratch/notes.txt", b"new notes".to_vec()),
+        ];
+        let expected = BTreeMap::from([
+            ("MEMORY.md".to_string(), None),
+            ("scratch/notes.txt".to_string(), Some(b"old notes".to_vec())),
+        ]);
+        let canonical = tmp.path().canonicalize().unwrap();
+        set_conditional_write_actions(
+            canonical.join("scratch/notes.txt"),
+            vec![
+                (canonical.join("MEMORY.md"), b"concurrent memory".to_vec()),
+                (
+                    canonical.join("scratch/notes.txt"),
+                    b"concurrent notes".to_vec(),
+                ),
+            ],
+        );
+
+        let error = ward
+            .apply_after_coherence_approval(
+                &edits,
+                &Authorization::unsigned(),
+                &expected,
+                &resolved_as_target(&edits),
+                ApprovedApplyMode::Initial,
+            )
+            .expect_err("the second target race must abort the approved unit");
+
+        assert!(
+            format!("{error:#}").contains("conditional rollback"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            fs::read(tmp.path().join("MEMORY.md")).unwrap(),
+            b"concurrent memory",
+            "rollback must not delete bytes written by a concurrent actor"
+        );
+        assert_eq!(
+            fs::read(tmp.path().join("scratch/notes.txt")).unwrap(),
+            b"concurrent notes"
+        );
+    }
+
+    #[test]
+    fn coherence_approval_removes_its_owned_create_when_a_later_target_races() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::create_dir(tmp.path().join("scratch")).unwrap();
+        fs::write(tmp.path().join("scratch/notes.txt"), b"old notes").unwrap();
+        let edits = vec![
+            FileEdit::new("MEMORY.md", b"new memory".to_vec()),
+            FileEdit::new("scratch/notes.txt", b"new notes".to_vec()),
+        ];
+        let expected = BTreeMap::from([
+            ("MEMORY.md".to_string(), None),
+            ("scratch/notes.txt".to_string(), Some(b"old notes".to_vec())),
+        ]);
+        set_conditional_write_hook(
+            tmp.path().canonicalize().unwrap().join("scratch/notes.txt"),
+            b"concurrent notes".to_vec(),
+        );
+
+        let error = ward
+            .apply_after_coherence_approval(
+                &edits,
+                &Authorization::unsigned(),
+                &expected,
+                &resolved_as_target(&edits),
+                ApprovedApplyMode::Initial,
+            )
+            .expect_err("the later target race must abort the approved unit");
+
+        assert!(
+            format!("{error:#}").contains("approved proposal was rolled back"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            !tmp.path().join("MEMORY.md").exists(),
+            "rollback must remove the create owned by this apply attempt"
+        );
+        assert_eq!(
+            fs::read(tmp.path().join("scratch/notes.txt")).unwrap(),
+            b"concurrent notes"
+        );
+        assert_eq!(staging_litter(tmp.path()), Vec::<String>::new());
+        assert_eq!(
+            staging_litter(&tmp.path().join("scratch")),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn coherence_approval_refuses_authorized_protected_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::write(tmp.path().join("SOUL.md"), b"old soul").unwrap();
+        let edits = vec![FileEdit::new("SOUL.md", b"new soul".to_vec())];
+        let expected = BTreeMap::from([("SOUL.md".to_string(), Some(b"old soul".to_vec()))]);
+
+        let report = ward
+            .apply_after_coherence_approval(
+                &edits,
+                &Authorization::signed_by("SHA256:principal-key"),
+                &expected,
+                &resolved_as_target(&edits),
+                ApprovedApplyMode::Initial,
+            )
+            .unwrap();
+
+        assert!(report.is_refused());
+        assert_eq!(
+            report.changes[0].decision.verdict,
+            Verdict::AuthorizedProtectedChange
+        );
+        assert_eq!(fs::read(tmp.path().join("SOUL.md")).unwrap(), b"old soul");
+    }
+
+    #[test]
+    fn coherence_approval_refuses_a_unit_without_a_reviewed_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::create_dir(tmp.path().join("scratch")).unwrap();
+        fs::write(tmp.path().join("scratch/notes.txt"), b"old notes").unwrap();
+        let edits = vec![FileEdit::new("scratch/notes.txt", b"new notes".to_vec())];
+        let expected =
+            BTreeMap::from([("scratch/notes.txt".to_string(), Some(b"old notes".to_vec()))]);
+
+        let report = ward
+            .apply_after_coherence_approval(
+                &edits,
+                &Authorization::unsigned(),
+                &expected,
+                &resolved_as_target(&edits),
+                ApprovedApplyMode::Initial,
+            )
+            .unwrap();
+
+        assert!(report.is_refused());
+        assert_eq!(
+            fs::read(tmp.path().join("scratch/notes.txt")).unwrap(),
+            b"old notes"
+        );
     }
 
     #[test]
@@ -2352,6 +3175,8 @@ formatter = "lenient"
                 &edits,
                 &Authorization::signed_by("SHA256:principal-key"),
                 &expected,
+                &resolved_as_target(&edits),
+                ApprovedApplyMode::Initial,
             )
             .expect_err("concurrent target replacement must fail closed");
 
@@ -2387,6 +3212,8 @@ formatter = "lenient"
                 &edits,
                 &Authorization::signed_by("SHA256:principal-key"),
                 &expected,
+                &resolved_as_target(&edits),
+                ApprovedApplyMode::Recovery,
             )
             .expect_err("diverged recovery target must fail the whole batch");
 
@@ -2427,6 +3254,8 @@ formatter = "lenient"
                 &edits,
                 &Authorization::signed_by("SHA256:principal-key"),
                 &expected,
+                &resolved_as_target(&edits),
+                ApprovedApplyMode::Recovery,
             )
             .expect_err("already-applied targets must be revalidated");
 
@@ -2475,6 +3304,8 @@ formatter = "lenient"
                 &edits,
                 &Authorization::signed_by("SHA256:principal-key"),
                 &expected,
+                &resolved_as_target(&edits),
+                ApprovedApplyMode::Initial,
             )
             .expect_err("rollback must not overwrite a concurrent target");
 
@@ -2489,6 +3320,34 @@ formatter = "lenient"
         assert_eq!(
             fs::read(tmp.path().join("IDENTITY.md")).unwrap(),
             b"concurrent identity"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn file_identity_matches_hard_links_and_distinguishes_siblings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = tmp.path().join("original");
+        let alias = tmp.path().join("alias");
+        let sibling = tmp.path().join("sibling");
+        fs::write(&original, b"same bytes").unwrap();
+        fs::hard_link(&original, &alias).unwrap();
+        fs::write(&sibling, b"same bytes").unwrap();
+
+        assert!(same_file_identity(&original, &alias).unwrap());
+        assert!(!same_file_identity(&original, &sibling).unwrap());
+    }
+
+    #[test]
+    fn windows_file_identity_rejects_unusable_sentinels() {
+        assert!(validate_windows_file_identity(7, [0; 16]).is_err());
+        assert!(validate_windows_file_identity(7, [u8::MAX; 16]).is_err());
+
+        let mut usable = [0; 16];
+        usable[15] = 1;
+        assert_eq!(
+            validate_windows_file_identity(7, usable).unwrap(),
+            (7, usable)
         );
     }
 

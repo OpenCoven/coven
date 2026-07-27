@@ -5,18 +5,18 @@ description: "Design for resolving held Ward proposals: stage Tier-1 holds besid
 
 # Ward Gate 3 — Coherence Review Design
 
-Status: Proposed — needs maintainer ratification of the open questions
-Date: 2026-07-18
+Status: Implemented through G3.4; CLI decision verbs remain in PR 5
+Date: 2026-07-26
 Scope: `crates/coven-cli` (`ward.rs`, `threads_gate.rs`, `api.rs`, `observe.rs`) plus
 reference docs. Composes with — never duplicates — the coven-threads §5 staging
 machinery that already exists. Tracking: #415 (sub-issue of #335).
 
 ## Summary
 
-Gate 3 is the last unimplemented gate from RFC-0001: identity-coherence review
-for held proposals. Today a hold is a dead end for Tier-1 targets and a
-principal-judgment loop (without probes) for Tier-0 targets. This design
-closes the gap by (a) giving Tier-1 holds the same staged-proposal lifecycle
+Gate 3 is RFC-0001's identity-coherence review for held proposals. Before this
+work, a hold was a dead end for Tier-1 targets and a principal-judgment loop
+(without probes) for Tier-0 targets. The implementation closes the gap by
+(a) giving Tier-1 holds the same staged-proposal lifecycle
 Tier-0 already has, (b) attaching **deterministic** coherence probes to every
 staged proposal so the principal decides with evidence, and (c) keeping the
 principal's explicit approval as the only transition from *held* to *applied*.
@@ -46,7 +46,7 @@ amendment (RFC-0001 change), not an implementation choice at the Gate 3 layer.
   encode what *coherent* means for a given familiar — that lives in the
   familiar's declared surface and the principal's contract with it.
 
-## Current state (verified on main @ b98504c)
+## Starting state (verified on main @ b98504c)
 
 What already exists — Gate 3 must compose with all of it:
 
@@ -134,10 +134,9 @@ with evidence:
   review kind, staged-at, targets, probe summary. Missing dir ⇒ `[]`.
 - `GET /api/v1/threads/proposals/:id` — one proposal with full probe detail.
 - CLI: `coven ward pending [--json]` and `coven ward pending <id> [--json]`
-  via the observe.rs pattern (`--json` = exact daemon body), plus
-  `coven ward approve <id>` / `coven ward reject <id> [--note ...]` wrapping
-  the existing POST routes. Reference page `docs/reference/cli-ward.md`
-  documents the lifecycle; `api.md` gains the route rows.
+  via the observe.rs pattern (`--json` = exact daemon body). Reference page
+  `docs/reference/cli-ward.md` documents the lifecycle; `api.md` carries the
+  route rows. The `approve` / `reject` CLI wrappers are the final PR 5 slice.
 
 ### G3.4 — Resolution for coherence proposals
 
@@ -146,14 +145,18 @@ with evidence:
 - `authority` (today's flow): unchanged.
 - `coherence`: re-run Gate 1–2 adjudication fail-closed (as today), **skip**
   the threads validator (Tier-1 surfaces are not woven), re-run the probe
-  set against current disk state (staleness check — a surface that drifted
-  since staging demotes the probe report and is surfaced in the response),
-  then apply via a new `ward.apply_after_coherence_approval(&edits, &auth)`
-  that clears `RequiresCoherenceReview` only — `AuthorizedProtectedChange`
+  set against current disk state, and bind the conditional write's before-image
+  to that exact re-probed baseline. Stale, missing, malformed, or inconsistent
+  evidence blocks approval with `409` and leaves the proposal pending;
+  rejection remains available and reports degraded evidence. A valid probe
+  run's `failed` or `unscored` score remains advisory and does not block an
+  explicit principal approval. Apply uses
+  `ward.apply_after_coherence_approval(&edits, &auth, &expected_before)`,
+  which clears `RequiresCoherenceReview` only — `AuthorizedProtectedChange`
   and blocked verdicts still refuse, mirroring
-  `apply_after_threads_approval`'s narrow bypass. Audit
-  `proposal_approved`/`proposal_rejected` with the probe summary in the
-  decision detail.
+  `apply_after_threads_approval`'s narrow bypass. Approval audit detail carries
+  the probe summary. Rejection returns the summary while retaining the
+  upstream-compatible terminal rejection detail shape.
 
 ### Compatibility and invariants
 
@@ -164,12 +167,20 @@ with evidence:
   stage through the *authority* lane as a unit, exactly as today; the
   coherence lane only takes proposals whose sole hold reason is Tier-1
   review.
-- Staging-write hardening invariants (randomized `create_new` staging,
-  `prepare_staging_parent` no-follow walk) are untouched — approval re-uses
-  `write_atomic` unchanged.
+- Staging-write hardening invariants (randomized `create_new` staging and
+  `prepare_staging_parent` no-follow walk) remain intact. Approval uses the
+  conditional atomic writer, including no-replace creation and rollback that
+  preserves concurrent bytes. A first apply must still observe the exact
+  reviewed before-image even when a concurrent writer produced identical
+  after-bytes; only a durable crash-recovery intent may accept already-applied
+  bytes. A clean pre-write failure or proven rollback removes that recovery
+  state, so a retry cannot promote concurrent bytes into an idempotent apply.
+  Recovery also persists the Gate-2-resolved surface, and the Ward's final
+  adjudication must match that binding before it writes.
 - `ward_audit` stays append-only with existing event tags; probe evidence
-  rides in existing text columns. (Gate-4 apply-record persistence is
-  separate work: #414, blocked on coven-threads#5.)
+  rides in existing text columns. Logged edits carried in an approved proposal
+  append their Gate-4 `apply_audit` rows in the same database transaction as
+  baseline advancement and `proposal_approved`.
 
 ## Implementation decomposition (one PR each)
 

@@ -248,6 +248,12 @@ pub(crate) enum ProbeEvidenceValidation {
     Inconsistent,
 }
 
+/// Current deterministic evidence plus its relationship to the staged sidecar.
+pub(crate) struct RevalidatedProbeEvidence {
+    pub validation: ProbeEvidenceValidation,
+    pub current: Option<Vec<SurfaceProbeReport>>,
+}
+
 /// Recompute a persisted sidecar from the staged contents and current baseline.
 /// Callers must summarize only `Valid` evidence; stale or inconsistent evidence
 /// is explicitly unscored.
@@ -257,10 +263,15 @@ pub(crate) fn validate_staged_reports(
     proposal: &coven_threads_core::PendingProposal,
     reports: &[SurfaceProbeReport],
 ) -> ProbeEvidenceValidation {
-    if reports.len() != proposal.edits.len() {
-        return ProbeEvidenceValidation::Inconsistent;
-    }
+    revalidate_staged_reports(workspace, config, proposal, reports).validation
+}
 
+pub(crate) fn revalidate_staged_reports(
+    workspace: &Path,
+    config: &WardConfig,
+    proposal: &coven_threads_core::PendingProposal,
+    reports: &[SurfaceProbeReport],
+) -> RevalidatedProbeEvidence {
     let Some(edits) = proposal
         .edits
         .iter()
@@ -272,7 +283,10 @@ pub(crate) fn validate_staged_reports(
         })
         .collect::<Option<Vec<_>>>()
     else {
-        return ProbeEvidenceValidation::Inconsistent;
+        return RevalidatedProbeEvidence {
+            validation: ProbeEvidenceValidation::Inconsistent,
+            current: None,
+        };
     };
     let authorization = proposal
         .writer
@@ -280,25 +294,33 @@ pub(crate) fn validate_staged_reports(
         .strip_prefix("principal:")
         .map(|fingerprint| Authorization::signed_by(fingerprint.to_string()))
         .unwrap_or_else(Authorization::unsigned);
-    let Ok(expected) = run_at_staging(workspace, config, &edits, &authorization) else {
-        return ProbeEvidenceValidation::Inconsistent;
+    let Ok(current) = run_at_staging(workspace, config, &edits, &authorization) else {
+        return RevalidatedProbeEvidence {
+            validation: ProbeEvidenceValidation::Inconsistent,
+            current: None,
+        };
     };
-    if reports == expected {
-        return ProbeEvidenceValidation::Valid;
-    }
 
-    let same_binding = reports.len() == expected.len()
-        && reports
-            .iter()
-            .zip(&expected)
-            .all(|(stored, current)| same_evidence_binding(stored, current));
-    let baseline_changed = reports.iter().zip(&expected).any(|(stored, current)| {
-        stored.baseline_sha256 != current.baseline_sha256 || stored.error != current.error
-    });
-    if same_binding && baseline_changed {
-        ProbeEvidenceValidation::Stale
+    let validation = if reports == current {
+        ProbeEvidenceValidation::Valid
     } else {
-        ProbeEvidenceValidation::Inconsistent
+        let same_binding = reports.len() == current.len()
+            && reports
+                .iter()
+                .zip(&current)
+                .all(|(stored, current)| same_evidence_binding(stored, current));
+        let baseline_changed = reports.iter().zip(&current).any(|(stored, current)| {
+            stored.baseline_sha256 != current.baseline_sha256 || stored.error != current.error
+        });
+        if same_binding && baseline_changed {
+            ProbeEvidenceValidation::Stale
+        } else {
+            ProbeEvidenceValidation::Inconsistent
+        }
+    };
+    RevalidatedProbeEvidence {
+        validation,
+        current: Some(current),
     }
 }
 

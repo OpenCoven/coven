@@ -62,7 +62,7 @@ These power `coven status`, `coven familiars`, `coven skills`, `coven memory`, `
 | GET | `/api/v1/overview` | Dashboard aggregate: open sessions, roster/skill/research counts. | overview object |
 | GET | `/api/v1/familiars` | Familiar roster from `familiars.toml`. | `FamiliarDto[]` |
 | GET | `/api/v1/familiars/:id/ward` | One familiar's declared Ward surface (tiers, protected paths, principal binding) — the read twin of `/familiars/:id/edits`. | `{ ok, familiarId, workspace, ward }` · `400 invalid_request` / `404 familiar_not_found` / `404 ward_not_configured` / `500 ward_config_invalid` |
-| GET | `/api/v1/familiars/:id/audit` | The append-only `ward_audit` ledger for one familiar, newest first — where `/edits` persists its Gate 4 apply records. `?limit=N` (default 100, max 1000), `?event=TYPE` (e.g. `apply_audit`). | `{ ok, familiarId, records }` · `400 invalid_request` / `404 familiar_not_found` |
+| GET | `/api/v1/familiars/:id/audit` | The append-only `ward_audit` ledger for one familiar, newest first — where direct and proposal-approved writes persist Gate 4 apply records. `?limit=N` (default 100, max 1000), `?event=TYPE` (e.g. `apply_audit`). | `{ ok, familiarId, records }` · `400 invalid_request` / `404 familiar_not_found` |
 | GET | `/api/v1/skills` | Installed skills from `~/.coven/skills/`. | `SkillDto[]` |
 | GET | `/api/v1/memory` | Familiar memory files from `~/.coven/memory/`. | memory list |
 | GET | `/api/v1/memory/overview` | Memory counts plus explicit detail, verification, attestation, supersession, and mutation capability state. | overview object |
@@ -111,7 +111,7 @@ Tier-0 authority degradations and Tier-1 coherence holds, distinguished by
 | GET | `/api/v1/threads/weaves` | Per-familiar weave/authority state (degraded configs reported inline). | weave entries | — |
 | GET | `/api/v1/threads/proposals` | Pending proposals with compact `probeSummary` evidence (unparseable files reported as `degraded` entries, newest first). | `{ proposals }` | — |
 | GET | `/api/v1/threads/proposals/:id` | One pending proposal with `probeSummary` and full per-surface `probes`. | `{ proposal }` | `400 invalid_request` / `404 proposal_not_found` |
-| POST | `/api/v1/threads/proposals/:id/approve` | Re-validate and apply a staged authority proposal (coherence approval lands with Gate 3 PR 4). | decision report | `400`, `404`, `409` |
+| POST | `/api/v1/threads/proposals/:id/approve` | Re-validate and atomically apply a staged authority or coherence proposal. | decision report | `400`, `404`, `409` |
 | POST | `/api/v1/threads/proposals/:id/reject` | Reject and remove a staged proposal (audited). | decision report | `400`, `404`, `409` |
 
 Probe evidence is additive sidecar data, so the underlying
@@ -122,6 +122,24 @@ Stale, malformed, or internally inconsistent sidecars are likewise demoted to
 `unscored` with `probeEvidenceDegraded`, after deterministic recomputation
 against staged targets and contents, the current baseline and Gate-2
 resolution, and the declared probe set.
+
+For `reviewKind: "coherence"`, approval re-runs Gates 1–2 and the deterministic
+probes, skips the threads validator (Tier-1 surfaces are deliberately not
+woven), and conditionally writes only if the captured before-image still
+matches the re-probed baseline. Missing, malformed, stale, or inconsistent
+probe evidence returns `409`, leaves the proposal pending, and writes nothing.
+A first approval attempt never treats matching proposed bytes as proof that
+Coven already applied them; that idempotent shortcut is restricted to a
+persisted recovery intent, which is also bound to the Gate-2-resolved surface.
+Known no-write failures and proven rollbacks clear that recovery state before
+returning; failures that may have committed preserve it for safe replay. The
+Ward's final path adjudication must still equal the persisted resolution.
+A valid `failed` or `unscored` probe result is advisory: an explicit principal
+approval may still apply it. Rejection remains available when evidence is stale
+and returns `probeSummary` plus `probeEvidenceDegraded`; it never applies the
+staged edit. On approval, any logged edits in the proposal append their
+`apply_audit` rows atomically with baseline advancement and the terminal
+`proposal_approved` row.
 
 ## Skills: eval-loop
 

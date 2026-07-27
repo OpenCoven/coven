@@ -47,8 +47,8 @@ mod tui;
 mod verification;
 mod ward_probes;
 // Wired into the daemon router via `POST /familiars/{id}/edits` (api.rs);
-// Gate 3 staging, read surfaces, and deterministic probes are present;
-// coherence approval remains a follow-up — see ward.rs.
+// Gate 3 staging, deterministic probes, read surfaces, and explicit
+// coherence approval all compose through the Ward primitives in ward.rs.
 #[allow(dead_code)]
 mod ward;
 mod ward_migrate;

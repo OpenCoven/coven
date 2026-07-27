@@ -633,24 +633,51 @@ pub fn persist_apply_audit_records(
     config: &ward::WardConfig,
     report: &ward::ApplyReport,
 ) -> Result<()> {
-    let mut records = report.audit_records().peekable();
-    if records.peek().is_none() {
+    if report.audit_records().next().is_none() {
         return Ok(());
     }
     let state = build_weave_state(conn, familiar_id, workspace, config, &[], false)?;
-    let now = time::OffsetDateTime::now_utc();
-    let format = time::format_description::well_known::Rfc3339;
-    let now_text = now.format(&format)?;
     let transaction = conn
         .transaction()
         .context("starting apply-audit batch transaction")?;
+    append_apply_audit_records(
+        &transaction,
+        None,
+        familiar_id,
+        state.weave.weave_hash(),
+        report,
+        threads::Channel::Mutation,
+    )?;
+    transaction
+        .commit()
+        .context("committing apply-audit batch transaction")
+}
+
+/// Append the Ward's logged apply records to an existing transaction scope.
+///
+/// Proposal finalization uses this form so `apply_audit` rows and the terminal
+/// proposal event commit as one unit. Direct writes wrap it in their own
+/// transaction via [`persist_apply_audit_records`].
+pub(crate) fn append_apply_audit_records(
+    conn: &Connection,
+    proposal_id: Option<&str>,
+    familiar_id: &str,
+    ward_hash: &[u8],
+    report: &ward::ApplyReport,
+    channel: threads::Channel,
+) -> Result<()> {
+    let records = report.audit_records();
+    let familiar_uuid = familiar_weave_id(familiar_id);
+    let now = time::OffsetDateTime::now_utc();
+    let format = time::format_description::well_known::Rfc3339;
+    let now_text = now.format(&format)?;
     {
-        let mut statement = transaction.prepare(
+        let mut statement = conn.prepare(
             "INSERT INTO ward_audit (
                 event_type, proposal_id, familiar_id, ward_version, ward_hash,
                 tier, decision, approver, diff_hash, detail, files_touched,
                 channel, submitted_at, decided_at
-            ) VALUES (?1, NULL, ?2, NULL, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10, ?10)",
+            ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10, ?11, ?11)",
         )?;
         for audit in records {
             let prev = audit
@@ -662,14 +689,14 @@ pub fn persist_apply_audit_records(
             let next =
                 hex_to_bytes(&audit.next_sha256).context("decoding apply-audit next_sha256")?;
             let record = threads::WardAuditRecord::for_apply(
-                state.familiar_uuid,
-                state.weave.weave_hash(),
+                familiar_uuid,
+                ward_hash,
                 threads::SurfaceId::new(audit.resolved.clone()),
                 &format!("tier_{}", u8::from(audit.tier)),
                 prev.as_deref(),
                 Some(&next),
                 audit.bytes_written as u64,
-                Some(threads::Channel::Mutation),
+                Some(channel),
                 now,
                 now,
             );
@@ -683,10 +710,11 @@ pub fn persist_apply_audit_records(
             statement
                 .execute(params![
                     record.event_type.tag(),
+                    proposal_id,
                     // Human-readable familiar id in the store; the uuid rides in
                     // the JSON record shape for cross-system correlation.
                     familiar_id,
-                    record.ward_hash,
+                    ward_hash,
                     record.tier,
                     record.decision,
                     record.diff_hash,
@@ -698,9 +726,7 @@ pub fn persist_apply_audit_records(
                 .context("appending apply_audit row")?;
         }
     }
-    transaction
-        .commit()
-        .context("committing apply-audit batch transaction")
+    Ok(())
 }
 
 /// Decode a hex digest into raw bytes. The Ward emits SHA-256 hex strings;
@@ -727,8 +753,8 @@ fn hex_to_bytes(hex: &str) -> Result<Vec<u8>> {
 /// covers the surface — under a fresh `ThreadId`, plus the `reviewKind:
 /// "coherence"` sidecar marker the decide path branches on. One
 /// `proposal_submitted` row lands in the append-only `ward_audit` ledger.
-/// Resolution is PR 4 of the design; until then the existing decide-path
-/// guards keep approval fail-closed.
+/// The decide path re-probes this sidecar, keeps Tier-1 outside the weave, and
+/// clears only `RequiresCoherenceReview` after an explicit principal approval.
 pub fn stage_coherence_proposal(
     conn: &Connection,
     coven_home: &Path,

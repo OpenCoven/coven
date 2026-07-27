@@ -85,20 +85,30 @@ inconsistent sidecars are demoted to `unscored` and carry
 
 Decisions are daemon-API verbs today
 (`POST /api/v1/threads/proposals/<id>/approve|reject` — see
-[api](api.md)); approving a `coherence` proposal stays fail-closed until
-Gate 3's resolution stage lands. Nothing ever auto-approves — the principal
-is the sole approver (design Non-goals).
+[api](api.md)); the CLI wrappers land in the final Gate-3 slice. Coherence
+approval re-runs Gates 1–2 and the probes, skips the threads validator, and
+atomically applies only while the write's before-image matches the re-probed
+baseline. Missing, malformed, stale, or inconsistent evidence returns `409`
+and leaves the proposal pending. A valid `failed` or `unscored` result remains
+advisory and may be explicitly approved. Nothing ever auto-approves — the
+principal is the sole approver (design Non-goals). A first apply also requires
+the exact before-image even when concurrent bytes equal the proposal; only a
+durable recovery intent may accept already-applied bytes, and recovery
+revalidates the persisted Gate-2-resolved surface at the Ward's final
+adjudication. Clean failures clear recovery state; only a write that may have
+committed remains eligible for idempotent replay.
 
 ## Audit ledger
 
 `coven ward audit <familiar>` reads the append-only `ward_audit` ledger for
 one familiar, newest first — the Gate 4 record of what the Ward actually did
-(RFC-0001 §5.6). Every applied write through `POST /familiars/{id}/edits`
-persists one `apply_audit` row per logged change: `diffSha256` is the
-post-write content hash, and `detail` carries `prev_sha256` (null on file
-creation) and `bytes_written`, so consecutive writes to the same surface form
-a tamper-evident hash chain. Gate verdicts (`validation_verdict`), proposal
-lifecycle events, and compaction ledger entries land in the same table.
+(RFC-0001 §5.6). Direct writes and approved proposals persist one `apply_audit`
+row per logged change: `diffSha256` is the post-write content hash, and
+`detail` carries `prev_sha256` (null on file creation) and `bytes_written`, so
+consecutive writes to the same surface form a tamper-evident hash chain.
+Proposal apply rows commit atomically with `proposal_approved`. Gate verdicts
+(`validation_verdict`), proposal lifecycle events, and compaction ledger
+entries land in the same table.
 
 ```sh
 coven ward audit sage                      # full ledger, newest first
