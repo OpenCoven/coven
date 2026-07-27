@@ -13,6 +13,11 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+PNPM_SHA512_INTEGRITY_DIGEST = re.compile(
+    r"(?P<prefix>(?:^\s*|[{,]\s*)integrity:\s*)"
+    r"sha512-[A-Za-z0-9+/]{86}=="
+    r"(?=$|[\s},#])"
+)
 RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "coven_session_key",
@@ -44,9 +49,19 @@ RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 
+def scannable_line(line: str, path: str) -> str:
+    if pathlib.PurePath(path).name != "pnpm-lock.yaml":
+        return line
+    return PNPM_SHA512_INTEGRITY_DIGEST.sub(
+        r"\g<prefix><integrity-digest>",
+        line,
+    )
+
+
 def scan_text(text: str, path: str) -> list[tuple[str, int, str]]:
     hits: list[tuple[str, int, str]] = []
     for line_number, line in enumerate(text.splitlines(), 1):
+        line = scannable_line(line, path)
         session_key_hit = False
         for name, pattern in RULES:
             if name == "messenger_chat_id" and session_key_hit:

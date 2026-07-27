@@ -46,6 +46,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.x'
+      - run: python scripts/check-coven-privacy-test.py
       - run: python scripts/check-secrets.py
       - name: Coven privacy guard (pull request changes)
         if: github.event_name == 'pull_request'

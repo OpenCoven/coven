@@ -17,6 +17,17 @@ assert spec.loader is not None
 spec.loader.exec_module(check_coven_privacy)
 
 
+def phone_like_sha512_digest() -> str:
+    return (
+        "sha512-"
+        + ("a" * 40)
+        + "+"
+        + "576"
+        + ("b" * 42)
+        + "=="
+    )
+
+
 class CovenPrivacyPatternTests(unittest.TestCase):
     def test_scanner_sources_do_not_match_their_own_rules(self) -> None:
         sources = [
@@ -38,6 +49,16 @@ class CovenPrivacyPatternTests(unittest.TestCase):
         )
         self.assertNotIn(
             '${{ github.event.pull_request.base.sha }}...HEAD',
+            workflow,
+        )
+
+    def test_ci_runs_privacy_guard_unit_tests(self) -> None:
+        workflow = (
+            SCRIPT.parents[1] / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "python scripts/check-coven-privacy-test.py",
             workflow,
         )
 
@@ -220,6 +241,64 @@ class CovenPrivacyPatternTests(unittest.TestCase):
 
     def test_short_e164_phone_number_is_blocked(self) -> None:
         text = "+" + "683" + "1234"
+
+        hits = check_coven_privacy.scan_text(text, "docs/example.md")
+
+        self.assertEqual(hits, [("docs/example.md", 1, "phone_number")])
+
+    def test_pnpm_integrity_digest_phone_like_substring_is_allowed(self) -> None:
+        digest = phone_like_sha512_digest()
+        text = f"resolution: {{integrity: {digest}}}"
+
+        hits = check_coven_privacy.scan_text(
+            text, "packages/example/pnpm-lock.yaml"
+        )
+
+        self.assertEqual(hits, [])
+
+    def test_phone_number_outside_pnpm_integrity_digest_is_blocked(self) -> None:
+        digest = phone_like_sha512_digest()
+        phone = "+" + "1" + "312" + "555" + "0100"
+        text = f"resolution: {{integrity: {digest}}} phone: {phone}"
+
+        hits = check_coven_privacy.scan_text(
+            text, "packages/example/pnpm-lock.yaml"
+        )
+
+        self.assertEqual(
+            hits,
+            [("packages/example/pnpm-lock.yaml", 1, "phone_number")],
+        )
+
+    def test_invalid_pnpm_integrity_digest_remains_scannable(self) -> None:
+        phone = "+" + "1" + "312" + "555" + "0100"
+        text = f"integrity: sha512-{phone}"
+
+        hits = check_coven_privacy.scan_text(
+            text, "packages/example/pnpm-lock.yaml"
+        )
+
+        self.assertEqual(
+            hits,
+            [("packages/example/pnpm-lock.yaml", 1, "phone_number")],
+        )
+
+    def test_pnpm_non_field_integrity_text_remains_scannable(self) -> None:
+        digest = phone_like_sha512_digest()
+        text = f"note: integrity={digest}"
+
+        hits = check_coven_privacy.scan_text(
+            text, "packages/example/pnpm-lock.yaml"
+        )
+
+        self.assertEqual(
+            hits,
+            [("packages/example/pnpm-lock.yaml", 1, "phone_number")],
+        )
+
+    def test_integrity_digest_in_regular_file_remains_scannable(self) -> None:
+        digest = phone_like_sha512_digest()
+        text = f"integrity: {digest}"
 
         hits = check_coven_privacy.scan_text(text, "docs/example.md")
 
