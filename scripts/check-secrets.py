@@ -22,10 +22,6 @@ LOCKFILE_NODE_MODULE_KEY = re.compile(r'''^\s*["']?node_modules/(?:@?[A-Za-z0-9_
 LOCKFILE_PACKAGE_VERSION_ENTRY = re.compile(r"^\s*['\"]?@?[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?['\"]?\s*:\s*\d+\.\d+\.\d+(?:[-+][A-Za-z0-9_.-]+)?\s*$")
 LOCKFILE_INTEGRITY_LINE = re.compile(r'''["']?\bintegrity\b["']?\s*:\s*["']?(?:sha256|sha384|sha512)-[A-Za-z0-9+/=]+["']?''')
 LOCKFILE_RESOLVED_LINE = re.compile(r'''["']?\bresolved\b["']?\s*:\s*["']?https://registry\.npmjs\.org/[A-Za-z0-9_+/@.,~%:-]+\.tgz["']?''')
-OPENCOVEN_GITHUB_URL = re.compile(r"https://github\.com/OpenCoven/coven/(?:blob|tree)/[A-Za-z0-9_./@%+-]+")
-OPENCOVEN_LOCAL_WORKTREE = re.compile(
-    r"/Users/[A-Za-z0-9_.-]+/Documents/GitHub/OpenCoven/coven/\.worktrees/[A-Za-z0-9_.-]+"
-)
 SECRET_RULES: list[tuple[str, re.Pattern[str]]] = [
     ("private_key", re.compile(r"-----BEGIN (?:RSA |DSA |EC |OPENSSH |PGP )?PRIVATE KEY-----")),
     ("aws_access_key", re.compile(r"AKIA[0-9A-Z]{16}")),
@@ -40,16 +36,37 @@ SECRET_RULES: list[tuple[str, re.Pattern[str]]] = [
         ),
     ),
 ]
-ALLOW_LINE = re.compile(
-    r"(?i)(example|placeholder|secret_value|your_|<.*>|op://|secret scanning|secret guard|missing|expected|description|readme|docs/|abcdefghijklmnopqrstuvwxyz|custom-coven-home)"
+GENERIC_ASSIGNMENT_SAFE_VALUE = re.compile(
+    r'''(?ix)\b(?:api[_-]?key|secret|token|password|private[_-]?key)\b\s*[:=]\s*["']?'''
+    r"(?:"
+    r"<[-A-Za-z0-9_ .]{1,40}>"
+    r"|your_[A-Za-z0-9_.-]{1,64}"
+    r"|(?:placeholder|example|secret_value)(?:[-_][A-Za-z0-9_.-]{1,64})?"
+    r"|op://[A-Za-z0-9_.@/%+-]{1,200}"
+    r")"
+    r'''["']?'''
+)
+RESERVED_EXAMPLE_URL = re.compile(
+    r"(?i)https?://(?:[A-Za-z0-9-]+\.)*"
+    r"(?:example\.(?:com|net|org)|[A-Za-z0-9-]+\.(?:example|invalid|localhost|test))"
+    r"(?::[0-9]{1,5})?(?:/[^\s\"'<>]*)?"
 )
 ENV_SECRET_READ = re.compile(
-    r"(?i)\b(?:api[_-]?key|secret|token|password|private[_-]?key)\b\s*[:=]\s*"
-    r"(?:os\.environ(?:\.get)?\(|std::env::var\(|env::var\(|process\.env\.)"
+    r'''(?ix)\b(?:api[_-]?key|secret|token|password|private[_-]?key)\b\s*[:=]\s*
+    (?:
+        os\.environ\.get\(
+            \s*["'][A-Z0-9_]+["']
+            (?:\s*,\s*(?:""|''|None))?
+            \s*
+        \)
+        |std::env::var\(\s*["'][A-Z0-9_]+["']\s*\)
+        |env::var\(\s*["'][A-Z0-9_]+["']\s*\)
+        |process\.env\.[A-Z0-9_]+(?:\.trim\(\)|\?\.trim\(\)|!)?
+    )'''
 )
 ENV_SECRET_REFERENCE = re.compile(
     r"(?i)\b(?:api[_-]?key|secret|token|password|private[_-]?key)\b\s*[:=]\s*[\"']?"
-    r"\$\{?[A-Z0-9_]+(?:[:?][^\"']*)?\}?"
+    r"(?:\$[A-Z0-9_]+|\$\{[A-Z0-9_]+(?:(?::?\?)[^}\"']*)?\})"
 )
 # A Rust `let` binding whose right-hand side begins with a call expression
 # (identifier chain followed by `(`, e.g. `let token = text.split_whitespace()`).
@@ -59,6 +76,33 @@ ENV_SECRET_REFERENCE = re.compile(
 RUST_LET_CALL_BINDING = re.compile(
     r"^\s*let\s+(?:mut\s+)?[A-Za-z_][A-Za-z0-9_]*\s*(?::[^=]{1,64})?=\s*"
     r"[A-Za-z_][A-Za-z0-9_]*(?:(?:::|\.)[A-Za-z_][A-Za-z0-9_]*)*!?\("
+)
+QUOTED_TEXT = re.compile(r"'[^']*'|\"[^\"]*\"")
+SAFE_ASSIGNMENT_SUFFIX = re.compile(
+    r'''(?x)
+    (?:
+        ["';,.:?)}\]`]+
+        |</[A-Za-z][A-Za-z0-9-]*>
+        |\.(?:strip|trim|unwrap_or_default)\(\)
+    )*
+    '''
+)
+SAFE_FALLBACK_VALUE = re.compile(
+    r'''(?ix)(?:""|''|none|null|undefined)[;,.)}\]]*(?:\s*(?:\#|//).*)?'''
+)
+ASSIGNMENT_CONTINUATION_OPERATOR = re.compile(
+    r"(?is)\s*(\+|\|\||\?\?|or\b)\s*(.*)"
+)
+ORDERED_ALPHABET_FIXTURES = {
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ",
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUV",
+}
+KNOWN_PUBLIC_DOCUMENTATION_TOKENS = {
+    "support-dev.discord.com/hc/en-us/articles/"
+    "6207308062871-What-are-Privileged-Intents",
+}
+KNOWN_FAKE_PRIVATE_KEY_FIXTURE = re.compile(
+    r"-----BEGIN PRIVATE KEY-----\\n(?:fake){3,}\\n-----END PRIVATE KEY-----"
 )
 
 
@@ -83,16 +127,108 @@ def is_excluded_path(path: str) -> bool:
     return normalized in EXCLUDED_PATHS
 
 
-def is_known_safe_lockfile_line(path: str, line: str) -> bool:
+def match_is_within(
+    inner: re.Match[str], outer: re.Match[str], *, require_end: bool = True
+) -> bool:
+    if require_end:
+        return outer.start() <= inner.start() and inner.end() <= outer.end()
+    return outer.start() <= inner.start() < outer.end()
+
+
+def assignment_is_covered_by_safe_match(
+    assignment: re.Match[str], safe_match: re.Match[str]
+) -> bool:
+    if assignment.start() < safe_match.start() or assignment.start() >= safe_match.end():
+        return False
+    if assignment.end() <= safe_match.end():
+        return True
+    suffix = assignment.string[safe_match.end() : assignment.end()]
+    return bool(SAFE_ASSIGNMENT_SUFFIX.fullmatch(suffix))
+
+
+def safe_assignment_continuation_is_syntax(
+    line: str, safe_match: re.Match[str]
+) -> bool:
+    tail = line[safe_match.end() :]
+    immediate_suffix = re.match(r"\S*", tail)
+    assert immediate_suffix is not None
+    if not SAFE_ASSIGNMENT_SUFFIX.fullmatch(immediate_suffix.group(0)):
+        return False
+    remainder = tail[immediate_suffix.end() :]
+    continuation = ASSIGNMENT_CONTINUATION_OPERATOR.fullmatch(remainder)
+    if continuation is None:
+        return True
+    operator, fallback = continuation.groups()
+    return operator != "+" and bool(SAFE_FALLBACK_VALUE.fullmatch(fallback))
+
+
+def has_unsafe_safe_assignment_continuation(line: str) -> bool:
+    return any(
+        not safe_assignment_continuation_is_syntax(line, safe_match)
+        for pattern in (
+            GENERIC_ASSIGNMENT_SAFE_VALUE,
+            ENV_SECRET_READ,
+            ENV_SECRET_REFERENCE,
+        )
+        for safe_match in pattern.finditer(line)
+    )
+
+
+def is_known_safe_generic_assignment(
+    line: str, assignment: re.Match[str]
+) -> bool:
+    for pattern in (
+        GENERIC_ASSIGNMENT_SAFE_VALUE,
+        ENV_SECRET_READ,
+        ENV_SECRET_REFERENCE,
+    ):
+        if any(
+            assignment_is_covered_by_safe_match(assignment, match)
+            and safe_assignment_continuation_is_syntax(line, match)
+            for match in pattern.finditer(line)
+        ):
+            return True
+
+    if any(
+        assignment_is_covered_by_safe_match(assignment, match)
+        for match in RESERVED_EXAMPLE_URL.finditer(line)
+    ):
+        return True
+
+    rust_binding = RUST_LET_CALL_BINDING.match(line)
+    if rust_binding and match_is_within(
+        assignment, rust_binding, require_end=False
+    ):
+        return True
+
+    if "grep" in line and re.search(r"-[A-Za-z]*E\b", line):
+        if any(
+            match_is_within(assignment, quoted)
+            for quoted in QUOTED_TEXT.finditer(line)
+        ):
+            return True
+
+    return False
+
+
+def is_known_safe_lockfile_token(
+    path: str, line: str, token_match: re.Match[str]
+) -> bool:
     if not is_lockfile_path(path):
         return False
+
+    for pattern in (LOCKFILE_INTEGRITY_LINE, LOCKFILE_RESOLVED_LINE):
+        if any(
+            match_is_within(token_match, safe_match)
+            for safe_match in pattern.finditer(line)
+        ):
+            return True
+
     stripped = line.strip()
     return bool(
-        LOCKFILE_INTEGRITY_LINE.search(stripped)
-        or LOCKFILE_RESOLVED_LINE.search(stripped)
-        or LOCKFILE_NODE_MODULE_KEY.match(stripped)
-        or LOCKFILE_PACKAGE_KEY.match(stripped)
-        or LOCKFILE_PACKAGE_VERSION_ENTRY.match(stripped)
+        LOCKFILE_NODE_MODULE_KEY.fullmatch(stripped)
+        or LOCKFILE_PACKAGE_KEY.fullmatch(stripped)
+        or LOCKFILE_PACKAGE_VERSION_ENTRY.fullmatch(stripped)
     )
 
 
@@ -196,11 +332,20 @@ def is_apple_dtd_url_token(token: str) -> bool:
     return bool(_APPLE_DTD_URL_TOKEN.fullmatch(token))
 
 
-def is_known_fake_private_key_fixture(line: str) -> bool:
-    return (
-        "-----BEGIN PRIVATE KEY-----" in line
-        and "\\nfakefakefake" in line
-        and "\\n-----END PRIVATE KEY-----" in line
+def is_ordered_alphabet_fixture_token(token: str) -> bool:
+    return token in ORDERED_ALPHABET_FIXTURES
+
+
+def is_discord_support_article_token(token: str) -> bool:
+    return token in KNOWN_PUBLIC_DOCUMENTATION_TOKENS
+
+
+def is_known_fake_private_key_match(
+    line: str, private_key_match: re.Match[str]
+) -> bool:
+    return any(
+        match_is_within(private_key_match, fixture_match)
+        for fixture_match in KNOWN_FAKE_PRIVATE_KEY_FIXTURE.finditer(line)
     )
 
 
@@ -243,35 +388,37 @@ def is_programming_identifier_token(token: str) -> bool:
 def scan_text(text: str, path: str) -> list[tuple[str, int, str]]:
     hits: list[tuple[str, int, str]] = []
     for line_number, line in enumerate(text.splitlines(), 1):
-        allow = bool(ALLOW_LINE.search(line))
         for name, pattern in SECRET_RULES:
-            if name == "private_key" and is_known_fake_private_key_fixture(line):
-                continue
-            if name == "generic_assignment" and ENV_SECRET_READ.search(line):
-                continue
-            if name == "generic_assignment" and ENV_SECRET_REFERENCE.search(line):
-                continue
-            if name == "generic_assignment" and RUST_LET_CALL_BINDING.match(line):
-                continue
-            if name == "generic_assignment" and "grep" in line and re.search(r"-[A-Za-z]*E\b", line):
-                continue
-            if pattern.search(line) and not (allow and name != "private_key"):
+            matches = list(pattern.finditer(line))
+            if name == "private_key":
+                matches = [
+                    match
+                    for match in matches
+                    if not is_known_fake_private_key_match(line, match)
+                ]
+            if name == "generic_assignment":
+                unsafe_continuation = has_unsafe_safe_assignment_continuation(line)
+                if not matches:
+                    if unsafe_continuation:
+                        hits.append((path, line_number, name))
+                    continue
+                if not unsafe_continuation and all(
+                    is_known_safe_generic_assignment(line, match)
+                    for match in matches
+                ):
+                    continue
                 hits.append((path, line_number, name))
-        if allow:
-            continue
-        if (
-            OPENCOVEN_GITHUB_URL.search(line)
-            or OPENCOVEN_LOCAL_WORKTREE.search(line)
-        ):
-            continue
-        if is_known_safe_lockfile_line(path, line):
-            continue
+                continue
+            if not matches:
+                continue
+            hits.append((path, line_number, name))
         for match in re.finditer(r"\b[A-Za-z0-9_+/@.-]{32,}\b", line):
             token = match.group(0)
             if re.fullmatch(r"[0-9a-f]{32,64}", token):
                 continue
             if (
-                is_local_path_like_token(token)
+                is_known_safe_lockfile_token(path, line, match)
+                or is_local_path_like_token(token)
                 or is_public_repo_url_like_token(token)
                 or is_opencoven_repo_relative_path_token(token)
                 or is_github_advisory_url_like_token(token)
@@ -279,6 +426,8 @@ def scan_text(text: str, path: str) -> list[tuple[str, int, str]]:
                 or is_github_action_sha_ref_token(token)
                 or is_macos_library_path_token(token)
                 or is_apple_dtd_url_token(token)
+                or is_ordered_alphabet_fixture_token(token)
+                or is_discord_support_article_token(token)
                 or is_programming_identifier_token(token)
             ):
                 continue

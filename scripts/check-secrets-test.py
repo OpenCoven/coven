@@ -69,6 +69,13 @@ class SecretGuardLockfileTests(unittest.TestCase):
 
         self.assertEqual(hits, [])
 
+    def test_markdown_environment_secret_references_do_not_trigger(self) -> None:
+        text = "and the header `X-API-Key: $TINYFISH_API_KEY`."
+
+        hits = check_secrets.scan_text(text, "skills/tinyfish-agent-run/SKILL.md")
+
+        self.assertEqual(hits, [])
+
     def test_literal_secret_assignments_still_trigger_generic_assignment(self) -> None:
         key_name = "api" + "_key"
         secret_value = "S" * 24
@@ -89,6 +96,20 @@ class SecretGuardLockfileTests(unittest.TestCase):
 
         self.assertEqual(hits, [])
 
+    def test_fake_private_key_fixture_does_not_hide_another_header(self) -> None:
+        begin = "-----BEGIN " + "PRIVATE KEY-----"
+        end = "-----END " + "PRIVATE KEY-----"
+        other_begin = "-----BEGIN OPENSSH " + "PRIVATE KEY-----"
+        fixture = f'"{begin}\\nfakefakefakefakefakefakefake\\n{end}"'
+        text = f"{fixture} {other_begin}"
+
+        hits = check_secrets.scan_text(text, "crates/coven-cli/src/privacy.rs")
+
+        self.assertEqual(
+            hits,
+            [("crates/coven-cli/src/privacy.rs", 1, "private_key")],
+        )
+
     def test_real_private_key_header_still_triggers(self) -> None:
         text = "-----BEGIN PRIVATE KEY-----\nnot-a-placeholder\n-----END PRIVATE KEY-----"
 
@@ -108,7 +129,7 @@ class SecretGuardLockfileTests(unittest.TestCase):
         self.assertEqual(hits, [])
 
     def test_opencoven_local_worktree_paths_do_not_trigger_high_entropy(self) -> None:
-        text = "/Users/buns/Documents/GitHub/OpenCoven/coven/.worktrees/feat-tui-chat-module"
+        text = "/tmp/OpenCoven/coven/.worktrees/feat-tui-chat-module"
 
         hits = check_secrets.scan_text(text, "docs/superpowers/plans/example.md")
 
@@ -119,8 +140,8 @@ class SecretGuardLockfileTests(unittest.TestCase):
 
     def test_local_worktree_paths_do_not_trigger_high_entropy(self) -> None:
         text = (
-            "cd /Users/buns/Documents/GitHub/OpenCoven/coven/.worktrees/feat-tui-chat-module\n"
-            "Expected: /Users/buns/Documents/GitHub/OpenCoven/coven/.worktrees/feat-tui-chat-module"
+            "cd /tmp/OpenCoven/coven/.worktrees/feat-tui-chat-module\n"
+            "Expected: /tmp/OpenCoven/coven/.worktrees/feat-tui-chat-module"
         )
 
         hits = check_secrets.scan_text(text, "docs/superpowers/plans/example.md")
@@ -319,7 +340,7 @@ class SecretGuardLockfileTests(unittest.TestCase):
             [
                 "`~/Library/LaunchAgents/dev.opencoven.hub.plist`:",
                 'launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/dev.opencoven.hub.plist',
-                "sudo cp hub.plist /Users/coven/Library/LaunchAgents/dev.opencoven.hub.plist",
+                "sudo cp hub.plist Library/LaunchAgents/dev.opencoven.hub.plist",
             ]
         )
 
@@ -392,6 +413,223 @@ class SecretGuardLockfileTests(unittest.TestCase):
                 "actions/checkout@m9R3tQv7WzK2pL5nX8cF1gJ4sD6hY0aBEuIqOwPz9RkT"
             )
         )
+
+
+class SecretGuardExceptionScopeTests(unittest.TestCase):
+    def test_angle_brackets_do_not_suppress_structural_secret_rules(self) -> None:
+        cases = {
+            "aws_access_key": "AKIA" + "A1" * 8,
+            "github_token": "ghp_" + "A1" * 12,
+            "openai_key": "sk-" + "A1" * 16,
+            "anthropic_key": "sk-ant-" + "A1" * 10,
+            "slack_token": "xoxb-" + "A1-" * 7,
+        }
+
+        for expected_rule, value in cases.items():
+            with self.subTest(rule=expected_rule):
+                hits = check_secrets.scan_text(
+                    f"<span>{value}</span>", "docs/example.html"
+                )
+
+                self.assertEqual(
+                    hits, [("docs/example.html", 1, expected_rule)]
+                )
+
+    def test_safe_line_context_does_not_suppress_high_entropy_tokens(self) -> None:
+        token = (
+            "m9R3tQv7WzK2pL5nX8cF1gJ4sD6hY0aB/"
+            "EuIqOwPz9RkTlVxCyNmS3HdG7fA"
+        )
+        contexts = [
+            "<span>rendered value</span>",
+            "example value",
+            "api_key=<secret-value>",
+            "https://github.com/OpenCoven/coven/blob/main/DESIGN.md",
+            "/tmp/OpenCoven/coven/.worktrees/demo",
+        ]
+
+        for context in contexts:
+            with self.subTest(context=context):
+                hits = check_secrets.scan_text(
+                    f"{context} {token}", "docs/example.md"
+                )
+
+                self.assertEqual(
+                    hits, [("docs/example.md", 1, "high_entropy")]
+                )
+
+    def test_angle_placeholder_is_scoped_to_the_assignment_value(self) -> None:
+        placeholder_hits = check_secrets.scan_text(
+            "api_key=<secret-value>", "docs/example.env"
+        )
+        literal_hits = check_secrets.scan_text(
+            "api_key=hunter2hunter2hunter2 <span>example</span>",
+            "docs/example.env",
+        )
+
+        self.assertEqual(placeholder_hits, [])
+        self.assertEqual(
+            literal_hits,
+            [("docs/example.env", 1, "generic_assignment")],
+        )
+
+    def test_lockfile_exception_is_scoped_to_the_integrity_token(self) -> None:
+        digest = (
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        )
+        token = (
+            "m9R3tQv7WzK2pL5nX8cF1gJ4sD6hY0aB/"
+            "EuIqOwPz9RkTlVxCyNmS3HdG7fA"
+        )
+        text = f"resolution: {{integrity: sha512-{digest}}} observed: {token}"
+
+        hits = check_secrets.scan_text(
+            text, "packages/openclaw-coven/pnpm-lock.yaml"
+        )
+
+        self.assertEqual(
+            hits,
+            [
+                (
+                    "packages/openclaw-coven/pnpm-lock.yaml",
+                    1,
+                    "high_entropy",
+                )
+            ],
+        )
+
+    def test_known_public_discord_article_url_is_not_high_entropy(self) -> None:
+        text = (
+            "https://support-dev.discord.com/hc/en-us/articles/"
+            "6207308062871-What-are-Privileged-Intents"
+        )
+
+        hits = check_secrets.scan_text(text, "docs/channels/discord-setup.md")
+
+        self.assertEqual(hits, [])
+
+    def test_other_discord_article_slugs_still_trigger_high_entropy(self) -> None:
+        token = (
+            "m9R3tQv7WzK2pL5nX8cF1gJ4sD6hY0aB"
+            "EuIqOwPz9RkTlVxCyNmS3HdG7fA"
+        )
+        text = (
+            "https://support-dev.discord.com/hc/en-us/articles/1-"
+            f"{token}"
+        )
+
+        hits = check_secrets.scan_text(text, "docs/channels/discord-setup.md")
+
+        self.assertEqual(
+            hits,
+            [("docs/channels/discord-setup.md", 1, "high_entropy")],
+        )
+
+    def test_ordered_alphabet_fixtures_are_not_high_entropy(self) -> None:
+        fixtures = [
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUV",
+        ]
+
+        for fixture in fixtures:
+            with self.subTest(fixture_length=len(fixture)):
+                hits = check_secrets.scan_text(fixture, "src/lib.rs")
+
+                self.assertEqual(hits, [])
+
+    def test_reserved_example_url_assignment_is_not_a_secret(self) -> None:
+        text = (
+            'let url = "https://private-gateway.example.test/'
+            'session?token=fakegatewaytoken123";'
+        )
+
+        hits = check_secrets.scan_text(text, "crates/coven-cli/src/privacy.rs")
+
+        self.assertEqual(hits, [])
+
+    def test_safe_generic_values_allow_only_syntax_suffixes(self) -> None:
+        cases = [
+            "api_key=<secret-value>;",
+            "<code>api_key=<secret-value></code>",
+            "const token = process.env.REALLY_LONG_SECRET_NAME;",
+            "const token = process.env.REALLY_LONG_SECRET_NAME.trim();",
+            "const token = process.env.REALLY_LONG_SECRET_NAME?.trim();",
+            "const token = process.env.REALLY_LONG_SECRET_NAME!;",
+            'const token = process.env.REALLY_LONG_SECRET_NAME ?? "";',
+            'const token = process.env.REALLY_LONG_SECRET_NAME || "";',
+            'api_key=os.environ.get("API_KEY", "")',
+            'api_key=os.environ.get("API_KEY", None)',
+            'api_key=os.environ.get("API_KEY", "").strip()',
+            'api_key=os.environ.get("API_KEY") or None',
+            'let token = std::env::var("TOKEN").unwrap_or_default();',
+            "api_key=your_api_key_here",
+            "api_key=placeholder_value",
+            "api_key=op://Development/Service/api_key",
+        ]
+
+        for text in cases:
+            with self.subTest(text=text):
+                hits = check_secrets.scan_text(text, "docs/example.md")
+
+                self.assertEqual(hits, [])
+
+    def test_environment_reference_with_appended_value_is_not_safe(self) -> None:
+        text = "api_key=${API_KEY}hunter2hunter2hunter2"
+
+        hits = check_secrets.scan_text(text, "src/config.env")
+
+        self.assertEqual(
+            hits,
+            [("src/config.env", 1, "generic_assignment")],
+        )
+
+    def test_environment_read_with_literal_fallback_is_not_safe(self) -> None:
+        text = 'api_key=os.environ.get("API_KEY","hunter2hunter2hunter2")'
+
+        hits = check_secrets.scan_text(text, "src/config.py")
+
+        self.assertEqual(
+            hits,
+            [("src/config.py", 1, "generic_assignment")],
+        )
+
+    def test_shell_environment_reference_with_literal_default_is_not_safe(
+        self,
+    ) -> None:
+        text = "api_key=${API_KEY:-hunter2hunter2hunter2}"
+
+        hits = check_secrets.scan_text(text, "src/config.env")
+
+        self.assertEqual(
+            hits,
+            [("src/config.env", 1, "generic_assignment")],
+        )
+
+    def test_quoted_and_call_safe_values_reject_appended_payloads(self) -> None:
+        cases = [
+            'api_key="<secret-value>"hunter2hunter2hunter2',
+            'api_key="${API_KEY}"hunter2hunter2hunter2',
+            'api_key=os.environ.get("API_KEY")+hunter2hunter2hunter2',
+            'api_key=std::env::var("API_KEY")+hunter2hunter2hunter2',
+            'api_key="<secret-value>" + hunter2hunter2hunter2',
+            'api_key="${API_KEY}" + hunter2hunter2hunter2',
+            'api_key=os.environ.get("API_KEY") + hunter2hunter2hunter2',
+            "api_key=process.env.API_KEY + hunter2hunter2hunter2",
+            'api_key=process.env.API_KEY || "hunter2hunter2hunter2"',
+            'api_key=process.env.API_KEY ?? "hunter2hunter2hunter2"',
+            'api_key=os.environ.get("API_KEY") or "hunter2hunter2hunter2"',
+            'api_key=os.environ.get("API_KEY", "").strip()hunter2hunter2hunter2',
+        ]
+
+        for text in cases:
+            with self.subTest(text=text):
+                hits = check_secrets.scan_text(text, "src/config.example")
+
+                self.assertEqual(
+                    hits,
+                    [("src/config.example", 1, "generic_assignment")],
+                )
 
 
 class SecretGuardRustLetBindingTests(unittest.TestCase):
