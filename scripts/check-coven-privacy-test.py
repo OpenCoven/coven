@@ -62,6 +62,16 @@ class CovenPrivacyPatternTests(unittest.TestCase):
             workflow,
         )
 
+    def test_ci_runs_secret_guard_unit_tests(self) -> None:
+        workflow = (
+            SCRIPT.parents[1] / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "python scripts/check-secrets-test.py",
+            workflow,
+        )
+
     def test_ci_scans_the_entire_push_range(self) -> None:
         workflow = (
             SCRIPT.parents[1] / ".github" / "workflows" / "ci.yml"

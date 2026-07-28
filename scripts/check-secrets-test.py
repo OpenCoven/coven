@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import io
 import importlib.util
 import pathlib
+import subprocess
+import tempfile
 import unittest
 from unittest import mock
 
@@ -223,6 +226,176 @@ class SecretGuardLockfileTests(unittest.TestCase):
 
         self.assertEqual(hits, [])
         self.assertEqual(calls, [("git", "rev-list", "--objects", "origin/main")])
+
+    def test_batch_reader_rejects_malformed_headers(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "malformed object header"):
+            check_secrets.read_batch_object(io.BytesIO(b"malformed\n"), "a" * 40)
+
+    def test_batch_reader_rejects_out_of_order_objects(self) -> None:
+        stream = io.BytesIO(f"{'b' * 40} blob 0\n\n".encode())
+
+        with self.assertRaisesRegex(RuntimeError, "objects out of order"):
+            check_secrets.read_batch_object(stream, "a" * 40)
+
+    def test_batch_reader_rejects_unknown_object_types(self) -> None:
+        stream = io.BytesIO(f"{'a' * 40} future-object 0\n\n".encode())
+
+        with self.assertRaisesRegex(RuntimeError, "unknown object type"):
+            check_secrets.read_batch_object(stream, "a" * 40)
+
+    def test_batch_reader_rejects_invalid_object_sizes(self) -> None:
+        sha = "a" * 40
+        invalid_sizes = (
+            b"not-a-number",
+            b"-1",
+            str(check_secrets.MAX_BATCH_OBJECT_BYTES + 1).encode(),
+        )
+
+        for size in invalid_sizes:
+            with self.subTest(size=size):
+                stream = io.BytesIO(sha.encode() + b" blob " + size + b"\n")
+                with self.assertRaisesRegex(RuntimeError, "malformed object size"):
+                    check_secrets.read_batch_object(stream, sha)
+
+    def test_batch_reader_rejects_truncated_objects_and_missing_trailers(self) -> None:
+        sha = "a" * 40
+        streams = (
+            io.BytesIO(f"{sha} blob 4\n".encode() + b"abc"),
+            io.BytesIO(f"{sha} blob 3\n".encode() + b"abcX"),
+        )
+
+        for stream in streams:
+            with self.subTest(data=stream.getvalue()):
+                with self.assertRaisesRegex(RuntimeError, "truncated object"):
+                    check_secrets.read_batch_object(stream, sha)
+
+    def test_history_scan_rejects_nonzero_batch_exit(self) -> None:
+        sha = "a" * 40
+
+        class FailedBatch:
+            stdout = io.BytesIO(f"{sha} blob 0\n\n".encode())
+
+            def __enter__(self) -> FailedBatch:
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+            def wait(self) -> int:
+                return 1
+
+        with (
+            mock.patch.object(
+                check_secrets,
+                "sh",
+                return_value=f"{sha} docs/example.md\n",
+            ),
+            mock.patch.object(subprocess, "Popen", return_value=FailedBatch()),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "cat-file --batch failed"):
+                check_secrets.history_blob_hits()
+
+    def test_history_scan_rejects_unexpected_batch_output(self) -> None:
+        sha = "a" * 40
+
+        class ExtraOutputBatch:
+            stdout = io.BytesIO(f"{sha} blob 0\n\nunexpected".encode())
+
+            def __enter__(self) -> ExtraOutputBatch:
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+            def wait(self) -> int:
+                return 0
+
+        with (
+            mock.patch.object(
+                check_secrets,
+                "sh",
+                return_value=f"{sha} docs/example.md\n",
+            ),
+            mock.patch.object(
+                subprocess,
+                "Popen",
+                return_value=ExtraOutputBatch(),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "unexpected trailing output"):
+                check_secrets.history_blob_hits()
+
+    def test_history_scan_uses_bounded_git_processes_without_skipping_deleted_secrets(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = pathlib.Path(temp_dir)
+
+            def git(*args: str) -> None:
+                subprocess.run(
+                    ["git", *args],
+                    cwd=repo,
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+
+            git("init", "-q")
+            git("config", "user.name", "Secret Guard Test")
+            git("config", "user.email", "secret-guard@example.invalid")
+            secret_file = repo / "secret.txt"
+            secret_file.write_text(
+                "token=" + "ghp_" + ("A1" * 12) + "\n",
+                encoding="utf-8",
+            )
+            git("add", "secret.txt")
+            git("commit", "-q", "-m", "add historical fixture")
+            secret_file.unlink()
+            git("add", "-u")
+            git("commit", "-q", "-m", "remove historical fixture")
+
+            original_popen = subprocess.Popen
+            spawned: list[tuple[object, dict[str, object]]] = []
+
+            def counting_popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+                spawned.append((args[0], kwargs))
+                return original_popen(*args, **kwargs)
+
+            with (
+                mock.patch.object(check_secrets, "ROOT", repo),
+                mock.patch.object(
+                    subprocess,
+                    "Popen",
+                    side_effect=counting_popen,
+                ),
+            ):
+                hits = check_secrets.history_blob_hits()
+
+        self.assertIn(
+            ("secret.txt", 1, "github_token"),
+            [(path, line, rule) for _, path, line, rule in hits],
+        )
+        self.assertLessEqual(
+            len(spawned),
+            3,
+            f"history scan spawned one or more Git processes per object: {spawned}",
+        )
+        batch_calls = [
+            kwargs
+            for command, kwargs in spawned
+            if command == ["git", "cat-file", "--batch"]
+        ]
+        self.assertEqual(len(batch_calls), 1)
+        self.assertIsNot(
+            batch_calls[0].get("stdin"),
+            subprocess.PIPE,
+            "batch stdin must be finite so malformed output cannot wait for another request",
+        )
+        self.assertEqual(
+            batch_calls[0].get("stderr"),
+            subprocess.DEVNULL,
+            "batch stderr must not be an undrained pipe",
+        )
 
     def test_base64_like_values_still_trigger_high_entropy(self) -> None:
         token = "m9R3tQv7WzK2pL5nX8cF1gJ4sD6hY0aB/EuIqOwPz9RkTlVxCyNmS3HdG7fA"

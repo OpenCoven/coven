@@ -24,8 +24,8 @@
 //   --with-cargo-gates    Also run `cargo fmt --check`, `cargo clippy`, and
 //                         `cargo test --workspace --locked` (the CI verify
 //                         gates). Off by default to keep local runs fast.
-//   --skip-secrets-scan   Skip `python3 scripts/check-secrets.py` for local
-//                         iteration; CI still runs it.
+//   --skip-secrets-scan   Skip the secret-guard unit tests and full scan for
+//                         local iteration; CI still runs both.
 //   --keep-tempdir        Leave the temp install dir on disk for inspection.
 //   COVEN_NPM_DRY_RUN_VERSION=vX.Y.Z
 //                         Override the synthesized dry-run version when the
@@ -106,6 +106,7 @@ step('prerequisites', () => {
 
 if (!skipSecretsScan) {
   step('secrets scan', () => {
+    run('python3', ['scripts/check-secrets-test.py']);
     run('python3', ['scripts/check-secrets.py']);
   });
 }

@@ -12,8 +12,14 @@ import pathlib
 import re
 import subprocess
 import sys
+import tempfile
+from typing import BinaryIO
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+GIT_OBJECT_TYPES = {b"blob", b"commit", b"tag", b"tree"}
+# Fail closed instead of allowing a malformed batch header to request an
+# unbounded allocation. The largest object in this repository is under 6 MiB.
+MAX_BATCH_OBJECT_BYTES = 64 * 1024 * 1024
 EXCLUDED_PARTS = {".git", "target", "node_modules", ".coven", ".comux", ".comux-hooks"}
 EXCLUDED_PATHS = {"scripts/check-secrets.py", "scripts/check-secrets-test.py"}
 LOCKFILE_NAMES = ("pnpm-lock.yaml", "package-lock.json", "yarn.lock")
@@ -951,10 +957,36 @@ def tracked_file_hits() -> list[tuple[str, int, str]]:
     return hits
 
 
+def read_batch_object(
+    stream: BinaryIO, expected_sha: str
+) -> tuple[bytes, bytes]:
+    header = stream.readline().rstrip(b"\n").split()
+    if len(header) != 3:
+        raise RuntimeError("git cat-file --batch returned a malformed object header")
+    object_sha, object_type, size_bytes = header
+    if object_sha != expected_sha.encode("ascii"):
+        raise RuntimeError("git cat-file --batch returned objects out of order")
+    if object_type not in GIT_OBJECT_TYPES:
+        raise RuntimeError("git cat-file --batch returned an unknown object type")
+    try:
+        size = int(size_bytes)
+    except ValueError as error:
+        raise RuntimeError(
+            "git cat-file --batch returned a malformed object size"
+        ) from error
+    if not 0 <= size <= MAX_BATCH_OBJECT_BYTES:
+        raise RuntimeError("git cat-file --batch returned a malformed object size")
+    data = stream.read(size)
+    if len(data) != size or stream.read(1) != b"\n":
+        raise RuntimeError("git cat-file --batch returned a truncated object")
+    return object_type, data
+
+
 def history_blob_hits(ref: str = "HEAD") -> list[tuple[str, str, int, str]]:
     rows = sh("git", "rev-list", "--objects", ref).splitlines()
     hits: list[tuple[str, str, int, str]] = []
     seen: set[str] = set()
+    objects: list[tuple[str, str]] = []
     for row in rows:
         parts = row.split(" ", 1)
         sha = parts[0]
@@ -966,11 +998,40 @@ def history_blob_hits(ref: str = "HEAD") -> list[tuple[str, str, int, str]]:
         seen.add(sha)
         if any(part in EXCLUDED_PARTS for part in pathlib.PurePosixPath(rel).parts):
             continue
-        if sh("git", "cat-file", "-t", sha).strip() != "blob":
-            continue
-        data = subprocess.check_output(["git", "cat-file", "-p", sha], cwd=ROOT)
-        for path, line, rule in scan_bytes(data, rel):
-            hits.append((sha[:12], path, line, rule))
+        objects.append((sha, rel))
+
+    if not objects:
+        return hits
+
+    # A finite file gives cat-file every request up front. If its output is
+    # malformed or truncated, it cannot deadlock waiting for another request.
+    with tempfile.TemporaryFile() as requests:
+        for sha, _ in objects:
+            requests.write(f"{sha}\n".encode())
+        requests.seek(0)
+
+        with subprocess.Popen(
+            ["git", "cat-file", "--batch"],
+            cwd=ROOT,
+            stdin=requests,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        ) as batch:
+            assert batch.stdout is not None
+            for sha, rel in objects:
+                object_type, data = read_batch_object(batch.stdout, sha)
+                if object_type != b"blob":
+                    continue
+                for path, line, rule in scan_bytes(data, rel):
+                    hits.append((sha[:12], path, line, rule))
+
+            if batch.stdout.read(1):
+                raise RuntimeError(
+                    "git cat-file --batch returned unexpected trailing output"
+                )
+            return_code = batch.wait()
+            if return_code != 0:
+                raise RuntimeError("git cat-file --batch failed")
     return hits
 
 

@@ -668,6 +668,31 @@ test('release workflow concurrency keeps overlapping releases from interleaving'
   assert.match(workflow, /cancel-in-progress:\s*false/);
 });
 
+test('secret guard unit tests run in local and tag-driven release gates', () => {
+  const prepublish = readFileSync(
+    new URL('test-cli-prepublish.mjs', import.meta.url),
+    'utf8'
+  );
+  const workflow = readFileSync(
+    new URL(
+      ['..', '.github', 'workflows', 'release-npm.yml'].join('/'),
+      import.meta.url
+    ),
+    'utf8'
+  );
+
+  assert.match(
+    prepublish,
+    /run\('python3', \['scripts\/check-secrets-test\.py'\]\)/,
+    'local prepublish must prove the scanner regression suite before scanning'
+  );
+  assert.match(
+    workflow,
+    /python3 scripts\/check-secrets-test\.py/,
+    'tag-driven release gates must prove the scanner regression suite before publishing'
+  );
+});
+
 test('prepublish smoke has explicit dry-run version override and registry failure message', () => {
   const scriptPath = new URL('test-cli-prepublish.mjs', import.meta.url);
   const script = readFileSync(scriptPath, 'utf8');
