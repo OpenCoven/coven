@@ -2770,6 +2770,30 @@ mod tests {
     }
 
     #[test]
+    fn cave_hermes_1_0_2_recipe_bytes_match_pr_465() {
+        use sha2::{Digest, Sha256};
+
+        for (platform, manifest, expected_sha256) in [
+            (
+                "posix",
+                CAVE_HERMES_POSIX_1_0_2_MANIFEST,
+                "d0ecc06979bb868e6ebf742a8babafbc2f39a759d369876096f919c4060ed7f1",
+            ),
+            (
+                "windows",
+                CAVE_HERMES_WINDOWS_1_0_2_MANIFEST,
+                "1c0e97645a7fdb08e8d0c5ebc7994efa2de784f6ef818a55264cffe9e5723534",
+            ),
+        ] {
+            let actual_sha256 = Sha256::digest(manifest.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            assert_eq!(actual_sha256, expected_sha256, "{platform}");
+        }
+    }
+
+    #[test]
     fn trusted_recipe_size_candidates_cover_current_and_legacy_manifests() {
         for id in ["grok", "hermes", "opencode"] {
             let current = known_adapter_manifest(id).expect("current recipe");
