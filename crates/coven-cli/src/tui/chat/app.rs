@@ -30,6 +30,9 @@ pub enum MessageRole {
     User,
     Agent,
     System,
+    /// Compact tool-activity lines (⚒ indicators, ⚠ failures) rendered dim,
+    /// without a sender header (#472).
+    Tool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -38,6 +41,129 @@ enum AgentOutputMode {
     Unknown,
     Assistant,
     Hidden,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CopilotStatsLine {
+    Changes,
+    Requests,
+    Tokens,
+    Resume,
+}
+
+#[derive(Debug, Default)]
+struct CopilotStatsCandidate {
+    /// Exact cleaned lines, including their newlines. Candidate advancement
+    /// bounds this to the four recognized trailer rows.
+    lines: Vec<String>,
+    /// Copilot may print cosmetic blank spacing after its terminal table.
+    trailing_blank: bool,
+}
+
+impl CopilotStatsCandidate {
+    fn expected(&self) -> Option<CopilotStatsLine> {
+        match self.lines.len() {
+            0 => Some(CopilotStatsLine::Changes),
+            1 => Some(CopilotStatsLine::Requests),
+            2 => Some(CopilotStatsLine::Tokens),
+            3 => Some(CopilotStatsLine::Resume),
+            _ => None,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    fn is_complete(&self) -> bool {
+        self.lines.len() == 4
+    }
+
+    fn clear(&mut self) {
+        self.lines.clear();
+        self.trailing_blank = false;
+    }
+
+    fn take_visible(&mut self) -> String {
+        let mut visible = std::mem::take(&mut self.lines).concat();
+        if std::mem::take(&mut self.trailing_blank) {
+            visible.push('\n');
+        }
+        visible
+    }
+
+    fn push_line(&mut self, raw_line: &str, visible: &mut String) {
+        let marker = raw_line.trim_end_matches('\n').trim();
+        if self.is_complete() && marker.is_empty() {
+            self.trailing_blank = true;
+            return;
+        }
+
+        let kind = copilot_stats_line_kind(marker);
+        if self
+            .expected()
+            .is_some_and(|expected| kind == Some(expected))
+        {
+            self.lines.push(raw_line.to_string());
+            debug_assert!(self.lines.len() <= 4);
+            return;
+        }
+
+        if !self.is_empty() {
+            visible.push_str(&self.take_visible());
+        }
+        if kind == Some(CopilotStatsLine::Changes) {
+            self.lines.push(raw_line.to_string());
+        } else {
+            visible.push_str(raw_line);
+        }
+    }
+
+    /// Normal EOF confirms a complete candidate as the terminal trailer.
+    /// Every incomplete candidate fails open.
+    fn finish_at_exit(&mut self) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        if self.is_complete() {
+            self.clear();
+            return None;
+        }
+        Some(self.take_visible())
+    }
+}
+
+/// Per-PTY-session state for the trailing partial line of the transcript
+/// filter (#471). See the `pty_line_buffers` field.
+#[derive(Debug, Default)]
+struct PtyLineBuffer {
+    /// Raw text of the current line, including any head already rendered.
+    /// Keeping the contiguous raw line lets CR, backspace, and ANSI escapes
+    /// re-clean correctly across arbitrary PTY read boundaries (#486/#488).
+    tail: String,
+    /// Number of cleaned chars from `tail` already appended to the current
+    /// agent bubble. Continuations re-clean `tail` and reconcile this prefix.
+    emitted_len: usize,
+    /// Bounded Copilot-only candidate for a terminal usage-stats trailer.
+    copilot_stats: CopilotStatsCandidate,
+}
+
+impl PtyLineBuffer {
+    fn has_pending(&self) -> bool {
+        !self.tail.is_empty() || self.emitted_len > 0 || !self.copilot_stats.is_empty()
+    }
+}
+
+/// Whether an appended chunk of agent output starts a new assistant
+/// segment. Stream-JSON dispatch marks every assistant event (and each
+/// text block within one) as a `NewSegment` so prose around tool calls
+/// gets a paragraph break instead of gluing together (#470). PTY chunks
+/// are `Continuation`s — they carry their own newlines and arbitrary
+/// split points, so no separator may ever be injected between them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SegmentBoundary {
+    Continuation,
+    NewSegment,
 }
 
 #[derive(Clone, Debug)]
@@ -54,6 +180,7 @@ pub struct AgentInfo {
     pub label: String,
     pub harness: String,
     pub available: bool,
+    pub supports_chat_resume: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -157,6 +284,19 @@ pub(super) struct App {
     /// `dispatch_stream_json_output` only ever tries to parse complete
     /// newline-terminated lines.
     stream_json_buffers: HashMap<String, String>,
+    /// Tool names keyed by `tool_use` block id, so a later `tool_result`
+    /// frame can name the tool that failed. Entries are consumed by the
+    /// matching result and cleared wholesale on session teardown (#472).
+    stream_tool_names: HashMap<String, String>,
+    /// PTY analogue of `stream_json_buffers` (#471): PTY output events are
+    /// raw 8KiB reads too, so a chunk's last line usually lacks its
+    /// newline. `dispatch_pty_output` holds that trailing fragment here so
+    /// the transcript filter only classifies complete lines — a prose line
+    /// split right after `user` must not flip the filter to Hidden, and a
+    /// `codex` marker split as `cod`/`ex` must still be recognized.
+    /// Flushed through the classifier on session exit (EOF ends the line),
+    /// dropped on kill, mirroring the stream buffer teardown.
+    pty_line_buffers: HashMap<String, PtyLineBuffer>,
     client: Box<dyn ChatClient>,
     /// Optional familiar id for the session owner (e.g. `"sage"`). When set,
     /// delegation events are emitted to `cave-coven-calls.json` whenever
@@ -343,6 +483,8 @@ impl App {
             suppressed_session_ids: HashSet::new(),
             harness_stream_session_ids: HashMap::new(),
             stream_json_buffers: HashMap::new(),
+            stream_tool_names: HashMap::new(),
+            pty_line_buffers: HashMap::new(),
             familiar_id: None,
             active_call_id: None,
             client,
@@ -391,9 +533,26 @@ impl App {
         });
     }
 
-    fn push_or_append_agent_message(&mut self, agent_name: &str, content: &str) {
+    fn push_tool_message(&mut self, content: &str) {
+        self.messages.push(ChatMessage {
+            role: MessageRole::Tool,
+            sender: "tool".into(),
+            content: content.to_string(),
+            timestamp: timestamp_now(),
+        });
+    }
+
+    fn push_or_append_agent_message(
+        &mut self,
+        agent_name: &str,
+        content: &str,
+        boundary: SegmentBoundary,
+    ) {
         if let Some(last) = self.messages.last_mut() {
             if matches!(last.role, MessageRole::Agent) && last.sender == agent_name {
+                if boundary == SegmentBoundary::NewSegment {
+                    last.content.push_str(segment_separator(&last.content));
+                }
                 last.content.push_str(content);
                 return;
             }
@@ -404,9 +563,19 @@ impl App {
     /// Stash agent output until the session completes (batched mode). Keyed by
     /// sender so a mid-stream agent switch doesn't merge two voices into one
     /// bubble.
-    fn buffer_pending_agent_output(&mut self, agent_name: &str, content: &str) {
+    fn buffer_pending_agent_output(
+        &mut self,
+        agent_name: &str,
+        content: &str,
+        boundary: SegmentBoundary,
+    ) {
         match self.pending_agent_buffer.as_mut() {
-            Some((sender, buffer)) if sender == agent_name => buffer.push_str(content),
+            Some((sender, buffer)) if sender == agent_name => {
+                if boundary == SegmentBoundary::NewSegment {
+                    buffer.push_str(segment_separator(buffer));
+                }
+                buffer.push_str(content);
+            }
             Some(_) => {
                 self.flush_pending_agent_buffer();
                 self.pending_agent_buffer = Some((agent_name.to_string(), content.to_string()));
@@ -427,6 +596,20 @@ impl App {
             return;
         }
         self.push_agent_message(&sender, &buffer);
+    }
+
+    /// Route a stream-JSON assistant text chunk to the transcript according
+    /// to the streaming mode: live appends progressively, batched holds it
+    /// back until the turn completes.
+    fn emit_stream_assistant_text(&mut self, sender: &str, chunk: &str) {
+        // Every flushed chunk is a whole assistant segment (chunks are cut
+        // at assistant-event and tool_use boundaries), so it starts a new
+        // segment in the sink (#470).
+        if self.streaming_mode.is_live() {
+            self.push_or_append_agent_message(sender, chunk, SegmentBoundary::NewSegment);
+        } else {
+            self.buffer_pending_agent_output(sender, chunk, SegmentBoundary::NewSegment);
+        }
     }
 
     pub(super) fn streaming_mode(&self) -> StreamingMode {
@@ -594,6 +777,11 @@ impl App {
         self.scroll_offset = 0;
         self.harness_conversation_ids.clear();
         self.kill_all_stream_sessions();
+        // Held PTY line fragments belong to the transcript the user just
+        // wiped — keeping them would let pre-clear text resurface on the
+        // session's exit flush (#489). `kill_all_stream_sessions` only
+        // covers stream sessions, so PTY buffers are dropped here.
+        self.pty_line_buffers.clear();
         self.clear_persisted_conversations();
         self.push_system_message("Chat cleared.");
     }
@@ -603,6 +791,11 @@ impl App {
     /// a fresh thread (next message will create a new harness session) but
     /// keep the prior exchange visible for their own reference. Tears down
     /// any long-lived stream sessions for the same reason as `/clear`.
+    ///
+    /// Unlike `/clear` this keeps held PTY line fragments: the transcript
+    /// stays visible and PTY sessions aren't killed, so a held fragment is
+    /// the head of an in-flight line still streaming into that transcript
+    /// — dropping it would render the line's tail without its head (#489).
     pub(super) fn start_new_conversation(&mut self) {
         self.harness_conversation_ids.clear();
         self.kill_all_stream_sessions();
@@ -659,6 +852,9 @@ impl App {
             }
         }
         self.harness_stream_session_ids.clear();
+        // Any tool_use ids from the torn-down sessions will never see a
+        // tool_result — drop them so the map can't grow unbounded.
+        self.stream_tool_names.clear();
     }
 
     pub(super) fn handle_slash_command(&mut self, input: &str) -> SlashCommandResult {
@@ -1036,7 +1232,7 @@ impl App {
         // making the user retype.
         self.last_chat_prompt = Some(prompt.to_string());
 
-        // Fast path for stream-mode harnesses (today: claude). If we
+        // Fast path for stream-mode harnesses (claude, coven-code). If we
         // already have a long-lived stream session for this harness, send
         // the next user message into it instead of cold-starting a new
         // daemon session.
@@ -1104,8 +1300,8 @@ impl App {
 
     /// Decide whether a launch for `harness` should ride a resumable chat
     /// session, and if so produce the right hint. For harnesses where we can
-    /// pre-assign the session id (claude/copilot `--session-id`) the first
-    /// turn sends
+    /// pre-assign the session id (claude/copilot/grok `--session-id`) the
+    /// first turn sends
     /// `Init` with a freshly generated UUID. For harnesses that auto-assign
     /// (codex) the first turn sends no hint and the id is captured from
     /// output afterwards via `maybe_capture_codex_session_id`.
@@ -1113,7 +1309,12 @@ impl App {
         &mut self,
         harness: &str,
     ) -> Option<harness::ConversationHint> {
-        if !harness_supports_chat_resume(harness) {
+        if !self
+            .agents
+            .iter()
+            .find(|agent| agent.harness == harness)
+            .is_some_and(|agent| agent.supports_chat_resume)
+        {
             return None;
         }
         if let Some(id) = self.harness_conversation_ids.get(harness) {
@@ -1268,6 +1469,9 @@ impl App {
                 self.chat_owns_active_session = false;
                 self.last_event_seq = None;
                 self.agent_output_mode = AgentOutputMode::Unknown;
+                // Events replay from seq 0 on attach; a leftover fragment
+                // from an earlier attach would double-buffer (#471).
+                self.pty_line_buffers.remove(&session.id);
                 self.reset_event_poll_failures();
                 self.push_system_message(&format!(
                     "Attached to daemon session {} ({}, {})",
@@ -1291,7 +1495,10 @@ impl App {
 
     fn archive_session(&mut self, session_id: &str) {
         match self.client.archive_session(session_id) {
-            Ok(()) => self.push_system_message(&format!("Archived session {session_id}.")),
+            Ok(()) => {
+                self.remove_session_from_list(session_id);
+                self.push_system_message(&format!("Archived session {session_id}."));
+            }
             Err(error) => self.push_system_message(&format!("Archive failed: {error}")),
         }
     }
@@ -1309,6 +1516,8 @@ impl App {
                 self.chat_owns_active_session = false;
                 self.last_event_seq = None;
                 self.agent_output_mode = AgentOutputMode::Unknown;
+                // Same replay-from-zero hygiene as /attach (#471).
+                self.pty_line_buffers.remove(&session.id);
                 self.reset_event_poll_failures();
                 self.push_system_message(&format!(
                     "Attached to daemon session {} ({}, {})",
@@ -1323,6 +1532,7 @@ impl App {
     fn sacrifice_session(&mut self, session_id: &str) {
         match self.client.sacrifice_session(session_id) {
             Ok(()) => {
+                self.remove_session_from_list(session_id);
                 if self.active_session_id.as_deref() == Some(session_id) {
                     self.active_session_id = None;
                     self.active_session_harness = None;
@@ -1332,6 +1542,20 @@ impl App {
             }
             Err(error) => self.push_system_message(&format!("Sacrifice failed: {error}")),
         }
+    }
+
+    /// Drop a session from the in-memory `/sessions` overlay list after a
+    /// mutation that removes it from the daemon's default listing (sacrifice
+    /// deletes the row; archive hides it behind the `archived_at IS NULL`
+    /// filter in [`crate::store::list_sessions`]).
+    ///
+    /// The mutation paths write to the store directly while
+    /// [`Self::refresh_sessions`] needs a daemon round-trip, so mirroring the
+    /// removal locally keeps an open overlay honest even when the daemon is
+    /// down (#451: a sacrificed session kept rendering until the next overlay
+    /// toggle, and re-sacrificing it reported "session not found").
+    fn remove_session_from_list(&mut self, session_id: &str) {
+        self.sessions.retain(|session| session.id != session_id);
     }
 
     pub(super) fn refresh_sessions(&mut self) {
@@ -1361,7 +1585,11 @@ impl App {
             .resolved_coven_home()
             .map(|home| home.display().to_string())
             .unwrap_or_else(|| "unresolved — set COVEN_HOME".to_string());
-        let harnesses = harness::built_in_harnesses();
+        // Configured = built-ins plus installed adapter manifests; fall back
+        // to built-ins on a manifest load error and surface the error so users
+        // can diagnose why installed adapters are missing without a launch attempt.
+        let (harnesses, harness_load_err) =
+            doctor_harness_inventory(harness::configured_harnesses());
         let mut lines = vec![
             "Doctor".to_string(),
             format!("  Store    {store_path}"),
@@ -1377,6 +1605,11 @@ impl App {
             lines.push(format!(
                 "    {:<11} `{}` is {status}",
                 harness.label, harness.executable
+            ));
+        }
+        if let Some(err) = harness_load_err {
+            lines.push(format!(
+                "  [warn] adapter manifests could not be loaded (showing built-ins only): {err}"
             ));
         }
         let next = harnesses
@@ -1398,16 +1631,16 @@ impl App {
         let home = std::env::var("HOME")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
-        for (harness_id, label) in &[
-            ("codex", "Codex"),
-            ("claude", "Claude"),
-            ("copilot", "Copilot"),
-        ] {
-            let m = match *harness_id {
+        for harness in &harnesses {
+            let m = match harness.id.as_str() {
                 "codex" => crate::capabilities::scan_codex_capabilities(&home),
                 "claude" => crate::capabilities::scan_claude_capabilities(&home),
+                "coven-code" => crate::capabilities::scan_coven_code_capabilities(&home),
                 "copilot" => crate::capabilities::scan_copilot_capabilities(&home),
-                other => unreachable!("unhandled capabilities row for harness `{other}`"),
+                "opencode" => crate::capabilities::scan_opencode_capabilities(&home),
+                // Adapters without a capability scanner (grok, hermes, …)
+                // have no instructions/skills/plugins convention to inspect.
+                _ => continue,
             };
             let instr = if m.global_instructions.present {
                 "✓"
@@ -1416,6 +1649,7 @@ impl App {
             };
             let skills_n = m.skills.len();
             let plugins_n = m.plugins.len();
+            let label = &harness.label;
             lines.push(format!(
                 "    {label:<11} instructions {instr}  automations {skills_n}  plugins {plugins_n}"
             ));
@@ -1592,10 +1826,11 @@ impl App {
     /// Parse a chunk of stream-mode harness output (newline-delimited JSON)
     /// and turn it into chat-visible messages. Each line is one JSON event:
     /// `assistant.message.content[].text` becomes an agent message; the
-    /// `result` event marks the turn complete and clears `is_responding`;
-    /// other event types (system init, rate_limit_event, …) are ignored
-    /// for now. Malformed lines are silently dropped — stream-mode is too
-    /// noisy to surface every parse error.
+    /// `result` event marks the turn complete, clears `is_responding`, and
+    /// surfaces a failure notice when the turn errored (#468); other event
+    /// types (system init, rate_limit_event, …) are ignored for now.
+    /// Malformed lines are silently dropped — stream-mode is too noisy to
+    /// surface every parse error.
     fn dispatch_stream_json_output(&mut self, session_id: &str, data: &str) {
         let sender = self.active_agent_label().to_string();
         // Daemon output events come from raw 8KiB reads, so a JSON line
@@ -1633,27 +1868,132 @@ impl App {
                     else {
                         continue;
                     };
+                    // Process blocks in order so ⚒ indicators land between
+                    // the text that precedes and follows a tool call (#472).
                     let mut chunk = String::new();
                     for block in content {
-                        if block.get("type").and_then(serde_json::Value::as_str) == Some("text") {
-                            if let Some(text) =
-                                block.get("text").and_then(serde_json::Value::as_str)
-                            {
-                                chunk.push_str(text);
+                        match block.get("type").and_then(serde_json::Value::as_str) {
+                            Some("text") => {
+                                if let Some(text) =
+                                    block.get("text").and_then(serde_json::Value::as_str)
+                                {
+                                    if text.is_empty() {
+                                        continue;
+                                    }
+                                    // Text blocks within one event are
+                                    // separate segments — paragraph-break
+                                    // them (#470).
+                                    chunk.push_str(segment_separator(&chunk));
+                                    chunk.push_str(text);
+                                }
                             }
+                            Some("tool_use") => {
+                                let Some(name) =
+                                    block.get("name").and_then(serde_json::Value::as_str)
+                                else {
+                                    continue;
+                                };
+                                if let Some(id) =
+                                    block.get("id").and_then(serde_json::Value::as_str)
+                                {
+                                    self.stream_tool_names
+                                        .insert(id.to_string(), name.to_string());
+                                }
+                                if !chunk.is_empty() {
+                                    self.emit_stream_assistant_text(&sender, &chunk);
+                                    chunk.clear();
+                                }
+                                // Indicators are progress feedback; batched
+                                // mode holds output until the turn completes,
+                                // so they are suppressed there (tool errors
+                                // still surface via the tool_result arm).
+                                if self.streaming_mode.is_live() {
+                                    let indicator = match summarize_tool_input(block.get("input")) {
+                                        Some(summary) => format!("\u{2692} {name}: {summary}"),
+                                        None => format!("\u{2692} {name}"),
+                                    };
+                                    self.push_tool_message(&indicator);
+                                }
+                            }
+                            _ => {}
                         }
                     }
                     if !chunk.is_empty() {
-                        if self.streaming_mode.is_live() {
-                            self.push_or_append_agent_message(&sender, &chunk);
-                        } else {
-                            self.buffer_pending_agent_output(&sender, &chunk);
-                        }
+                        self.emit_stream_assistant_text(&sender, &chunk);
                     }
+                }
+                "tool_result" => {
+                    let name = value
+                        .get("tool_use_id")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|id| self.stream_tool_names.remove(id));
+                    let is_error = value
+                        .get("is_error")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    if !is_error {
+                        continue;
+                    }
+                    // A failed tool call was previously invisible (#472).
+                    // Surface it in both streaming modes — in batched mode
+                    // flush the held-back text first so the transcript
+                    // reads in arrival order.
+                    let detail = value
+                        .get("content")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|blocks| {
+                            blocks
+                                .iter()
+                                .filter_map(|block| {
+                                    block.get("text").and_then(serde_json::Value::as_str)
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .and_then(|text| clean_terminal_output(&text))
+                        .and_then(|text| {
+                            text.lines()
+                                .map(str::trim)
+                                .find(|line| !line.is_empty())
+                                .map(|line| truncate_with_ellipsis(line, 160))
+                        });
+                    self.flush_pending_agent_buffer();
+                    let label = name.as_deref().unwrap_or("tool");
+                    let notice = match detail {
+                        Some(detail) => format!("\u{26A0} {label} failed: {detail}"),
+                        None => format!("\u{26A0} {label} failed."),
+                    };
+                    self.push_tool_message(&notice);
                 }
                 "result" => {
                     self.flush_pending_agent_buffer();
                     self.is_responding = false;
+                    // A turn can die (rate limit, auth expiry, max-turns
+                    // abort) — surface why instead of letting the spinner
+                    // vanish silently (#468). Clean the harness-supplied
+                    // detail before rendering: it may carry control codes.
+                    let is_error = value
+                        .get("is_error")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    if is_error {
+                        let subtype = value
+                            .get("subtype")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|s| !s.trim().is_empty())
+                            .unwrap_or("error");
+                        let detail = value
+                            .get("error")
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(clean_terminal_output)
+                            .map(|text| text.trim().to_string())
+                            .filter(|text| !text.is_empty());
+                        let notice = match detail {
+                            Some(detail) => format!("Reply failed ({subtype}): {detail}"),
+                            None => format!("Reply failed ({subtype})."),
+                        };
+                        self.push_system_message(&notice);
+                    }
                 }
                 "system" => {
                     // Daemon wraps stream-mode child stderr in
@@ -1705,6 +2045,214 @@ impl App {
         }
     }
 
+    /// Whether the active session's harness emits codex's non-interactive
+    /// transcript, whose interleaved role markers (`user`, `codex`,
+    /// `exec`, …) drive the Hidden/Assistant mode machine. No other
+    /// supported harness prints those markers, so honoring them elsewhere
+    /// lets ordinary prose flip the filter to Hidden with nothing to flip
+    /// it back (#471). An unknown harness keeps the historical
+    /// conservative behavior.
+    fn active_session_emits_codex_markers(&self) -> bool {
+        matches!(self.active_session_harness.as_deref(), None | Some("codex"))
+    }
+
+    /// Copilot is the only supported PTY harness with this terminal stats
+    /// trailer. Unknown and other harnesses fail open.
+    fn active_session_emits_copilot_stats(&self) -> bool {
+        self.active_session_harness.as_deref() == Some("copilot")
+    }
+
+    /// Route visible PTY text through the live/batched display split.
+    /// PTY chunks split at arbitrary byte boundaries and already carry
+    /// their own newlines, so they never start a new segment (#470).
+    fn emit_agent_text(&mut self, text: &str) {
+        let sender = self.active_agent_label().to_string();
+        if self.streaming_mode.is_live() {
+            self.push_or_append_agent_message(&sender, text, SegmentBoundary::Continuation);
+        } else {
+            self.buffer_pending_agent_output(&sender, text, SegmentBoundary::Continuation);
+        }
+    }
+
+    fn retract_agent_text(&mut self, chars: usize) {
+        if chars == 0 {
+            return;
+        }
+        let sender = self.active_agent_label().to_string();
+        if self.streaming_mode.is_live() {
+            if let Some(last) = self.messages.last_mut() {
+                if matches!(last.role, MessageRole::Agent) && last.sender == sender {
+                    truncate_suffix_chars(&mut last.content, chars);
+                }
+            }
+        } else if let Some((pending_sender, buffer)) = self.pending_agent_buffer.as_mut() {
+            if pending_sender == &sender {
+                truncate_suffix_chars(buffer, chars);
+            }
+        }
+    }
+
+    fn flush_pty_visible(&mut self, visible: &mut String, force: bool) {
+        let has_structure = visible.chars().any(|ch| ch == '\n' || !ch.is_whitespace());
+        if force || has_structure {
+            self.emit_agent_text(visible);
+        }
+        visible.clear();
+    }
+
+    fn reconcile_pre_emitted_pty_line(
+        &mut self,
+        state: &mut PtyLineBuffer,
+        old_cleaned: &str,
+        new_cleaned: &str,
+        visible: &mut String,
+    ) -> bool {
+        let old_emitted = take_chars(old_cleaned, state.emitted_len);
+        let common = common_prefix_chars(&old_emitted, new_cleaned);
+        if common < state.emitted_len {
+            self.flush_pty_visible(visible, false);
+            self.retract_agent_text(state.emitted_len - common);
+        }
+        let suffix = skip_chars(new_cleaned, common);
+        let emitted_payload = !suffix.is_empty();
+        visible.push_str(&suffix);
+        state.emitted_len = new_cleaned.chars().count();
+        emitted_payload
+    }
+
+    /// PTY analogue of `dispatch_stream_json_output`'s buffering (#471):
+    /// output events are raw 8KiB PTY reads, so a chunk's last line
+    /// usually lacks its newline. Classifying that fragment as a complete
+    /// line misreads it — prose split right after `user` flipped the
+    /// filter to Hidden, and a `codex` marker split as `cod`/`ex` was
+    /// missed, eating the rest of the reply. Classify only complete
+    /// lines; a trailing fragment is shown immediately once it can no
+    /// longer become a marker line (so live streaming stays live), and
+    /// held otherwise until its newline or the session's exit.
+    fn dispatch_pty_output(&mut self, session_id: &str, data: &str) {
+        let codex_markers = self.active_session_emits_codex_markers();
+        let copilot_stats = self.active_session_emits_copilot_stats();
+        let mut state = self.pty_line_buffers.remove(session_id).unwrap_or_default();
+        let mut visible = String::new();
+        let mut force_emit_visible = false;
+        let mut rest = data;
+
+        // A pre-emitted line is already known prose. Re-clean the whole raw
+        // line on every continuation so CR/backspace/escape state can rewrite
+        // the already-rendered bubble instead of accumulating frames (#486).
+        if state.emitted_len > 0 {
+            let old_cleaned = clean_terminal_output_text(&state.tail);
+            match rest.find('\n') {
+                Some(idx) => {
+                    state.tail.push_str(&rest[..=idx]);
+                    let new_cleaned = clean_terminal_output_text(&state.tail);
+                    force_emit_visible |= self.reconcile_pre_emitted_pty_line(
+                        &mut state,
+                        &old_cleaned,
+                        &new_cleaned,
+                        &mut visible,
+                    );
+                    state.tail.clear();
+                    state.emitted_len = 0;
+                    rest = &rest[idx + 1..];
+                }
+                None => {
+                    state.tail.push_str(rest);
+                    let new_cleaned = clean_terminal_output_text(&state.tail);
+                    force_emit_visible |= self.reconcile_pre_emitted_pty_line(
+                        &mut state,
+                        &old_cleaned,
+                        &new_cleaned,
+                        &mut visible,
+                    );
+                    rest = "";
+                }
+            }
+        }
+
+        state.tail.push_str(rest);
+        let fragment = match state.tail.rfind('\n') {
+            Some(idx) => state.tail.split_off(idx + 1),
+            None => std::mem::take(&mut state.tail),
+        };
+        let complete = std::mem::replace(&mut state.tail, fragment);
+        if !complete.is_empty() {
+            let classified = human_facing_pty_output(
+                &complete,
+                &mut self.agent_output_mode,
+                codex_markers,
+                copilot_stats,
+                &mut state.copilot_stats,
+            );
+            if let Some(text) = classified {
+                visible.push_str(&text);
+            }
+        }
+
+        // Show the fragment now if it provably can't become a marker line;
+        // otherwise hold it for the next chunk (or the exit flush). The raw
+        // tail stays even after pre-emission so a later `\r`, backspace, or
+        // split escape can retract/rewrite this line.
+        if !state.tail.is_empty()
+            && self.agent_output_mode != AgentOutputMode::Hidden
+            && state.emitted_len == 0
+            && state.copilot_stats.is_empty()
+        {
+            let displayable = clean_terminal_output(&state.tail).filter(|text| {
+                !partial_line_may_become_marker(text.trim(), codex_markers, copilot_stats)
+            });
+            if let Some(text) = displayable {
+                visible.push_str(&text);
+                state.emitted_len = text.chars().count();
+            }
+        }
+
+        if state.has_pending() {
+            self.pty_line_buffers.insert(session_id.to_string(), state);
+        }
+
+        self.flush_pty_visible(&mut visible, force_emit_visible);
+    }
+
+    /// A session's exit finalizes its held fragment: EOF ends the line, so
+    /// classify it as a complete line and surface it if it's assistant
+    /// prose — a reply whose final line lacks a trailing newline must not
+    /// be eaten (#471). Kill paths surface any complete candidate rows but
+    /// still drop the cancelled turn's unfinished raw line.
+    fn flush_pty_line_buffer(&mut self, session_id: &str) {
+        let Some(mut state) = self.pty_line_buffers.remove(session_id) else {
+            return;
+        };
+        let codex_markers = self.active_session_emits_codex_markers();
+        let copilot_stats = self.active_session_emits_copilot_stats();
+        let mut visible = String::new();
+
+        if !state.tail.is_empty() && state.emitted_len == 0 {
+            if let Some(text) = human_facing_pty_output(
+                &state.tail,
+                &mut self.agent_output_mode,
+                codex_markers,
+                copilot_stats,
+                &mut state.copilot_stats,
+            ) {
+                visible.push_str(&text);
+            }
+        }
+        if let Some(text) = state.copilot_stats.finish_at_exit() {
+            visible.push_str(&text);
+        }
+        self.flush_pty_visible(&mut visible, false);
+    }
+
+    fn flush_pty_candidate_on_kill(&mut self, session_id: &str) {
+        let Some(mut state) = self.pty_line_buffers.remove(session_id) else {
+            return;
+        };
+        if !state.copilot_stats.is_empty() {
+            self.emit_agent_text(&state.copilot_stats.take_visible());
+        }
+    }
+
     fn push_event_message(&mut self, event: &store::EventRecord) {
         // Drop events from sessions we've decided to hide (today: failed
         // sessions whose stale-id we already auto-recovered from). Clear
@@ -1713,6 +2261,10 @@ impl App {
         if self.suppressed_session_ids.contains(&event.session_id) {
             if matches!(event.kind.as_str(), "exit" | "kill") {
                 self.suppressed_session_ids.remove(&event.session_id);
+                // The suppressed session may have buffered PTY state before
+                // it was hidden; its terminal event is the last chance to
+                // reclaim that memory (#471).
+                self.pty_line_buffers.remove(&event.session_id);
             }
             return;
         }
@@ -1750,19 +2302,13 @@ impl App {
                         self.dispatch_stream_json_output(&event.session_id, &data);
                         return;
                     }
-                    let sender = self.active_agent_label().to_string();
-                    if let Some(text) =
-                        human_facing_agent_output(&data, &mut self.agent_output_mode)
-                    {
-                        if self.streaming_mode.is_live() {
-                            self.push_or_append_agent_message(&sender, &text);
-                        } else {
-                            self.buffer_pending_agent_output(&sender, &text);
-                        }
-                    }
+                    self.dispatch_pty_output(&event.session_id, &data);
                 }
             }
             "exit" => {
+                // Finalize any held partial line before draining the
+                // batched buffer: EOF completes the line (#471).
+                self.flush_pty_line_buffer(&event.session_id);
                 self.flush_pending_agent_buffer();
                 let status =
                     event_payload_text(event, "status").unwrap_or_else(|| "exited".to_string());
@@ -1771,7 +2317,12 @@ impl App {
                 if let (Some(call_id), Some(home)) =
                     (self.active_call_id.take(), self.coven_home.as_deref())
                 {
-                    let call_status = if status == "0" || status == "success" {
+                    // The daemon's exit event writes `status` as
+                    // `"completed"` / `"failed"` (pty_runner wait results via
+                    // `record_exit_event`), so match that vocabulary exactly
+                    // (#467). Anything other than a clean completion counts
+                    // as failed.
+                    let call_status = if status == "completed" {
                         crate::coven_calls::CovenCallStatus::Completed
                     } else {
                         crate::coven_calls::CovenCallStatus::Failed
@@ -1804,6 +2355,10 @@ impl App {
                 self.push_system_message(&format!("Session {status}."));
             }
             "kill" => {
+                // A cancelled turn's incomplete raw line is noise, but a
+                // bounded Copilot candidate contains complete cleaned lines
+                // and must fail open instead of disappearing.
+                self.flush_pty_candidate_on_kill(&event.session_id);
                 self.flush_pending_agent_buffer();
                 // Delegation call was cancelled by a kill event.
                 if let (Some(call_id), Some(home)) =
@@ -1911,6 +2466,7 @@ impl App {
                 MessageRole::User => "**You**",
                 MessageRole::Agent => &format!("**{}**", msg.sender),
                 MessageRole::System => "*system*",
+                MessageRole::Tool => "*tool*",
             };
             content.push_str(&format!(
                 "{} ({})\n{}\n\n---\n\n",
@@ -2151,18 +2707,33 @@ fn is_api_mismatch_error(message: &str) -> bool {
     message.contains("Coven daemon API mismatch")
 }
 
-// ── Discover agents from built-in harnesses ────────────────────────────────
+// ── Discover agents from configured harnesses ──────────────────────────────
 
 pub(super) fn discover_agents() -> Vec<AgentInfo> {
-    harness::built_in_harnesses()
+    // Configured = built-ins plus installed adapter manifests (grok, hermes,
+    // opencode, …), so every runtime `coven run` accepts is selectable in
+    // chat. A manifest load error falls back to built-ins only — the launch
+    // path re-reads the manifests and surfaces the error with full context.
+    harness::configured_chat_harnesses()
+        .unwrap_or_else(|_| harness::built_in_chat_harnesses())
         .into_iter()
         .map(|h| AgentInfo {
-            id: h.id.to_string(),
-            label: h.label.to_string(),
-            harness: h.id.to_string(),
-            available: h.available,
+            id: h.summary.id.to_string(),
+            label: h.summary.label.to_string(),
+            harness: h.summary.id.to_string(),
+            available: h.summary.available,
+            supports_chat_resume: h.supports_chat_resume,
         })
         .collect()
+}
+
+fn doctor_harness_inventory(
+    configured: anyhow::Result<Vec<harness::HarnessSummary>>,
+) -> (Vec<harness::HarnessSummary>, Option<String>) {
+    match configured {
+        Ok(harnesses) => (harnesses, None),
+        Err(error) => (harness::built_in_harnesses(), Some(error.to_string())),
+    }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -2219,13 +2790,6 @@ fn short_session_id(session_id: &str) -> String {
 fn should_keep_launch_inline(plan: &CastPlan) -> bool {
     !matches!(plan.intent, CastIntent::NaturalSpell { .. })
         || !matches!(plan.risk(), CastRisk::Safe)
-}
-
-/// Whether a chat turn launched against this harness should reuse the prior
-/// turn's conversation via the harness CLI's session-resume mechanism. See
-/// `docs/chat-persistence.md` for the per-harness mechanics.
-fn harness_supports_chat_resume(harness: &str) -> bool {
-    matches!(harness, "claude" | "codex" | "copilot" | "grok")
 }
 
 /// Whether `data` (a chunk of harness output) indicates the harness rejected
@@ -2355,22 +2919,128 @@ fn event_payload_text(event: &store::EventRecord, field: &str) -> Option<String>
         .map(ToOwned::to_owned)
 }
 
-fn clean_terminal_output(data: &str) -> Option<String> {
+/// Pick a one-line human summary of a `tool_use` input for the ⚒ indicator.
+/// Prefers the conventional argument keys harnesses use; otherwise falls
+/// back to the first string value. Never returns raw JSON (#472).
+fn summarize_tool_input(input: Option<&serde_json::Value>) -> Option<String> {
+    const SUMMARY_KEYS: &[&str] = &[
+        "command",
+        "file_path",
+        "path",
+        "pattern",
+        "description",
+        "url",
+        "query",
+    ];
+    let object = input?.as_object()?;
+    let raw = SUMMARY_KEYS
+        .iter()
+        .find_map(|key| object.get(*key).and_then(serde_json::Value::as_str))
+        .or_else(|| object.values().find_map(serde_json::Value::as_str))?;
+    let flat = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.is_empty() {
+        return None;
+    }
+    Some(truncate_with_ellipsis(&flat, 80))
+}
+
+/// Truncate to `max_chars` characters, replacing the tail with a single `…`.
+/// Char-based so multi-byte input can't split a codepoint.
+fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut truncated: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    truncated.push('\u{2026}');
+    truncated
+}
+
+/// Separator that tops `existing` up to a blank line before a new
+/// assistant segment is appended (#470): nothing when the content is
+/// empty (no leading separator) or already ends with a blank line, one
+/// newline when it ends mid-paragraph on a single newline, otherwise a
+/// full paragraph break.
+fn segment_separator(existing: &str) -> &'static str {
+    if existing.is_empty() || existing.ends_with("\n\n") {
+        ""
+    } else if existing.ends_with('\n') {
+        "\n"
+    } else {
+        "\n\n"
+    }
+}
+
+fn take_chars(text: &str, count: usize) -> String {
+    text.chars().take(count).collect()
+}
+
+fn skip_chars(text: &str, count: usize) -> String {
+    text.chars().skip(count).collect()
+}
+
+fn common_prefix_chars(left: &str, right: &str) -> usize {
+    left.chars()
+        .zip(right.chars())
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn truncate_suffix_chars(text: &mut String, count: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    let char_count = text.chars().count();
+    let remove_count = count.min(char_count);
+    let keep_count = char_count - remove_count;
+    if keep_count == 0 {
+        text.clear();
+    } else if let Some((byte_idx, _)) = text.char_indices().nth(keep_count) {
+        text.truncate(byte_idx);
+    }
+    remove_count
+}
+
+fn clean_terminal_output_text(data: &str) -> String {
     let mut output = String::new();
     let mut chars = data.chars().peekable();
     while let Some(ch) = chars.next() {
         match ch {
             '\x1b' => skip_escape_sequence(&mut chars),
-            '\r' => {}
+            '\r' => match chars.peek() {
+                // `\r\n` is a plain line ending — normalize to `\n`.
+                Some('\n') => {
+                    chars.next();
+                    output.push('\n');
+                }
+                // A bare `\r` returns to column 0 so the next frame
+                // overwrites the current line (progress bars, spinners).
+                // Keep only the final frame by discarding the current
+                // line (#469).
+                Some(_) => match output.rfind('\n') {
+                    Some(idx) => output.truncate(idx + 1),
+                    None => output.clear(),
+                },
+                // A chunk-final `\r` may be half of a `\r\n` split across
+                // PTY reads — drop it rather than eat the line.
+                None => {}
+            },
             '\n' | '\t' => output.push(ch),
             '\x08' => {
-                output.pop();
+                // Backspace never crosses a line boundary on a real
+                // terminal — keep `\n` intact (#469).
+                if !output.is_empty() && !output.ends_with('\n') {
+                    output.pop();
+                }
             }
             ch if ch.is_control() => {}
             ch => output.push(ch),
         }
     }
+    output
+}
 
+fn clean_terminal_output(data: &str) -> Option<String> {
+    let output = clean_terminal_output_text(data);
     // Newlines carry paragraph-break structure even when nothing visible
     // surrounds them, so keep any chunk that has a newline OR any
     // non-whitespace char. Drop only space/tab-only or fully empty chunks —
@@ -2391,10 +3061,7 @@ fn human_facing_agent_output(data: &str, mode: &mut AgentOutputMode) -> Option<S
             *mode = AgentOutputMode::Assistant;
             continue;
         }
-        if is_hidden_transcript_marker(marker)
-            || is_codex_metadata_line(marker)
-            || is_copilot_stats_line(marker)
-        {
+        if is_hidden_transcript_marker(marker) || is_codex_metadata_line(marker) {
             *mode = AgentOutputMode::Hidden;
             continue;
         }
@@ -2407,6 +3074,122 @@ fn human_facing_agent_output(data: &str, mode: &mut AgentOutputMode) -> Option<S
 
     let has_structure = visible.chars().any(|ch| ch == '\n' || !ch.is_whitespace());
     has_structure.then_some(visible)
+}
+
+/// Harnesses without Codex transcript markers or Copilot's known terminal
+/// trailer are plain terminal prose.
+fn human_facing_plain_output(data: &str) -> Option<String> {
+    clean_terminal_output(data)
+}
+
+fn human_facing_copilot_output(
+    data: &str,
+    candidate: &mut CopilotStatsCandidate,
+) -> Option<String> {
+    let cleaned = clean_terminal_output(data)?;
+    let mut visible = String::new();
+
+    for raw_line in cleaned.split_inclusive('\n') {
+        candidate.push_line(raw_line, &mut visible);
+    }
+
+    let has_structure = visible.chars().any(|ch| ch == '\n' || !ch.is_whitespace());
+    has_structure.then_some(visible)
+}
+
+fn human_facing_pty_output(
+    data: &str,
+    mode: &mut AgentOutputMode,
+    codex_markers: bool,
+    copilot_stats: bool,
+    candidate: &mut CopilotStatsCandidate,
+) -> Option<String> {
+    if codex_markers {
+        human_facing_agent_output(data, mode)
+    } else if copilot_stats {
+        human_facing_copilot_output(data, candidate)
+    } else {
+        human_facing_plain_output(data)
+    }
+}
+
+/// True when `fragment` — the cleaned, trimmed text of a line that hasn't
+/// seen its newline yet — could still classify as a marker/stats line once
+/// the rest of the line arrives. Such fragments are held back instead of
+/// shown or classified early: judging them as complete lines is exactly
+/// the misread #471 fixes (prose split right after `user` flipped the
+/// filter to Hidden; a `codex` marker split as `cod`/`ex` was missed).
+fn partial_line_may_become_marker(
+    fragment: &str,
+    codex_markers: bool,
+    copilot_stats: bool,
+) -> bool {
+    // A fragment can still come to *start with* `pattern` while it's a
+    // prefix of the pattern or already carries the pattern as its head.
+    fn may_match_prefix_pattern(fragment: &str, pattern: &str) -> bool {
+        if fragment.len() < pattern.len() {
+            pattern.starts_with(fragment)
+        } else {
+            fragment.starts_with(pattern)
+        }
+    }
+
+    if copilot_stats {
+        // Hold a Copilot label head until enough of the line is present to
+        // rule out the 3+-space stats gutter.
+        const STATS_LABELS: [&str; 4] = ["Changes", "Requests", "Tokens", "Resume"];
+        let stats_open = STATS_LABELS.iter().any(|label| {
+            if fragment.len() < label.len() {
+                label.starts_with(fragment)
+            } else {
+                fragment
+                    .strip_prefix(label)
+                    .is_some_and(|rest| rest.chars().take(3).all(|c| c == ' '))
+            }
+        });
+        if stats_open {
+            return true;
+        }
+    }
+    if !codex_markers {
+        return false;
+    }
+
+    // Exact-match markers can only still be reached while the fragment is
+    // a prefix of one (the empty fragment counts — hold until it grows).
+    const EXACT_MARKERS: [&str; 11] = [
+        "codex",
+        "assistant",
+        "user",
+        "exec",
+        "tool",
+        "bash",
+        "shell",
+        "system",
+        "Completed",
+        "tokens used",
+        "--------",
+    ];
+    if EXACT_MARKERS.iter().any(|m| m.starts_with(fragment)) {
+        return true;
+    }
+    const PREFIX_PATTERNS: [&str; 12] = [
+        "hook:",
+        "succeeded in ",
+        "failed in ",
+        "OpenAI Codex v",
+        "workdir:",
+        "model:",
+        "provider:",
+        "approval:",
+        "sandbox:",
+        "reasoning effort:",
+        "reasoning summaries:",
+        "session id:",
+    ];
+    PREFIX_PATTERNS
+        .iter()
+        .any(|p| may_match_prefix_pattern(fragment, p))
 }
 
 fn is_assistant_marker(line: &str) -> bool {
@@ -2437,32 +3220,30 @@ fn is_codex_metadata_line(line: &str) -> bool {
         || line.starts_with("session id:")
 }
 
-/// One-shot `copilot --prompt` runs close with a columnar stats block on
-/// stderr (`Changes    +0 -0`, `Requests   1 Premium (8s)`,
-/// `Tokens     ↑ 28.0k … • ↓ 43 …`, `Resume     copilot --resume=<id>`),
-/// which the PTY merges into the transcript. Recognize those exact column
-/// shapes — label, a 3+-space gutter, then a value with a distinctive lead —
-/// so chat stays prose-only. Anything looser risks hiding assistant text
-/// that merely starts with the same word.
-fn is_copilot_stats_line(line: &str) -> bool {
+/// Classify the strict column shape of one row in Copilot's four-line
+/// terminal stats trailer.
+fn copilot_stats_line_kind(line: &str) -> Option<CopilotStatsLine> {
     fn column<'a>(line: &'a str, label: &str) -> Option<&'a str> {
         line.strip_prefix(label)?
             .strip_prefix("   ")
             .map(str::trim_start)
     }
-    if let Some(value) = column(line, "Changes") {
-        return value.starts_with('+');
+
+    if column(line, "Changes").is_some_and(|value| value.starts_with('+')) {
+        return Some(CopilotStatsLine::Changes);
     }
-    if let Some(value) = column(line, "Requests") {
-        return value.chars().next().is_some_and(|c| c.is_ascii_digit());
+    if column(line, "Requests")
+        .is_some_and(|value| value.chars().next().is_some_and(|c| c.is_ascii_digit()))
+    {
+        return Some(CopilotStatsLine::Requests);
     }
-    if let Some(value) = column(line, "Tokens") {
-        return value.starts_with('↑');
+    if column(line, "Tokens").is_some_and(|value| value.starts_with('↑')) {
+        return Some(CopilotStatsLine::Tokens);
     }
-    if let Some(value) = column(line, "Resume") {
-        return value.starts_with("copilot --resume=");
+    if column(line, "Resume").is_some_and(|value| value.starts_with("copilot --resume=")) {
+        return Some(CopilotStatsLine::Resume);
     }
-    false
+    None
 }
 
 fn skip_escape_sequence<I>(chars: &mut std::iter::Peekable<I>)
@@ -2532,6 +3313,7 @@ mod tests {
             label: id.to_string(),
             harness: id.to_string(),
             available,
+            supports_chat_resume: matches!(id, "claude" | "codex" | "copilot"),
         }
     }
 
@@ -2731,6 +3513,29 @@ mod tests {
         }
     }
 
+    fn terminal_event(seq: i64, session_id: &str, kind: &str) -> EventRecord {
+        EventRecord {
+            seq,
+            id: format!("event-{seq}"),
+            session_id: session_id.to_string(),
+            kind: kind.to_string(),
+            payload_json: serde_json::json!({
+                "status": if kind == "exit" { "completed" } else { "killed" }
+            })
+            .to_string(),
+            created_at: "2026-07-26T00:00:00Z".to_string(),
+        }
+    }
+
+    fn agent_text(app: &App) -> String {
+        app.messages
+            .iter()
+            .filter(|message| matches!(message.role, MessageRole::Agent))
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Build a stream-json `{"type":"system","subtype":"stderr","text":...}\n`
     /// envelope, the wire format the daemon emits for piped-child stderr
     /// lines. Stale-id detection in stream-mode runs ONLY against the
@@ -2828,6 +3633,42 @@ mod tests {
         assert!(
             !transcript.contains("Run `coven doctor`"),
             "doctor should run inline, not hand the user back to the shell:\n{transcript}"
+        );
+    }
+
+    #[test]
+    fn doctor_harness_inventory_preserves_manifest_errors_with_builtin_fallback() {
+        let (harnesses, error) =
+            doctor_harness_inventory(Err(anyhow::anyhow!("manifest.json: invalid JSON")));
+
+        assert!(
+            !harnesses.is_empty(),
+            "built-in fallback must remain available"
+        );
+        assert_eq!(
+            error.as_deref(),
+            Some("manifest.json: invalid JSON"),
+            "doctor must retain the configured-harness error for display"
+        );
+    }
+
+    #[test]
+    fn conversation_hint_uses_discovered_resume_support_without_reloading_manifests() {
+        let mut app = app_with_agents(vec![AgentInfo {
+            id: "custom-resume".to_string(),
+            label: "Custom Resume".to_string(),
+            harness: "custom-resume".to_string(),
+            available: true,
+            supports_chat_resume: true,
+        }]);
+        app.harness_conversation_ids
+            .insert("custom-resume".to_string(), "persisted-session".to_string());
+
+        assert_eq!(
+            app.conversation_hint_for_harness("custom-resume"),
+            Some(harness::ConversationHint::Resume {
+                id: "persisted-session".to_string()
+            })
         );
     }
 
@@ -3425,6 +4266,353 @@ mod tests {
         assert!(!app.is_responding, "result event must clear is_responding");
     }
 
+    /// Regression for #468: a stream turn that dies (rate limit, auth expiry,
+    /// max-turns abort) emits `{"type":"result","is_error":true,...}` — the
+    /// user must see why the reply stopped, not just a spinner that quietly
+    /// disappears.
+    #[test]
+    fn stream_error_result_surfaces_failure_to_the_user() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        let result_chunk = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"error":"rate limited by upstream"}"#
+            .to_string()
+            + "\n";
+        app.push_event_message(&output_event(1, &session_id, &result_chunk));
+
+        assert!(!app.is_responding, "error result must clear is_responding");
+        assert!(
+            app.messages.iter().any(|m| {
+                matches!(m.role, MessageRole::System)
+                    && m.content.contains("Reply failed")
+                    && m.content.contains("error_during_execution")
+                    && m.content.contains("rate limited by upstream")
+            }),
+            "error result must surface the failure subtype and detail: {:?}",
+            app.messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn stream_error_result_without_detail_still_reports_the_subtype() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        let result_chunk =
+            r#"{"type":"result","subtype":"error_max_turns","is_error":true}"#.to_string() + "\n";
+        app.push_event_message(&output_event(1, &session_id, &result_chunk));
+
+        assert!(
+            app.messages.iter().any(|m| {
+                matches!(m.role, MessageRole::System)
+                    && m.content.contains("Reply failed")
+                    && m.content.contains("error_max_turns")
+            }),
+            "error result without an error field must still name the subtype"
+        );
+    }
+
+    #[test]
+    fn stream_success_result_adds_no_transcript_noise() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+        let before = app.messages.len();
+
+        let result_chunk = r#"{"type":"result","subtype":"success","is_error":false,"error":null}"#
+            .to_string()
+            + "\n";
+        app.push_event_message(&output_event(1, &session_id, &result_chunk));
+
+        assert!(!app.is_responding);
+        assert_eq!(
+            app.messages.len(),
+            before,
+            "a clean result must stay silent — no per-turn transcript noise"
+        );
+    }
+
+    /// Batched mode: the held-back partial output must flush BEFORE the
+    /// failure notice so the user reads what arrived, then why it stopped.
+    #[test]
+    fn batched_error_result_flushes_partial_output_before_the_failure_notice() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.handle_slash_command("/stream off");
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        let text_chunk =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"partial answer"}]}}"#
+                .to_string()
+                + "\n";
+        app.push_event_message(&output_event(1, &session_id, &text_chunk));
+
+        let result_chunk =
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"error":"boom"}"#
+                .to_string() + "\n";
+        app.push_event_message(&output_event(2, &session_id, &result_chunk));
+
+        let agent_idx = app
+            .messages
+            .iter()
+            .position(|m| {
+                matches!(m.role, MessageRole::Agent) && m.content.contains("partial answer")
+            })
+            .expect("batched output must flush on the error result");
+        let failure_idx = app
+            .messages
+            .iter()
+            .position(|m| {
+                matches!(m.role, MessageRole::System) && m.content.contains("Reply failed")
+            })
+            .expect("failure notice must be pushed");
+        assert!(
+            agent_idx < failure_idx,
+            "partial output must appear before the failure notice"
+        );
+    }
+
+    /// Regression for #472: tool_use blocks were skipped entirely, so long
+    /// tool phases showed only a spinner. A compact dim indicator must
+    /// appear — never the raw input JSON.
+    #[test]
+    fn stream_tool_use_shows_compact_indicator() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        let chunk = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Let me check."},{"type":"tool_use","id":"tu_1","name":"bash","input":{"command":"cargo test --workspace"}}]}}"#
+            .to_string()
+            + "\n";
+        app.push_event_message(&output_event(1, &session_id, &chunk));
+
+        let text_idx = app
+            .messages
+            .iter()
+            .position(|m| {
+                matches!(m.role, MessageRole::Agent) && m.content.contains("Let me check.")
+            })
+            .expect("assistant text must still render");
+        let tool_idx = app
+            .messages
+            .iter()
+            .position(|m| {
+                matches!(m.role, MessageRole::Tool)
+                    && m.content.contains("\u{2692} bash")
+                    && m.content.contains("cargo test --workspace")
+            })
+            .expect(
+                "tool_use must render a compact indicator with the tool name and input summary",
+            );
+        assert!(
+            text_idx < tool_idx,
+            "indicator must follow the text block that preceded it"
+        );
+        let indicator = &app.messages[tool_idx].content;
+        assert!(
+            !indicator.contains("\"command\"") && !indicator.contains('{'),
+            "indicator must summarize input, never dump raw JSON: {indicator}"
+        );
+    }
+
+    #[test]
+    fn stream_tool_use_indicator_truncates_long_input() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        let long_command = "x".repeat(300);
+        let chunk = format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"tu_1","name":"bash","input":{{"command":"{long_command}"}}}}]}}}}"#
+        ) + "\n";
+        app.push_event_message(&output_event(1, &session_id, &chunk));
+
+        let indicator = app
+            .messages
+            .iter()
+            .find(|m| matches!(m.role, MessageRole::Tool))
+            .expect("indicator must render");
+        assert!(
+            indicator.content.chars().count() < 100,
+            "long tool input must be truncated, got {} chars",
+            indicator.content.chars().count()
+        );
+        assert!(
+            indicator.content.ends_with('\u{2026}'),
+            "truncated summary must end with an ellipsis: {}",
+            indicator.content
+        );
+    }
+
+    /// Regression for #472: failed tool results (is_error:true) were
+    /// completely invisible — the user must see that a tool call failed.
+    #[test]
+    fn stream_tool_result_error_surfaces_failure() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        let use_chunk = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_1","name":"bash","input":{"command":"cargo build"}}]}}"#
+            .to_string()
+            + "\n";
+        app.push_event_message(&output_event(1, &session_id, &use_chunk));
+        let result_chunk = r#"{"type":"tool_result","tool_use_id":"tu_1","is_error":true,"content":[{"type":"text","text":"error: could not compile `coven-cli`"}]}"#
+            .to_string()
+            + "\n";
+        app.push_event_message(&output_event(2, &session_id, &result_chunk));
+
+        assert!(
+            app.messages.iter().any(|m| {
+                matches!(m.role, MessageRole::Tool)
+                    && m.content.contains('\u{26A0}')
+                    && m.content.contains("bash failed")
+                    && m.content.contains("could not compile")
+            }),
+            "error tool_result must surface the tool name and detail: {:?}",
+            app.messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn stream_tool_result_error_without_known_name_still_surfaces() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        // No prior tool_use event (e.g. it was lost) — the failure must
+        // still be visible under a generic label.
+        let result_chunk = r#"{"type":"tool_result","tool_use_id":"tu_unknown","is_error":true,"content":[{"type":"text","text":"permission denied"}]}"#
+            .to_string()
+            + "\n";
+        app.push_event_message(&output_event(1, &session_id, &result_chunk));
+
+        assert!(
+            app.messages.iter().any(|m| {
+                matches!(m.role, MessageRole::Tool)
+                    && m.content.contains("tool failed")
+                    && m.content.contains("permission denied")
+            }),
+            "error tool_result without a known name must still surface"
+        );
+    }
+
+    #[test]
+    fn stream_tool_result_success_stays_silent() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        let use_chunk = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_1","name":"bash","input":{"command":"ls"}}]}}"#
+            .to_string()
+            + "\n";
+        app.push_event_message(&output_event(1, &session_id, &use_chunk));
+        let before = app.messages.len();
+
+        let result_chunk = r#"{"type":"tool_result","tool_use_id":"tu_1","is_error":false,"content":[{"type":"text","text":"Cargo.toml\nsrc"}]}"#
+            .to_string()
+            + "\n";
+        app.push_event_message(&output_event(2, &session_id, &result_chunk));
+
+        assert_eq!(
+            app.messages.len(),
+            before,
+            "successful tool results must not add transcript noise beyond the indicator"
+        );
+    }
+
+    /// Batched mode holds back progressive output, so ⚒ indicators are
+    /// suppressed — but tool *errors* must still surface immediately, after
+    /// flushing any held-back text so the transcript reads in order.
+    #[test]
+    fn batched_mode_suppresses_indicators_but_surfaces_tool_errors() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.handle_slash_command("/stream off");
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        let chunk = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"partial answer"},{"type":"tool_use","id":"tu_1","name":"bash","input":{"command":"ls"}}]}}"#
+            .to_string()
+            + "\n";
+        app.push_event_message(&output_event(1, &session_id, &chunk));
+
+        assert!(
+            !app.messages
+                .iter()
+                .any(|m| matches!(m.role, MessageRole::Tool) && m.content.contains('\u{2692}')),
+            "batched mode must not stream tool indicators"
+        );
+
+        let result_chunk = r#"{"type":"tool_result","tool_use_id":"tu_1","is_error":true,"content":[{"type":"text","text":"boom"}]}"#
+            .to_string()
+            + "\n";
+        app.push_event_message(&output_event(2, &session_id, &result_chunk));
+
+        let agent_idx = app
+            .messages
+            .iter()
+            .position(|m| {
+                matches!(m.role, MessageRole::Agent) && m.content.contains("partial answer")
+            })
+            .expect("held-back text must flush before the tool failure surfaces");
+        let warn_idx = app
+            .messages
+            .iter()
+            .position(|m| matches!(m.role, MessageRole::Tool) && m.content.contains("bash failed"))
+            .expect("tool error must surface even in batched mode");
+        assert!(
+            agent_idx < warn_idx,
+            "flushed text must appear before the tool failure notice"
+        );
+    }
+
     #[test]
     fn stream_json_assistant_split_across_two_output_chunks_still_renders_correctly() {
         let client = RecordingChatClient::default();
@@ -3458,6 +4646,225 @@ mod tests {
                 .iter()
                 .any(|m| m.content.contains("Hello from split.")),
             "rejoined line must parse and render after the trailing newline arrives"
+        );
+    }
+
+    /// Regression for #470: assistant prose from before and after a tool
+    /// call arrives as two `assistant` events. They must be joined with a
+    /// paragraph break, not glued into "…the file.Now I see…".
+    #[test]
+    fn stream_json_separate_assistant_events_get_a_paragraph_break() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        let first =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"I'll read the file."}]}}"#
+                .to_string()
+                + "\n";
+        let second =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Now I see the issue."}]}}"#
+                .to_string()
+                + "\n";
+        app.push_event_message(&output_event(1, &session_id, &first));
+        app.push_event_message(&output_event(2, &session_id, &second));
+
+        let agent_messages: Vec<_> = app
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, MessageRole::Agent))
+            .collect();
+        assert_eq!(agent_messages.len(), 1, "both segments share one bubble");
+        assert_eq!(
+            agent_messages[0].content, "I'll read the file.\n\nNow I see the issue.",
+            "separate assistant events must be separated by a blank line"
+        );
+    }
+
+    /// The first segment of a bubble must render exactly as sent — the
+    /// segment boundary must not inject a leading separator (#470).
+    #[test]
+    fn stream_json_first_segment_gets_no_leading_separator() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        let chunk =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Only segment."}]}}"#
+                .to_string() + "\n";
+        app.push_event_message(&output_event(1, &session_id, &chunk));
+
+        let agent = app
+            .messages
+            .iter()
+            .find(|m| matches!(m.role, MessageRole::Agent))
+            .expect("assistant text must render");
+        assert_eq!(agent.content, "Only segment.");
+    }
+
+    /// Multiple text blocks inside ONE assistant event are separate
+    /// segments and need the same paragraph break (#470).
+    #[test]
+    fn stream_json_text_blocks_within_one_assistant_event_get_a_paragraph_break() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        let chunk = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"First thought."},{"type":"text","text":"Second thought."}]}}"#
+            .to_string()
+            + "\n";
+        app.push_event_message(&output_event(1, &session_id, &chunk));
+
+        let agent = app
+            .messages
+            .iter()
+            .find(|m| matches!(m.role, MessageRole::Agent))
+            .expect("assistant text must render");
+        assert_eq!(agent.content, "First thought.\n\nSecond thought.");
+    }
+
+    /// Prose around an inline tool_use block renders as two separate
+    /// bubbles split by the ⚒ indicator (#472) — still no gluing (#470).
+    #[test]
+    fn stream_json_prose_around_inline_tool_use_stays_split_by_the_indicator() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        let chunk = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"First thought."},{"type":"tool_use","name":"read_file","input":{}},{"type":"text","text":"Second thought."}]}}"#
+            .to_string()
+            + "\n";
+        app.push_event_message(&output_event(1, &session_id, &chunk));
+
+        let rendered: Vec<(&MessageRole, &str)> = app
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, MessageRole::Agent | MessageRole::Tool))
+            .map(|m| (&m.role, m.content.as_str()))
+            .collect();
+        assert_eq!(rendered.len(), 3, "agent, tool indicator, agent");
+        assert!(matches!(rendered[0].0, MessageRole::Agent));
+        assert_eq!(rendered[0].1, "First thought.");
+        assert!(matches!(rendered[1].0, MessageRole::Tool));
+        assert!(rendered[1].1.starts_with('\u{2692}'));
+        assert!(matches!(rendered[2].0, MessageRole::Agent));
+        assert_eq!(rendered[2].1, "Second thought.");
+    }
+
+    /// If a segment already ends with a blank line, the boundary must not
+    /// stack more newlines on top of it (#470).
+    #[test]
+    fn stream_json_segment_break_is_not_duplicated_when_text_already_ends_blank() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        let first =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Intro.\n\n"}]}}"#
+                .to_string()
+                + "\n";
+        let second =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Next."}]}}"#
+                .to_string()
+                + "\n";
+        app.push_event_message(&output_event(1, &session_id, &first));
+        app.push_event_message(&output_event(2, &session_id, &second));
+
+        let agent = app
+            .messages
+            .iter()
+            .find(|m| matches!(m.role, MessageRole::Agent))
+            .expect("assistant text must render");
+        assert_eq!(agent.content, "Intro.\n\nNext.");
+    }
+
+    /// Batched mode buffers events instead of appending to a live bubble;
+    /// the flushed message needs the same paragraph break between
+    /// assistant events as the live path (#470).
+    #[test]
+    fn batched_stream_json_assistant_events_get_a_paragraph_break() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_agent = Some(1); // claude
+        app.handle_slash_command("/stream off");
+        app.input = "hi".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        let session_id = app.active_session_id().expect("first launch").to_string();
+
+        let first =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"I'll read the file."}]}}"#
+                .to_string()
+                + "\n";
+        let second =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Now I see the issue."}]}}"#
+                .to_string()
+                + "\n";
+        app.push_event_message(&output_event(1, &session_id, &first));
+        app.push_event_message(&output_event(2, &session_id, &second));
+
+        let result_chunk =
+            r#"{"type":"result","subtype":"success","is_error":false}"#.to_string() + "\n";
+        app.push_event_message(&output_event(3, &session_id, &result_chunk));
+
+        let agent = app
+            .messages
+            .iter()
+            .find(|m| matches!(m.role, MessageRole::Agent))
+            .expect("batched output must flush on the result event");
+        assert_eq!(
+            agent.content, "I'll read the file.\n\nNow I see the issue.",
+            "batched events must get the same blank-line separator as live ones"
+        );
+    }
+
+    /// PTY chunks carry their own newlines; the #470 segment separator is
+    /// a stream-JSON concern and must never leak into PTY appends.
+    #[test]
+    fn pty_output_appends_get_no_segment_separator() {
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "codex",
+            "Existing",
+            "running",
+        ));
+        client.events.borrow_mut().extend([
+            output_event(1, "session-1", "Hello"),
+            output_event(2, "session-1", " world"),
+        ]);
+        let (mut app, _) = app_with_client(client);
+
+        app.handle_slash_command("/attach session-1");
+
+        let agent_messages: Vec<_> = app
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, MessageRole::Agent))
+            .collect();
+        assert_eq!(agent_messages.len(), 1);
+        assert_eq!(
+            agent_messages[0].content, "Hello world",
+            "PTY appends must coalesce verbatim, without injected separators"
         );
     }
 
@@ -3544,6 +4951,99 @@ mod tests {
         assert!(
             !app.stream_json_buffers.contains_key(&session_id),
             "exit must drop the per-session JSON buffer so it doesn't leak across the chat"
+        );
+    }
+
+    /// Regression for #467: the daemon's exit event writes `status` as
+    /// `"completed"` / `"failed"` (see `record_exit_event` in daemon.rs), so
+    /// the delegation-call resolution must key off that vocabulary. It used
+    /// to compare against `"0"` / `"success"`, which never match — every
+    /// cleanly-completed delegated call was recorded as failed.
+    #[test]
+    fn completed_exit_resolves_delegation_call_as_completed() {
+        let coven_home = tempfile::tempdir().unwrap();
+        let call_id = crate::coven_calls::emit_running(
+            coven_home.path(),
+            "caller-familiar",
+            "callee-familiar",
+            "do the task",
+            None,
+        )
+        .expect("seed running call");
+
+        let client = RecordingChatClient::default();
+        let agents = vec![agent("codex", true), agent("claude", true)];
+        let mut app = App::new_with_state(
+            agents,
+            Some(0),
+            Box::new(client),
+            Some(coven_home.path().to_path_buf()),
+        );
+        app.active_call_id = Some(call_id.clone());
+
+        app.push_event_message(&EventRecord {
+            seq: 1,
+            id: "event-exit".to_string(),
+            session_id: "session-1".to_string(),
+            kind: "exit".to_string(),
+            payload_json: serde_json::json!({ "status": "completed" }).to_string(),
+            created_at: "2026-05-19T00:00:00Z".to_string(),
+        });
+
+        let calls = crate::coven_calls::load_calls(coven_home.path()).expect("load calls");
+        let record = calls
+            .iter()
+            .find(|call| call.id == call_id)
+            .expect("call record survives");
+        assert_eq!(
+            record.status, "completed",
+            "a status:\"completed\" exit event must resolve the delegation call as completed"
+        );
+        assert!(
+            record.ended_at.is_some(),
+            "terminal resolution must stamp ended_at"
+        );
+    }
+
+    #[test]
+    fn failed_exit_resolves_delegation_call_as_failed() {
+        let coven_home = tempfile::tempdir().unwrap();
+        let call_id = crate::coven_calls::emit_running(
+            coven_home.path(),
+            "caller-familiar",
+            "callee-familiar",
+            "do the task",
+            None,
+        )
+        .expect("seed running call");
+
+        let client = RecordingChatClient::default();
+        let agents = vec![agent("codex", true), agent("claude", true)];
+        let mut app = App::new_with_state(
+            agents,
+            Some(0),
+            Box::new(client),
+            Some(coven_home.path().to_path_buf()),
+        );
+        app.active_call_id = Some(call_id.clone());
+
+        app.push_event_message(&EventRecord {
+            seq: 1,
+            id: "event-exit".to_string(),
+            session_id: "session-1".to_string(),
+            kind: "exit".to_string(),
+            payload_json: serde_json::json!({ "status": "failed" }).to_string(),
+            created_at: "2026-05-19T00:00:00Z".to_string(),
+        });
+
+        let calls = crate::coven_calls::load_calls(coven_home.path()).expect("load calls");
+        let record = calls
+            .iter()
+            .find(|call| call.id == call_id)
+            .expect("call record survives");
+        assert_eq!(
+            record.status, "failed",
+            "a status:\"failed\" exit event must resolve the delegation call as failed"
         );
     }
 
@@ -3825,50 +5325,839 @@ mod tests {
         ));
     }
 
+    // Chat-resume support is captured during agent discovery from each
+    // configured spec's declared continuity args; the hermetic coverage
+    // (built-ins, installed grok/opencode adapters, the coven-code carve-out)
+    // lives in `harness.rs`'s
+    // `chat_resume_support_is_driven_by_declared_continuity`.
+
+    const COPILOT_STATS_TRAILER: &str = concat!(
+        "Changes    +1 -1\n",
+        "Requests   1 Premium (8s)\n",
+        "Tokens     ↑ 28.0k (20.4k cached) • ↓ 32\n",
+        "Resume     copilot --resume=cb845dd4-234f-46a0-8e6a-7f15ce8170be\n",
+    );
+
     #[test]
-    fn chat_resume_covers_all_built_in_pty_harnesses() {
-        assert!(harness_supports_chat_resume("claude"));
-        assert!(harness_supports_chat_resume("codex"));
-        assert!(harness_supports_chat_resume("copilot"));
-        assert!(harness_supports_chat_resume("grok"));
-        assert!(!harness_supports_chat_resume("hermes"));
+    fn copilot_resume_shaped_prose_and_following_reply_stay_visible() {
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "copilot",
+            "Existing",
+            "running",
+        ));
+        client.events.borrow_mut().push(output_event(
+            1,
+            "session-1",
+            concat!(
+                "Use the saved command below.\n",
+                "Resume     copilot --resume=example\n",
+                "Then verify the result.\n",
+            ),
+        ));
+        let (mut app, _) = app_with_client(client);
+
+        app.handle_slash_command("/attach session-1");
+
+        assert_eq!(
+            agent_text(&app),
+            concat!(
+                "Use the saved command below.\n",
+                "Resume     copilot --resume=example\n",
+                "Then verify the result.\n",
+            )
+        );
+        assert_eq!(app.agent_output_mode, AgentOutputMode::Unknown);
     }
 
     #[test]
-    fn copilot_stats_lines_hide_from_chat_transcript() {
-        assert!(is_copilot_stats_line("Changes    +0 -0"));
-        assert!(is_copilot_stats_line("Requests   1 Premium (11s)"));
-        assert!(is_copilot_stats_line(
-            "Tokens     ↑ 28.0k (28.0k written) • ↓ 43 (28 reasoning)"
+    fn copilot_complete_stats_shape_followed_by_prose_is_visible_verbatim() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+
+        app.push_event_message(&output_event(
+            1,
+            "session-1",
+            &format!("{COPILOT_STATS_TRAILER}Explanation continues.\n"),
         ));
-        assert!(is_copilot_stats_line(
-            "Resume     copilot --resume=0ded81e6-36cc-4b36-bc11-42ef4a254c10"
+
+        assert_eq!(
+            agent_text(&app),
+            format!("{COPILOT_STATS_TRAILER}Explanation continues.\n")
+        );
+    }
+
+    #[test]
+    fn copilot_false_positive_split_across_chunks_stays_visible() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+
+        app.push_event_message(&output_event(1, "session-1", "Res"));
+        app.push_event_message(&output_event(
+            2,
+            "session-1",
+            "ume     copilot --resume=example\nLater prose.\n",
         ));
+
+        assert_eq!(
+            agent_text(&app),
+            "Resume     copilot --resume=example\nLater prose.\n"
+        );
+    }
+
+    #[test]
+    fn copilot_out_of_order_candidate_flushes_verbatim() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+        let out_of_order = concat!(
+            "Changes    +1 -1\n",
+            "Tokens     ↑ 28.0k (20.4k cached) • ↓ 32\n",
+        );
+
+        app.push_event_message(&output_event(1, "session-1", out_of_order));
+
+        assert_eq!(agent_text(&app), out_of_order);
+    }
+
+    #[test]
+    fn copilot_partial_stats_candidate_flushes_on_exit() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+
+        let partial = concat!("Changes    +1 -1\n", "Requests   1 Premium (8s)\n",);
+        app.push_event_message(&output_event(1, "session-1", partial));
+        assert!(agent_text(&app).is_empty());
+
+        app.push_event_message(&terminal_event(2, "session-1", "exit"));
+
+        assert_eq!(agent_text(&app), partial);
+    }
+
+    #[test]
+    fn copilot_complete_terminal_stats_trailer_is_hidden_on_exit() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+
+        app.push_event_message(&output_event(
+            1,
+            "session-1",
+            &format!("Answer.\n{COPILOT_STATS_TRAILER}"),
+        ));
+        assert_eq!(agent_text(&app), "Answer.\n");
+        assert!(app.pty_line_buffers.contains_key("session-1"));
+
+        app.push_event_message(&terminal_event(2, "session-1", "exit"));
+
+        assert_eq!(agent_text(&app), "Answer.\n");
+        assert!(!app.pty_line_buffers.contains_key("session-1"));
+    }
+
+    #[test]
+    fn kill_flushes_copilot_candidate_but_drops_the_unfinished_tail() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+        let candidate = concat!("Changes    +1 -1\n", "Requests   1 Premium (8s)\n",);
+
+        app.push_event_message(&output_event(
+            1,
+            "session-1",
+            &format!("{candidate}unfinished"),
+        ));
+        assert!(agent_text(&app).is_empty());
+
+        app.push_event_message(&terminal_event(2, "session-1", "kill"));
+
+        assert_eq!(agent_text(&app), candidate);
+        assert!(!agent_text(&app).contains("unfinished"));
+    }
+
+    #[test]
+    fn batched_kill_flushes_copilot_candidate_through_the_pending_sink() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.handle_slash_command("/stream off");
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+        app.is_responding = true;
+        let candidate = concat!("Changes    +1 -1\n", "Requests   1 Premium (8s)\n",);
+
+        app.push_event_message(&output_event(
+            1,
+            "session-1",
+            &format!("{candidate}unfinished"),
+        ));
+        assert!(agent_text(&app).is_empty());
+
+        app.push_event_message(&terminal_event(2, "session-1", "kill"));
+
+        assert_eq!(agent_text(&app), candidate);
+        assert!(!agent_text(&app).contains("unfinished"));
+    }
+
+    #[test]
+    fn batched_copilot_stats_shaped_prose_fails_open() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.handle_slash_command("/stream off");
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+        app.is_responding = true;
+        let reply = concat!(
+            "Changes    +1 -1\n",
+            "Requests   1 Premium (8s)\n",
+            "This table is part of the answer.\n",
+        );
+
+        app.push_event_message(&output_event(1, "session-1", reply));
+        app.push_event_message(&terminal_event(2, "session-1", "exit"));
+
+        assert_eq!(agent_text(&app), reply);
+    }
+
+    #[test]
+    fn stats_shaped_prose_is_visible_for_non_copilot_harnesses() {
+        for harness in ["codex", "claude", "grok", "custom"] {
+            let client = RecordingChatClient::default();
+            let (mut app, _) = app_with_client(client);
+            app.active_session_id = Some(format!("{harness}-session"));
+            app.active_session_harness = Some(harness.to_string());
+            let session_id = app.active_session_id.clone().expect("active session");
+            let transcript =
+                format!("assistant\n{COPILOT_STATS_TRAILER}This belongs to {harness}.\n");
+
+            app.push_event_message(&output_event(1, &session_id, &transcript));
+            app.push_event_message(&terminal_event(2, &session_id, "exit"));
+
+            let visible = agent_text(&app);
+            assert!(
+                visible.contains("Resume     copilot --resume="),
+                "{harness} must not run the Copilot trailer recognizer: {visible:?}"
+            );
+            assert!(
+                visible.contains(&format!("This belongs to {harness}.")),
+                "{harness} prose after stats-shaped text must stay visible: {visible:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn copilot_stats_classifier_requires_strict_row_shapes() {
+        assert_eq!(
+            copilot_stats_line_kind("Changes    +0 -0"),
+            Some(CopilotStatsLine::Changes)
+        );
+        assert_eq!(
+            copilot_stats_line_kind("Requests   1 Premium (11s)"),
+            Some(CopilotStatsLine::Requests)
+        );
+        assert_eq!(
+            copilot_stats_line_kind("Tokens     ↑ 28.0k (28.0k written) • ↓ 43 (28 reasoning)"),
+            Some(CopilotStatsLine::Tokens)
+        );
+        assert_eq!(
+            copilot_stats_line_kind(
+                "Resume     copilot --resume=0ded81e6-36cc-4b36-bc11-42ef4a254c10"
+            ),
+            Some(CopilotStatsLine::Resume)
+        );
         // Assistant prose that merely leads with a stats label must stay
         // visible: no column gutter, or the wrong value shape.
-        assert!(!is_copilot_stats_line(
-            "Changes to the API are listed below"
-        ));
-        assert!(!is_copilot_stats_line(
-            "Requests should be retried with backoff"
-        ));
-        assert!(!is_copilot_stats_line("Tokens are stored in the keychain"));
-        assert!(!is_copilot_stats_line(
-            "Resume     the deployment afterwards"
-        ));
-        assert!(!is_copilot_stats_line("Resume work on the parser"));
+        assert_eq!(
+            copilot_stats_line_kind("Changes to the API are listed below"),
+            None
+        );
+        assert_eq!(
+            copilot_stats_line_kind("Requests should be retried with backoff"),
+            None
+        );
+        assert_eq!(
+            copilot_stats_line_kind("Tokens are stored in the keychain"),
+            None
+        );
+        assert_eq!(
+            copilot_stats_line_kind("Resume     the deployment afterwards"),
+            None
+        );
+        assert_eq!(copilot_stats_line_kind("Resume work on the parser"), None);
     }
 
     #[test]
-    fn copilot_transcript_keeps_prose_and_drops_stats_block() {
-        let mut mode = AgentOutputMode::Unknown;
+    fn copilot_output_holds_a_complete_stats_candidate() {
+        let mut candidate = CopilotStatsCandidate::default();
         let transcript = "The fix is in `parser.rs`.\n\nChanges    +1 -1\nRequests   1 Premium (8s)\nTokens     ↑ 28.0k (20.4k cached) • ↓ 32\nResume     copilot --resume=cb845dd4-234f-46a0-8e6a-7f15ce8170be\n";
-        let visible =
-            human_facing_agent_output(transcript, &mut mode).expect("prose must stay visible");
+        let visible = human_facing_copilot_output(transcript, &mut candidate)
+            .expect("prose must stay visible");
         assert!(visible.contains("The fix is in `parser.rs`."));
         assert!(!visible.contains("Premium"));
         assert!(!visible.contains("--resume="));
         assert!(!visible.contains("↑"));
+        assert!(candidate.is_complete());
+        assert_eq!(candidate.finish_at_exit(), None);
+    }
+
+    /// Plain non-Codex/non-Copilot output has no role or trailer syntax.
+    #[test]
+    fn plain_output_keeps_marker_and_stats_shaped_prose() {
+        let transcript = "Run these:\nbash\nCompleted\nuser\nAll good.\nChanges    +1 -1\nRequests   1 Premium (8s)\n";
+        let visible = human_facing_plain_output(transcript).expect("prose must stay visible");
+        assert_eq!(visible, transcript);
+    }
+
+    /// Hold rules for chunk-split fragments (#471): a fragment is held only
+    /// while it could still turn into a marker/stats line once the rest of
+    /// its line arrives.
+    #[test]
+    fn partial_line_hold_rules_cover_markers_stats_and_prose() {
+        // Prefixes of codex markers (exact and starts_with shapes) hold.
+        assert!(partial_line_may_become_marker("cod", true, false));
+        assert!(partial_line_may_become_marker("codex", true, false));
+        assert!(partial_line_may_become_marker("user", true, false));
+        assert!(partial_line_may_become_marker("Comp", true, false));
+        assert!(partial_line_may_become_marker(
+            "succeeded in 0",
+            true,
+            false
+        ));
+        assert!(partial_line_may_become_marker("hook", true, false));
+        assert!(partial_line_may_become_marker("", true, false));
+        // Once the fragment can no longer match, it is shown immediately.
+        assert!(!partial_line_may_become_marker("codexy", true, false));
+        assert!(!partial_line_may_become_marker("user data", true, false));
+        assert!(!partial_line_may_become_marker(
+            "hello from daemon",
+            true,
+            false
+        ));
+        assert!(!partial_line_may_become_marker(
+            "successfully parsed",
+            true,
+            false
+        ));
+        // Stats labels hold only for Copilot until the gutter is ruled out.
+        assert!(partial_line_may_become_marker("Resume", false, true));
+        assert!(partial_line_may_become_marker("Changes   ", false, true));
+        assert!(partial_line_may_become_marker("Tokens    ↑ 2", false, true));
+        assert!(!partial_line_may_become_marker("Resume work", false, true));
+        assert!(!partial_line_may_become_marker(
+            "Tokens are stored",
+            false,
+            true
+        ));
+        // Neither syntax holds for an unrelated harness.
+        assert!(!partial_line_may_become_marker("cod", false, false));
+        assert!(!partial_line_may_become_marker("user", false, false));
+        assert!(!partial_line_may_become_marker("Resume", false, false));
+    }
+
+    /// Regression for #471: copilot's PTY never emits codex-style role
+    /// markers (`codex`/`assistant`), so nothing could ever flip the mode
+    /// machine back to visible. A reply that merely contains a
+    /// marker-shaped line (a bare `bash` list item, a closing `Completed`)
+    /// must not flip the filter to Hidden and eat the rest of the reply.
+    #[test]
+    fn copilot_prose_with_marker_like_lines_stays_visible() {
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "copilot",
+            "Existing",
+            "running",
+        ));
+        client.events.borrow_mut().push(output_event(
+            1,
+            "session-1",
+            "Here is the plan:\r\nbash\r\nrun the tests\r\nCompleted\r\nLet me know if anything fails.\r\n",
+        ));
+        let (mut app, _) = app_with_client(client);
+
+        app.handle_slash_command("/attach session-1");
+
+        let agent_text = app
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, MessageRole::Agent))
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(agent_text.contains("Here is the plan:"));
+        assert!(agent_text.contains("bash"));
+        assert!(agent_text.contains("run the tests"));
+        assert!(agent_text.contains("Completed"));
+        assert!(
+            agent_text.contains("Let me know if anything fails."),
+            "prose after a marker-shaped line must not be eaten: {agent_text}"
+        );
+    }
+
+    /// Regression for #471: PTY output events are raw 8KiB reads, so a
+    /// codex role marker can be split across two chunks. The split marker
+    /// must still be recognized once complete — `cod`/`ex` used to be
+    /// misread as two prose lines, leaving the mode machine stuck Hidden
+    /// after a tool section and eating the rest of the reply.
+    #[test]
+    fn codex_marker_split_across_chunks_is_recognized_once_complete() {
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "codex",
+            "Existing",
+            "running",
+        ));
+        client.events.borrow_mut().extend([
+            output_event(
+                1,
+                "session-1",
+                "codex\r\nFirst answer.\r\nexec\r\n/bin/zsh -lc \"secret tool cmd\"\r\n",
+            ),
+            output_event(2, "session-1", "cod"),
+            output_event(3, "session-1", "ex\r\nSecond answer.\r\n"),
+        ]);
+        let (mut app, _) = app_with_client(client);
+
+        app.handle_slash_command("/attach session-1");
+
+        let agent_text = app
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, MessageRole::Agent))
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(agent_text.contains("First answer."));
+        assert!(
+            agent_text.contains("Second answer."),
+            "split assistant marker must flip the filter back to visible: {agent_text}"
+        );
+        assert!(!agent_text.contains("secret tool cmd"));
+        assert!(
+            !agent_text.contains("cod"),
+            "split marker fragments must not leak into the transcript: {agent_text}"
+        );
+    }
+
+    /// Regression for #471: a prose line split right after a word that
+    /// happens to be a transcript marker (`user …`) must not flip the
+    /// filter to Hidden — only complete lines are classified.
+    #[test]
+    fn prose_split_right_after_user_word_is_not_misread_as_marker() {
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "codex",
+            "Existing",
+            "running",
+        ));
+        client.events.borrow_mut().extend([
+            output_event(1, "session-1", "codex\r\nuser"),
+            output_event(2, "session-1", " data shows steady growth.\r\n"),
+        ]);
+        let (mut app, _) = app_with_client(client);
+
+        app.handle_slash_command("/attach session-1");
+
+        let agent_text = app
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, MessageRole::Agent))
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            agent_text.contains("user data shows steady growth."),
+            "a chunk-split prose line must not be classified as a marker: {agent_text}"
+        );
+    }
+
+    /// A genuine terminal Copilot trailer stays hidden even when arbitrary
+    /// PTY read boundaries split its labels and values.
+    #[test]
+    fn copilot_terminal_stats_trailer_is_hidden_across_pty_chunks() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+
+        for (seq, chunk) in [
+            "Answer.\nCha",
+            "nges    +1 -1\nRequests ",
+            "  1 Premium (8s)\nTokens     ↑ 28.0k",
+            " (20.4k cached) • ↓ 32\nRes",
+            "ume     copilot --resume=cb845dd4\n",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            app.push_event_message(&output_event(seq as i64 + 1, "session-1", chunk));
+        }
+        app.push_event_message(&terminal_event(6, "session-1", "exit"));
+
+        assert_eq!(agent_text(&app), "Answer.\n");
+    }
+
+    /// Regression for #471: a held trailing fragment is finalized by the
+    /// session's exit — EOF ends the line, so it must be classified as a
+    /// complete line and surfaced, mirroring how `stream_json_buffers`
+    /// teardown runs on exit.
+    #[test]
+    fn held_pty_fragment_is_flushed_when_the_session_exits() {
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "copilot",
+            "Existing",
+            "running",
+        ));
+        client
+            .events
+            .borrow_mut()
+            .push(output_event(1, "session-1", "All done.\r\nResume"));
+        let (mut app, _) = app_with_client(client);
+
+        app.handle_slash_command("/attach session-1");
+
+        let agent_text_before_exit = app
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, MessageRole::Agent))
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(agent_text_before_exit.contains("All done."));
+        assert!(
+            !agent_text_before_exit.contains("Resume"),
+            "a fragment that could still become a stats line must be held: {agent_text_before_exit}"
+        );
+
+        app.push_event_message(&EventRecord {
+            seq: 2,
+            id: "event-exit".to_string(),
+            session_id: "session-1".to_string(),
+            kind: "exit".to_string(),
+            payload_json: serde_json::json!({ "status": "completed" }).to_string(),
+            created_at: "2026-05-19T00:00:00Z".to_string(),
+        });
+
+        let agent_text = app
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, MessageRole::Agent))
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            agent_text.contains("Resume"),
+            "exit must flush the held fragment as a complete prose line: {agent_text}"
+        );
+    }
+
+    /// Regression for #489: `/clear` wipes the transcript, so buffered PTY
+    /// state from before the clear must not resurface on a later exit.
+    #[test]
+    fn clear_transcript_drops_held_pty_line_fragments() {
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "copilot",
+            "Existing",
+            "running",
+        ));
+        client
+            .events
+            .borrow_mut()
+            .push(output_event(1, "session-1", "Changes    +1 -1\r\n"));
+        let (mut app, _) = app_with_client(client);
+
+        app.handle_slash_command("/attach session-1");
+        assert!(
+            app.pty_line_buffers.contains_key("session-1"),
+            "the trailer candidate must be held before the clear"
+        );
+
+        app.clear_transcript();
+        assert!(
+            !app.pty_line_buffers.contains_key("session-1"),
+            "/clear must drop held PTY state, as it drops stream JSON buffers"
+        );
+
+        app.push_event_message(&terminal_event(2, "session-1", "exit"));
+
+        assert!(
+            !app.messages
+                .iter()
+                .any(|message| message.content.contains("Changes    +1 -1")),
+            "a pre-clear candidate must not land in the cleared transcript: {:?}",
+            app.messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// `/new` keeps the transcript visible on purpose, and it does not kill
+    /// PTY sessions — so buffered output still belongs to that same visible
+    /// transcript and `/new` must keep it (#489).
+    #[test]
+    fn start_new_conversation_keeps_held_pty_line_fragments() {
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "copilot",
+            "Existing",
+            "running",
+        ));
+        client
+            .events
+            .borrow_mut()
+            .push(output_event(1, "session-1", "Changes    +1 -1\r\n"));
+        let (mut app, _) = app_with_client(client);
+
+        app.handle_slash_command("/attach session-1");
+        app.start_new_conversation();
+
+        assert!(
+            app.pty_line_buffers.contains_key("session-1"),
+            "/new keeps the transcript, so the active candidate must survive"
+        );
+    }
+
+    #[test]
+    fn suppressed_terminal_event_drops_copilot_candidate_without_displaying_it() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+
+        app.push_event_message(&output_event(1, "session-1", "Changes    +1 -1\n"));
+        assert!(app.pty_line_buffers.contains_key("session-1"));
+        app.suppressed_session_ids.insert("session-1".to_string());
+
+        app.push_event_message(&terminal_event(2, "session-1", "exit"));
+
+        assert!(!app.pty_line_buffers.contains_key("session-1"));
+        assert!(!app.suppressed_session_ids.contains("session-1"));
+        assert!(agent_text(&app).is_empty());
+    }
+
+    #[test]
+    fn copilot_stats_candidate_storage_stays_bounded() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+
+        app.push_event_message(&output_event(
+            1,
+            "session-1",
+            &format!("{COPILOT_STATS_TRAILER}\n\n\n"),
+        ));
+
+        let state = app
+            .pty_line_buffers
+            .get("session-1")
+            .expect("complete trailer candidate");
+        assert_eq!(state.copilot_stats.lines.len(), 4);
+        assert!(state.copilot_stats.trailing_blank);
+    }
+
+    /// Regression for #471 × #469: a CR-overwrite sequence split across
+    /// two PTY reads must still keep only the final frame. A fragment
+    /// ending in a bare `\r` is held so the overwrite (or a split `\r\n`)
+    /// reassembles before cleaning; showing the head early would glue the
+    /// discarded frame onto the final one.
+    #[test]
+    fn cr_overwrite_split_across_chunks_keeps_only_the_final_frame() {
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "copilot",
+            "Existing",
+            "running",
+        ));
+        client.events.borrow_mut().extend([
+            output_event(1, "session-1", "Downloading 10%\r"),
+            output_event(2, "session-1", "Downloading 100%\r\n"),
+        ]);
+        let (mut app, _) = app_with_client(client);
+
+        app.handle_slash_command("/attach session-1");
+
+        let agent_text = app
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, MessageRole::Agent))
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(agent_text.contains("Downloading 100%"));
+        assert!(
+            !agent_text.contains("10%"),
+            "the overwritten frame must not be glued onto the final one: {agent_text}"
+        );
+    }
+
+    /// Regression for #486: progress bars commonly write frames as
+    /// `\rFrame N`, so the CR arrives at the start of the next PTY read.
+    #[test]
+    fn cr_leading_progress_frames_retract_pre_emitted_frames() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+
+        for (seq, chunk) in [
+            "\rProgress:  10%",
+            "\rProgress:  50%",
+            "\rProgress: 100%",
+            "\rProgress: done\r\n",
+        ]
+        .iter()
+        .enumerate()
+        {
+            app.push_event_message(&output_event((seq as i64) + 1, "session-1", chunk));
+        }
+
+        assert_eq!(agent_text(&app), "Progress: done\n");
+    }
+
+    /// Regression for #486: a second chunk that starts with CR must replace
+    /// the line head that was already streamed to the agent bubble.
+    #[test]
+    fn cr_at_start_of_second_chunk_retracts_prior_frame() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+
+        app.push_event_message(&output_event(1, "session-1", "Downloading 10%"));
+        app.push_event_message(&output_event(2, "session-1", "\rDownloading 100%\r\n"));
+
+        assert_eq!(agent_text(&app), "Downloading 100%\n");
+    }
+
+    /// Regression for #486: a CR can be isolated in its own PTY read between
+    /// the pre-emitted frame and the replacement frame.
+    #[test]
+    fn cr_alone_between_chunks_retracts_prior_frame() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+
+        app.push_event_message(&output_event(1, "session-1", "Downloading 10%"));
+        app.push_event_message(&output_event(2, "session-1", "\r"));
+        app.push_event_message(&output_event(3, "session-1", "Downloading 100%\n"));
+
+        assert_eq!(agent_text(&app), "Downloading 100%\n");
+    }
+
+    /// Regression for #486: backspaces in a continuation chunk apply to the
+    /// already-rendered head of the same raw line.
+    #[test]
+    fn backspace_across_chunks_retracts_pre_emitted_text() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+
+        app.push_event_message(&output_event(1, "session-1", "helo"));
+        app.push_event_message(&output_event(2, "session-1", "\x08\x08lo\n"));
+
+        assert_eq!(agent_text(&app), "helo\n");
+    }
+
+    /// Regression for #487: spaces-only continuation chunks are payload once
+    /// a line head has already been emitted.
+    #[test]
+    fn whitespace_only_continuation_chunk_is_preserved() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+
+        app.push_event_message(&output_event(1, "session-1", "col1"));
+        app.push_event_message(&output_event(2, "session-1", "   "));
+        app.push_event_message(&output_event(3, "session-1", "col2\n"));
+
+        assert_eq!(agent_text(&app), "col1   col2\n");
+    }
+
+    /// Regression for #488: ANSI escape state must effectively survive PTY
+    /// read boundaries by re-cleaning the whole raw line.
+    #[test]
+    fn split_ansi_escape_does_not_leak_parameter_bytes() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+
+        app.push_event_message(&output_event(1, "session-1", "plain \x1b["));
+        app.push_event_message(&output_event(2, "session-1", "1mBold\x1b[0m\n"));
+
+        assert_eq!(agent_text(&app), "plain Bold\n");
+    }
+
+    /// Regression for #486: the same retraction path must edit the pending
+    /// batched buffer before it is flushed on session exit.
+    #[test]
+    fn batched_streaming_retracts_pre_emitted_pty_line() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.handle_slash_command("/stream off");
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+        app.is_responding = true;
+
+        app.push_event_message(&output_event(1, "session-1", "Downloading 10%"));
+        app.push_event_message(&output_event(2, "session-1", "\rDownloading 100%\n"));
+        app.push_event_message(&EventRecord {
+            seq: 3,
+            id: "event-3".to_string(),
+            session_id: "session-1".to_string(),
+            kind: "exit".to_string(),
+            payload_json: serde_json::json!({ "status": "completed" }).to_string(),
+            created_at: "2026-05-19T00:00:00Z".to_string(),
+        });
+
+        assert_eq!(agent_text(&app), "Downloading 100%\n");
+    }
+
+    /// Regression for #486: retraction is char-based, so multi-byte UTF-8
+    /// frames cannot be split at an invalid byte boundary.
+    #[test]
+    fn multibyte_utf8_retraction_does_not_split_codepoints() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("copilot".to_string());
+
+        app.push_event_message(&output_event(1, "session-1", "🧙 progress 10%"));
+        app.push_event_message(&output_event(2, "session-1", "\r✅ done\n"));
+
+        assert_eq!(agent_text(&app), "✅ done\n");
+    }
+
+    /// Regression guard for #471 while fixing #486-#488: marker-shaped
+    /// fragments must still be held instead of pre-emitted.
+    #[test]
+    fn marker_shaped_fragment_is_still_held_until_complete() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.active_session_harness = Some("codex".to_string());
+
+        app.push_event_message(&output_event(1, "session-1", "cod"));
+        assert!(
+            agent_text(&app).is_empty(),
+            "marker-shaped head must not be pre-emitted"
+        );
+
+        app.push_event_message(&output_event(2, "session-1", "ex\nVisible answer\n"));
+        assert_eq!(agent_text(&app), "Visible answer\n");
     }
 
     #[test]
@@ -4662,6 +6951,91 @@ mod tests {
     }
 
     #[test]
+    fn sacrificing_a_session_removes_it_from_the_open_sessions_overlay() {
+        // #451: the overlay list is an in-memory mirror; sacrifice used to
+        // delete the store row but keep rendering the stale entry until the
+        // next overlay toggle, and re-sacrificing it reported "session not
+        // found".
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "codex",
+            "Existing",
+            "completed",
+        ));
+        let (mut app, _) = app_with_client(client);
+        app.refresh_sessions();
+        app.show_session_overlay = true;
+        assert!(app.sessions.iter().any(|s| s.id == "session-1"));
+
+        app.input = "/sacrifice session-1".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        app.input = "accept".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+
+        assert!(
+            !app.sessions.iter().any(|s| s.id == "session-1"),
+            "sacrificed session must leave the overlay list immediately"
+        );
+    }
+
+    #[test]
+    fn archiving_a_session_removes_it_from_the_open_sessions_overlay() {
+        // Archived sessions leave the daemon's default listing (`archived_at
+        // IS NULL` filter), so the overlay mirror has to drop them too.
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "codex",
+            "Existing",
+            "completed",
+        ));
+        let (mut app, _) = app_with_client(client);
+        app.refresh_sessions();
+        app.show_session_overlay = true;
+        assert!(app.sessions.iter().any(|s| s.id == "session-1"));
+
+        app.input = "/archive session-1".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+
+        assert!(
+            !app.sessions.iter().any(|s| s.id == "session-1"),
+            "archived session must leave the overlay list immediately"
+        );
+    }
+
+    #[test]
+    fn failed_sacrifice_keeps_the_session_in_the_overlay_list() {
+        // The mirror removal only applies on success: a failed sacrifice
+        // must not eat the row from the overlay.
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "codex",
+            "Existing",
+            "completed",
+        ));
+        let (mut app, _) = app_with_client(client);
+        app.refresh_sessions();
+
+        app.input = "/sacrifice nope".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        app.input = "accept".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+
+        assert!(app
+            .messages
+            .iter()
+            .any(|message| message.content.contains("Sacrifice failed")));
+        assert!(
+            app.sessions.iter().any(|s| s.id == "session-1"),
+            "failed sacrifice must leave the overlay list untouched"
+        );
+    }
+
+    #[test]
     fn informational_cast_slashes_do_not_fall_through_to_unwired_message() {
         for input in ["/start", "/tui", "/patch", "/quest ship chat mode"] {
             let client = RecordingChatClient::default();
@@ -4956,6 +7330,50 @@ mod tests {
         let cleaned =
             clean_terminal_output("Hello\x08\x08world").expect("non-empty after sanitization");
         assert_eq!(cleaned, "Helworld");
+    }
+
+    /// Regression for #469: backspace never crosses a line boundary on a
+    /// real terminal — it must not pop a `\n` and merge two lines.
+    #[test]
+    fn clean_terminal_output_backspace_stops_at_line_start() {
+        let cleaned = clean_terminal_output("ab\n\x08\x08c").expect("non-empty after sanitization");
+        assert_eq!(cleaned, "ab\nc");
+    }
+
+    /// Regression for #469: a bare `\r` means "return to column 0 and
+    /// overwrite" — progress output must keep only the final frame instead
+    /// of concatenating every frame into run-on garbage.
+    #[test]
+    fn clean_terminal_output_keeps_only_the_final_cr_overwrite_frame() {
+        let cleaned = clean_terminal_output("Downloading 10%\rDownloading 55%\rDownloading 100%\n")
+            .expect("non-empty after sanitization");
+        assert_eq!(cleaned, "Downloading 100%\n");
+    }
+
+    #[test]
+    fn clean_terminal_output_cr_overwrite_only_affects_the_current_line() {
+        let cleaned = clean_terminal_output("done line\nprogress 1\rprogress 2\n")
+            .expect("non-empty after sanitization");
+        assert_eq!(cleaned, "done line\nprogress 2\n");
+    }
+
+    #[test]
+    fn clean_terminal_output_normalizes_crlf_line_endings() {
+        // `\r\n` is a plain line ending, not an overwrite — the text before
+        // it must survive.
+        let cleaned =
+            clean_terminal_output("first\r\nsecond\r\n").expect("non-empty after sanitization");
+        assert_eq!(cleaned, "first\nsecond\n");
+    }
+
+    #[test]
+    fn clean_terminal_output_keeps_text_before_a_chunk_final_cr() {
+        // A `\r` as the chunk's last char may be half of a `\r\n` split
+        // across PTY reads — truncating here would eat the whole line, so
+        // the trailing CR is dropped instead.
+        let cleaned =
+            clean_terminal_output("partial line\r").expect("non-empty after sanitization");
+        assert_eq!(cleaned, "partial line");
     }
 
     #[test]

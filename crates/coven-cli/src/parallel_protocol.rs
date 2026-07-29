@@ -7,6 +7,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, SecondsFormat};
 const CLAIM_TTL_SECONDS: u64 = 60 * 60;
+/// Passes allowed through the acquire loop. Each pass either settles the claim
+/// or loses a race to another agent, and a loser only re-runs after the winner
+/// has published its claim, so a couple of passes is plenty.
+const CLAIM_ACQUIRE_ATTEMPTS: usize = 8;
+/// A takeover holds its lock for two syscalls, so anything older than this was
+/// abandoned by a process that died mid-takeover.
+const TAKEOVER_LOCK_STALE: Duration = Duration::from_secs(30);
+/// Initial claim writes normally finish within one syscall-sized critical
+/// window. An incomplete file older than this was abandoned by a process that
+/// died after `create_new` published the directory entry.
+const INCOMPLETE_CLAIM_STALE: Duration = Duration::from_secs(30);
 const DEFAULT_PRIMARY_BRANCH: &str = "main";
 const MANAGED_HOOK_MARKER: &str = "Coven Parallel Work Protocol managed hook";
 
@@ -23,6 +34,13 @@ struct Claim {
     acquired_at: u64,
     expires_at: u64,
     head: Option<String>,
+}
+
+#[derive(Debug)]
+enum ClaimFileState {
+    Missing,
+    Incomplete,
+    Parsed(Claim),
 }
 
 #[derive(Debug)]
@@ -68,63 +86,130 @@ pub(crate) fn run_wt_command(
 
 pub(crate) fn claim_acquire(branch: &str) -> Result<()> {
     let repo = Repo::discover()?;
-    let agent_id = agent_id();
-    let now = unix_now();
-    if let Some(existing) = read_claim(&repo, branch)? {
-        if existing.is_active(now) && existing.agent_id != agent_id {
-            anyhow::bail!(
-                "{} is already claimed by {} until {}",
-                branch,
-                existing.agent_id,
-                existing.expires_at
-            );
+    let agent_id = agent_id(&repo);
+
+    // Creating the claim file is the only step that decides the race, so it
+    // has to be the same step that tests for a free slot: a separate
+    // read-then-write lets two agents both observe "free" and both write,
+    // which is how one issue ends up with two agents and two PRs.
+    for _ in 0..CLAIM_ACQUIRE_ATTEMPTS {
+        let now = unix_now();
+        let claim = Claim {
+            branch: branch.to_string(),
+            agent_id: agent_id.clone(),
+            acquired_at: now,
+            expires_at: now + claim_ttl_seconds(),
+            head: current_head().ok(),
+        };
+
+        if create_claim_exclusive(&repo, &claim)? {
+            println!("claimed {branch} for {agent_id} until {}", claim.expires_at);
+            return Ok(());
+        }
+
+        // Someone holds the slot. Re-read to decide whether it is ours to
+        // refresh, someone else's to respect, or expired and up for grabs.
+        match read_claim(&repo, branch)? {
+            ClaimFileState::Missing => {
+                // A takeover lock may temporarily protect a missing slot, or
+                // the owner may change between the failed create and this
+                // read. Retry without treating either state as free.
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            ClaimFileState::Incomplete => {
+                // A fresh partial file belongs to a writer still publishing
+                // its exclusive-create win. Once stale, recover it under the
+                // same lock used for expired-claim takeover.
+                if incomplete_claim_is_stale(&repo, branch) && try_takeover(&repo, branch, &claim)?
+                {
+                    println!("claimed {branch} for {agent_id} until {}", claim.expires_at);
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            ClaimFileState::Parsed(existing)
+                if existing.is_active(now) && existing.agent_id != agent_id =>
+            {
+                anyhow::bail!(
+                    "{} is already claimed by {} until {}",
+                    branch,
+                    existing.agent_id,
+                    existing.expires_at
+                );
+            }
+            ClaimFileState::Parsed(existing) if existing.is_active(now) => {
+                // Our own live claim: extend it in place rather than
+                // reporting a conflict against ourselves.
+                debug_assert_eq!(existing.agent_id, agent_id);
+                replace_claim(&repo, &claim)?;
+                println!("claimed {branch} for {agent_id} until {}", claim.expires_at);
+                return Ok(());
+            }
+            // An expired claim is eligible for takeover. Contend under a
+            // lock: unlike a free slot, this transition cannot be arbitrated
+            // by `create_new` (the file already exists), and it must never
+            // leave the slot empty or a concurrent creator could slip in.
+            ClaimFileState::Parsed(_) => {
+                if try_takeover(&repo, branch, &claim)? {
+                    println!("claimed {branch} for {agent_id} until {}", claim.expires_at);
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
     }
 
-    let claim = Claim {
-        branch: branch.to_string(),
-        agent_id: agent_id.clone(),
-        acquired_at: now,
-        expires_at: now + claim_ttl_seconds(),
-        head: current_head().ok(),
-    };
-    write_claim(&repo, &claim)?;
-    println!("claimed {branch} for {agent_id} until {}", claim.expires_at);
-    Ok(())
+    anyhow::bail!("could not acquire claim for {branch}: contended by other agents, retry")
 }
 
 pub(crate) fn claim_release(branch: &str) -> Result<()> {
     let repo = Repo::discover()?;
-    let agent_id = agent_id();
-    if let Some(existing) = read_claim(&repo, branch)? {
-        if existing.is_active(unix_now()) && existing.agent_id != agent_id {
+    let agent_id = agent_id(&repo);
+    match read_claim(&repo, branch)? {
+        ClaimFileState::Parsed(existing) => {
+            if existing.is_active(unix_now()) && existing.agent_id != agent_id {
+                anyhow::bail!(
+                    "{} is claimed by {}; {} cannot release it",
+                    branch,
+                    existing.agent_id,
+                    agent_id
+                );
+            }
+            fs::remove_file(claim_path(&repo, branch))
+                .with_context(|| format!("failed to release claim for {branch}"))?;
+            println!("released {branch}");
+        }
+        ClaimFileState::Incomplete => {
             anyhow::bail!(
-                "{} is claimed by {}; {} cannot release it",
-                branch,
-                existing.agent_id,
-                agent_id
+                "claim file for {branch} is incomplete; refusing to release ambiguous ownership"
             );
         }
-        fs::remove_file(claim_path(&repo, branch))
-            .with_context(|| format!("failed to release claim for {branch}"))?;
-        println!("released {branch}");
-    } else {
-        println!("no claim for {branch}");
+        ClaimFileState::Missing => {
+            println!("no claim for {branch}");
+        }
     }
     Ok(())
 }
 
 pub(crate) fn claim_heartbeat(branch: &str) -> Result<()> {
     let repo = Repo::discover()?;
-    let agent_id = agent_id();
+    let agent_id = agent_id(&repo);
     let now = unix_now();
-    let mut claim = read_claim(&repo, branch)?.unwrap_or_else(|| Claim {
-        branch: branch.to_string(),
-        agent_id: agent_id.clone(),
-        acquired_at: now,
-        expires_at: now,
-        head: current_head().ok(),
-    });
+    let mut claim = match read_claim(&repo, branch)? {
+        ClaimFileState::Parsed(claim) => claim,
+        ClaimFileState::Missing => Claim {
+            branch: branch.to_string(),
+            agent_id: agent_id.clone(),
+            acquired_at: now,
+            expires_at: now,
+            head: current_head().ok(),
+        },
+        ClaimFileState::Incomplete => {
+            anyhow::bail!(
+                "claim file for {branch} is incomplete; refusing to heartbeat ambiguous ownership"
+            );
+        }
+    };
     if claim.is_active(now) && claim.agent_id != agent_id {
         anyhow::bail!(
             "{} is claimed by {}; {} cannot heartbeat it",
@@ -160,7 +245,13 @@ pub(crate) fn claim_status(json: bool) -> Result<()> {
     let mut claims = if claims_dir.exists() {
         fs::read_dir(&claims_dir)?
             .filter_map(|entry| entry.ok())
-            .filter_map(|entry| read_claim_file(&entry.path()).ok().flatten())
+            .filter_map(|entry| {
+                let path = entry.path();
+                read_claim_file(&path)
+                    .ok()
+                    .and_then(ClaimFileState::into_parsed)
+                    .filter(|claim| claim_path(&repo, &claim.branch) == path)
+            })
             .collect::<Vec<_>>()
     } else {
         Vec::new()
@@ -282,7 +373,8 @@ fn wt_list(repo: &Repo, json: bool) -> Result<()> {
         let claimed_by = worktree
             .branch
             .as_deref()
-            .and_then(|branch| read_claim(repo, branch).ok().flatten())
+            .and_then(|branch| read_claim(repo, branch).ok())
+            .and_then(ClaimFileState::into_parsed)
             .filter(|claim| claim.is_active(now))
             .map(|claim| claim.agent_id);
         rows.push(WorktreeRow {
@@ -552,32 +644,255 @@ fn worktree_path(repo: &Repo, branch: &str) -> Result<PathBuf> {
     Ok(worktree_root(repo)?.join(branch_slug(branch)))
 }
 
-fn write_claim(repo: &Repo, claim: &Claim) -> Result<()> {
+fn render_claim(claim: &Claim) -> String {
+    let mut rendered = String::new();
+    rendered.push_str(&format!("branch={}\n", claim.branch));
+    rendered.push_str(&format!("agent_id={}\n", claim.agent_id));
+    rendered.push_str(&format!("acquired_at={}\n", claim.acquired_at));
+    rendered.push_str(&format!("expires_at={}\n", claim.expires_at));
+    if let Some(head) = &claim.head {
+        rendered.push_str(&format!("head={head}\n"));
+    }
+    rendered
+}
+
+/// Create the claim file, failing rather than overwriting when one exists.
+///
+/// `create_new` is the whole guarantee: the kernel resolves the O_CREAT|O_EXCL
+/// open, so exactly one of any number of racing agents is told it created the
+/// file. Returns `false` when the slot was already taken.
+fn create_claim_exclusive(repo: &Repo, claim: &Claim) -> Result<bool> {
     let claims_dir = repo.common_dir.join("agent-claims");
     fs::create_dir_all(&claims_dir)?;
     let path = claim_path(repo, &claim.branch);
-    let mut file = fs::File::create(&path)
-        .with_context(|| format!("failed to create claim {}", path.display()))?;
-    writeln!(file, "branch={}", claim.branch)?;
-    writeln!(file, "agent_id={}", claim.agent_id)?;
-    writeln!(file, "acquired_at={}", claim.acquired_at)?;
-    writeln!(file, "expires_at={}", claim.expires_at)?;
-    if let Some(head) = &claim.head {
-        writeln!(file, "head={head}")?;
+    let takeover_lock = takeover_lock_path(&path);
+    if takeover_lock.try_exists().with_context(|| {
+        format!(
+            "failed to inspect takeover lock {}",
+            takeover_lock.display()
+        )
+    })? {
+        if path_is_stale(&takeover_lock, TAKEOVER_LOCK_STALE) {
+            let _ = fs::remove_file(&takeover_lock);
+        } else {
+            // A releaser can remove an expired claim while its winner holds
+            // the takeover lock. Do not let that temporary empty slot admit
+            // a second winner before the takeover publishes its replacement.
+            return Ok(false);
+        }
     }
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            file.write_all(render_claim(claim).as_bytes())
+                .with_context(|| format!("failed to write claim {}", path.display()))?;
+            Ok(true)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(err) => Err(err).with_context(|| format!("failed to create claim {}", path.display())),
+    }
+}
+
+/// Overwrite an existing claim through a temp file plus rename, so a reader
+/// never observes a half-written claim and two concurrent writers cannot
+/// interleave their lines into one file.
+fn replace_claim(repo: &Repo, claim: &Claim) -> Result<()> {
+    let claims_dir = repo.common_dir.join("agent-claims");
+    fs::create_dir_all(&claims_dir)?;
+    let path = claim_path(repo, &claim.branch);
+    let staging = temp_claim_path(&path, "write");
+    fs::write(&staging, render_claim(claim))
+        .with_context(|| format!("failed to stage claim {}", staging.display()))?;
+    replace_claim_file(&staging, &path)
+        .inspect_err(|_| {
+            let _ = fs::remove_file(&staging);
+        })
+        .with_context(|| format!("failed to publish claim {}", path.display()))?;
     Ok(())
 }
 
-fn read_claim(repo: &Repo, branch: &str) -> Result<Option<Claim>> {
+#[cfg(not(windows))]
+fn replace_claim_file(staging: &Path, path: &Path) -> std::io::Result<()> {
+    fs::rename(staging, path)
+}
+
+#[cfg(windows)]
+fn replace_claim_file(staging: &Path, path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+
+    #[link(name = "Kernel32")]
+    extern "system" {
+        #[link_name = "MoveFileExW"]
+        fn move_file_ex_w(existing: *const u16, new: *const u16, flags: u32) -> i32;
+    }
+
+    let existing: Vec<u16> = staging
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let new: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let ok = unsafe {
+        move_file_ex_w(
+            existing.as_ptr(),
+            new.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Sibling path for staged and cleared claim files. Kept in the same directory
+/// so the rename stays within one filesystem. The `@` prefix is reserved for
+/// protocol internals because `branch_slug` never preserves `@`, so no valid
+/// claim filename can collide with staging or lock state.
+fn temp_claim_path(path: &Path, kind: &str) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "claim".to_string());
+    let unique = format!(
+        "@{name}.{kind}.{}.{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or_default()
+    );
+    path.with_file_name(unique)
+}
+
+/// Take over an expired claim, serialised so exactly one agent can do it.
+///
+/// Replacing an existing claim cannot be arbitrated by `create_new`, so this
+/// is the one transition that needs a lock. The replacement is published with
+/// an atomic rename rather than a delete-then-create, so the slot is never
+/// observed empty: agents that are not holding the lock keep failing their own
+/// `create_new`, re-read, and see the new owner.
+///
+/// Returns `true` when `claim` was published.
+fn try_takeover(repo: &Repo, branch: &str, claim: &Claim) -> Result<bool> {
+    let Some(_lock) = TakeoverLock::try_acquire(repo, branch)? else {
+        return Ok(false);
+    };
+
+    // Re-read under the lock: the state that justified the takeover may have
+    // changed while we were contending for it.
+    let now = unix_now();
+    match read_claim(repo, branch)? {
+        ClaimFileState::Parsed(existing)
+            if existing.is_active(now) && existing.agent_id != claim.agent_id =>
+        {
+            Ok(false)
+        }
+        ClaimFileState::Parsed(_) => {
+            replace_claim(repo, claim)?;
+            Ok(true)
+        }
+        ClaimFileState::Incomplete if incomplete_claim_is_stale(repo, branch) => {
+            replace_claim(repo, claim)?;
+            Ok(true)
+        }
+        // A concurrent release may remove the expired claim after we decide
+        // to take it over. With no file left to replace, drop the lock and let
+        // the next free-slot acquisition use `create_new`; recreating it here
+        // would race that path and could report two winners.
+        ClaimFileState::Missing | ClaimFileState::Incomplete => Ok(false),
+    }
+}
+
+/// Exclusive lock guarding the expired-claim takeover, released on drop.
+struct TakeoverLock {
+    path: PathBuf,
+}
+
+impl TakeoverLock {
+    fn try_acquire(repo: &Repo, branch: &str) -> Result<Option<Self>> {
+        let path = takeover_lock_path(&claim_path(repo, branch));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => Ok(Some(Self { path })),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                // The critical section is two syscalls long, so a lock this
+                // old belongs to a process that died holding it. Breaking it
+                // only returns us to contending for the same lock.
+                if path_is_stale(&path, TAKEOVER_LOCK_STALE) {
+                    let _ = fs::remove_file(&path);
+                }
+                Ok(None)
+            }
+            Err(err) => {
+                Err(err).with_context(|| format!("failed to lock takeover {}", path.display()))
+            }
+        }
+    }
+}
+
+impl Drop for TakeoverLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn path_is_stale(path: &Path, stale_after: Duration) -> bool {
+    let Ok(modified) = fs::metadata(path).and_then(|meta| meta.modified()) else {
+        return false;
+    };
+    // A clock skew that puts the lock in the future reads as not-stale, which
+    // is the safe direction: we wait instead of breaking someone's lock.
+    SystemTime::now()
+        .duration_since(modified)
+        .map(|age| age > stale_after)
+        .unwrap_or(false)
+}
+
+fn takeover_lock_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "claim".to_string());
+    path.with_file_name(format!("@{name}.takeover"))
+}
+
+fn write_claim(repo: &Repo, claim: &Claim) -> Result<()> {
+    replace_claim(repo, claim)
+}
+
+fn incomplete_claim_is_stale(repo: &Repo, branch: &str) -> bool {
+    path_is_stale(&claim_path(repo, branch), INCOMPLETE_CLAIM_STALE)
+}
+
+fn read_claim(repo: &Repo, branch: &str) -> Result<ClaimFileState> {
     read_claim_file(&claim_path(repo, branch))
 }
 
-fn read_claim_file(path: &Path) -> Result<Option<Claim>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("failed to read claim {}", path.display()))?;
+fn read_claim_file(path: &Path) -> Result<ClaimFileState> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ClaimFileState::Missing);
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read claim {}", path.display()));
+        }
+    };
     let value = |key: &str| -> Option<String> {
         contents.lines().find_map(|line| {
             line.split_once('=')
@@ -585,21 +900,19 @@ fn read_claim_file(path: &Path) -> Result<Option<Claim>> {
                 .map(|(_, value)| value.to_string())
         })
     };
-    let branch = value("branch").unwrap_or_else(|| {
-        path.file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unknown".to_string())
-    });
-    let Some(agent_id) = value("agent_id") else {
-        return Ok(None);
+    let Some(branch) = value("branch").filter(|value| !value.trim().is_empty()) else {
+        return Ok(ClaimFileState::Incomplete);
     };
-    let acquired_at = value("acquired_at")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let expires_at = value("expires_at")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    Ok(Some(Claim {
+    let Some(agent_id) = value("agent_id").filter(|value| !value.trim().is_empty()) else {
+        return Ok(ClaimFileState::Incomplete);
+    };
+    let Some(acquired_at) = value("acquired_at").and_then(|value| value.parse().ok()) else {
+        return Ok(ClaimFileState::Incomplete);
+    };
+    let Some(expires_at) = value("expires_at").and_then(|value| value.parse().ok()) else {
+        return Ok(ClaimFileState::Incomplete);
+    };
+    Ok(ClaimFileState::Parsed(Claim {
         branch,
         agent_id,
         acquired_at,
@@ -617,6 +930,15 @@ fn claim_path(repo: &Repo, branch: &str) -> PathBuf {
 impl Claim {
     fn is_active(&self, now: u64) -> bool {
         self.expires_at > now
+    }
+}
+
+impl ClaimFileState {
+    fn into_parsed(self) -> Option<Claim> {
+        match self {
+            Self::Parsed(claim) => Some(claim),
+            Self::Missing | Self::Incomplete => None,
+        }
     }
 }
 
@@ -756,12 +1078,25 @@ fn primary_branch() -> String {
     std::env::var("COVEN_PRIMARY_BRANCH").unwrap_or_else(|_| DEFAULT_PRIMARY_BRANCH.to_string())
 }
 
-fn agent_id() -> String {
-    std::env::var("COVEN_AGENT_ID")
+fn agent_id(repo: &Repo) -> String {
+    if let Some(agent_id) = std::env::var("COVEN_AGENT_ID")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| std::env::var("USER").ok())
-        .unwrap_or_else(|| "unknown-agent".to_string())
+    {
+        return agent_id;
+    }
+
+    let user = std::env::var("USER")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "unknown-agent".to_string());
+    let worktree = repo
+        .root
+        .file_name()
+        .map(|name| branch_slug(&name.to_string_lossy()))
+        .filter(|slug| !slug.is_empty())
+        .unwrap_or_else(|| "worktree".to_string());
+    format!("{user}@{worktree}")
 }
 
 fn claim_ttl_seconds() -> u64 {
@@ -795,7 +1130,22 @@ claim_value() {
 
 branch="$(git symbolic-ref --quiet --short HEAD || true)"
 primary="${COVEN_PRIMARY_BRANCH:-main}"
-agent="${COVEN_AGENT_ID:-${USER:-unknown-agent}}"
+repo_root="$(git rev-parse --show-toplevel)"
+worktree_name="${repo_root##*/}"
+worktree_slug="$(slug_branch "$worktree_name")"
+[ -n "$worktree_slug" ] || worktree_slug="worktree"
+nonblank() {
+  [ -n "$(printf '%s' "$1" | tr -d '[:space:]')" ]
+}
+base_user="${USER:-}"
+if ! nonblank "$base_user"; then
+  base_user="unknown-agent"
+fi
+fallback_agent="${base_user}@${worktree_slug}"
+agent="${COVEN_AGENT_ID:-}"
+if ! nonblank "$agent"; then
+  agent="$fallback_agent"
+fi
 common_dir="$(git rev-parse --git-common-dir)"
 
 if [ "$branch" = "$primary" ] && [ "${COVEN_ALLOW_PRIMARY_COMMIT:-}" != "1" ]; then
@@ -827,6 +1177,18 @@ if [ -f "$canary" ] && [ -n "$branch" ]; then
       echo "Current HEAD is not a descendant of $canary_head." >&2
       exit 1
     fi
+  fi
+fi
+
+privacy_guard="$repo_root/scripts/check-coven-privacy.py"
+if [ -f "$privacy_guard" ]; then
+  if command -v python3 >/dev/null 2>&1; then
+    python3 "$privacy_guard" --staged
+  elif command -v python >/dev/null 2>&1 \
+    && python -c 'import sys; sys.exit(sys.version_info[0] != 3)' >/dev/null 2>&1; then
+    python "$privacy_guard" --staged
+  else
+    echo "Coven privacy guard skipped: Python 3 not found (CI enforces it)." >&2
   fi
 fi
 
@@ -901,6 +1263,19 @@ mod tests {
     // 2026-01-01T00:00:00Z
     const NEW_YEAR_2026_EPOCH: u64 = 1_767_225_600;
 
+    #[test]
+    fn managed_pre_commit_hook_runs_coven_privacy_guard_when_present() {
+        assert!(PRE_COMMIT_HOOK.contains("scripts/check-coven-privacy.py"));
+        assert!(PRE_COMMIT_HOOK.contains("\"$privacy_guard\" --staged"));
+        // Hook must not hard-require python3 (absent in some Windows sh
+        // environments); CI remains the authoritative enforcement layer.
+        assert!(PRE_COMMIT_HOOK.contains("command -v python3"));
+        assert!(
+            PRE_COMMIT_HOOK.contains("python -c 'import sys; sys.exit(sys.version_info[0] != 3)'")
+        );
+        assert!(PRE_COMMIT_HOOK.contains("Coven privacy guard skipped"));
+    }
+
     fn sample_claim() -> Claim {
         Claim {
             branch: "feat/sample".to_string(),
@@ -962,6 +1337,58 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
 
         assert_eq!(value["claims"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn replace_claim_overwrites_existing_claim() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let repo = Repo {
+            root: temp.path().to_path_buf(),
+            common_dir: temp.path().to_path_buf(),
+        };
+        let original = sample_claim();
+        assert!(create_claim_exclusive(&repo, &original).expect("create original claim"));
+
+        let replacement = Claim {
+            agent_id: "agent-b".to_string(),
+            expires_at: original.expires_at + 3600,
+            ..original.clone()
+        };
+        replace_claim(&repo, &replacement).expect("replace existing claim");
+
+        let stored = read_claim(&repo, &replacement.branch)
+            .expect("read replacement")
+            .into_parsed()
+            .expect("claim exists");
+        assert_eq!(stored.agent_id, replacement.agent_id);
+        assert_eq!(stored.expires_at, replacement.expires_at);
+    }
+
+    #[test]
+    fn takeover_does_not_recreate_a_released_claim() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let repo = Repo {
+            root: temp.path().to_path_buf(),
+            common_dir: temp.path().to_path_buf(),
+        };
+        fs::create_dir_all(repo.common_dir.join("agent-claims")).expect("claims dir");
+        let claim = sample_claim();
+
+        assert!(!try_takeover(&repo, &claim.branch, &claim).expect("try takeover"));
+        assert!(!claim_path(&repo, &claim.branch).exists());
+    }
+
+    #[test]
+    fn internal_claim_paths_use_unrepresentable_prefix() {
+        let claim = PathBuf::from("feature-demo");
+        let staged = temp_claim_path(&claim, "write");
+        let lock = takeover_lock_path(&claim);
+
+        for internal in [staged, lock] {
+            let name = internal.file_name().unwrap().to_string_lossy();
+            assert!(name.starts_with('@'));
+            assert_ne!(branch_slug(&name), name);
+        }
     }
 
     #[test]

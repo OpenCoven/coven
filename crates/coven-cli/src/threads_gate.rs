@@ -224,6 +224,11 @@ pub fn gate_protected_edits(conn: &Connection, req: &GateRequest<'_>) -> Result<
             },
             edits,
             now,
+            StagingProbeContext {
+                workspace,
+                config,
+                authorization,
+            },
         )?;
         GateOutcome::Staged {
             pending_path,
@@ -396,6 +401,16 @@ pub(crate) fn familiar_weave_id(familiar_id: &str) -> threads::FamiliarId {
 /// directories included), and the read is capped so a pathological
 /// declaration cannot balloon memory.
 pub(crate) fn read_surface(workspace: &Path, surface: &str) -> Result<Vec<u8>> {
+    Ok(read_surface_if_exists(workspace, surface)?.unwrap_or_default())
+}
+
+/// The confined surface read with file absence preserved.
+///
+/// Probe evidence needs to distinguish an absent baseline from an existing
+/// empty file so a later approval can detect either state changing. The
+/// authority weave keeps its historical absent-as-empty convention through
+/// [`read_surface`].
+pub(crate) fn read_surface_if_exists(workspace: &Path, surface: &str) -> Result<Option<Vec<u8>>> {
     const MAX_SURFACE_BYTES: u64 = 16 * 1024 * 1024;
 
     if surface.starts_with('/') || surface.starts_with('\\') {
@@ -416,12 +431,9 @@ pub(crate) fn read_surface(workspace: &Path, surface: &str) -> Result<Vec<u8>> {
     // component, so canonicalize the deepest *existing* ancestor and require
     // it to stay inside the canonical workspace (second review pass finding —
     // `linkdir/secret` with `linkdir` pointing outside must refuse).
-    let canonical_workspace = workspace.canonicalize().with_context(|| {
-        format!(
-            "familiar workspace `{}` is not resolvable",
-            workspace.display()
-        )
-    })?;
+    let canonical_workspace = workspace
+        .canonicalize()
+        .with_context(|| format!("familiar workspace for surface `{surface}` is not resolvable"))?;
     let mut ancestor = path.parent();
     let deepest_existing = loop {
         match ancestor {
@@ -431,9 +443,8 @@ pub(crate) fn read_surface(workspace: &Path, surface: &str) -> Result<Vec<u8>> {
                     ancestor = candidate.parent();
                 }
                 Err(err) => {
-                    return Err(err).with_context(|| {
-                        format!("resolving ancestor of surface {}", path.display())
-                    })
+                    return Err(err)
+                        .with_context(|| format!("resolving ancestor of surface `{surface}`"))
                 }
             },
             None => break None,
@@ -451,10 +462,8 @@ pub(crate) fn read_surface(workspace: &Path, surface: &str) -> Result<Vec<u8>> {
         Ok(metadata) => metadata,
         // An absent protected file baselines as empty: creating it later is
         // drift like any other content change.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => {
-            return Err(err).with_context(|| format!("inspecting surface {}", path.display()))
-        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("inspecting surface `{surface}`")),
     };
     // Only regular files are hashable surfaces; a symlinked or special-file
     // surface is refused rather than followed out of the workspace.
@@ -466,7 +475,9 @@ pub(crate) fn read_surface(workspace: &Path, surface: &str) -> Result<Vec<u8>> {
             "protected surface `{surface}` exceeds the {MAX_SURFACE_BYTES}-byte baseline cap"
         );
     }
-    std::fs::read(&path).with_context(|| format!("reading surface {}", path.display()))
+    std::fs::read(&path)
+        .map(Some)
+        .with_context(|| format!("reading surface `{surface}`"))
 }
 
 fn load_or_create_manifest_id(conn: &Connection, familiar_id: &str) -> Result<threads::ManifestId> {
@@ -606,6 +617,133 @@ pub(crate) fn append_audit_row(
     Ok(())
 }
 
+/// Persist the Ward's Gate-4 apply records into the append-only `ward_audit`
+/// ledger (#414; RFC-0001 §5.6, coven-threads#5).
+///
+/// One `apply_audit` row per written change that carries an
+/// [`ward::AuditRecord`] (Tier-2 logged writes). Following the upstream
+/// `WardAuditRecord::for_apply` contract, `diff_hash` carries the post-write
+/// SHA-256 and the pre-write hash plus byte count ride in the `detail` JSON
+/// (`{"prev_sha256":…,"bytes_written":…}`). The weave view is read-only:
+/// persisting audit rows must not bootstrap baselines.
+pub fn persist_apply_audit_records(
+    conn: &mut Connection,
+    familiar_id: &str,
+    workspace: &Path,
+    config: &ward::WardConfig,
+    report: &ward::ApplyReport,
+) -> Result<()> {
+    if report.audit_records().next().is_none() {
+        return Ok(());
+    }
+    let state = build_weave_state(conn, familiar_id, workspace, config, &[], false)?;
+    let transaction = conn
+        .transaction()
+        .context("starting apply-audit batch transaction")?;
+    append_apply_audit_records(
+        &transaction,
+        None,
+        familiar_id,
+        state.weave.weave_hash(),
+        report,
+        threads::Channel::Mutation,
+    )?;
+    transaction
+        .commit()
+        .context("committing apply-audit batch transaction")
+}
+
+/// Append the Ward's logged apply records to an existing transaction scope.
+///
+/// Proposal finalization uses this form so `apply_audit` rows and the terminal
+/// proposal event commit as one unit. Direct writes wrap it in their own
+/// transaction via [`persist_apply_audit_records`].
+pub(crate) fn append_apply_audit_records(
+    conn: &Connection,
+    proposal_id: Option<&str>,
+    familiar_id: &str,
+    ward_hash: &[u8],
+    report: &ward::ApplyReport,
+    channel: threads::Channel,
+) -> Result<()> {
+    let records = report.audit_records();
+    let familiar_uuid = familiar_weave_id(familiar_id);
+    let now = time::OffsetDateTime::now_utc();
+    let format = time::format_description::well_known::Rfc3339;
+    let now_text = now.format(&format)?;
+    {
+        let mut statement = conn.prepare(
+            "INSERT INTO ward_audit (
+                event_type, proposal_id, familiar_id, ward_version, ward_hash,
+                tier, decision, approver, diff_hash, detail, files_touched,
+                channel, submitted_at, decided_at
+            ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10, ?11, ?11)",
+        )?;
+        for audit in records {
+            let prev = audit
+                .prev_sha256
+                .as_deref()
+                .map(hex_to_bytes)
+                .transpose()
+                .context("decoding apply-audit prev_sha256")?;
+            let next =
+                hex_to_bytes(&audit.next_sha256).context("decoding apply-audit next_sha256")?;
+            let record = threads::WardAuditRecord::for_apply(
+                familiar_uuid,
+                ward_hash,
+                threads::SurfaceId::new(audit.resolved.clone()),
+                &format!("tier_{}", u8::from(audit.tier)),
+                prev.as_deref(),
+                Some(&next),
+                audit.bytes_written as u64,
+                Some(channel),
+                now,
+                now,
+            );
+            let files_touched = serde_json::to_string(
+                &record
+                    .files_touched
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>(),
+            )?;
+            statement
+                .execute(params![
+                    record.event_type.tag(),
+                    proposal_id,
+                    // Human-readable familiar id in the store; the uuid rides in
+                    // the JSON record shape for cross-system correlation.
+                    familiar_id,
+                    ward_hash,
+                    record.tier,
+                    record.decision,
+                    record.diff_hash,
+                    record.detail,
+                    files_touched,
+                    record.channel.map(|c| format!("{c:?}").to_lowercase()),
+                    now_text,
+                ])
+                .context("appending apply_audit row")?;
+        }
+    }
+    Ok(())
+}
+
+/// Decode a hex digest into raw bytes. The Ward emits SHA-256 hex strings;
+/// the `ward_audit` ledger stores raw bytes (`diff_hash BLOB`).
+fn hex_to_bytes(hex: &str) -> Result<Vec<u8>> {
+    if !hex.is_ascii() {
+        anyhow::bail!("non-ASCII hex digest");
+    }
+    if hex.len() != 64 {
+        anyhow::bail!("expected 64-character SHA-256 hex digest");
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).context("invalid hex digest"))
+        .collect()
+}
+
 /// Stage a proposal held **solely** for Gate-3 coherence review (Tier-1
 /// targets) as a pending proposal beside the Tier-0 authority lane
 /// (`docs/design/ward-gate3-coherence.md` G3.1).
@@ -615,8 +753,8 @@ pub(crate) fn append_audit_row(
 /// covers the surface — under a fresh `ThreadId`, plus the `reviewKind:
 /// "coherence"` sidecar marker the decide path branches on. One
 /// `proposal_submitted` row lands in the append-only `ward_audit` ledger.
-/// Resolution is PR 4 of the design; until then the existing decide-path
-/// guards keep approval fail-closed.
+/// The decide path re-probes this sidecar, keeps Tier-1 outside the weave, and
+/// clears only `RequiresCoherenceReview` after an explicit principal approval.
 pub fn stage_coherence_proposal(
     conn: &Connection,
     coven_home: &Path,
@@ -647,6 +785,11 @@ pub fn stage_coherence_proposal(
         },
         edits,
         now,
+        StagingProbeContext {
+            workspace,
+            config,
+            authorization,
+        },
     )?;
 
     let files_touched = serde_json::to_string(
@@ -691,6 +834,12 @@ struct StagingLane {
     review_kind: Option<&'static str>,
 }
 
+struct StagingProbeContext<'a> {
+    workspace: &'a Path,
+    config: &'a ward::WardConfig,
+    authorization: &'a ward::Authorization,
+}
+
 fn stage_pending_proposal(
     coven_home: &Path,
     familiar_uuid: &threads::FamiliarId,
@@ -698,6 +847,7 @@ fn stage_pending_proposal(
     lane: StagingLane,
     edits: &[ward::FileEdit],
     now: time::OffsetDateTime,
+    probe_context: StagingProbeContext<'_>,
 ) -> Result<(PathBuf, String)> {
     let proposal = threads::PendingProposal {
         id: threads::ProposalId::new(),
@@ -715,25 +865,34 @@ fn stage_pending_proposal(
             .collect(),
         staged_at: now,
     };
+    let probes = crate::ward_probes::run_at_staging(
+        probe_context.workspace,
+        probe_context.config,
+        edits,
+        probe_context.authorization,
+    )
+    .context("running deterministic Ward probes")?;
 
     let pending_dir = coven_home.join("pending");
     std::fs::create_dir_all(&pending_dir)
         .with_context(|| format!("creating {}", pending_dir.display()))?;
     let path = pending_dir.join(proposal.file_name());
     let body = {
-        /// On-disk pending-proposal shape: the core type plus the optional
-        /// lane marker (absent ⇒ authority, so existing files and the core
-        /// deserializer keep working unchanged).
+        /// On-disk pending-proposal shape: the core type plus additive lane
+        /// and probe-evidence sidecars. An absent lane still means authority;
+        /// existing files and the core deserializer keep working unchanged.
         #[derive(serde::Serialize)]
         struct StagedProposalFile<'a> {
             #[serde(flatten)]
             proposal: &'a threads::PendingProposal,
             #[serde(rename = "reviewKind", skip_serializing_if = "Option::is_none")]
             review_kind: Option<&'static str>,
+            probes: &'a [crate::ward_probes::SurfaceProbeReport],
         }
         serde_json::to_vec_pretty(&StagedProposalFile {
             proposal: &proposal,
             review_kind: lane.review_kind,
+            probes: &probes,
         })
         .context("serializing pending proposal")?
     };
@@ -799,6 +958,59 @@ tier = 2
 
     fn signed() -> ward::Authorization {
         ward::Authorization::signed_by("fp-val-1")
+    }
+
+    #[test]
+    fn hex_to_bytes_rejects_non_ascii_without_panicking() {
+        let error = hex_to_bytes("0éx").expect_err("non-ASCII hex must be rejected");
+        assert!(error.to_string().contains("non-ASCII"), "{error:#}");
+    }
+
+    #[test]
+    fn hex_to_bytes_rejects_non_sha256_lengths() {
+        let error = hex_to_bytes("abcd").expect_err("non-SHA-256 digest must be rejected");
+        assert!(error.to_string().contains("64-character"), "{error:#}");
+    }
+
+    #[test]
+    fn persist_apply_audit_records_rolls_back_the_batch_on_insert_failure() {
+        let mut f = fixture();
+        let config = ward_config();
+        let ward = ward::Ward::new(f.workspace.clone(), config.clone()).unwrap();
+        let report = ward
+            .apply(
+                &[
+                    ward::FileEdit::new("notes/a.md", "one"),
+                    ward::FileEdit::new("notes/b.md", "two"),
+                ],
+                &ward::Authorization::unsigned(),
+            )
+            .unwrap();
+        f.conn
+            .execute_batch(
+                r#"
+                CREATE TRIGGER fail_second_apply_audit
+                BEFORE INSERT ON ward_audit
+                WHEN NEW.files_touched = '["notes/b.md"]'
+                BEGIN
+                    SELECT RAISE(ABORT, 'injected second-row failure');
+                END;
+                "#,
+            )
+            .unwrap();
+
+        let result =
+            persist_apply_audit_records(&mut f.conn, "sage", &f.workspace, &config, &report);
+        assert!(result.is_err(), "injected insert failure must surface");
+        let count: i64 = f
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM ward_audit WHERE event_type = 'apply_audit'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "the failed batch must leave no partial rows");
     }
 
     fn soul_edit() -> Vec<ward::FileEdit> {
@@ -926,8 +1138,17 @@ tier = 2
             panic!("expected Staged, got {report:?}");
         };
         assert!(pending_path.exists(), "pending file must exist");
-        let staged: threads::PendingProposal =
-            serde_json::from_slice(&std::fs::read(pending_path).unwrap()).unwrap();
+        let raw = std::fs::read(pending_path).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(value["probes"][0]["target"], "SOUL.md");
+        assert_eq!(value["probes"][0]["surface"], "SOUL.md");
+        assert_eq!(value["probes"][0]["status"], "unscored");
+        assert_eq!(value["probes"][0]["results"], serde_json::json!([]));
+        assert_eq!(
+            value["probes"][0]["baselineSha256"].as_str().map(str::len),
+            Some(64)
+        );
+        let staged: threads::PendingProposal = serde_json::from_slice(&raw).unwrap();
         assert_eq!(staged.edits.len(), 1);
         assert!(matches!(
             staged.fray,
@@ -1138,6 +1359,37 @@ tier = 0
         )
         .expect_err("symlinked surface must refuse");
         assert!(format!("{err:#}").contains("not a regular file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn surface_read_errors_name_only_the_logical_surface() {
+        let f = fixture();
+        let missing_workspace = f.workspace.join("missing-workspace");
+        let missing_error = read_surface_if_exists(&missing_workspace, "reviewed/file.md")
+            .expect_err("a missing workspace must refuse");
+        let missing_rendered = format!("{missing_error:#}");
+
+        assert!(
+            missing_rendered.contains("reviewed/file.md"),
+            "{missing_rendered}"
+        );
+        assert!(
+            !missing_rendered.contains(&missing_workspace.display().to_string()),
+            "{missing_rendered}"
+        );
+
+        std::os::unix::fs::symlink("loop", f.workspace.join("loop")).unwrap();
+
+        let error = read_surface_if_exists(&f.workspace, "loop/file.md")
+            .expect_err("a symlink loop must refuse");
+        let rendered = format!("{error:#}");
+
+        assert!(rendered.contains("loop/file.md"), "{rendered}");
+        assert!(
+            !rendered.contains(&f.workspace.display().to_string()),
+            "{rendered}"
+        );
     }
 
     #[cfg(unix)]

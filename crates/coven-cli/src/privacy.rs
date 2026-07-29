@@ -27,7 +27,53 @@ impl Default for PrivacyConfig {
     }
 }
 
+/// Snapshot of the privacy-related process env vars. Production takes the
+/// snapshot once per load via [`PrivacyEnv::from_process`]; tests construct
+/// values directly so they never mutate process env.
+#[derive(Debug, Default)]
+struct PrivacyEnv {
+    persist_raw_artifacts: Option<String>,
+    raw_artifact_retention_days: Option<String>,
+    log_retention_days: Option<String>,
+}
+
+impl PrivacyEnv {
+    fn from_process() -> Self {
+        Self {
+            persist_raw_artifacts: std::env::var_os("COVEN_PERSIST_RAW_ARTIFACTS")
+                .map(|value| value.to_string_lossy().into_owned()),
+            raw_artifact_retention_days: std::env::var("COVEN_RAW_ARTIFACT_RETENTION_DAYS").ok(),
+            log_retention_days: std::env::var("COVEN_LOG_RETENTION_DAYS").ok(),
+        }
+    }
+}
+
+/// Env overrides beat file and settings values; callers apply this last.
+fn apply_env_overrides(config: &mut PrivacyConfig, privacy_env: &PrivacyEnv) {
+    if let Some(value) = &privacy_env.persist_raw_artifacts {
+        config.persist_raw_artifacts = env_truthy(value);
+    }
+    if let Some(value) = privacy_env
+        .raw_artifact_retention_days
+        .as_deref()
+        .and_then(parse_positive_u64)
+    {
+        config.raw_artifact_retention_days = value;
+    }
+    if let Some(value) = privacy_env
+        .log_retention_days
+        .as_deref()
+        .and_then(parse_positive_u64)
+    {
+        config.log_retention_days = value;
+    }
+}
+
 pub fn load_config(coven_home: &Path) -> Result<PrivacyConfig> {
+    load_config_with_env(coven_home, &PrivacyEnv::from_process())
+}
+
+fn load_config_with_env(coven_home: &Path, privacy_env: &PrivacyEnv) -> Result<PrivacyConfig> {
     let mut config = PrivacyConfig::default();
     let path = coven_home.join("privacy.toml");
     match std::fs::read_to_string(&path) {
@@ -53,15 +99,7 @@ pub fn load_config(coven_home: &Path) -> Result<PrivacyConfig> {
         }
     }
 
-    if let Some(value) = std::env::var_os("COVEN_PERSIST_RAW_ARTIFACTS") {
-        config.persist_raw_artifacts = env_truthy(&value.to_string_lossy());
-    }
-    if let Some(value) = env_u64("COVEN_RAW_ARTIFACT_RETENTION_DAYS") {
-        config.raw_artifact_retention_days = value;
-    }
-    if let Some(value) = env_u64("COVEN_LOG_RETENTION_DAYS") {
-        config.log_retention_days = value;
-    }
+    apply_env_overrides(&mut config, privacy_env);
 
     Ok(config)
 }
@@ -70,7 +108,15 @@ pub fn load_with_settings(
     coven_home: &Path,
     settings: Option<&crate::settings::Settings>,
 ) -> Result<PrivacyConfig> {
-    let mut config = load_config(coven_home)?;
+    load_with_settings_env(coven_home, settings, &PrivacyEnv::from_process())
+}
+
+fn load_with_settings_env(
+    coven_home: &Path,
+    settings: Option<&crate::settings::Settings>,
+    privacy_env: &PrivacyEnv,
+) -> Result<PrivacyConfig> {
+    let mut config = load_config_with_env(coven_home, privacy_env)?;
     if let Some(settings) = settings.and_then(|settings| settings.coven_cli.privacy.as_ref()) {
         if let Some(value) = settings.persist_raw_artifacts {
             config.persist_raw_artifacts = value;
@@ -86,15 +132,9 @@ pub fn load_with_settings(
         }
     }
 
-    if let Some(value) = std::env::var_os("COVEN_PERSIST_RAW_ARTIFACTS") {
-        config.persist_raw_artifacts = env_truthy(&value.to_string_lossy());
-    }
-    if let Some(value) = env_u64("COVEN_RAW_ARTIFACT_RETENTION_DAYS") {
-        config.raw_artifact_retention_days = value;
-    }
-    if let Some(value) = env_u64("COVEN_LOG_RETENTION_DAYS") {
-        config.log_retention_days = value;
-    }
+    // Re-apply env last so it wins over both file and settings values,
+    // matching the original load order: file → env → settings → env.
+    apply_env_overrides(&mut config, privacy_env);
 
     Ok(config)
 }
@@ -158,11 +198,8 @@ fn env_truthy(value: &str) -> bool {
     )
 }
 
-fn env_u64(name: &str) -> Option<u64> {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|value| *value > 0)
+fn parse_positive_u64(value: &str) -> Option<u64> {
+    value.trim().parse::<u64>().ok().filter(|value| *value > 0)
 }
 
 fn redact_value_with_config(value: &Value, config: &PrivacyConfig) -> Value {
@@ -246,32 +283,6 @@ fn built_in_patterns() -> &'static [Regex] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    struct EnvVarGuard {
-        name: &'static str,
-        previous: Option<OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(name: &'static str, value: &str) -> Self {
-            let previous = std::env::var_os(name);
-            std::env::set_var(name, value);
-            Self { name, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(value) => std::env::set_var(self.name, value),
-                None => std::env::remove_var(self.name),
-            }
-        }
-    }
 
     #[test]
     fn redact_text_removes_common_secret_shapes() {
@@ -362,9 +373,13 @@ extra_patterns = ["custom-sensitive-[0-9]+"]
 "#,
         )?;
 
-        let _env_lock = ENV_LOCK.lock().expect("privacy env lock poisoned");
-        let _env_guard = EnvVarGuard::set("COVEN_PERSIST_RAW_ARTIFACTS", "1");
-        let config = load_config(temp.path())?;
+        let config = load_config_with_env(
+            temp.path(),
+            &PrivacyEnv {
+                persist_raw_artifacts: Some("1".to_string()),
+                ..Default::default()
+            },
+        )?;
 
         assert!(config.persist_raw_artifacts);
         assert_eq!(config.raw_artifact_retention_days, 9);
@@ -401,14 +416,52 @@ extra_patterns = ["toml-secret"]
             },
         };
 
-        let _env_lock = ENV_LOCK.lock().expect("privacy env lock poisoned");
-        let _env_guard = EnvVarGuard::set("COVEN_PERSIST_RAW_ARTIFACTS", "1");
-        let loaded = load_with_settings(temp.path(), Some(&settings))?;
+        let loaded = load_with_settings_env(
+            temp.path(),
+            Some(&settings),
+            &PrivacyEnv {
+                persist_raw_artifacts: Some("1".to_string()),
+                ..Default::default()
+            },
+        )?;
 
         assert!(loaded.persist_raw_artifacts);
         assert_eq!(loaded.raw_artifact_retention_days, 3);
         assert_eq!(loaded.log_retention_days, 4);
         assert_eq!(loaded.extra_patterns, vec!["jsonc-secret"]);
+        Ok(())
+    }
+
+    #[test]
+    fn env_retention_day_overrides_apply_only_when_positive_numbers() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        std::fs::write(
+            temp.path().join("privacy.toml"),
+            "raw_artifact_retention_days = 9\nlog_retention_days = 41\n",
+        )?;
+
+        let overridden = load_config_with_env(
+            temp.path(),
+            &PrivacyEnv {
+                raw_artifact_retention_days: Some("2".to_string()),
+                log_retention_days: Some(" 5 ".to_string()),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(overridden.raw_artifact_retention_days, 2);
+        assert_eq!(overridden.log_retention_days, 5);
+
+        // Zero and non-numeric values are ignored, keeping the file values.
+        let ignored = load_config_with_env(
+            temp.path(),
+            &PrivacyEnv {
+                raw_artifact_retention_days: Some("0".to_string()),
+                log_retention_days: Some("not-a-number".to_string()),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(ignored.raw_artifact_retention_days, 9);
+        assert_eq!(ignored.log_retention_days, 41);
         Ok(())
     }
 

@@ -51,11 +51,28 @@ Negotiate against `apiVersion` and `capabilities` before depending on session or
 | `POST /api/v1/sessions` | Launch a session. |
 | `GET /api/v1/sessions/:id` | Fetch one session. |
 | `GET /api/v1/events?sessionId=...` | Read session events. |
+| `GET /api/v1/memory` | List familiar memory summaries with opaque ids. |
+| `GET /api/v1/memory/overview` | Read memory totals and capability state. |
+| `GET /api/v1/memory/:id` | Read validated markdown content for a list id. |
 | `POST /api/v1/sessions/:id/input` | Forward input to a live session. |
 | `POST /api/v1/sessions/:id/kill` | Kill a live session. |
 | `POST /api/v1/store/vacuum` | Rebuild the event FTS index and compact the SQLite store. |
 
 Detailed shapes live in the [API reference](/reference/api).
+
+Memory path entries must be UTF-8 regular `.md` files; invalid names,
+symlinks, Windows reparse points, non-files/non-directories, and entries that
+disappear during scanning are excluded. Unexpected enumeration, directory-open,
+or metadata errors fail the request rather than returning partial data.
+Overview reads metadata only. List omits the excerpt for an unreadable,
+invalid-UTF-8, or over-4-MiB body by returning its metadata-valid row with an
+empty `excerpt`. Detail reads only the selected validated handle and returns
+`413 memory_content_too_large` above 4 MiB or `422 memory_content_invalid` for
+invalid UTF-8. A missing or unsafe target at open time returns
+`404 memory_not_found`; permission failures, unexpected open failures, and
+post-open metadata/read failures return `503 memory_content_unavailable`.
+Those path-safe errors include only `memoryId` in `details`, never a filesystem
+path or raw I/O error.
 
 ## Error envelope
 
@@ -67,7 +84,7 @@ All error responses use:
     "code": "session.cwd_outside_root",
     "message": "cwd must canonicalize inside project root",
     "details": {
-      "projectRoot": "/Users/me/work/proj",
+      "projectRoot": "/workspace/project",
       "cwd": "/tmp/wander"
     }
   }

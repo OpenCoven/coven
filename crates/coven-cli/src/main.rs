@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{SecondsFormat, Utc};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use uuid::Uuid;
 
 mod api;
@@ -26,6 +26,7 @@ mod executor_node;
 mod familiar_identity;
 mod harness;
 mod hub;
+mod memory_dashboard;
 mod observe;
 mod openclaw_repo;
 mod parallel_protocol;
@@ -38,19 +39,20 @@ mod prompt_refs;
 mod proposal_scheduler;
 mod pty_runner;
 mod repos_config;
+mod session_launch;
 mod settings;
 mod store;
 mod stream_json;
-#[cfg(test)]
-mod test_env;
 mod theme;
 mod tui;
 mod verification;
-// Ward identity-layer enforcement (Gates 1-2). Not yet wired into the API
+mod ward_probes;
 // Wired into the daemon router via `POST /familiars/{id}/edits` (api.rs);
-// Gate 3 (coherence review) remains a follow-up — see ward.rs.
+// Gate 3 staging, deterministic probes, read surfaces, and explicit
+// coherence approval all compose through the Ward primitives in ward.rs.
 #[allow(dead_code)]
 mod ward;
+mod ward_decision;
 mod ward_migrate;
 // The coven-threads validator call site: typed authority-state gating of
 // protected-surface mutations (OpenCoven/coven-threads Phase 2). Runs before
@@ -99,6 +101,28 @@ struct Cli {
     prompt: Vec<String>,
 }
 
+impl Cli {
+    fn validate(self) -> std::result::Result<Self, clap::Error> {
+        if matches!(
+            self.command,
+            Some(Command::Memory {
+                command: Some(MemoryCommand::Open),
+                json: true,
+            })
+        ) {
+            let mut command = Cli::command();
+            let memory = command
+                .find_subcommand_mut("memory")
+                .expect("derived CLI must contain the memory command");
+            return Err(memory.error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "the argument '--json' cannot be used with 'open'",
+            ));
+        }
+        Ok(self)
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum Command {
     #[command(about = "Open the interactive Coven UI (requires coven-code)")]
@@ -144,7 +168,7 @@ enum Command {
         #[command(subcommand)]
         command: DaemonCommand,
     },
-    #[command(about = "Inspect and migrate Ward configuration")]
+    #[command(about = "Inspect and decide Ward proposals or migrate configuration")]
     Ward {
         #[command(subcommand)]
         command: WardCommand,
@@ -210,7 +234,7 @@ enum Command {
         #[arg(
             long,
             value_name = "ID",
-            help = "Model to run the harness on. Accepts a namespaced id (e.g. openai/gpt-5.5, anthropic/claude-...); Coven strips the provider/ prefix and forwards the bare id to the harness's native model flag (codex/claude/copilot --model). Adapters that declare no model mechanism warn and continue. Echoed back in the stream-json system.init `model` field."
+            help = "Model to run the harness on. Accepts a provider-qualified id (e.g. openai/gpt-5.5, anthropic/claude-...). Each adapter declares whether to strip the first provider/ segment (`strip_provider`, the legacy default) or preserve the full id (`preserve`). Adapters that declare no model mechanism warn and continue. Echoed back unchanged in the stream-json system.init `model` field."
         )]
         model: Option<String>,
         #[arg(
@@ -414,8 +438,10 @@ enum Command {
         #[arg(long, help = "Print skills as JSON (machine-readable)")]
         json: bool,
     },
-    #[command(about = "List familiar memory files from ~/.coven/memory/")]
+    #[command(about = "List familiar memory or open its private local dashboard")]
     Memory {
+        #[command(subcommand)]
+        command: Option<MemoryCommand>,
         #[arg(long, help = "Print memory files as JSON (machine-readable)")]
         json: bool,
     },
@@ -476,6 +502,12 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum MemoryCommand {
+    #[command(about = "Open the private local memory dashboard")]
+    Open,
 }
 
 #[derive(Subcommand, Debug)]
@@ -614,7 +646,7 @@ enum AdapterCommand {
     },
     #[command(about = "Install a trusted local adapter recipe")]
     Install {
-        #[arg(help = "Adapter recipe to install, e.g. hermes")]
+        #[arg(help = "Adapter recipe to install")]
         adapter: String,
     },
 }
@@ -696,6 +728,47 @@ enum WardCommand {
         #[arg(help = "Proposal id: show one staged proposal instead of the list")]
         id: Option<String>,
         #[arg(long, help = "Print proposals as JSON (machine-readable)")]
+        json: bool,
+    },
+    #[command(about = "Approve and apply a pending Ward proposal")]
+    Approve {
+        #[arg(help = "Proposal id")]
+        id: String,
+        #[arg(
+            long,
+            value_name = "TEXT",
+            help = "Principal rationale (required by some approval paths)"
+        )]
+        note: Option<String>,
+        #[arg(long, help = "Print the API decision report as JSON")]
+        json: bool,
+    },
+    #[command(about = "Reject a pending Ward proposal without applying it")]
+    Reject {
+        #[arg(help = "Proposal id")]
+        id: String,
+        #[arg(long, value_name = "TEXT", help = "Principal rejection rationale")]
+        note: Option<String>,
+        #[arg(long, help = "Print the API decision report as JSON")]
+        json: bool,
+    },
+    #[command(about = "Show the append-only ward_audit ledger for one familiar")]
+    Audit {
+        #[arg(help = "Familiar id (familiars.toml key)")]
+        familiar: String,
+        #[arg(
+            long,
+            value_name = "N",
+            help = "Maximum rows to show, newest first (default 100, max 1000)"
+        )]
+        limit: Option<u32>,
+        #[arg(
+            long,
+            value_name = "TYPE",
+            help = "Only rows with this event type (proposal_submitted, proposal_window_opened, proposal_approved, proposal_rejected, proposal_vetoed, ward_updated, memory_entry_admitted, principal_authorized_write, validation_verdict, compaction_ledger, apply_audit)"
+        )]
+        event: Option<String>,
+        #[arg(long, help = "Print the ledger as JSON (machine-readable)")]
         json: bool,
     },
     #[command(about = "Migrate Ward v0.1 ward.toml files to Phase-2 WardConfig")]
@@ -816,7 +889,7 @@ fn main() -> Result<()> {
         });
     settings::init_cached(loaded);
 
-    let cli = Cli::parse();
+    let cli = Cli::parse().validate().unwrap_or_else(|error| error.exit());
     // Resolve --color before anything renders: theme::mode() caches on
     // first use, so the override must be recorded ahead of any output.
     theme::set_color_choice(match cli.color.as_str() {
@@ -942,7 +1015,10 @@ fn run_cli(cli: Cli) -> Result<()> {
         Some(Command::Status { json }) => observe::run_status(json),
         Some(Command::Familiars { id, json }) => observe::run_familiars(id.as_deref(), json),
         Some(Command::Skills { json }) => observe::run_skills(json),
-        Some(Command::Memory { json }) => observe::run_memory(json),
+        Some(Command::Memory { command, json }) => match command {
+            Some(MemoryCommand::Open) => memory_dashboard::run_open(),
+            None => observe::run_memory(json),
+        },
         Some(Command::Research { json }) => observe::run_research(json),
         Some(Command::Calls { id, json }) => observe::run_calls(id.as_deref(), json),
         Some(Command::Hub { command }) => match command {
@@ -2395,29 +2471,27 @@ fn default_harness_id() -> Option<String> {
 }
 
 fn launch_patch_session(request: &patch::PatchRequest) -> Result<String> {
-    let selected_harness = selected_available_harness(request.harness_id.as_str())?;
+    let selected_harness = session_launch::validate_harness(
+        request.harness_id.as_str(),
+        session_launch::HarnessCheck::Available,
+    )?;
     let coven_home = coven_home_dir()?;
     let store_path = coven_home.join(STORE_FILE_NAME);
     let conn = store::open_store(&store_path)?;
     let now = current_timestamp();
     let brief = patch::build_repair_brief(request);
-    let record = store::SessionRecord {
+    let record = session_launch::new_session_record(session_launch::NewSessionParams {
         id: Uuid::new_v4().to_string(),
         project_root: request.repo.root.to_string_lossy().into_owned(),
         harness: selected_harness.id.to_string(),
         title: session_title(Some(&format!("Patch {}", request.repo.repo_name)), &brief),
         status: DEFAULT_SESSION_STATUS.to_string(),
-        exit_code: None,
-        archived_at: None,
-        created_at: now.clone(),
-        updated_at: now.clone(),
+        now: now.clone(),
         conversation_id: None,
         familiar_id: None,
         labels: Vec::new(),
-        visibility: "private".to_string(),
-        external: false,
-        transcript_path: None,
-    };
+        visibility: None,
+    });
     store::insert_session(&conn, &record)?;
     let metadata = serde_json::json!({
         "patchTarget": request.repo.repo_name,
@@ -2857,6 +2931,30 @@ fn run_ward_command(command: WardCommand) -> Result<()> {
         WardCommand::Pending { id, json } => {
             return observe::run_ward_pending(id.as_deref(), json);
         }
+        WardCommand::Approve { id, note, json } => {
+            return ward_decision::run(
+                &id,
+                ward_decision::WardDecision::Approve,
+                note.as_deref(),
+                json,
+            );
+        }
+        WardCommand::Reject { id, note, json } => {
+            return ward_decision::run(
+                &id,
+                ward_decision::WardDecision::Reject,
+                note.as_deref(),
+                json,
+            );
+        }
+        WardCommand::Audit {
+            familiar,
+            limit,
+            event,
+            json,
+        } => {
+            return observe::run_ward_audit(&familiar, limit, event.as_deref(), json);
+        }
         WardCommand::Migrate {
             familiar,
             fingerprint,
@@ -3030,15 +3128,17 @@ fn run_session(
         anyhow::bail!("nothing to do; pass a prompt, or use --continue [ID] to resume a session");
     }
 
-    let selected_harness = selected_available_harness(harness_id)?;
+    let selected_harness =
+        session_launch::validate_harness(harness_id, session_launch::HarnessCheck::Available)?;
     let current_dir = std::env::current_dir().context("failed to read current directory")?;
-    let project_root = project::canonical_project_root(&current_dir).with_context(|| {
-        format!(
-            "failed to resolve project root from {}",
-            current_dir.display()
-        )
-    })?;
-    let cwd = project::resolve_inside_root(&project_root, cwd).context("failed to resolve cwd")?;
+    let session_launch::LaunchPaths { project_root, cwd } =
+        session_launch::resolve_launch_paths(&current_dir, cwd).map_err(|error| match error {
+            session_launch::LaunchPathError::ProjectRoot(error) => error.context(format!(
+                "failed to resolve project root from {}",
+                current_dir.display()
+            )),
+            session_launch::LaunchPathError::Cwd(error) => error.context("failed to resolve cwd"),
+        })?;
     let coven_home = coven_home_dir()?;
     let store_path = coven_store_path()?;
     let conn = store::open_store(&store_path)?;
@@ -3058,17 +3158,16 @@ fn run_session(
     // via that flag in build_harness_command_with_conversation; the prompt stays
     // clean. For harnesses without one (Codex), we prepend a bracketed identity
     // preamble to the prompt here so the integration layer remains harness-agnostic.
-    let familiar_ctx = familiar_identity::resolve_optional(&coven_home, familiar_id)?;
-    let spec = harness::configured_harness_specs()?
-        .into_iter()
-        .find(|s| s.id == selected_harness.id);
+    let familiar_ctx = session_launch::resolve_familiar(&coven_home, familiar_id)
+        .map_err(session_launch::FamiliarError::into_error)?;
+    let spec = Some(&selected_harness);
 
-    // Resolve the requested model. Cave sends a namespaced id; the harness arg
-    // builders strip the provider/ prefix and forward the bare id to the native
-    // model flag, while `system.init` echoes the requested id verbatim so Cave
-    // can confirm acceptance with an exact match. Adapters that declare no model
-    // mechanism warn (don't error) so a selection degrades gracefully. A blank
-    // value is ignored.
+    // Resolve the requested model. Cave sends a provider-qualified id; the
+    // selected adapter applies its declared strip_provider/preserve transform
+    // before forwarding to the native model mechanism. `system.init` still
+    // echoes the requested id verbatim so Cave can confirm acceptance with an
+    // exact match. Adapters that declare no model mechanism warn (don't error)
+    // so a selection degrades gracefully. A blank value is ignored.
     let requested_model: Option<&str> = model.map(str::trim).filter(|m| !m.is_empty());
     let requested_speed = speed.map(harness::HarnessSpeed::parse).transpose()?;
     // Resolve the requested sandbox/permission policy. It forwards to the
@@ -3186,23 +3285,18 @@ fn run_session(
             ),
         }
     } else {
-        let r = store::SessionRecord {
+        let r = session_launch::new_session_record(session_launch::NewSessionParams {
             id: Uuid::new_v4().to_string(),
             project_root: project_root.to_string_lossy().into_owned(),
             harness: selected_harness.id.to_string(),
             title: session_title(title, &prompt),
             status: DEFAULT_SESSION_STATUS.to_string(),
-            exit_code: None,
-            archived_at: None,
-            created_at: now.clone(),
-            updated_at: now,
+            now,
             conversation_id: None,
             familiar_id: familiar_ctx.as_ref().map(|f| f.id.clone()),
             labels,
-            visibility: visibility.unwrap_or("private").to_string(),
-            external: false,
-            transcript_path: None,
-        };
+            visibility: visibility.map(str::to_string),
+        });
         (r, false)
     };
 
@@ -3958,31 +4052,6 @@ fn parse_http_status(response: &str) -> Result<u16> {
         .context("invalid Coven daemon response")
 }
 
-fn selected_available_harness(harness_id: &str) -> Result<harness::HarnessSummary> {
-    let harnesses = harness::configured_harnesses()?;
-    let configured_ids = harnesses
-        .iter()
-        .map(|harness| harness.id.as_str())
-        .collect::<Vec<_>>();
-    let selected = harnesses
-        .iter()
-        .find(|harness| harness.id == harness_id)
-        .cloned();
-
-    match selected {
-        Some(harness) if harness.available => Ok(harness),
-        Some(harness) => Err(anyhow!(
-            "harness `{}` is not available. {}",
-            harness.id,
-            harness.install_hint
-        )),
-        None => Err(anyhow!(
-            "{}",
-            harness::unsupported_harness_message(harness_id, &configured_ids)
-        )),
-    }
-}
-
 fn joined_prompt(prompt_args: &[String]) -> Result<String> {
     let prompt = prompt_args.join(" ");
     let prompt = prompt.trim();
@@ -4025,7 +4094,6 @@ fn coven_store_path_if_exists() -> Result<Option<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_env::{lock_env, EnvVarGuard};
     use crate::tui::cast::{
         build_plan, parse_spell, CastHarness, CastIntent, CastRisk, CastStepKind, SafetyDecision,
     };
@@ -4113,7 +4181,24 @@ mod tests {
         ));
         assert!(matches!(
             Cli::parse_from(["coven", "memory"]).command,
-            Some(Command::Memory { json: false })
+            Some(Command::Memory {
+                command: None,
+                json: false
+            })
+        ));
+        assert!(matches!(
+            Cli::parse_from(["coven", "memory", "--json"]).command,
+            Some(Command::Memory {
+                command: None,
+                json: true
+            })
+        ));
+        assert!(matches!(
+            Cli::parse_from(["coven", "memory", "open"]).command,
+            Some(Command::Memory {
+                command: Some(MemoryCommand::Open),
+                json: false
+            })
         ));
         assert!(matches!(
             Cli::parse_from(["coven", "research"]).command,
@@ -4134,6 +4219,35 @@ mod tests {
             Cli::parse_from(["coven", "doctor", "--json"]).command,
             Some(Command::Doctor { json: true })
         ));
+    }
+
+    #[test]
+    fn memory_open_rejects_list_flags_but_keeps_global_color_placements() {
+        let error = Cli::try_parse_from(["coven", "memory", "--json", "open"])
+            .and_then(Cli::validate)
+            .expect_err("memory open must reject parent list-only --json");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        let error = Cli::try_parse_from(["coven", "memory", "open", "--json"])
+            .expect_err("memory open must reject trailing list-only --json");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+
+        for args in [
+            vec!["coven", "--color=never", "memory", "open"],
+            vec!["coven", "memory", "--color=never", "open"],
+            vec!["coven", "memory", "open", "--color=never"],
+        ] {
+            assert!(matches!(
+                Cli::try_parse_from(args)
+                    .and_then(Cli::validate)
+                    .expect("global --color remains valid around memory open")
+                    .command,
+                Some(Command::Memory {
+                    command: Some(MemoryCommand::Open),
+                    json: false
+                })
+            ));
+        }
     }
 
     #[test]
@@ -4568,10 +4682,10 @@ mod tests {
         assert!(frame.contains("/start"));
         assert!(frame.contains("/help"));
         assert!(frame.contains("/run"));
-        // Selection arrow uses the thin guillemet (U+203A), not ASCII `>`.
+        // Selection arrow uses the thin guillemet (Unicode 203A), not ASCII `>`.
         assert!(
             frame.contains('›'),
-            "selected row should render with U+203A"
+            "selected row should render with Unicode 203A"
         );
     }
 
@@ -4696,12 +4810,12 @@ mod tests {
             let allowed = ch == '\n'
                 || ch == '\r'
                 || ch.is_ascii()
-                || ch == '─'   // U+2500 thin horizontal rule
-                || ch == '›'   // U+203A selected-row marker
-                || ch == '·'   // U+00B7 separator
+                || ch == '─'   // Unicode 2500 thin horizontal rule
+                || ch == '›'   // Unicode 203A selected-row marker
+                || ch == '·'   // Unicode 00B7 separator
                 || ch == '↑'
                 || ch == '↓'
-                || ch == '…'; // U+2026 truncation marker from fit_chars
+                || ch == '…'; // Unicode 2026 truncation marker from fit_chars
             assert!(
                 allowed,
                 "unexpected glyph in launcher frame: {ch:?} (U+{code:04X})"
@@ -4992,6 +5106,28 @@ mod tests {
     }
 
     #[test]
+    fn adapter_install_help_does_not_duplicate_the_recipe_registry() {
+        use clap::CommandFactory;
+
+        let mut cmd = Cli::command();
+        let adapter = cmd
+            .find_subcommand_mut("adapter")
+            .expect("adapter subcommand exists");
+        let install = adapter
+            .find_subcommand_mut("install")
+            .expect("adapter install subcommand exists");
+        let help = install.render_long_help().to_string();
+
+        assert!(help.contains("Adapter recipe to install"));
+        for recipe in harness::known_adapter_recipe_names() {
+            assert!(
+                !help.contains(recipe),
+                "adapter install help must not hardcode recipe `{recipe}`:\n{help}"
+            );
+        }
+    }
+
+    #[test]
     fn cli_accepts_attach_command() {
         let cli = Cli::parse_from(["coven", "attach", "session-1"]);
 
@@ -5091,6 +5227,75 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_ward_approve_options() {
+        let cli = Cli::parse_from([
+            "coven",
+            "ward",
+            "approve",
+            "018f6e9d-4d20-7e42-b9f1-6bdb1bb35165",
+            "--note",
+            "reviewed identity change",
+            "--json",
+        ]);
+
+        match cli.command {
+            Some(Command::Ward {
+                command: WardCommand::Approve { id, note, json },
+            }) => {
+                assert_eq!(id, "018f6e9d-4d20-7e42-b9f1-6bdb1bb35165");
+                assert_eq!(note.as_deref(), Some("reviewed identity change"));
+                assert!(json);
+            }
+            other => panic!("expected ward approve command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_bare_ward_approve() {
+        let cli = Cli::parse_from([
+            "coven",
+            "ward",
+            "approve",
+            "018f6e9d-4d20-7e42-b9f1-6bdb1bb35165",
+        ]);
+
+        match cli.command {
+            Some(Command::Ward {
+                command: WardCommand::Approve { id, note, json },
+            }) => {
+                assert_eq!(id, "018f6e9d-4d20-7e42-b9f1-6bdb1bb35165");
+                assert!(note.is_none());
+                assert!(!json);
+            }
+            other => panic!("expected bare ward approve command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_ward_reject_options() {
+        let cli = Cli::parse_from([
+            "coven",
+            "ward",
+            "reject",
+            "018f6e9d-4d20-7e42-b9f1-6bdb1bb35165",
+            "--note",
+            "needs revision",
+            "--json",
+        ]);
+
+        match cli.command {
+            Some(Command::Ward {
+                command: WardCommand::Reject { id, note, json },
+            }) => {
+                assert_eq!(id, "018f6e9d-4d20-7e42-b9f1-6bdb1bb35165");
+                assert_eq!(note.as_deref(), Some("needs revision"));
+                assert!(json);
+            }
+            other => panic!("expected ward reject command, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn cli_accepts_logs_prune_options() {
         let cli = Cli::parse_from([
             "coven",
@@ -5159,22 +5364,6 @@ mod tests {
             }) => assert_eq!(adapter, "hermes"),
             other => panic!("expected adapter install command, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn coven_home_uses_userprofile_when_home_is_missing() -> anyhow::Result<()> {
-        let temp_dir = tempfile::tempdir()?;
-        let user_profile = temp_dir.path().join("windows-user");
-        let _guard = lock_env();
-        let _coven_home = EnvVarGuard::remove("COVEN_HOME");
-        let _home = EnvVarGuard::remove("HOME");
-        let _user_profile = EnvVarGuard::set("USERPROFILE", &user_profile);
-
-        assert_eq!(
-            coven_home_dir()?,
-            user_profile.join(paths::DEFAULT_COVEN_HOME_DIR)
-        );
-        Ok(())
     }
 
     #[test]

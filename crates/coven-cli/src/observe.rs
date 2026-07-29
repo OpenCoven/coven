@@ -530,8 +530,8 @@ fn render_ward_pending(body: &Value) -> String {
     }
     let mut out = String::new();
     out.push_str(&format!(
-        "{:<38} {:<12} {:<10} {:<22} targets\n",
-        "proposal", "familiar", "review", "staged"
+        "{:<38} {:<12} {:<10} {:<10} {:<22} targets\n",
+        "proposal", "familiar", "review", "probes", "staged"
     ));
     for proposal in &proposals {
         if let Some(degraded) = proposal.get("degraded") {
@@ -543,10 +543,14 @@ fn render_ward_pending(body: &Value) -> String {
             continue;
         }
         out.push_str(&format!(
-            "{:<38} {:<12} {:<10} {:<22} {}\n",
+            "{:<38} {:<12} {:<10} {:<10} {:<22} {}\n",
             str_cell(proposal, "proposalId"),
             str_cell(proposal, "familiarId"),
             str_cell(proposal, "reviewKind"),
+            proposal
+                .get("probeSummary")
+                .map(|summary| str_cell(summary, "status"))
+                .unwrap_or_else(|| "unscored".to_string()),
             str_cell(proposal, "stagedAt"),
             proposal
                 .get("targets")
@@ -560,7 +564,8 @@ fn render_ward_pending(body: &Value) -> String {
         ));
     }
     out.push_str(
-        "\nDecide with the daemon API: POST /api/v1/threads/proposals/<id>/approve|reject\n",
+        "\nDecide: coven ward approve <id> [--note \"rationale\"] · \
+         coven ward reject <id> [--note \"reason\"]\n",
     );
     out
 }
@@ -590,6 +595,163 @@ fn render_ward_proposal(proposal: &Value) -> String {
             out.push_str(&format!("    {target}\n"));
         }
     }
+    out.push_str(&format!(
+        "  probe set  {}\n",
+        proposal
+            .get("probeSummary")
+            .map(|summary| str_cell(summary, "status"))
+            .unwrap_or_else(|| "unscored".to_string())
+    ));
+    if let Some(reason) = proposal
+        .get("probeEvidenceDegraded")
+        .and_then(|degraded| degraded.get("reason"))
+        .and_then(Value::as_str)
+    {
+        out.push_str(&format!("  probe evidence degraded: {reason}\n"));
+    }
+    out.push_str("  probes\n");
+    let probes = proposal
+        .get("probes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if probes.is_empty() {
+        out.push_str("    unscored (no staged probe evidence)\n");
+    }
+    for report in &probes {
+        out.push_str(&format!(
+            "    {} [{}]\n",
+            str_cell(report, "surface"),
+            str_cell(report, "status")
+        ));
+        out.push_str(&format!(
+            "      baseline {}\n",
+            report
+                .get("baselineSha256")
+                .and_then(Value::as_str)
+                .unwrap_or("(absent)")
+        ));
+        out.push_str(&format!(
+            "      proposed {}\n",
+            str_cell(report, "proposedSha256")
+        ));
+        if let Some(error) = report.get("error").and_then(Value::as_str) {
+            out.push_str(&format!("      error    {error}\n"));
+        }
+        for result in report
+            .get("results")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            out.push_str(&format!(
+                "      {} [{}] — {}\n",
+                str_cell(result, "id"),
+                str_cell(result, "status"),
+                str_cell(result, "summary")
+            ));
+            if let Some(detail) = result.get("detail").filter(|detail| !detail.is_null()) {
+                out.push_str(&format!("        {}\n", detail));
+            }
+        }
+    }
+    out
+}
+
+// ── coven ward audit ─────────────────────────────────────────────────────────
+
+pub(crate) fn run_ward_audit(
+    familiar_id: &str,
+    limit: Option<u32>,
+    event: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let coven_home = coven_home_dir()?;
+    let path = ward_audit_path(familiar_id, limit, event)?;
+    let body = api_get(&coven_home, &path)?;
+    if json {
+        return print_json(&body);
+    }
+    print!("{}", render_ward_audit(&body));
+    Ok(())
+}
+
+fn ward_audit_path(familiar_id: &str, limit: Option<u32>, event: Option<&str>) -> Result<String> {
+    if familiar_id.is_empty()
+        || familiar_id.bytes().any(|byte| {
+            byte.is_ascii_whitespace()
+                || byte.is_ascii_control()
+                || matches!(byte, b'/' | b'\\' | b'?' | b'#' | b'%')
+        })
+    {
+        bail!(
+            "familiar id must be a non-empty URL path segment without delimiters, whitespace, or control characters"
+        );
+    }
+    let mut path = format!("/api/v1/familiars/{familiar_id}/audit");
+    let mut params = Vec::new();
+    if let Some(limit) = limit {
+        params.push(format!("limit={limit}"));
+    }
+    if let Some(event) = event {
+        crate::api::validate_ward_audit_event_tag(event)
+            .with_context(|| "--event must be a known lowercase ASCII ward_audit event tag")?;
+        params.push(format!("event={event}"));
+    }
+    if !params.is_empty() {
+        path.push('?');
+        path.push_str(&params.join("&"));
+    }
+    Ok(path)
+}
+
+fn render_ward_audit(body: &Value) -> String {
+    let records = body
+        .get("records")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if records.is_empty() {
+        return concat!(
+            "No matching ward_audit rows.\n",
+            "Applied Tier-2 writes, gate verdicts, and proposal events land here\n",
+            "(append-only, RFC-0001 §5.6).\n"
+        )
+        .to_string();
+    }
+    let rows: Vec<Vec<String>> = records
+        .iter()
+        .map(|record| {
+            let surfaces = record
+                .get("filesTouched")
+                .and_then(Value::as_array)
+                .map(|files| {
+                    files
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            vec![
+                record
+                    .get("id")
+                    .and_then(Value::as_i64)
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "—".to_string()),
+                str_cell(record, "eventType"),
+                str_cell(record, "tier"),
+                str_cell(record, "decision"),
+                theme::fit_chars(&surfaces, TEXT_CELL_LIMIT),
+                str_cell(record, "decidedAt"),
+            ]
+        })
+        .collect();
+    let mut out = render_table(
+        &["ID", "EVENT", "TIER", "DECISION", "SURFACES", "DECIDED"],
+        &rows,
+    );
+    out.push_str(&format!("\n{} audit row(s), newest first\n", records.len()));
     out
 }
 
@@ -1377,6 +1539,148 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn ward_pending_renderer_surfaces_probe_summary() {
+        let body = json!({
+            "proposals": [{
+                "proposalId": "proposal-1",
+                "familiarId": "sage",
+                "reviewKind": "coherence",
+                "stagedAt": "2026-07-27T00:00:00Z",
+                "targets": ["reviewed/SKILL.md"],
+                "probeSummary": {
+                    "status": "failed",
+                    "passed": 2,
+                    "failed": 1,
+                    "unscored": 0,
+                    "targets": 1
+                }
+            }]
+        });
+
+        let rendered = render_ward_pending(&body);
+
+        assert!(rendered.contains("probes"), "{rendered}");
+        assert!(rendered.contains("failed"), "{rendered}");
+        assert!(rendered.contains("coven ward approve <id>"), "{rendered}");
+        assert!(rendered.contains("coven ward reject <id>"), "{rendered}");
+        assert!(
+            rendered.contains("approve <id> [--note \"rationale\"]"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("reject <id> [--note \"reason\"]"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn ward_proposal_renderer_surfaces_full_probe_evidence() {
+        let proposal = json!({
+            "proposalId": "proposal-1",
+            "familiarId": "sage",
+            "reviewKind": "coherence",
+            "writer": "client:unsigned",
+            "stagedAt": "2026-07-27T00:00:00Z",
+            "targets": ["reviewed/SKILL.md"],
+            "probeSummary": {
+                "status": "passed",
+                "passed": 1,
+                "failed": 0,
+                "unscored": 0,
+                "targets": 1
+            },
+            "probes": [{
+                "surface": "reviewed/SKILL.md",
+                "baselineSha256": null,
+                "proposedSha256": "abc123",
+                "status": "passed",
+                "results": [{
+                    "id": "size-delta",
+                    "configuredSurface": "reviewed/**",
+                    "status": "passed",
+                    "summary": "Size delta calculated.",
+                    "detail": {"beforeBytes": 0, "afterBytes": 12}
+                }]
+            }]
+        });
+
+        let rendered = render_ward_proposal(&proposal);
+
+        assert!(
+            rendered.contains("reviewed/SKILL.md [passed]"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("size-delta [passed]"), "{rendered}");
+        assert!(rendered.contains("beforeBytes"), "{rendered}");
+    }
+
+    #[test]
+    fn ward_proposal_renderer_surfaces_degraded_probe_evidence() {
+        let proposal = json!({
+            "proposalId": "proposal-1",
+            "probeSummary": {
+                "status": "unscored",
+                "passed": 0,
+                "failed": 0,
+                "unscored": 1,
+                "targets": 1
+            },
+            "probeEvidenceDegraded": {
+                "reason": "proposal-probes-inconsistent"
+            },
+            "probes": []
+        });
+
+        let rendered = render_ward_proposal(&proposal);
+
+        assert!(
+            rendered.contains("probe evidence degraded: proposal-probes-inconsistent"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn ward_audit_path_rejects_ambiguous_event_query_values() {
+        for event in [
+            "apply_audit&limit=1",
+            "apply_audit=1",
+            "apply audit",
+            "äpply",
+            "unknown_tag",
+        ] {
+            let error = ward_audit_path("sage", Some(10), Some(event))
+                .expect_err("unsafe event query value must be rejected");
+            assert!(error.to_string().contains("--event"), "{event}: {error:#}");
+        }
+    }
+
+    #[test]
+    fn ward_audit_path_rejects_ambiguous_familiar_path_segments() {
+        for familiar_id in [
+            "",
+            "sa/ge",
+            "sage?limit=1",
+            "sage#fragment",
+            "sage%2Faudit",
+            "sage name",
+        ] {
+            let error = ward_audit_path(familiar_id, None, None)
+                .expect_err("unsafe familiar path segment must be rejected");
+            assert!(
+                error.to_string().contains("familiar id"),
+                "{familiar_id}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_ward_audit_empty_output_is_filter_safe() {
+        let output = render_ward_audit(&json!({ "records": [] }));
+
+        assert!(output.starts_with("No matching ward_audit rows.\n"));
+    }
+
+    #[test]
     fn render_table_pads_columns_and_trims_trailing_space() {
         let out = render_table(
             &["ID", "NAME"],
@@ -1507,7 +1811,7 @@ mod tests {
         let body = json!({
             "ok": true,
             "familiarId": "sage",
-            "workspace": "/home/x/.coven/familiars/sage",
+            "workspace": "/var/tmp/coven-test/familiars/sage",
             "ward": {
                 "principalKeyFingerprint": "SHA256:principal-key",
                 "defaultTier": 2,
@@ -1522,7 +1826,7 @@ mod tests {
         let text = render_familiar_ward(&body);
 
         assert!(text.contains("Familiar sage — Ward surface"));
-        assert!(text.contains("/home/x/.coven/familiars/sage"));
+        assert!(text.contains("/var/tmp/coven-test/familiars/sage"));
         assert!(text.contains("SHA256:principal-key"));
         assert!(text.contains("tier 2 (logged)"));
         assert!(text.contains("protected"));

@@ -7,7 +7,10 @@ title: "Grok Build (experimental)"
 description: "Install and use Coven's trusted Grok Build adapter recipe without promoting Grok to a bundled default harness."
 ---
 
-Grok Build is available through a trusted, installable Coven adapter recipe. It is **not** a bundled default harness yet: users opt in with `coven adapter install grok`, and the recipe stays experimental until the promotion checklist below is complete.
+Grok Build is available through trusted recipe 1.0.0. It is **not** a bundled
+default harness yet: users opt in with `coven adapter install grok`, and the
+recipe stays experimental until the promotion checklist below is complete.
+Its bytes match `coven-runtimes/registry/runtimes/grok/1.0.0.json`.
 
 Coven does not embed or fork Grok Build; it launches the installed CLI and reads its plain-text headless output like any other one-shot coding-agent CLI (Codex, Hermes) — no custom protocol or event translation is involved.
 
@@ -38,7 +41,10 @@ The Coven harness id is `grok`; the executable is `grok`.
     coven adapter doctor grok
     ```
 
-    The first command writes the versioned recipe to `COVEN_HOME/adapters/grok.json`. Coven only loads the file while it exactly matches its bundled trusted recipe.
+    The first command writes the versioned recipe to
+    `COVEN_HOME/adapters/grok.json`. Coven loads only exact current or
+    recognized historical trusted recipe bytes; historical bytes execute the
+    current recipe in memory.
   </Step>
   <Step title="Run a project-scoped session">
     ```bash
@@ -55,7 +61,7 @@ The Coven harness id is `grok`; the executable is `grok`.
 | Coven behavior | Grok Build argv |
 |---|---|
 | One-shot prompt | `--single=<prompt>` |
-| Model selection | `--model <model>` |
+| Model selection | `--model <model>` (effective `strip_provider` default; the recipe omits explicit transform metadata) |
 | Familiar identity | `--rules <identity>` |
 | New named conversation | `--session-id <uuid>` |
 | Resume conversation | `--resume <uuid>` |

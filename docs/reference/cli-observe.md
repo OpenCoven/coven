@@ -10,10 +10,11 @@ description: "Reference for coven status, familiars, skills, memory, research, c
 # Observability commands
 
 Everything the CovenCave dashboard reads is also visible from the terminal.
-These commands are **read-only**, work **without a running daemon** (they read
-the same `~/.coven` files and SQLite store the daemon serves), and each takes
-`--json` for machine-readable output that carries the same body as the
-corresponding daemon API route.
+The commands in the table below are **read-only**, work **without a running
+daemon** (they read the same `~/.coven` files and SQLite store the daemon
+serves), and each takes `--json` for machine-readable output that carries the
+same body as the corresponding daemon API route. `coven memory open` is a
+separate local-dashboard launcher described after the table.
 
 | Command | Human view | `--json` body |
 |---|---|---|
@@ -31,6 +32,15 @@ corresponding daemon API route.
 | `coven sessions events <id>` | Recorded events (redacted) | `GET /api/v1/sessions/:id/events` |
 | `coven sessions log <id>` | Log lines | `GET /api/v1/sessions/:id/log` |
 
+## coven memory open
+
+`coven memory open` launches the optional
+`@opencoven/coven-memory-dashboard` companion on a validated loopback address.
+It does not accept `--json`; `coven memory` and `coven memory --json` retain the
+read-only list behavior above. The npm wrapper requires Node.js 24 or newer for
+the dashboard only, while other wrapped Coven commands continue to support
+Node.js 18 or newer.
+
 ## coven status
 
 The "what is my coven doing" front door. Complements `coven doctor`
@@ -39,7 +49,7 @@ The "what is my coven doing" front door. Complements `coven doctor`
 ```text
 Coven status
 
-  daemon     running (pid 63321, socket /Users/alice/.coven/coven.sock)
+  daemon     running (pid 63321, socket /path/to/coven.sock)
   version    0.1.7
   sessions   3 open
   familiars  1 active / 2 total
@@ -80,7 +90,7 @@ one source of truth for what a familiar's principal has protected:
 ```text
 Familiar sage — Ward surface
 
-  workspace  /home/x/.coven/familiars/sage
+  workspace  /path/to/familiar-workspace
   principal  SHA256:principal-key
   unmatched  tier 2 (logged)
 
@@ -176,4 +186,3 @@ bare words (`status`, `familiars`, `roster`, …). Every card shows the
 scriptable `coven <view>` spelling so the terminal form stays discoverable.
 `status` in a composer means this ecosystem overview; setup checks stay on
 `doctor`/`health`.
-

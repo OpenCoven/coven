@@ -15,14 +15,17 @@
 // Flags:
 //   --target=<name>       Override the npm target (macos, linux-x64, windows).
 //                         Defaults to the local platform.
+//   --dashboard-tarball=<path>
+//                         Install a locally packed dashboard companion and
+//                         verify `coven memory open --help` through the wrapper.
 //   --skip-build          Reuse an existing release binary at
 //                         target/<rust-target>/release/coven instead of
 //                         re-running `cargo build --release --target ...`.
 //   --with-cargo-gates    Also run `cargo fmt --check`, `cargo clippy`, and
 //                         `cargo test --workspace --locked` (the CI verify
 //                         gates). Off by default to keep local runs fast.
-//   --skip-secrets-scan   Skip `python3 scripts/check-secrets.py` for local
-//                         iteration; CI still runs it.
+//   --skip-secrets-scan   Skip the secret-guard unit tests and full scan for
+//                         local iteration; CI still runs both.
 //   --keep-tempdir        Leave the temp install dir on disk for inspection.
 //   COVEN_NPM_DRY_RUN_VERSION=vX.Y.Z
 //                         Override the synthesized dry-run version when the
@@ -31,7 +34,7 @@
 // Exit code is non-zero on the first failing step.
 
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -62,6 +65,20 @@ const skipBuild = flag('--skip-build');
 const withCargoGates = flag('--with-cargo-gates');
 const skipSecretsScan = flag('--skip-secrets-scan');
 const keepTempdir = flag('--keep-tempdir');
+const dashboardTarballOption = opt('--dashboard-tarball');
+const dashboardTarball =
+  dashboardTarballOption === undefined
+    ? undefined
+    : path.resolve(dashboardTarballOption);
+
+if (
+  dashboardTarballOption !== undefined &&
+  (!dashboardTarballOption ||
+    !existsSync(dashboardTarball) ||
+    !statSync(dashboardTarball).isFile())
+) {
+  fail(`dashboard tarball not found or is not a file: ${dashboardTarballOption || '(empty)'}`);
+}
 
 const target = PLATFORM_TARGETS[targetName];
 if (!target) {
@@ -89,6 +106,7 @@ step('prerequisites', () => {
 
 if (!skipSecretsScan) {
   step('secrets scan', () => {
+    run('python3', ['scripts/check-secrets-test.py']);
     run('python3', ['scripts/check-secrets.py']);
   });
 }
@@ -162,7 +180,11 @@ step(`install wrapper + native package in a temp project (${targetName})`, () =>
 
   // --omit=optional avoids npm trying to fetch the optional native package by
   // version from the public registry; we install the local tarball directly.
-  run('npm', ['install', '--no-package-lock', '--omit=optional', platformTgz, wrapperTgz], {
+  const installArgs = ['install', '--no-package-lock', '--omit=optional', platformTgz, wrapperTgz];
+  if (dashboardTarball) {
+    installArgs.push(dashboardTarball);
+  }
+  run('npm', installArgs, {
     cwd: tempDir
   });
 
@@ -176,11 +198,20 @@ step(`install wrapper + native package in a temp project (${targetName})`, () =>
     fail(`wrapper bin not present at ${wrapperBin} after install`);
   }
 
+  const isolatedUserHome = path.join(tempDir, 'user-home');
+  mkdirSync(isolatedUserHome, { recursive: true });
   const smokeEnv = {
     ...process.env,
     COVEN_HOME: path.join(tempDir, 'coven-home'),
-    PATH: firstRunSmokePath(wrapperBin, tempDir)
+    HOME: isolatedUserHome,
+    PATH: firstRunSmokePath(wrapperBin, tempDir),
+    USERPROFILE: isolatedUserHome
   };
+  if (process.platform === 'win32') {
+    const homeRoot = path.parse(isolatedUserHome).root;
+    smokeEnv.HOMEDRIVE = homeRoot.replace(/[\\/]$/, '');
+    smokeEnv.HOMEPATH = isolatedUserHome.slice(homeRoot.length - 1);
+  }
   mkdirSync(smokeEnv.COVEN_HOME, { recursive: true });
 
   const versionOutput = runCapture(wrapperBin, ['--version'], { env: smokeEnv });
@@ -224,6 +255,28 @@ step(`install wrapper + native package in a temp project (${targetName})`, () =>
   }
   if (!helpOutput.stdout.toLowerCase().includes('usage')) {
     fail(`\`coven --help\` missing usage section.\nstdout:\n${helpOutput.stdout}`);
+  }
+
+  if (dashboardTarball) {
+    const dashboardEntry = path.join(
+      tempDir,
+      'node_modules',
+      '@opencoven',
+      'coven-memory-dashboard',
+      'bin',
+      'coven-memory-dashboard.mjs'
+    );
+    if (!existsSync(dashboardEntry)) {
+      fail(`dashboard entry not present after install: ${dashboardEntry}`);
+    }
+    const memoryHelp = runCapture(wrapperBin, ['memory', 'open', '--help'], {
+      env: smokeEnv
+    });
+    if (!memoryHelp.stdout.includes('private local memory dashboard')) {
+      fail(
+        `\`coven memory open --help\` did not describe the private local dashboard.\nstdout:\n${memoryHelp.stdout}\nstderr:\n${memoryHelp.stderr}`
+      );
+    }
   }
 
   let daemonStarted = false;

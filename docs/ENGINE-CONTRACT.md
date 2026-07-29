@@ -35,7 +35,10 @@ version.
 6. `coven-code --session-id <tag>` — attach a tracking tag to a headless run (for
    logs/hooks); NOT the same as --resume — does not pin or restore a session
 7. `coven-code --model <id>` / `--append-system-prompt <text>` / `--cwd <dir>` —
-   accepted and honored; coven passes values through unvalidated
+   accepted and honored; coven preserves provider-qualified model ids and
+   rejects model values that are unsafe for process argv after the adapter
+   transform; accepted model ids are otherwise passed through without catalog
+   validation
 8. `coven-code --permission-mode {default|accept-edits|bypass-permissions|plan}` —
    accepted and honored; coven passes the value through unvalidated
 9. `coven-code auth status --json` — machine-readable auth state; coven reads only
@@ -52,7 +55,8 @@ version.
     accepts no flags and produces no --help output — it is a fast-path in the CLI
     dispatcher
 11. `--effort {low|medium|high|max}` → extended-thinking budget; coven maps the
-    harness "think" capability to `--effort high`
+    harness "think" capability to `--effort high` and
+    `--speed fast|balanced|thorough` to `low|medium|high`
 
 ## Environment
 

@@ -12,8 +12,14 @@ import pathlib
 import re
 import subprocess
 import sys
+import tempfile
+from typing import BinaryIO
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+GIT_OBJECT_TYPES = {b"blob", b"commit", b"tag", b"tree"}
+# Fail closed instead of allowing a malformed batch header to request an
+# unbounded allocation. The largest object in this repository is under 6 MiB.
+MAX_BATCH_OBJECT_BYTES = 64 * 1024 * 1024
 EXCLUDED_PARTS = {".git", "target", "node_modules", ".coven", ".comux", ".comux-hooks"}
 EXCLUDED_PATHS = {"scripts/check-secrets.py", "scripts/check-secrets-test.py"}
 LOCKFILE_NAMES = ("pnpm-lock.yaml", "package-lock.json", "yarn.lock")
@@ -22,10 +28,6 @@ LOCKFILE_NODE_MODULE_KEY = re.compile(r'''^\s*["']?node_modules/(?:@?[A-Za-z0-9_
 LOCKFILE_PACKAGE_VERSION_ENTRY = re.compile(r"^\s*['\"]?@?[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?['\"]?\s*:\s*\d+\.\d+\.\d+(?:[-+][A-Za-z0-9_.-]+)?\s*$")
 LOCKFILE_INTEGRITY_LINE = re.compile(r'''["']?\bintegrity\b["']?\s*:\s*["']?(?:sha256|sha384|sha512)-[A-Za-z0-9+/=]+["']?''')
 LOCKFILE_RESOLVED_LINE = re.compile(r'''["']?\bresolved\b["']?\s*:\s*["']?https://registry\.npmjs\.org/[A-Za-z0-9_+/@.,~%:-]+\.tgz["']?''')
-OPENCOVEN_GITHUB_URL = re.compile(r"https://github\.com/OpenCoven/coven/(?:blob|tree)/[A-Za-z0-9_./@%+-]+")
-OPENCOVEN_LOCAL_WORKTREE = re.compile(
-    r"/Users/[A-Za-z0-9_.-]+/Documents/GitHub/OpenCoven/coven/\.worktrees/[A-Za-z0-9_.-]+"
-)
 SECRET_RULES: list[tuple[str, re.Pattern[str]]] = [
     ("private_key", re.compile(r"-----BEGIN (?:RSA |DSA |EC |OPENSSH |PGP )?PRIVATE KEY-----")),
     ("aws_access_key", re.compile(r"AKIA[0-9A-Z]{16}")),
@@ -40,25 +42,192 @@ SECRET_RULES: list[tuple[str, re.Pattern[str]]] = [
         ),
     ),
 ]
-ALLOW_LINE = re.compile(
-    r"(?i)(example|placeholder|secret_value|your_|<.*>|op://|secret scanning|secret guard|missing|expected|description|readme|docs/|abcdefghijklmnopqrstuvwxyz|custom-coven-home)"
+GENERIC_ASSIGNMENT_SAFE_VALUE = re.compile(
+    r'''(?ix)\b(?:api[_-]?key|secret|token|password|private[_-]?key)\b\s*[:=]\s*["']?'''
+    r"(?:"
+    r"<(?:"
+    r"(?:your|example|placeholder)[-_ ]"
+    r"(?:api[-_ ]?key|private[-_ ]?key|secret|token|password|credential|value)"
+    r"(?:[-_ ](?:value|placeholder|example|here))?"
+    r"|(?:api[-_ ]?key|private[-_ ]?key|secret|token|password|credential)"
+    r"(?:[-_ ](?:value|placeholder|example|here))?"
+    r"|value|placeholder|example"
+    r")>"
+    r"|your_[A-Za-z0-9_.-]{1,64}"
+    r"|(?:placeholder|example|secret_value)(?:[-_][A-Za-z0-9_.-]{1,64})?"
+    r"|op://[A-Za-z0-9_.@/%+-]{1,200}"
+    r")"
+    r'''["']?'''
+)
+RESERVED_EXAMPLE_URL = re.compile(
+    r"(?i)https?://(?:[A-Za-z0-9-]+\.)*"
+    r"(?:example\.(?:com|net|org)|[A-Za-z0-9-]+\.(?:example|invalid|localhost|test))"
+    r"(?::[0-9]{1,5})?(?:/[^\s\"'<>]*)?"
 )
 ENV_SECRET_READ = re.compile(
-    r"(?i)\b(?:api[_-]?key|secret|token|password|private[_-]?key)\b\s*[:=]\s*"
-    r"(?:os\.environ(?:\.get)?\(|std::env::var\(|env::var\(|process\.env\.)"
+    r'''(?ix)\b(?:api[_-]?key|secret|token|password|private[_-]?key)\b\s*[:=]\s*
+    (?:
+        os\.environ\.get\(
+            \s*["'][A-Z0-9_]+["']
+            (?:\s*,\s*(?:""|''|None))?
+            \s*
+        \)
+        |std::env::var\(\s*["'][A-Z0-9_]+["']\s*\)
+        |env::var\(\s*["'][A-Z0-9_]+["']\s*\)
+        |process\.env\.[A-Z0-9_]+(?:\.trim\(\)|\?\.trim\(\)|!)?
+    )'''
 )
 ENV_SECRET_REFERENCE = re.compile(
     r"(?i)\b(?:api[_-]?key|secret|token|password|private[_-]?key)\b\s*[:=]\s*[\"']?"
-    r"\$\{?[A-Z0-9_]+(?:[:?][^\"']*)?\}?"
+    r"(?:\$[A-Z0-9_]+|\$\{[A-Z0-9_]+(?:(?::?\?)[^}\"']*)?\})"
 )
-# A Rust `let` binding whose right-hand side begins with a call expression
-# (identifier chain followed by `(`, e.g. `let token = text.split_whitespace()`).
-# The secret-sounding name binds the RESULT of code that runs later; the line
-# cannot contain a credential literal. A quoted or bare-blob RHS does not match
-# this shape and still trips `generic_assignment`.
-RUST_LET_CALL_BINDING = re.compile(
-    r"^\s*let\s+(?:mut\s+)?[A-Za-z_][A-Za-z0-9_]*\s*(?::[^=]{1,64})?=\s*"
-    r"[A-Za-z_][A-Za-z0-9_]*(?:(?:::|\.)[A-Za-z_][A-Za-z0-9_]*)*!?\("
+# History scanning cannot be repaired by renaming these locals at HEAD. Keep
+# the exception to the three proven runtime-derived bindings instead of
+# attempting to recognize arbitrary Rust call expressions.
+RUST_KNOWN_SAFE_RUNTIME_BINDING = re.compile(
+    r"""(?x)
+    ^\s*
+    (?:
+        let\s+token\s*=\s*text\.split_whitespace\(\)\.last\(\)\?;
+        |let\s+token\s*=\s*token\.strip_prefix\('v'\)\.unwrap_or\(token\);
+        |let\s+mut\s+secret\s*=\s*std::env::args\(\)\.nth\(1\)
+            \.unwrap_or_default\(\);
+    )
+    \s*$
+    """
+)
+QUOTED_TEXT = re.compile(r"'[^']*'|\"[^\"]*\"")
+SAFE_SECRET_FIELD_REGEX_PATTERN = re.compile(
+    r"""(?ix)
+    ^(?P<paren>\()?
+    (?:
+        (?:api[_-]?key|apikey|key|secret|token|password|private[_-]?key|authorization)
+        (?:\s*[:=]|\[=:\])?
+        |bearer(?:\s+\[A-Za-z0-9\])?\s*
+    )
+    (?:
+        \|
+        (?:
+            (?:api[_-]?key|apikey|key|secret|token|password|private[_-]?key|authorization)
+            (?:\s*[:=]|\[=:\])?
+            |bearer(?:\s+\[A-Za-z0-9\])?\s*
+        )
+    )+
+    (?(paren)\)|)
+    $
+    """
+)
+SAFE_ASSIGNMENT_SUFFIX = re.compile(
+    r'''(?x)
+    (?:
+        ["';,.:?)}\]`]+
+        |</[A-Za-z][A-Za-z0-9-]*>
+        |\.(?:strip|to_string|trim|unwrap_or_default)\(\)
+    )*
+    '''
+)
+SAFE_FALLBACK_VALUE = re.compile(
+    r'''(?ix)(?:""|''|none|null|undefined)[;,.)}\]]*(?:\s*(?:\#|//).*)?'''
+)
+ASSIGNMENT_CONTINUATION_OPERATOR = re.compile(
+    r"(?is)\s*(\+|\|\||\?\?|or\b)\s*(.*)"
+)
+ASSIGNMENT_TRAILING_CHUNK = re.compile(
+    r'''\[[^\]\r\n]{1,80}\]\([^()\s]+\)'''
+    r'''|(?:\#|//)[^\r\n]*'''
+    r'''|"[^"]*"|'[^']*'|`[^`]*`|(?:\\.|[^\s])+'''
+)
+ASSIGNMENT_CONTEXT_IDENTIFIER = re.compile(
+    r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+"
+)
+ASSIGNMENT_CONTEXT_ENV_REFERENCE = re.compile(
+    r"\$(?:[A-Z][A-Z0-9_]*|\{[A-Z][A-Z0-9_]*\})"
+)
+ASSIGNMENT_CONTEXT_ENV_PATH = re.compile(
+    r"(?:~|\$[A-Z][A-Z0-9_]*|\$\{[A-Z][A-Z0-9_]*\})"
+    r"(?:/[A-Za-z0-9_.-]{1,64})+"
+)
+ASSIGNMENT_CONTEXT_MARKDOWN_LINK = re.compile(
+    r"\[([^\]\r\n]{1,80})\]\(([^()\s]+)\)"
+)
+ASSIGNMENT_CONTEXT_PROSE = re.compile(
+    r"[A-Za-z][A-Za-z ,.:;()'/-]{0,160}"
+)
+ASSIGNMENT_CONTEXT_GUIDANCE = re.compile(
+    r"""(?ix)
+    (?:
+        replace\s+with\s+(?:your\s+)?actual\s+value
+        |(?:parse|read|load|derive|use)\s+(?:the\s+)?runtime\s+
+            (?:value|token|input|argument)
+    )
+    [.:;]?
+    """
+)
+ASSIGNMENT_CONTEXT_DOC_PATH = re.compile(
+    r"(?:[A-Za-z0-9_.-]{1,64}/)*"
+    r"[A-Za-z0-9_.-]{1,64}\."
+    r"(?:md|txt|rst|adoc|html?)"
+)
+ASSIGNMENT_CONTEXT_PATH = re.compile(
+    r"(?:(?:/(?:etc|usr|opt|var|tmp|home|Users))"
+    r"|(?:(?:\./|\.\./)?(?:docs|src|scripts|crates|packages|skills)))"
+    r"(?:/[A-Za-z0-9_.-]{1,64})+"
+)
+OPEN_COVEN_REPO_ROOT_URL = re.compile(
+    r"https?://github\.com/OpenCoven/coven/?"
+)
+SAFE_URL_FRAGMENT = re.compile(
+    r"#(?:L[0-9]{1,7}(?:-L[0-9]{1,7})?"
+    r"|[A-Za-z][A-Za-z0-9_.-]{0,63})$"
+)
+ENTROPY_TOKEN = re.compile(r"\b[A-Za-z0-9_+/@.-]{32,}\b")
+ORDERED_ALPHABET_FIXTURES = {
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ",
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUV",
+}
+KNOWN_PUBLIC_DOCUMENTATION_TOKENS = {
+    "support-dev.discord.com/hc/en-us/articles/6207308062871-What-are-Privileged-Intents",
+}
+KNOWN_SAFE_LONG_PATH_ATOMS = {
+    "ARCHITECTURE",
+    "CONTRIBUTING",
+    "LaunchAgents",
+    "LaunchDaemons",
+    "PropertyList",
+    "TROUBLESHOOTING",
+    "accessibility",
+    "announcements",
+    "architecture",
+    "capabilities",
+    "configuration",
+    "orchestration",
+    "troubleshooting",
+    "verification",
+}
+PATH_CONTEXT_BOUNDARIES = {
+    ".worktrees",
+    "Library",
+    "LaunchAgents",
+    "LaunchDaemons",
+    "OpenCoven",
+    "assets",
+    "blob",
+    "brand",
+    "crates",
+    "docs",
+    "download",
+    "main",
+    "packages",
+    "releases",
+    "scripts",
+    "skills",
+    "specs",
+    "src",
+    "tree",
+    "worktrees",
+}
+KNOWN_FAKE_PRIVATE_KEY_FIXTURE = re.compile(
+    r"-----BEGIN PRIVATE KEY-----\\n(?:fake){3,}\\n-----END PRIVATE KEY-----"
 )
 
 
@@ -83,23 +252,236 @@ def is_excluded_path(path: str) -> bool:
     return normalized in EXCLUDED_PATHS
 
 
-def is_known_safe_lockfile_line(path: str, line: str) -> bool:
-    if not is_lockfile_path(path):
+def match_is_within(
+    inner: re.Match[str], outer: re.Match[str], *, require_end: bool = True
+) -> bool:
+    if require_end:
+        return outer.start() <= inner.start() and inner.end() <= outer.end()
+    return outer.start() <= inner.start() < outer.end()
+
+
+def assignment_is_covered_by_safe_match(
+    assignment: re.Match[str], safe_match: re.Match[str]
+) -> bool:
+    if assignment.start() < safe_match.start() or assignment.start() >= safe_match.end():
         return False
-    stripped = line.strip()
-    return bool(
-        LOCKFILE_INTEGRITY_LINE.search(stripped)
-        or LOCKFILE_RESOLVED_LINE.search(stripped)
-        or LOCKFILE_NODE_MODULE_KEY.match(stripped)
-        or LOCKFILE_PACKAGE_KEY.match(stripped)
-        or LOCKFILE_PACKAGE_VERSION_ENTRY.match(stripped)
+    if assignment.end() <= safe_match.end():
+        return True
+    suffix = assignment.string[safe_match.end() : assignment.end()]
+    return bool(SAFE_ASSIGNMENT_SUFFIX.fullmatch(suffix))
+
+
+def safe_assignment_continuation_is_syntax(
+    path: str,
+    line: str,
+    safe_match: re.Match[str],
+    *,
+    reject_unmarked_passphrase: bool = True,
+) -> bool:
+    tail = line[safe_match.end() :]
+    immediate_suffix = re.match(r"\S*", tail)
+    assert immediate_suffix is not None
+    if not SAFE_ASSIGNMENT_SUFFIX.fullmatch(immediate_suffix.group(0)):
+        return False
+    remainder = tail[immediate_suffix.end() :]
+    continuation = ASSIGNMENT_CONTINUATION_OPERATOR.fullmatch(remainder)
+    if continuation is not None:
+        operator, fallback = continuation.groups()
+        return operator != "+" and bool(SAFE_FALLBACK_VALUE.fullmatch(fallback))
+    trailing_start = safe_match.end() + immediate_suffix.end()
+    trailing_context = line[trailing_start:].strip()
+    if (
+        reject_unmarked_passphrase
+        and not trailing_context.startswith(("#", "//"))
+        and is_likely_unmarked_passphrase(trailing_context)
+    ):
+        return False
+    return all(
+        assignment_trailing_chunk_is_accounted_for(path, line, chunk_match)
+        for chunk_match in ASSIGNMENT_TRAILING_CHUNK.finditer(
+            line, trailing_start
+        )
     )
 
 
-def is_local_path_like_token(token: str) -> bool:
+def has_unsafe_safe_assignment_continuation(path: str, line: str) -> bool:
+    return any(
+        not safe_assignment_continuation_is_syntax(path, line, safe_match)
+        for pattern in (
+            GENERIC_ASSIGNMENT_SAFE_VALUE,
+            ENV_SECRET_READ,
+            ENV_SECRET_REFERENCE,
+        )
+        for safe_match in pattern.finditer(line)
+    )
+
+
+def is_safe_secret_field_regex_assignment(
+    path: str, line: str, assignment: re.Match[str]
+) -> bool:
+    return any(
+        match_is_within(assignment, quoted)
+        and bool(
+            SAFE_SECRET_FIELD_REGEX_PATTERN.fullmatch(
+                quoted.group(0)[1:-1]
+            )
+        )
+        and safe_assignment_continuation_is_syntax(
+            path,
+            line,
+            quoted,
+            reject_unmarked_passphrase=False,
+        )
+        for quoted in QUOTED_TEXT.finditer(line)
+    )
+
+
+def is_known_safe_rust_runtime_binding(
+    path: str, line: str, assignment: re.Match[str]
+) -> bool:
+    code, comment_marker, comment = line.partition("//")
+    if comment_marker and not is_known_safe_assignment_context_prose(
+        comment, allow_empty=True
+    ):
+        return False
+    binding = RUST_KNOWN_SAFE_RUNTIME_BINDING.fullmatch(code)
+    return bool(
+        path.replace("\\", "/").endswith(".rs")
+        and binding
+        and match_is_within(assignment, binding)
+    )
+
+
+def is_known_safe_generic_assignment(
+    path: str, line: str, assignment: re.Match[str]
+) -> bool:
+    for pattern in (
+        GENERIC_ASSIGNMENT_SAFE_VALUE,
+        ENV_SECRET_READ,
+        ENV_SECRET_REFERENCE,
+    ):
+        if any(
+            assignment_is_covered_by_safe_match(assignment, match)
+            and safe_assignment_continuation_is_syntax(path, line, match)
+            for match in pattern.finditer(line)
+        ):
+            return True
+
+    if any(
+        assignment_is_covered_by_safe_match(assignment, match)
+        and safe_assignment_continuation_is_syntax(path, line, match)
+        for match in RESERVED_EXAMPLE_URL.finditer(line)
+    ):
+        return True
+
+    if is_known_safe_rust_runtime_binding(path, line, assignment):
+        return True
+
+    if is_safe_secret_field_regex_assignment(path, line, assignment):
+        return True
+
+    return False
+
+
+def is_known_safe_lockfile_token(
+    path: str, line: str, token_match: re.Match[str]
+) -> bool:
+    if not is_lockfile_path(path):
+        return False
+
+    for pattern in (LOCKFILE_INTEGRITY_LINE, LOCKFILE_RESOLVED_LINE):
+        if any(
+            match_is_within(token_match, safe_match)
+            for safe_match in pattern.finditer(line)
+        ):
+            return True
+
+    stripped = line.strip()
+    return bool(
+        LOCKFILE_NODE_MODULE_KEY.fullmatch(stripped)
+        or LOCKFILE_PACKAGE_KEY.fullmatch(stripped)
+        or LOCKFILE_PACKAGE_VERSION_ENTRY.fullmatch(stripped)
+    )
+
+
+def is_safe_path_segment(segment: str, *, strict: bool = False) -> bool:
+    if (
+        not segment
+        or len(segment) > 64
+        or not re.fullmatch(r"[A-Za-z0-9_.-]+", segment)
+    ):
+        return False
+    for atom in (part for part in re.split(r"[._-]", segment) if part):
+        if (
+            strict
+            and len(atom) >= 12
+            and atom not in KNOWN_SAFE_LONG_PATH_ATOMS
+        ):
+            return False
+        if len(atom) > 24:
+            return False
+        if len(atom) < 12:
+            continue
+        letters = "".join(char for char in atom if char.isalpha())
+        if any(char.isdigit() for char in atom):
+            return False
+        if (
+            letters
+            and not (letters.islower() or letters.isupper())
+            and not re.fullmatch(r"(?:[A-Z][a-z]+){2,}", letters)
+        ):
+            return False
+    return True
+
+
+def path_segments_are_safe(
+    segments: list[str], *, strict: bool = False
+) -> bool:
+    if any(
+        not is_safe_path_segment(segment, strict=strict)
+        for segment in segments
+    ):
+        return False
+    if not strict:
+        return True
+
+    passphrase_run = 0
+    for segment in segments:
+        if segment in PATH_CONTEXT_BOUNDARIES:
+            passphrase_run = 0
+            continue
+        stem = segment.rsplit(".", 1)[0]
+        if re.fullmatch(r"[A-Za-z0-9]{4,}", stem):
+            passphrase_run += 1
+            if passphrase_run >= 3:
+                return False
+        else:
+            passphrase_run = 0
+    return True
+
+
+def is_known_safe_assignment_context_path(path: str) -> bool:
+    if not (
+        ASSIGNMENT_CONTEXT_PATH.fullmatch(path)
+        or ASSIGNMENT_CONTEXT_DOC_PATH.fullmatch(path)
+    ):
+        return False
+    return path_segments_are_safe(
+        [
+            part
+            for part in path.replace("\\", "/").split("/")
+            if part not in {"", ".", ".."}
+        ],
+        strict=True,
+    )
+
+
+def is_local_path_like_token(token: str, *, strict: bool = False) -> bool:
     normalized = token.strip("/")
     parts = normalized.split("/")
     if len(parts) < 4:
+        return False
+    if not path_segments_are_safe(parts, strict=strict):
         return False
     if parts[0] in {"Users", "home", "private", "var", "tmp", "Volumes"}:
         return True
@@ -108,60 +490,98 @@ def is_local_path_like_token(token: str) -> bool:
     return ".worktrees" in parts or "worktrees" in parts
 
 
-def is_public_repo_url_like_token(token: str) -> bool:
+def is_public_repo_url_like_token(
+    token: str, *, strict: bool = False
+) -> bool:
     normalized = token.strip("/")
-    if not re.match(r"github\.com/OpenCoven/[A-Za-z0-9_.-]+/", normalized):
+    if not re.fullmatch(
+        r"github\.com/OpenCoven/[A-Za-z0-9_.-]+/"
+        r"[A-Za-z0-9_+/@.,~%:-]+",
+        normalized,
+    ):
+        return False
+    if not path_segments_are_safe(
+        normalized.split("/"), strict=strict
+    ):
         return False
     if "/blob/" in normalized or "/tree/" in normalized:
         return True
-    # Release-artifact URLs (…/releases/download/<tag>/<artifact>): tags and
-    # artifact filenames are short path segments; cap each so a token-like
-    # blob smuggled into a fake artifact name still trips the entropy rule.
+    # Release-artifact URLs (…/releases/download/<tag>/<artifact>) use the
+    # same segment validation so credential-like artifact names fail closed.
     if "/releases/download/" in normalized:
-        return all(len(part) <= 64 for part in normalized.split("/"))
+        return True
     return False
 
 
-def is_opencoven_repo_relative_path_token(token: str) -> bool:
+def is_opencoven_repo_relative_path_token(
+    token: str, *, strict: bool = False
+) -> bool:
     normalized = token.strip("/")
     if not normalized.startswith("OpenCoven/coven/"):
         return False
-    # Keep this allowlist tight: only permit path-ish characters (no `+`/`@`) and
-    # reject mixed-case-within-a-segment / extremely long segments that look token-like.
+    # Keep this allowlist tight: only permit path-ish characters (no `+`/`@`)
+    # and reject credential-like path segments.
     if not re.fullmatch(r"OpenCoven/coven/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+){1,}", normalized):
         return False
-    for part in normalized.split("/")[2:]:
-        if len(part) > 64:
-            return False
-        letters = "".join(ch for ch in part if ch.isalpha())
-        if letters and not (letters.islower() or letters.isupper()):
-            return False
-    return True
+    return path_segments_are_safe(
+        normalized.split("/")[2:], strict=strict
+    )
 
 
 def is_github_advisory_url_like_token(token: str) -> bool:
     normalized = token.strip("/")
-    return normalized.startswith("github.com/advisories/GHSA-")
+    return bool(
+        re.fullmatch(
+            r"(?i)github\.com/advisories/"
+            r"GHSA-[23456789cfghjmpqrvwx]{4}"
+            r"-[23456789cfghjmpqrvwx]{4}"
+            r"-[23456789cfghjmpqrvwx]{4}",
+            normalized,
+        )
+    )
 
 
-def is_github_commit_url_like_token(token: str) -> bool:
+def is_github_commit_url_like_token(
+    token: str, *, strict: bool = False
+) -> bool:
     normalized = token.strip("/")
-    return bool(re.fullmatch(r"github\.com/[^/\s]+/[^/\s]+/commit/[0-9a-f]{32,64}", normalized))
+    match = re.fullmatch(
+        r"github\.com/(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)"
+        r"/commit/[0-9a-f]{32,64}",
+        normalized,
+    )
+    return bool(
+        match
+        and path_segments_are_safe(
+            [match.group("owner"), match.group("repo")],
+            strict=strict,
+        )
+    )
 
 
 _GITHUB_ACTION_SHA_REF = re.compile(
-    r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+@[0-9a-f]{40}$"
+    r"^(?P<owner>[A-Za-z0-9._-]+)/(?P<repo>[A-Za-z0-9._-]+)"
+    r"@[0-9a-f]{40}$"
 )
 
 
-def is_github_action_sha_ref_token(token: str) -> bool:
+def is_github_action_sha_ref_token(
+    token: str, *, strict: bool = False
+) -> bool:
     """Whether `token` is a GitHub Actions `uses:` reference pinned to a 40-char
     commit SHA, e.g. ``actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd``.
     SHA-pinned refs are an OpenSSF best practice (they prevent action authors
     from silently moving a version tag onto a malicious commit) but the trailing
     40-hex SHA otherwise pushes the workflow line over the entropy threshold.
     """
-    return bool(_GITHUB_ACTION_SHA_REF.match(token))
+    match = _GITHUB_ACTION_SHA_REF.fullmatch(token)
+    return bool(
+        match
+        and path_segments_are_safe(
+            [match.group("owner"), match.group("repo")],
+            strict=strict,
+        )
+    )
 
 
 _MACOS_LIBRARY_PATH_TOKEN = re.compile(
@@ -171,7 +591,9 @@ _MACOS_LIBRARY_PATH_TOKEN = re.compile(
 )
 
 
-def is_macos_library_path_token(token: str) -> bool:
+def is_macos_library_path_token(
+    token: str, *, strict: bool = False
+) -> bool:
     """Whether `token` is a macOS `Library/...` well-known path such as
     ``Library/LaunchAgents/dev.opencoven.hub.plist``. These show up in
     launchd/service documentation and are never credentials, but reverse-DNS
@@ -181,26 +603,47 @@ def is_macos_library_path_token(token: str) -> bool:
     """
     if not _MACOS_LIBRARY_PATH_TOKEN.fullmatch(token):
         return False
-    return all(len(part) <= 64 for part in token.split("/"))
+    return path_segments_are_safe(
+        token.split("/"), strict=strict
+    )
 
 
-_APPLE_DTD_URL_TOKEN = re.compile(r"www\.apple\.com/DTDs/[A-Za-z0-9_.-]{1,64}\.dtd")
+_APPLE_DTD_URL_TOKEN = re.compile(
+    r"www\.apple\.com/DTDs/(?P<name>[A-Za-z0-9_.-]{1,64})\.dtd"
+)
 
 
-def is_apple_dtd_url_token(token: str) -> bool:
+def is_apple_dtd_url_token(
+    token: str, *, strict: bool = False
+) -> bool:
     """Whether `token` is the Apple property-list DTD system identifier
     (``www.apple.com/DTDs/PropertyList-1.0.dtd``) that appears in every plist
     XML doctype. It is public boilerplate, not a secret, but the mixed-case
     host/path combination exceeds the entropy threshold.
     """
-    return bool(_APPLE_DTD_URL_TOKEN.fullmatch(token))
+    match = _APPLE_DTD_URL_TOKEN.fullmatch(token)
+    return bool(
+        match
+        and is_safe_path_segment(
+            match.group("name"), strict=strict
+        )
+    )
 
 
-def is_known_fake_private_key_fixture(line: str) -> bool:
-    return (
-        "-----BEGIN PRIVATE KEY-----" in line
-        and "\\nfakefakefake" in line
-        and "\\n-----END PRIVATE KEY-----" in line
+def is_ordered_alphabet_fixture_token(token: str) -> bool:
+    return token in ORDERED_ALPHABET_FIXTURES
+
+
+def is_discord_support_article_token(token: str) -> bool:
+    return token in KNOWN_PUBLIC_DOCUMENTATION_TOKENS
+
+
+def is_known_fake_private_key_match(
+    line: str, private_key_match: re.Match[str]
+) -> bool:
+    return any(
+        match_is_within(private_key_match, fixture_match)
+        for fixture_match in KNOWN_FAKE_PRIVATE_KEY_FIXTURE.finditer(line)
     )
 
 
@@ -240,49 +683,254 @@ def is_programming_identifier_token(token: str) -> bool:
     return has_letter_segment
 
 
+def is_assignment_context_identifier(chunk: str) -> bool:
+    if not ASSIGNMENT_CONTEXT_IDENTIFIER.fullmatch(chunk):
+        return False
+    for part in chunk.split("_"):
+        if len(part) > 32:
+            return False
+    return True
+
+
+def is_safe_url_fragment(fragment: str, *, strict: bool = False) -> bool:
+    if not SAFE_URL_FRAGMENT.fullmatch(fragment):
+        return False
+    anchor = fragment[1:]
+    if re.fullmatch(r"L[0-9]{1,7}(?:-L[0-9]{1,7})?", anchor):
+        return True
+    return is_safe_path_segment(anchor, strict=strict)
+
+
+def is_known_safe_assignment_context_url(url: str) -> bool:
+    fragment = SAFE_URL_FRAGMENT.search(url)
+    if fragment and not is_safe_url_fragment(
+        fragment.group(0), strict=True
+    ):
+        return False
+    base_url = url[: fragment.start()] if fragment else url
+    without_scheme = re.sub(r"(?i)^https?://", "", base_url)
+    return bool(
+        RESERVED_EXAMPLE_URL.fullmatch(base_url)
+        or OPEN_COVEN_REPO_ROOT_URL.fullmatch(base_url)
+        or is_public_repo_url_like_token(without_scheme, strict=True)
+        or is_github_advisory_url_like_token(without_scheme)
+        or is_github_commit_url_like_token(without_scheme, strict=True)
+        or is_apple_dtd_url_token(without_scheme, strict=True)
+        or is_discord_support_article_token(without_scheme)
+    )
+
+
+def is_known_safe_markdown_target(target: str) -> bool:
+    if is_known_safe_assignment_context_url(target):
+        return True
+    if SAFE_URL_FRAGMENT.fullmatch(target):
+        return is_safe_url_fragment(target, strict=True)
+    fragment = SAFE_URL_FRAGMENT.search(target)
+    if fragment and not is_safe_url_fragment(
+        fragment.group(0), strict=True
+    ):
+        return False
+    base_target = target[: fragment.start()] if fragment else target
+    return is_known_safe_assignment_context_path(base_target)
+
+
+def is_likely_passphrase_prose(text: str) -> bool:
+    words = re.findall(r"[A-Za-z]+", text)
+    if any(len(word) >= 20 for word in words):
+        return True
+    return len(words) >= 3 and all(
+        len(word) >= 4 and word.islower() for word in words
+    )
+
+
+def is_likely_unmarked_passphrase(text: str) -> bool:
+    candidate = re.split(r"\s+(?:#|//)", text, maxsplit=1)[0]
+    candidate = normalize_assignment_context_chunk(candidate.strip())
+    markdown_link = ASSIGNMENT_CONTEXT_MARKDOWN_LINK.fullmatch(candidate)
+    if markdown_link:
+        label, target = markdown_link.groups()
+        if (
+            is_known_safe_assignment_context_prose(label)
+            and is_known_safe_markdown_target(target)
+        ):
+            return False
+    if (
+        is_known_safe_assignment_context_url(candidate)
+        or is_known_safe_assignment_context_path(candidate)
+        or is_assignment_context_identifier(candidate)
+        or ASSIGNMENT_CONTEXT_ENV_REFERENCE.fullmatch(candidate)
+        or ASSIGNMENT_CONTEXT_ENV_PATH.fullmatch(candidate)
+        or is_local_path_like_token(candidate, strict=True)
+        or is_opencoven_repo_relative_path_token(candidate, strict=True)
+        or is_github_action_sha_ref_token(candidate, strict=True)
+        or is_macos_library_path_token(candidate, strict=True)
+        or is_ordered_alphabet_fixture_token(candidate)
+    ):
+        return False
+    if any(
+        name != "generic_assignment" and pattern.search(candidate)
+        for name, pattern in SECRET_RULES
+    ) or any(
+        entropy(token_match.group(0)) >= 4.3
+        for token_match in ENTROPY_TOKEN.finditer(candidate)
+    ):
+        return False
+    words = re.findall(r"[A-Za-z0-9]+", candidate)
+    return sum(len(word) >= 4 for word in words) >= 3
+
+
+def is_known_safe_assignment_context_prose(
+    text: str, *, allow_empty: bool = False
+) -> bool:
+    normalized = text.strip()
+    if not normalized:
+        return allow_empty
+    return bool(
+        ASSIGNMENT_CONTEXT_PROSE.fullmatch(normalized)
+        and (
+            ASSIGNMENT_CONTEXT_GUIDANCE.fullmatch(normalized)
+            or not is_likely_passphrase_prose(normalized)
+        )
+    )
+
+
+def normalize_assignment_context_chunk(chunk: str) -> str:
+    core = chunk.rstrip(".,;:")
+    wrapper_pairs = (
+        ('"', '"'),
+        ("'", "'"),
+        ("`", "`"),
+        ("(", ")"),
+        ("[", "]"),
+        ("{", "}"),
+        ("<", ">"),
+    )
+    while len(core) >= 2:
+        for opener, closer in wrapper_pairs:
+            if core.startswith(opener) and core.endswith(closer):
+                core = core[1:-1].strip().rstrip(".,;:")
+                break
+        else:
+            return core
+    return core
+
+
+def is_known_safe_assignment_context_chunk(chunk: str) -> bool:
+    markdown_link = ASSIGNMENT_CONTEXT_MARKDOWN_LINK.fullmatch(chunk)
+    if markdown_link:
+        label, target = markdown_link.groups()
+        if is_known_safe_assignment_context_prose(
+            label
+        ) and is_known_safe_markdown_target(target):
+            return True
+    if chunk.startswith("#"):
+        return is_known_safe_assignment_context_prose(
+            chunk[1:], allow_empty=True
+        )
+    if chunk.startswith("//"):
+        return is_known_safe_assignment_context_prose(
+            chunk[2:], allow_empty=True
+        )
+    contains_quote = any(quote in chunk for quote in "\"'`")
+    core = normalize_assignment_context_chunk(chunk)
+    if not core:
+        return True
+    if (
+        is_known_safe_assignment_context_url(core)
+        or is_known_safe_assignment_context_path(core)
+        or is_assignment_context_identifier(core)
+        or ASSIGNMENT_CONTEXT_ENV_REFERENCE.fullmatch(core)
+        or ASSIGNMENT_CONTEXT_ENV_PATH.fullmatch(core)
+        or is_local_path_like_token(core, strict=True)
+        or is_opencoven_repo_relative_path_token(core, strict=True)
+        or is_github_action_sha_ref_token(core, strict=True)
+        or is_macos_library_path_token(core, strict=True)
+        or is_ordered_alphabet_fixture_token(core)
+    ):
+        return True
+    return not contains_quote and len(core) < 12
+
+
+def is_known_safe_entropy_token(
+    path: str, line: str, token_match: re.Match[str]
+) -> bool:
+    token = token_match.group(0)
+    return bool(
+        re.fullmatch(r"[0-9a-f]{32,64}", token)
+        or is_known_safe_lockfile_token(path, line, token_match)
+        or is_local_path_like_token(token)
+        or is_public_repo_url_like_token(token)
+        or is_opencoven_repo_relative_path_token(token)
+        or is_github_advisory_url_like_token(token)
+        or is_github_commit_url_like_token(token)
+        or is_github_action_sha_ref_token(token)
+        or is_macos_library_path_token(token)
+        or is_apple_dtd_url_token(token)
+        or is_ordered_alphabet_fixture_token(token)
+        or is_discord_support_article_token(token)
+        or is_programming_identifier_token(token)
+    )
+
+
+def is_high_entropy_finding(
+    path: str, line: str, token_match: re.Match[str]
+) -> bool:
+    token = token_match.group(0)
+    return not is_known_safe_entropy_token(
+        path, line, token_match
+    ) and entropy(token) >= 4.3
+
+
+def assignment_trailing_chunk_is_accounted_for(
+    path: str, line: str, chunk_match: re.Match[str]
+) -> bool:
+    chunk = chunk_match.group(0)
+    if is_known_safe_assignment_context_chunk(chunk):
+        return True
+    if any(
+        name != "generic_assignment" and pattern.search(chunk)
+        for name, pattern in SECRET_RULES
+    ):
+        return True
+    return any(
+        is_high_entropy_finding(path, line, token_match)
+        for token_match in ENTROPY_TOKEN.finditer(
+            line, chunk_match.start(), chunk_match.end()
+        )
+    )
+
+
 def scan_text(text: str, path: str) -> list[tuple[str, int, str]]:
     hits: list[tuple[str, int, str]] = []
     for line_number, line in enumerate(text.splitlines(), 1):
-        allow = bool(ALLOW_LINE.search(line))
         for name, pattern in SECRET_RULES:
-            if name == "private_key" and is_known_fake_private_key_fixture(line):
-                continue
-            if name == "generic_assignment" and ENV_SECRET_READ.search(line):
-                continue
-            if name == "generic_assignment" and ENV_SECRET_REFERENCE.search(line):
-                continue
-            if name == "generic_assignment" and RUST_LET_CALL_BINDING.match(line):
-                continue
-            if name == "generic_assignment" and "grep" in line and re.search(r"-[A-Za-z]*E\b", line):
-                continue
-            if pattern.search(line) and not (allow and name != "private_key"):
+            matches = list(pattern.finditer(line))
+            if name == "private_key":
+                matches = [
+                    match
+                    for match in matches
+                    if not is_known_fake_private_key_match(line, match)
+                ]
+            if name == "generic_assignment":
+                unsafe_continuation = has_unsafe_safe_assignment_continuation(
+                    path, line
+                )
+                if not matches:
+                    if unsafe_continuation:
+                        hits.append((path, line_number, name))
+                    continue
+                if not unsafe_continuation and all(
+                    is_known_safe_generic_assignment(path, line, match)
+                    for match in matches
+                ):
+                    continue
                 hits.append((path, line_number, name))
-        if allow:
-            continue
-        if (
-            OPENCOVEN_GITHUB_URL.search(line)
-            or OPENCOVEN_LOCAL_WORKTREE.search(line)
-        ):
-            continue
-        if is_known_safe_lockfile_line(path, line):
-            continue
-        for match in re.finditer(r"\b[A-Za-z0-9_+/@.-]{32,}\b", line):
-            token = match.group(0)
-            if re.fullmatch(r"[0-9a-f]{32,64}", token):
                 continue
-            if (
-                is_local_path_like_token(token)
-                or is_public_repo_url_like_token(token)
-                or is_opencoven_repo_relative_path_token(token)
-                or is_github_advisory_url_like_token(token)
-                or is_github_commit_url_like_token(token)
-                or is_github_action_sha_ref_token(token)
-                or is_macos_library_path_token(token)
-                or is_apple_dtd_url_token(token)
-                or is_programming_identifier_token(token)
-            ):
+            if not matches:
                 continue
-            if entropy(token) >= 4.3:
+            hits.append((path, line_number, name))
+        for match in ENTROPY_TOKEN.finditer(line):
+            if is_high_entropy_finding(path, line, match):
                 hits.append((path, line_number, "high_entropy"))
     return hits
 
@@ -309,10 +957,36 @@ def tracked_file_hits() -> list[tuple[str, int, str]]:
     return hits
 
 
+def read_batch_object(
+    stream: BinaryIO, expected_sha: str
+) -> tuple[bytes, bytes]:
+    header = stream.readline().rstrip(b"\n").split()
+    if len(header) != 3:
+        raise RuntimeError("git cat-file --batch returned a malformed object header")
+    object_sha, object_type, size_bytes = header
+    if object_sha != expected_sha.encode("ascii"):
+        raise RuntimeError("git cat-file --batch returned objects out of order")
+    if object_type not in GIT_OBJECT_TYPES:
+        raise RuntimeError("git cat-file --batch returned an unknown object type")
+    try:
+        size = int(size_bytes)
+    except ValueError as error:
+        raise RuntimeError(
+            "git cat-file --batch returned a malformed object size"
+        ) from error
+    if not 0 <= size <= MAX_BATCH_OBJECT_BYTES:
+        raise RuntimeError("git cat-file --batch returned a malformed object size")
+    data = stream.read(size)
+    if len(data) != size or stream.read(1) != b"\n":
+        raise RuntimeError("git cat-file --batch returned a truncated object")
+    return object_type, data
+
+
 def history_blob_hits(ref: str = "HEAD") -> list[tuple[str, str, int, str]]:
     rows = sh("git", "rev-list", "--objects", ref).splitlines()
     hits: list[tuple[str, str, int, str]] = []
     seen: set[str] = set()
+    objects: list[tuple[str, str]] = []
     for row in rows:
         parts = row.split(" ", 1)
         sha = parts[0]
@@ -324,11 +998,40 @@ def history_blob_hits(ref: str = "HEAD") -> list[tuple[str, str, int, str]]:
         seen.add(sha)
         if any(part in EXCLUDED_PARTS for part in pathlib.PurePosixPath(rel).parts):
             continue
-        if sh("git", "cat-file", "-t", sha).strip() != "blob":
-            continue
-        data = subprocess.check_output(["git", "cat-file", "-p", sha], cwd=ROOT)
-        for path, line, rule in scan_bytes(data, rel):
-            hits.append((sha[:12], path, line, rule))
+        objects.append((sha, rel))
+
+    if not objects:
+        return hits
+
+    # A finite file gives cat-file every request up front. If its output is
+    # malformed or truncated, it cannot deadlock waiting for another request.
+    with tempfile.TemporaryFile() as requests:
+        for sha, _ in objects:
+            requests.write(f"{sha}\n".encode())
+        requests.seek(0)
+
+        with subprocess.Popen(
+            ["git", "cat-file", "--batch"],
+            cwd=ROOT,
+            stdin=requests,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        ) as batch:
+            assert batch.stdout is not None
+            for sha, rel in objects:
+                object_type, data = read_batch_object(batch.stdout, sha)
+                if object_type != b"blob":
+                    continue
+                for path, line, rule in scan_bytes(data, rel):
+                    hits.append((sha[:12], path, line, rule))
+
+            if batch.stdout.read(1):
+                raise RuntimeError(
+                    "git cat-file --batch returned unexpected trailing output"
+                )
+            return_code = batch.wait()
+            if return_code != 0:
+                raise RuntimeError("git cat-file --batch failed")
     return hits
 
 

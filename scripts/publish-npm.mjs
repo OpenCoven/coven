@@ -148,7 +148,9 @@ function writeWrapperPackage(version, packageName = primaryWrapperPackageName) {
   packageJson.name = packageName;
   packageJson.version = version;
   for (const optionalName of Object.keys(packageJson.optionalDependencies)) {
-    packageJson.optionalDependencies[optionalName] = version;
+    if (optionalName.startsWith('@opencoven/cli-')) {
+      packageJson.optionalDependencies[optionalName] = version;
+    }
   }
   writeFileSync(packagePath, `${JSON.stringify(packageJson, null, 2)}\n`);
   rewriteWrapperText(path.join(outDir, 'README.md'), packageName);

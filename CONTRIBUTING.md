@@ -130,6 +130,7 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
 python scripts/check-secrets.py
+python3 scripts/check-coven-privacy.py --staged
 ```
 
 5. Include smoke-test notes for runtime or API changes.

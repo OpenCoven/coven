@@ -21,7 +21,7 @@ use crate::{
     daemon::DaemonStatus,
     encrypted_artifacts::SensitiveArtifactStore,
     harness::{ConversationHint, HarnessLaunchMode},
-    privacy, project, store, ward,
+    privacy, session_launch, store, ward,
 };
 
 const MAX_EVENTS_LIMIT: i64 = 1_000;
@@ -177,9 +177,10 @@ pub struct SessionLaunch {
     pub project_root: String,
     pub cwd: String,
     pub harness: String,
-    /// Optional namespaced model id (for example `openai/gpt-5.6-sol`). The
-    /// runtime keeps the provider prefix here and lets the harness adapter
-    /// normalize it for the underlying CLI.
+    /// Optional provider-qualified model id (for example
+    /// `openai/gpt-5.6-sol`). The runtime keeps the provider prefix here and
+    /// lets the harness adapter apply its declared strip-provider or preserve
+    /// transform for the underlying CLI.
     pub model: Option<String>,
     pub launch_mode: HarnessLaunchMode,
     pub prompt: String,
@@ -352,6 +353,14 @@ pub fn handle_request_with_runtime(
                 .trim_end_matches("/edits");
             apply_familiar_edits(coven_home, id, body)
         }
+        // The append-only ward_audit ledger for one familiar — where the
+        // /edits write path persists its Gate 4 apply records (#414).
+        ("GET", path) if path.starts_with("/familiars/") && path.ends_with("/audit") => {
+            let id = path
+                .trim_start_matches("/familiars/")
+                .trim_end_matches("/audit");
+            familiar_audit_response(coven_home, id, query)
+        }
         ("GET", "/threads/weaves") => threads_weaves_response(coven_home),
         ("GET", "/threads/proposals") => threads_proposals_response(coven_home, None),
         ("GET", path) if path.starts_with("/threads/proposals/") => {
@@ -495,6 +504,63 @@ pub fn handle_request_with_runtime(
             }
         }
 
+        ("GET", "/memory/overview") => {
+            json_response(200, &crate::cockpit_sources::memory_overview(coven_home)?)
+        }
+        ("GET", path) if path.starts_with("/memory/") => {
+            let id = path.trim_start_matches("/memory/");
+            if id.contains('/') || Uuid::parse_str(id).is_err() {
+                return api_error(400, "invalid_request", "Memory id must be a UUID.", None);
+            }
+            match crate::cockpit_sources::read_memory_detail(coven_home, id) {
+                Ok(Some(detail)) => json_response(200, &detail),
+                Ok(None) => api_error(
+                    404,
+                    "memory_not_found",
+                    "Memory entry was not found.",
+                    Some(serde_json::json!({ "memoryId": id })),
+                ),
+                Err(error) => match error
+                    .downcast_ref::<crate::cockpit_sources::MemoryContentError>()
+                {
+                    Some(crate::cockpit_sources::MemoryContentError::TooLarge { max_bytes }) => {
+                        api_error(
+                            413,
+                            "memory_content_too_large",
+                            "Memory entry exceeds the maximum readable size.",
+                            Some(serde_json::json!({
+                                "memoryId": id,
+                                "maxBytes": max_bytes,
+                            })),
+                        )
+                    }
+                    Some(crate::cockpit_sources::MemoryContentError::InvalidUtf8) => api_error(
+                        422,
+                        "memory_content_invalid",
+                        "Memory entry is not valid UTF-8.",
+                        Some(serde_json::json!({ "memoryId": id })),
+                    ),
+                    Some(crate::cockpit_sources::MemoryContentError::MissingOrUnsafe) => api_error(
+                        404,
+                        "memory_not_found",
+                        "Memory entry was not found.",
+                        Some(serde_json::json!({ "memoryId": id })),
+                    ),
+                    Some(crate::cockpit_sources::MemoryContentError::Unavailable(_)) => api_error(
+                        503,
+                        "memory_content_unavailable",
+                        "Memory entry content is temporarily unavailable.",
+                        Some(serde_json::json!({ "memoryId": id })),
+                    ),
+                    None => api_error(
+                        503,
+                        "memory_content_unavailable",
+                        "Memory entry content is temporarily unavailable.",
+                        Some(serde_json::json!({ "memoryId": id })),
+                    ),
+                },
+            }
+        }
         ("GET", "/memory") => json_response(200, &crate::cockpit_sources::scan_memory(coven_home)?),
         ("GET", "/research") => {
             json_response(200, &crate::cockpit_sources::read_research(coven_home)?)
@@ -1630,12 +1696,10 @@ fn launch_session(
             return api_error(400, "invalid_request", &error.to_string(), None);
         }
     };
-    let familiar_ctx = match launch.familiar_id.as_deref() {
-        Some(familiar_id) => match crate::familiar_identity::resolve(coven_home, familiar_id) {
-            Ok(Some(familiar_ctx)) => Some(familiar_ctx),
-            Ok(None) => {
-                let error =
-                    crate::familiar_identity::unknown_familiar_error(coven_home, familiar_id);
+    let familiar_ctx =
+        match session_launch::resolve_familiar(coven_home, launch.familiar_id.as_deref()) {
+            Ok(familiar_ctx) => familiar_ctx,
+            Err(session_launch::FamiliarError::Unknown { familiar_id, error }) => {
                 return api_error(
                     400,
                     "unknown_familiar",
@@ -1643,32 +1707,25 @@ fn launch_session(
                     Some(json!({ "familiarId": familiar_id })),
                 );
             }
-            Err(error) => {
+            Err(session_launch::FamiliarError::LookupFailed(error)) => {
                 return api_error(500, "familiar_lookup_failed", &error.to_string(), None);
             }
-        },
-        None => None,
-    };
+        };
     launch.familiar_id = familiar_ctx.as_ref().map(|familiar| familiar.id.clone());
     let conn = store::open_store(&store_path(coven_home))?;
     let now = current_timestamp();
-    let record = store::SessionRecord {
+    let record = session_launch::new_session_record(session_launch::NewSessionParams {
         id: launch.id.clone(),
         project_root: launch.project_root.clone(),
         harness: launch.harness.clone(),
         title: launch.title.clone(),
         status: "running".to_string(),
-        exit_code: None,
-        archived_at: None,
-        created_at: now.clone(),
-        updated_at: now,
+        now,
         conversation_id: launch.conversation_id.clone(),
         familiar_id: familiar_ctx.as_ref().map(|familiar| familiar.id.clone()),
         labels: Vec::new(),
-        visibility: "private".to_string(),
-        external: false,
-        transcript_path: None,
-    };
+        visibility: None,
+    });
     store::insert_session(&conn, &record)?;
     if let Err(error) = runtime.launch_session(&launch) {
         // Don't propagate to the accept loop — that crashes the daemon.
@@ -1815,25 +1872,21 @@ fn complete_external_session(
 fn session_launch_from_payload(payload: Value) -> Result<SessionLaunch> {
     let project_root = required_string(&payload, "projectRoot")?;
     let cwd = payload.get("cwd").and_then(Value::as_str);
-    let canonical_project_root = project::canonical_project_root(Path::new(&project_root))
-        .context("failed to resolve projectRoot")?;
-    let canonical_cwd = project::resolve_inside_root(&canonical_project_root, cwd.map(Path::new))?;
+    let paths = session_launch::resolve_launch_paths(Path::new(&project_root), cwd.map(Path::new))
+        .map_err(|error| match error {
+            session_launch::LaunchPathError::ProjectRoot(error) => {
+                error.context("failed to resolve projectRoot")
+            }
+            session_launch::LaunchPathError::Cwd(error) => error,
+        })?;
     let harness = required_string(&payload, "harness")?;
     // Validate against the supported harness set up-front (client error)
     // instead of letting the runtime's arg builder surface it later as a
     // 500. Bonus: rejecting here means we never insert a session row for
-    // a launch that can't possibly succeed.
-    let supported_specs = crate::harness::configured_harness_specs()?;
-    let supported: Vec<&str> = supported_specs
-        .iter()
-        .map(|spec| spec.id.as_str())
-        .collect();
-    if !supported.contains(&harness.as_str()) {
-        anyhow::bail!(
-            "{}",
-            crate::harness::unsupported_harness_message(&harness, &supported)
-        );
-    }
+    // a launch that can't possibly succeed. Availability is deliberately
+    // not required (HarnessCheck::Configured): a configured-but-missing
+    // binary is surfaced by the runtime as a structured launch failure.
+    session_launch::validate_harness(&harness, session_launch::HarnessCheck::Configured)?;
     let launch_mode = launch_mode_from_payload(&payload)?;
     let model = payload
         .get("model")
@@ -1871,8 +1924,8 @@ fn session_launch_from_payload(payload: Value) -> Result<SessionLaunch> {
 
     Ok(SessionLaunch {
         id: Uuid::new_v4().to_string(),
-        project_root: canonical_project_root.to_string_lossy().into_owned(),
-        cwd: canonical_cwd.to_string_lossy().into_owned(),
+        project_root: paths.project_root.to_string_lossy().into_owned(),
+        cwd: paths.cwd.to_string_lossy().into_owned(),
         harness,
         model,
         launch_mode,
@@ -2673,6 +2726,22 @@ fn apply_familiar_edits(
             Some(json!({ "changes": changes })),
         );
     }
+    let mut resolved_targets = HashSet::with_capacity(adjudication.decisions.len());
+    if let Some(duplicate) = adjudication
+        .decisions
+        .iter()
+        .find(|decision| !resolved_targets.insert(ward::portable_surface_key(&decision.resolved)))
+    {
+        return api_error(
+            400,
+            "invalid_request",
+            "Each edit must resolve to a unique familiar surface.",
+            Some(json!({
+                "resolved": duplicate.resolved.as_str(),
+                "target": duplicate.target.as_str(),
+            })),
+        );
+    }
     let gated_targets: Vec<String> = adjudication
         .decisions
         .iter()
@@ -2792,6 +2861,38 @@ fn apply_familiar_edits(
             }),
         );
     }
+    // Gate 4 persistence (#414): the audit records returned to the client
+    // also land in the append-only ward_audit ledger, so applied writes stay
+    // observable across daemon restarts. Persist before advancing protected
+    // baselines so a post-write failure is less likely to leave an audit gap.
+    // On persistence failure, return a structured 500 that includes the applied
+    // changes so clients can distinguish "write applied, audit failed" from a
+    // full failure and avoid blind retries that would produce duplicate writes.
+    {
+        let mut conn = store::open_store(&store_path(coven_home))?;
+        if let Err(err) = crate::threads_gate::persist_apply_audit_records(
+            &mut conn,
+            familiar_id,
+            &workspace,
+            &config,
+            &report,
+        ) {
+            return json_response(
+                500,
+                &json!({
+                    "error": {
+                        "code": "audit_persist_failed",
+                        "message": format!(
+                            "The file write was applied but the audit ledger \
+                             could not be updated: {err:#}"
+                        ),
+                        "details": { "writeApplied": true },
+                    },
+                    "changes": changes,
+                }),
+            );
+        }
+    }
     advance_applied_protected_baselines(coven_home, familiar_id, &workspace, &report.changes)?;
     json_response(
         200,
@@ -2884,12 +2985,207 @@ fn familiar_ward_response(coven_home: &Path, familiar_id: &str) -> Result<ApiRes
                 "defaultTier": config.default_tier,
                 "surface": config.surface,
                 "protectedSurface": config.protected_surface,
+                "probes": config.probe,
             },
         }),
     )
 }
 
 const DEGRADED_WARD_CONFIG_UNPARSEABLE: &str = "ward-config-unparseable";
+
+fn normalize_ward_audit_tier(tier: Option<String>) -> Option<String> {
+    tier.map(|value| {
+        value
+            .parse::<u8>()
+            .map(|number| format!("tier_{number}"))
+            .unwrap_or(value)
+    })
+}
+
+/// `GET /familiars/{id}/audit` — the append-only `ward_audit` ledger for one
+/// familiar, newest first (#414; RFC-0001 §5.6).
+///
+/// Read-side twin of the `/edits` write path's Gate 4 persistence: rows come
+/// straight from the store the write path appends to — no separate source of
+/// truth. Unlike `/ward` this endpoint does not require a live `ward.toml`:
+/// the ledger is append-only history and stays observable even after a
+/// familiar's Ward config is removed. Unknown familiars are structured 404s.
+///
+/// Query parameters: `limit` (rows, default 100, max 1000) and `event`
+/// (exact `event_type` filter, e.g. `apply_audit`).
+fn familiar_audit_response(
+    coven_home: &Path,
+    familiar_id: &str,
+    query: Option<&str>,
+) -> Result<ApiResponse> {
+    if familiar_id.is_empty() || familiar_id.contains('/') {
+        return api_error(
+            400,
+            "invalid_request",
+            "Familiar id is required and must not contain '/'.",
+            None,
+        );
+    }
+    if crate::familiar_identity::resolve(coven_home, familiar_id)?.is_none() {
+        return api_error(
+            404,
+            "familiar_not_found",
+            "No familiar with that id is declared in familiars.toml.",
+            Some(json!({ "id": familiar_id })),
+        );
+    }
+    let limit = match query.and_then(|q| query_param(q, "limit")) {
+        None => 100_i64,
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(n) if (1..=1000).contains(&n) => n,
+            _ => {
+                return api_error(
+                    400,
+                    "invalid_request",
+                    "Query parameter `limit` must be an integer between 1 and 1000.",
+                    Some(json!({ "limit": raw })),
+                );
+            }
+        },
+    };
+    let event = match query.and_then(|q| query_param(q, "event")) {
+        Some(event) => {
+            if let Err(message) = validate_ward_audit_event_tag(event) {
+                let message = message.to_string();
+                return api_error(
+                    400,
+                    "invalid_request",
+                    &message,
+                    Some(json!({ "event": event })),
+                );
+            }
+            Some(event)
+        }
+        None => None,
+    };
+
+    let conn = store::open_store(&store_path(coven_home))?;
+    let mut sql = String::from(
+        "SELECT id, event_type, proposal_id, ward_version, ward_hash,
+                CAST(tier AS TEXT),
+                decision, approver, diff_hash, detail, files_touched, channel,
+                thread_id, submitted_at, decided_at, recorded_at
+         FROM ward_audit WHERE familiar_id = ?1",
+    );
+    if event.is_some() {
+        sql.push_str(" AND event_type = ?3");
+    }
+    sql.push_str(" ORDER BY id DESC LIMIT ?2");
+    let mut statement = conn.prepare(&sql)?;
+    let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<Value> {
+        let ward_hash: Vec<u8> = row.get(4)?;
+        let tier = normalize_ward_audit_tier(row.get(5)?);
+        let diff_hash: Option<Vec<u8>> = row.get(8)?;
+        let detail: Option<String> = row.get(9)?;
+        let files_touched: String = row.get(10)?;
+        let files_touched = serde_json::from_str::<Value>(&files_touched)
+            .ok()
+            .filter(Value::is_array)
+            .unwrap_or_else(|| json!([]));
+        let (detail, detail_raw) = match detail {
+            Some(raw) => match serde_json::from_str::<Value>(&raw) {
+                Ok(parsed) => (parsed, None),
+                Err(_) => (Value::Null, Some(raw)),
+            },
+            None => (Value::Null, None),
+        };
+        let mut record = serde_json::Map::from_iter([
+            ("id".to_string(), json!(row.get::<_, i64>(0)?)),
+            ("eventType".to_string(), json!(row.get::<_, String>(1)?)),
+            (
+                "proposalId".to_string(),
+                json!(row.get::<_, Option<String>>(2)?),
+            ),
+            (
+                "wardVersion".to_string(),
+                json!(row.get::<_, Option<String>>(3)?),
+            ),
+            ("wardHash".to_string(), json!(hex_string(&ward_hash))),
+            ("tier".to_string(), json!(tier)),
+            ("decision".to_string(), json!(row.get::<_, String>(6)?)),
+            (
+                "approver".to_string(),
+                json!(row.get::<_, Option<String>>(7)?),
+            ),
+            (
+                "diffSha256".to_string(),
+                json!(diff_hash.as_deref().map(hex_string)),
+            ),
+            ("detail".to_string(), detail),
+            ("filesTouched".to_string(), files_touched),
+            (
+                "channel".to_string(),
+                json!(row.get::<_, Option<String>>(11)?),
+            ),
+            (
+                "threadId".to_string(),
+                json!(row.get::<_, Option<String>>(12)?),
+            ),
+            ("submittedAt".to_string(), json!(row.get::<_, String>(13)?)),
+            ("decidedAt".to_string(), json!(row.get::<_, String>(14)?)),
+            ("recordedAt".to_string(), json!(row.get::<_, String>(15)?)),
+        ]);
+        if let Some(raw) = detail_raw {
+            record.insert("detailRaw".to_string(), Value::String(raw));
+        }
+        Ok(Value::Object(record))
+    };
+    let records: Vec<Value> = match event {
+        Some(event) => statement
+            .query_map(rusqlite::params![familiar_id, limit, event], map_row)?
+            .collect::<rusqlite::Result<_>>()?,
+        None => statement
+            .query_map(rusqlite::params![familiar_id, limit], map_row)?
+            .collect::<rusqlite::Result<_>>()?,
+    };
+    json_response(
+        200,
+        &json!({
+            "ok": true,
+            "familiarId": familiar_id,
+            "records": records,
+        }),
+    )
+}
+
+pub(crate) const WARD_AUDIT_EVENT_TAGS: &[&str] = &[
+    "proposal_submitted",
+    "proposal_window_opened",
+    "proposal_approved",
+    "proposal_rejected",
+    "proposal_vetoed",
+    "ward_updated",
+    "memory_entry_admitted",
+    "principal_authorized_write",
+    "validation_verdict",
+    "compaction_ledger",
+    "apply_audit",
+];
+
+pub(crate) fn validate_ward_audit_event_tag(event: &str) -> Result<()> {
+    anyhow::ensure!(
+        !event.is_empty()
+            && event
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'),
+        "Query parameter `event` must be a lowercase ASCII event tag containing only lowercase letters, digits, and `_`."
+    );
+    anyhow::ensure!(
+        WARD_AUDIT_EVENT_TAGS.contains(&event),
+        "Query parameter `event` must be a known ward_audit event tag."
+    );
+    Ok(())
+}
+
+/// Lowercase hex of raw hash bytes for API payloads.
+fn hex_string(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
 
 /// `GET /api/v1/threads/proposals[/:id]` — the pending-proposal read surface
 /// (Gate 3 PR 3, `docs/design/ward-gate3-coherence.md` G3.3).
@@ -2939,6 +3235,17 @@ fn threads_proposals_response(coven_home: &Path, id: Option<&str>) -> Result<Api
                 "degraded": { "file": file_name, "reason": "proposal-unparseable" },
             }));
             continue;
+        };
+        let (mut probes, mut probe_evidence_degraded) = match raw_value.get("probes") {
+            Some(value) => {
+                match serde_json::from_value::<Vec<crate::ward_probes::SurfaceProbeReport>>(
+                    value.clone(),
+                ) {
+                    Ok(probes) => (Some(probes), None),
+                    Err(_) => (None, Some("proposal-probes-unparseable")),
+                }
+            }
+            None => (None, None),
         };
         let mut proposal_value = raw_value.clone();
         if let Some(object) = proposal_value.as_object_mut() {
@@ -2990,11 +3297,35 @@ fn threads_proposals_response(coven_home: &Path, id: Option<&str>) -> Result<Api
             }));
             continue;
         };
+        if let Some(reports) = probes.as_deref() {
+            let workspace = crate::cockpit_sources::familiar_workspace(coven_home, &familiar_id);
+            let validation = match ward::WardConfig::load(&workspace) {
+                Ok(Some(config)) => crate::ward_probes::validate_staged_reports(
+                    &workspace, &config, proposal, reports,
+                ),
+                Ok(None) | Err(_) => crate::ward_probes::ProbeEvidenceValidation::Inconsistent,
+            };
+            match validation {
+                crate::ward_probes::ProbeEvidenceValidation::Valid => {}
+                crate::ward_probes::ProbeEvidenceValidation::Stale => {
+                    probes = None;
+                    probe_evidence_degraded = Some("proposal-probes-stale");
+                }
+                crate::ward_probes::ProbeEvidenceValidation::Inconsistent => {
+                    probes = None;
+                    probe_evidence_degraded = Some("proposal-probes-inconsistent");
+                }
+            }
+        }
         let targets: Vec<String> = proposal
             .edits
             .iter()
             .map(|edit| edit.surface.as_str().to_string())
             .collect();
+        let probe_summary = probes
+            .as_deref()
+            .map(crate::ward_probes::ProbeSummary::from_reports)
+            .unwrap_or_else(|| crate::ward_probes::ProbeSummary::unscored_targets(targets.len()));
         let format = time::format_description::well_known::Rfc3339;
         let mut view = json!({
             "proposalId": proposal.id.0.to_string(),
@@ -3004,7 +3335,21 @@ fn threads_proposals_response(coven_home: &Path, id: Option<&str>) -> Result<Api
             "stagedAt": proposal.staged_at.format(&format).ok(),
             "targets": targets,
             "proposalRevision": proposal_revision(&proposal_value)?,
+            "probeSummary": probe_summary,
         });
+        if let Some(reason) = probe_evidence_degraded {
+            view.as_object_mut()
+                .expect("proposal view is always a JSON object")
+                .insert(
+                    "probeEvidenceDegraded".to_string(),
+                    json!({ "reason": reason }),
+                );
+        }
+        if id.is_some() {
+            view.as_object_mut()
+                .expect("proposal view is always a JSON object")
+                .insert("probes".to_string(), json!(probes.unwrap_or_default()));
+        }
         if let Some(scheduled) = &scheduled {
             let approval_path = coven_threads_core::ApprovalPathWireEnvelope::from_classification(
                 scheduled.classification(),
@@ -3300,6 +3645,91 @@ fn ward_tier_number(tier: ward::Tier) -> u8 {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingReviewKind {
+    Authority,
+    Coherence,
+}
+
+impl PendingReviewKind {
+    fn from_pending_value(value: &Value) -> Option<Self> {
+        match value.get("reviewKind") {
+            None => Some(Self::Authority),
+            Some(Value::String(kind)) if kind == "authority" => Some(Self::Authority),
+            Some(Value::String(kind)) if kind == "coherence" => Some(Self::Coherence),
+            Some(_) => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Authority => "authority",
+            Self::Coherence => "coherence",
+        }
+    }
+}
+
+struct CoherenceDecisionEvidence {
+    validation: crate::ward_probes::ProbeEvidenceValidation,
+    summary: crate::ward_probes::ProbeSummary,
+    reports: Option<Vec<crate::ward_probes::SurfaceProbeReport>>,
+    degraded_reason: Option<&'static str>,
+}
+
+fn coherence_decision_evidence(
+    raw_value: &Value,
+    workspace: &Path,
+    config: &ward::WardConfig,
+    pending: &coven_threads_core::PendingProposal,
+) -> CoherenceDecisionEvidence {
+    let targets = pending.edits.len();
+    let reports = raw_value
+        .get("probes")
+        .cloned()
+        .map(serde_json::from_value::<Vec<crate::ward_probes::SurfaceProbeReport>>)
+        .transpose();
+    let Ok(Some(reports)) = reports else {
+        return CoherenceDecisionEvidence {
+            validation: crate::ward_probes::ProbeEvidenceValidation::Inconsistent,
+            summary: crate::ward_probes::ProbeSummary::unscored_targets(targets),
+            reports: None,
+            degraded_reason: Some(if raw_value.get("probes").is_some() {
+                "proposal-probes-unparseable"
+            } else {
+                "proposal-probes-missing"
+            }),
+        };
+    };
+    let revalidated =
+        crate::ward_probes::revalidate_staged_reports(workspace, config, pending, &reports);
+    match (revalidated.validation, revalidated.current) {
+        (crate::ward_probes::ProbeEvidenceValidation::Valid, Some(current)) => {
+            let summary = crate::ward_probes::ProbeSummary::from_reports(&current);
+            CoherenceDecisionEvidence {
+                validation: revalidated.validation,
+                summary,
+                reports: Some(current),
+                degraded_reason: None,
+            }
+        }
+        (crate::ward_probes::ProbeEvidenceValidation::Valid, None)
+        | (crate::ward_probes::ProbeEvidenceValidation::Inconsistent, _) => {
+            CoherenceDecisionEvidence {
+                validation: crate::ward_probes::ProbeEvidenceValidation::Inconsistent,
+                summary: crate::ward_probes::ProbeSummary::unscored_targets(targets),
+                reports: None,
+                degraded_reason: Some("proposal-probes-inconsistent"),
+            }
+        }
+        (crate::ward_probes::ProbeEvidenceValidation::Stale, _) => CoherenceDecisionEvidence {
+            validation: revalidated.validation,
+            summary: crate::ward_probes::ProbeSummary::unscored_targets(targets),
+            reports: None,
+            degraded_reason: Some("proposal-probes-stale"),
+        },
+    }
+}
+
 pub(crate) fn decide_threads_proposal(
     coven_home: &Path,
     proposal_id: &str,
@@ -3436,6 +3866,14 @@ fn decide_threads_proposal_inner(
         Err(_) => {
             return json_response(409, &json!({ "blocked": true, "why": "proposal-corrupt" }))
         }
+    };
+    let Some(review_kind) = PendingReviewKind::from_pending_value(&raw_value) else {
+        if raw_value.get("decisionState").is_some() {
+            claim.preserve();
+        } else {
+            claim.restore_pending(&mut raw_value)?;
+        }
+        return json_response(409, &json!({ "blocked": true, "why": "proposal-corrupt" }));
     };
     let durable_request = proposal_decision_request(&raw_value)?;
     maybe_fail_proposal_decision(
@@ -3590,6 +4028,50 @@ fn decide_threads_proposal_inner(
         }
     };
     let targets: Vec<String> = edits.iter().map(|edit| edit.target.clone()).collect();
+    let coherence_evidence = (review_kind == PendingReviewKind::Coherence)
+        .then(|| coherence_decision_evidence(&authority_value, &workspace, &config, &pending));
+    let probe_summary = if review_kind == PendingReviewKind::Coherence {
+        if let Some(applying) = applying_state.as_ref() {
+            let Some(summary) = applying.probe_summary.clone() else {
+                return json_response(
+                    409,
+                    &json!({
+                        "blocked": true,
+                        "why": "proposal-recovery-intent-unverifiable",
+                        "proposalId": proposal_id,
+                    }),
+                );
+            };
+            Some(summary)
+        } else {
+            coherence_evidence
+                .as_ref()
+                .map(|evidence| evidence.summary.clone())
+        }
+    } else {
+        None
+    };
+    if decision == "approve" && applying_state.is_none() {
+        if let Some(evidence) = coherence_evidence.as_ref() {
+            if evidence.validation != crate::ward_probes::ProbeEvidenceValidation::Valid {
+                claim.restore_pending(&mut raw_value)?;
+                let reason = evidence
+                    .degraded_reason
+                    .unwrap_or("proposal-probes-inconsistent");
+                return json_response(
+                    409,
+                    &json!({
+                        "blocked": true,
+                        "why": reason,
+                        "proposalId": proposal_id,
+                        "reviewKind": review_kind.as_str(),
+                        "probeSummary": evidence.summary,
+                        "probeEvidenceDegraded": { "reason": reason },
+                    }),
+                );
+            }
+        }
+    }
     let ward = ward::Ward::new(&workspace, config.clone())?;
     let adjudication = ward.evaluate(&ward::Proposal {
         targets: targets.clone(),
@@ -3659,7 +4141,56 @@ fn decide_threads_proposal_inner(
             );
         }
     }
-    if scheduled.is_some() && applying_state.is_none() && adjudication.is_blocked() {
+    let coherence_rejection = review_kind == PendingReviewKind::Coherence && decision == "reject";
+    let coherence_revalidation_failed =
+        review_kind == PendingReviewKind::Coherence
+            && decision == "approve"
+            && (!adjudication.decisions.iter().any(|decision| {
+                matches!(decision.verdict, ward::Verdict::RequiresCoherenceReview)
+            }) || adjudication.decisions.iter().any(|decision| {
+                matches!(
+                    decision.verdict,
+                    ward::Verdict::AuthorizedProtectedChange | ward::Verdict::Blocked { .. }
+                )
+            }));
+    if coherence_revalidation_failed {
+        let state = crate::threads_gate::build_weave_state(
+            &conn,
+            &familiar_id,
+            &workspace,
+            &config,
+            &[],
+            false,
+        )?;
+        append_proposal_refusal_audit(
+            &conn,
+            proposal_id,
+            &familiar_id,
+            state.weave.weave_hash(),
+            &pending.writer,
+            &targets,
+            pending.channel,
+        )?;
+        if applying_state.is_none() {
+            claim.restore_pending(&mut raw_value)?;
+        } else {
+            claim.preserve();
+        }
+        return json_response(
+            409,
+            &json!({
+                "blocked": true,
+                "why": "proposal-revalidation-failed",
+                "proposalId": proposal_id,
+                "reviewKind": review_kind.as_str(),
+            }),
+        );
+    }
+    if scheduled.is_some()
+        && applying_state.is_none()
+        && adjudication.is_blocked()
+        && !coherence_rejection
+    {
         let state = crate::threads_gate::build_weave_state_for_writer(
             &conn,
             &familiar_id,
@@ -3696,7 +4227,7 @@ fn decide_threads_proposal_inner(
             }),
         );
     }
-    if adjudication.is_blocked() {
+    if adjudication.is_blocked() && !coherence_rejection {
         let state = crate::threads_gate::build_weave_state(
             &conn,
             &familiar_id,
@@ -3720,15 +4251,28 @@ fn decide_threads_proposal_inner(
             &json!({ "blocked": true, "why": "proposal-revalidation-failed" }),
         );
     }
-    let gated_targets: Vec<String> = adjudication
-        .decisions
-        .iter()
-        .filter(|d| {
-            !d.verdict.is_blocked() && (scheduled.is_some() || d.tier == ward::Tier::Protected)
-        })
-        .map(|d| d.resolved.clone())
-        .collect();
-    let state = if scheduled.is_some() {
+    let gated_targets: Vec<String> = if review_kind == PendingReviewKind::Coherence {
+        Vec::new()
+    } else {
+        adjudication
+            .decisions
+            .iter()
+            .filter(|d| {
+                !d.verdict.is_blocked() && (scheduled.is_some() || d.tier == ward::Tier::Protected)
+            })
+            .map(|d| d.resolved.clone())
+            .collect()
+    };
+    let state = if review_kind == PendingReviewKind::Coherence {
+        crate::threads_gate::build_weave_state(
+            &conn,
+            &familiar_id,
+            &workspace,
+            &config,
+            &[],
+            false,
+        )?
+    } else if scheduled.is_some() {
         crate::threads_gate::build_weave_state_for_writer(
             &conn,
             &familiar_id,
@@ -3748,7 +4292,10 @@ fn decide_threads_proposal_inner(
             false,
         )?
     };
-    if decision == "approve" && gated_targets.is_empty() {
+    if decision == "approve"
+        && review_kind == PendingReviewKind::Authority
+        && gated_targets.is_empty()
+    {
         append_proposal_refusal_audit(
             &conn,
             proposal_id,
@@ -3767,6 +4314,10 @@ fn decide_threads_proposal_inner(
 
     if decision == "reject" {
         claim.preserve();
+        // The upstream rejection detail schema is reserved for veto-window
+        // closure. Keep the terminal row canonical; coherence probe evidence
+        // remains available in the decision response (approval details permit
+        // additive fields and carry it durably there).
         append_proposal_decision_audit(
             &conn,
             ProposalDecisionAudit {
@@ -3785,16 +4336,30 @@ fn decide_threads_proposal_inner(
         )?;
         maybe_fail_proposal_decision(ProposalDecisionFailpoint::AuditBeforeCleanup, proposal_id)?;
         claim.consume()?;
-        return json_response(
-            200,
-            &json!({
-                "ok": true,
-                "decision": decision_semantics.rejection_decision,
-                "proposalId": proposal_id,
-                "filesTouched": targets,
-                "note": note,
-            }),
-        );
+        let mut response = json!({
+            "ok": true,
+            "decision": decision_semantics.rejection_decision,
+            "proposalId": proposal_id,
+            "filesTouched": targets,
+            "note": note,
+        });
+        if let Some(summary) = probe_summary.as_ref() {
+            let object = response
+                .as_object_mut()
+                .expect("proposal decision response is an object");
+            object.insert("reviewKind".to_string(), json!(review_kind.as_str()));
+            object.insert("probeSummary".to_string(), json!(summary));
+            if let Some(reason) = coherence_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.degraded_reason)
+            {
+                object.insert(
+                    "probeEvidenceDegraded".to_string(),
+                    json!({ "reason": reason }),
+                );
+            }
+        }
+        return json_response(200, &response);
     }
 
     if applying_state.is_none() {
@@ -3849,17 +4414,25 @@ fn decide_threads_proposal_inner(
         );
     }
     if let Some(applying) = applying_state {
-        if let Err(error) = verify_recoverable_apply_state(&workspace, &pending, &applying) {
-            return json_response(
-                409,
-                &json!({
-                    "blocked": true,
-                    "why": "proposal-recovery-surface-diverged",
-                    "proposalId": proposal_id,
-                    "error": error.to_string(),
-                }),
-            );
-        }
+        let expected_resolved = match verify_recoverable_apply_state(
+            &workspace,
+            &pending,
+            &applying,
+            &adjudication.decisions,
+        ) {
+            Ok(expected_resolved) => expected_resolved,
+            Err(error) => {
+                return json_response(
+                    409,
+                    &json!({
+                        "blocked": true,
+                        "why": "proposal-recovery-surface-diverged",
+                        "proposalId": proposal_id,
+                        "error": error.to_string(),
+                    }),
+                )
+            }
+        };
         let expected_before = proposal_expected_before(&applying)?;
         let recovery_authorization = recovery_authorization(proposal_id, &authorization);
         if !ward_config_is_unchanged(&workspace, &config)? {
@@ -3872,15 +4445,26 @@ fn decide_threads_proposal_inner(
                 }),
             );
         }
-        let report =
-            ward.apply_after_threads_approval(&edits, &recovery_authorization, &expected_before)?;
+        let report = apply_after_review_approval(
+            &ward,
+            review_kind,
+            &edits,
+            &recovery_authorization,
+            &expected_before,
+            &expected_resolved,
+            ward::ApprovedApplyMode::Recovery,
+        )?;
         if report.is_refused() {
             let rollback_edits = proposal_rollback_edits(&applying)?;
             let expected_after = proposal_expected_after(&edits);
-            let rollback = ward.apply_after_threads_approval(
+            let rollback = apply_after_review_approval(
+                &ward,
+                review_kind,
                 &rollback_edits,
                 &authorization,
                 &expected_after,
+                &expected_resolved,
+                ward::ApprovedApplyMode::Recovery,
             )?;
             if rollback.is_refused() {
                 anyhow::bail!(
@@ -3915,6 +4499,7 @@ fn decide_threads_proposal_inner(
                 workspace: &workspace,
                 weave_hash: &applying.weave_hash,
                 approver: &pending.writer,
+                apply_report: &report,
                 gated_targets: &gated_targets,
                 approved_bytes: &approved_bytes,
                 files_touched: &targets,
@@ -3922,61 +4507,103 @@ fn decide_threads_proposal_inner(
                 approval_path_label: &decision_semantics.approval_path_label,
                 window_close: decision_semantics.window_close.as_ref(),
                 channel: pending.channel,
+                probe_summary: applying.probe_summary.as_ref(),
             },
         )?;
         maybe_fail_proposal_decision(ProposalDecisionFailpoint::AuditBeforeCleanup, proposal_id)?;
         claim.consume()?;
-        return json_response(
-            200,
-            &json!({
-                "ok": true,
-                "decision": "approved",
-                "proposalId": proposal_id,
-                "filesTouched": targets,
-                "recovered": true,
-            }),
-        );
+        let mut response = json!({
+            "ok": true,
+            "decision": "approved",
+            "proposalId": proposal_id,
+            "filesTouched": targets,
+            "recovered": true,
+        });
+        if let Some(summary) = applying.probe_summary {
+            let object = response
+                .as_object_mut()
+                .expect("proposal recovery response is an object");
+            object.insert("reviewKind".to_string(), json!(review_kind.as_str()));
+            object.insert("probeSummary".to_string(), json!(summary));
+        }
+        return json_response(200, &response);
     }
 
-    for target in &gated_targets {
-        let request = coven_threads_core::MutationRequest {
-            surface: coven_threads_core::SurfaceId::new(target.clone()),
-            writer: pending.writer.clone(),
-            channel: pending.channel,
-            identity_context: None,
-        };
-        let verdict = coven_threads_core::validate_fail_closed(&state.weave, &request);
-        crate::threads_gate::append_audit_row(
-            &conn,
-            &familiar_id,
-            &state.familiar_uuid,
-            state.weave.weave_hash(),
-            &request,
-            &verdict,
-            time::OffsetDateTime::now_utc(),
-        )?;
-        if !verdict.permits_write() {
-            append_proposal_refusal_audit(
+    if review_kind == PendingReviewKind::Authority {
+        for target in &gated_targets {
+            let request = coven_threads_core::MutationRequest {
+                surface: coven_threads_core::SurfaceId::new(target.clone()),
+                writer: pending.writer.clone(),
+                channel: pending.channel,
+                identity_context: None,
+            };
+            let verdict = coven_threads_core::validate_fail_closed(&state.weave, &request);
+            crate::threads_gate::append_audit_row(
                 &conn,
-                proposal_id,
                 &familiar_id,
+                &state.familiar_uuid,
                 state.weave.weave_hash(),
-                &pending.writer,
-                &targets,
-                pending.channel,
+                &request,
+                &verdict,
+                time::OffsetDateTime::now_utc(),
             )?;
+            if !verdict.permits_write() {
+                append_proposal_refusal_audit(
+                    &conn,
+                    proposal_id,
+                    &familiar_id,
+                    state.weave.weave_hash(),
+                    &pending.writer,
+                    &targets,
+                    pending.channel,
+                )?;
+                return json_response(
+                    409,
+                    &json!({
+                        "blocked": true,
+                        "why": "proposal-revalidation-failed",
+                        "proposalId": proposal_id,
+                        "verdict": verdict,
+                    }),
+                );
+            }
+        }
+    }
+
+    let coherence_reports = if review_kind == PendingReviewKind::Coherence {
+        Some(
+            coherence_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.reports.as_deref())
+                .context("valid coherence evidence has no current reports")?,
+        )
+    } else {
+        None
+    };
+    let before_images = proposal_before_images(
+        &workspace,
+        &adjudication.decisions,
+        scheduled.as_ref(),
+        review_kind,
+        coherence_reports,
+    )?;
+    if let Some(reports) = coherence_reports {
+        if verify_coherence_before_images_match_reports(&before_images, reports).is_err() {
+            claim.restore_pending(&mut raw_value)?;
+            let summary = crate::ward_probes::ProbeSummary::unscored_targets(targets.len());
             return json_response(
                 409,
                 &json!({
                     "blocked": true,
-                    "why": "proposal-revalidation-failed",
+                    "why": "proposal-probes-stale",
                     "proposalId": proposal_id,
-                    "verdict": verdict,
+                    "reviewKind": review_kind.as_str(),
+                    "probeSummary": summary,
+                    "probeEvidenceDegraded": { "reason": "proposal-probes-stale" },
                 }),
             );
         }
     }
-
     let applying = ProposalApplyingState {
         decision: "approve".to_string(),
         recovery_commitment: proposal_recovery_commitment(
@@ -3987,9 +4614,12 @@ fn decide_threads_proposal_inner(
             &targets,
         )?,
         weave_hash: state.weave.weave_hash().to_vec(),
-        before_images: proposal_before_images(&workspace, &targets, scheduled.as_ref())?,
+        before_images,
         rationale: note.clone(),
+        probe_summary: probe_summary.clone(),
     };
+    let expected_resolved =
+        proposal_expected_resolved_surfaces(&applying, &adjudication.decisions)?;
     append_proposal_apply_intent(
         &conn,
         proposal_id,
@@ -4001,18 +4631,42 @@ fn decide_threads_proposal_inner(
     )?;
     persist_proposal_applying_state(&claim.path, &mut raw_value, &applying)?;
     claim.preserve();
-    if !ward_config_is_unchanged(&workspace, &config)? {
-        return json_response(
-            409,
-            &json!({
-                "blocked": true,
-                "why": "proposal-recovery-evidence-diverged",
-                "proposalId": proposal_id,
-            }),
-        );
+    match ward_config_is_unchanged(&workspace, &config) {
+        Ok(true) => {}
+        Ok(false) => {
+            claim.restore_pending(&mut raw_value)?;
+            return json_response(
+                409,
+                &json!({
+                    "blocked": true,
+                    "why": "proposal-recovery-evidence-diverged",
+                    "proposalId": proposal_id,
+                }),
+            );
+        }
+        Err(error) => {
+            claim.restore_pending(&mut raw_value)?;
+            return Err(error);
+        }
     }
     let expected_before = proposal_expected_before(&applying)?;
-    let report = ward.apply_after_threads_approval(&edits, &authorization, &expected_before)?;
+    let report = match apply_after_review_approval(
+        &ward,
+        review_kind,
+        &edits,
+        &authorization,
+        &expected_before,
+        &expected_resolved,
+        ward::ApprovedApplyMode::Initial,
+    ) {
+        Ok(report) => report,
+        Err(error) => {
+            if ward::approved_apply_error_may_have_committed_write(&error) == Some(false) {
+                claim.restore_pending(&mut raw_value)?;
+            }
+            return Err(error);
+        }
+    };
     if report.is_refused() {
         append_proposal_refusal_audit(
             &conn,
@@ -4039,6 +4693,7 @@ fn decide_threads_proposal_inner(
             workspace: &workspace,
             weave_hash: state.weave.weave_hash(),
             approver: &pending.writer,
+            apply_report: &report,
             gated_targets: &gated_targets,
             approved_bytes: &approved_bytes,
             files_touched: &targets,
@@ -4046,20 +4701,26 @@ fn decide_threads_proposal_inner(
             approval_path_label: &decision_semantics.approval_path_label,
             window_close: decision_semantics.window_close.as_ref(),
             channel: pending.channel,
+            probe_summary: probe_summary.as_ref(),
         },
     )?;
     maybe_fail_proposal_decision(ProposalDecisionFailpoint::AuditBeforeCleanup, proposal_id)?;
     claim.consume()?;
-    json_response(
-        200,
-        &json!({
-            "ok": true,
-            "decision": "approved",
-            "proposalId": proposal_id,
-            "filesTouched": targets,
-            "note": note,
-        }),
-    )
+    let mut response = json!({
+        "ok": true,
+        "decision": "approved",
+        "proposalId": proposal_id,
+        "filesTouched": targets,
+        "note": note,
+    });
+    if let Some(summary) = probe_summary {
+        let object = response
+            .as_object_mut()
+            .expect("proposal decision response is an object");
+        object.insert("reviewKind".to_string(), json!(review_kind.as_str()));
+        object.insert("probeSummary".to_string(), json!(summary));
+    }
+    json_response(200, &response)
 }
 
 fn find_pending_proposal(coven_home: &Path, proposal_id: Uuid) -> Result<Option<PathBuf>> {
@@ -4492,13 +5153,21 @@ struct ProposalApplyingState {
     weave_hash: Vec<u8>,
     before_images: Vec<ProposalBeforeImage>,
     rationale: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    probe_summary: Option<crate::ward_probes::ProbeSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ProposalBeforeImage {
     target: String,
-    contents: coven_threads_core::StagedContents,
+    /// Gate-2-resolved surface captured with the apply intent. Older authority
+    /// recovery records predate this field and rederive it from live Ward
+    /// adjudication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resolved: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    contents: Option<coven_threads_core::StagedContents>,
 }
 
 fn proposal_recovery_commitment(
@@ -4539,53 +5208,166 @@ fn proposal_recovery_commitment(
 
 fn proposal_before_images(
     workspace: &Path,
-    targets: &[String],
+    decisions: &[ward::Decision],
     scheduled: Option<&crate::proposal_scheduler::ScheduledProposal>,
+    review_kind: PendingReviewKind,
+    coherence_reports: Option<&[crate::ward_probes::SurfaceProbeReport]>,
 ) -> Result<Vec<ProposalBeforeImage>> {
-    targets
+    decisions
         .iter()
-        .map(|target| {
+        .map(|decision| {
+            let target = &decision.target;
             let contents = if let Some(scheduled) = scheduled {
-                scheduled
-                    .materialized_diff()
-                    .for_surface(&coven_threads_core::SurfaceId::new(target))
+                Some(
+                    scheduled
+                        .materialized_diff()
+                        .for_surface(&coven_threads_core::SurfaceId::new(target))
+                        .with_context(|| {
+                            format!("scheduled materialized diff is missing target {target}")
+                        })?
+                        .before
+                        .clone()
+                        .with_context(|| {
+                            format!("scheduled target {target} has no approved before-image")
+                        })?,
+                )
+            } else if review_kind == PendingReviewKind::Coherence {
+                let report = coherence_reports
+                    .context("coherence before-images require current probe reports")?
+                    .iter()
+                    .find(|report| report.target == *target)
                     .with_context(|| {
-                        format!("scheduled materialized diff is missing target {target}")
-                    })?
-                    .before
-                    .clone()
-                    .with_context(|| {
-                        format!("scheduled target {target} has no approved before-image")
-                    })?
+                        format!("missing coherence probe report for target {target}")
+                    })?;
+                if report.surface != decision.resolved {
+                    anyhow::bail!(
+                        "coherence probe surface for {target} diverged from live Gate-2 resolution"
+                    );
+                }
+                crate::threads_gate::read_surface_if_exists(workspace, &decision.resolved)?
             } else {
-                crate::threads_gate::read_surface(workspace, target)?
+                Some(crate::threads_gate::read_surface(
+                    workspace,
+                    &decision.resolved,
+                )?)
             };
             Ok(ProposalBeforeImage {
                 target: target.clone(),
-                contents: coven_threads_core::StagedContents::from_bytes(&contents),
+                resolved: Some(decision.resolved.clone()),
+                contents: contents
+                    .as_deref()
+                    .map(coven_threads_core::StagedContents::from_bytes),
             })
         })
         .collect()
 }
 
-fn proposal_expected_before(applying: &ProposalApplyingState) -> Result<BTreeMap<String, Vec<u8>>> {
+fn verify_coherence_before_images_match_reports(
+    before_images: &[ProposalBeforeImage],
+    reports: &[crate::ward_probes::SurfaceProbeReport],
+) -> Result<()> {
+    if before_images.len() != reports.len() {
+        anyhow::bail!("coherence probe reports do not match approved targets");
+    }
+    let mut reports_by_target = BTreeMap::new();
+    for report in reports {
+        if reports_by_target
+            .insert(report.target.as_str(), report)
+            .is_some()
+        {
+            anyhow::bail!("duplicate coherence probe report for {}", report.target);
+        }
+    }
+    for before in before_images {
+        let report = reports_by_target
+            .get(before.target.as_str())
+            .with_context(|| format!("missing coherence probe report for {}", before.target))?;
+        let actual_sha256 = before
+            .contents
+            .as_ref()
+            .map(|contents| {
+                contents
+                    .to_bytes()
+                    .map_err(anyhow::Error::msg)
+                    .map(|bytes| {
+                        Sha256::digest(bytes)
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<String>()
+                    })
+            })
+            .transpose()?;
+        if actual_sha256 != report.baseline_sha256 {
+            anyhow::bail!("surface {} changed after coherence re-probe", before.target);
+        }
+    }
+    Ok(())
+}
+
+fn proposal_expected_before(
+    applying: &ProposalApplyingState,
+) -> Result<BTreeMap<String, Option<Vec<u8>>>> {
     applying
         .before_images
         .iter()
         .map(|before| {
             Ok((
                 before.target.clone(),
-                before.contents.to_bytes().map_err(anyhow::Error::msg)?,
+                before
+                    .contents
+                    .as_ref()
+                    .map(|contents| contents.to_bytes().map_err(anyhow::Error::msg))
+                    .transpose()?,
             ))
         })
         .collect()
 }
 
-fn proposal_expected_after(edits: &[ward::FileEdit]) -> BTreeMap<String, Vec<u8>> {
+fn proposal_expected_after(edits: &[ward::FileEdit]) -> BTreeMap<String, Option<Vec<u8>>> {
     edits
         .iter()
-        .map(|edit| (edit.target.clone(), edit.new_contents.clone()))
+        .map(|edit| (edit.target.clone(), Some(edit.new_contents.clone())))
         .collect()
+}
+
+fn apply_after_review_approval(
+    ward: &ward::Ward,
+    review_kind: PendingReviewKind,
+    edits: &[ward::FileEdit],
+    authorization: &ward::Authorization,
+    expected_before: &BTreeMap<String, Option<Vec<u8>>>,
+    expected_resolved: &BTreeMap<String, String>,
+    mode: ward::ApprovedApplyMode,
+) -> Result<ward::ApplyReport> {
+    match review_kind {
+        PendingReviewKind::Authority => {
+            let required = expected_before
+                .iter()
+                .map(|(target, contents)| {
+                    Ok((
+                        target.clone(),
+                        contents.clone().with_context(|| {
+                            format!("approved target {target} has no approved before-image")
+                        })?,
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?;
+            ward.apply_after_threads_approval(
+                edits,
+                authorization,
+                &required,
+                expected_resolved,
+                mode,
+            )
+        }
+        PendingReviewKind::Coherence => ward.apply_after_coherence_approval(
+            edits,
+            authorization,
+            expected_before,
+            expected_resolved,
+            mode,
+        ),
+    }
 }
 
 fn approved_bytes_by_resolved(
@@ -4608,9 +5390,15 @@ fn proposal_rollback_edits(applying: &ProposalApplyingState) -> Result<Vec<ward:
         .before_images
         .iter()
         .map(|before| {
+            let contents = before.contents.as_ref().with_context(|| {
+                format!(
+                    "created target {} cannot be represented as a rollback edit",
+                    before.target
+                )
+            })?;
             Ok(ward::FileEdit::new(
                 before.target.clone(),
-                before.contents.to_bytes().map_err(anyhow::Error::msg)?,
+                contents.to_bytes().map_err(anyhow::Error::msg)?,
             ))
         })
         .collect()
@@ -4732,11 +5520,50 @@ fn load_proposal_apply_intent(
         .transpose()
 }
 
+fn proposal_expected_resolved_surfaces(
+    applying: &ProposalApplyingState,
+    decisions: &[ward::Decision],
+) -> Result<BTreeMap<String, String>> {
+    let mut live = BTreeMap::new();
+    for decision in decisions {
+        if live
+            .insert(decision.target.as_str(), decision.resolved.as_str())
+            .is_some()
+        {
+            anyhow::bail!("duplicate Ward decision for {}", decision.target);
+        }
+    }
+    let mut expected = BTreeMap::new();
+    for before in &applying.before_images {
+        let live_resolved = live
+            .get(before.target.as_str())
+            .with_context(|| format!("missing Ward decision for {}", before.target))?;
+        let resolved = before.resolved.as_deref().unwrap_or(live_resolved);
+        if resolved != *live_resolved {
+            anyhow::bail!(
+                "surface {} no longer has its approved Gate-2 resolution",
+                before.target
+            );
+        }
+        if expected
+            .insert(before.target.clone(), resolved.to_string())
+            .is_some()
+        {
+            anyhow::bail!("duplicate before image for {}", before.target);
+        }
+    }
+    if expected.len() != live.len() {
+        anyhow::bail!("live Ward decisions do not match approved targets");
+    }
+    Ok(expected)
+}
+
 fn verify_recoverable_apply_state(
     workspace: &Path,
     pending: &coven_threads_core::PendingProposal,
     applying: &ProposalApplyingState,
-) -> Result<()> {
+    decisions: &[ward::Decision],
+) -> Result<BTreeMap<String, String>> {
     let staged: std::collections::BTreeMap<&str, Vec<u8>> = pending
         .edits
         .iter()
@@ -4750,7 +5577,7 @@ fn verify_recoverable_apply_state(
     let mut before_images = std::collections::BTreeMap::new();
     for before in &applying.before_images {
         if before_images
-            .insert(before.target.as_str(), &before.contents)
+            .insert(before.target.as_str(), before.contents.as_ref())
             .is_some()
         {
             anyhow::bail!("duplicate before image for {}", before.target);
@@ -4761,20 +5588,36 @@ fn verify_recoverable_apply_state(
     {
         anyhow::bail!("proposal before images do not match staged targets");
     }
+    let resolved_surfaces = proposal_expected_resolved_surfaces(applying, decisions)?;
+    if resolved_surfaces
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        != staged.keys().copied().collect::<Vec<_>>()
+    {
+        anyhow::bail!("live Ward decisions do not match staged targets");
+    }
     for before in &applying.before_images {
-        let current = crate::threads_gate::read_surface(workspace, &before.target)?;
-        let before_bytes = before.contents.to_bytes().map_err(anyhow::Error::msg)?;
+        let expected_resolved = resolved_surfaces
+            .get(before.target.as_str())
+            .with_context(|| format!("missing Ward decision for {}", before.target))?;
+        let current = crate::threads_gate::read_surface_if_exists(workspace, expected_resolved)?;
+        let before_bytes = before
+            .contents
+            .as_ref()
+            .map(|contents| contents.to_bytes().map_err(anyhow::Error::msg))
+            .transpose()?;
         let after_bytes = staged
             .get(before.target.as_str())
             .with_context(|| format!("missing staged contents for {}", before.target))?;
-        if current != before_bytes && current != *after_bytes {
+        if current != before_bytes && current.as_deref() != Some(after_bytes.as_slice()) {
             anyhow::bail!(
                 "surface {} diverged from both before and staged contents during recovery",
                 before.target
             );
         }
     }
-    Ok(())
+    Ok(resolved_surfaces)
 }
 
 struct ProposalTerminalAudit {
@@ -4892,7 +5735,44 @@ fn authorization_from_writer(writer: &coven_threads_core::WriterId) -> ward::Aut
         .unwrap_or_else(ward::Authorization::unsigned)
 }
 
+#[cfg(test)]
+type WardConfigCheckHook = std::sync::Mutex<BTreeMap<PathBuf, Vec<u8>>>;
+
+#[cfg(test)]
+fn ward_config_check_hook() -> &'static WardConfigCheckHook {
+    static HOOK: std::sync::OnceLock<WardConfigCheckHook> = std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn set_ward_config_check_hook(path: &Path, replacement: Vec<u8>) {
+    ward_config_check_hook()
+        .lock()
+        .expect("Ward config check hook lock poisoned")
+        .insert(path.to_path_buf(), replacement);
+}
+
+#[cfg(test)]
+fn maybe_run_ward_config_check_hook(workspace: &Path) -> Result<()> {
+    let path = workspace.join(ward::WARD_CONFIG_FILE);
+    let replacement = ward_config_check_hook()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Ward config check hook lock poisoned"))?
+        .remove(&path);
+    if let Some(replacement) = replacement {
+        std::fs::write(&path, replacement)
+            .with_context(|| format!("running Ward config check hook for {}", path.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn maybe_run_ward_config_check_hook(_workspace: &Path) -> Result<()> {
+    Ok(())
+}
+
 fn ward_config_is_unchanged(workspace: &Path, expected: &ward::WardConfig) -> Result<bool> {
+    maybe_run_ward_config_check_hook(workspace)?;
     Ok(ward::WardConfig::load(workspace)?.as_ref() == Some(expected))
 }
 
@@ -4961,6 +5841,7 @@ struct ApprovedProposalFinalization<'a> {
     workspace: &'a Path,
     weave_hash: &'a [u8],
     approver: &'a coven_threads_core::WriterId,
+    apply_report: &'a ward::ApplyReport,
     gated_targets: &'a [String],
     approved_bytes: &'a BTreeMap<String, Vec<u8>>,
     files_touched: &'a [String],
@@ -4968,6 +5849,7 @@ struct ApprovedProposalFinalization<'a> {
     approval_path_label: &'a str,
     window_close: Option<&'a coven_threads_core::ProposalWindowCloseAuditDetail>,
     channel: coven_threads_core::Channel,
+    probe_summary: Option<&'a crate::ward_probes::ProbeSummary>,
 }
 
 fn finalize_approved_proposal(
@@ -4977,6 +5859,14 @@ fn finalize_approved_proposal(
     conn.execute_batch("BEGIN IMMEDIATE")
         .context("starting proposal approval transaction")?;
     let result = (|| -> Result<()> {
+        crate::threads_gate::append_apply_audit_records(
+            conn,
+            Some(finalization.proposal_id),
+            finalization.familiar_id,
+            finalization.weave_hash,
+            finalization.apply_report,
+            finalization.channel,
+        )?;
         for target in finalization.gated_targets {
             let expected_bytes = finalization
                 .approved_bytes
@@ -4990,7 +5880,7 @@ fn finalize_approved_proposal(
                 expected_bytes,
             )?;
         }
-        append_proposal_decision_audit(
+        append_proposal_decision_audit_with_probe_summary(
             conn,
             ProposalDecisionAudit {
                 event_type: coven_threads_core::AuditEventType::ProposalApproved,
@@ -5005,6 +5895,7 @@ fn finalize_approved_proposal(
                 window_close: finalization.window_close,
                 channel: finalization.channel,
             },
+            finalization.probe_summary,
         )?;
         conn.execute_batch("COMMIT")
             .context("committing proposal approval transaction")
@@ -5019,15 +5910,31 @@ fn append_proposal_decision_audit(
     conn: &rusqlite::Connection,
     audit: ProposalDecisionAudit<'_>,
 ) -> Result<()> {
+    append_proposal_decision_audit_with_probe_summary(conn, audit, None)
+}
+
+fn append_proposal_decision_audit_with_probe_summary(
+    conn: &rusqlite::Connection,
+    audit: ProposalDecisionAudit<'_>,
+    probe_summary: Option<&crate::ward_probes::ProbeSummary>,
+) -> Result<()> {
     let files_touched = serde_json::to_string(audit.files_touched)?;
     let detail = match audit.event_type {
-        coven_threads_core::AuditEventType::ProposalApproved => Some(serde_json::to_string(
-            &coven_threads_core::ProposalApprovalAuditDetail {
-                approval_path_label: audit.approval_path_label.to_string(),
-                rationale: audit.approval_rationale.map(str::to_string),
-                window_close: audit.window_close.cloned(),
-            },
-        )?),
+        coven_threads_core::AuditEventType::ProposalApproved => {
+            let mut detail =
+                serde_json::to_value(&coven_threads_core::ProposalApprovalAuditDetail {
+                    approval_path_label: audit.approval_path_label.to_string(),
+                    rationale: audit.approval_rationale.map(str::to_string),
+                    window_close: audit.window_close.cloned(),
+                })?;
+            if let Some(probe_summary) = probe_summary {
+                detail
+                    .as_object_mut()
+                    .expect("proposal approval detail is an object")
+                    .insert("probeSummary".to_string(), json!(probe_summary));
+            }
+            Some(serde_json::to_string(&detail)?)
+        }
         coven_threads_core::AuditEventType::ProposalVetoed => {
             audit.window_close.map(serde_json::to_string).transpose()?
         }
@@ -5178,6 +6085,7 @@ pub(crate) fn json_response<T: Serialize>(status: u16, body: &T) -> Result<ApiRe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project;
 
     #[test]
     fn builds_health_response() {
@@ -6849,25 +7757,16 @@ mod tests {
     #[test]
     fn launch_request_with_unknown_harness_returns_400_upfront_no_session_row() -> anyhow::Result<()>
     {
-        // Harness validation reads ambient adapter config: the external
-        // manifest/dirs env vars plus the COVEN_HOME trust store. Neutralize
-        // all three under the crate-wide env lock so a host with a real
-        // hermes adapter installed cannot turn this 400 into a 201.
-        let _env = crate::test_env::lock_env();
-        let _manifest =
-            crate::test_env::EnvVarGuard::remove(crate::harness::EXTERNAL_ADAPTER_MANIFEST_ENV);
-        let _dirs = crate::test_env::EnvVarGuard::remove(crate::harness::EXTERNAL_ADAPTER_DIRS_ENV);
         let temp_dir = tempfile::tempdir()?;
-        let _home = crate::test_env::EnvVarGuard::set(
-            "COVEN_HOME",
-            temp_dir.path().join("empty-coven-home"),
-        );
         let project_root = temp_dir.path().join("repo");
         std::fs::create_dir_all(&project_root)?;
         let runtime = RecordingRuntime::default();
+        // A synthetic id no adapter would declare: `hermes` (the previous
+        // fixture) is a real installable adapter, so it *is* configured on
+        // machines with local adapter recipes and the test would flake.
         let body = json!({
             "projectRoot": project_root,
-            "harness": "hermes",
+            "harness": "no-such-harness-xyzzy",
             "launchMode": "nonInteractive",
             "prompt": "hello"
         })
@@ -6884,7 +7783,9 @@ mod tests {
 
         assert_eq!(response.status, 400);
         assert!(
-            response.body.contains("unsupported harness `hermes`"),
+            response
+                .body
+                .contains("unsupported harness `no-such-harness-xyzzy`"),
             "expected unsupported-harness validation message, got: {}",
             response.body
         );
@@ -8086,6 +8987,318 @@ description = "digs deep"
     }
 
     #[test]
+    fn memory_overview_route_reports_capabilities_and_opaque_list_ids() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let sage = home.join("memory").join("sage");
+        std::fs::create_dir_all(&sage)?;
+        std::fs::write(sage.join("notes.md"), "Durable fact.")?;
+
+        let list = handle_request("GET", "/api/v1/memory", home, None)?;
+        assert_eq!(list.status, 200);
+        let entries: serde_json::Value = serde_json::from_str(&list.body)?;
+        let id = entries[0]["id"].as_str().expect("opaque id");
+        assert!(Uuid::parse_str(id).is_ok());
+        assert_eq!(entries[0]["path"], "sage/notes.md");
+        assert_eq!(entries[0]["verification_state"], "unknown");
+        assert!(!list.body.contains(home.to_string_lossy().as_ref()));
+
+        let response = handle_request("GET", "/api/v1/memory/overview", home, None)?;
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["totals"]["entries"], 1);
+        assert_eq!(body["capabilities"]["detail"], true);
+        assert_eq!(body["capabilities"]["verification"], false);
+        assert_eq!(body["verification"]["state"], "unavailable");
+        Ok(())
+    }
+
+    #[test]
+    fn memory_list_route_serializes_authoritative_source_without_absolute_path() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let sage = home.join("memory").join("sage");
+        std::fs::create_dir_all(&sage)?;
+        std::fs::write(sage.join("notes.md"), "Durable fact.")?;
+
+        let response = handle_request("GET", "/api/v1/memory", home, None)?;
+
+        assert_eq!(response.status, 200);
+        let entries: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(
+            entries[0]["source"],
+            serde_json::json!({
+                "kind": "coven-origin",
+                "label": "Coven origin"
+            })
+        );
+        assert!(!response.body.contains(home.to_string_lossy().as_ref()));
+        Ok(())
+    }
+
+    #[test]
+    fn memory_list_and_detail_routes_share_exact_source_metadata() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let sage = home.join("memory").join("sage");
+        std::fs::create_dir_all(&sage)?;
+        std::fs::write(sage.join("notes.md"), "Durable fact.")?;
+
+        let list_response = handle_request("GET", "/api/v1/memory", home, None)?;
+        let entries: serde_json::Value = serde_json::from_str(&list_response.body)?;
+        let id = entries[0]["id"].as_str().expect("opaque id");
+        let list_source = entries[0]["source"].clone();
+
+        let detail_response = handle_request("GET", &format!("/api/v1/memory/{id}"), home, None)?;
+        let detail: serde_json::Value = serde_json::from_str(&detail_response.body)?;
+
+        assert_eq!(detail_response.status, 200);
+        assert_eq!(detail["source"], list_source);
+        assert!(detail.get("path").is_none());
+        assert!(!detail_response
+            .body
+            .contains(home.to_string_lossy().as_ref()));
+        Ok(())
+    }
+
+    #[test]
+    fn memory_detail_route_returns_content_and_rejects_invalid_ids() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let sage = home.join("memory").join("sage");
+        std::fs::create_dir_all(&sage)?;
+        std::fs::write(sage.join("notes.md"), "Durable fact.")?;
+        let list = handle_request("GET", "/api/v1/memory", home, None)?;
+        let entries: serde_json::Value = serde_json::from_str(&list.body)?;
+        let id = entries[0]["id"].as_str().expect("opaque id");
+
+        let found = handle_request("GET", &format!("/api/v1/memory/{id}"), home, None)?;
+        assert_eq!(found.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&found.body)?;
+        assert_eq!(body["content"], "Durable fact.");
+        assert!(body.get("path").is_none());
+        assert!(!found.body.contains(home.to_string_lossy().as_ref()));
+
+        let missing = handle_request(
+            "GET",
+            "/api/v1/memory/00000000-0000-0000-0000-000000000000",
+            home,
+            None,
+        )?;
+        assert_eq!(missing.status, 404);
+        let missing_body: serde_json::Value = serde_json::from_str(&missing.body)?;
+        assert_eq!(missing_body["error"]["code"], "memory_not_found");
+
+        for path in [
+            "/api/v1/memory/not-a-uuid",
+            "/api/v1/memory/a/b",
+            "/api/v1/memory/",
+        ] {
+            let invalid = handle_request("GET", path, home, None)?;
+            assert_eq!(invalid.status, 400, "path {path}");
+            let invalid_body: serde_json::Value = serde_json::from_str(&invalid.body)?;
+            assert_eq!(invalid_body["error"]["code"], "invalid_request");
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn memory_detail_route_sanitizes_unclassified_root_errors() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        let outside_memory = outside.path().join("private-memory");
+        std::fs::create_dir(&outside_memory)?;
+        symlink(&outside_memory, temp.path().join("memory"))?;
+        let id = "00000000-0000-0000-0000-000000000000";
+
+        let response = handle_request("GET", &format!("/api/v1/memory/{id}"), temp.path(), None)?;
+
+        assert_eq!(response.status, 503);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "memory_content_unavailable");
+        assert_eq!(
+            body["error"]["message"],
+            "Memory entry content is temporarily unavailable."
+        );
+        assert_eq!(
+            body["error"]["details"],
+            serde_json::json!({ "memoryId": id })
+        );
+        assert!(!response
+            .body
+            .contains(temp.path().to_string_lossy().as_ref()));
+        assert!(!response
+            .body
+            .contains(outside.path().to_string_lossy().as_ref()));
+        assert!(!response.body.contains("symlink"));
+        Ok(())
+    }
+
+    #[test]
+    fn memory_detail_route_rejects_content_that_grows_over_the_limit() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let sage = home.join("memory").join("sage");
+        std::fs::create_dir_all(&sage)?;
+        let path = sage.join("notes.md");
+        std::fs::write(&path, "small")?;
+        let list = handle_request("GET", "/api/v1/memory", home, None)?;
+        let entries: serde_json::Value = serde_json::from_str(&list.body)?;
+        let id = entries[0]["id"].as_str().expect("opaque id");
+        std::fs::write(
+            &path,
+            vec![b'x'; crate::cockpit_sources::MEMORY_CONTENT_MAX_BYTES as usize + 1],
+        )?;
+
+        let response = handle_request("GET", &format!("/api/v1/memory/{id}"), home, None)?;
+
+        assert_eq!(response.status, 413);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "memory_content_too_large");
+        assert_eq!(
+            body["error"]["details"]["maxBytes"],
+            crate::cockpit_sources::MEMORY_CONTENT_MAX_BYTES
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn memory_detail_route_rejects_non_utf8_content() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let sage = home.join("memory").join("sage");
+        std::fs::create_dir_all(&sage)?;
+        let path = sage.join("notes.md");
+        std::fs::write(&path, "valid")?;
+        let list = handle_request("GET", "/api/v1/memory", home, None)?;
+        let entries: serde_json::Value = serde_json::from_str(&list.body)?;
+        let id = entries[0]["id"].as_str().expect("opaque id");
+        std::fs::write(&path, [0xff, 0xfe])?;
+
+        let response = handle_request("GET", &format!("/api/v1/memory/{id}"), home, None)?;
+
+        assert_eq!(response.status, 422);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "memory_content_invalid");
+        Ok(())
+    }
+
+    #[test]
+    fn memory_detail_route_returns_path_safe_not_found_after_removal() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let sage = home.join("memory").join("sage");
+        std::fs::create_dir_all(&sage)?;
+        let path = sage.join("notes.md");
+        std::fs::write(&path, "valid")?;
+        let list = handle_request("GET", "/api/v1/memory", home, None)?;
+        let entries: serde_json::Value = serde_json::from_str(&list.body)?;
+        let id = entries[0]["id"].as_str().expect("opaque id");
+        std::fs::remove_file(&path)?;
+
+        let response = handle_request("GET", &format!("/api/v1/memory/{id}"), home, None)?;
+
+        assert_eq!(response.status, 404);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "memory_not_found");
+        assert_eq!(
+            body["error"]["details"],
+            serde_json::json!({ "memoryId": id })
+        );
+        assert!(!response.body.contains(home.to_string_lossy().as_ref()));
+        assert!(!response.body.contains("sage/notes.md"));
+        Ok(())
+    }
+
+    #[test]
+    fn memory_detail_route_returns_path_safe_not_found_for_non_regular_replacement() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let sage = home.join("memory").join("sage");
+        std::fs::create_dir_all(&sage)?;
+        let path = sage.join("notes.md");
+        std::fs::write(&path, "valid")?;
+        let list = handle_request("GET", "/api/v1/memory", home, None)?;
+        let entries: serde_json::Value = serde_json::from_str(&list.body)?;
+        let id = entries[0]["id"].as_str().expect("opaque id");
+        std::fs::remove_file(&path)?;
+        std::fs::create_dir(&path)?;
+
+        let response = handle_request("GET", &format!("/api/v1/memory/{id}"), home, None)?;
+
+        assert_eq!(response.status, 404);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "memory_not_found");
+        assert_eq!(
+            body["error"]["details"],
+            serde_json::json!({ "memoryId": id })
+        );
+        assert!(!response.body.contains(home.to_string_lossy().as_ref()));
+        assert!(!response.body.contains("sage/notes.md"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn memory_detail_route_returns_path_safe_unavailable_after_permission_denial() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct PermissionRestore {
+            path: std::path::PathBuf,
+            permissions: Option<std::fs::Permissions>,
+        }
+
+        impl PermissionRestore {
+            fn restore(mut self) -> std::io::Result<()> {
+                let permissions = self.permissions.as_ref().expect("permissions").clone();
+                std::fs::set_permissions(&self.path, permissions)?;
+                self.permissions = None;
+                Ok(())
+            }
+        }
+
+        impl Drop for PermissionRestore {
+            fn drop(&mut self) {
+                if let Some(permissions) = self.permissions.take() {
+                    let _ = std::fs::set_permissions(&self.path, permissions);
+                }
+            }
+        }
+
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let sage = home.join("memory").join("sage");
+        std::fs::create_dir_all(&sage)?;
+        let path = sage.join("notes.md");
+        std::fs::write(&path, "valid")?;
+        let list = handle_request("GET", "/api/v1/memory", home, None)?;
+        let entries: serde_json::Value = serde_json::from_str(&list.body)?;
+        let id = entries[0]["id"].as_str().expect("opaque id");
+        let restore = PermissionRestore {
+            path: path.clone(),
+            permissions: Some(std::fs::metadata(&path)?.permissions()),
+        };
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))?;
+
+        let response = handle_request("GET", &format!("/api/v1/memory/{id}"), home, None)?;
+        restore.restore()?;
+
+        assert_eq!(response.status, 503);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "memory_content_unavailable");
+        assert_eq!(
+            body["error"]["details"],
+            serde_json::json!({ "memoryId": id })
+        );
+        assert!(!response.body.contains(home.to_string_lossy().as_ref()));
+        assert!(!response.body.contains("sage/notes.md"));
+        Ok(())
+    }
+
+    #[test]
     fn get_cast_codes_returns_grammar_templates() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let response = handle_request("GET", "/api/v1/cast-codes", temp.path(), None)?;
@@ -8207,6 +9420,10 @@ tier = 0
 [[surface]]
 path = "memory/"
 tier = 2
+
+[[probe]]
+surface = "memory/**"
+id = "size-delta"
 "#,
         )?;
 
@@ -8225,6 +9442,8 @@ tier = 2
         assert_eq!(body["ward"]["surface"][1]["path"], "memory/");
         assert_eq!(body["ward"]["surface"][1]["tier"], 2);
         assert_eq!(body["ward"]["protectedSurface"][0], "SOUL.md");
+        assert_eq!(body["ward"]["probes"][0]["surface"], "memory/**");
+        assert_eq!(body["ward"]["probes"][0]["id"], "size-delta");
         Ok(())
     }
 
@@ -8284,6 +9503,15 @@ tier = 2
         assert_eq!(listed["familiarId"], "sage");
         assert_eq!(listed["reviewKind"], "coherence");
         assert_eq!(listed["targets"][0], "reviewed/skill.md");
+        assert_eq!(listed["probeSummary"]["status"], "passed");
+        assert_eq!(listed["probeSummary"]["passed"], 2);
+        assert_eq!(listed["probeSummary"]["failed"], 0);
+        assert_eq!(listed["probeSummary"]["unscored"], 0);
+        assert_eq!(listed["probeSummary"]["targets"], 1);
+        assert!(
+            listed.get("probes").is_none(),
+            "the list route must expose only the compact summary"
+        );
 
         // Detail returns the same record; unknown and malformed ids fail
         // closed with the structured shapes.
@@ -8296,6 +9524,17 @@ tier = 2
         assert_eq!(response.status, 200);
         let body: serde_json::Value = serde_json::from_str(&response.body)?;
         assert_eq!(body["proposal"]["reviewKind"], "coherence");
+        assert_eq!(body["proposal"]["probeSummary"]["status"], "passed");
+        assert_eq!(body["proposal"]["probes"][0]["target"], "reviewed/skill.md");
+        assert_eq!(body["proposal"]["probes"][0]["status"], "passed");
+        assert_eq!(
+            body["proposal"]["probes"][0]["results"][0]["id"],
+            "size-delta"
+        );
+        assert_eq!(
+            body["proposal"]["probes"][0]["results"][1]["id"],
+            "pattern-lint"
+        );
 
         let response = handle_request(
             "GET",
@@ -8392,7 +9631,166 @@ tier = 2
         assert_eq!(listed["lifecycle"], "veto_window_open");
         assert_eq!(listed["earliestClose"], "2023-11-14T22:14:20Z");
         assert_eq!(listed["affectedRegions"][0], "tool_defaults");
+        assert_eq!(listed["probeSummary"]["status"], "unscored");
+        assert_eq!(listed["probeSummary"]["unscored"], 1);
         assert!(listed.get("reviewKind").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn threads_proposals_degrades_malformed_probe_evidence() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_warded_familiar(home)?;
+        let staged = post_edits(
+            home,
+            r#"{"edits":[{"target":"reviewed/skill.md","contents":"tweak"}]}"#,
+        )?;
+        let body: serde_json::Value = serde_json::from_str(&staged.body)?;
+        let pending_path = PathBuf::from(body["pendingPath"].as_str().context("pending path")?);
+        let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(&pending_path)?)?;
+        value["probes"] = serde_json::json!({"not": "an array"});
+        std::fs::write(&pending_path, serde_json::to_vec_pretty(&value)?)?;
+
+        let response = handle_request("GET", "/api/v1/threads/proposals", home, None)?;
+
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(
+            body["proposals"][0]["probeEvidenceDegraded"]["reason"],
+            "proposal-probes-unparseable"
+        );
+        assert_eq!(body["proposals"][0]["probeSummary"]["status"], "unscored");
+        assert_eq!(body["proposals"][0]["probeSummary"]["targets"], 1);
+        assert_eq!(body["proposals"][0]["probeSummary"]["unscored"], 1);
+        Ok(())
+    }
+
+    #[test]
+    fn threads_proposals_demotes_inconsistent_probe_evidence_to_unscored() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+        let staged = post_edits(
+            home,
+            r#"{"edits":[{"target":"reviewed/skill.md","contents":"tweak"}]}"#,
+        )?;
+        let body: serde_json::Value = serde_json::from_str(&staged.body)?;
+        let proposal_id = body["proposalId"].as_str().context("proposal id")?;
+        let pending_path = PathBuf::from(body["pendingPath"].as_str().context("pending path")?);
+        let original: serde_json::Value = serde_json::from_slice(&std::fs::read(&pending_path)?)?;
+        let mut wrong_target = original.clone();
+        wrong_target["probes"][0]["target"] = serde_json::json!("reviewed/other.md");
+        let mut wrong_surface = original.clone();
+        wrong_surface["probes"][0]["surface"] = serde_json::json!("reviewed/other.md");
+        let mut wrong_hash = original.clone();
+        wrong_hash["probes"][0]["proposedSha256"] = serde_json::json!("0".repeat(64));
+        let mut wrong_baseline = original.clone();
+        wrong_baseline["probes"][0]["baselineSha256"] = serde_json::json!("0".repeat(64));
+        let mut contradictory_status = original.clone();
+        contradictory_status["probes"][0]["status"] = serde_json::json!("failed");
+        let mut inner_result_tamper = original.clone();
+        inner_result_tamper["probes"][0]["results"][1]["status"] = serde_json::json!("failed");
+        inner_result_tamper["probes"][0]["results"][1]["summary"] =
+            serde_json::json!("Tampered result.");
+        inner_result_tamper["probes"][0]["status"] = serde_json::json!("failed");
+        let cases = [
+            ("empty coverage", {
+                let mut value = original.clone();
+                value["probes"] = serde_json::json!([]);
+                (value, "proposal-probes-inconsistent")
+            }),
+            (
+                "wrong target",
+                (wrong_target, "proposal-probes-inconsistent"),
+            ),
+            (
+                "wrong surface",
+                (wrong_surface, "proposal-probes-inconsistent"),
+            ),
+            (
+                "wrong proposed hash",
+                (wrong_hash, "proposal-probes-inconsistent"),
+            ),
+            (
+                "wrong baseline hash",
+                (wrong_baseline, "proposal-probes-stale"),
+            ),
+            (
+                "contradictory aggregate status",
+                (contradictory_status, "proposal-probes-inconsistent"),
+            ),
+            (
+                "coordinated inner-result tamper",
+                (inner_result_tamper, "proposal-probes-inconsistent"),
+            ),
+        ];
+
+        for (case, (value, expected_reason)) in cases {
+            std::fs::write(&pending_path, serde_json::to_vec_pretty(&value)?)?;
+            let response = handle_request(
+                "GET",
+                &format!("/api/v1/threads/proposals/{proposal_id}"),
+                home,
+                None,
+            )?;
+
+            assert_eq!(response.status, 200, "{case}: got {}", response.body);
+            let body: serde_json::Value = serde_json::from_str(&response.body)?;
+            assert_eq!(
+                body["proposal"]["probeSummary"]["status"], "unscored",
+                "{case}"
+            );
+            assert_eq!(body["proposal"]["probeSummary"]["targets"], 1, "{case}");
+            assert_eq!(body["proposal"]["probeSummary"]["unscored"], 1, "{case}");
+            assert_eq!(
+                body["proposal"]["probeEvidenceDegraded"]["reason"], expected_reason,
+                "{case}"
+            );
+            assert_eq!(body["proposal"]["probes"], serde_json::json!([]), "{case}");
+        }
+
+        std::fs::create_dir_all(workspace.join("reviewed"))?;
+        std::fs::write(workspace.join("reviewed/skill.md"), "drifted baseline")?;
+        std::fs::write(&pending_path, serde_json::to_vec_pretty(&original)?)?;
+        let response = handle_request(
+            "GET",
+            &format!("/api/v1/threads/proposals/{proposal_id}"),
+            home,
+            None,
+        )?;
+        assert_eq!(
+            response.status, 200,
+            "baseline drift: got {}",
+            response.body
+        );
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["proposal"]["probeSummary"]["status"], "unscored");
+        assert_eq!(
+            body["proposal"]["probeEvidenceDegraded"]["reason"],
+            "proposal-probes-stale"
+        );
+
+        std::fs::write(&pending_path, serde_json::to_vec_pretty(&original)?)?;
+        let ward_path = workspace.join("ward.toml");
+        let ward_toml = std::fs::read_to_string(&ward_path)?;
+        let changed_ward_toml =
+            ward_toml.replace("(?i)ignore previous", "(?i)different forbidden pattern");
+        assert_ne!(changed_ward_toml, ward_toml);
+        std::fs::write(&ward_path, changed_ward_toml)?;
+        let response = handle_request(
+            "GET",
+            &format!("/api/v1/threads/proposals/{proposal_id}"),
+            home,
+            None,
+        )?;
+        assert_eq!(response.status, 200, "config drift: got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["proposal"]["probeSummary"]["status"], "unscored");
+        assert_eq!(
+            body["proposal"]["probeEvidenceDegraded"]["reason"],
+            "proposal-probes-inconsistent"
+        );
         Ok(())
     }
 
@@ -8555,6 +9953,15 @@ tier = 0
 [[surface]]
 path = "reviewed/"
 tier = 1
+
+[[probe]]
+surface = "reviewed/**"
+id = "size-delta"
+
+[[probe]]
+surface = "reviewed/**"
+id = "pattern-lint"
+forbidden = ["(?i)ignore previous"]
 "#,
         )?;
         Ok(workspace)
@@ -8597,6 +10004,320 @@ tier = 1
             std::fs::read_to_string(workspace.join("notes/today.md"))?,
             "hello ward"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_rejects_duplicate_resolved_targets() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_warded_familiar(home)?;
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[
+                {"target":"reviewed/skill.md","contents":"first"},
+                {"target":"reviewed/../reviewed/skill.md","contents":"second"}
+            ]}"#,
+        )?;
+
+        assert_eq!(response.status, 400, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "invalid_request");
+        assert_eq!(body["error"]["details"]["resolved"], "reviewed/skill.md");
+        assert!(!home.join("pending").exists());
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[
+                {"target":"reviewed/skill.md","contents":"first"},
+                {"target":"reviewed/SKILL.md","contents":"second"}
+            ]}"#,
+        )?;
+
+        assert_eq!(response.status, 400, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "invalid_request");
+        assert_eq!(body["error"]["details"]["resolved"], "reviewed/SKILL.md");
+        assert!(!home.join("pending").exists());
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[
+                {"target":"reviewed/caf\u00e9.md","contents":"first"},
+                {"target":"reviewed/cafe\u0301.md","contents":"second"}
+            ]}"#,
+        )?;
+
+        assert_eq!(response.status, 400, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "invalid_request");
+        assert_eq!(
+            body["error"]["details"]["resolved"],
+            "reviewed/cafe\u{301}.md"
+        );
+        assert!(!home.join("pending").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_persists_apply_audit_rows_across_reopen() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_warded_familiar(home)?;
+
+        let first = post_edits(
+            home,
+            r#"{"edits":[{"target":"notes/today.md","contents":"hello ward"}]}"#,
+        )?;
+        assert_eq!(first.status, 200, "got {}", first.body);
+        let first_body: Value = serde_json::from_str(&first.body)?;
+        let first_next = first_body["changes"][0]["audit"]["nextSha256"]
+            .as_str()
+            .expect("apply response carries nextSha256")
+            .to_string();
+
+        // A fresh store connection stands in for a daemon restart: the rows
+        // must come from disk, not the in-memory ApplyReport.
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let (tier, decision, diff_hash, detail, files_touched): (
+            String,
+            String,
+            Vec<u8>,
+            String,
+            String,
+        ) = conn.query_row(
+            "SELECT tier, decision, diff_hash, detail, files_touched
+             FROM ward_audit WHERE event_type = 'apply_audit' AND familiar_id = 'sage'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        assert_eq!(tier, "tier_2");
+        assert_eq!(decision, "applied");
+        assert_eq!(hex_string(&diff_hash), first_next);
+        let detail: Value = serde_json::from_str(&detail)?;
+        assert!(detail["prev_sha256"].is_null(), "created file has no prev");
+        assert_eq!(detail["bytes_written"], "hello ward".len() as u64);
+        assert_eq!(
+            serde_json::from_str::<Value>(&files_touched)?,
+            serde_json::json!(["notes/today.md"])
+        );
+
+        // Overwrite: the second row's prev must chain to the first's next.
+        let second = post_edits(
+            home,
+            r#"{"edits":[{"target":"notes/today.md","contents":"hello again"}]}"#,
+        )?;
+        assert_eq!(second.status, 200, "got {}", second.body);
+        let second_detail: String = conn.query_row(
+            "SELECT detail FROM ward_audit
+             WHERE event_type = 'apply_audit' ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let second_detail: Value = serde_json::from_str(&second_detail)?;
+        assert_eq!(second_detail["prev_sha256"], Value::String(first_next));
+
+        // The ledger stays append-only under the new event type.
+        let tampered = conn.execute(
+            "UPDATE ward_audit SET decision = 'forged' WHERE event_type = 'apply_audit'",
+            [],
+        );
+        assert!(
+            tampered.is_err(),
+            "append-only trigger must abort UPDATEs on apply_audit rows"
+        );
+        Ok(())
+    }
+
+    // ---- GET /api/v1/familiars/{id}/audit (ward_audit read surface) -------
+
+    #[test]
+    fn familiar_audit_route_serves_ledger_rows_newest_first() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_warded_familiar(home)?;
+
+        let response = handle_request("GET", "/api/v1/familiars/sage/audit", home, None)?;
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["records"], serde_json::json!([]));
+
+        post_edits(
+            home,
+            r#"{"edits":[{"target":"notes/a.md","contents":"one"}]}"#,
+        )?;
+        post_edits(
+            home,
+            r#"{"edits":[{"target":"notes/b.md","contents":"two"}]}"#,
+        )?;
+
+        let response = handle_request(
+            "GET",
+            "/api/v1/familiars/sage/audit?event=apply_audit",
+            home,
+            None,
+        )?;
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        let records = body["records"].as_array().expect("records array");
+        assert_eq!(records.len(), 2);
+        // Newest first: the second write leads.
+        assert_eq!(
+            records[0]["filesTouched"],
+            serde_json::json!(["notes/b.md"])
+        );
+        assert_eq!(records[0]["eventType"], "apply_audit");
+        assert_eq!(records[0]["tier"], "tier_2");
+        assert_eq!(records[0]["decision"], "applied");
+        assert_eq!(records[0]["channel"], "mutation");
+        assert!(records[0]["diffSha256"].is_string());
+        assert_eq!(records[0]["detail"]["bytes_written"], 3);
+
+        let limited = handle_request(
+            "GET",
+            "/api/v1/familiars/sage/audit?event=apply_audit&limit=1",
+            home,
+            None,
+        )?;
+        let body: Value = serde_json::from_str(&limited.body)?;
+        assert_eq!(body["records"].as_array().map(Vec::len), Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn familiar_audit_route_keeps_files_touched_an_array_for_malformed_legacy_json() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_warded_familiar(home)?;
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        conn.execute(
+            "INSERT INTO ward_audit (
+                event_type, familiar_id, ward_hash, decision, files_touched,
+                submitted_at, decided_at
+             ) VALUES ('apply_audit', 'sage', ?1, 'applied', ?2, ?3, ?3)",
+            rusqlite::params![
+                vec![0x11_u8; 32],
+                "{malformed legacy json",
+                "2026-07-26T00:00:00Z"
+            ],
+        )?;
+
+        let response = handle_request("GET", "/api/v1/familiars/sage/audit", home, None)?;
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["records"][0]["filesTouched"], serde_json::json!([]));
+        Ok(())
+    }
+
+    #[test]
+    fn familiar_audit_route_preserves_malformed_detail_as_detail_raw() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_warded_familiar(home)?;
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        conn.execute(
+            "INSERT INTO ward_audit (
+                event_type, familiar_id, ward_hash, decision, detail, files_touched,
+                submitted_at, decided_at
+             ) VALUES ('apply_audit', 'sage', ?1, 'applied', ?2, '[]', ?3, ?3)",
+            rusqlite::params![
+                vec![0x11_u8; 32],
+                "{malformed detail",
+                "2026-07-26T00:00:00Z"
+            ],
+        )?;
+
+        let response = handle_request("GET", "/api/v1/familiars/sage/audit", home, None)?;
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert!(body["records"][0]["detail"].is_null());
+        assert_eq!(body["records"][0]["detailRaw"], "{malformed detail");
+        Ok(())
+    }
+
+    #[test]
+    fn familiar_audit_route_normalizes_numeric_legacy_tier() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_warded_familiar(home)?;
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        conn.execute(
+            "INSERT INTO ward_audit (
+                event_type, familiar_id, ward_hash, tier, decision, files_touched,
+                submitted_at, decided_at
+             ) VALUES ('proposal_submitted', 'sage', ?1, ?2, 'staged:coherence',
+                       '[]', ?3, ?3)",
+            rusqlite::params![vec![0x11_u8; 32], 1_i64, "2026-07-26T00:00:00Z"],
+        )?;
+
+        let response = handle_request("GET", "/api/v1/familiars/sage/audit", home, None)?;
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["records"][0]["tier"], "tier_1");
+        Ok(())
+    }
+
+    #[test]
+    fn familiar_audit_route_fails_closed_on_unknown_and_bad_limit() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_warded_familiar(home)?;
+
+        let response = handle_request("GET", "/api/v1/familiars/ghost/audit", home, None)?;
+        assert_eq!(response.status, 404, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "familiar_not_found");
+
+        for path in [
+            "/api/v1/familiars/sage/audit?limit=0",
+            "/api/v1/familiars/sage/audit?limit=1001",
+            "/api/v1/familiars/sage/audit?limit=abc",
+            "/api/v1/familiars/sage/audit?event=",
+            "/api/v1/familiars/sage/audit?event=ApplyAudit",
+            "/api/v1/familiars/sage/audit?event=apply%20audit",
+            "/api/v1/familiars/sage/audit?event=unknown_tag",
+        ] {
+            let response = handle_request("GET", path, home, None)?;
+            assert_eq!(response.status, 400, "path {path} got {}", response.body);
+            let body: Value = serde_json::from_str(&response.body)?;
+            assert_eq!(body["error"]["code"], "invalid_request");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn familiar_audit_event_filter_accepts_every_ledger_event_type() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_warded_familiar(home)?;
+
+        for event in [
+            "proposal_submitted",
+            "proposal_window_opened",
+            "proposal_approved",
+            "proposal_rejected",
+            "proposal_vetoed",
+            "ward_updated",
+            "memory_entry_admitted",
+            "principal_authorized_write",
+            "validation_verdict",
+            "compaction_ledger",
+            "apply_audit",
+        ] {
+            let path = format!("/api/v1/familiars/sage/audit?event={event}");
+            let response = handle_request("GET", &path, home, None)?;
+            assert_eq!(response.status, 200, "event {event} got {}", response.body);
+        }
         Ok(())
     }
 
@@ -8655,8 +10376,8 @@ tier = 1
         let home = temp.path();
         let workspace = seed_warded_familiar(home)?;
 
-        // Gate 1 passes, but Gate 3 (coherence) is unimplemented: held, not
-        // written — fail-closed.
+        // Gate 1 passes, but the direct edit path cannot resolve a Tier-0
+        // authority decision: held, not written — fail-closed.
         let response = post_edits(
             home,
             r#"{"edits":[{"target":"SOUL.md","contents":"new identity"}],
@@ -8789,7 +10510,8 @@ tier = 1
     #[test]
     fn post_familiar_edits_editable_tier_bypasses_the_weave() -> Result<()> {
         // Editable-tier writes are the Ward tiers' lane: the weave reports no
-        // verdicts and appends nothing to ward_audit.
+        // verdicts and appends no validation rows to ward_audit. Gate 4
+        // persistence (#414) still appends the applied write's audit record.
         let temp = tempfile::tempdir()?;
         let home = temp.path();
         seed_warded_familiar(home)?;
@@ -8804,8 +10526,18 @@ tier = 1
             Some(0)
         );
         let conn = store::open_store(&home.join("coven.sqlite3"))?;
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM ward_audit", [], |row| row.get(0))?;
-        assert_eq!(count, 0);
+        let verdict_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit WHERE event_type = 'validation_verdict'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(verdict_count, 0, "weave must not adjudicate editable tiers");
+        let apply_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit WHERE event_type = 'apply_audit'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(apply_count, 1, "applied tier-2 write must persist Gate 4");
         Ok(())
     }
 
@@ -8954,6 +10686,838 @@ tier = 0
             .expect("staged response carries proposalId")
             .to_string();
         Ok((pending, proposal_id))
+    }
+
+    fn stage_coherence_edit(
+        home: &Path,
+        target: &str,
+        before: Option<&str>,
+        after: &str,
+    ) -> Result<(std::path::PathBuf, String, std::path::PathBuf)> {
+        let workspace = seed_warded_familiar(home)?;
+        if let Some(before) = before {
+            let path = workspace.join(target);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, before)?;
+        }
+        let staged = post_edits(
+            home,
+            &json!({
+                "edits": [{
+                    "target": target,
+                    "contents": after,
+                }],
+            })
+            .to_string(),
+        )?;
+        assert_eq!(staged.status, 202, "got {}", staged.body);
+        let body: Value = serde_json::from_str(&staged.body)?;
+        assert_eq!(body["reviewKind"], "coherence");
+        let pending = std::path::PathBuf::from(
+            body["pendingPath"]
+                .as_str()
+                .context("coherence response carries pendingPath")?,
+        );
+        let proposal_id = body["proposalId"]
+            .as_str()
+            .context("coherence response carries proposalId")?
+            .to_string();
+        Ok((pending, proposal_id, workspace))
+    }
+
+    #[test]
+    fn threads_coherence_approve_reprobes_applies_and_audits_without_weaving() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id, workspace) =
+            stage_coherence_edit(home, "reviewed/skill.md", Some("before"), "after")?;
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(r#"{"note":"coherent with the familiar"}"#),
+        )?;
+
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["decision"], "approved");
+        assert_eq!(body["reviewKind"], "coherence");
+        assert_eq!(body["probeSummary"]["status"], "passed");
+        assert_eq!(body["probeSummary"]["passed"], 2);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("reviewed/skill.md"))?,
+            "after"
+        );
+        assert!(!pending.exists(), "approved coherence proposal is consumed");
+
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let detail: String = conn.query_row(
+            "SELECT detail FROM ward_audit
+             WHERE proposal_id = ?1 AND event_type = 'proposal_approved'",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        let detail: Value = serde_json::from_str(&detail)?;
+        assert_eq!(detail["probeSummary"]["status"], "passed");
+        assert_eq!(
+            detail["rationale"],
+            Value::String("coherent with the familiar".to_string())
+        );
+        let typed_detail: coven_threads_core::ProposalApprovalAuditDetail =
+            serde_json::from_value(detail)?;
+        assert_eq!(
+            typed_detail.rationale.as_deref(),
+            Some("coherent with the familiar"),
+            "additive probe evidence must preserve the upstream terminal schema"
+        );
+        let validation_rows: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit
+             WHERE proposal_id = ?1
+               AND event_type = 'validation_verdict'
+               AND decision != 'proposal-apply-intent'",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            validation_rows, 0,
+            "Tier-1 coherence decisions must skip the threads validator"
+        );
+        let woven_rows: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_manifest
+             WHERE familiar_id = 'sage' AND surface = 'reviewed/skill.md'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            woven_rows, 0,
+            "Tier-1 surfaces must remain out of the weave"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn threads_coherence_approval_persists_logged_apply_audits_in_the_terminal_unit() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+        std::fs::create_dir_all(workspace.join("reviewed"))?;
+        std::fs::create_dir_all(workspace.join("notes"))?;
+        std::fs::write(workspace.join("reviewed/skill.md"), "before skill")?;
+        std::fs::write(workspace.join("notes/log.md"), "before log")?;
+        let staged = post_edits(
+            home,
+            r#"{"edits":[
+                {"target":"reviewed/skill.md","contents":"after skill"},
+                {"target":"notes/log.md","contents":"after log"}
+            ]}"#,
+        )?;
+        assert_eq!(staged.status, 202, "got {}", staged.body);
+        let staged_body: Value = serde_json::from_str(&staged.body)?;
+        let proposal_id = staged_body["proposalId"].as_str().context("proposalId")?;
+        set_proposal_decision_failpoint(Some((
+            ProposalDecisionFailpoint::ApplyBeforeAudit,
+            proposal_id.to_string(),
+        )));
+
+        let interrupted = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        );
+        assert!(interrupted.is_err());
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let before_recovery: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM ward_audit
+             WHERE proposal_id = ?1 AND event_type = 'apply_audit'",
+            [proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            before_recovery, 0,
+            "apply-audit rows must not precede terminal finalization"
+        );
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM ward_audit
+             WHERE proposal_id = ?1 AND event_type = 'apply_audit'",
+            [proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, 1);
+        let (files_touched, detail): (String, String) = conn.query_row(
+            "SELECT files_touched, detail
+             FROM ward_audit
+             WHERE proposal_id = ?1 AND event_type = 'apply_audit'",
+            [proposal_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(
+            serde_json::from_str::<Value>(&files_touched)?,
+            json!(["notes/log.md"])
+        );
+        let detail: Value = serde_json::from_str(&detail)?;
+        assert!(detail["prev_sha256"].is_string());
+        assert_eq!(detail["bytes_written"], "after log".len() as u64);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("reviewed/skill.md"))?,
+            "after skill"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("notes/log.md"))?,
+            "after log"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn threads_coherence_approve_can_create_a_reviewed_surface() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id, workspace) =
+            stage_coherence_edit(home, "reviewed/skill.md", None, "new skill")?;
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+
+        assert_eq!(response.status, 200, "got {}", response.body);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("reviewed/skill.md"))?,
+            "new skill"
+        );
+        assert!(!pending.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn threads_coherence_same_byte_replacement_cannot_retry_as_recovery() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id, workspace) =
+            stage_coherence_edit(home, "reviewed/skill.md", Some("before"), "after")?;
+        crate::ward::set_conditional_write_hook(
+            workspace.canonicalize()?.join("reviewed/skill.md"),
+            b"after".to_vec(),
+        );
+
+        let first = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        );
+        assert!(
+            first.is_err(),
+            "the concurrent replacement must abort apply"
+        );
+        assert!(pending.exists(), "known pre-write failure stays retryable");
+        let staged: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
+        assert!(staged.get("decisionState").is_none());
+
+        let retry = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+        assert_eq!(retry.status, 409, "got {}", retry.body);
+        assert!(pending.exists());
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let terminal: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit
+             WHERE proposal_id = ?1
+               AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(terminal, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn threads_coherence_same_byte_create_cannot_retry_as_recovery() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id, workspace) =
+            stage_coherence_edit(home, "reviewed/skill.md", None, "after")?;
+        crate::ward::set_conditional_write_hook(
+            workspace.canonicalize()?.join("reviewed/skill.md"),
+            b"after".to_vec(),
+        );
+
+        let first = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        );
+        assert!(first.is_err(), "the concurrent create must abort apply");
+        assert!(pending.exists(), "known pre-write failure stays retryable");
+        let staged: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
+        assert!(staged.get("decisionState").is_none());
+
+        let retry = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+        assert_eq!(retry.status, 409, "got {}", retry.body);
+        assert!(pending.exists());
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let terminal: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit
+             WHERE proposal_id = ?1
+               AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(terminal, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn threads_coherence_config_race_cannot_promote_same_bytes_to_recovery() -> Result<()> {
+        for before in [Some("before"), None] {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let (pending, proposal_id, workspace) =
+                stage_coherence_edit(home, "reviewed/skill.md", before, "after")?;
+            let ward_path = workspace.join("ward.toml");
+            let original_ward = std::fs::read(&ward_path)?;
+            let changed_ward =
+                String::from_utf8(original_ward.clone())?.replace("fpr-val", "fpr-other");
+            set_ward_config_check_hook(&ward_path, changed_ward.into_bytes());
+
+            let first = handle_request_with_body(
+                "POST",
+                &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+                home,
+                None,
+                Some("{}"),
+            )?;
+            assert_eq!(first.status, 409, "got {}", first.body);
+            assert!(pending.exists(), "known pre-writer divergence is retryable");
+            let staged: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
+            assert!(staged.get("decisionState").is_none());
+
+            std::fs::write(&ward_path, original_ward)?;
+            std::fs::create_dir_all(workspace.join("reviewed"))?;
+            std::fs::write(workspace.join("reviewed/skill.md"), "after")?;
+            let retry = handle_request_with_body(
+                "POST",
+                &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+                home,
+                None,
+                Some("{}"),
+            )?;
+            assert_eq!(retry.status, 409, "got {}", retry.body);
+            assert!(pending.exists());
+            let conn = store::open_store(&home.join("coven.sqlite3"))?;
+            let terminal: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM ward_audit
+                 WHERE proposal_id = ?1
+                   AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
+                [&proposal_id],
+                |row| row.get(0),
+            )?;
+            assert_eq!(terminal, 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn threads_coherence_config_check_error_cannot_promote_same_bytes_to_recovery() -> Result<()> {
+        for before in [Some("before"), None] {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let (pending, proposal_id, workspace) =
+                stage_coherence_edit(home, "reviewed/skill.md", before, "after")?;
+            let ward_path = workspace.join("ward.toml");
+            let original_ward = std::fs::read(&ward_path)?;
+            set_ward_config_check_hook(&ward_path, b"invalid = [".to_vec());
+
+            handle_request_with_body(
+                "POST",
+                &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+                home,
+                None,
+                Some("{}"),
+            )
+            .expect_err("malformed post-intent Ward config must fail");
+            assert!(pending.exists(), "known pre-writer failure is retryable");
+            let staged: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
+            assert!(staged.get("decisionState").is_none());
+
+            std::fs::write(&ward_path, original_ward)?;
+            std::fs::create_dir_all(workspace.join("reviewed"))?;
+            std::fs::write(workspace.join("reviewed/skill.md"), "after")?;
+            let retry = handle_request_with_body(
+                "POST",
+                &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+                home,
+                None,
+                Some("{}"),
+            )?;
+            assert_eq!(retry.status, 409, "got {}", retry.body);
+            assert!(pending.exists());
+            let conn = store::open_store(&home.join("coven.sqlite3"))?;
+            let terminal: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM ward_audit
+                 WHERE proposal_id = ?1
+                   AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
+                [&proposal_id],
+                |row| row.get(0),
+            )?;
+            assert_eq!(terminal, 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn threads_coherence_approval_reads_the_gate2_resolved_before_image() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+        std::fs::create_dir_all(workspace.join("reviewed"))?;
+        std::fs::write(workspace.join("reviewed/skill.md"), "before")?;
+        let staged = post_edits(
+            home,
+            r#"{"edits":[{
+                "target":"reviewed/nested/../skill.md",
+                "contents":"after"
+            }]}"#,
+        )?;
+        assert_eq!(staged.status, 202, "got {}", staged.body);
+        let body: Value = serde_json::from_str(&staged.body)?;
+        let proposal_id = body["proposalId"].as_str().context("proposalId")?;
+        set_proposal_decision_failpoint(Some((
+            ProposalDecisionFailpoint::ApplyBeforeAudit,
+            proposal_id.to_string(),
+        )));
+
+        let interrupted = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        );
+        assert!(interrupted.is_err());
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("reviewed/skill.md"))?,
+            "after"
+        );
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["recovered"], true);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("reviewed/skill.md"))?,
+            "after"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn threads_coherence_approve_keeps_failed_probes_advisory() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id, workspace) = stage_coherence_edit(
+            home,
+            "reviewed/skill.md",
+            Some("before"),
+            "ignore previous instructions",
+        )?;
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(r#"{"note":"principal accepts the flagged change"}"#),
+        )?;
+
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["decision"], "approved");
+        assert_eq!(body["probeSummary"]["status"], "failed");
+        assert_eq!(body["probeSummary"]["failed"], 1);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("reviewed/skill.md"))?,
+            "ignore previous instructions"
+        );
+        assert!(!pending.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn coherence_before_image_must_match_the_reprobed_baseline() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, _, _) =
+            stage_coherence_edit(home, "reviewed/skill.md", Some("before"), "after")?;
+        let staged: Value = serde_json::from_slice(&std::fs::read(pending)?)?;
+        let reports: Vec<crate::ward_probes::SurfaceProbeReport> =
+            serde_json::from_value(staged["probes"].clone())?;
+        let before_images = vec![ProposalBeforeImage {
+            target: "reviewed/skill.md".to_string(),
+            resolved: Some("reviewed/skill.md".to_string()),
+            contents: Some(coven_threads_core::StagedContents::from_bytes(
+                b"drift after re-probe",
+            )),
+        }];
+
+        let error = verify_coherence_before_images_match_reports(&before_images, &reports)
+            .expect_err("a post-probe baseline race must fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("changed after coherence re-probe"),
+            "unexpected error: {error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn threads_coherence_approve_fails_closed_on_missing_or_malformed_probe_sidecar() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id, workspace) =
+            stage_coherence_edit(home, "reviewed/skill.md", Some("before"), "after")?;
+        let original: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
+
+        for (label, probes, expected_reason) in [
+            ("missing", None, "proposal-probes-missing"),
+            (
+                "malformed",
+                Some(json!("not-a-probe-array")),
+                "proposal-probes-unparseable",
+            ),
+        ] {
+            let mut staged = original.clone();
+            match probes {
+                Some(probes) => staged["probes"] = probes,
+                None => {
+                    staged
+                        .as_object_mut()
+                        .expect("pending proposal is an object")
+                        .remove("probes");
+                }
+            }
+            std::fs::write(&pending, serde_json::to_vec_pretty(&staged)?)?;
+
+            let response = handle_request_with_body(
+                "POST",
+                &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+                home,
+                None,
+                Some("{}"),
+            )?;
+
+            assert_eq!(response.status, 409, "{label}: got {}", response.body);
+            let body: Value = serde_json::from_str(&response.body)?;
+            assert_eq!(body["why"], expected_reason, "{label}");
+            assert_eq!(body["probeSummary"]["status"], "unscored", "{label}");
+            assert!(
+                pending.exists(),
+                "{label}: proposal must remain inspectable"
+            );
+            assert_eq!(
+                std::fs::read_to_string(workspace.join("reviewed/skill.md"))?,
+                "before",
+                "{label}: approval must not write"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn threads_coherence_unknown_review_kind_is_corrupt_and_preserved() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id, workspace) =
+            stage_coherence_edit(home, "reviewed/skill.md", Some("before"), "after")?;
+        let mut staged: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
+        staged["reviewKind"] = json!("automatic");
+        std::fs::write(&pending, serde_json::to_vec_pretty(&staged)?)?;
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+
+        assert_eq!(response.status, 409, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["why"], "proposal-corrupt");
+        assert!(pending.exists(), "corrupt proposal must remain inspectable");
+        let preserved: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
+        assert_eq!(preserved["reviewKind"], "automatic");
+        assert!(
+            preserved.get("decisionRequest").is_none(),
+            "failed validation must not leave an internal claim marker"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("reviewed/skill.md"))?,
+            "before"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn threads_coherence_approve_surfaces_stale_evidence_without_writing() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id, workspace) =
+            stage_coherence_edit(home, "reviewed/skill.md", Some("before"), "after")?;
+        std::fs::write(workspace.join("reviewed/skill.md"), "concurrent drift")?;
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+
+        assert_eq!(response.status, 409, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["why"], "proposal-probes-stale");
+        assert_eq!(
+            body["probeEvidenceDegraded"]["reason"],
+            "proposal-probes-stale"
+        );
+        assert_eq!(body["probeSummary"]["status"], "unscored");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("reviewed/skill.md"))?,
+            "concurrent drift"
+        );
+        assert!(pending.exists(), "stale proposal remains inspectable");
+        Ok(())
+    }
+
+    #[test]
+    fn threads_coherence_reject_allows_stale_evidence_and_reports_degradation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id, workspace) =
+            stage_coherence_edit(home, "reviewed/skill.md", Some("before"), "after")?;
+        std::fs::write(workspace.join("reviewed/skill.md"), "concurrent drift")?;
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/reject"),
+            home,
+            None,
+            Some(r#"{"note":"stale evidence"}"#),
+        )?;
+
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["decision"], "rejected");
+        assert_eq!(body["probeSummary"]["status"], "unscored");
+        assert_eq!(
+            body["probeEvidenceDegraded"]["reason"],
+            "proposal-probes-stale"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("reviewed/skill.md"))?,
+            "concurrent drift"
+        );
+        assert!(!pending.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn threads_coherence_reject_remains_available_after_live_tier_drift() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id, workspace) =
+            stage_coherence_edit(home, "reviewed/skill.md", Some("before"), "after")?;
+        let ward_path = workspace.join("ward.toml");
+        let config = std::fs::read_to_string(&ward_path)?;
+        let drifted = config.replacen(
+            "[[surface]]\npath = \"reviewed/\"\ntier = 1",
+            "[[surface]]\npath = \"reviewed/\"\ntier = 2",
+            1,
+        );
+        assert_ne!(drifted, config);
+        std::fs::write(ward_path, drifted)?;
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/reject"),
+            home,
+            None,
+            Some(r#"{"note":"classification changed"}"#),
+        )?;
+
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["decision"], "rejected");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("reviewed/skill.md"))?,
+            "before"
+        );
+        assert!(!pending.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn threads_coherence_reject_reports_summary_audits_terminal_and_never_applies() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id, workspace) =
+            stage_coherence_edit(home, "reviewed/skill.md", Some("before"), "after")?;
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/reject"),
+            home,
+            None,
+            Some(r#"{"note":"not coherent"}"#),
+        )?;
+
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["decision"], "rejected");
+        assert_eq!(body["reviewKind"], "coherence");
+        assert_eq!(body["probeSummary"]["status"], "passed");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("reviewed/skill.md"))?,
+            "before"
+        );
+        assert!(!pending.exists());
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let (event, detail): (String, Option<String>) = conn.query_row(
+            "SELECT event_type, detail FROM ward_audit
+             WHERE proposal_id = ?1 AND event_type = 'proposal_rejected'",
+            [&proposal_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(event, "proposal_rejected");
+        assert!(
+            detail.is_none(),
+            "rejection terminal detail must retain the upstream schema"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn threads_coherence_approve_recovers_after_apply_before_audit() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id, workspace) =
+            stage_coherence_edit(home, "reviewed/skill.md", Some("before"), "after")?;
+        set_proposal_decision_failpoint(Some((
+            ProposalDecisionFailpoint::ApplyBeforeAudit,
+            proposal_id.clone(),
+        )));
+
+        let interrupted = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(r#"{"note":"coherent"}"#),
+        );
+        assert!(interrupted.is_err());
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("reviewed/skill.md"))?,
+            "after"
+        );
+        assert!(!pending.exists());
+
+        let retry = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(r#"{"note":"coherent"}"#),
+        )?;
+
+        assert_eq!(retry.status, 200, "got {}", retry.body);
+        let body: Value = serde_json::from_str(&retry.body)?;
+        assert_eq!(body["decision"], "approved");
+        assert_eq!(body["reviewKind"], "coherence");
+        assert_eq!(body["recovered"], true);
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let approvals: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit
+             WHERE proposal_id = ?1 AND event_type = 'proposal_approved'",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(approvals, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn threads_coherence_marker_cannot_bypass_protected_authority() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id) = stage_pending_protected_edit(home)?;
+        let workspace = home.join("familiars/sage");
+        let mut staged: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
+        staged["reviewKind"] = json!("coherence");
+        std::fs::write(&pending, serde_json::to_vec_pretty(&staged)?)?;
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+
+        assert_eq!(response.status, 409, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["why"], "proposal-revalidation-failed");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("SOUL.md"))?,
+            "# Mallory\n"
+        );
+        assert!(pending.exists(), "forged lane marker remains inspectable");
+        Ok(())
     }
 
     fn stage_scheduled_reviewed_edit(
@@ -9222,16 +11786,25 @@ tier = 0
             serde_json::from_slice(&std::fs::read(pending)?)?;
         let workspace = home.join("familiars/sage");
         std::fs::write(workspace.join("reviewed/skill.md"), b"concurrent")?;
+        let config = ward::WardConfig::load(&workspace)?.context("Ward config exists")?;
+        let adjudication = ward::Ward::new(&workspace, config)?.evaluate(&ward::Proposal {
+            targets: vec!["reviewed/skill.md".to_string()],
+            authorization: authorization_from_writer(&scheduled.pending().writer),
+        });
 
         let before_images = proposal_before_images(
             &workspace,
-            &["reviewed/skill.md".to_string()],
+            &adjudication.decisions,
             Some(&scheduled),
+            PendingReviewKind::Authority,
+            None,
         )?;
 
         assert_eq!(
             before_images[0]
                 .contents
+                .as_ref()
+                .expect("scheduled before-image is present")
                 .to_bytes()
                 .map_err(anyhow::Error::msg)?,
             b"before"
@@ -10495,6 +13068,9 @@ tier = 0
         let raw = std::fs::read_to_string(&pending_path)?;
         let staged: serde_json::Value = serde_json::from_str(&raw)?;
         assert_eq!(staged["reviewKind"], "coherence");
+        assert_eq!(staged["probes"][0]["surface"], "reviewed/skill.md");
+        assert_eq!(staged["probes"][0]["status"], "passed");
+        assert_eq!(staged["probes"][0]["results"].as_array().unwrap().len(), 2);
         let parsed: coven_threads_core::PendingProposal = serde_json::from_str(&raw)?;
         assert_eq!(parsed.id.0.to_string(), body["proposalId"]);
         assert_eq!(parsed.edits.len(), 1);
@@ -10509,8 +13085,8 @@ tier = 0
         )?;
         assert_eq!(count, 1);
 
-        // Fail-closed until Gate-3 resolution (PR 4) lands: approving a
-        // coherence proposal 409s; nothing is written.
+        // Explicit approval re-probes and atomically applies the reviewed
+        // surface, then consumes the staged proposal.
         let proposal_id = body["proposalId"].as_str().expect("proposalId");
         let approve = handle_request_with_body(
             "POST",
@@ -10519,8 +13095,15 @@ tier = 0
             None,
             Some("{}"),
         )?;
-        assert_eq!(approve.status, 409, "got {}", approve.body);
-        assert!(!workspace.join("reviewed/skill.md").exists());
+        assert_eq!(approve.status, 200, "got {}", approve.body);
+        let approve_body: Value = serde_json::from_str(&approve.body)?;
+        assert_eq!(approve_body["decision"], "approved");
+        assert_eq!(approve_body["reviewKind"], "coherence");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("reviewed/skill.md"))?,
+            "tweak"
+        );
+        assert!(!pending_path.exists(), "approved proposal must be consumed");
         Ok(())
     }
 

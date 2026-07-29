@@ -3083,7 +3083,7 @@ exit 0
             "hello prompt",
             false,
             None,
-            // Namespaced id is normalized to the bare model before forwarding.
+            // Claude declares strip_provider, so only its bare model is forwarded.
             crate::harness::HarnessLaunchOptions {
                 model: Some("anthropic/claude-sonnet-4"),
                 ..Default::default()

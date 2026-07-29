@@ -45,7 +45,7 @@ The Coven daemon socket API is a public compatibility boundary for comux and ext
   "daemon": {
     "pid": 12345,
     "startedAt": "2026-05-09T06:43:00Z",
-    "socket": "/Users/alice/.coven/coven.sock"
+    "socket": "/var/lib/coven/coven.sock"
   },
   "hub": {
     "role": "hub",
@@ -221,6 +221,133 @@ Distinct from the control-plane catalog above, `GET /api/v1/capabilities/harness
 
 Uninstalled harnesses return empty manifests, never errors. Unknown harness ids on `/capabilities/:harnessId` return `404 harness_not_found`. `harnesses` is a reserved path segment, never a harness id. See [Capabilities endpoint](reference/api-capabilities.md) for the full reference.
 
+## Memory dashboard read shapes (`v1`)
+
+The memory read surface is additive to the existing observability list:
+
+- `GET /api/v1/memory` returns summary rows;
+- `GET /api/v1/memory/overview` returns counts and capability state;
+- `GET /api/v1/memory/:id` returns one validated detail row.
+
+The list preserves its original `familiar_id`, `title`, `path`, `updated_at`,
+and `excerpt` fields, and adds the same authoritative `source` object returned
+by detail. `path` is relative to the memory root and exists for CLI
+compatibility; it is never absolute. The opaque UUID `id` is stable while the
+relative file identity is stable. Browser-facing adapters should omit `path`
+from their DTOs.
+
+Memory enumeration is metadata-only. It accepts UTF-8 familiar directory names
+and UTF-8 `.md` file names whose directory entries are regular files. Confirmed
+non-UTF-8 names, symlinks, Windows reparse points, non-files/non-directories,
+and entries that disappear during enumeration are excluded. Unexpected
+iterator, directory-open, or entry-metadata errors fail the request instead of
+returning a partial or empty success. If two accepted entries ever produce the
+same opaque id, the request fails closed instead of returning an ambiguous id.
+The list then reads each accepted file through a no-follow,
+directory-relative handle to build its excerpt. If that body is unavailable,
+invalid UTF-8, or larger than 4 MiB, the metadata-valid row remains in the list
+with an empty `excerpt`; other valid rows are still returned.
+
+```json
+[
+  {
+    "id": "d251bc66-3e45-5d03-8d78-1e76919642f9",
+    "familiar_id": "sage",
+    "title": "notes",
+    "path": "sage/notes.md",
+    "updated_at": "4m ago",
+    "updated_at_iso": "2026-07-26T09:56:00Z",
+    "excerpt": "Durable fact.",
+    "source": {
+      "kind": "coven-origin",
+      "label": "Coven origin"
+    },
+    "privacy_classification": null,
+    "reveal_required": null,
+    "verification_state": "unknown"
+  }
+]
+```
+
+The overview uses the same metadata-only enumeration and does not read any file
+bodies. A structurally valid entry is therefore counted even when its body is
+invalid UTF-8 or too large for list/detail reads. The overview does not
+translate unavailable metadata into zero or healthy:
+
+```json
+{
+  "generated_at": "2026-07-26T10:00:00Z",
+  "totals": {
+    "entries": 1,
+    "familiars": 1,
+    "verified": 0,
+    "needs_review": 0,
+    "unknown": 1
+  },
+  "last_updated_at": "2026-07-26T09:56:00Z",
+  "capabilities": {
+    "detail": true,
+    "verification": false,
+    "attestation_metadata": false,
+    "supersession_history": false,
+    "mutations": false
+  },
+  "verification": {
+    "state": "unavailable",
+    "checked_at": "2026-07-26T10:00:00Z",
+    "manifest": null,
+    "index": null,
+    "issues": []
+  }
+}
+```
+
+Detail accepts only a UUID returned by the list. It enumerates metadata, opens
+only the matching entry through a no-follow directory-relative handle,
+validates that exact handle as a regular file, and reads from that same handle.
+It returns content without a path:
+
+```json
+{
+  "id": "d251bc66-3e45-5d03-8d78-1e76919642f9",
+  "familiar_id": "sage",
+  "title": "notes",
+  "updated_at": "2026-07-26T09:56:00Z",
+  "source": {
+    "kind": "coven-origin",
+    "label": "Coven origin"
+  },
+  "content": "Durable fact.",
+  "content_format": "markdown",
+  "privacy": {
+    "classification": null,
+    "reveal_required": null,
+    "reason": "privacy taxonomy unavailable"
+  },
+  "verification": {
+    "state": "unknown",
+    "reason": "verification metadata unavailable"
+  },
+  "attestation": null,
+  "supersession": {
+    "supersedes": null,
+    "superseded_by": null
+  }
+}
+```
+
+Detail content must be UTF-8 and no larger than 4 MiB (4,194,304 bytes).
+Malformed ids return `400 invalid_request`; well-formed ids that do not resolve,
+or entries that disappear or become an unsafe target before the validated
+open, return `404 memory_not_found`. Permission failures, unexpected open
+failures, and metadata/read failures on an already-opened handle return
+`503 memory_content_unavailable`. Its error details contain only `memoryId`;
+filesystem errors and paths are never exposed. Oversize content returns
+`413 memory_content_too_large` with `details.maxBytes`; invalid UTF-8 returns
+`422 memory_content_invalid`. Until the promotion privacy contract provides a
+classification, clients must treat `classification: null` and
+`reveal_required: null` as requiring explicit reveal.
+
 ## Control action shape (`v1`)
 
 `POST /api/v1/actions` accepts a policy-shaped action envelope. The daemon validates the action id before any adapter work is allowed.
@@ -267,8 +394,9 @@ Unknown action ids return `400` and fail closed:
 ## `POST /api/v1/sessions`
 
 Launches a daemon-managed harness session. `model` is optional; when present,
-the daemon forwards the namespaced id through the selected harness adapter.
-Clients that omit it retain the harness's own default model.
+the daemon forwards the provider-qualified id through the selected harness
+adapter's declared `strip_provider` or `preserve` transform. Clients that omit
+it retain the harness's own default model.
 
 ```json
 {
@@ -715,7 +843,7 @@ Request:
     "host": "compute-primary.internal",
     "user": "coven",
     "port": 22,
-    "identityFile": "/home/coven/.ssh/id_ed25519"
+    "identityFile": "/var/lib/coven/keys/id_ed25519"
   },
   "capabilities": ["gpu", "long-running-loop"],
   "available": true
@@ -729,7 +857,7 @@ Response:
   "nodeId": "compute-primary",
   "role": "compute_executor",
   "transport": "ssh",
-  "transportConfig": { "kind": "ssh", "host": "compute-primary.internal", "user": "coven", "port": 22, "identityFile": "/home/coven/.ssh/id_ed25519" },
+  "transportConfig": { "kind": "ssh", "host": "compute-primary.internal", "user": "coven", "port": 22, "identityFile": "/var/lib/coven/keys/id_ed25519" },
   "capabilities": ["gpu", "long-running-loop"],
   "available": true,
   "queuePressure": 0,

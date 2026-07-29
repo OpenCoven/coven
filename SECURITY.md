@@ -22,6 +22,30 @@ Coven should not require repository-stored secrets. Runtime state belongs outsid
 
 The CI secret guard scans both the current tree and git history for common token/key patterns without printing matched values.
 
+### Coven privacy guard
+
+As of 2026-07-26, Coven uses two explicit scanning tiers:
+
+1. `scripts/check-secrets.py` scans the current tree and full git history for
+   classic credentials, private keys, and high-entropy secret material.
+2. `scripts/check-coven-privacy.py` fails closed on newly staged and
+   pull-request-changed files containing private session identifiers, messenger
+   IDs, absolute home paths, runtime-internal paths, phone numbers, or
+   invite/handoff URLs containing tokens. Managed hooks installed by
+   `coven hooks install` run this guard before commits, and CI is the
+   authoritative enforcement layer.
+
+The second tier intentionally applies to new changes while the repository's
+legacy path examples are inventoried and converted to placeholders. This is a
+documented baseline, not a claim that historical commits satisfy the newer
+privacy rules. Rewriting public history requires explicit maintainer approval.
+
+Memory-layer code, tests, documentation, and PR discussion must describe memory
+shape without including real memory content. Use synthetic placeholders such
+as `FAMILIAR_ROOT`, `<familiar-id>`, and `01JEXAMPLE...`; never copy real
+attestation prose, session identifiers, chat IDs, or local workspace paths into
+the repository.
+
 ## Session logs and sensitive artifacts
 
 Coven treats session logs, prompts, harness output, tool payloads, and event history as sensitive local data. Do not place secrets in prompts or session context.
@@ -87,4 +111,4 @@ The following properties are design goals of OpenCoven. If you find a way to vio
 
 ---
 
-*Last updated: 2026-07-04*
+*Last updated: 2026-07-26*

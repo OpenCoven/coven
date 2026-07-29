@@ -19,26 +19,28 @@ familiars alike.
 
 ```mermaid
 flowchart LR
-  A["Claim the work"] --> B["Branch in a worktree"]
-  B --> C["Make the change"]
-  C --> D["Run local gates"]
-  D --> E["Open a scoped PR"]
-  E --> F["Review + green CI"]
-  F --> G["Squash merge"]
-  G --> H["Clean up"]
+  A["Check existing work"] --> B["Branch in a worktree"]
+  B --> C["Claim the issue"]
+  C --> D["Make the change"]
+  D --> E["Run local gates"]
+  E --> F["Open a scoped PR"]
+  F --> G["Review + green CI"]
+  G --> H["Squash merge"]
+  H --> I["Clean up"]
 ```
 
 In prose, the same contract:
 
-1. **Claim** the issue so parallel sessions do not duplicate it.
+1. **Check** claims and PRs so parallel sessions do not duplicate work.
 2. **Branch** from current `origin/main` in an isolated worktree.
-3. **Change** one concern; no drive-by refactors.
-4. **Gate** locally: format, lint, test, secret scan.
-5. **PR** with a conventional-commit subject and a DCO sign-off.
-6. **Merge** only with green CI, preserving contributor attribution.
-7. **Clean up**: delete the branch, prune the worktree, release the claim.
+3. **Claim** the issue from inside that worktree before editing.
+4. **Change** one concern; no drive-by refactors.
+5. **Gate** locally: format, lint, test, secret scan.
+6. **PR** with a conventional-commit subject and a DCO sign-off.
+7. **Merge** only with green CI, preserving contributor attribution.
+8. **Clean up**: delete the branch, prune the worktree, release the claim.
 
-## Step 1 — Claim the work
+## Step 1 — Check for existing work
 
 Multiple sessions (Codex, Claude Code, familiars) often run against the same
 repository at once. Worktrees stop git operations from racing, but they do not
@@ -56,26 +58,7 @@ Branch names alone will not reveal duplication — one issue can spawn
 three different sessions. Check the claim registry and the open PR list, not
 just branches.
 
-If the work is free, claim it with a **shared, issue-keyed token** — not your
-working branch name, which no other session can predict:
-
-```sh
-coven claim acquire issue-311
-```
-
-Claims are TTL-bounded (default one hour) and live under git's common
-directory in `agent-claims/`, so every worktree and session sees them. For
-long tasks, extend the claim:
-
-```sh
-coven claim heartbeat issue-311
-```
-
-Set `COVEN_AGENT_ID` to a stable agent name so claim ownership is meaningful
-across sessions. See [Parallel specialist lanes](familiars/parallel-lanes.md)
-for the full protocol, including hooks and environment variables.
-
-## Step 2 — Branch in a worktree
+## Step 2 — Branch in a worktree and claim
 
 Branch from current `origin/main`, one fresh branch per task. If more than one
 session can touch the repository, work in a worktree so operations do not race:
@@ -90,6 +73,28 @@ This creates or enters `<repo>.wt/<branch-slug>/`. The plain-git equivalent:
 git fetch origin main
 git worktree add -b fix/311-output-polish /path/to/coven.wt/fix-311-output-polish origin/main
 ```
+
+From inside the new worktree, claim the issue with a **shared, issue-keyed
+token** — not your working branch name, which no other session can predict:
+
+```sh
+cd /path/to/coven.wt/fix-311-output-polish
+coven claim acquire issue-311
+```
+
+Claims are TTL-bounded (default one hour) and live under git's common
+`agent-claims/` directory, so every worktree sees them. Without an explicit
+`COVEN_AGENT_ID`, the owner defaults to `$USER@<worktree-slug>`; multiple
+agents intentionally sharing one worktree must set distinct explicit IDs.
+Heartbeat and release the claim from the same worktree:
+
+```sh
+coven claim heartbeat issue-311
+coven claim release issue-311
+```
+
+See [Parallel specialist lanes](familiars/parallel-lanes.md) for the full
+protocol, including hooks and environment variables.
 
 Optionally install the local guard hooks; they block accidental
 primary-branch commits, cross-agent claim conflicts, and protected pushes

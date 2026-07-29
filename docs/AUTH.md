@@ -118,7 +118,11 @@ The current auth solution is not:
 - a cloud account boundary; or
 - permission to expose the socket API on localhost TCP, a remote network, or a browser page.
 
-If a future dashboard, mobile app, remote bridge, or browser-exposed service needs to talk to Coven, it needs an explicit additional auth and pairing design. Do not tunnel or proxy the raw daemon socket into a network service and call that authenticated.
+If a future dashboard, mobile app, remote bridge, or browser-exposed service needs to talk to Coven,
+it needs an explicit additional auth and pairing design. Do not tunnel or proxy the raw daemon socket
+into a network service and call that authenticated. That design is drafted in
+[Authenticated remote listener](/design/remote-listener-auth) (#463); until it ships, the tunnel
+patterns in [Remote access](/daemon/remote-access) are the only supported remote paths.
 
 ## Current hardening gap
 

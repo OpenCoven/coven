@@ -815,7 +815,7 @@ fn stream_json_init_echoes_requested_model_verbatim() {
         serde_json::from_str(first_line).expect("first line is not valid JSON");
     assert_eq!(first["type"], "system");
     assert_eq!(first["subtype"], "init");
-    // system.init echoes the requested id verbatim (namespaced form preserved)
-    // so Cave can confirm acceptance with an exact match.
+    // system.init echoes the requested id verbatim (provider-qualified form
+    // preserved) so Cave can confirm acceptance with an exact match.
     assert_eq!(first["model"], "openai/gpt-5.5");
 }

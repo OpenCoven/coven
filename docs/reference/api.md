@@ -62,12 +62,34 @@ These power `coven status`, `coven familiars`, `coven skills`, `coven memory`, `
 | GET | `/api/v1/overview` | Dashboard aggregate: open sessions, roster/skill/research counts. | overview object |
 | GET | `/api/v1/familiars` | Familiar roster from `familiars.toml`. | `FamiliarDto[]` |
 | GET | `/api/v1/familiars/:id/ward` | One familiar's declared Ward surface (tiers, protected paths, principal binding) — the read twin of `/familiars/:id/edits`. | `{ ok, familiarId, workspace, ward }` · `400 invalid_request` / `404 familiar_not_found` / `404 ward_not_configured` / `500 ward_config_invalid` |
+| GET | `/api/v1/familiars/:id/audit` | The append-only `ward_audit` ledger for one familiar, newest first — where direct and proposal-approved writes persist Gate 4 apply records. `?limit=N` (default 100, max 1000), `?event=TYPE` (e.g. `apply_audit`). | `{ ok, familiarId, records }` · `400 invalid_request` / `404 familiar_not_found` |
 | GET | `/api/v1/skills` | Installed skills from `~/.coven/skills/`. | `SkillDto[]` |
 | GET | `/api/v1/memory` | Familiar memory files from `~/.coven/memory/`. | memory list |
+| GET | `/api/v1/memory/overview` | Memory counts plus explicit detail, verification, attestation, supersession, and mutation capability state. | overview object |
+| GET | `/api/v1/memory/:id` | Validated markdown content for an opaque id returned by the memory list. | memory detail · `400 invalid_request` / `404 memory_not_found` / `413 memory_content_too_large` / `422 memory_content_invalid` / `503 memory_content_unavailable` |
 | GET | `/api/v1/research` | Research loop log rows. | research list |
 | GET | `/api/v1/coven-calls` | Coven Calls delegation ledger. | `{ ok, calls }` |
 | GET | `/api/v1/coven-calls/:id` | One delegation call. | `{ ok, call }` · `404 call_not_found` |
 | GET | `/api/v1/cast-codes` | Cast code catalog (`~?`, `~>` …). | code list |
+
+Memory list `path` values are relative compatibility fields, never absolute
+filesystem paths. Browser-facing clients should remove them from their own
+DTOs. Enumeration is metadata-only and excludes non-UTF-8 path entries,
+symlinks, Windows reparse points, non-files/non-directories, and entries that
+disappear during the scan. Unexpected enumeration, directory-open, or metadata
+errors fail the request instead of returning partial data. Overview reads no
+bodies. List reads excerpts and retains a metadata-valid row with an empty
+`excerpt` when its body is unreadable, invalid UTF-8, or larger than 4 MiB.
+Detail reads only the selected entry from its validated no-follow handle;
+content must be UTF-8 and at most 4 MiB (4,194,304 bytes). Detail responses
+contain no path field. A missing or unsafe replacement before the validated
+open returns `404 memory_not_found`; permission failures, unexpected open
+failures, and post-open metadata/read failures return
+`503 memory_content_unavailable`. Both errors expose only `memoryId` in their
+details, never filesystem paths or raw I/O errors. Until the promotion privacy
+and verification contracts land, the API reports those capabilities as
+unavailable and returns unknown/null metadata rather than inferring a healthy
+or public state.
 
 ## Cast and familiar writes
 
@@ -75,7 +97,7 @@ These power `coven status`, `coven familiars`, `coven skills`, `coven memory`, `
 |---|---|---|---|---|
 | POST | `/api/v1/cast` | Submit a cast line (status/delegation shorthand) to the cockpit session. | `202 { accepted, cast_id, echo }` | `400 invalid_request` |
 | PUT | `/api/v1/familiars/:id/icon` | Update a familiar's icon glyph. | updated familiar | `400`, `404` |
-| POST | `/api/v1/familiars/:id/edits` | Ward-adjudicated writes into a familiar home (Gates 1–2, fail-closed, audited). | edit report | `400`, `403` (ward denial), `404` |
+| POST | `/api/v1/familiars/:id/edits` | Ward-adjudicated writes into a familiar home (Gates 1–2, fail-closed, audited). Held writes stage with deterministic Gate-3 probe evidence; applied writes append `apply_audit` rows to the `ward_audit` ledger. | edit report | `400`, `403` (ward denial), `404` |
 
 ## Ward proposals (threads)
 
@@ -87,10 +109,37 @@ Tier-0 authority degradations and Tier-1 coherence holds, distinguished by
 | Method | Path | Purpose | Success | Errors |
 |---|---|---|---|---|
 | GET | `/api/v1/threads/weaves` | Per-familiar weave/authority state (degraded configs reported inline). | weave entries | — |
-| GET | `/api/v1/threads/proposals` | Pending proposals (unparseable files reported as `degraded` entries, newest first). | `{ proposals }` | — |
-| GET | `/api/v1/threads/proposals/:id` | One pending proposal. | `{ proposal }` | `400 invalid_request` / `404 proposal_not_found` |
-| POST | `/api/v1/threads/proposals/:id/approve` | Re-validate and apply a staged authority proposal (coherence approval lands with Gate 3 PR 4). | decision report | `400`, `404`, `409` |
-| POST | `/api/v1/threads/proposals/:id/reject` | Reject and remove a staged proposal (audited). | decision report | `400`, `404`, `409` |
+| GET | `/api/v1/threads/proposals` | Pending proposals with compact `probeSummary` evidence (unparseable files reported as `degraded` entries, newest first). | `{ proposals }` | — |
+| GET | `/api/v1/threads/proposals/:id` | One pending proposal with `probeSummary` and full per-surface `probes`. | `{ proposal }` | `400 invalid_request` / `404 proposal_not_found` |
+| POST | `/api/v1/threads/proposals/:id/approve` | Re-validate and atomically apply a staged authority or coherence proposal. Pending decisions require `{ expectedRevision, note? }`; take the exact revision from the GET detail response. `HumanApprovalWithRationale` paths require a non-empty `note`. | decision report | `400`, `404`, `409` |
+| POST | `/api/v1/threads/proposals/:id/reject` | Reject and remove a staged proposal (audited). Pending decisions require `{ expectedRevision, note? }`; take the exact revision from the GET detail response. | decision report | `400`, `404`, `409` |
+
+Probe evidence is additive sidecar data, so the underlying
+`coven_threads_core::PendingProposal` remains backward-readable. A missing
+probe sidecar (older pending files), no matching `[[probe]]`, or a probe
+runtime error is reported as `unscored`; it is never treated as a pass.
+Stale, malformed, or internally inconsistent sidecars are likewise demoted to
+`unscored` with `probeEvidenceDegraded`, after deterministic recomputation
+against staged targets and contents, the current baseline and Gate-2
+resolution, and the declared probe set.
+
+For `reviewKind: "coherence"`, approval re-runs Gates 1–2 and the deterministic
+probes, skips the threads validator (Tier-1 surfaces are deliberately not
+woven), and conditionally writes only if the captured before-image still
+matches the re-probed baseline. Missing, malformed, stale, or inconsistent
+probe evidence returns `409`, leaves the proposal pending, and writes nothing.
+A first approval attempt never treats matching proposed bytes as proof that
+Coven already applied them; that idempotent shortcut is restricted to a
+persisted recovery intent, which is also bound to the Gate-2-resolved surface.
+Known no-write failures and proven rollbacks clear that recovery state before
+returning; failures that may have committed preserve it for safe replay. The
+Ward's final path adjudication must still equal the persisted resolution.
+A valid `failed` or `unscored` probe result is advisory: an explicit principal
+approval may still apply it. Rejection remains available when evidence is stale
+and returns `probeSummary` plus `probeEvidenceDegraded`; it never applies the
+staged edit. On approval, any logged edits in the proposal append their
+`apply_audit` rows atomically with baseline advancement and the terminal
+`proposal_approved` row.
 
 ## Skills: eval-loop
 
