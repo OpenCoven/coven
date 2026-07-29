@@ -18,6 +18,7 @@ import {
   launchHarnessSession,
   prepareEventTail,
   measureEventTails,
+  measureCapabilityReads,
   measureSessionLists,
   registerInputEvents,
   registerExternalSessions,
@@ -500,6 +501,51 @@ test('measureSessionLists isolates every requested fixture size', async () => {
   ]);
 });
 
+test('measureCapabilityReads uses a short socket-safe fixture home', async () => {
+  const calls = [];
+  let releaseHotRead;
+  let hotReadStarted;
+  const hotReadStartedPromise = new Promise((resolve) => {
+    hotReadStarted = resolve;
+  });
+  const reportPromise = measureCapabilityReads({
+    binary: '/tmp/coven',
+    fixtureRoot: '/fixture/root',
+    environment: { PATH: '/fixture/bin' },
+    iterations: 2,
+    makeDirectory: async (path) => calls.push(['mkdir', path]),
+    start: async ({ covenHome, env }) => {
+      calls.push(['start', covenHome, env.COVEN_HOME]);
+      return `${covenHome}/coven.sock`;
+    },
+    measure: async ({ socketPath, path, iterations }) => {
+      calls.push(['measure', socketPath, path, iterations]);
+      if (iterations === 2) {
+        hotReadStarted();
+        await new Promise((resolve) => {
+          releaseHotRead = resolve;
+        });
+      }
+      return { samplesMs: [1], statusCodes: [200], summary: { minMs: 1 } };
+    },
+    stop: ({ covenHome }) => calls.push(['stop', covenHome])
+  });
+
+  await hotReadStartedPromise;
+  assert.equal(calls.some(([name]) => name === 'stop'), false);
+  releaseHotRead();
+  const report = await reportPromise;
+
+  assert.deepEqual(report, { samplesMs: [1], statusCodes: [200], summary: { minMs: 1 } });
+  assert.deepEqual(calls, [
+    ['mkdir', '/fixture/root/k/user-home'],
+    ['start', '/fixture/root/k', '/fixture/root/k'],
+    ['measure', '/fixture/root/k/coven.sock', '/api/v1/capabilities/harnesses', 1],
+    ['measure', '/fixture/root/k/coven.sock', '/api/v1/capabilities/harnesses', 2],
+    ['stop', '/fixture/root/k']
+  ]);
+});
+
 test('collectBenchmarkScenarios merges core and daemon fixture reports', async () => {
   const calls = [];
   const scenarios = await collectBenchmarkScenarios({
@@ -522,6 +568,10 @@ test('collectBenchmarkScenarios merges core and daemon fixture reports', async (
     measureLists: async (input) => {
       calls.push(['lists', input.fixtureRoot, input.sessionCounts]);
       return { sessions_2: { samplesMs: [2], statusCodes: [200], summary: { minMs: 2 } } };
+    },
+    measureCapabilities: async (input) => {
+      calls.push(['capabilities', input.fixtureRoot, input.iterations]);
+      return { samplesMs: [5], statusCodes: [200], summary: { minMs: 5 } };
     }
   });
 
@@ -529,15 +579,42 @@ test('collectBenchmarkScenarios merges core and daemon fixture reports', async (
     'help',
     'harness_first_output',
     'event_tail_2',
-    'sessions_2'
+    'sessions_2',
+    'capabilities_hot'
   ]);
   assert.deepEqual(calls, [
     ['mkdir', '/fixture/root/c/user-home'],
     ['core', '/fixture/root/c'],
     ['harness', '/fixture/root', 2],
     ['events', '/fixture/root', [2]],
-    ['lists', '/fixture/root', [2]]
+    ['lists', '/fixture/root', [2]],
+    ['capabilities', '/fixture/root', 2]
   ]);
+});
+
+test('collectBenchmarkScenarios records warmed capability reads', async () => {
+  const calls = [];
+  const scenarios = await collectBenchmarkScenarios({
+    options: { binary: '/tmp/coven', iterations: 2, sessionCounts: [2] },
+    fixtureRoot: '/fixture/root',
+    environment: { PATH: '/fixture/bin' },
+    makeDirectory: async () => {},
+    collectCore: () => ({ help: { samplesMs: [1], exitCodes: [0], summary: { minMs: 1 } } }),
+    measureHarness: async () => ({ samplesMs: [3], statusCodes: [201], summary: { minMs: 3 } }),
+    measureEvents: async () => ({ event_tail_2: { samplesMs: [4], statusCodes: [200], summary: { minMs: 4 } } }),
+    measureLists: async () => ({ sessions_2: { samplesMs: [2], statusCodes: [200], summary: { minMs: 2 } } }),
+    measureCapabilities: async (input) => {
+      calls.push([input.fixtureRoot, input.iterations]);
+      return { samplesMs: [5], statusCodes: [200], summary: { minMs: 5 } };
+    }
+  });
+
+  assert.deepEqual(scenarios.capabilities_hot, {
+    samplesMs: [5],
+    statusCodes: [200],
+    summary: { minMs: 5 }
+  });
+  assert.deepEqual(calls, [['/fixture/root', 2]]);
 });
 
 test('external session fixture request uses the versioned sessions endpoint', () => {

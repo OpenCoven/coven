@@ -546,6 +546,40 @@ export async function measureSessionLists({
   return reports;
 }
 
+export async function measureCapabilityReads({
+  binary,
+  fixtureRoot,
+  environment,
+  iterations,
+  makeDirectory = (path) => mkdir(path, { recursive: true }),
+  start = startDaemon,
+  measure = runSocketScenario,
+  stop = stopDaemon
+}) {
+  // Unix-domain socket paths have a small platform limit (104 bytes on macOS).
+  // Keep this fixture name shorter than the session fixtures so a default
+  // macOS temporary directory still leaves enough room for `coven.sock`.
+  const covenHome = join(fixtureRoot, 'k');
+  const env = isolatedEnvironment(covenHome, environment);
+  await makeDirectory(join(covenHome, 'user-home'));
+  const socketPath = await start({ binary, covenHome, env });
+
+  try {
+    await measure({
+      socketPath,
+      path: '/api/v1/capabilities/harnesses',
+      iterations: 1
+    });
+    return await measure({
+      socketPath,
+      path: '/api/v1/capabilities/harnesses',
+      iterations
+    });
+  } finally {
+    stop({ binary, covenHome, env });
+  }
+}
+
 export async function measureHarnessOutput({
   binary,
   fixtureRoot,
@@ -620,7 +654,8 @@ export async function collectBenchmarkScenarios({
   collectCore = collectCoreScenarios,
   measureHarness = measureHarnessOutput,
   measureEvents = measureEventTails,
-  measureLists = measureSessionLists
+  measureLists = measureSessionLists,
+  measureCapabilities = measureCapabilityReads
 }) {
   const coreHome = join(fixtureRoot, 'c');
   const coreEnv = isolatedEnvironment(coreHome, environment);
@@ -658,6 +693,12 @@ export async function collectBenchmarkScenarios({
         iterations: options.iterations
       })
     );
+    scenarios.capabilities_hot = await measureCapabilities({
+      binary: options.binary,
+      fixtureRoot,
+      environment,
+      iterations: options.iterations
+    });
   }
 
   return scenarios;

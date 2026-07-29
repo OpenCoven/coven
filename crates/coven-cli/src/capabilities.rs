@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -88,15 +88,73 @@ pub struct CapabilitiesResponse {
 
 const CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
 
-struct CapabilityCache {
-    manifests: HashMap<String, HarnessCapabilityManifest>,
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct CacheKey {
+    coven_home: PathBuf,
+    harness_home: PathBuf,
+}
+
+impl CacheKey {
+    fn new(coven_home: PathBuf, harness_home: PathBuf) -> Self {
+        Self {
+            coven_home,
+            harness_home,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CapabilitySnapshot {
+    response: CapabilitiesResponse,
     built_at: Instant,
 }
 
-static CACHE: OnceLock<Mutex<Option<CapabilityCache>>> = OnceLock::new();
+static CACHE: OnceLock<RwLock<HashMap<CacheKey, CapabilitySnapshot>>> = OnceLock::new();
 
-fn cache() -> &'static Mutex<Option<CapabilityCache>> {
-    CACHE.get_or_init(|| Mutex::new(None))
+fn cache() -> &'static RwLock<HashMap<CacheKey, CapabilitySnapshot>> {
+    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn get_or_refresh(
+    key: CacheKey,
+    refresh: bool,
+    build: impl FnOnce() -> CapabilitiesResponse,
+) -> CapabilitiesResponse {
+    if !refresh {
+        let guard = cache()
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(snapshot) = guard
+            .get(&key)
+            .filter(|snapshot| snapshot.built_at.elapsed() < CACHE_TTL)
+        {
+            return snapshot.response.clone();
+        }
+    }
+
+    // Filesystem discovery must happen outside the shared cache lock. Two
+    // concurrent refreshes may duplicate work, but readers retain access to a
+    // complete prior snapshot throughout either scan.
+    let response = build();
+    cache()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            key,
+            CapabilitySnapshot {
+                response: response.clone(),
+                built_at: Instant::now(),
+            },
+        );
+    response
+}
+
+#[cfg(test)]
+fn clear_cache_for_tests() {
+    cache()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
 }
 
 fn utc_now_iso() -> String {
@@ -130,56 +188,27 @@ fn utc_now_iso() -> String {
 /// Returns all harness manifests, using the cache when fresh.
 /// Pass `refresh = true` to force a re-scan.
 pub fn get_all(coven_home: &Path, refresh: bool) -> CapabilitiesResponse {
-    let home = dirs_home();
-    {
-        let mut guard = cache().lock().unwrap_or_else(|e| e.into_inner());
-        if !refresh {
-            if let Some(ref c) = *guard {
-                if c.built_at.elapsed() < CACHE_TTL {
-                    let manifests: Vec<_> = c.manifests.values().cloned().collect();
-                    let coven_skills =
-                        crate::cockpit_sources::scan_skills(coven_home).unwrap_or_default();
-                    return CapabilitiesResponse {
-                        coven_skills,
-                        harness_capabilities: manifests,
-                        scanned_at: utc_now_iso(),
-                    };
-                }
-            }
-        }
-        // Re-scan.
-        let codex = scan_codex_capabilities(&home);
-        let claude = scan_claude_capabilities(&home);
-        let cursor = scan_cursor_capabilities(&home);
-        let gemini = scan_gemini_capabilities(&home);
-        let opencode = scan_opencode_capabilities(&home);
-        let coven_code = scan_coven_code_capabilities(&home);
-        let copilot = scan_copilot_capabilities(&home);
-        let mut manifests = HashMap::new();
-        manifests.insert("codex".to_string(), codex);
-        manifests.insert("claude".to_string(), claude);
-        manifests.insert("cursor".to_string(), cursor);
-        manifests.insert("gemini".to_string(), gemini);
-        manifests.insert("opencode".to_string(), opencode);
-        manifests.insert("coven-code".to_string(), coven_code);
-        manifests.insert("copilot".to_string(), copilot);
-        *guard = Some(CapabilityCache {
-            manifests,
-            built_at: Instant::now(),
-        });
-    }
-    let guard = cache().lock().unwrap_or_else(|e| e.into_inner());
-    let manifests: Vec<_> = guard
-        .as_ref()
-        .unwrap()
-        .manifests
-        .values()
-        .cloned()
-        .collect();
-    let coven_skills = crate::cockpit_sources::scan_skills(coven_home).unwrap_or_default();
+    let harness_home = dirs_home();
+    get_all_for_home(coven_home, &harness_home, refresh)
+}
+
+fn get_all_for_home(coven_home: &Path, harness_home: &Path, refresh: bool) -> CapabilitiesResponse {
+    let key = CacheKey::new(coven_home.to_path_buf(), harness_home.to_path_buf());
+    get_or_refresh(key, refresh, || build_response(coven_home, harness_home))
+}
+
+fn build_response(coven_home: &Path, harness_home: &Path) -> CapabilitiesResponse {
     CapabilitiesResponse {
-        coven_skills,
-        harness_capabilities: manifests,
+        coven_skills: crate::cockpit_sources::scan_skills(coven_home).unwrap_or_default(),
+        harness_capabilities: vec![
+            scan_codex_capabilities(harness_home),
+            scan_claude_capabilities(harness_home),
+            scan_cursor_capabilities(harness_home),
+            scan_gemini_capabilities(harness_home),
+            scan_opencode_capabilities(harness_home),
+            scan_coven_code_capabilities(harness_home),
+            scan_copilot_capabilities(harness_home),
+        ],
         scanned_at: utc_now_iso(),
     }
 }
@@ -190,17 +219,29 @@ pub fn get_one(
     harness_id: &str,
     refresh: bool,
 ) -> Option<HarnessCapabilityManifest> {
-    // Ensure the cache is warm first.
-    get_all(coven_home, refresh);
-    let guard = cache().lock().unwrap_or_else(|e| e.into_inner());
-    guard.as_ref()?.manifests.get(harness_id).cloned()
+    let harness_home = dirs_home();
+    get_one_for_home(coven_home, &harness_home, harness_id, refresh)
+}
+
+fn get_one_for_home(
+    coven_home: &Path,
+    harness_home: &Path,
+    harness_id: &str,
+    refresh: bool,
+) -> Option<HarnessCapabilityManifest> {
+    get_all_for_home(coven_home, harness_home, refresh)
+        .harness_capabilities
+        .into_iter()
+        .find(|manifest| manifest.harness_id == harness_id)
 }
 
 /// Invalidate the cache (e.g. on SIGHUP).
 #[allow(dead_code)]
 pub fn invalidate() {
-    let mut guard = cache().lock().unwrap_or_else(|e| e.into_inner());
-    *guard = None;
+    cache()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
 }
 
 // ── Scanners ──────────────────────────────────────────────────────────────────
@@ -848,11 +889,135 @@ fn parse_automation_toml(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use std::{
+        fs,
+        sync::{mpsc, Mutex},
+        time::Duration,
+    };
     use tempfile::TempDir;
 
     fn tmp() -> TempDir {
         tempfile::tempdir().expect("tempdir")
+    }
+
+    fn cache_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn fixture_response(label: &str) -> CapabilitiesResponse {
+        CapabilitiesResponse {
+            coven_skills: vec![crate::cockpit_sources::SkillDto {
+                id: label.to_string(),
+                name: label.to_string(),
+                owner: "test".to_string(),
+                category: "test".to_string(),
+                tags: vec![],
+                score: 0.0,
+                effective_rate: 0.0,
+                applied_rate: 0.0,
+                completion_rate: 0.0,
+                fallback_rate: 0.0,
+                version: "1.0.0".to_string(),
+                description: "test fixture".to_string(),
+            }],
+            harness_capabilities: vec![HarnessCapabilityManifest {
+                harness_id: "codex".to_string(),
+                scanned_at: label.to_string(),
+                global_instructions: GlobalInstructions {
+                    present: false,
+                    path: None,
+                    byte_count: None,
+                },
+                skills: vec![],
+                plugins: vec![],
+                warnings: vec![],
+            }],
+            scanned_at: label.to_string(),
+        }
+    }
+
+    #[test]
+    fn fresh_cache_hit_returns_the_complete_snapshot_without_building() {
+        let _serial = cache_test_lock().lock().unwrap();
+        clear_cache_for_tests();
+        let key = CacheKey::new(PathBuf::from("/coven"), PathBuf::from("/harness"));
+        let initial = fixture_response("initial");
+
+        let first = get_or_refresh(key.clone(), false, || initial.clone());
+        let hit = get_or_refresh(key, false, || panic!("fresh cache must not build"));
+
+        assert_eq!(first.scanned_at, "initial");
+        assert_eq!(hit.scanned_at, "initial");
+        assert_eq!(hit.coven_skills[0].id, "initial");
+        assert_eq!(hit.harness_capabilities[0].scanned_at, "initial");
+    }
+
+    #[test]
+    fn refresh_does_not_block_fresh_reader() {
+        let _serial = cache_test_lock().lock().unwrap();
+        clear_cache_for_tests();
+        let key = CacheKey::new(PathBuf::from("/coven"), PathBuf::from("/harness"));
+        let cached = fixture_response("cached");
+        get_or_refresh(key.clone(), false, || cached);
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let refresh_key = key.clone();
+        let refresh = std::thread::spawn(move || {
+            get_or_refresh(refresh_key, true, || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                fixture_response("refreshed")
+            })
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let (reader_tx, reader_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            reader_tx
+                .send(get_or_refresh(key, false, || {
+                    panic!("fresh cache must not build")
+                }))
+                .unwrap();
+        });
+        let response = reader_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(response.scanned_at, "cached");
+
+        release_tx.send(()).unwrap();
+        reader.join().unwrap();
+        assert_eq!(refresh.join().unwrap().scanned_at, "refreshed");
+    }
+
+    #[test]
+    fn get_one_reads_the_published_response_snapshot() {
+        let _serial = cache_test_lock().lock().unwrap();
+        clear_cache_for_tests();
+        let coven_home = PathBuf::from("/coven");
+        let harness_home = PathBuf::from("/harness");
+        get_or_refresh(
+            CacheKey::new(coven_home.clone(), harness_home.clone()),
+            false,
+            || fixture_response("published"),
+        );
+
+        let manifest = get_one_for_home(&coven_home, &harness_home, "codex", false)
+            .expect("published codex manifest");
+        assert_eq!(manifest.scanned_at, "published");
+    }
+
+    #[test]
+    fn snapshots_are_scoped_to_coven_and_harness_homes() {
+        let _serial = cache_test_lock().lock().unwrap();
+        clear_cache_for_tests();
+        let first = CacheKey::new(PathBuf::from("/coven-one"), PathBuf::from("/harness"));
+        let second = CacheKey::new(PathBuf::from("/coven-two"), PathBuf::from("/harness"));
+
+        get_or_refresh(first.clone(), false, || fixture_response("first"));
+        get_or_refresh(second, false, || fixture_response("second"));
+
+        let first_hit = get_or_refresh(first, false, || panic!("first cache must remain scoped"));
+        assert_eq!(first_hit.scanned_at, "first");
     }
 
     // ── Codex ──────────────────────────────────────────────────────────────
