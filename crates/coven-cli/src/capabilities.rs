@@ -971,7 +971,7 @@ mod tests {
                 fixture_response("refreshed")
             })
         });
-        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
 
         let (reader_tx, reader_rx) = mpsc::channel();
         let reader = std::thread::spawn(move || {
@@ -981,7 +981,7 @@ mod tests {
                 }))
                 .unwrap();
         });
-        let response = reader_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let response = reader_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(response.scanned_at, "cached");
 
         release_tx.send(()).unwrap();

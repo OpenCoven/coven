@@ -7,8 +7,8 @@ discovery never holds the shared cache lock.
 
 ## Scope
 
-The affected API routes are `GET /capabilities/harnesses` and
-`GET /capabilities/:harness_id`. Their existing `refresh=1` and five-minute
+The affected API routes are `GET /api/v1/capabilities/harnesses` and
+`GET /api/v1/capabilities/:harnessId`. Their existing `refresh=1` and five-minute
 TTL behavior remain unchanged. Coven continues to read harness and skill
 directories only; this change introduces no writes to those directories.
 
