@@ -2187,6 +2187,10 @@ fn acquire_serve_lock(coven_home: &Path) -> Result<std::fs::File> {
     Ok(file)
 }
 
+fn initialize_daemon_store(coven_home: &Path) -> Result<()> {
+    crate::store::initialize_store(&coven_home.join("coven.sqlite3"))
+}
+
 #[cfg(unix)]
 pub fn serve_forever(
     coven_home: &Path,
@@ -2206,6 +2210,7 @@ pub fn serve_forever(
     // catching the wedged-but-alive incumbent the socket guard can't, and the
     // direct `daemon serve` path that bypasses ensure_background_server.
     let _serve_lock = acquire_serve_lock(coven_home)?;
+    initialize_daemon_store(coven_home)?;
     let status = DaemonStatus {
         pid: std::process::id(),
         started_at: started_at.clone(),
@@ -2752,6 +2757,7 @@ pub fn serve_forever(
     // Claim the pipe before mutating shared daemon/session state. A duplicate
     // daemon must fail at bind without replacing the incumbent's daemon.json
     // or marking sessions owned by that live daemon orphaned.
+    initialize_daemon_store(coven_home)?;
     write_status(coven_home, &status)?;
     recover_orphaned_sessions(coven_home, &started_at)?;
 
@@ -2829,6 +2835,15 @@ pub fn serve_forever(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_store_initialization_prepares_request_connections() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        initialize_daemon_store(temp_dir.path())?;
+        let conn = crate::store::open_initialized_store(&temp_dir.path().join("coven.sqlite3"))?;
+        assert!(crate::store::list_sessions(&conn)?.is_empty());
+        Ok(())
+    }
 
     #[test]
     fn is_client_disconnect_detects_wrapped_broken_pipe() {

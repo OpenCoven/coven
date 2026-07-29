@@ -1,9 +1,16 @@
-use std::path::Path;
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    sync::{OnceLock, RwLock},
+};
+
+#[cfg(test)]
+use std::{collections::HashMap, sync::Mutex};
 
 use anyhow::{Context, Result};
 use base64::Engine;
 use chrono::{Duration, SecondsFormat, Utc};
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use rusqlite::{params, Connection, ErrorCode, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -329,7 +336,63 @@ fn ensure_ward_audit_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn initialized_store_paths() -> &'static RwLock<HashSet<PathBuf>> {
+    static PATHS: OnceLock<RwLock<HashSet<PathBuf>>> = OnceLock::new();
+    PATHS.get_or_init(|| RwLock::new(HashSet::new()))
+}
+
+fn store_was_initialized(path: &Path) -> bool {
+    initialized_store_paths()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(path)
+}
+
+fn remember_initialized_store(path: &Path) {
+    initialized_store_paths()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(path.to_path_buf());
+    #[cfg(test)]
+    {
+        let mut counts = initialization_counts()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *counts.entry(path.to_path_buf()).or_default() += 1;
+    }
+}
+
+#[cfg(test)]
+fn initialization_counts() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    static COUNTS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn initialization_count(path: &Path) -> usize {
+    initialization_counts()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(path)
+        .copied()
+        .unwrap_or_default()
+}
+
+/// Opens a writable store for a standalone CLI caller. The first open for a
+/// path in this process initializes or upgrades it; later opens only configure
+/// the connection. Daemon startup calls [`initialize_store`] explicitly before
+/// it starts accepting requests, so its request paths always take the latter.
 pub fn open_store(path: &Path) -> Result<Connection> {
+    if !store_was_initialized(path) {
+        initialize_store(path)?;
+    }
+    open_initialized_store(path)
+}
+
+/// Performs the idempotent, write-capable store initialization and migration
+/// sequence. Call this before serving requests; ordinary request connections
+/// should use [`open_initialized_store`] after this succeeds.
+pub fn initialize_store(path: &Path) -> Result<()> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -340,7 +403,39 @@ pub fn open_store(path: &Path) -> Result<Connection> {
 
     let conn = Connection::open(path)
         .with_context(|| format!("failed to open Coven store at {}", path.display()))?;
-    configure_writable_connection(&conn)?;
+    configure_initializing_connection(&conn)?;
+    // The Ward audit migrator owns its own transaction because a legacy table
+    // rebuild must be atomic. Run it before our transaction for the remaining
+    // idempotent store schema work; nesting these transactions is invalid in
+    // SQLite. Its transaction also serializes concurrent Ward upgrades.
+    ensure_ward_audit_schema(&conn)?;
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .context("failed to acquire SQLite initialization transaction")?;
+    let result = initialize_store_schema(&conn);
+    match result {
+        Ok(()) => conn
+            .execute_batch("COMMIT")
+            .context("failed to commit SQLite initialization transaction")?,
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(error);
+        }
+    }
+    remember_initialized_store(path);
+    Ok(())
+}
+
+/// Opens a writable connection after [`initialize_store`] has completed. This
+/// deliberately omits schema DDL, compatibility checks, FTS backfill, and WAL
+/// changes so it is safe for per-request use on the daemon hot path.
+pub fn open_initialized_store(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path)
+        .with_context(|| format!("failed to open Coven store at {}", path.display()))?;
+    configure_runtime_writable_connection(&conn)?;
+    Ok(conn)
+}
+
+fn initialize_store_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS sessions (
             id TEXT PRIMARY KEY NOT NULL,
@@ -567,35 +662,68 @@ pub fn open_store(path: &Path) -> Result<Connection> {
         ",
     )
     .context("failed to initialize Coven store schema")?;
-    // The coven-threads gate layer's daemon-owned tables: the append-only
-    // ward.audit ledger (single audit store — PHASE-0-DESIGN §3.4, RFC-0001
-    // §5.6) and the per-familiar surface baseline manifest. Both idempotent.
-    ensure_ward_audit_schema(&conn)?;
+    // The per-familiar surface baseline manifest is idempotent. The Ward audit
+    // ledger ran before this transaction because legacy migration SQL owns its
+    // own transaction.
     conn.execute_batch(crate::threads_gate::WARD_MANIFEST_SCHEMA_SQL)
         .context("failed to initialize ward_manifest schema")?;
-    ensure_exit_code_column(&conn)?;
-    ensure_archived_at_column(&conn)?;
-    ensure_conversation_id_column(&conn)?;
-    ensure_event_privacy_columns(&conn)?;
-    ensure_sensitive_artifacts_table(&conn)?;
-    ensure_labels_column(&conn)?;
-    ensure_visibility_column(&conn)?;
-    ensure_familiar_id_column(&conn)?;
-    ensure_node_registry_dispatch_columns(&conn)?;
-    ensure_session_external_columns(&conn)?;
+    ensure_exit_code_column(conn)?;
+    ensure_archived_at_column(conn)?;
+    ensure_conversation_id_column(conn)?;
+    ensure_event_privacy_columns(conn)?;
+    ensure_sensitive_artifacts_table(conn)?;
+    ensure_labels_column(conn)?;
+    ensure_visibility_column(conn)?;
+    ensure_familiar_id_column(conn)?;
+    ensure_node_registry_dispatch_columns(conn)?;
+    ensure_session_external_columns(conn)?;
 
-    backfill_events_fts_if_needed(&conn)?;
+    backfill_events_fts_if_needed(conn)?;
 
-    Ok(conn)
+    Ok(())
 }
 
-fn configure_writable_connection(conn: &Connection) -> Result<()> {
+fn configure_initializing_connection(conn: &Connection) -> Result<()> {
     // WAL mode allows concurrent readers alongside a single writer and avoids
     // "database is locked" errors under typical daemon + API concurrency.
     // busy_timeout gives writers up to 5 s to retry before returning SQLITE_BUSY.
     conn.execute_batch(
-        "PRAGMA journal_mode = WAL;
-         PRAGMA busy_timeout = 5000;
+        "PRAGMA busy_timeout = 5000;
+         PRAGMA foreign_keys = ON;",
+    )
+    .context("failed to configure writable Coven store connection")?;
+    enable_wal_with_retry(conn)?;
+    Ok(())
+}
+
+fn enable_wal_with_retry(conn: &Connection) -> Result<()> {
+    const ATTEMPTS: usize = 50;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+    for attempt in 0..ATTEMPTS {
+        match conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
+            row.get::<_, String>(0)
+        }) {
+            Ok(mode) if mode.eq_ignore_ascii_case("wal") => return Ok(()),
+            Ok(mode) => anyhow::bail!("SQLite refused WAL mode and reported `{mode}`"),
+            Err(error)
+                if matches!(
+                    error.sqlite_error_code(),
+                    Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+                ) && attempt + 1 < ATTEMPTS =>
+            {
+                std::thread::sleep(RETRY_DELAY);
+            }
+            Err(error) => return Err(error).context("failed to enable WAL mode for Coven store"),
+        }
+    }
+
+    unreachable!("WAL retry loop either succeeds or returns its final error")
+}
+
+fn configure_runtime_writable_connection(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "PRAGMA busy_timeout = 5000;
          PRAGMA foreign_keys = ON;",
     )
     .context("failed to configure writable Coven store connection")?;
@@ -3133,7 +3261,8 @@ mod tests {
         )?;
         drop(conn);
 
-        let conn = open_store(&path)?;
+        initialize_store(&path)?;
+        let conn = open_initialized_store(&path)?;
 
         assert_eq!(
             ward_audit_component_version(&conn)?,
@@ -3366,6 +3495,61 @@ mod tests {
         let conn = open_existing_store_read_only(&store_path)?.expect("store should exist");
 
         assert!(!repositories_table_exists(&conn)?);
+        Ok(())
+    }
+
+    #[test]
+    fn store_initialization_boundary_creates_schema_once_before_lightweight_opens() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let path = temp_dir.path().join("coven.db");
+
+        let unopened = open_initialized_store(&path)?;
+        assert!(list_sessions(&unopened).is_err());
+        drop(unopened);
+
+        initialize_store(&path)?;
+        let conn = open_initialized_store(&path)?;
+        assert!(list_sessions(&conn)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn open_store_only_initializes_an_unseen_path_once_per_process() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let path = temp_dir.path().join("coven.db");
+
+        drop(open_store(&path)?);
+        assert_eq!(initialization_count(&path), 1);
+        drop(open_store(&path)?);
+        assert_eq!(initialization_count(&path), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_store_initialization_serializes_migrations() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let path = temp_dir.path().join("coven.db");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    initialize_store(&path)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.join().expect("initializer thread panicked")?;
+        }
+        let conn = open_initialized_store(&path)?;
+        assert!(list_sessions(&conn)?.is_empty());
+        assert_eq!(
+            ward_audit_component_version(&conn)?,
+            coven_threads_core::WARD_AUDIT_SCHEMA_VERSION
+        );
         Ok(())
     }
 
