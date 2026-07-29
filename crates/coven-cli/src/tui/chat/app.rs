@@ -320,6 +320,7 @@ pub(super) enum InterruptOutcome {
 }
 
 const INTERRUPT_REARM_WINDOW: Duration = Duration::from_secs(2);
+const CHAT_TICK_INTERVAL: Duration = Duration::from_millis(120);
 
 /// One row in the slash-command autocomplete popup. `name` is what the popup
 /// matches against (including the leading slash) and `summary` is the one-line
@@ -1396,7 +1397,9 @@ impl App {
         };
         let result = self.client.send_input(session_id, &payload);
         match result {
-            Ok(()) => self.poll_session_events(),
+            Ok(()) => {
+                self.poll_session_events();
+            }
             Err(error) => {
                 self.is_responding = false;
                 self.push_system_message(&format!("Input rejected: {error}"));
@@ -1673,19 +1676,19 @@ impl App {
         self.push_system_message(&format_daemon_status_for_chat(&status));
     }
 
-    pub(super) fn poll_session_events(&mut self) {
+    pub(super) fn poll_session_events(&mut self) -> bool {
         let Some(session_id) = self.active_session_id.clone() else {
-            return;
+            return false;
         };
         let now = Instant::now();
         if self
             .event_poll_backoff_until
             .is_some_and(|until| until > now)
         {
-            return;
+            return false;
         }
         if self.event_poll_paused_for_api_mismatch {
-            return;
+            return false;
         }
         match self.client.list_events(ChatEventQuery {
             session_id: &session_id,
@@ -1694,6 +1697,7 @@ impl App {
         }) {
             Ok(events) => {
                 self.reset_event_poll_failures();
+                let mut changed = false;
                 for event in events {
                     // If `push_event_message` swapped the active session
                     // mid-batch (e.g. stale-id recovery auto-relaunched
@@ -1708,7 +1712,9 @@ impl App {
                     }
                     self.last_event_seq = Some(event.seq);
                     self.push_event_message(&event);
+                    changed = true;
                 }
+                changed
             }
             Err(error) => self.record_event_poll_failure(error),
         }
@@ -1721,7 +1727,7 @@ impl App {
         self.event_poll_paused_for_api_mismatch = false;
     }
 
-    fn record_event_poll_failure(&mut self, error: anyhow::Error) {
+    fn record_event_poll_failure(&mut self, error: anyhow::Error) -> bool {
         let message = error.to_string();
         if is_api_mismatch_error(&message) {
             self.event_poll_paused_for_api_mismatch = true;
@@ -1739,6 +1745,7 @@ impl App {
             };
             self.push_system_message(&message);
         }
+        !repeated_error
     }
 
     /// Codex auto-assigns a session id on its first turn and prints it in
@@ -2496,12 +2503,23 @@ impl App {
         self.scroll_offset = usize::MAX;
     }
 
-    pub(super) fn tick(&mut self) {
-        if self.last_tick.elapsed() >= Duration::from_millis(120) {
-            self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
-            self.last_tick = Instant::now();
-            self.poll_session_events();
+    pub(super) fn tick_timeout(&self) -> Option<Duration> {
+        (self.is_responding || self.active_session_id.is_some())
+            .then(|| CHAT_TICK_INTERVAL.saturating_sub(self.last_tick.elapsed()))
+    }
+
+    pub(super) fn tick(&mut self) -> bool {
+        if self.tick_timeout().is_none() || self.last_tick.elapsed() < CHAT_TICK_INTERVAL {
+            return false;
         }
+
+        self.last_tick = Instant::now();
+        let spinner_changed = self.is_responding;
+        if spinner_changed {
+            self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
+        }
+        let session_changed = self.poll_session_events();
+        spinner_changed || session_changed
     }
 
     pub(super) fn insert_char(&mut self, c: char) {
@@ -7493,6 +7511,66 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn idle_tick_has_no_deadline_or_daemon_poll() {
+        let client = RecordingChatClient::default();
+        let (mut app, mirror) = app_with_client(client);
+        app.last_tick = Instant::now() - Duration::from_millis(120);
+
+        assert_eq!(app.tick_timeout(), None);
+        assert!(!app.tick());
+        assert!(!mirror
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call.starts_with("events:")));
+    }
+
+    #[test]
+    fn active_session_tick_polls_without_redrawing_when_nothing_visible_changed() {
+        let client = RecordingChatClient::default();
+        let (mut app, mirror) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.last_tick = Instant::now() - Duration::from_millis(120);
+
+        assert_eq!(app.tick_timeout(), Some(Duration::ZERO));
+        assert!(!app.tick());
+        assert!(mirror
+            .calls
+            .borrow()
+            .contains(&"events:session-1:0".to_string()));
+    }
+
+    #[test]
+    fn responding_tick_advances_the_spinner_and_requests_a_redraw() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.is_responding = true;
+        app.last_tick = Instant::now() - Duration::from_millis(120);
+        let frame = app.spinner_frame;
+
+        assert!(app.tick());
+        assert_ne!(app.spinner_frame, frame);
+    }
+
+    #[test]
+    fn active_session_event_requests_a_redraw() {
+        let client = RecordingChatClient::default();
+        client
+            .events
+            .borrow_mut()
+            .push(output_event(1, "session-1", "final text"));
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.last_tick = Instant::now() - Duration::from_millis(120);
+
+        assert!(app.tick());
+        assert!(app
+            .messages
+            .iter()
+            .any(|message| message.content.contains("final text")));
     }
 
     #[test]
