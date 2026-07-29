@@ -156,7 +156,12 @@ export function sessionInputRequest(sessionId, index) {
   };
 }
 
-export function socketRequest(socketPath, { method, path, body = '' }) {
+export function socketRequest(socketPath, {
+  method,
+  path,
+  body = '',
+  timeoutMs = COMMAND_TIMEOUT_MS
+}) {
   return new Promise((resolve, reject) => {
     const request = requestHttp(
       {
@@ -181,6 +186,9 @@ export function socketRequest(socketPath, { method, path, body = '' }) {
     );
 
     request.once('error', reject);
+    request.setTimeout(timeoutMs, () => {
+      request.destroy(new Error(`socket request timed out after ${timeoutMs}ms`));
+    });
     request.end(body);
   });
 }

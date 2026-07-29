@@ -769,6 +769,23 @@ test('socketRequest sends an external-session fixture over a local socket', asyn
   assert.deepEqual(response, { statusCode: 201, body: '{"ok":true}' });
 });
 
+test('socketRequest rejects when a local daemon request stalls', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'coven-benchmark-timeout-'));
+  const socketPath = join(directory, 'daemon.sock');
+  const server = createServer(() => {});
+
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve));
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  await assert.rejects(
+    socketRequest(socketPath, { method: 'GET', path: '/api/v1/health', timeoutMs: 25 }),
+    /socket request timed out after 25ms/
+  );
+});
+
 test('waitForHealth resolves after the local daemon health response', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'coven-benchmark-health-'));
   const socketPath = join(directory, 'daemon.sock');
