@@ -2504,8 +2504,23 @@ impl App {
     }
 
     pub(super) fn tick_timeout(&self) -> Option<Duration> {
-        (self.is_responding || self.active_session_id.is_some())
-            .then(|| CHAT_TICK_INTERVAL.saturating_sub(self.last_tick.elapsed()))
+        if self.is_responding {
+            return Some(CHAT_TICK_INTERVAL.saturating_sub(self.last_tick.elapsed()));
+        }
+
+        self.active_session_id.as_ref()?;
+        if self.event_poll_paused_for_api_mismatch {
+            return None;
+        }
+
+        let now = Instant::now();
+        if let Some(until) = self.event_poll_backoff_until {
+            if until > now {
+                return Some(until.duration_since(now));
+            }
+        }
+
+        Some(CHAT_TICK_INTERVAL.saturating_sub(self.last_tick.elapsed()))
     }
 
     pub(super) fn tick(&mut self) -> bool {
@@ -7526,6 +7541,52 @@ mod tests {
             .borrow()
             .iter()
             .any(|call| call.starts_with("events:")));
+    }
+
+    #[test]
+    fn paused_nonresponding_session_blocks_until_input() {
+        let client = RecordingChatClient::default();
+        let (mut app, mirror) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.event_poll_paused_for_api_mismatch = true;
+        app.last_tick = Instant::now() - CHAT_TICK_INTERVAL;
+
+        assert_eq!(app.tick_timeout(), None);
+        assert!(!app.tick());
+        assert!(!mirror
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call.starts_with("events:")));
+    }
+
+    #[test]
+    fn nonresponding_backoff_waits_until_retry_deadline() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.event_poll_backoff_until = Some(Instant::now() + Duration::from_secs(1));
+
+        let timeout = app
+            .tick_timeout()
+            .expect("backing off session should schedule its retry");
+        assert!(timeout > CHAT_TICK_INTERVAL);
+        assert!(timeout <= Duration::from_secs(1));
+    }
+
+    #[test]
+    fn responding_paused_session_keeps_spinner_deadline() {
+        let client = RecordingChatClient::default();
+        let (mut app, _) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        app.is_responding = true;
+        app.event_poll_paused_for_api_mismatch = true;
+        app.last_tick = Instant::now();
+
+        assert!(matches!(
+            app.tick_timeout(),
+            Some(timeout) if timeout <= CHAT_TICK_INTERVAL
+        ));
     }
 
     #[test]
