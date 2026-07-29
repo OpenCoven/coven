@@ -32,6 +32,10 @@ fn read_terminal_event(wait: TerminalWait) -> Result<Option<Event>> {
     }
 }
 
+fn terminal_event_requests_redraw(input_event: &Event) -> bool {
+    !matches!(input_event, Event::Key(key) if key.kind != KeyEventKind::Press)
+}
+
 pub(super) fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
@@ -44,7 +48,9 @@ pub(super) fn run_event_loop(
         }
 
         if let Some(input_event) = read_terminal_event(next_terminal_wait(app.tick_timeout()))? {
-            needs_redraw = true;
+            if terminal_event_requests_redraw(&input_event) {
+                needs_redraw = true;
+            }
             match input_event {
                 Event::Key(key) => {
                     if key.kind != KeyEventKind::Press {
@@ -292,6 +298,29 @@ mod tests {
             next_terminal_wait(Some(Duration::from_millis(37))),
             TerminalWait::Timed(Duration::from_millis(37))
         );
+    }
+
+    #[test]
+    fn ignored_key_events_do_not_request_a_redraw() {
+        let release = Event::Key(crossterm::event::KeyEvent::new_with_kind(
+            KeyCode::Char('x'),
+            KeyModifiers::empty(),
+            KeyEventKind::Release,
+        ));
+        let repeat = Event::Key(crossterm::event::KeyEvent::new_with_kind(
+            KeyCode::Char('x'),
+            KeyModifiers::empty(),
+            KeyEventKind::Repeat,
+        ));
+        let press = Event::Key(crossterm::event::KeyEvent::new_with_kind(
+            KeyCode::Char('x'),
+            KeyModifiers::empty(),
+            KeyEventKind::Press,
+        ));
+
+        assert!(!terminal_event_requests_redraw(&release));
+        assert!(!terminal_event_requests_redraw(&repeat));
+        assert!(terminal_event_requests_redraw(&press));
     }
 
     #[test]
