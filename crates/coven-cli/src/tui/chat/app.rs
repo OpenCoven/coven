@@ -320,7 +320,7 @@ pub(super) enum InterruptOutcome {
 }
 
 const INTERRUPT_REARM_WINDOW: Duration = Duration::from_secs(2);
-const CHAT_TICK_INTERVAL: Duration = Duration::from_millis(120);
+pub(super) const CHAT_TICK_INTERVAL: Duration = Duration::from_millis(120);
 
 /// One row in the slash-command autocomplete popup. `name` is what the popup
 /// matches against (including the leading slash) and `summary` is the one-line

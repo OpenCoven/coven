@@ -8,6 +8,8 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{backend::CrosstermBackend, Terminal};
 
+#[cfg(test)]
+use super::app::CHAT_TICK_INTERVAL;
 use super::app::{App, InputMode, InterruptOutcome, SlashCommandResult};
 use super::render::render_ui;
 
@@ -273,7 +275,11 @@ struct ScheduleMetrics {
 
 #[cfg(test)]
 fn schedule_metrics(duration_ms: u64, streaming: bool) -> ScheduleMetrics {
-    let polls = if streaming { duration_ms / 120 } else { 0 };
+    let polls = if streaming {
+        duration_ms / CHAT_TICK_INTERVAL.as_millis() as u64
+    } else {
+        0
+    };
     ScheduleMetrics {
         // Idle mode renders only the initial frame. Streaming renders that
         // frame plus one spinner/session-update frame per tick.
