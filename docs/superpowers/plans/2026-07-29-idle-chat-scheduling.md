@@ -278,7 +278,7 @@ git diff --cached --check
 
 Expected: `Coven privacy guard passed` and no whitespace errors. Update only the completed task checkboxes in this plan before staging it.
 
-- [ ] **Step 3: Commit and deliver the issue-linked branch**
+- [x] **Step 3: Commit and deliver the issue-linked branch**
 
 Run:
 
