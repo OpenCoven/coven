@@ -378,11 +378,17 @@ export function collectCoreScenarios({ binary, iterations, env, run = runScenari
 
 export function isolatedEnvironment(covenHome, environment = process.env) {
   const userHome = join(covenHome, 'user-home');
+  const xdgConfigHome = join(userHome, '.config');
+  const xdgCacheHome = join(userHome, '.cache');
+  const xdgStateHome = join(userHome, '.local', 'state');
   return {
     ...environment,
     COVEN_HOME: covenHome,
     HOME: userHome,
-    USERPROFILE: userHome
+    USERPROFILE: userHome,
+    XDG_CONFIG_HOME: xdgConfigHome,
+    XDG_CACHE_HOME: xdgCacheHome,
+    XDG_STATE_HOME: xdgStateHome
   };
 }
 
