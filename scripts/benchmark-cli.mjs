@@ -5,6 +5,8 @@ import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
+const COMMAND_TIMEOUT_MS = 120_000;
+
 export function summarizeSamples(samples) {
   const sorted = [...samples].sort((left, right) => left - right);
   const middle = Math.floor(sorted.length / 2);
@@ -73,7 +75,12 @@ export function runScenario({ command, args, iterations, allowedExitCodes = [0],
 
   for (let iteration = 0; iteration < iterations; iteration += 1) {
     const startedAt = process.hrtime.bigint();
-    const result = spawnSync(command, args, { encoding: 'utf8', env, timeout: 120_000, killSignal: 'SIGKILL' });
+    const result = spawnSync(command, args, {
+      encoding: 'utf8',
+      env,
+      timeout: COMMAND_TIMEOUT_MS,
+      killSignal: 'SIGKILL'
+    });
     const elapsedMs = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
 
     if (result.error) {
@@ -90,8 +97,19 @@ export function runScenario({ command, args, iterations, allowedExitCodes = [0],
   return { samplesMs, exitCodes, summary: summarizeSamples(samplesMs) };
 }
 
-export function runCommand({ command, args, allowedExitCodes = [0], env }) {
-  const result = spawnSync(command, args, { encoding: 'utf8', env });
+export function runCommand({
+  command,
+  args,
+  allowedExitCodes = [0],
+  env,
+  timeoutMs = COMMAND_TIMEOUT_MS
+}) {
+  const result = spawnSync(command, args, {
+    encoding: 'utf8',
+    env,
+    timeout: timeoutMs,
+    killSignal: 'SIGKILL'
+  });
   if (result.error) {
     throw result.error;
   }

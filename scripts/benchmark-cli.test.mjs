@@ -80,6 +80,17 @@ test('parseOptions accepts an output path and explicit session fixture sizes', (
   );
 });
 
+test('parseOptions rejects a missing output path', () => {
+  assert.throws(
+    () => parseOptions(['--binary=/tmp/coven', '--output']),
+    /--output requires a path/
+  );
+  assert.throws(
+    () => parseOptions(['--binary=/tmp/coven', '--output=']),
+    /--output requires a path/
+  );
+});
+
 test('parseOptions accepts space-separated option values', () => {
   assert.deepEqual(
     parseOptions([
@@ -178,7 +189,10 @@ test('isolatedEnvironment replaces Coven and user-home paths', () => {
     PATH: '/fixture/bin',
     COVEN_HOME: '/fixture/coven-home',
     HOME: '/fixture/coven-home/user-home',
-    USERPROFILE: '/fixture/coven-home/user-home'
+    USERPROFILE: '/fixture/coven-home/user-home',
+    XDG_CONFIG_HOME: '/fixture/coven-home/user-home/.config',
+    XDG_CACHE_HOME: '/fixture/coven-home/user-home/.cache',
+    XDG_STATE_HOME: '/fixture/coven-home/user-home/.local/state'
   });
 });
 
@@ -310,6 +324,18 @@ test('runCommand includes captured stderr when a lifecycle command fails', () =>
       env: process.env
     }),
     /command exited with 7: fixture command failed/
+  );
+});
+
+test('runCommand times out hung lifecycle commands', () => {
+  assert.throws(
+    () => runCommand({
+      command: process.execPath,
+      args: ['--eval', 'setTimeout(() => {}, 10_000)'],
+      env: process.env,
+      timeoutMs: 25
+    }),
+    /ETIMEDOUT/
   );
 });
 
