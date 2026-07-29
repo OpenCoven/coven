@@ -41,6 +41,9 @@ export function parseOptions(args) {
       iterations = value;
     } else if (arg === '--output' || arg.startsWith('--output=')) {
       output = valueFor('--output');
+      if (!output) {
+        throw new Error('--output requires a path');
+      }
     } else if (arg === '--session-counts' || arg.startsWith('--session-counts=')) {
       const raw = valueFor('--session-counts');
       if (raw === 'none') {
