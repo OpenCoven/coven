@@ -230,3 +230,49 @@ pub(super) fn run_event_loop(
         app.tick();
     }
 }
+
+#[cfg(test)]
+struct ScheduleMetrics {
+    draws: u64,
+    polls: u64,
+    streaming: bool,
+}
+
+#[cfg(test)]
+fn schedule_metrics(duration_ms: u64, streaming: bool) -> ScheduleMetrics {
+    let polls = duration_ms / 100;
+    ScheduleMetrics {
+        // The current loop draws once before its first poll, then once at the
+        // top of each subsequent poll cycle.
+        draws: polls + 1,
+        polls,
+        streaming,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schedule_metrics_model_the_current_draw_before_poll_loop() {
+        let idle = schedule_metrics(10_000, false);
+        assert_eq!(idle.polls, 100);
+        assert_eq!(idle.draws, 101);
+        assert!(!idle.streaming);
+    }
+
+    #[test]
+    #[ignore]
+    fn benchmark_schedule_metrics_emit_json() {
+        let idle = schedule_metrics(10_000, false);
+        let streaming = schedule_metrics(10_000, true);
+        println!(
+            "COVEN_BENCHMARK_TUI={}",
+            serde_json::json!({
+                "idle": { "draws": idle.draws, "polls": idle.polls, "durationMs": 10_000 },
+                "streaming": { "draws": streaming.draws, "polls": streaming.polls, "durationMs": 10_000 }
+            })
+        );
+    }
+}

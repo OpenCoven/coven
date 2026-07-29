@@ -624,6 +624,24 @@ cargo run -p coven-cli -- sessions
 cargo run -p coven-cli -- daemon stop
 ```
 
+### CLI performance baselines
+
+Build the native binary first, then run the isolated benchmark fixture:
+
+```bash
+cargo build -p coven-cli --locked
+node scripts/benchmark-cli.mjs --binary target/debug/coven --iterations 3 --output /tmp/coven-perf.json
+cargo test -p coven-cli --bin coven tui::chat::events::tests::benchmark_schedule_metrics_emit_json --locked -- --ignored --nocapture
+```
+
+The runner uses a disposable `COVEN_HOME`, a fixture-only fake Codex executable,
+and the local socket API. It records command startup, daemon session-listing,
+event-tail, and harness-first-output timings without reading real configuration,
+prompts, or session logs. The ignored Rust test prints deterministic TUI
+poll/draw counters. These outputs are trend data: CI uploads them as artifacts
+and validates fixture construction, but does not fail pull requests on
+wall-clock thresholds.
+
 ### Architecture rules for contributors
 
 - **Rust is the authority layer.** Process launch, cwd/project-root validation, PTY lifecycle, session persistence, and socket request enforcement are all Rust's responsibility. TypeScript clients improve UX but are never the trust boundary.

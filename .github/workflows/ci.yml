@@ -36,6 +36,36 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --locked
 
+  performance-baseline:
+    name: CLI performance baseline
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install native link dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
+      - name: Build coven
+        run: cargo build -p coven-cli --locked
+      - name: Validate benchmark runner
+        run: node --test scripts/benchmark-cli.test.mjs
+      - name: Collect non-gating baseline artifact
+        run: node scripts/benchmark-cli.mjs --binary target/debug/coven --iterations 3 --output coven-perf.json
+      - name: Collect deterministic TUI scheduling metric
+        run: |
+          set -o pipefail
+          cargo test -p coven-cli --bin coven tui::chat::events::tests::benchmark_schedule_metrics_emit_json --locked -- --ignored --nocapture | tee coven-tui-metrics.txt
+      - name: Upload baseline artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coven-cli-performance-baseline
+          path: |
+            coven-perf.json
+            coven-tui-metrics.txt
+          if-no-files-found: error
+
   secret-guard:
     name: Secret guard
     runs-on: ubuntu-latest
