@@ -29,12 +29,22 @@
 //! layers fail closed; neither can be skipped on the daemon's only
 //! arbitrary-file write path into familiar homes (`POST /familiars/{id}/edits`).
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
+use cap_std::ambient_authority;
+#[cfg(windows)]
+use cap_std::fs::MetadataExt;
+#[cfg(unix)]
+use cap_std::fs::OpenOptionsExt;
+use cap_std::fs::{Dir, OpenOptions};
 use coven_threads_core as threads;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
 use crate::ward;
 
@@ -52,6 +62,7 @@ const PROTECTED_CHANNELS: [threads::Channel; 3] = [
 /// until the Phase 3 portability format defines the real contract hash.
 const SERIALIZATION_CONTRACT: &[u8] = b"coven-threads:serialization-contract:v0.1.0";
 const SERIALIZATION_FORMAT_VERSION: &str = "0.1.0";
+const MAX_SURFACE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// What the gate decided about a proposal, as a unit.
 #[derive(Debug)]
@@ -398,8 +409,8 @@ pub(crate) fn familiar_weave_id(familiar_id: &str) -> threads::FamiliarId {
 /// only operator-authored convention — so this function re-enforces
 /// confinement itself (fail-closed, review finding): no absolute paths, no
 /// `..`/`.` segments, no symlinks anywhere in the path (intermediate
-/// directories included), and the read is capped so a pathological
-/// declaration cannot balloon memory.
+/// directories included), opened handles are revalidated before reading, and
+/// the read is capped so a pathological declaration cannot balloon memory.
 pub(crate) fn read_surface(workspace: &Path, surface: &str) -> Result<Vec<u8>> {
     Ok(read_surface_if_exists(workspace, surface)?.unwrap_or_default())
 }
@@ -411,12 +422,10 @@ pub(crate) fn read_surface(workspace: &Path, surface: &str) -> Result<Vec<u8>> {
 /// authority weave keeps its historical absent-as-empty convention through
 /// [`read_surface`].
 pub(crate) fn read_surface_if_exists(workspace: &Path, surface: &str) -> Result<Option<Vec<u8>>> {
-    const MAX_SURFACE_BYTES: u64 = 16 * 1024 * 1024;
-
     if surface.starts_with('/') || surface.starts_with('\\') {
         anyhow::bail!("protected surface `{surface}` must be workspace-relative");
     }
-    let mut path = workspace.to_path_buf();
+    let mut components = Vec::new();
     for segment in surface.split('/').filter(|s| !s.is_empty()) {
         if segment == ".." || segment == "." || segment.contains('\\') || segment.contains(':') {
             anyhow::bail!(
@@ -424,41 +433,48 @@ pub(crate) fn read_surface_if_exists(workspace: &Path, surface: &str) -> Result<
                  declarations must stay inside the familiar workspace"
             );
         }
-        path.push(segment);
+        components.push(segment);
     }
 
-    // Intermediate symlinks: `symlink_metadata` below only protects the final
-    // component, so canonicalize the deepest *existing* ancestor and require
-    // it to stay inside the canonical workspace (second review pass finding —
-    // `linkdir/secret` with `linkdir` pointing outside must refuse).
-    let canonical_workspace = workspace
-        .canonicalize()
-        .with_context(|| format!("familiar workspace for surface `{surface}` is not resolvable"))?;
-    let mut ancestor = path.parent();
-    let deepest_existing = loop {
-        match ancestor {
-            Some(candidate) => match candidate.canonicalize() {
-                Ok(resolved) => break Some(resolved),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    ancestor = candidate.parent();
-                }
-                Err(err) => {
-                    return Err(err)
-                        .with_context(|| format!("resolving ancestor of surface `{surface}`"))
-                }
-            },
-            None => break None,
-        }
+    let mut directory = Dir::open_ambient_dir(workspace, ambient_authority())
+        .with_context(|| format!("opening familiar workspace for surface `{surface}`"))?;
+    let workspace_metadata = directory
+        .dir_metadata()
+        .with_context(|| format!("inspecting familiar workspace for surface `{surface}`"))?;
+    if !workspace_metadata.is_dir() || metadata_is_windows_reparse_point(&workspace_metadata) {
+        anyhow::bail!("familiar workspace for surface `{surface}` is not a real directory");
+    }
+
+    let Some((name, parents)) = components.split_last() else {
+        anyhow::bail!("protected surface `{surface}` must name a file");
     };
-    match deepest_existing {
-        Some(resolved) if resolved.starts_with(&canonical_workspace) => {}
-        _ => anyhow::bail!(
-            "protected surface `{surface}` resolves outside the familiar workspace \
-             (symlinked ancestor?); declarations must stay inside it"
-        ),
+    for component in parents {
+        let metadata = match directory.symlink_metadata(component) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspecting surface `{surface}`"))
+            }
+        };
+        if !metadata.is_dir() || metadata_is_windows_reparse_point(&metadata) {
+            anyhow::bail!(
+                "protected surface `{surface}` has a symlinked or non-directory ancestor"
+            );
+        }
+        directory = directory
+            .open_dir_nofollow(component)
+            .with_context(|| format!("opening ancestor of surface `{surface}`"))?;
+        let opened_metadata = directory
+            .dir_metadata()
+            .with_context(|| format!("inspecting opened ancestor of surface `{surface}`"))?;
+        if !opened_metadata.is_dir() || metadata_is_windows_reparse_point(&opened_metadata) {
+            anyhow::bail!(
+                "protected surface `{surface}` has a symlinked or non-directory ancestor"
+            );
+        }
     }
 
-    let metadata = match std::fs::symlink_metadata(&path) {
+    let metadata = match directory.symlink_metadata(name) {
         Ok(metadata) => metadata,
         // An absent protected file baselines as empty: creating it later is
         // drift like any other content change.
@@ -475,9 +491,47 @@ pub(crate) fn read_surface_if_exists(workspace: &Path, surface: &str) -> Result<
             "protected surface `{surface}` exceeds the {MAX_SURFACE_BYTES}-byte baseline cap"
         );
     }
-    std::fs::read(&path)
-        .map(Some)
-        .with_context(|| format!("reading surface `{surface}`"))
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .follow(FollowSymlinks::No)
+        .maybe_dir(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK);
+    let file = directory
+        .open_with(name, &options)
+        .with_context(|| format!("opening surface `{surface}`"))?;
+    let opened_metadata = file
+        .metadata()
+        .with_context(|| format!("inspecting opened surface `{surface}`"))?;
+    if !opened_metadata.is_file() || metadata_is_windows_reparse_point(&opened_metadata) {
+        anyhow::bail!("protected surface `{surface}` is not a regular file inside the workspace");
+    }
+    if opened_metadata.len() > MAX_SURFACE_BYTES {
+        anyhow::bail!(
+            "protected surface `{surface}` exceeds the {MAX_SURFACE_BYTES}-byte baseline cap"
+        );
+    }
+    let mut bytes = Vec::with_capacity(opened_metadata.len().min(MAX_SURFACE_BYTES) as usize);
+    file.take(MAX_SURFACE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading surface `{surface}`"))?;
+    if bytes.len() as u64 > MAX_SURFACE_BYTES {
+        anyhow::bail!(
+            "protected surface `{surface}` exceeds the {MAX_SURFACE_BYTES}-byte baseline cap"
+        );
+    }
+    Ok(Some(bytes))
+}
+
+#[cfg(windows)]
+fn metadata_is_windows_reparse_point(metadata: &cap_std::fs::Metadata) -> bool {
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_windows_reparse_point(_metadata: &cap_std::fs::Metadata) -> bool {
+    false
 }
 
 fn load_or_create_manifest_id(conn: &Connection, familiar_id: &str) -> Result<threads::ManifestId> {
@@ -1363,6 +1417,61 @@ tier = 0
 
     #[cfg(unix)]
     #[test]
+    fn special_file_surface_is_refused_without_opening_it() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let f = fixture();
+        let fifo = f.workspace.join("events.fifo");
+        let fifo = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+        let err = read_surface_if_exists(&f.workspace, "events.fifo")
+            .expect_err("a FIFO must refuse before attempting a read");
+        assert!(format!("{err:#}").contains("not a regular file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_surface_replacement_never_reads_outside_the_workspace() {
+        let f = fixture();
+        let surface = f.workspace.join("REVIEWED.md");
+        let parked = f.workspace.join("REVIEWED.parked");
+        let outside = f.coven_home.join("outside-secret.txt");
+        std::fs::write(&surface, b"inside").unwrap();
+        std::fs::write(&outside, b"outside-secret").unwrap();
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..250 {
+                    if std::fs::rename(&surface, &parked).is_ok() {
+                        let _ = std::os::unix::fs::symlink(&outside, &surface);
+                        let _ = std::fs::remove_file(&surface);
+                        let _ = std::fs::rename(&parked, &surface);
+                    }
+                }
+            });
+
+            for _ in 0..250 {
+                if let Ok(Some(bytes)) = read_surface_if_exists(&f.workspace, "REVIEWED.md") {
+                    assert_eq!(bytes, b"inside");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn surface_read_is_bounded_to_the_baseline_cap() {
+        let f = fixture();
+        let bytes = vec![b'x'; MAX_SURFACE_BYTES as usize + 1];
+        std::fs::write(f.workspace.join("large.md"), bytes).unwrap();
+
+        let err = read_surface_if_exists(&f.workspace, "large.md")
+            .expect_err("an oversized surface must refuse");
+        assert!(format!("{err:#}").contains("baseline cap"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn surface_read_errors_name_only_the_logical_surface() {
         let f = fixture();
         let missing_workspace = f.workspace.join("missing-workspace");
@@ -1431,7 +1540,7 @@ tier = 0
         )
         .expect_err("symlinked ancestor must refuse");
         assert!(
-            format!("{err:#}").contains("resolves outside"),
+            format!("{err:#}").contains("symlinked or non-directory ancestor"),
             "error should name the escape: {err:#}"
         );
     }

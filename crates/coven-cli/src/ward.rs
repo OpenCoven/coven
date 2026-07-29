@@ -93,6 +93,7 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
+use unicode_casefold::UnicodeCaseFold;
 use unicode_normalization::UnicodeNormalization;
 
 /// Trust tier of a path within a familiar's surface.
@@ -2154,7 +2155,7 @@ fn to_forward_slashes(path: &Path) -> String {
 /// a case-sensitive checkout. Rejecting them everywhere keeps staged evidence
 /// portable and follows the Ward's existing case-insensitive collision posture.
 pub(crate) fn portable_surface_key(surface: &str) -> String {
-    surface.chars().flat_map(char::to_lowercase).nfc().collect()
+    surface.chars().case_fold().nfc().collect()
 }
 
 #[cfg(test)]
@@ -3510,5 +3511,13 @@ formatter = "lenient"
         let audit = report.audit_records().next().unwrap();
         assert_eq!(audit.prev_sha256, Some(sha256_hex(b"old")));
         assert_eq!(audit.next_sha256, sha256_hex(b"new"));
+    }
+
+    #[test]
+    fn portable_surface_key_uses_full_unicode_case_folding() {
+        assert_eq!(
+            portable_surface_key("reviewed/stra\u{00df}e.md"),
+            portable_surface_key("reviewed/STRASSE.md")
+        );
     }
 }
