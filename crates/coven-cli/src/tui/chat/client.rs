@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::{
-    api::{EventsResponse, HealthResponse, COVEN_API_NAMED_VERSION},
+    api::{EventsResponse, HealthResponse, SessionPageResponse, COVEN_API_NAMED_VERSION},
     current_timestamp, daemon, harness, store, STORE_FILE_NAME,
 };
 
@@ -272,7 +272,9 @@ impl ChatClient for DaemonChatClient {
     }
 
     fn list_sessions(&mut self) -> Result<Vec<store::SessionRecord>> {
-        self.request_json("GET", "/api/v1/sessions", None)
+        let page: SessionPageResponse =
+            self.request_json("GET", "/api/v1/sessions?limit=100", None)?;
+        Ok(page.sessions)
     }
 
     fn list_events(&mut self, query: ChatEventQuery<'_>) -> Result<Vec<store::EventRecord>> {

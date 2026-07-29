@@ -164,6 +164,12 @@ pub struct EventsResponse {
     pub has_more: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPageResponse {
+    pub sessions: Vec<store::SessionRecord>,
+    pub next_cursor: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiResponse {
     pub status: u16,
@@ -636,12 +642,7 @@ pub fn handle_request_with_runtime(
             let loop_id = path.trim_start_matches("/scheduler/loops/");
             get_scheduler_loop_state(coven_home, loop_id)
         }
-        ("GET", "/sessions") => {
-            let conn = store::open_store(&store_path(coven_home))?;
-            reap_stale_created_sessions_throttled(&conn);
-            let sessions = store::list_sessions(&conn)?;
-            json_response(200, &sessions)
-        }
+        ("GET", "/sessions") => list_sessions_response(coven_home, query),
         ("POST", "/sessions") => launch_session(coven_home, body, runtime),
         ("POST", "/sessions/external") => register_external_session(coven_home, body),
         ("POST", path) if path.starts_with("/sessions/") && path.ends_with("/complete") => {
@@ -2136,6 +2137,72 @@ struct OverviewDto {
     average_skill_score: u32,
     research_iterations: u32,
     last_research_delta: i32,
+}
+
+fn list_sessions_response(coven_home: &Path, query: Option<&str>) -> Result<ApiResponse> {
+    let query = query.unwrap_or_default();
+    let limit = query_param(query, "limit");
+    let cursor = query_param(query, "cursor");
+    let include_archived = query_param(query, "includeArchived");
+    if limit.is_none() && cursor.is_none() && include_archived.is_none() {
+        let conn = store::open_store(&store_path(coven_home))?;
+        reap_stale_created_sessions_throttled(&conn);
+        return json_response(200, &store::list_sessions(&conn)?);
+    }
+
+    let limit = match limit {
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(limit) if (1..=store::MAX_SESSION_PAGE_LIMIT).contains(&limit) => limit,
+            _ => {
+                return api_error(
+                    400,
+                    "invalid_request",
+                    "Query parameter `limit` must be an integer between 1 and 1000.",
+                    Some(json!({ "limit": raw })),
+                )
+            }
+        },
+        None => store::DEFAULT_SESSION_PAGE_LIMIT,
+    };
+    let include_archived = match include_archived {
+        Some("true") => true,
+        Some("false") | None => false,
+        Some(raw) => {
+            return api_error(
+                400,
+                "invalid_request",
+                "Query parameter `includeArchived` must be `true` or `false`.",
+                Some(json!({ "includeArchived": raw })),
+            )
+        }
+    };
+    if let Some(cursor) = cursor {
+        if let Err(error) = store::validate_session_cursor(cursor) {
+            return api_error(
+                400,
+                "invalid_request",
+                "Query parameter `cursor` is invalid.",
+                Some(json!({ "cursor": cursor, "detail": error.to_string() })),
+            );
+        }
+    }
+    let conn = store::open_store(&store_path(coven_home))?;
+    reap_stale_created_sessions_throttled(&conn);
+    let page = store::list_session_page(
+        &conn,
+        store::SessionListQuery {
+            limit,
+            cursor,
+            include_archived,
+        },
+    )?;
+    json_response(
+        200,
+        &SessionPageResponse {
+            sessions: page.sessions,
+            next_cursor: page.next_cursor,
+        },
+    )
 }
 
 fn overview_response(coven_home: &Path) -> Result<ApiResponse> {
@@ -6086,6 +6153,99 @@ pub(crate) fn json_response<T: Serialize>(status: u16, body: &T) -> Result<ApiRe
 mod tests {
     use super::*;
     use crate::project;
+
+    #[test]
+    fn sessions_endpoint_keeps_legacy_array_and_supports_cursor_pages() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let home = temp_dir.path();
+        let conn = store::open_store(&store_path(home))?;
+        for (id, created_at) in [
+            ("oldest", "2026-07-29T00:00:00Z"),
+            ("middle", "2026-07-29T01:00:00Z"),
+            ("newest", "2026-07-29T02:00:00Z"),
+        ] {
+            store::insert_session(
+                &conn,
+                &store::SessionRecord {
+                    id: id.to_string(),
+                    project_root: "/repo".to_string(),
+                    harness: "codex".to_string(),
+                    title: id.to_string(),
+                    status: "completed".to_string(),
+                    exit_code: Some(0),
+                    archived_at: None,
+                    created_at: created_at.to_string(),
+                    updated_at: created_at.to_string(),
+                    conversation_id: None,
+                    familiar_id: None,
+                    labels: Vec::new(),
+                    visibility: "private".to_string(),
+                    external: false,
+                    transcript_path: None,
+                },
+            )?;
+        }
+        drop(conn);
+
+        let legacy = handle_request("GET", "/api/v1/sessions", home, None)?;
+        let legacy: Vec<store::SessionRecord> = serde_json::from_str(&legacy.body)?;
+        assert_eq!(legacy.len(), 3);
+
+        let first = handle_request("GET", "/api/v1/sessions?limit=2", home, None)?;
+        let first: SessionPageResponse = serde_json::from_str(&first.body)?;
+        assert_eq!(
+            first
+                .sessions
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["newest", "middle"]
+        );
+        let cursor = first.next_cursor.expect("first page must continue");
+        let second = handle_request(
+            "GET",
+            &format!("/api/v1/sessions?limit=2&cursor={cursor}"),
+            home,
+            None,
+        )?;
+        let second: SessionPageResponse = serde_json::from_str(&second.body)?;
+        assert_eq!(
+            second
+                .sessions
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["oldest"]
+        );
+        assert!(second.next_cursor.is_none());
+
+        for path in [
+            "/api/v1/sessions?limit=0",
+            "/api/v1/sessions?limit=1001",
+            "/api/v1/sessions?includeArchived=yes",
+            "/api/v1/sessions?cursor=not-a-valid-cursor",
+        ] {
+            let response = handle_request("GET", path, home, None)?;
+            assert_eq!(response.status, 400, "path {path}");
+            let body: serde_json::Value = serde_json::from_str(&response.body)?;
+            assert_eq!(body["error"]["code"], "invalid_request");
+        }
+
+        let conn = store::open_store(&store_path(home))?;
+        store::archive_session(&conn, "oldest", "2026-07-29T03:00:00Z")?;
+        let included = handle_request(
+            "GET",
+            "/api/v1/sessions?limit=10&includeArchived=true",
+            home,
+            None,
+        )?;
+        assert_eq!(included.status, 200);
+        let included: SessionPageResponse = serde_json::from_str(&included.body)?;
+        assert_eq!(included.sessions.len(), 3);
+        assert_eq!(included.sessions[2].id, "oldest");
+        assert!(included.sessions[2].archived_at.is_some());
+        Ok(())
+    }
 
     #[test]
     fn builds_health_response() {

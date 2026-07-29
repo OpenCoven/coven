@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use base64::Engine;
 use chrono::{Duration, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,8 @@ use crate::{
 
 const FTS_BACKFILL_BATCH_SIZE: i64 = 1_000;
 const FTS_BACKFILL_COMPLETE_KEY: &str = "events_fts_backfill_complete";
+pub const DEFAULT_SESSION_PAGE_LIMIT: usize = 100;
+pub const MAX_SESSION_PAGE_LIMIT: usize = 1_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRecord {
@@ -1933,6 +1936,107 @@ pub fn list_sessions_including_archived(conn: &Connection) -> Result<Vec<Session
     list_sessions_with_archive_filter(conn, true)
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct SessionListQuery<'a> {
+    pub limit: usize,
+    pub cursor: Option<&'a str>,
+    pub include_archived: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPage {
+    pub sessions: Vec<SessionRecord>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SessionCursor {
+    created_at: String,
+    id: String,
+}
+
+pub fn list_session_page(conn: &Connection, query: SessionListQuery<'_>) -> Result<SessionPage> {
+    if query.limit == 0 || query.limit > MAX_SESSION_PAGE_LIMIT {
+        anyhow::bail!(
+            "session page limit must be between 1 and {MAX_SESSION_PAGE_LIMIT}, got {}",
+            query.limit
+        );
+    }
+    let cursor = query.cursor.map(decode_session_cursor).transpose()?;
+    let archive_filter = if query.include_archived {
+        ""
+    } else {
+        "WHERE archived_at IS NULL"
+    };
+    let cursor_filter = if cursor.is_some() {
+        if query.include_archived {
+            "WHERE (created_at < ?1 OR (created_at = ?1 AND id < ?2))"
+        } else {
+            "AND (created_at < ?1 OR (created_at = ?1 AND id < ?2))"
+        }
+    } else {
+        ""
+    };
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT
+                {SESSION_COLUMNS}
+            FROM sessions
+            {archive_filter}
+            {cursor_filter}
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?3"
+        ))
+        .context("failed to prepare paginated session list query")?;
+    let limit = i64::try_from(query.limit + 1).expect("bounded session page limit fits i64");
+    let mut sessions = match cursor {
+        Some(cursor) => statement
+            .query_map(
+                params![cursor.created_at, cursor.id, limit],
+                session_record_from_row,
+            )
+            .context("failed to query paginated sessions")?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("failed to read paginated sessions")?,
+        None => statement
+            .query_map(params!["", "", limit], session_record_from_row)
+            .context("failed to query paginated sessions")?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("failed to read paginated sessions")?,
+    };
+    let has_next_page = sessions.len() > query.limit;
+    sessions.truncate(query.limit);
+    let next_cursor = has_next_page
+        .then(|| sessions.last())
+        .flatten()
+        .map(encode_session_cursor)
+        .transpose()?;
+    Ok(SessionPage {
+        sessions,
+        next_cursor,
+    })
+}
+
+fn encode_session_cursor(session: &SessionRecord) -> Result<String> {
+    let cursor = SessionCursor {
+        created_at: session.created_at.clone(),
+        id: session.id.clone(),
+    };
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(&cursor).context("failed to encode session cursor")?))
+}
+
+fn decode_session_cursor(cursor: &str) -> Result<SessionCursor> {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor)
+        .context("session cursor is not valid URL-safe base64")?;
+    serde_json::from_slice(&bytes).context("session cursor is malformed")
+}
+
+pub fn validate_session_cursor(cursor: &str) -> Result<()> {
+    decode_session_cursor(cursor).map(|_| ())
+}
+
 fn list_sessions_with_archive_filter(
     conn: &Connection,
     include_archived: bool,
@@ -3281,6 +3385,113 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(ids, vec!["newer", "older"]);
+        Ok(())
+    }
+
+    #[test]
+    fn list_session_page_continues_in_created_at_and_id_order() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+        for (id, created_at) in [
+            ("oldest", "2026-04-27T06:00:00Z"),
+            ("middle-a", "2026-04-27T07:00:00Z"),
+            ("middle-b", "2026-04-27T07:00:00Z"),
+            ("newest", "2026-04-27T08:00:00Z"),
+        ] {
+            insert_session(&conn, &session_record(id, created_at))?;
+        }
+
+        let first = list_session_page(
+            &conn,
+            SessionListQuery {
+                limit: 2,
+                cursor: None,
+                include_archived: false,
+            },
+        )?;
+        assert_eq!(
+            first
+                .sessions
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["newest", "middle-b"]
+        );
+        let second = list_session_page(
+            &conn,
+            SessionListQuery {
+                limit: 2,
+                cursor: first.next_cursor.as_deref(),
+                include_archived: false,
+            },
+        )?;
+        assert_eq!(
+            second
+                .sessions
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["middle-a", "oldest"]
+        );
+        assert!(second.next_cursor.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn list_session_page_rejects_invalid_limits_and_cursors() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+
+        for limit in [0, MAX_SESSION_PAGE_LIMIT + 1] {
+            assert!(list_session_page(
+                &conn,
+                SessionListQuery {
+                    limit,
+                    cursor: None,
+                    include_archived: false,
+                },
+            )
+            .is_err());
+        }
+        assert!(list_session_page(
+            &conn,
+            SessionListQuery {
+                limit: 1,
+                cursor: Some("not-a-valid-cursor"),
+                include_archived: false,
+            },
+        )
+        .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn list_session_page_respects_archived_filter() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+        insert_session(&conn, &session_record("active", "2026-04-27T06:00:00Z"))?;
+        insert_session(&conn, &session_record("archived", "2026-04-27T07:00:00Z"))?;
+        archive_session(&conn, "archived", "2026-04-27T08:00:00Z")?;
+
+        for (include_archived, expected_ids) in
+            [(false, vec!["active"]), (true, vec!["archived", "active"])]
+        {
+            let page = list_session_page(
+                &conn,
+                SessionListQuery {
+                    limit: 10,
+                    cursor: None,
+                    include_archived,
+                },
+            )?;
+            assert_eq!(
+                page.sessions
+                    .iter()
+                    .map(|session| session.id.as_str())
+                    .collect::<Vec<_>>(),
+                expected_ids
+            );
+        }
         Ok(())
     }
 

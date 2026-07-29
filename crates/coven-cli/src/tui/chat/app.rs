@@ -21,6 +21,7 @@ use super::client::{
     ChatClient, ChatDaemonStatus, ChatEventQuery, DaemonChatClient, LaunchRequest,
 };
 use super::persistence;
+use super::render::collapse_session_overlay_indices;
 use super::settings::{self, ChatSettings, StreamingMode};
 
 // ── Data types ─────────────────────────────────────────────────────────────
@@ -225,6 +226,7 @@ pub(super) struct App {
     event_poll_paused_for_api_mismatch: bool,
     daemon_status: ChatDaemonStatus,
     pub(super) sessions: Vec<store::SessionRecord>,
+    pub(super) session_overlay_entries: Vec<(usize, usize)>,
     pub(super) show_session_overlay: bool,
     pub(super) input_history: Vec<String>,
     pub(super) history_index: Option<usize>,
@@ -463,6 +465,7 @@ impl App {
             event_poll_paused_for_api_mismatch: false,
             daemon_status,
             sessions: Vec::new(),
+            session_overlay_entries: Vec::new(),
             show_session_overlay: false,
             input_history: Vec::new(),
             history_index: None,
@@ -1556,13 +1559,21 @@ impl App {
     /// toggle, and re-sacrificing it reported "session not found").
     fn remove_session_from_list(&mut self, session_id: &str) {
         self.sessions.retain(|session| session.id != session_id);
+        self.rebuild_session_overlay_entries();
     }
 
     pub(super) fn refresh_sessions(&mut self) {
         match self.client.list_sessions() {
-            Ok(sessions) => self.sessions = sessions,
+            Ok(sessions) => {
+                self.sessions = sessions;
+                self.rebuild_session_overlay_entries();
+            }
             Err(error) => self.push_system_message(&format!("Failed to load sessions: {error}")),
         }
+    }
+
+    fn rebuild_session_overlay_entries(&mut self) {
+        self.session_overlay_entries = collapse_session_overlay_indices(&self.sessions);
     }
 
     /// The Coven home for store-backed views and exports: the app-pinned
@@ -7555,7 +7566,7 @@ mod tests {
         // A realistic long cwd previously pushed the rightmost segment off the
         // status bar; the project label must yield first so the spinner +
         // (composing) tail always survives.
-        app.project_label = "/Users/buns/Documents/GitHub/OpenCoven/coven".to_string();
+        app.project_label = "/workspace/opencoven/coven".to_string();
         app.active_session_id = Some("demo-session".to_string());
         app.is_responding = true;
         app.push_event_message(&output_event(1, "demo-session", "partial reply"));

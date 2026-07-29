@@ -535,7 +535,7 @@ export async function measureSessionLists({
       });
       reports[`sessions_${count}`] = await measure({
         socketPath,
-        path: '/api/v1/sessions',
+        path: '/api/v1/sessions?limit=100',
         iterations
       });
     } finally {

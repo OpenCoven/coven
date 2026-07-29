@@ -1037,7 +1037,6 @@ fn render_session_overlay(f: &mut Frame, app: &App, area: Rect) {
             theme::ratatui_style(DIM),
         )));
     } else {
-        let entries = collapse_sessions_by_conversation(&app.sessions);
         // Compute the composite key of the chat's active session (same
         // shape as `collapse_sessions_by_conversation` uses) so the
         // active-marker matches the same grouping a colliding
@@ -1056,11 +1055,8 @@ fn render_session_overlay(f: &mut Frame, app: &App, area: Rect) {
                     })
                 })
         });
-        for entry in entries.iter().take(10) {
-            let (rep, turn_count) = match entry {
-                SessionOverlayEntry::Group { rep, turn_count } => (*rep, *turn_count),
-                SessionOverlayEntry::Singleton { session } => (*session, 1),
-            };
+        for &(representative_index, turn_count) in app.session_overlay_entries.iter().take(10) {
+            let rep = &app.sessions[representative_index];
             // A row is "active" if the chat's active_session_id belongs
             // to it: either via shared composite `(project_root,
             // harness, conversation_id)` key (group) or matching the
@@ -1121,6 +1117,7 @@ fn render_session_overlay(f: &mut Frame, app: &App, area: Rect) {
 /// one-off `coven run`-style launches) or a group of N chat turns that all
 /// share the same conversation_id — collapsed into a single representative
 /// row so the overlay isn't flooded after a long chat.
+#[cfg(test)]
 enum SessionOverlayEntry<'a> {
     Group {
         rep: &'a crate::store::SessionRecord,
@@ -1146,13 +1143,9 @@ enum SessionOverlayEntry<'a> {
 /// same chat) and otherwise watch the overlay merge unrelated rows
 /// into a single entry. Composite key makes that misuse harmless.
 ///
-/// Runs in O(N) over `sessions` with two passes (counts + entries). Called
-/// from `render_session_overlay` per frame while the overlay is open, so
-/// the realistic cost ceiling is N×<200 (a few hundred sessions on a
-/// busy user's machine) × ~10 frames/sec — sub-millisecond per render.
-/// If `app.sessions` ever grows past O(thousands), move this behind a
-/// cache that invalidates on `refresh_sessions` instead of recomputing
-/// per frame.
+/// Test-only reference implementation of the grouping rules. Production uses
+/// the cached index form below, rebuilt when `App::sessions` changes.
+#[cfg(test)]
 fn collapse_sessions_by_conversation(
     sessions: &[crate::store::SessionRecord],
 ) -> Vec<SessionOverlayEntry<'_>> {
@@ -1186,6 +1179,38 @@ fn collapse_sessions_by_conversation(
                 }
             }
             None => entries.push(SessionOverlayEntry::Singleton { session }),
+        }
+    }
+    entries
+}
+
+pub(super) fn collapse_session_overlay_indices(
+    sessions: &[crate::store::SessionRecord],
+) -> Vec<(usize, usize)> {
+    use std::collections::{HashMap, HashSet};
+    type GroupKey<'a> = (&'a str, &'a str, &'a str);
+    fn key_of(session: &crate::store::SessionRecord) -> Option<GroupKey<'_>> {
+        session.conversation_id.as_deref().map(|conversation_id| {
+            (
+                session.project_root.as_str(),
+                session.harness.as_str(),
+                conversation_id,
+            )
+        })
+    }
+    let mut counts: HashMap<GroupKey<'_>, usize> = HashMap::new();
+    for session in sessions {
+        if let Some(key) = key_of(session) {
+            *counts.entry(key).or_insert(0) += 1;
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut entries = Vec::new();
+    for (index, session) in sessions.iter().enumerate() {
+        match key_of(session) {
+            Some(key) if seen.insert(key) => entries.push((index, counts[&key])),
+            Some(_) => {}
+            None => entries.push((index, 1)),
         }
     }
     entries
@@ -1711,6 +1736,23 @@ mod tests {
     }
 
     #[test]
+    fn cached_overlay_entries_bound_ten_thousand_session_history() {
+        let sessions = (0..10_000)
+            .map(|index| {
+                make_session(
+                    &format!("turn-{index}"),
+                    Some(&format!("conversation-{}", index % 100)),
+                    "chat turn",
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let entries = collapse_session_overlay_indices(&sessions);
+        assert_eq!(entries.len(), 100);
+        assert!(entries.iter().all(|&(_, turns)| turns == 100));
+    }
+
+    #[test]
     fn collapse_sessions_groups_consecutive_same_conversation_into_one_entry() {
         let sessions = vec![
             make_session("turn-3", Some("conv-a"), "third"),
@@ -1718,6 +1760,7 @@ mod tests {
             make_session("turn-1", Some("conv-a"), "first"),
         ];
         let entries = collapse_sessions_by_conversation(&sessions);
+        assert_eq!(collapse_session_overlay_indices(&sessions), vec![(0, 3)]);
         assert_eq!(entries.len(), 1);
         match &entries[0] {
             SessionOverlayEntry::Group { rep, turn_count } => {
@@ -1735,6 +1778,10 @@ mod tests {
             make_session("solo-1", None, "free-running task 1"),
         ];
         let entries = collapse_sessions_by_conversation(&sessions);
+        assert_eq!(
+            collapse_session_overlay_indices(&sessions),
+            vec![(0, 1), (1, 1)]
+        );
         assert_eq!(entries.len(), 2);
         for entry in &entries {
             assert!(matches!(entry, SessionOverlayEntry::Singleton { .. }));

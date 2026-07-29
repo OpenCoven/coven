@@ -473,12 +473,15 @@ test('measureSessionLists isolates every requested fixture size', async () => {
     },
     seed: async ({ count, socketPath, concurrency }) =>
       calls.push(['seed', count, socketPath, concurrency]),
-    measure: async ({ socketPath }) => ({
-      samplesMs: [1],
-      statusCodes: [200],
-      summary: { minMs: 1 },
-      socketPath
-    }),
+    measure: async ({ socketPath, path }) => {
+      calls.push(['measure', socketPath, path]);
+      return {
+        samplesMs: [1],
+        statusCodes: [200],
+        summary: { minMs: 1 },
+        socketPath
+      };
+    },
     stop: ({ covenHome }) => calls.push(['stop', covenHome])
   });
 
@@ -487,10 +490,12 @@ test('measureSessionLists isolates every requested fixture size', async () => {
     ['mkdir', '/fixture/root/s-2/user-home'],
     ['start', '/fixture/root/s-2', '/fixture/root/s-2'],
     ['seed', 2, '/fixture/root/s-2/coven.sock', 2],
+    ['measure', '/fixture/root/s-2/coven.sock', '/api/v1/sessions?limit=100'],
     ['stop', '/fixture/root/s-2'],
     ['mkdir', '/fixture/root/s-3/user-home'],
     ['start', '/fixture/root/s-3', '/fixture/root/s-3'],
     ['seed', 3, '/fixture/root/s-3/coven.sock', 2],
+    ['measure', '/fixture/root/s-3/coven.sock', '/api/v1/sessions?limit=100'],
     ['stop', '/fixture/root/s-3']
   ]);
 });
