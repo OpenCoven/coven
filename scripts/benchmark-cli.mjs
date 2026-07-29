@@ -70,7 +70,7 @@ export function runScenario({ command, args, iterations, allowedExitCodes = [0],
 
   for (let iteration = 0; iteration < iterations; iteration += 1) {
     const startedAt = process.hrtime.bigint();
-    const result = spawnSync(command, args, { encoding: 'utf8', env });
+    const result = spawnSync(command, args, { encoding: 'utf8', env, timeout: 120_000, killSignal: 'SIGKILL' });
     const elapsedMs = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
 
     if (result.error) {
