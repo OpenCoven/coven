@@ -136,6 +136,7 @@ fn get_or_refresh(
     // concurrent refreshes may duplicate work, but readers retain access to a
     // complete prior snapshot throughout either scan.
     let response = build();
+    let built_at = Instant::now();
     cache()
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -143,7 +144,7 @@ fn get_or_refresh(
             key,
             CapabilitySnapshot {
                 response: response.clone(),
-                built_at: Instant::now(),
+                built_at,
             },
         );
     response
@@ -987,6 +988,32 @@ mod tests {
         release_tx.send(()).unwrap();
         reader.join().unwrap();
         assert_eq!(refresh.join().unwrap().scanned_at, "refreshed");
+    }
+
+    #[test]
+    fn snapshot_ttl_starts_when_discovery_finishes() {
+        let _serial = cache_test_lock().lock().unwrap();
+        clear_cache_for_tests();
+        let key = CacheKey::new(PathBuf::from("/coven"), PathBuf::from("/harness"));
+
+        let write_guard = cache().write().unwrap();
+        let (built_tx, built_rx) = mpsc::channel();
+        let refresh_key = key.clone();
+        let refresh = std::thread::spawn(move || {
+            get_or_refresh(refresh_key, true, || {
+                built_tx.send(()).unwrap();
+                fixture_response("refreshed")
+            })
+        });
+        built_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        let lock_released_at = Instant::now();
+        drop(write_guard);
+        refresh.join().unwrap();
+
+        let snapshot = cache().read().unwrap().get(&key).cloned().unwrap();
+        assert!(snapshot.built_at <= lock_released_at);
     }
 
     #[test]
