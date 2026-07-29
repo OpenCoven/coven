@@ -119,6 +119,17 @@ test('parseOptions accepts none as a core-only session fixture mode', () => {
   );
 });
 
+test('parseOptions rejects a missing session fixture size', () => {
+  assert.throws(
+    () => parseOptions(['--binary=/tmp/coven', '--session-counts']),
+    /--session-counts requires a value/
+  );
+  assert.throws(
+    () => parseOptions(['--binary=/tmp/coven', '--session-counts=']),
+    /--session-counts requires a value/
+  );
+});
+
 test('buildReport omits the local binary path and fixture home', () => {
   const report = buildReport({
     binary: '/private/tmp/coven',
@@ -701,7 +712,8 @@ test('waitForOutputEvent resolves only after an output event is recorded', async
       return {
         statusCode: 200,
         body: JSON.stringify({
-          events: reads === 2 ? [{ kind: 'output' }] : [{ kind: 'exit' }]
+          events: reads === 2 ? [{ kind: 'output' }] : [{ kind: 'exit' }],
+          nextCursor: { afterSeq: reads * 10 }
         })
       };
     }
@@ -709,7 +721,7 @@ test('waitForOutputEvent resolves only after an output event is recorded', async
 
   assert.deepEqual(paths, [
     '/api/v1/sessions/session-1/events?limit=1',
-    '/api/v1/sessions/session-1/events?limit=1'
+    '/api/v1/sessions/session-1/events?afterSeq=10&limit=1'
   ]);
 });
 

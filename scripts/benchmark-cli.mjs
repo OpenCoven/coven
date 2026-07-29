@@ -48,6 +48,9 @@ export function parseOptions(args) {
       }
     } else if (arg === '--session-counts' || arg.startsWith('--session-counts=')) {
       const raw = valueFor('--session-counts');
+      if (!raw) {
+        throw new Error('--session-counts requires a value');
+      }
       if (raw === 'none') {
         sessionCounts = [];
       } else {
@@ -224,16 +227,25 @@ export async function waitForOutputEvent(
   { attempts, delayMs, request = socketRequest }
 ) {
   let lastError;
-  const path = `/api/v1/sessions/${sessionId}/events?limit=1`;
+  let afterSeq;
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
+      const cursor = afterSeq === undefined ? '' : `afterSeq=${afterSeq}&`;
+      const path = `/api/v1/sessions/${sessionId}/events?${cursor}limit=1`;
       const response = await request(socketPath, { method: 'GET', path });
-      const body = JSON.parse(response.body);
-      if (response.statusCode === 200 && body.events?.some((event) => event.kind === 'output')) {
-        return;
+      if (response.statusCode !== 200) {
+        lastError = new Error(`events returned ${response.statusCode}`);
+      } else {
+        const body = JSON.parse(response.body);
+        if (body.events?.some((event) => event.kind === 'output')) {
+          return;
+        }
+        if (Number.isInteger(body.nextCursor?.afterSeq)) {
+          afterSeq = body.nextCursor.afterSeq;
+        }
+        lastError = new Error('no output event yet');
       }
-      lastError = new Error(`events returned ${response.statusCode}`);
     } catch (error) {
       lastError = error;
     }
