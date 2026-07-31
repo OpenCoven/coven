@@ -115,6 +115,7 @@ step('onboarding, PR readiness, and publish guardrails', () => {
   run('node', [
     '--test',
     'scripts/onboarding-docs-test.mjs',
+    'scripts/cli-docs-test.mjs',
     'scripts/pr-readiness-test.mjs',
     'scripts/publish-npm-test.mjs'
   ]);
