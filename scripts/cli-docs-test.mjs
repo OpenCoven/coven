@@ -41,6 +41,62 @@ function escaped(phrase) {
   return phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+function assertNotStub(text, path) {
+  assert.doesNotMatch(text, /^Stub\s+(?:--|—)\s+fill in\b/im, `${path} must not be a stub`);
+}
+
+test('CLI docs guard rejects ASCII and em-dash stub markers', () => {
+  for (const stub of ['Stub -- fill in.', 'Stub — fill in. Add the command details here.']) {
+    assert.throws(() => assertNotStub(stub, 'fixture'), /fixture must not be a stub/);
+  }
+});
+
+test('run permission policy is listed in both CLI references', () => {
+  const commandReference = readRepoFile('docs/reference/cli.md');
+  const runReference = readRepoFile('docs/reference/cli-run.md');
+
+  assert.match(commandReference, /--permission <full\\\|read-only>/);
+  assert.match(runReference, /--permission <full\\\|read-only>/);
+});
+
+test('command ownership uses fully-qualified Coven commands', () => {
+  const developerGuide = readRepoFile('docs/development/cli-core-functionality.md');
+
+  for (const command of [
+    'coven attach',
+    'coven archive',
+    'coven summon',
+    'coven sacrifice',
+    'coven kill',
+    'coven status',
+    'coven familiars',
+    'coven skills',
+    'coven memory',
+    'coven research',
+    'coven calls',
+    'coven hub',
+    'coven scheduler',
+    'coven travel',
+    'coven wt',
+    'coven claim',
+    'coven hooks',
+    'coven patch',
+    'coven pc',
+    'coven logs',
+    'coven vacuum'
+  ]) {
+    assert.match(developerGuide, new RegExp(escaped(command)), `command ownership must include ${command}`);
+  }
+});
+
+test('parallel-work guide uses issue-keyed claim tokens', () => {
+  const guide = readRepoFile('docs/guides/multi-agent-worktrees.md');
+
+  for (const action of ['acquire', 'heartbeat', 'release']) {
+    assert.match(guide, new RegExp(`coven claim ${action} issue-<N>`));
+  }
+});
+
 test('prepublish smoke runs the CLI docs discovery guard', () => {
   const prepublish = readRepoFile('scripts/test-cli-prepublish.mjs');
   assert.match(prepublish, /scripts\/cli-docs-test\.mjs/);
@@ -53,14 +109,14 @@ test('core CLI docs are discoverable from the README and guide index', () => {
   assert.match(readme, /docs\/reference\/cli-coven\.md/);
 
   const topLevelCli = readRepoFile('docs/reference/cli-coven.md');
-  assert.doesNotMatch(topLevelCli, /^Stub -- fill in\.?$/m);
+  assertNotStub(topLevelCli, 'docs/reference/cli-coven.md');
   assert.match(topLevelCli, /## Usage/);
   assert.match(topLevelCli, /## Related/);
   assert.match(topLevelCli, /coven chat/);
 
   for (const { path, required } of coreGuideDocs) {
     const text = readRepoFile(path);
-    assert.doesNotMatch(text, /^Stub -- fill in\.?$/m, `${path} must not be a stub`);
+    assertNotStub(text, path);
     assert.match(text, /## Related/, `${path} must link next steps`);
     for (const phrase of required) {
       assert.match(text, new RegExp(escaped(phrase), 'i'), `${path} must mention ${phrase}`);

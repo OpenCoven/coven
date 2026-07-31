@@ -32,14 +32,14 @@ The printed path is designed for command substitution. Use a task-specific branc
 ## 3. Acquire and maintain ownership
 
 ```sh
-coven claim acquire docs-cli-core-guides
-coven claim heartbeat docs-cli-core-guides
+coven claim acquire issue-<N>
+coven claim heartbeat issue-<N>
 ```
 
 Claims are TTL-bounded. Heartbeat a long-running task before the claim expires. Release it from the same worktree after the pull request merges or when you stop:
 
 ```sh
-coven claim release docs-cli-core-guides
+coven claim release issue-<N>
 ```
 
 ## 4. Install managed hooks when the repository uses them

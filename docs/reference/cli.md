@@ -126,7 +126,7 @@ flowchart TB
 
 | Command | Flags |
 |---|---|
-| `coven run` | `--cwd <path>`, `--title <text>`, `--detach`, `--model <id>`, `--think`, `--speed fast\|balanced\|thorough` |
+| `coven run` | `--cwd <path>`, `--title <text>`, `--detach`, `--model <id>`, `--permission <full\|read-only>`, `--think`, `--speed fast\|balanced\|thorough` |
 | `coven doctor` | `--json` |
 | `coven daemon status` | `--json` |
 | `coven sessions` | `--plain`, `--json`, `--all`, `--manage` |

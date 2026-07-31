@@ -32,10 +32,10 @@ Do not call the CLI healthy merely because `--help` renders. A healthy core path
 | Check local readiness | `coven doctor [--json]` | `main.rs`, `harness.rs`, `paths.rs`, `daemon.rs` | Human output gives repair hints; JSON stays a single machine-readable document. |
 | Control the daemon | `coven daemon start/status/restart/stop` | `daemon.rs`, `api.rs`, `paths.rs` | One same-user local daemon owns the socket and state directory. |
 | Launch work | `coven run <harness> <prompt>` | `session_launch.rs`, `harness.rs`, `pty_runner.rs`, `store.rs` | Validate project root and cwd in Rust, construct argv safely, then record session/events. |
-| Inspect and manage history | `coven sessions`, `attach`, `archive`, `summon`, `sacrifice`, `kill` | `store.rs`, `daemon.rs`, `tui/` | Archive is reversible; sacrifice and other destructive actions keep explicit confirmation. |
-| Read runtime state | `status`, `familiars`, `skills`, `memory`, `research`, `calls`, `hub`, `scheduler`, `travel` | `observe.rs`, `hub.rs`, `control_plane.rs` | Read surfaces do not silently become write paths. |
-| Coordinate parallel work | `wt`, `claim`, `hooks` | `parallel_protocol.rs` | Claims are shared through git's common directory and remain TTL-bounded. |
-| Repair or diagnose a machine | `patch`, `pc`, `logs`, `vacuum` | `patch.rs`, `pc.rs`, `store.rs` | Keep inspection separate from explicit write/repair confirmation. |
+| Inspect and manage history | `coven sessions`, `coven attach`, `coven archive`, `coven summon`, `coven sacrifice`, `coven kill` | `store.rs`, `daemon.rs`, `tui/` | Archive is reversible; sacrifice and other destructive actions keep explicit confirmation. |
+| Read runtime state | `coven status`, `coven familiars`, `coven skills`, `coven memory`, `coven research`, `coven calls`, `coven hub`, `coven scheduler`, `coven travel` | `observe.rs`, `hub.rs`, `control_plane.rs` | Read surfaces do not silently become write paths. |
+| Coordinate parallel work | `coven wt`, `coven claim`, `coven hooks` | `parallel_protocol.rs` | Claims are shared through git's common directory and remain TTL-bounded. |
+| Repair or diagnose a machine | `coven patch`, `coven pc`, `coven logs`, `coven vacuum` | `patch.rs`, `pc.rs`, `store.rs` | Keep inspection separate from explicit write/repair confirmation. |
 
 `main.rs` is the authoritative parser and dispatch map. When a command changes, start there and follow its delegated module before changing documentation.
 
