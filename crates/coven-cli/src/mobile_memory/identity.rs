@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{self, BufReader};
+use std::io;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -8,6 +8,7 @@ use base64::Engine;
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 use p256::pkcs8::DecodePrivateKey;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
+use rustls_pki_types::{pem::PemObject, CertificateDer};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -186,8 +187,7 @@ fn load_stored_certificate(
         bail!("mobile host identity does not match the private key");
     }
 
-    let mut reader = BufReader::new(stored.certificate_pem.as_bytes());
-    let certificates = rustls_pemfile::certs(&mut reader)
+    let certificates = CertificateDer::pem_slice_iter(stored.certificate_pem.as_bytes())
         .collect::<std::result::Result<Vec<_>, _>>()
         .context("mobile host certificate PEM is invalid")?;
     if certificates.len() != 1 {
