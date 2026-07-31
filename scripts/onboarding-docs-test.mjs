@@ -76,6 +76,37 @@ const platformDocs = [
   }
 ];
 
+const coreGuideDocs = [
+  {
+    path: 'docs/development/cli-core-functionality.md',
+    required: ['Command ownership', 'Access contract', 'coven doctor --json', 'coven daemon status --json']
+  },
+  {
+    path: 'docs/guides/index.md',
+    required: ['/guides/core-access', '/guides/session-operations', '/guides/automation-json', '/guides/multi-agent-worktrees', '/guides/troubleshooting-core-access']
+  },
+  {
+    path: 'docs/guides/core-access.md',
+    required: ['coven doctor', 'coven daemon start', 'coven run codex', 'coven sessions']
+  },
+  {
+    path: 'docs/guides/session-operations.md',
+    required: ['coven sessions --plain', 'coven attach', 'coven archive', 'coven sacrifice']
+  },
+  {
+    path: 'docs/guides/automation-json.md',
+    required: ['coven doctor --json', 'coven daemon status --json', 'coven sessions --json']
+  },
+  {
+    path: 'docs/guides/multi-agent-worktrees.md',
+    required: ['coven wt', 'coven claim acquire', 'coven hooks install']
+  },
+  {
+    path: 'docs/guides/troubleshooting-core-access.md',
+    required: ['COVEN_HOME', 'coven daemon status', 'coven doctor']
+  }
+];
+
 function readRepoFile(path) {
   return readFileSync(new URL(`../${path}`, import.meta.url), 'utf8');
 }
@@ -113,6 +144,28 @@ test('session command reference docs are actionable after onboarding', () => {
     assert.match(text, /## Usage/, `${path} must include usage`);
     assert.match(text, /## Related/, `${path} must link next steps`);
     assert.ok(text.length > 900, `${path} must include practical command guidance`);
+    for (const phrase of required) {
+      assert.match(text, new RegExp(phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'), `${path} must mention ${phrase}`);
+    }
+  }
+});
+
+test('core CLI docs are discoverable from the README and guide index', () => {
+  const readme = readRepoFile('README.md');
+  assert.match(readme, /docs\/development\/cli-core-functionality\.md/);
+  assert.match(readme, /docs\/guides\/index\.md/);
+  assert.match(readme, /docs\/reference\/cli-coven\.md/);
+
+  const topLevelCli = readRepoFile('docs/reference/cli-coven.md');
+  assert.doesNotMatch(topLevelCli, /^Stub -- fill in\.?$/m);
+  assert.match(topLevelCli, /## Usage/);
+  assert.match(topLevelCli, /## Related/);
+  assert.match(topLevelCli, /coven chat/);
+
+  for (const { path, required } of coreGuideDocs) {
+    const text = readRepoFile(path);
+    assert.doesNotMatch(text, /^Stub -- fill in\.?$/m, `${path} must not be a stub`);
+    assert.match(text, /## Related/, `${path} must link next steps`);
     for (const phrase of required) {
       assert.match(text, new RegExp(phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'), `${path} must mention ${phrase}`);
     }

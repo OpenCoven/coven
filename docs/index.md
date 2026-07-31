@@ -33,6 +33,9 @@ description: "Coven powers CastCodes with local-first project-scoped harness ses
   <Card title="CLI reference" href="/reference/cli" icon="terminal">
     Core verbs — doctor, daemon, run, sessions, attach — plus the archive, summon, and sacrifice rituals and the rest of the command surface.
   </Card>
+  <Card title="Workflow guides" href="/guides" icon="book-open">
+    Runnable paths for core access, session operations, JSON automation, parallel work, and diagnostics.
+  </Card>
 </Columns>
 
 ## What is Coven?

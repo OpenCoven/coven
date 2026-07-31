@@ -481,6 +481,9 @@ comux is a standalone terminal cockpit that proved the tmux-cockpit model for pa
 
 | Document                                                | What it covers                                                        |
 | ------------------------------------------------------- | --------------------------------------------------------------------- |
+| [CLI core functionality for developers](docs/development/cli-core-functionality.md) | Command ownership, core-access contract, source map, and maintainer verification loop |
+| [Workflow guides](docs/guides/index.md)                | Runnable examples for core access, session operations, JSON automation, worktrees, and troubleshooting |
+| [Top-level `coven` command](docs/reference/cli-coven.md) | Interactive entry point, free-text task routing, global flags, and command discovery |
 | [Getting started](docs/GETTING-STARTED.md)              | Full install → first session walkthrough                              |
 | [Concepts](docs/CONCEPTS.md)                            | Definitions: harness, session, project, ritual, daemon, store, client |
 | [Glossary](docs/GLOSSARY.md)                            | Term definitions for the full OpenCoven ecosystem                     |

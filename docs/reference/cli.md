@@ -214,6 +214,8 @@ Current builds return `0` for success and a non-zero error for failed CLI execut
 ## Related
 
 - [Getting started](/GETTING-STARTED)
+- [Workflow guides](/guides)
+- [Developer core-functionality guide](/development/cli-core-functionality)
 - [Coven TUI](/start/coven-tui)
 - [Session lifecycle](/SESSION-LIFECYCLE)
 - [Harness adapter guide](/HARNESS-ADAPTERS)
