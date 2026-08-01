@@ -71,7 +71,13 @@ were already committed to an active pull request:
 - `git status --short --branch`
 - the base and head commit identifiers
 - tracked working-tree and index patches
-- copies of untracked files with their relative paths
+- a private NUL-delimited `.untracked.zlist` plus JSON-escaped untracked
+  evidence derived from that inventory
+- an uncompressed `untracked.tar` created from the source worktree with
+  `tar --null -T` so newline pathnames, symlink entries, and file metadata are
+  preserved losslessly
+- a private NUL-delimited `.ignored.zlist` plus JSON-escaped ignored evidence
+  derived from that inventory, without archiving ignored content itself
 
 For each orphan branch, create a Git bundle or equivalent ref-preserving
 archive and record its commits relative to current `origin/main`.
@@ -79,7 +85,9 @@ archive and record its commits relative to current `origin/main`.
 Reruns therefore create a new current run while every prior run remains
 immutable under the archive directory. Snapshots remain until the corresponding
 pull request is open and its source branch is pushed, or until the work is
-explicitly recorded as blocked.
+explicitly recorded as blocked. Snapshot completeness validates the
+NUL-delimited inventories, their JSON evidence, and the uncompressed untracked
+tar archives, including valid empty inventories.
 
 ### 2. Classify against current authority
 
@@ -121,19 +129,21 @@ PR by commits can still be adopted safely.
 For dirty-worktree sources, successful identity and ancestry verification is
 still not enough to adopt the existing PR. The recovery must next inspect the
 preserved snapshot's `worktree.patch`, `index.patch`, and
-`untracked-files.txt`; adoption is allowed only when all three dirty classes
+`.untracked.zlist`; adoption is allowed only when all three dirty classes
 are empty. If any preserved dirty delta remains, the row moves to `blocked`
 with evidence naming the existing PR URL, the preserved snapshot archive IDs,
 and the safe resume condition: land or reconcile that PR first, then recover
-the preserved delta from current `main` in a separate scoped track. While that
-blocker stands, the original source worktree and branch remain untouched. If
-more than one same-repo exact-source-branch pull request exists, the row moves
-directly to `blocked` with saved evidence rather than fetching or guessing. If
-the single-candidate branch fetch fails, if the PR head differs from the
-fetched branch tip, if the preserved local head is not an ancestor of the PR
-head, or if the candidate pull request fails any other identity check including
-closing or merging between list and view, the row also moves to `blocked` with
-saved evidence rather than falling through to duplicate-recovery work.
+the preserved delta from current `main` in a separate scoped track. That
+evidence cites the preserved `.untracked.zlist`, `untracked.json`, and
+`untracked.tar` alongside the tracked patch artifacts. While that blocker
+stands, the original source worktree and branch remain untouched. If more than
+one same-repo exact-source-branch pull request exists, the row moves directly
+to `blocked` with saved evidence rather than fetching or guessing. If the
+single-candidate branch fetch fails, if the PR head differs from the fetched
+branch tip, if the preserved local head is not an ancestor of the PR head, or
+if the candidate pull request fails any other identity check including closing
+or merging between list and view, the row also moves to `blocked` with saved
+evidence rather than falling through to duplicate-recovery work.
 
 Each viable concern without an adopted exact-source-branch open pull request
 receives:
@@ -162,7 +172,7 @@ For example, if the source branch `docs/psyche-specs` still has exactly one
 same-repo open pull request from that exact source when the query runs, its
 `headRefOid` matches the freshly fetched `origin/docs/psyche-specs` tip, the
 preserved local `head.txt` is equal to or an ancestor of that PR head, and the
-preserved `worktree.patch`, `index.patch`, and `untracked-files.txt` are all
+preserved `worktree.patch`, `index.patch`, and `.untracked.zlist` are all
 empty, the recovery adopts whichever PR GitHub returns at execution time
 instead of creating a duplicate issue, branch, worktree, claim, or pull
 request.
@@ -185,7 +195,14 @@ gone upstream references, and expired claims. Rows blocked because an existing
 PR already covers the preserved head while additional dirty snapshot state
 remains do not qualify for source-worktree or source-branch cleanup; those
 original sources stay in place until the blocked delta is recovered separately.
-Unrelated user changes are never discarded.
+Force-removal is also prohibited for any source worktree whose preserved
+`.ignored.zlist` is non-empty. Before any forced removal, the recovery
+regenerates the live `.untracked.zlist`, `untracked.tar`, and `.ignored.zlist`
+with the same lossless method used for the snapshot and compares them
+byte-for-byte to the preserved artifacts. Any ignored content or inventory
+drift blocks removal, records blocker evidence with a resume condition, and
+leaves the source worktree untouched. Unrelated user changes are never
+discarded.
 
 Before the final audit, the primary checkout is restored non-destructively to a
 clean `main`. If it is already on `main`, the recovery fetches `origin/main`

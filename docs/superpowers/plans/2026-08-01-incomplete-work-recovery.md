@@ -43,6 +43,25 @@
   - Private branch-ref recheck evidence for each recovered source branch,
     including missing-ref outcomes and drift blockers recorded immediately
     before each deletion command.
+- Create only when Task 8 Step 4 runs:
+  - `.git/agent-recovery/issue-541/private-retire-proof/<workstream-id>/live-head.txt`
+  - `.git/agent-recovery/issue-541/private-retire-proof/<workstream-id>/live-worktree.patch`
+  - `.git/agent-recovery/issue-541/private-retire-proof/<workstream-id>/live-index.patch`
+  - `.git/agent-recovery/issue-541/private-retire-proof/<workstream-id>/live-untracked.zlist`
+  - `.git/agent-recovery/issue-541/private-retire-proof/<workstream-id>/live-untracked.json`
+  - `.git/agent-recovery/issue-541/private-retire-proof/<workstream-id>/live-untracked.tar`
+  - `.git/agent-recovery/issue-541/private-retire-proof/<workstream-id>/live-ignored.zlist`
+  - `.git/agent-recovery/issue-541/private-retire-proof/<workstream-id>/live-ignored.json`
+  - Byte-for-byte pre-removal proof artifacts regenerated from the live source
+    worktree before any forced removal.
+- Create only when Task 4 Step 2 runs:
+  - `.git/agent-recovery/issue-541/<workstream-id>-worktree-evidence.txt`
+  - `.git/agent-recovery/issue-541/<workstream-id>-index-evidence.txt`
+  - `.git/agent-recovery/issue-541/<workstream-id>-untracked-evidence.json`
+  - `.git/agent-recovery/issue-541/<workstream-id>-ignored-evidence.json`
+  - Readable tracked-change summaries plus JSON-escaped untracked and ignored
+    inventory evidence copied from the preserved snapshots for later
+    classification and cleanup checks.
 - Create only when Task 2 Step 1 reruns after a prior current root exists:
   - `.git/agent-recovery/private/reruns/<rerun-id>/issue-541/`
   - `.git/agent-recovery/private/reruns/<rerun-id>/archive-record.txt`
@@ -60,11 +79,20 @@
 - Create: `.git/agent-recovery/issue-541/dirty/memory-promote/branch.bundle`
 - Create: `.git/agent-recovery/issue-541/dirty/mobile-memory-gateway/branch.bundle`
 - Create: `.git/agent-recovery/issue-541/dirty/pr-476-review/branch.bundle`
+- Create: `.git/agent-recovery/issue-541/dirty/<workstream-id>/.untracked.zlist`
+- Create: `.git/agent-recovery/issue-541/dirty/<workstream-id>/untracked.json`
+- Create: `.git/agent-recovery/issue-541/dirty/<workstream-id>/untracked.tar`
+- Create: `.git/agent-recovery/issue-541/dirty/<workstream-id>/.ignored.zlist`
+- Create: `.git/agent-recovery/issue-541/dirty/<workstream-id>/ignored.json`
   - Status, commit identifiers, exact branch-name marker, verified
-    `branch.bundle`, binary patches, and copied untracked files for each source
-    worktree, so committed branch history is preserved before any later source
-    branch deletion. Empty patches remain valid evidence when a formerly dirty
-    worktree is now clean because its changes were committed to an active PR.
+    `branch.bundle`, binary patches, private NUL-delimited untracked and
+    ignored inventories, JSON-escaped readable inventories, and a lossless
+    uncompressed untracked tar archive for each source worktree, so committed
+    branch history plus untracked-path content and metadata are preserved
+    before any later source branch deletion. Ignored content is inventoried but
+    never archived. Empty patches and empty inventories remain valid evidence
+    when a formerly dirty worktree is now clean because its changes were
+    committed to an active PR.
 - Create: `.git/agent-recovery/issue-541/branches/docs-universal-runtime-capability-design.bundle`
 - Create: `.git/agent-recovery/issue-541/branches/feat-npm-macos-x64.bundle`
 - Create: `.git/agent-recovery/issue-541/branches/fix-521-ward-surface-confinement.bundle`
@@ -254,7 +282,7 @@ REPO="$(cd "$COMMON_DIR/.." && pwd)"
 SOURCE="$REPO/.worktrees/docs-psyche-specs"
 DEST="$COMMON_DIR/agent-recovery/issue-541/dirty/docs-psyche-specs"
 BRANCH="$(git -C "$SOURCE" branch --show-current)"
-mkdir -p "$DEST/untracked"
+mkdir -p "$DEST"
 git -C "$SOURCE" status --short --branch > "$DEST/status.txt"
 printf '%s\n' "$BRANCH" > "$DEST/branch.txt"
 git -C "$SOURCE" rev-parse HEAD > "$DEST/head.txt"
@@ -263,12 +291,27 @@ git -C "$REPO" bundle create "$DEST/branch.bundle" "$BRANCH"
 git -C "$REPO" bundle verify "$DEST/branch.bundle"
 git -C "$SOURCE" diff --binary > "$DEST/worktree.patch"
 git -C "$SOURCE" diff --cached --binary > "$DEST/index.patch"
-git -C "$SOURCE" ls-files --others --exclude-standard > "$DEST/untracked-files.txt"
-while IFS= read -r path; do
-  test -n "$path" || continue
-  mkdir -p "$DEST/untracked/$(dirname "$path")"
-  cp -p "$SOURCE/$path" "$DEST/untracked/$path"
-done < "$DEST/untracked-files.txt"
+git -C "$SOURCE" ls-files --others --exclude-standard -z > "$DEST/.untracked.zlist"
+python3 - "$DEST/.untracked.zlist" > "$DEST/untracked.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+raw = Path(sys.argv[1]).read_bytes()
+entries = [] if not raw else raw.rstrip(b"\0").split(b"\0")
+print(json.dumps([entry.decode("utf-8", "surrogateescape") for entry in entries], indent=2))
+PY
+tar -C "$SOURCE" --null -T "$DEST/.untracked.zlist" -cf "$DEST/untracked.tar"
+git -C "$SOURCE" ls-files --others --ignored --exclude-standard -z > "$DEST/.ignored.zlist"
+python3 - "$DEST/.ignored.zlist" > "$DEST/ignored.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+raw = Path(sys.argv[1]).read_bytes()
+entries = [] if not raw else raw.rstrip(b"\0").split(b"\0")
+print(json.dumps([entry.decode("utf-8", "surrogateescape") for entry in entries], indent=2))
+PY
 printf 'docs-psyche-specs\tdirty-worktree\t%s\t%s\t%s\t%s\n' \
   "$SOURCE" \
   "$(cat "$DEST/head.txt")" \
@@ -277,12 +320,16 @@ printf 'docs-psyche-specs\tdirty-worktree\t%s\t%s\t%s\t%s\n' \
 ```
 
 Expected: `branch.bundle` verifies against `docs/psyche-specs`, preserving its
-committed history before any later branch deletion; both patch files exist; and
-any copied untracked files match only the paths listed in
-`untracked-files.txt`. If the worktree is still dirty, the patch files capture
-those changes. If the worktree is now clean because the source branch already
-backs an active PR, the patch files may be empty and `status.txt` becomes the
-evidence of that clean post-commit state.
+committed history before any later branch deletion; both patch files exist; the
+private `.untracked.zlist` and `.ignored.zlist` inventories are NUL-delimited;
+`untracked.json` and `ignored.json` are JSON-escaped readable renderings of
+those inventories; and `untracked.tar` preserves exactly the listed untracked
+entries from the source worktree without rewriting newline pathnames or symlink
+metadata. Ignored content is inventoried only and is never archived. If the
+worktree is still dirty, the patch files capture those changes. If the worktree
+is now clean because the source branch already backs an active PR, the patch
+files may be empty and `status.txt` becomes the evidence of that clean
+post-commit state.
 
 - [ ] **Step 3: Snapshot `feat-cmem-1ev-memory-promote`**
 
@@ -294,7 +341,7 @@ REPO="$(cd "$COMMON_DIR/.." && pwd)"
 SOURCE="$REPO/.worktrees/feat-cmem-1ev-memory-promote"
 DEST="$COMMON_DIR/agent-recovery/issue-541/dirty/memory-promote"
 BRANCH="$(git -C "$SOURCE" branch --show-current)"
-mkdir -p "$DEST/untracked"
+mkdir -p "$DEST"
 git -C "$SOURCE" status --short --branch > "$DEST/status.txt"
 printf '%s\n' "$BRANCH" > "$DEST/branch.txt"
 git -C "$SOURCE" rev-parse HEAD > "$DEST/head.txt"
@@ -303,12 +350,27 @@ git -C "$REPO" bundle create "$DEST/branch.bundle" "$BRANCH"
 git -C "$REPO" bundle verify "$DEST/branch.bundle"
 git -C "$SOURCE" diff --binary > "$DEST/worktree.patch"
 git -C "$SOURCE" diff --cached --binary > "$DEST/index.patch"
-git -C "$SOURCE" ls-files --others --exclude-standard > "$DEST/untracked-files.txt"
-while IFS= read -r path; do
-  test -n "$path" || continue
-  mkdir -p "$DEST/untracked/$(dirname "$path")"
-  cp -p "$SOURCE/$path" "$DEST/untracked/$path"
-done < "$DEST/untracked-files.txt"
+git -C "$SOURCE" ls-files --others --exclude-standard -z > "$DEST/.untracked.zlist"
+python3 - "$DEST/.untracked.zlist" > "$DEST/untracked.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+raw = Path(sys.argv[1]).read_bytes()
+entries = [] if not raw else raw.rstrip(b"\0").split(b"\0")
+print(json.dumps([entry.decode("utf-8", "surrogateescape") for entry in entries], indent=2))
+PY
+tar -C "$SOURCE" --null -T "$DEST/.untracked.zlist" -cf "$DEST/untracked.tar"
+git -C "$SOURCE" ls-files --others --ignored --exclude-standard -z > "$DEST/.ignored.zlist"
+python3 - "$DEST/.ignored.zlist" > "$DEST/ignored.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+raw = Path(sys.argv[1]).read_bytes()
+entries = [] if not raw else raw.rstrip(b"\0").split(b"\0")
+print(json.dumps([entry.decode("utf-8", "surrogateescape") for entry in entries], indent=2))
+PY
 ```
 
 ```bash
@@ -321,9 +383,11 @@ printf 'memory-promote\tdirty-worktree\t%s\t%s\t%s\t%s\n' \
 
 Expected: `branch.bundle` verifies against
 `feat/cmem-1ev-memory-promote`, preserving committed branch history before any
-later branch deletion, and the untracked tree includes
-`crates/coven-memory/src/promotion.rs`, `scripts/check-coven-privacy.py`, and
-`scripts/check-coven-privacy-test.py`.
+later branch deletion, and the untracked inventory plus `untracked.tar`
+preserve `crates/coven-memory/src/promotion.rs`,
+`scripts/check-coven-privacy.py`, and
+`scripts/check-coven-privacy-test.py` losslessly. Any ignored paths are
+captured only in `.ignored.zlist` and `ignored.json`.
 
 - [ ] **Step 4: Snapshot `feat/mobile-memory-gateway`**
 
@@ -335,7 +399,7 @@ REPO="$(cd "$COMMON_DIR/.." && pwd)"
 SOURCE="$REPO/.worktrees/mobile-memory-gateway"
 DEST="$COMMON_DIR/agent-recovery/issue-541/dirty/mobile-memory-gateway"
 BRANCH="$(git -C "$SOURCE" branch --show-current)"
-mkdir -p "$DEST/untracked"
+mkdir -p "$DEST"
 git -C "$SOURCE" status --short --branch > "$DEST/status.txt"
 printf '%s\n' "$BRANCH" > "$DEST/branch.txt"
 git -C "$SOURCE" rev-parse HEAD > "$DEST/head.txt"
@@ -344,12 +408,27 @@ git -C "$REPO" bundle create "$DEST/branch.bundle" "$BRANCH"
 git -C "$REPO" bundle verify "$DEST/branch.bundle"
 git -C "$SOURCE" diff --binary > "$DEST/worktree.patch"
 git -C "$SOURCE" diff --cached --binary > "$DEST/index.patch"
-git -C "$SOURCE" ls-files --others --exclude-standard > "$DEST/untracked-files.txt"
-while IFS= read -r path; do
-  test -n "$path" || continue
-  mkdir -p "$DEST/untracked/$(dirname "$path")"
-  cp -p "$SOURCE/$path" "$DEST/untracked/$path"
-done < "$DEST/untracked-files.txt"
+git -C "$SOURCE" ls-files --others --exclude-standard -z > "$DEST/.untracked.zlist"
+python3 - "$DEST/.untracked.zlist" > "$DEST/untracked.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+raw = Path(sys.argv[1]).read_bytes()
+entries = [] if not raw else raw.rstrip(b"\0").split(b"\0")
+print(json.dumps([entry.decode("utf-8", "surrogateescape") for entry in entries], indent=2))
+PY
+tar -C "$SOURCE" --null -T "$DEST/.untracked.zlist" -cf "$DEST/untracked.tar"
+git -C "$SOURCE" ls-files --others --ignored --exclude-standard -z > "$DEST/.ignored.zlist"
+python3 - "$DEST/.ignored.zlist" > "$DEST/ignored.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+raw = Path(sys.argv[1]).read_bytes()
+entries = [] if not raw else raw.rstrip(b"\0").split(b"\0")
+print(json.dumps([entry.decode("utf-8", "surrogateescape") for entry in entries], indent=2))
+PY
 ```
 
 ```bash
@@ -363,7 +442,9 @@ printf 'mobile-memory-gateway\tdirty-worktree\t%s\t%s\t%s\t%s\n' \
 Expected: `branch.bundle` verifies against `feat/mobile-memory-gateway`,
 preserving committed branch history before any later branch deletion, and
 `worktree.patch` contains the changes to
-`crates/coven-cli/src/mobile_memory/pairing.rs`.
+`crates/coven-cli/src/mobile_memory/pairing.rs`. Any untracked additions are
+captured through `.untracked.zlist`, `untracked.json`, and `untracked.tar`,
+while ignored paths remain inventory-only.
 
 - [ ] **Step 5: Snapshot `fix/476-review-threads`**
 
@@ -375,7 +456,7 @@ REPO="$(cd "$COMMON_DIR/.." && pwd)"
 SOURCE="$REPO/.worktrees/pr-476-review"
 DEST="$COMMON_DIR/agent-recovery/issue-541/dirty/pr-476-review"
 BRANCH="$(git -C "$SOURCE" branch --show-current)"
-mkdir -p "$DEST/untracked"
+mkdir -p "$DEST"
 git -C "$SOURCE" status --short --branch > "$DEST/status.txt"
 printf '%s\n' "$BRANCH" > "$DEST/branch.txt"
 git -C "$SOURCE" rev-parse HEAD > "$DEST/head.txt"
@@ -384,12 +465,27 @@ git -C "$REPO" bundle create "$DEST/branch.bundle" "$BRANCH"
 git -C "$REPO" bundle verify "$DEST/branch.bundle"
 git -C "$SOURCE" diff --binary > "$DEST/worktree.patch"
 git -C "$SOURCE" diff --cached --binary > "$DEST/index.patch"
-git -C "$SOURCE" ls-files --others --exclude-standard > "$DEST/untracked-files.txt"
-while IFS= read -r path; do
-  test -n "$path" || continue
-  mkdir -p "$DEST/untracked/$(dirname "$path")"
-  cp -p "$SOURCE/$path" "$DEST/untracked/$path"
-done < "$DEST/untracked-files.txt"
+git -C "$SOURCE" ls-files --others --exclude-standard -z > "$DEST/.untracked.zlist"
+python3 - "$DEST/.untracked.zlist" > "$DEST/untracked.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+raw = Path(sys.argv[1]).read_bytes()
+entries = [] if not raw else raw.rstrip(b"\0").split(b"\0")
+print(json.dumps([entry.decode("utf-8", "surrogateescape") for entry in entries], indent=2))
+PY
+tar -C "$SOURCE" --null -T "$DEST/.untracked.zlist" -cf "$DEST/untracked.tar"
+git -C "$SOURCE" ls-files --others --ignored --exclude-standard -z > "$DEST/.ignored.zlist"
+python3 - "$DEST/.ignored.zlist" > "$DEST/ignored.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+raw = Path(sys.argv[1]).read_bytes()
+entries = [] if not raw else raw.rstrip(b"\0").split(b"\0")
+print(json.dumps([entry.decode("utf-8", "surrogateescape") for entry in entries], indent=2))
+PY
 ```
 
 ```bash
@@ -402,7 +498,9 @@ printf 'pr-476-review\tdirty-worktree\t%s\t%s\t%s\t%s\n' \
 
 Expected: `branch.bundle` verifies against `fix/476-review-threads`,
 preserving committed branch history before any later branch deletion, and the
-untracked tree contains all three runtime parity plan files.
+untracked inventory plus `untracked.tar` contain all three runtime parity plan
+files without flattening special pathnames or symlink metadata. Any ignored
+paths remain captured only in `.ignored.zlist` and `ignored.json`.
 
 - [ ] **Step 6: Verify snapshot completeness**
 
@@ -415,6 +513,20 @@ RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
 test "$(wc -l < "$RECOVERY/manifest.tsv" | tr -d ' ')" = 5
 for id in docs-psyche-specs memory-promote mobile-memory-gateway pr-476-review; do
   SNAPSHOT="$RECOVERY/dirty/$id"
+  case "$id" in
+    docs-psyche-specs)
+      SOURCE="$REPO/.worktrees/docs-psyche-specs"
+      ;;
+    memory-promote)
+      SOURCE="$REPO/.worktrees/feat-cmem-1ev-memory-promote"
+      ;;
+    mobile-memory-gateway)
+      SOURCE="$REPO/.worktrees/mobile-memory-gateway"
+      ;;
+    pr-476-review)
+      SOURCE="$REPO/.worktrees/pr-476-review"
+      ;;
+  esac
   test -s "$SNAPSHOT/status.txt"
   test -s "$SNAPSHOT/branch.txt"
   test -s "$SNAPSHOT/head.txt"
@@ -422,21 +534,65 @@ for id in docs-psyche-specs memory-promote mobile-memory-gateway pr-476-review; 
   test -s "$SNAPSHOT/branch.bundle"
   test -f "$SNAPSHOT/worktree.patch"
   test -f "$SNAPSHOT/index.patch"
-  test -f "$SNAPSHOT/untracked-files.txt"
-  while IFS= read -r path; do
-    test -n "$path" || continue
-    test -e "$SNAPSHOT/untracked/$path"
-  done < "$SNAPSHOT/untracked-files.txt"
+  test -f "$SNAPSHOT/.untracked.zlist"
+  test -s "$SNAPSHOT/untracked.json"
+  test -f "$SNAPSHOT/untracked.tar"
+  test -f "$SNAPSHOT/.ignored.zlist"
+  test -s "$SNAPSHOT/ignored.json"
+  python3 - "$SNAPSHOT" "$SOURCE" <<'PY'
+import json
+import os
+import stat
+import sys
+import tarfile
+from pathlib import Path
+
+snapshot = Path(sys.argv[1])
+source = Path(sys.argv[2])
+
+def read_zlist(path: Path) -> list[str]:
+    raw = path.read_bytes()
+    if not raw:
+        return []
+    return [entry.decode("utf-8", "surrogateescape") for entry in raw.rstrip(b"\0").split(b"\0")]
+
+untracked = read_zlist(snapshot / ".untracked.zlist")
+if json.loads((snapshot / "untracked.json").read_text()) != untracked:
+    raise SystemExit("untracked.json does not match .untracked.zlist")
+
+with tarfile.open(snapshot / "untracked.tar") as tf:
+    members = tf.getmembers()
+    if [member.name for member in members] != untracked:
+        raise SystemExit("untracked.tar members do not match .untracked.zlist")
+    for member in members:
+        path = source / member.name
+        st = os.lstat(path)
+        if member.issym() != stat.S_ISLNK(st.st_mode):
+            raise SystemExit(f"type mismatch for {member.name}")
+        if stat.S_IMODE(st.st_mode) != stat.S_IMODE(member.mode):
+            raise SystemExit(f"mode mismatch for {member.name}")
+        if member.isfile() and st.st_size != member.size:
+            raise SystemExit(f"size mismatch for {member.name}")
+        if member.issym() and os.readlink(path) != member.linkname:
+            raise SystemExit(f"symlink target mismatch for {member.name}")
+
+ignored = read_zlist(snapshot / ".ignored.zlist")
+if json.loads((snapshot / "ignored.json").read_text()) != ignored:
+    raise SystemExit("ignored.json does not match .ignored.zlist")
+PY
   git -C "$REPO" bundle verify "$SNAPSHOT/branch.bundle" > /dev/null
 done
 ```
 
 Expected: every dirty snapshot includes status, branch, head, merge-base, both
-patches, an explicit untracked inventory, and a verified `branch.bundle`, so
-committed branch history is preserved before any later branch deletion. Empty
-worktree, index, and untracked artifact classes are valid and appear as
-existing zero-byte files; non-empty untracked inventories still verify every
-copied path, and an empty inventory passes.
+patches, private NUL-delimited untracked and ignored inventories, JSON-escaped
+readable inventory files, an uncompressed `untracked.tar`, and a verified
+`branch.bundle`, so committed branch history plus lossless untracked content
+and metadata are preserved before any later branch deletion. Empty worktree and
+index patches remain valid zero-byte files, and empty untracked or ignored
+inventories remain valid when `.untracked.zlist` or `.ignored.zlist` is empty,
+their JSON companions are `[]`, and `untracked.tar` is a readable empty
+archive.
 
 ### Task 3: Archive Every Orphan Branch
 
@@ -612,25 +768,21 @@ do
   fi
   test -f "$RECOVERY/$id-index-evidence.txt"
   test -s "$RECOVERY/$id-index-evidence.txt"
-  if test -s "$SNAPSHOT/untracked-files.txt"; then
-    cp "$SNAPSHOT/untracked-files.txt" "$RECOVERY/$id-untracked-evidence.txt"
-  else
-    printf 'No untracked files in snapshot.\n' \
-      > "$RECOVERY/$id-untracked-evidence.txt"
-  fi
-  test -f "$RECOVERY/$id-untracked-evidence.txt"
-  test -s "$RECOVERY/$id-untracked-evidence.txt"
+  cp "$SNAPSHOT/untracked.json" "$RECOVERY/$id-untracked-evidence.json"
+  test -s "$RECOVERY/$id-untracked-evidence.json"
+  cp "$SNAPSHOT/ignored.json" "$RECOVERY/$id-ignored-evidence.json"
+  test -s "$RECOVERY/$id-ignored-evidence.json"
 done
 ```
 
 Expected: the seven historical branch comparisons still provide complementary
 commit, stat, and cherry evidence, and the four dirty snapshots now each have
-reviewable worktree, index, and inventory-backed untracked evidence files, so
-branch evidence covers all seven branch-backed workstreams and dirty evidence
-complements the four dirty rows. Empty worktree, index, and untracked snapshot
-classes remain valid, but each generated evidence file is still non-empty
-because it contains either `git apply --stat --summary` output or a
-deterministic sentinel line documenting that the snapshot class was empty.
+reviewable worktree, index, untracked, and ignored evidence files, so branch
+evidence covers all seven branch-backed workstreams and dirty evidence
+complements the four dirty rows. Empty worktree and index snapshot classes
+remain valid because they emit deterministic sentinel lines, while empty
+untracked or ignored inventories remain valid because their copied JSON
+evidence files still contain readable `[]`.
 
 - [ ] **Step 3: Write the ledger with one evidence-backed row per workstream**
 
@@ -969,28 +1121,40 @@ case "$PR_COUNT" in
     if test -n "$DIRTY_SNAPSHOT_ROOT"; then
       test -f "$DIRTY_SNAPSHOT_ROOT/worktree.patch"
       test -f "$DIRTY_SNAPSHOT_ROOT/index.patch"
-      test -f "$DIRTY_SNAPSHOT_ROOT/untracked-files.txt"
+      test -f "$DIRTY_SNAPSHOT_ROOT/.untracked.zlist"
+      test -s "$DIRTY_SNAPSHOT_ROOT/untracked.json"
+      test -f "$DIRTY_SNAPSHOT_ROOT/untracked.tar"
+      test -f "$DIRTY_SNAPSHOT_ROOT/.ignored.zlist"
+      test -s "$DIRTY_SNAPSHOT_ROOT/ignored.json"
       WORKTREE_BYTES="$(wc -c < "$DIRTY_SNAPSHOT_ROOT/worktree.patch" | tr -d ' ')"
       INDEX_BYTES="$(wc -c < "$DIRTY_SNAPSHOT_ROOT/index.patch" | tr -d ' ')"
-      UNTRACKED_BYTES="$(wc -c < "$DIRTY_SNAPSHOT_ROOT/untracked-files.txt" | tr -d ' ')"
+      UNTRACKED_BYTES="$(wc -c < "$DIRTY_SNAPSHOT_ROOT/.untracked.zlist" | tr -d ' ')"
+      IGNORED_BYTES="$(wc -c < "$DIRTY_SNAPSHOT_ROOT/.ignored.zlist" | tr -d ' ')"
       DIRTY_CLASS_LIST=""
       if [ "$WORKTREE_BYTES" -gt 0 ]; then DIRTY_CLASS_LIST="worktree.patch"; fi
       if [ "$INDEX_BYTES" -gt 0 ]; then DIRTY_CLASS_LIST="${DIRTY_CLASS_LIST:+$DIRTY_CLASS_LIST, }index.patch"; fi
-      if [ "$UNTRACKED_BYTES" -gt 0 ]; then DIRTY_CLASS_LIST="${DIRTY_CLASS_LIST:+$DIRTY_CLASS_LIST, }untracked-files.txt"; fi
+      if [ "$UNTRACKED_BYTES" -gt 0 ]; then DIRTY_CLASS_LIST="${DIRTY_CLASS_LIST:+$DIRTY_CLASS_LIST, }.untracked.zlist"; fi
       {
         printf 'Preserved dirty snapshot: %s\n' "$DIRTY_SNAPSHOT_ID"
         printf 'worktree.patch bytes: %s\n' "$WORKTREE_BYTES"
         printf 'index.patch bytes: %s\n' "$INDEX_BYTES"
-        printf 'untracked-files.txt bytes: %s\n' "$UNTRACKED_BYTES"
+        printf '.untracked.zlist bytes: %s\n' "$UNTRACKED_BYTES"
+        printf 'untracked.json: %s/untracked.json\n' "$DIRTY_SNAPSHOT_ID"
+        printf 'untracked.tar: %s/untracked.tar\n' "$DIRTY_SNAPSHOT_ID"
+        printf '.ignored.zlist bytes: %s\n' "$IGNORED_BYTES"
+        printf 'ignored.json: %s/ignored.json\n' "$DIRTY_SNAPSHOT_ID"
       } >> "$PR_ADOPTION_EVIDENCE"
+      if [ "$IGNORED_BYTES" -gt 0 ]; then
+        printf 'Cleanup note: preserved ignored inventory is non-empty; Task 8 force-removal is prohibited for this source worktree.\n' >> "$PR_ADOPTION_EVIDENCE"
+      fi
       if [ -n "$DIRTY_CLASS_LIST" ]; then
         {
           printf 'Blocked %s: existing PR #%s passed identity checks, but preserved dirty delta remains.\n' \
             "$WORKSTREAM_ID" "$PR_NUMBER"
           printf 'Existing PR URL: %s\n' "$PR_URL"
           printf 'Preserved local head: %s\n' "$EXPECTED_HEAD"
-          printf 'Preserved snapshot archive IDs: %s/worktree.patch, %s/index.patch, %s/untracked-files.txt\n' \
-            "$DIRTY_SNAPSHOT_ID" "$DIRTY_SNAPSHOT_ID" "$DIRTY_SNAPSHOT_ID"
+          printf 'Preserved snapshot archive IDs: %s/worktree.patch, %s/index.patch, %s/.untracked.zlist, %s/untracked.json, %s/untracked.tar\n' \
+            "$DIRTY_SNAPSHOT_ID" "$DIRTY_SNAPSHOT_ID" "$DIRTY_SNAPSHOT_ID" "$DIRTY_SNAPSHOT_ID" "$DIRTY_SNAPSHOT_ID"
           printf 'Non-empty preserved dirty classes: %s\n' "$DIRTY_CLASS_LIST"
           printf 'Resume condition: land or reconcile PR #%s, then recover the preserved delta from current main in a separate scoped track.\n' "$PR_NUMBER"
           printf 'Do not force-remove or delete the original source worktree or branch while this blocker remains.\n'
@@ -1050,17 +1214,21 @@ fetched tip may the plan compare the preserved local `head.txt` to the PR head
 with `git merge-base --is-ancestor`; equality or ancestry is acceptable, but a
 diverged local head blocks adoption. For dirty-worktree sources, identity and
 ancestry success is still insufficient: inspect the preserved
-`worktree.patch`, `index.patch`, and `untracked-files.txt`, and adopt the PR
-only when all three classes are empty. If any preserved dirty class is
+`worktree.patch`, `index.patch`, and `.untracked.zlist`, and adopt the PR only
+when all three classes are empty. The same preserved snapshot must also carry
+`untracked.json`, `untracked.tar`, `.ignored.zlist`, and `ignored.json` so the
+dirty-state evidence is readable and lossless. If any preserved dirty class is
 non-empty, write `viable/$WORKSTREAM_ID-pr-blocker.txt` with the existing PR
 URL, the snapshot archive IDs, and the safe resume condition to land or
 reconcile that PR first and then recover the preserved delta from current
 `main` in a separate scoped track; the original source worktree and branch stay
 untouched while blocked. Record the preserved local head, fresh branch tip, PR
 head, ancestry result, PR URL, and any dirty-class byte counts in
-`viable/$WORKSTREAM_ID-pr-adoption.txt`, and record `continue existing PR`
-only after all of those checks pass. If `PR_COUNT>1`, block immediately with
-open-PR evidence because the same-repo exact-head query is already ambiguous.
+`viable/$WORKSTREAM_ID-pr-adoption.txt`, and also note there when the
+preserved ignored inventory is non-empty so later cleanup knows forced removal
+is prohibited. Record `continue existing PR` only after all of those checks
+pass. If `PR_COUNT>1`, block immediately with open-PR evidence because the
+same-repo exact-head query is already ambiguous.
 If `gh pr view` fails because the candidate disappears or cannot be read after
 the paginated REST capture, if the single-candidate branch fetch fails, if the
 GitHub capture itself fails, or if any other identity, ancestry, or dirty
@@ -1083,7 +1251,7 @@ verification. If `docs/psyche-specs` still has exactly one same-repo open PR
 from branch `docs/psyche-specs` at execution time, its `headRefOid` matches
 the freshly fetched `origin/docs/psyche-specs` tip, the preserved local
 `head.txt` is equal to or an ancestor of that PR head, and the preserved
-`worktree.patch`, `index.patch`, and `untracked-files.txt` are all empty, this
+`worktree.patch`, `index.patch`, and `.untracked.zlist` are all empty, this
 step adopts the exact-source-branch PR that GitHub returns at that moment
 rather than hardcoding a PR number. If any of those three preserved dirty
 classes are non-empty, the row blocks with resume instructions instead of being
@@ -1781,14 +1949,16 @@ complete. Their runtime dirtiness may change after snapshotting—for example, a
 formerly dirty tree may now be clean because its changes were committed to an
 accurate active PR. `git worktree remove --force` is allowed only in this
 step, only for these four exact paths, and only after the worktree and index
-patch evidence, verified branch bundle, untracked inventory, terminal ledger
-classification, and either an adopted exact-source-branch open PR, an open
-replacement PR, or recorded non-viable/blocker evidence are all present.
+patch evidence, verified branch bundle, lossless untracked inventory plus tar
+evidence, ignored-path inventory evidence, terminal ledger classification, and
+either an adopted exact-source-branch open PR, an open replacement PR, or
+recorded non-viable/blocker evidence are all present.
 Rows blocked because an existing PR already covers the preserved head while
-`worktree.patch`, `index.patch`, or `untracked-files.txt` remains non-empty are
+`worktree.patch`, `index.patch`, or `.untracked.zlist` remains non-empty are
 explicitly excluded from forced source cleanup and leave their original
-worktree and branch untouched. Unrelated or unsnapshotted worktrees must never
-use force.
+worktree and branch untouched. Any non-empty preserved `.ignored.zlist` also
+prohibits forced source cleanup and must instead emit blocker evidence with a
+resume condition. Unrelated or unsnapshotted worktrees must never use force.
 
 Run:
 
@@ -1804,7 +1974,11 @@ for id in \
 do
   test -s "$RECOVERY/$id-worktree-evidence.txt"
   test -s "$RECOVERY/$id-index-evidence.txt"
-  test -s "$RECOVERY/$id-untracked-evidence.txt"
+  test -s "$RECOVERY/$id-untracked-evidence.json"
+  test -s "$RECOVERY/$id-ignored-evidence.json"
+  test -f "$RECOVERY/dirty/$id/.untracked.zlist"
+  test -f "$RECOVERY/dirty/$id/untracked.tar"
+  test -f "$RECOVERY/dirty/$id/.ignored.zlist"
   git -C "$REPO" bundle verify "$RECOVERY/dirty/$id/branch.bundle" > /dev/null
   grep -E "^\| $id \| (already-shipped|superseded|viable|blocked) \|" \
     "$RECOVERY/classification.md"
@@ -1816,9 +1990,12 @@ exact-source-branch PR URL or the open replacement PR URL before removal.
 Otherwise confirm the row already records its `already-shipped`, `superseded`,
 or `blocked` evidence. Before any `--force` removal, recompute live proof files
 under the private recovery archive and compare them byte-for-byte with the
-preserved snapshot. Any mismatch or missing file blocks removal and requires a
-fresh snapshot plus reclassification for that row. Only unchanged rows may use
-the exact-path force-removal exception:
+preserved snapshot. This proof must regenerate the live `.untracked.zlist`,
+`untracked.json`, `untracked.tar`, `.ignored.zlist`, and `ignored.json` with
+the same lossless method used at snapshot time. Any mismatch or missing file
+blocks removal and requires a fresh snapshot plus reclassification for that
+row. Only unchanged rows with an empty preserved ignored inventory may use the
+exact-path force-removal exception:
 
 ```bash
 COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
@@ -1881,30 +2058,57 @@ do
       "$id" > "$BLOCKER"
     exit 1
   fi
-  git -C "$SOURCE" ls-files --others --exclude-standard > "$PROOF_DIR/live-untracked-files.txt"
-  if ! cmp -s "$PROOF_DIR/live-untracked-files.txt" "$SNAPSHOT/untracked-files.txt"; then
+  git -C "$SOURCE" ls-files --others --exclude-standard -z > "$PROOF_DIR/live-untracked.zlist"
+  python3 - "$PROOF_DIR/live-untracked.zlist" > "$PROOF_DIR/live-untracked.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+raw = Path(sys.argv[1]).read_bytes()
+entries = [] if not raw else raw.rstrip(b"\0").split(b"\0")
+print(json.dumps([entry.decode("utf-8", "surrogateescape") for entry in entries], indent=2))
+PY
+  tar -C "$SOURCE" --null -T "$PROOF_DIR/live-untracked.zlist" -cf "$PROOF_DIR/live-untracked.tar"
+  if ! cmp -s "$PROOF_DIR/live-untracked.zlist" "$SNAPSHOT/.untracked.zlist"; then
     printf 'Blocked %s: untracked path inventory drifted since snapshot; take a fresh snapshot and reclassify before removal.\n' \
       "$id" > "$BLOCKER"
     exit 1
   fi
-  while IFS= read -r path; do
-    test -n "$path" || continue
-    if ! test -e "$SOURCE/$path"; then
-      printf 'Blocked %s: live untracked file is missing: %s. Take a fresh snapshot and reclassify before removal.\n' \
-        "$id" "$path" > "$BLOCKER"
-      exit 1
-    fi
-    if ! test -e "$SNAPSHOT/untracked/$path"; then
-      printf 'Blocked %s: snapshotted untracked file copy is missing: %s. Take a fresh snapshot and reclassify before removal.\n' \
-        "$id" "$path" > "$BLOCKER"
-      exit 1
-    fi
-    if ! cmp -s "$SOURCE/$path" "$SNAPSHOT/untracked/$path"; then
-      printf 'Blocked %s: untracked file content drifted for %s; take a fresh snapshot and reclassify before removal.\n' \
-        "$id" "$path" > "$BLOCKER"
-      exit 1
-    fi
-  done < "$SNAPSHOT/untracked-files.txt"
+  if ! cmp -s "$PROOF_DIR/live-untracked.json" "$SNAPSHOT/untracked.json"; then
+    printf 'Blocked %s: readable untracked inventory evidence drifted since snapshot; take a fresh snapshot and reclassify before removal.\n' \
+      "$id" > "$BLOCKER"
+    exit 1
+  fi
+  if ! cmp -s "$PROOF_DIR/live-untracked.tar" "$SNAPSHOT/untracked.tar"; then
+    printf 'Blocked %s: untracked tar archive drifted since snapshot; take a fresh snapshot and reclassify before removal.\n' \
+      "$id" > "$BLOCKER"
+    exit 1
+  fi
+  git -C "$SOURCE" ls-files --others --ignored --exclude-standard -z > "$PROOF_DIR/live-ignored.zlist"
+  python3 - "$PROOF_DIR/live-ignored.zlist" > "$PROOF_DIR/live-ignored.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+raw = Path(sys.argv[1]).read_bytes()
+entries = [] if not raw else raw.rstrip(b"\0").split(b"\0")
+print(json.dumps([entry.decode("utf-8", "surrogateescape") for entry in entries], indent=2))
+PY
+  if ! cmp -s "$PROOF_DIR/live-ignored.zlist" "$SNAPSHOT/.ignored.zlist"; then
+    printf 'Blocked %s: ignored path inventory drifted since snapshot; leave the source worktree untouched, take a fresh snapshot, and reclassify before removal.\n' \
+      "$id" > "$BLOCKER"
+    continue
+  fi
+  if ! cmp -s "$PROOF_DIR/live-ignored.json" "$SNAPSHOT/ignored.json"; then
+    printf 'Blocked %s: readable ignored inventory evidence drifted since snapshot; leave the source worktree untouched, take a fresh snapshot, and reclassify before removal.\n' \
+      "$id" > "$BLOCKER"
+    continue
+  fi
+  if test -s "$SNAPSHOT/.ignored.zlist"; then
+    printf 'Blocked %s: preserved ignored-path inventory is non-empty, so forced source-worktree removal is prohibited. Resume only after that ignored content is intentionally handled outside this recovery, a fresh snapshot records an empty ignored inventory, and the row is reclassified.\n' \
+      "$id" > "$BLOCKER"
+    continue
+  fi
   git -C "$REPO" worktree remove --force "$SOURCE"
 done
 ```
@@ -1912,13 +2116,14 @@ done
 Expected: only those four exact dirty source paths are force-removed, because
 their committed history, dirty state, and recovery disposition have already
 been proven elsewhere in the archive and reconfirmed as unchanged against the
-preserved snapshot immediately before removal. Empty worktree, index, and
-untracked snapshot classes are still acceptable, but the retirement proof now
-requires non-empty evidence files populated either with captured change
-summaries or deterministic sentinel lines, plus matching live proof files under
-`private-retire-proof/`. Any row blocked because preserved dirty delta remains
-behind an active PR writes a skip blocker and leaves its original source
-worktree in place.
+preserved snapshot immediately before removal. Empty worktree and index patches
+are still acceptable, and empty untracked or ignored inventories remain valid
+when the regenerated `.zlist`, JSON, and tar artifacts match byte-for-byte.
+Rows with non-empty preserved or live ignored inventories never use force:
+they write blocker evidence plus a resume condition and leave the original
+source worktree in place. Any row blocked because preserved dirty delta remains
+behind an active PR likewise writes a skip blocker and leaves its original
+source worktree untouched.
 
 - [ ] **Step 5: Delete only proven local branch residue after worktree retirement**
 
