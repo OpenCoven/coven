@@ -64,16 +64,35 @@ No production file is modified during preservation or classification.
 - Existing: `docs/superpowers/specs/2026-08-01-incomplete-work-recovery-design.md`
 - Create: `docs/superpowers/plans/2026-08-01-incomplete-work-recovery.md`
 
-- [ ] **Step 1: Confirm the design worktree is clean except for the plan**
+- [ ] **Step 1: Check claim state, check open pull requests, acquire `issue-541`, and confirm the design worktree state**
 
 Run:
 
 ```bash
-git -C /tmp/coven-issue-541 status --short --branch
+cd /tmp/coven-issue-541
+coven claim status
+gh pr list --repo OpenCoven/coven --state open --limit 100
+coven claim acquire issue-541
+git status --short --branch
 ```
 
-Expected: branch `docs/541-incomplete-work-recovery-design`, with only the plan
-file untracked before it is staged.
+Expected: the shared claim registry and open PR set are reviewed before any
+publication or recovery action; `issue-541` is actively claimed from
+`/tmp/coven-issue-541`; and branch
+`docs/541-incomplete-work-recovery-design` shows only the plan file untracked
+before it is staged.
+
+If this publication session or the later recovery session runs long, keep the
+parent claim alive from `/tmp/coven-issue-541`:
+
+```bash
+cd /tmp/coven-issue-541
+coven claim heartbeat issue-541
+```
+
+Do not release `issue-541` after PR creation. Keep it active until this
+recovery session stops or the full issue #541 recovery effort is complete, then
+release it from `/tmp/coven-issue-541` with `coven claim release issue-541`.
 
 - [ ] **Step 2: Run document safety checks**
 
@@ -392,10 +411,11 @@ Run:
 
 ```bash
 COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
 RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
-git bundle verify "$RECOVERY/branches/docs-universal-runtime-capability-design.bundle"
-git bundle verify "$RECOVERY/branches/feat-npm-macos-x64.bundle"
-git bundle verify "$RECOVERY/branches/fix-521-ward-surface-confinement.bundle"
+git -C "$REPO" bundle verify "$RECOVERY/branches/docs-universal-runtime-capability-design.bundle"
+git -C "$REPO" bundle verify "$RECOVERY/branches/feat-npm-macos-x64.bundle"
+git -C "$REPO" bundle verify "$RECOVERY/branches/fix-521-ward-surface-confinement.bundle"
 ```
 
 Expected: Git reports each bundle is okay and lists its branch ref.
@@ -618,7 +638,8 @@ Expected: every workstream appears in both files.
 
 - [ ] **Step 1: Create or identify one issue per viable row**
 
-Use the matching exact query for each viable row:
+Set `WORKSTREAM_ID` to the viable row's exact workstream ID, then use the
+matching exact query:
 
 ```bash
 gh issue list --repo OpenCoven/coven --state all --search '"mobile pairing"' --limit 20
@@ -630,12 +651,53 @@ gh issue list --repo OpenCoven/coven --state all --search '"universal runtime" c
 gh issue list --repo OpenCoven/coven --state all --search '"runtime model parity"' --limit 20
 ```
 
-If no issue accurately owns the concern, create one whose body includes:
+Then set the issue title from this fixed mapping:
+
+```bash
+case "$WORKSTREAM_ID" in
+  mobile-memory-gateway)
+    ISSUE_TITLE="Recover mobile pairing workstream"
+    ;;
+  feat-npm-macos-x64)
+    ISSUE_TITLE="Recover Intel macOS npm packaging workstream"
+    ;;
+  fix-521-ward-surface-confinement)
+    ISSUE_TITLE="Recover Ward surface confinement workstream"
+    ;;
+  memory-promote)
+    ISSUE_TITLE="Recover memory promotion workstream"
+    ;;
+  docs-psyche-specs)
+    ISSUE_TITLE="Recover Psyche specification workstream"
+    ;;
+  docs-universal-runtime-capability-design)
+    ISSUE_TITLE="Recover universal runtime capability design workstream"
+    ;;
+  pr-476-review)
+    ISSUE_TITLE="Recover runtime model parity plan workstream"
+    ;;
+  *)
+    printf 'Unknown WORKSTREAM_ID: %s\n' "$WORKSTREAM_ID" >&2
+    exit 1
+    ;;
+esac
+```
+
+If an accurate issue already exists, reuse it without creating a duplicate:
+
+```bash
+ISSUE_NUMBER=<existing issue number>
+gh issue view --repo OpenCoven/coven "$ISSUE_NUMBER" \
+  --json number,state,title,url
+```
+
+If no issue accurately owns the concern, create one and verify it immediately:
 
 ```markdown
 ## Recovered source
 
-Issue #541 recovery archive and classification ledger.
+- Source issue: #541
+- Source artifacts: issue-541 recovery archive and classification ledger.
 
 ## Acceptance criteria
 
@@ -643,6 +705,27 @@ Issue #541 recovery archive and classification ledger.
 - Rebuild against current `origin/main`; do not blindly replay obsolete code.
 - Add or retain regression coverage for the recovered behavior.
 - Pass all repository-required gates.
+```
+
+```bash
+ISSUE_BODY="$(cat <<'EOF'
+## Recovered source
+
+- Source issue: #541
+- Source artifacts: issue-541 recovery archive and classification ledger.
+
+## Acceptance criteria
+
+- Preserve the still-valid intent identified in the classification evidence.
+- Rebuild against current `origin/main`; do not blindly replay obsolete code.
+- Add or retain regression coverage for the recovered behavior.
+- Pass all repository-required gates.
+EOF
+)"
+ISSUE_URL="$(gh issue create --repo OpenCoven/coven --title "$ISSUE_TITLE" --body "$ISSUE_BODY")"
+ISSUE_NUMBER="${ISSUE_URL##*/}"
+gh issue view --repo OpenCoven/coven "$ISSUE_NUMBER" \
+  --json number,state,title,url
 ```
 
 Expected: every viable row has exactly one issue number.
@@ -723,6 +806,23 @@ git -C "$REPO" worktree add \
   origin/main
 cd "$RECOVERY_WORKTREE"
 coven claim acquire "issue-$ISSUE_NUMBER"
+```
+
+For long child recovery sessions, keep the child claim alive from that child
+worktree:
+
+```bash
+cd "$RECOVERY_WORKTREE"
+coven claim heartbeat "issue-$ISSUE_NUMBER"
+```
+
+Keep that child claim active after PR creation while follow-up commits, review
+responses, or final verification continue in the same session. Release it only
+when that pull request merges or the owning recovery session stops:
+
+```bash
+cd "$RECOVERY_WORKTREE"
+coven claim release "issue-$ISSUE_NUMBER"
 ```
 
 Execute that issue's plan, run its full gates, commit each child change with
@@ -930,22 +1030,34 @@ git -C "$REPO" branch -D "$BRANCH_TO_DELETE"
 only after confirming its source worktree is already removed and its verified
 snapshot bundle or pushed replacement branch still proves the committed history.
 
-- [ ] **Step 6: Release stopped recovery claims**
+- [ ] **Step 6: Release only merged or stopped recovery claims**
 
-After each child pull request is opened, release its claim from that worktree:
+For any child recovery workstream whose PR has merged or whose owning recovery
+session has stopped, release its claim from that child worktree:
 
 ```bash
+cd "$RECOVERY_WORKTREE"
 coven claim release "issue-$ISSUE_NUMBER"
 ```
 
-Release the design claim when issue #541 work stops:
+Keep child claims active while follow-up work for an open PR continues. During
+long-running follow-up from that worktree, use:
+
+```bash
+cd "$RECOVERY_WORKTREE"
+coven claim heartbeat "issue-$ISSUE_NUMBER"
+```
+
+Release the parent `issue-541` claim only when the issue #541 recovery session
+stops or the full issue #541 recovery effort is complete:
 
 ```bash
 cd /tmp/coven-issue-541
 coven claim release issue-541
 ```
 
-Expected: `coven claim status` has no abandoned active claim.
+Expected: `coven claim status` shows no abandoned claim; active claims remain
+allowed only for still-running recovery sessions and open follow-up work.
 
 ### Task 8: Reconcile Repository Goals
 
