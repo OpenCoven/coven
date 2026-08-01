@@ -27,16 +27,22 @@
   - `.git/agent-recovery/issue-541/viable/<workstream-id>-pr-adoption.txt`
   - `.git/agent-recovery/issue-541/viable/<workstream-id>-issue-search.json`
   - `.git/agent-recovery/issue-541/viable/<workstream-id>-issue-view.json`
+  - `.git/agent-recovery/issue-541/viable/<workstream-id>-issue-postcondition.json`
+  - `.git/agent-recovery/issue-541/viable/<workstream-id>-issue-postcondition-search.json`
+  - `.git/agent-recovery/issue-541/viable/<workstream-id>-issue-postcondition-view.json`
   - `.git/agent-recovery/issue-541/viable/<workstream-id>-pr-blocker.txt`
   - `.git/agent-recovery/issue-541/viable/<workstream-id>-issue-blocker.txt`
   - `.git/agent-recovery/issue-541/private/issue-ledger-refresh/<workstream-id>-issues.stage.json`
+  - `.git/agent-recovery/issue-541/private/issue-ledger-refresh/<workstream-id>-issue-postcondition.stage.json`
   - Authoritative source-branch fetch evidence, open-PR evidence, verified
     same-repository candidate evidence, verified PR-view evidence,
     preserved-head adoption ancestry evidence plus dirty-snapshot emptiness
     evidence when applicable,
     per-workstream exact-title open issue-match evidence derived from paginated
-    `issues.json`, blocker evidence for each viable workstream, and the
-    private staged ledger used to atomically refresh `issues.json`.
+    `issues.json`, blocker evidence for each viable workstream, the
+    postcondition revalidation evidence saved after selecting or creating
+    `ISSUE_NUMBER`, and the private staged ledgers used to atomically refresh
+    `issues.json` before and after the exact-title decision.
 - Create only when Task 8 Step 5 runs:
   - `.git/agent-recovery/issue-541/private/branch-delete-proof/<branch-proof-id>-pre-delete-d.txt`
   - `.git/agent-recovery/issue-541/private/branch-delete-proof/<branch-proof-id>-pre-delete-D.txt`
@@ -2682,9 +2688,13 @@ case "$WORKSTREAM_ID" in
 esac
 ISSUE_SEARCH_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-issue-search.json"
 ISSUE_VIEW_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-issue-view.json"
+ISSUE_POSTCONDITION_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-issue-postcondition.json"
+ISSUE_POSTCONDITION_SEARCH_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-issue-postcondition-search.json"
+ISSUE_POSTCONDITION_VIEW_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-issue-postcondition-view.json"
 ISSUE_BLOCKER_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-issue-blocker.txt"
 ISSUE_LEDGER_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-issues.json"
 ISSUE_LEDGER_STAGE="$PRIVATE_RECOVERY/issue-ledger-refresh/$WORKSTREAM_ID-issues.stage.json"
+ISSUE_POSTCONDITION_STAGE="$PRIVATE_RECOVERY/issue-ledger-refresh/$WORKSTREAM_ID-issue-postcondition.stage.json"
 rm -f "$ISSUE_LEDGER_STAGE"
 if ! gh api --paginate --slurp \
   "repos/OpenCoven/coven/issues?state=all&per_page=100" \
@@ -2879,9 +2889,77 @@ EOF
 esac
 ISSUE_NUMBER="$(jq -r '.number' "$ISSUE_VIEW_EVIDENCE")"
 ISSUE_URL="$(jq -r '.url' "$ISSUE_VIEW_EVIDENCE")"
+rm -f "$ISSUE_POSTCONDITION_STAGE"
+if ! gh api --paginate --slurp \
+  "repos/OpenCoven/coven/issues?state=all&per_page=100" \
+  > "$ISSUE_POSTCONDITION_STAGE"
+then
+  rm -f "$ISSUE_POSTCONDITION_STAGE"
+  {
+    printf 'Blocked %s: could not refresh the postcondition paginated issue ledger after selecting issue #%s.\n' \
+      "$WORKSTREAM_ID" "$ISSUE_NUMBER"
+    printf 'Verified precondition issue ledger: issue-541/issues.json\n'
+    printf 'Postcondition staging target: private/issue-ledger-refresh/%s-issue-postcondition.stage.json\n' "$WORKSTREAM_ID"
+  } > "$ISSUE_BLOCKER_EVIDENCE"
+  update_classification_row \
+    "blocked" \
+    "Issue postcondition refresh failed without replacing viable/$WORKSTREAM_ID-issue-postcondition-search.json; see viable/$WORKSTREAM_ID-issue-blocker.txt." \
+    "Blocked: could not refresh live issue evidence after exact-title reuse/create."
+  exit 0
+fi
+if ! test -s "$ISSUE_POSTCONDITION_STAGE" || \
+   ! jq -e 'type == "array" and length > 0 and all(.[]; type == "array")' "$ISSUE_POSTCONDITION_STAGE" > /dev/null
+then
+  rm -f "$ISSUE_POSTCONDITION_STAGE"
+  {
+    printf 'Blocked %s: staged postcondition issue ledger was empty or not a valid paginated slurped array.\n' \
+      "$WORKSTREAM_ID"
+    printf 'Verified precondition issue ledger: issue-541/issues.json\n'
+    printf 'Postcondition staging target: private/issue-ledger-refresh/%s-issue-postcondition.stage.json\n' "$WORKSTREAM_ID"
+  } > "$ISSUE_BLOCKER_EVIDENCE"
+  update_classification_row \
+    "blocked" \
+    "Issue postcondition staging validation failed without replacing viable/$WORKSTREAM_ID-issue-postcondition-search.json; see viable/$WORKSTREAM_ID-issue-blocker.txt." \
+    "Blocked: live issue evidence failed validation after exact-title reuse/create."
+  exit 0
+fi
+if ! mv "$ISSUE_POSTCONDITION_STAGE" "$ISSUE_POSTCONDITION_EVIDENCE"; then
+  rm -f "$ISSUE_POSTCONDITION_STAGE"
+  {
+    printf 'Blocked %s: could not atomically replace the postcondition issue ledger.\n' \
+      "$WORKSTREAM_ID"
+    printf 'Postcondition staging target: private/issue-ledger-refresh/%s-issue-postcondition.stage.json\n' "$WORKSTREAM_ID"
+    printf 'Postcondition ledger path: viable/%s-issue-postcondition.json\n' "$WORKSTREAM_ID"
+  } > "$ISSUE_BLOCKER_EVIDENCE"
+  update_classification_row \
+    "blocked" \
+    "Issue postcondition replacement failed; see viable/$WORKSTREAM_ID-issue-blocker.txt." \
+    "Blocked: could not atomically replace postcondition live issue evidence after exact-title reuse/create."
+  exit 0
+fi
+jq --arg title "$ISSUE_TITLE" \
+  '[.[] | .[] | select(.pull_request? | not) | select(.title == $title and .state == "open") | {number, title, url, state}]' \
+  "$ISSUE_POSTCONDITION_EVIDENCE" > "$ISSUE_POSTCONDITION_SEARCH_EVIDENCE"
+if ! jq -e 'length == 1' "$ISSUE_POSTCONDITION_SEARCH_EVIDENCE" > /dev/null || \
+   ! jq -e --argjson issue_number "$ISSUE_NUMBER" '.[0].number == $issue_number' "$ISSUE_POSTCONDITION_SEARCH_EVIDENCE" > /dev/null
+then
+  {
+    printf 'Blocked %s: postcondition issue evidence did not resolve to exactly one exact-title OPEN non-PR issue matching #%s.\n' \
+      "$WORKSTREAM_ID" "$ISSUE_NUMBER"
+    printf 'Postcondition paginated issue evidence: viable/%s-issue-postcondition.json\n' "$WORKSTREAM_ID"
+    printf 'Postcondition filtered issue evidence: viable/%s-issue-postcondition-search.json\n' "$WORKSTREAM_ID"
+    printf 'Postcondition issue view evidence: viable/%s-issue-postcondition-view.json\n' "$WORKSTREAM_ID"
+  } > "$ISSUE_BLOCKER_EVIDENCE"
+  update_classification_row \
+    "blocked" \
+    "Issue postcondition mismatch; see issue-541/issues.json, viable/$WORKSTREAM_ID-issue-postcondition-search.json, viable/$WORKSTREAM_ID-issue-blocker.txt, and the postcondition ledger." \
+    "Blocked: postcondition exact-title issue verification failed after reuse/create."
+  exit 0
+fi
+jq '.[0]' "$ISSUE_POSTCONDITION_SEARCH_EVIDENCE" > "$ISSUE_POSTCONDITION_VIEW_EVIDENCE"
 update_classification_row \
   "viable" \
-  "Issue verified via issue-541/issues.json, viable/$WORKSTREAM_ID-issues.json, viable/$WORKSTREAM_ID-issue-search.json, and viable/$WORKSTREAM_ID-issue-view.json." \
+  "Issue verified via issue-541/issues.json, viable/$WORKSTREAM_ID-issues.json, viable/$WORKSTREAM_ID-issue-search.json, viable/$WORKSTREAM_ID-issue-view.json, viable/$WORKSTREAM_ID-issue-postcondition.json, viable/$WORKSTREAM_ID-issue-postcondition-search.json, and viable/$WORKSTREAM_ID-issue-postcondition-view.json." \
   "Recover via issue #$ISSUE_NUMBER ($ISSUE_URL)."
 ```
 
