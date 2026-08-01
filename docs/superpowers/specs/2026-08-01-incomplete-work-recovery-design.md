@@ -93,23 +93,26 @@ squash merges make many merged branches appear unmerged.
 
 Before creating a child issue, branch, or worktree, each viable concern maps to
 its exact current source branch, reads that workstream's preserved local
-`head.txt`, fetches that exact branch from `origin`, records the freshly
-fetched authoritative remote tip, and runs an exact-source-branch
-open-pull-request query. If exactly one candidate open pull request exists, the
-recovery verifies that its `state` is `OPEN`, its `headRefName` matches the
-expected branch, its `headRepositoryOwner` is `OpenCoven`,
+`head.txt`, and first runs an exact-source-branch open-pull-request query. If
+that query returns zero candidates, the concern follows the normal
+issue-reuse-or-create flow without fetching the source branch. If the query
+returns exactly one candidate open pull request, the recovery then fetches that
+exact branch from `origin`, records the freshly fetched authoritative remote
+tip, and verifies that the candidate's `state` is `OPEN`, its `headRefName`
+matches the expected branch, its `headRepositoryOwner` is `OpenCoven`,
 `isCrossRepository` is false, its `baseRefName` is `main`, and its
 `headRefOid` exactly equals the freshly fetched authoritative source-branch
-tip. It then verifies via ancestry that the preserved local `head.txt` equals
-or is an ancestor of that PR head, so a clean local worktree that is behind its
-open PR by commits can still be adopted safely. If no exact-source-branch pull
-request exists, the concern follows the normal issue-reuse-or-create flow. If
-more than one exact-source-branch pull request exists, if the PR head differs
-from the fetched branch tip, if the preserved local head is not an ancestor of
-the PR head, or if the candidate pull request fails any other identity check
-including closing or merging between list and view, the row moves to `blocked`
-with saved evidence rather than guessing or falling through to
-duplicate-recovery work.
+tip. Only after the PR head matches the fetched authoritative tip does the
+recovery verify via ancestry that the preserved local `head.txt` equals or is
+an ancestor of that PR head, so a clean local worktree that is behind its open
+PR by commits can still be adopted safely. If more than one
+exact-source-branch pull request exists, the row moves directly to `blocked`
+with saved evidence rather than fetching or guessing. If the single-candidate
+branch fetch fails, if the PR head differs from the fetched branch tip, if the
+preserved local head is not an ancestor of the PR head, or if the candidate
+pull request fails any other identity check including closing or merging
+between list and view, the row also moves to `blocked` with saved evidence
+rather than falling through to duplicate-recovery work.
 
 Each viable concern without an adopted exact-source-branch open pull request
 receives:
@@ -223,11 +226,11 @@ after staging the intended change so it evaluates the actual proposed commit.
   never wins automatically.
 - A failing required gate blocks push and pull-request creation.
 - More than one exact-source-branch open pull request, any candidate PR state,
-  branch, owner, base, or cross-repo mismatch, any PR head that differs from
-  the freshly fetched authoritative branch tip, any preserved local head that
-  is not an ancestor of the PR head, or more than one exact-title open
-  matching recovery issue blocks the row with evidence rather than choosing a
-  duplicate target.
+  branch, owner, base, or cross-repo mismatch, any single-candidate branch
+  fetch failure, any PR head that differs from the freshly fetched
+  authoritative branch tip, any preserved local head that is not an ancestor
+  of the PR head, or more than one exact-title open matching recovery issue
+  blocks the row with evidence rather than choosing a duplicate target.
 - Any unsafe primary-checkout restore condition blocks the final audit rather
   than forcing a branch switch or reset.
 - Ambiguous ownership, policy, or human approval moves the workstream to
@@ -242,9 +245,9 @@ after staging the intended change so it evaluates the actual proposed commit.
 - Every dirty, formerly dirty, or orphaned workstream has a durable snapshot
   and classification.
 - Every viable concern either adopts one accurate exact-source-branch open pull
-  request whose head matches the freshly fetched authoritative branch tip and
-  still descends from the preserved local snapshot, or has its own validated,
-  pushed branch and open pull request.
+  request whose queried single candidate survived authoritative branch-tip and
+  ancestry verification, or has its own validated, pushed branch and open pull
+  request after the zero-candidate normal flow.
 - Already-shipped and superseded work has concrete GitHub or main-branch
   evidence.
 - No uncommitted work is deleted.

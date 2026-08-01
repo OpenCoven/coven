@@ -661,9 +661,10 @@ Expected: Task 4 Step 4 replaces every `pending` row with exactly one terminal
 classification (`already-shipped`, `superseded`, `viable`, or `blocked`) and
 one next action before Task 4 Step 5 and Task 9 Step 1 verification. A viable
 row may later keep that classification while Task 5 updates its action to
-`continue existing PR` after verifying one open PR from the exact source
-branch whose head matches the freshly fetched `origin/<branch>` tip and still
-descends from the preserved local `head.txt` snapshot.
+`continue existing PR` only after an exact-head query returns one open PR from
+the source branch and that single candidate passes the fetched-tip and
+preserved-head ancestry checks. Rows with zero exact-head candidates keep the
+normal issue-reuse-or-create flow.
 
 - [ ] **Step 5: Review the ledger against the manifest**
 
@@ -773,27 +774,8 @@ EXPECTED_HEAD="$(tr -d '\n' < "$SOURCE_HEAD_FILE")"
 {
   printf 'Source branch: %s\n' "$SOURCE_BRANCH"
   printf 'Preserved local head: %s\n' "$EXPECTED_HEAD"
+  printf 'Exact-head PR query runs before any source-branch fetch.\n'
 } > "$BRANCH_FETCH_EVIDENCE"
-if ! git -C "$REPO" fetch --no-tags origin \
-  "refs/heads/$SOURCE_BRANCH:refs/remotes/origin/$SOURCE_BRANCH" \
-  >> "$BRANCH_FETCH_EVIDENCE" 2>&1; then
-  FETCH_OUTPUT="$(cat "$BRANCH_FETCH_EVIDENCE")"
-  {
-    printf 'Blocked %s: could not fetch origin/%s before PR adoption.\n' \
-      "$WORKSTREAM_ID" "$SOURCE_BRANCH"
-    printf 'Preserved local head: %s\n' "$EXPECTED_HEAD"
-    printf 'Branch fetch evidence: viable/%s-branch-fetch.txt\n' "$WORKSTREAM_ID"
-    printf 'Fetch output follows:\n%s\n' "$FETCH_OUTPUT"
-  } > "$PR_BLOCKER_EVIDENCE"
-  update_classification_row \
-    "blocked" \
-    "Source-branch fetch failed for preserved head $EXPECTED_HEAD; see viable/$WORKSTREAM_ID-branch-fetch.txt and viable/$WORKSTREAM_ID-pr-blocker.txt." \
-    "Blocked: candidate PR source branch could not be fetched from origin."
-  exit 0
-fi
-FRESH_BRANCH_TIP="$(git -C "$REPO" rev-parse "refs/remotes/origin/$SOURCE_BRANCH")"
-printf 'Fresh fetched origin/%s tip: %s\n' \
-  "$SOURCE_BRANCH" "$FRESH_BRANCH_TIP" >> "$BRANCH_FETCH_EVIDENCE"
 gh pr list \
   --repo OpenCoven/coven \
   --state open \
@@ -807,6 +789,29 @@ Then branch on the exact-source-branch result:
 ```bash
 case "$PR_COUNT" in
   1)
+    printf 'Exact-head open PR count: 1\n' >> "$BRANCH_FETCH_EVIDENCE"
+    printf 'Fetching origin/%s for candidate identity verification.\n' \
+      "$SOURCE_BRANCH" >> "$BRANCH_FETCH_EVIDENCE"
+    if ! git -C "$REPO" fetch --no-tags origin \
+      "refs/heads/$SOURCE_BRANCH:refs/remotes/origin/$SOURCE_BRANCH" \
+      >> "$BRANCH_FETCH_EVIDENCE" 2>&1; then
+      FETCH_OUTPUT="$(cat "$BRANCH_FETCH_EVIDENCE")"
+      {
+        printf 'Blocked %s: exact-head candidate exists, but origin/%s could not be fetched for identity verification.\n' \
+          "$WORKSTREAM_ID" "$SOURCE_BRANCH"
+        printf 'Preserved local head: %s\n' "$EXPECTED_HEAD"
+        printf 'Branch fetch evidence: viable/%s-branch-fetch.txt\n' "$WORKSTREAM_ID"
+        printf 'Fetch output follows:\n%s\n' "$FETCH_OUTPUT"
+      } > "$PR_BLOCKER_EVIDENCE"
+      update_classification_row \
+        "blocked" \
+        "Single PR candidate could not be verified because origin/$SOURCE_BRANCH fetch failed for preserved head $EXPECTED_HEAD; see viable/$WORKSTREAM_ID-branch-fetch.txt and viable/$WORKSTREAM_ID-pr-blocker.txt." \
+        "Blocked: candidate PR source branch could not be fetched from origin."
+      exit 0
+    fi
+    FRESH_BRANCH_TIP="$(git -C "$REPO" rev-parse "refs/remotes/origin/$SOURCE_BRANCH")"
+    printf 'Fresh fetched origin/%s tip: %s\n' \
+      "$SOURCE_BRANCH" "$FRESH_BRANCH_TIP" >> "$BRANCH_FETCH_EVIDENCE"
     PR_NUMBER="$(jq -r '.[0].number' "$OPEN_PR_EVIDENCE")"
     if ! gh pr view --repo OpenCoven/coven "$PR_NUMBER" \
       --json number,title,url,state,headRefOid,headRefName,headRepositoryOwner,isCrossRepository,baseRefName \
@@ -892,28 +897,33 @@ case "$PR_COUNT" in
     exit 0
     ;;
   0)
+    printf 'Exact-head open PR count: 0\n' >> "$BRANCH_FETCH_EVIDENCE"
+    printf 'No exact-head open PR candidate; skipping source-branch fetch and continuing to issue reuse/create.\n' >> "$BRANCH_FETCH_EVIDENCE"
     ;;
   *)
     {
-      printf 'Blocked %s: expected 0 or 1 open PRs for source branch %s, found %s.\n' \
+      printf 'Blocked %s: expected 0 or 1 open PRs for source branch %s, found %s before identity verification.\n' \
         "$WORKSTREAM_ID" "$SOURCE_BRANCH" "$PR_COUNT"
       printf 'Preserved local head: %s\n' "$EXPECTED_HEAD"
-      printf 'Fresh fetched origin/%s tip: %s\n' "$SOURCE_BRANCH" "$FRESH_BRANCH_TIP"
+      printf 'No source-branch fetch was attempted because the exact-head query was already ambiguous.\n'
       printf 'Branch fetch evidence: viable/%s-branch-fetch.txt\n' "$WORKSTREAM_ID"
       printf 'Open PR evidence: viable/%s-open-prs.json\n' "$WORKSTREAM_ID"
     } > "$PR_BLOCKER_EVIDENCE"
     update_classification_row \
       "blocked" \
-      "Open PR ambiguity after fetching origin/$SOURCE_BRANCH tip $FRESH_BRANCH_TIP for preserved head $EXPECTED_HEAD; see viable/$WORKSTREAM_ID-branch-fetch.txt, viable/$WORKSTREAM_ID-open-prs.json, and viable/$WORKSTREAM_ID-pr-blocker.txt." \
+      "Open PR ambiguity for preserved head $EXPECTED_HEAD before any source-branch verification; see viable/$WORKSTREAM_ID-branch-fetch.txt, viable/$WORKSTREAM_ID-open-prs.json, and viable/$WORKSTREAM_ID-pr-blocker.txt." \
       "Blocked: multiple open PRs claim $SOURCE_BRANCH."
     exit 0
     ;;
 esac
 ```
 
-If `PR_COUNT=1`, verify the candidate PR before adopting it: first fetch the
-exact expected source branch from `origin` and record the freshly fetched tip
-in `viable/$WORKSTREAM_ID-branch-fetch.txt`. Then require `.state=OPEN`,
+If `PR_COUNT=0`, do not fetch the source branch; record in
+`viable/$WORKSTREAM_ID-branch-fetch.txt` that the exact-head query found no
+candidate and continue directly to Step 2's issue reuse or creation flow. If
+`PR_COUNT=1`, verify the candidate PR before adopting it: fetch the exact
+expected source branch from `origin`, record the freshly fetched tip in
+`viable/$WORKSTREAM_ID-branch-fetch.txt`, then require `.state=OPEN`,
 `headRefName=$SOURCE_BRANCH`, `headRepositoryOwner.login=OpenCoven`,
 `isCrossRepository=false`, `baseRefName=main`, and `headRefOid` equal to that
 freshly fetched branch tip. Only after the PR head matches the authoritative
@@ -922,9 +932,11 @@ with `git merge-base --is-ancestor`; equality or ancestry is acceptable, but a
 diverged local head blocks adoption. Record the preserved local head, fresh
 branch tip, PR head, and ancestry result in
 `viable/$WORKSTREAM_ID-pr-adoption.txt`, and record `continue existing PR`
-only after all of those checks pass. If `gh pr view` fails because the
-candidate disappears or cannot be read after `gh pr list`, if the branch fetch
-fails, or if any other identity or ancestry check fails, write
+only after all of those checks pass. If `PR_COUNT>1`, block immediately with
+open-PR evidence because the exact-head query is already ambiguous. If
+`gh pr view` fails because the candidate disappears or cannot be read after
+`gh pr list`, if the single-candidate branch fetch fails, or if any other
+identity or ancestry check fails, write
 `viable/$WORKSTREAM_ID-pr-blocker.txt`, update the classification row to
 `blocked`, and stop that row only after the blocker evidence is persisted.
 This deterministically avoids duplicating possibly delivered work while still
@@ -933,14 +945,16 @@ beyond the preserved local snapshot. A later rerun must reclassify against
 current main and GitHub history before deciding whether any replacement issue
 or PR is still needed. Continue to Step 2 only when `PR_COUNT=0`.
 
-Expected: every viable row has an evidence-backed authoritative-source-branch
-fetch and a `main`-targeting PR decision before issue reuse or creation
-begins. If `docs/psyche-specs` still has exactly one open PR from branch
-`docs/psyche-specs` at execution time, its `headRefOid` matches the freshly
-fetched `origin/docs/psyche-specs` tip, and the preserved local `head.txt` is
-equal to or an ancestor of that PR head, this step adopts the
-exact-source-branch PR that GitHub returns at that moment rather than
-hardcoding a PR number.
+Expected: every viable row records the exact-head open-PR query before any
+issue reuse or creation begins. Rows with one candidate add an evidence-backed
+authoritative-source-branch fetch and a `main`-targeting PR decision; rows
+with zero candidates skip fetch and continue normally; rows with multiple
+candidates block before branch verification. If `docs/psyche-specs` still has
+exactly one open PR from branch `docs/psyche-specs` at execution time, its
+`headRefOid` matches the freshly fetched `origin/docs/psyche-specs` tip, and
+the preserved local `head.txt` is equal to or an ancestor of that PR head,
+this step adopts the exact-source-branch PR that GitHub returns at that moment
+rather than hardcoding a PR number.
 
 - [ ] **Step 2: Reuse or create one issue per viable row that does not already have an adopted PR**
 
@@ -1498,9 +1512,10 @@ update_classification_row \
 ```
 
 Expected: every viable row either continues one adopted exact-source-branch
-open pull request or rewrites its ledger row to stay `viable` with one
-verified OPEN recovery PR URL from the expected current-main recovery branch
-before Task 7 cleanup or Task 9 audit begins.
+open pull request after the single-candidate verification flow, or rewrites
+its ledger row to stay `viable` with one verified OPEN recovery PR URL from
+the expected current-main recovery branch after the zero-candidate normal
+flow, before Task 7 cleanup or Task 9 audit begins.
 
 ### Task 6: Record Non-Viable Outcomes
 
