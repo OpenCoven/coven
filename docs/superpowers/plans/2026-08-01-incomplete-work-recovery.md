@@ -35,7 +35,7 @@
   - Ref-preserving archive for each orphan branch.
 - Modify: `.copilot/goals.md`
   - Reconcile active goals after all classification and delivery outcomes are
-    known. This file is intentionally git-excluded.
+    known. Keep this as a local untracked file.
 - Create only when the matching workstream is viable:
   - `docs/superpowers/specs/2026-08-01-mobile-pairing-recovery-design.md`
   - `docs/superpowers/plans/2026-08-01-mobile-pairing-recovery.md`
@@ -93,11 +93,10 @@ Run:
 
 ```bash
 cd /tmp/coven-issue-541
-git commit -m "docs: plan incomplete work recovery"
+git commit -s -m "docs: plan incomplete work recovery"
 ```
 
-Expected: a commit containing only the implementation plan and the
-session-required Copilot co-author trailer.
+Expected: a commit containing only the implementation plan.
 
 - [ ] **Step 4: Push the design branch**
 
@@ -143,6 +142,7 @@ Run:
 ```bash
 COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
+git -C "$REPO" fetch origin main
 RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
 mkdir -p "$RECOVERY/dirty" "$RECOVERY/branches"
 printf 'id\ttype\tsource\thead\tmerge_base\tsnapshot\n' > "$RECOVERY/manifest.tsv"

@@ -25,12 +25,15 @@ requests, active claims, stashes, or session todos predating this recovery.
 
 Dirty worktrees:
 
-- `docs/psyche-specs`: Psyche product, technical, parity, threat-model,
-  prerequisites, and plan documents.
-- `feat/cmem-1ev-memory-promote`: memory promotion authority, CLI wiring,
-  privacy tooling, CI, and security documentation.
-- `feat/mobile-memory-gateway`: an uncommitted mobile pairing change.
-- `fix/476-review-threads`: Cave/runtime parity design and implementation plans.
+- `docs/psyche-specs` (`.worktrees/docs-psyche-specs`): Psyche product,
+  technical, parity, threat-model, prerequisites, and plan documents.
+- `feat/cmem-1ev-memory-promote` (`.worktrees/feat-cmem-1ev-memory-promote`):
+  memory promotion authority, CLI wiring, privacy tooling, CI, and security
+  documentation.
+- `feat/mobile-memory-gateway` (`.worktrees/mobile-memory-gateway`): an
+  uncommitted mobile pairing change.
+- `fix/476-review-threads` (`.worktrees/pr-476-review`): Cave/runtime parity
+  design and implementation plans.
 
 Clean orphan branches without open pull requests:
 
