@@ -24,8 +24,12 @@
   - `.git/agent-recovery/issue-541/viable/<workstream-id>-open-prs.json`
   - `.git/agent-recovery/issue-541/viable/<workstream-id>-pr-view.json`
   - `.git/agent-recovery/issue-541/viable/<workstream-id>-issue-search.json`
+  - `.git/agent-recovery/issue-541/viable/<workstream-id>-issue-search-exact-open.json`
   - `.git/agent-recovery/issue-541/viable/<workstream-id>-issue-view.json`
-  - Exact-head open-PR and issue-search evidence for each viable workstream.
+  - `.git/agent-recovery/issue-541/viable/<workstream-id>-pr-blocker.txt`
+  - `.git/agent-recovery/issue-541/viable/<workstream-id>-issue-blocker.txt`
+  - Exact-head open-PR evidence, exact-open issue-match evidence, and blocker
+    evidence for each viable workstream.
 - Create: `.git/agent-recovery/issue-541/dirty/docs-psyche-specs/`
 - Create: `.git/agent-recovery/issue-541/dirty/memory-promote/`
 - Create: `.git/agent-recovery/issue-541/dirty/mobile-memory-gateway/`
@@ -42,7 +46,13 @@
 - Create: `.git/agent-recovery/issue-541/branches/docs-universal-runtime-capability-design.bundle`
 - Create: `.git/agent-recovery/issue-541/branches/feat-npm-macos-x64.bundle`
 - Create: `.git/agent-recovery/issue-541/branches/fix-521-ward-surface-confinement.bundle`
+- Create: `.git/agent-recovery/issue-541/branches/docs-universal-runtime-capability-design/`
+- Create: `.git/agent-recovery/issue-541/branches/feat-npm-macos-x64/`
+- Create: `.git/agent-recovery/issue-541/branches/fix-521-ward-surface-confinement/`
   - Ref-preserving archive for each orphan branch.
+  - Exact `branch.txt`, `head.txt`, and `merge-base.txt` snapshots for each
+    orphan branch so later PR identity checks use the preserved source head
+    rather than a mutable local ref.
 - Modify: `.copilot/goals.md`
   - Reconcile active goals after all classification and delivery outcomes are
     known. Keep this as a local untracked file.
@@ -391,6 +401,15 @@ copied path, and an empty inventory passes.
 - Create: `.git/agent-recovery/issue-541/branches/docs-universal-runtime-capability-design.bundle`
 - Create: `.git/agent-recovery/issue-541/branches/feat-npm-macos-x64.bundle`
 - Create: `.git/agent-recovery/issue-541/branches/fix-521-ward-surface-confinement.bundle`
+- Create: `.git/agent-recovery/issue-541/branches/docs-universal-runtime-capability-design/branch.txt`
+- Create: `.git/agent-recovery/issue-541/branches/docs-universal-runtime-capability-design/head.txt`
+- Create: `.git/agent-recovery/issue-541/branches/docs-universal-runtime-capability-design/merge-base.txt`
+- Create: `.git/agent-recovery/issue-541/branches/feat-npm-macos-x64/branch.txt`
+- Create: `.git/agent-recovery/issue-541/branches/feat-npm-macos-x64/head.txt`
+- Create: `.git/agent-recovery/issue-541/branches/feat-npm-macos-x64/merge-base.txt`
+- Create: `.git/agent-recovery/issue-541/branches/fix-521-ward-surface-confinement/branch.txt`
+- Create: `.git/agent-recovery/issue-541/branches/fix-521-ward-surface-confinement/head.txt`
+- Create: `.git/agent-recovery/issue-541/branches/fix-521-ward-surface-confinement/merge-base.txt`
 
 - [ ] **Step 1: Create ref-preserving bundles**
 
@@ -400,6 +419,10 @@ Run:
 COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
+mkdir -p \
+  "$RECOVERY/branches/docs-universal-runtime-capability-design" \
+  "$RECOVERY/branches/feat-npm-macos-x64" \
+  "$RECOVERY/branches/fix-521-ward-surface-confinement"
 git -C "$REPO" bundle create \
   "$RECOVERY/branches/docs-universal-runtime-capability-design.bundle" \
   docs/universal-runtime-capability-design
@@ -411,7 +434,7 @@ git -C "$REPO" bundle create \
   fix/521-ward-surface-confinement
 ```
 
-Expected: three bundle files are created.
+Expected: three bundle files and three metadata directories are created.
 
 - [ ] **Step 2: Verify each bundle**
 
@@ -428,7 +451,7 @@ git -C "$REPO" bundle verify "$RECOVERY/branches/fix-521-ward-surface-confinemen
 
 Expected: Git reports each bundle is okay and lists its branch ref.
 
-- [ ] **Step 3: Record the archived branches**
+- [ ] **Step 3: Record the archived branches and snapshot their exact heads**
 
 Run:
 
@@ -443,16 +466,23 @@ for entry in \
 do
   id=${entry%%|*}
   branch=${entry#*|}
+  mkdir -p "$RECOVERY/branches/$id"
+  printf '%s\n' "$branch" > "$RECOVERY/branches/$id/branch.txt"
+  git -C "$REPO" rev-parse "$branch" > "$RECOVERY/branches/$id/head.txt"
+  git -C "$REPO" merge-base "$branch" origin/main \
+    > "$RECOVERY/branches/$id/merge-base.txt"
   printf '%s\torphan-branch\t%s\t%s\t%s\t%s\n' \
     "$id" \
     "$branch" \
-    "$(git -C "$REPO" rev-parse "$branch")" \
-    "$(git -C "$REPO" merge-base "$branch" origin/main)" \
+    "$(cat "$RECOVERY/branches/$id/head.txt")" \
+    "$(cat "$RECOVERY/branches/$id/merge-base.txt")" \
     "$RECOVERY/branches/$id.bundle" >> "$RECOVERY/manifest.tsv"
 done
 ```
 
-Expected: `manifest.tsv` has seven data rows plus its header.
+Expected: `manifest.tsv` has seven data rows plus its header, and each orphan
+branch now has immutable `branch.txt`, `head.txt`, and `merge-base.txt`
+metadata beside its bundle.
 Every Task 3 `merge_base` value still uses the `origin/main` fetched in Task 2
 Step 1.
 
@@ -652,38 +682,72 @@ Set `WORKSTREAM_ID` to the viable row's exact workstream ID, then map it to its
 current source branch:
 
 ```bash
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+RECOVERY="$COMMON_DIR/agent-recovery/issue-541/viable"
+CLASSIFICATION="$COMMON_DIR/agent-recovery/issue-541/classification.md"
+mkdir -p "$RECOVERY"
+update_classification_row() {
+  python3 - "$CLASSIFICATION" "$WORKSTREAM_ID" "$1" "$2" "$3" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+workstream, classification, evidence, action = sys.argv[2:6]
+needle = f"| {workstream} |"
+lines = path.read_text().splitlines()
+for idx, line in enumerate(lines):
+    if line.startswith(needle):
+        parts = [part.strip() for part in line.strip().strip("|").split("|")]
+        if len(parts) != 5:
+            raise SystemExit(f"Unexpected classification row: {line}")
+        parts[1] = classification
+        parts[2] = evidence
+        parts[4] = action
+        lines[idx] = "| " + " | ".join(parts) + " |"
+        path.write_text("\n".join(lines) + "\n")
+        break
+else:
+    raise SystemExit(f"Missing classification row for {workstream}")
+PY
+}
 case "$WORKSTREAM_ID" in
   mobile-memory-gateway)
     SOURCE_BRANCH="feat/mobile-memory-gateway"
+    SOURCE_HEAD_FILE="$COMMON_DIR/agent-recovery/issue-541/dirty/mobile-memory-gateway/head.txt"
     ;;
   feat-npm-macos-x64)
     SOURCE_BRANCH="feat/npm-macos-x64"
+    SOURCE_HEAD_FILE="$COMMON_DIR/agent-recovery/issue-541/branches/feat-npm-macos-x64/head.txt"
     ;;
   fix-521-ward-surface-confinement)
     SOURCE_BRANCH="fix/521-ward-surface-confinement"
+    SOURCE_HEAD_FILE="$COMMON_DIR/agent-recovery/issue-541/branches/fix-521-ward-surface-confinement/head.txt"
     ;;
   memory-promote)
     SOURCE_BRANCH="feat/cmem-1ev-memory-promote"
+    SOURCE_HEAD_FILE="$COMMON_DIR/agent-recovery/issue-541/dirty/memory-promote/head.txt"
     ;;
   docs-psyche-specs)
     SOURCE_BRANCH="docs/psyche-specs"
+    SOURCE_HEAD_FILE="$COMMON_DIR/agent-recovery/issue-541/dirty/docs-psyche-specs/head.txt"
     ;;
   docs-universal-runtime-capability-design)
     SOURCE_BRANCH="docs/universal-runtime-capability-design"
+    SOURCE_HEAD_FILE="$COMMON_DIR/agent-recovery/issue-541/branches/docs-universal-runtime-capability-design/head.txt"
     ;;
   pr-476-review)
     SOURCE_BRANCH="fix/476-review-threads"
+    SOURCE_HEAD_FILE="$COMMON_DIR/agent-recovery/issue-541/dirty/pr-476-review/head.txt"
     ;;
   *)
     printf 'Unknown WORKSTREAM_ID: %s\n' "$WORKSTREAM_ID" >&2
     exit 1
     ;;
 esac
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
-RECOVERY="$COMMON_DIR/agent-recovery/issue-541/viable"
-mkdir -p "$RECOVERY"
 OPEN_PR_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-open-prs.json"
 PR_VIEW_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-pr-view.json"
+PR_BLOCKER_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-pr-blocker.txt"
+test -s "$SOURCE_HEAD_FILE"
 gh pr list \
   --repo OpenCoven/coven \
   --state open \
@@ -699,30 +763,74 @@ case "$PR_COUNT" in
   1)
     PR_NUMBER="$(jq -r '.[0].number' "$OPEN_PR_EVIDENCE")"
     gh pr view --repo OpenCoven/coven "$PR_NUMBER" \
-      --json number,title,url,state,headRefName,baseRefName > "$PR_VIEW_EVIDENCE"
+      --json number,title,url,state,headRefOid,headRefName,headRepositoryOwner,isCrossRepository,baseRefName \
+      > "$PR_VIEW_EVIDENCE"
+    EXPECTED_HEAD="$(tr -d '\n' < "$SOURCE_HEAD_FILE")"
+    ACTUAL_HEAD="$(jq -r '.headRefOid' "$PR_VIEW_EVIDENCE")"
+    ACTUAL_BRANCH="$(jq -r '.headRefName' "$PR_VIEW_EVIDENCE")"
+    ACTUAL_OWNER="$(jq -r '.headRepositoryOwner.login' "$PR_VIEW_EVIDENCE")"
+    ACTUAL_CROSS="$(jq -r '.isCrossRepository' "$PR_VIEW_EVIDENCE")"
+    if [ "$ACTUAL_HEAD" != "$EXPECTED_HEAD" ] || \
+       [ "$ACTUAL_BRANCH" != "$SOURCE_BRANCH" ] || \
+       [ "$ACTUAL_OWNER" != "OpenCoven" ] || \
+       [ "$ACTUAL_CROSS" != "false" ]; then
+      {
+        printf 'Blocked %s: candidate PR #%s failed identity checks.\n' \
+          "$WORKSTREAM_ID" "$PR_NUMBER"
+        printf 'Expected source head: %s\n' "$EXPECTED_HEAD"
+        printf 'Expected source branch: %s\n' "$SOURCE_BRANCH"
+        printf 'Expected owner/cross-repo: OpenCoven / false\n'
+        printf 'Actual head: %s\n' "$ACTUAL_HEAD"
+        printf 'Actual branch: %s\n' "$ACTUAL_BRANCH"
+        printf 'Actual owner: %s\n' "$ACTUAL_OWNER"
+        printf 'Actual cross-repo: %s\n' "$ACTUAL_CROSS"
+        printf 'Open PR evidence: viable/%s-open-prs.json\n' "$WORKSTREAM_ID"
+        printf 'PR view evidence: viable/%s-pr-view.json\n' "$WORKSTREAM_ID"
+      } > "$PR_BLOCKER_EVIDENCE"
+      update_classification_row \
+        "blocked" \
+        "PR identity mismatch; see viable/$WORKSTREAM_ID-open-prs.json, viable/$WORKSTREAM_ID-pr-view.json, and viable/$WORKSTREAM_ID-pr-blocker.txt." \
+        "Blocked: candidate PR failed exact-head SHA/branch/owner/repository validation."
+      exit 0
+    fi
+    PR_URL="$(jq -r '.url' "$PR_VIEW_EVIDENCE")"
+    update_classification_row \
+      "viable" \
+      "Exact-head PR verified via viable/$WORKSTREAM_ID-open-prs.json and viable/$WORKSTREAM_ID-pr-view.json." \
+      "continue existing PR #$PR_NUMBER ($PR_URL)"
+    exit 0
     ;;
   0)
     ;;
   *)
-    printf 'Blocked %s: expected 0 or 1 open PRs for head %s, found %s. Evidence: %s\n' \
-      "$WORKSTREAM_ID" "$SOURCE_BRANCH" "$PR_COUNT" "$OPEN_PR_EVIDENCE" >&2
-    exit 1
+    {
+      printf 'Blocked %s: expected 0 or 1 open PRs for head %s, found %s.\n' \
+        "$WORKSTREAM_ID" "$SOURCE_BRANCH" "$PR_COUNT"
+      printf 'Open PR evidence: viable/%s-open-prs.json\n' "$WORKSTREAM_ID"
+    } > "$PR_BLOCKER_EVIDENCE"
+    update_classification_row \
+      "blocked" \
+      "Open PR ambiguity; see viable/$WORKSTREAM_ID-open-prs.json and viable/$WORKSTREAM_ID-pr-blocker.txt." \
+      "Blocked: multiple open PRs claim $SOURCE_BRANCH."
+    exit 0
     ;;
 esac
 ```
 
-If `PR_COUNT=1`, verify the PR accurately owns the workstream, record its
-number and URL in the classification row's `Recovery action` as
-`continue existing PR`, and skip child issue, branch, worktree, claim, and PR
-creation for that row. If `PR_COUNT>1`, change that row to `blocked`, cite
-`$OPEN_PR_EVIDENCE`, and stop rather than guessing. If `PR_COUNT=0`, continue
-to Step 2.
+If `PR_COUNT=1`, verify the candidate PR before adopting it: `headRefOid` must
+equal the snapshotted source `head.txt`, `headRefName` must equal
+`$SOURCE_BRANCH`, `headRepositoryOwner.login` must equal `OpenCoven`, and
+`isCrossRepository` must be `false`. Record `continue existing PR` only after
+those checks pass. If `PR_COUNT>1`, or if the single candidate fails any
+identity check, write `viable/$WORKSTREAM_ID-pr-blocker.txt`, update the
+classification row to `blocked`, and stop that row without creating or
+adopting anything. Continue to Step 2 only when `PR_COUNT=0`.
 
 Expected: every viable row has an evidence-backed exact-head PR decision before
 issue reuse or creation begins. If `docs/psyche-specs` still has exactly one
-open PR from head `docs/psyche-specs` at execution time, this step adopts that
-live PR (currently #546) dynamically via the query result rather than
-hardcoding the number.
+open PR from head `docs/psyche-specs` at execution time and its identity checks
+pass, this step adopts whichever exact-source PR GitHub returns then rather
+than hardcoding a PR number.
 
 - [ ] **Step 2: Reuse or create one issue per viable row that does not already have an adopted PR**
 
@@ -730,6 +838,34 @@ Set `WORKSTREAM_ID` to the viable row's exact workstream ID, then use the
 matching exact issue title and search query:
 
 ```bash
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+RECOVERY="$COMMON_DIR/agent-recovery/issue-541/viable"
+CLASSIFICATION="$COMMON_DIR/agent-recovery/issue-541/classification.md"
+mkdir -p "$RECOVERY"
+update_classification_row() {
+  python3 - "$CLASSIFICATION" "$WORKSTREAM_ID" "$1" "$2" "$3" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+workstream, classification, evidence, action = sys.argv[2:6]
+needle = f"| {workstream} |"
+lines = path.read_text().splitlines()
+for idx, line in enumerate(lines):
+    if line.startswith(needle):
+        parts = [part.strip() for part in line.strip().strip("|").split("|")]
+        if len(parts) != 5:
+            raise SystemExit(f"Unexpected classification row: {line}")
+        parts[1] = classification
+        parts[2] = evidence
+        parts[4] = action
+        lines[idx] = "| " + " | ".join(parts) + " |"
+        path.write_text("\n".join(lines) + "\n")
+        break
+else:
+    raise SystemExit(f"Missing classification row for {workstream}")
+PY
+}
 case "$WORKSTREAM_ID" in
   mobile-memory-gateway)
     ISSUE_TITLE="Recover mobile pairing workstream"
@@ -764,28 +900,51 @@ case "$WORKSTREAM_ID" in
     exit 1
     ;;
 esac
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
-RECOVERY="$COMMON_DIR/agent-recovery/issue-541/viable"
-mkdir -p "$RECOVERY"
 ISSUE_SEARCH_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-issue-search.json"
+EXACT_OPEN_ISSUE_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-issue-search-exact-open.json"
 ISSUE_VIEW_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-issue-view.json"
+ISSUE_BLOCKER_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-issue-blocker.txt"
 gh issue list \
   --repo OpenCoven/coven \
   --state all \
   --search "$ISSUE_SEARCH" \
   --json number,title,url,state > "$ISSUE_SEARCH_EVIDENCE"
-ISSUE_COUNT="$(jq 'length' "$ISSUE_SEARCH_EVIDENCE")"
+jq --arg title "$ISSUE_TITLE" \
+  '[.[] | select(.title == $title and .state == "OPEN")]' \
+  "$ISSUE_SEARCH_EVIDENCE" > "$EXACT_OPEN_ISSUE_EVIDENCE"
+ISSUE_COUNT="$(jq 'length' "$EXACT_OPEN_ISSUE_EVIDENCE")"
 ```
 
-If exactly one accurate issue already exists, reuse it without creating a
-duplicate:
+Broad search results are preserved for evidence, but only exact-title OPEN
+matches are reusable. A sole unrelated or closed search hit leaves
+`ISSUE_COUNT=0` and must not be reused.
+
+If exactly one exact-title OPEN issue already exists, reuse it without creating
+a duplicate:
 
 ```bash
 case "$ISSUE_COUNT" in
   1)
-    ISSUE_NUMBER="$(jq -r '.[0].number' "$ISSUE_SEARCH_EVIDENCE")"
+    ISSUE_NUMBER="$(jq -r '.[0].number' "$EXACT_OPEN_ISSUE_EVIDENCE")"
     gh issue view --repo OpenCoven/coven "$ISSUE_NUMBER" \
       --json number,state,title,url > "$ISSUE_VIEW_EVIDENCE"
+    if ! jq -e --arg title "$ISSUE_TITLE" \
+      '.title == $title and .state == "OPEN"' \
+      "$ISSUE_VIEW_EVIDENCE" > /dev/null
+    then
+      {
+        printf 'Blocked %s: issue #%s did not verify as exact-title OPEN.\n' \
+          "$WORKSTREAM_ID" "$ISSUE_NUMBER"
+        printf 'Broad issue evidence: viable/%s-issue-search.json\n' "$WORKSTREAM_ID"
+        printf 'Exact-open issue evidence: viable/%s-issue-search-exact-open.json\n' "$WORKSTREAM_ID"
+        printf 'Issue view evidence: viable/%s-issue-view.json\n' "$WORKSTREAM_ID"
+      } > "$ISSUE_BLOCKER_EVIDENCE"
+      update_classification_row \
+        "blocked" \
+        "Issue verification mismatch; see viable/$WORKSTREAM_ID-issue-search.json, viable/$WORKSTREAM_ID-issue-search-exact-open.json, viable/$WORKSTREAM_ID-issue-view.json, and viable/$WORKSTREAM_ID-issue-blocker.txt." \
+        "Blocked: candidate issue failed exact-title OPEN verification."
+      exit 0
+    fi
     ;;
 esac
 ```
@@ -827,15 +986,54 @@ EOF
     ISSUE_NUMBER="${ISSUE_URL##*/}"
     gh issue view --repo OpenCoven/coven "$ISSUE_NUMBER" \
       --json number,state,title,url > "$ISSUE_VIEW_EVIDENCE"
+    if ! jq -e --arg title "$ISSUE_TITLE" \
+      '.title == $title and .state == "OPEN"' \
+      "$ISSUE_VIEW_EVIDENCE" > /dev/null
+    then
+      {
+        printf 'Blocked %s: created issue #%s did not verify as exact-title OPEN.\n' \
+          "$WORKSTREAM_ID" "$ISSUE_NUMBER"
+        printf 'Broad issue evidence: viable/%s-issue-search.json\n' "$WORKSTREAM_ID"
+        printf 'Exact-open issue evidence: viable/%s-issue-search-exact-open.json\n' "$WORKSTREAM_ID"
+        printf 'Issue view evidence: viable/%s-issue-view.json\n' "$WORKSTREAM_ID"
+      } > "$ISSUE_BLOCKER_EVIDENCE"
+      update_classification_row \
+        "blocked" \
+        "Created issue verification mismatch; see viable/$WORKSTREAM_ID-issue-search.json, viable/$WORKSTREAM_ID-issue-search-exact-open.json, viable/$WORKSTREAM_ID-issue-view.json, and viable/$WORKSTREAM_ID-issue-blocker.txt." \
+        "Blocked: created issue did not verify as exact-title OPEN."
+      exit 0
+    fi
+    ;;
+  1)
+    ;;
+  *)
+    {
+      printf 'Blocked %s: expected 0 or 1 exact-title OPEN issues for %s, found %s.\n' \
+        "$WORKSTREAM_ID" "$ISSUE_TITLE" "$ISSUE_COUNT"
+      printf 'Broad issue evidence: viable/%s-issue-search.json\n' "$WORKSTREAM_ID"
+      printf 'Exact-open issue evidence: viable/%s-issue-search-exact-open.json\n' "$WORKSTREAM_ID"
+    } > "$ISSUE_BLOCKER_EVIDENCE"
+    update_classification_row \
+      "blocked" \
+      "Issue ambiguity; see viable/$WORKSTREAM_ID-issue-search.json, viable/$WORKSTREAM_ID-issue-search-exact-open.json, and viable/$WORKSTREAM_ID-issue-blocker.txt." \
+      "Blocked: multiple OPEN issues exactly match $ISSUE_TITLE."
+    exit 0
     ;;
 esac
+ISSUE_NUMBER="$(jq -r '.number' "$ISSUE_VIEW_EVIDENCE")"
+ISSUE_URL="$(jq -r '.url' "$ISSUE_VIEW_EVIDENCE")"
+update_classification_row \
+  "viable" \
+  "Issue verified via viable/$WORKSTREAM_ID-issue-search.json, viable/$WORKSTREAM_ID-issue-search-exact-open.json, and viable/$WORKSTREAM_ID-issue-view.json." \
+  "Recover via issue #$ISSUE_NUMBER ($ISSUE_URL)."
 ```
 
-If more than one issue matches, change that row to `blocked`, cite
-`$ISSUE_SEARCH_EVIDENCE`, and stop rather than choosing one arbitrarily.
+If `ISSUE_COUNT>1`, write `viable/$WORKSTREAM_ID-issue-blocker.txt`, update
+the row to `blocked`, and stop that row rather than choosing one arbitrarily.
 
 Expected: every viable row without an adopted PR has exactly one verified issue
-number, and every reuse or block decision cites a saved JSON evidence file.
+number, and every reuse, create, or block decision cites saved broad-search,
+exact-open-filter, and verification evidence files.
 
 - [ ] **Step 3: Create one approved design per viable issue**
 
