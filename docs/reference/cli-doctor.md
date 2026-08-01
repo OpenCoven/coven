@@ -38,11 +38,13 @@ found):
 }
 ```
 
-Absolute paths are replaced with stable role tokens such as `<coven-home>`,
-`<project>`, `<engine>`, and `<daemon-socket>`. This keeps repeated output
-comparable across machines and safer to attach to CI logs or bug reports. Run
-the prose form locally when you need the concrete paths. `project` is `null`
-when the command runs outside a project root.
+Known Doctor-owned absolute path roles are replaced with stable tokens such as
+`<coven-home>`, `<project>`, `<engine>`, `<daemon-socket>`, `<repo>`, and
+`<repos-config>`. This keeps repeated output comparable across machines and
+safer to attach to CI logs or bug reports without implying that arbitrary
+user-authored hint text is sanitized. Run the prose form locally when you need
+the concrete paths. `project` is `null` when the command runs outside a project
+root.
 
 Check `status` is `pass`, `warn`, or `fail`. Every `fail` is blocking — `ok`
 is false and the command exits 1 — while `warn` needs attention but does not

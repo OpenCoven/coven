@@ -1924,10 +1924,17 @@ impl DoctorJsonPathRedactor {
     fn new(report: &DoctorReport) -> Self {
         let mut replacements = Vec::new();
         let mut add_path = |path: &Path, token: String| {
-            // Only redact rooted paths with a component below the root. A
-            // one-character relative path or filesystem root would otherwise
-            // act like an unsafe global substring replacement.
-            if path.has_root() && path.components().count() > 1 {
+            // Only redact rooted paths with a normal component below the root.
+            // Checking components rather than their count rejects Unix `/`,
+            // Windows drive roots, and UNC share roots; prefix/root components
+            // alone would otherwise create an unsafe broad substring
+            // replacement. Root-relative Windows paths are still safe because
+            // the normal component keeps the replacement narrow.
+            if path.has_root()
+                && path
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::Normal(_)))
+            {
                 replacements.push((path.display().to_string(), token));
             }
         };
@@ -1941,7 +1948,10 @@ impl DoctorJsonPathRedactor {
             add_path(&engine.path, "<engine>".to_string());
         }
         for repo in &report.repos {
-            add_path(&repo.path, format!("<repo:{}>", repo.name));
+            // A path may be registered under multiple aliases. Keep the token
+            // path-scoped and neutral so insertion order cannot assign one
+            // alias's identity to another alias's check.
+            add_path(&repo.path, "<repo>".to_string());
         }
         if let Some(project_root) = &report.project_root {
             add_path(project_root, "<project>".to_string());
@@ -6282,6 +6292,54 @@ mod tests {
     }
 
     // --- doctor report/check unit tests ---
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_json_redactor_rejects_unix_root_replacements() {
+        let mut report = make_doctor_report();
+        report.home = PathBuf::from("/");
+
+        let redactor = DoctorJsonPathRedactor::new(&report);
+        assert!(
+            redactor.replacements.iter().all(|(path, _)| path != "/"),
+            "the Unix filesystem root must never become a global replacement"
+        );
+        assert_eq!(redactor.text("/var/lib/coven"), "/var/lib/coven");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn doctor_json_redactor_rejects_windows_drive_and_unc_roots() {
+        let mut drive_report = make_doctor_report();
+        drive_report.home = PathBuf::from(r"C:\");
+        let drive_redactor = DoctorJsonPathRedactor::new(&drive_report);
+        assert!(
+            drive_redactor
+                .replacements
+                .iter()
+                .all(|(path, _)| path != r"C:\"),
+            "a Windows drive root must never become a global replacement"
+        );
+        assert_eq!(
+            drive_redactor.text(r"C:\Users\example\project"),
+            r"C:\Users\example\project"
+        );
+
+        let mut unc_report = make_doctor_report();
+        unc_report.home = PathBuf::from(r"\\server\share\");
+        let unc_redactor = DoctorJsonPathRedactor::new(&unc_report);
+        assert!(
+            unc_redactor
+                .replacements
+                .iter()
+                .all(|(path, _)| path != r"\\server\share\"),
+            "a UNC share root must never become a global replacement"
+        );
+        assert_eq!(
+            unc_redactor.text(r"\\server\share\project"),
+            r"\\server\share\project"
+        );
+    }
 
     fn make_doctor_report() -> DoctorReport {
         DoctorReport {

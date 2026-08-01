@@ -26,9 +26,19 @@ fn isolated_doctor_command(
         .env("USERPROFILE", &fake_home)
         .env("PATH", OsString::new())
         .env("COVEN_ENGINE_BIN", root.join("missing-engine"))
+        .env_remove("COVEN_HARNESS_ADAPTER_MANIFEST")
         .env_remove("COVEN_HARNESS_ADAPTER_DIRS")
         .env_remove("COVEN_SETTINGS_PATH");
     command
+}
+
+fn toml_path(path: &Path) -> String {
+    format!(
+        "\"{}\"",
+        path.to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('\"', "\\\"")
+    )
 }
 
 fn assert_single_json_document(output: &Output) -> anyhow::Result<Value> {
@@ -49,6 +59,20 @@ fn doctor_json_is_stable_redacted_and_stdout_pure() -> anyhow::Result<()> {
     fs::create_dir_all(project.join(".git"))?;
     fs::create_dir_all(&coven_home)?;
     fs::create_dir_all(temp.path().join("user-home"))?;
+    let shared_repo = temp.path().join("private-shared-repo");
+    let missing_repo = temp.path().join("private-missing-repo");
+    fs::create_dir_all(shared_repo.join(".git"))?;
+    fs::write(
+        coven_home.join("repos.toml"),
+        format!(
+            "[repos.alias_a]\npath = {}\n\
+             [repos.alias_b]\npath = {}\n\
+             [repos.missing]\npath = {}\n",
+            toml_path(&shared_repo),
+            toml_path(&shared_repo),
+            toml_path(&missing_repo),
+        ),
+    )?;
 
     let first = isolated_doctor_command(
         temp.path(),
@@ -77,6 +101,27 @@ fn doctor_json_is_stable_redacted_and_stdout_pure() -> anyhow::Result<()> {
 
     let checks = first_json["checks"].as_array().expect("checks array");
     assert!(!checks.is_empty());
+    let check_ids: Vec<_> = checks
+        .iter()
+        .map(|check| check["id"].as_str().expect("check id"))
+        .collect();
+    assert_eq!(
+        check_ids,
+        vec![
+            "daemon",
+            "repo:alias_a",
+            "repo:alias_b",
+            "repo:missing",
+            "harness:codex",
+            "harness:claude",
+            "harness:coven-code",
+            "harness:copilot",
+            "harnesses",
+            "engine",
+            "familiars",
+        ],
+        "Doctor check ordering is part of the JSON compatibility contract"
+    );
     for check in checks {
         let check = check.as_object().expect("check object");
         assert!(check.get("id").is_some_and(Value::is_string));
@@ -87,6 +132,24 @@ fn doctor_json_is_stable_redacted_and_stdout_pure() -> anyhow::Result<()> {
             .is_some_and(|status| matches!(status, "pass" | "warn" | "fail")));
         assert!(check.get("hint").is_none_or(Value::is_string));
     }
+    for id in ["repo:alias_a", "repo:alias_b"] {
+        let check = checks
+            .iter()
+            .find(|check| check["id"] == id)
+            .expect("aliased repository check");
+        assert_eq!(check["status"], "pass");
+        assert_eq!(check["message"], "<repo>");
+    }
+    let missing = checks
+        .iter()
+        .find(|check| check["id"] == "repo:missing")
+        .expect("missing repository check");
+    assert_eq!(missing["status"], "fail");
+    assert_eq!(
+        missing["message"],
+        "<repo> is missing or not a git repository"
+    );
+    assert_eq!(missing["hint"], "fix the path in <repos-config>");
     assert!(first_json["nextSteps"]
         .as_array()
         .is_some_and(|steps| !steps.is_empty() && steps.iter().all(Value::is_string)));
