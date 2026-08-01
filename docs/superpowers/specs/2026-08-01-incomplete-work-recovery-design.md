@@ -67,11 +67,17 @@ its former location and archival time, then create a fresh current root at the
 same fixed path before writing any new manifest or snapshot. Publication and
 execution are driven from a controller worktree for
 `docs/541-incomplete-work-recovery-design` that is discovered with `git worktree
-list --porcelain` from any `OpenCoven/coven` worktree or, when absent, created
-under the repo-local `.worktrees/issue-541-recovery` convention after verifying
-`.worktrees/` is ignored. Every operational command block re-derives
-`CONTROL_WORKTREE`, `COMMON_DIR`, and `REPO` instead of assuming a fixed local
-path or persistent shell variables. For each source worktree, store its current
+list --porcelain` from any `OpenCoven/coven` worktree or, when absent,
+recreated at the deterministic repo-local `.worktrees/issue-541-recovery`
+location after verifying `.worktrees/` is ignored. A discovered registration
+whose directory no longer exists is treated as stale/absent rather than as an
+immediate hard failure; the recovery may use the minimal documented
+`git worktree add --force` exception only when that missing registration is
+proven stale and the controller branch is not present in any live worktree.
+Every operational command block re-derives `CONTROL_WORKTREE`, `COMMON_DIR`,
+and `REPO` instead of assuming a fixed local path or persistent shell
+variables, and every recreated controller path is re-verified on the exact
+branch before the plan continues. For each source worktree, store its current
 state even if it is now clean because its changes were already committed to an
 active pull request:
 
@@ -109,7 +115,12 @@ contracts. Assign one classification:
   human authority decision.
 
 Classification uses semantic comparison, not commit ancestry alone, because
-squash merges make many merged branches appear unmerged.
+squash merges make many merged branches appear unmerged. Branch commit/stat/
+cherry evidence also uses a fixed seven-row map from workstream IDs to the
+preserved `head.txt` files captured in the dirty-worktree and orphan-branch
+snapshots. Before any comparison runs, each referenced SHA must still verify as
+a commit and its paired bundle must still verify, so the source side remains
+immutable even if a live local branch later moves.
 
 ### 3. Recover viable concerns in isolation
 
@@ -258,12 +269,26 @@ python scripts/check-secrets.py
 python3 scripts/check-coven-privacy.py --staged
 ```
 
-Changes to npm or TypeScript packages also run:
+Use repository-native npm and Node validation based on the touched paths:
 
-```sh
-npm run build
-npm test
-```
+- If `packages/channels` is touched, run `npm ci`, `npm run build`, and
+  `npm test` with `working-directory=packages/channels` (or the exact
+  `npm --prefix packages/channels ...` equivalents).
+- If npm CLI wrapper or platform packaging is touched (`packages/cli`,
+  `npm/coven`, platform package manifests, or the publish/prepublish scripts),
+  run the supported `node scripts/test-cli-prepublish.mjs` smoke for the
+  affected target and pair it with the matching release build plus the cargo
+  gates above. The current supported matrix is
+  `macos`/`aarch64-apple-darwin`, `linux-x64`/`x86_64-unknown-linux-gnu`, and
+  `windows`/`x86_64-pc-windows-msvc`. For the Intel macOS recovery row, keep
+  using `--target=macos` unless the child design intentionally introduces a new
+  target contract.
+- If `packages/openclaw-coven` is touched, run `npm install` and
+  `npm exec vitest run` with `working-directory=packages/openclaw-coven`.
+  Do not claim nonexistent package-local build or test scripts there.
+- `packages/cli` and `npm/coven` have no package-local `npm run build` or
+  `npm test` scripts; validate them through the prepublish smoke and the
+  relevant Node tests that it already executes.
 
 Documentation-only pull requests run repository-provided documentation checks
 when present, plus the secret and staged privacy guards. The privacy guard runs

@@ -4,7 +4,7 @@
 
 **Goal:** Preserve and classify every discovered local workstream, recover each viable concern through its own issue and implementation plan, and safely remove only proven stale residue.
 
-**Architecture:** Use the repository's shared Git common directory as a non-worktree recovery archive with a fixed current-run root at `agent-recovery/issue-541` and immutable private rerun archives for older runs. Discover or create the controller worktree for `docs/541-incomplete-work-recovery-design` through repo-local worktree conventions rather than a fixed machine path, then run a preservation and classification phase before any cleanup and hand each viable subsystem to an isolated issue/spec/plan/PR flow based on current `origin/main`.
+**Architecture:** Use the repository's shared Git common directory as a non-worktree recovery archive with a fixed current-run root at `agent-recovery/issue-541` and immutable private rerun archives for older runs. Resolve the controller worktree for `docs/541-incomplete-work-recovery-design` through a resilient repo-local helper that treats registered-but-missing paths as stale, recreates `.worktrees/issue-541-recovery` only for the exact existing branch, and uses `git worktree add --force` only when that missing registration is proven stale and the branch is not live anywhere else. Classification evidence compares current `origin/main` against immutable preserved snapshot-head SHAs rather than mutable live branch names before any cleanup or child PR work begins.
 
 **Tech Stack:** Git worktrees and bundles, GitHub CLI, Coven claims, Markdown recovery ledger, Rust/Cargo, npm, repository secret and privacy guards.
 
@@ -55,11 +55,15 @@
   - Byte-for-byte pre-removal proof artifacts regenerated from the live source
     worktree before any forced removal.
 - Create only when Task 4 Step 2 runs:
+  - `.git/agent-recovery/issue-541/<workstream-id>-commits.txt`
+  - `.git/agent-recovery/issue-541/<workstream-id>-stat.txt`
+  - `.git/agent-recovery/issue-541/<workstream-id>-cherry.txt`
   - `.git/agent-recovery/issue-541/<workstream-id>-worktree-evidence.txt`
   - `.git/agent-recovery/issue-541/<workstream-id>-index-evidence.txt`
   - `.git/agent-recovery/issue-541/<workstream-id>-untracked-evidence.json`
   - `.git/agent-recovery/issue-541/<workstream-id>-ignored-evidence.json`
-  - Readable tracked-change summaries plus JSON-escaped untracked and ignored
+  - Immutable preserved-head commit lists, diff stats, and cherry evidence plus
+    readable tracked-change summaries and JSON-escaped untracked and ignored
     inventory evidence copied from the preserved snapshots for later
     classification and cleanup checks.
 - Create only when Task 2 Step 1 reruns after a prior current root exists:
@@ -138,49 +142,87 @@ Run:
 
 ```bash
 set -euo pipefail
-CONTROL_BRANCH="docs/541-incomplete-work-recovery-design"
 START_COMMON_DIR="$(git rev-parse --git-common-dir)"
 REPO="$(cd "$START_COMMON_DIR/.." && pwd)"
 coven claim status
 gh pr list --repo OpenCoven/coven --state open --limit 100
-CONTROL_WORKTREE="$(
-  git -C "$REPO" worktree list --porcelain | awk -v branch="refs/heads/$CONTROL_BRANCH" '
-    $1 == "worktree" { path = substr($0, 10) }
-    $1 == "branch" && $2 == branch { print path; exit }
-  '
-)"
-if test -z "$CONTROL_WORKTREE"; then
-  if ! git -C "$REPO" check-ignore -q .worktrees/; then
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
+    exit 1
+  fi
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
     exit 1
   fi
-  if ! git -C "$REPO" check-ignore -q .worktrees/issue-541-recovery; then
-    printf 'Repository-local control worktree path is not ignored: %s\n' \
-      '.worktrees/issue-541-recovery' >&2
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
     exit 1
   fi
-  mkdir -p "$REPO/.worktrees"
-  CONTROL_WORKTREE="$REPO/.worktrees/issue-541-recovery"
-  if test -e "$CONTROL_WORKTREE"; then
-    printf 'Control worktree path already exists without a branch registration: %s\n' \
-      "$CONTROL_WORKTREE" >&2
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$REPO" show-ref --verify --quiet "refs/heads/$CONTROL_BRANCH"; then
-    git -C "$REPO" fetch origin "$CONTROL_BRANCH:$CONTROL_BRANCH"
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  git -C "$REPO" worktree add "$CONTROL_WORKTREE" "$CONTROL_BRANCH"
-fi
-if ! test -d "$CONTROL_WORKTREE"; then
-  printf 'Control worktree path is not present: %s\n' "$CONTROL_WORKTREE" >&2
-  exit 1
-fi
-ACTUAL_BRANCH="$(git -C "$CONTROL_WORKTREE" branch --show-current)"
-if test "$ACTUAL_BRANCH" != "$CONTROL_BRANCH"; then
-  printf 'Control worktree branch mismatch: expected %s, got %s\n' \
-    "$CONTROL_BRANCH" "$ACTUAL_BRANCH" >&2
-  exit 1
-fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 (
   cd "$CONTROL_WORKTREE"
@@ -189,16 +231,20 @@ COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 git -C "$CONTROL_WORKTREE" status --short --branch
 printf 'CONTROL_WORKTREE=%s\nCOMMON_DIR=%s\nREPO=%s\n' \
   "$CONTROL_WORKTREE" "$COMMON_DIR" "$REPO"
+
 ```
 
 Expected: from any `OpenCoven/coven` worktree, the shared claim registry and
 open PR set are reviewed first; `git worktree list --porcelain` discovers an
-existing linked controller for branch `docs/541-incomplete-work-recovery-design`
-or, if none exists, the operator verifies `.worktrees/` is ignored and creates
-a deterministic repo-local controller worktree at
-`.worktrees/issue-541-recovery` from the existing or freshly fetched branch
-without creating a duplicate branch. `CONTROL_WORKTREE`, `COMMON_DIR`, and
-`REPO` are printed explicitly, `CONTROL_WORKTREE` is verified to be on
+existing linked controller for branch
+`docs/541-incomplete-work-recovery-design`; if the discovered registration
+points at a missing directory, the helper treats it as stale/absent instead of
+failing immediately. The deterministic repo-local controller
+`.worktrees/issue-541-recovery` is recreated only for the exact existing branch
+and only with the minimal `git worktree add --force` exception when that stale
+registration is proven missing and no live worktree still has the branch;
+otherwise the step blocks. `CONTROL_WORKTREE`, `COMMON_DIR`, and `REPO` are
+printed explicitly, the resolved or recreated controller path is verified on
 `docs/541-incomplete-work-recovery-design`, `issue-541` is acquired from that
 controller worktree, and `git status --short --branch` there shows only the
 plan file untracked before it is staged.
@@ -210,21 +256,79 @@ instead of assuming shell variables persist:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -245,21 +349,79 @@ Run:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -281,21 +443,79 @@ Run:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -322,21 +542,79 @@ Run:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -353,21 +631,79 @@ Run:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -402,21 +738,79 @@ Run:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -458,21 +852,79 @@ Run:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -536,21 +988,79 @@ Run:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -613,21 +1123,79 @@ Run:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -689,21 +1257,79 @@ Run:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -764,21 +1390,79 @@ Run:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -891,21 +1575,79 @@ Run:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -935,21 +1677,79 @@ Run:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -969,149 +1769,104 @@ Run:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
-for entry in \
-  'docs-universal-runtime-capability-design|docs/universal-runtime-capability-design' \
-  'feat-npm-macos-x64|feat/npm-macos-x64' \
-  'fix-521-ward-surface-confinement|fix/521-ward-surface-confinement'
-do
-  id=${entry%%|*}
-  branch=${entry#*|}
-  mkdir -p "$RECOVERY/branches/$id"
-  printf '%s\n' "$branch" > "$RECOVERY/branches/$id/branch.txt"
-  git -C "$REPO" rev-parse "$branch" > "$RECOVERY/branches/$id/head.txt"
-  git -C "$REPO" merge-base "$branch" origin/main \
-    > "$RECOVERY/branches/$id/merge-base.txt"
-  printf '%s\torphan-branch\t%s\t%s\t%s\t%s\n' \
-    "$id" \
-    "$branch" \
-    "$(cat "$RECOVERY/branches/$id/head.txt")" \
-    "$(cat "$RECOVERY/branches/$id/merge-base.txt")" \
-    "$RECOVERY/branches/$id.bundle" >> "$RECOVERY/manifest.tsv"
-done
-```
-
-Expected: `manifest.tsv` has seven data rows plus its header, and each orphan
-branch now has immutable `branch.txt`, `head.txt`, and `merge-base.txt`
-metadata beside its bundle.
-Every Task 3 `merge_base` value still uses the `origin/main` fetched in Task 2
-Step 1.
-
-### Task 4: Build the Classification Ledger
-
-**Artifacts:**
-- Create: `.git/agent-recovery/issue-541/classification.md`
-
-- [ ] **Step 1: Capture branch and GitHub evidence**
-
-Run:
-
-```bash
-resolve_control_worktree() {
-  local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
-  start_common_dir="$(git rev-parse --git-common-dir)"
-  repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
-    exit 1
-  fi
-  printf '%s\n' "$control_worktree"
-}
-CONTROL_WORKTREE="$(resolve_control_worktree)"
-COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
-REPO="$(cd "$COMMON_DIR/.." && pwd)"
-RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
-git -C "$REPO" fetch origin main
-git -C "$REPO" --no-pager branch -vv > "$RECOVERY/branches.txt"
-git -C "$REPO" worktree list --porcelain > "$RECOVERY/worktrees.txt"
-cd "$REPO"
-coven claim status > "$RECOVERY/claims.txt"
-gh api --paginate --slurp \
-  "repos/OpenCoven/coven/pulls?state=all&per_page=100" \
-  > "$RECOVERY/pulls.json"
-gh api --paginate --slurp \
-  "repos/OpenCoven/coven/issues?state=all&per_page=100" \
-  > "$RECOVERY/issues.json"
-```
-
-Expected: all five evidence files exist and are non-empty, and both
-`pulls.json` and `issues.json` are valid paginated GitHub API JSON captures.
-Because the issues API returns both issues and pull requests, PR-specific
-classification must use `pulls.json` as the dedicated pull-request evidence
-source and treat `issues.json` as the broader issue-history ledger and the
-authoritative fully paginated source for later exact-title issue-reuse filters.
-
-- [ ] **Step 2: Compare each source with current main**
-
-Run:
-
-```bash
-resolve_control_worktree() {
-  local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
-  start_common_dir="$(git rev-parse --git-common-dir)"
-  repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
-    exit 1
-  fi
-  printf '%s\n' "$control_worktree"
-}
-CONTROL_WORKTREE="$(resolve_control_worktree)"
-COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
-REPO="$(cd "$COMMON_DIR/.." && pwd)"
-RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
-for branch in \
-  docs/psyche-specs \
-  docs/universal-runtime-capability-design \
-  feat/cmem-1ev-memory-promote \
-  feat/mobile-memory-gateway \
-  feat/npm-macos-x64 \
-  fix/476-review-threads \
-  fix/521-ward-surface-confinement
-do
-  id=$(printf '%s' "$branch" | tr '/' '-')
-  git -C "$REPO" --no-pager log --oneline --reverse \
-    "origin/main..$branch" > "$RECOVERY/$id-commits.txt"
-  git -C "$REPO" --no-pager diff --stat \
-    "origin/main...$branch" > "$RECOVERY/$id-stat.txt"
-  git -C "$REPO" cherry -v origin/main "$branch" \
-    > "$RECOVERY/$id-cherry.txt"
-done
+while IFS='|' read -r id branch preserved_head_source bundle_source; do
+  preserved_head_file="$RECOVERY/$preserved_head_source"
+  bundle_file="$RECOVERY/$bundle_source"
+  test -s "$preserved_head_file"
+  test -s "$bundle_file"
+  source_head="$(cat "$preserved_head_file")"
+  git -C "$REPO" cat-file -e "$source_head^{commit}"
+  git -C "$REPO" bundle verify "$bundle_file" > /dev/null
+  git -C "$REPO" --no-pager log --oneline --reverse "origin/main..$source_head" > "$RECOVERY/$id-commits.txt"
+  git -C "$REPO" --no-pager diff --stat "origin/main...$source_head" > "$RECOVERY/$id-stat.txt"
+  git -C "$REPO" cherry -v origin/main "$source_head" > "$RECOVERY/$id-cherry.txt"
+done <<'EOF'
+docs-psyche-specs|docs/psyche-specs|dirty/docs-psyche-specs/head.txt|dirty/docs-psyche-specs/branch.bundle
+docs-universal-runtime-capability-design|docs/universal-runtime-capability-design|branches/docs-universal-runtime-capability-design/head.txt|branches/docs-universal-runtime-capability-design.bundle
+memory-promote|feat/cmem-1ev-memory-promote|dirty/memory-promote/head.txt|dirty/memory-promote/branch.bundle
+mobile-memory-gateway|feat/mobile-memory-gateway|dirty/mobile-memory-gateway/head.txt|dirty/mobile-memory-gateway/branch.bundle
+feat-npm-macos-x64|feat/npm-macos-x64|branches/feat-npm-macos-x64/head.txt|branches/feat-npm-macos-x64.bundle
+pr-476-review|fix/476-review-threads|dirty/pr-476-review/head.txt|dirty/pr-476-review/branch.bundle
+fix-521-ward-surface-confinement|fix/521-ward-surface-confinement|branches/fix-521-ward-surface-confinement/head.txt|branches/fix-521-ward-surface-confinement.bundle
+EOF
 for id in \
   docs-psyche-specs \
   memory-promote \
@@ -1144,14 +1899,17 @@ do
 done
 ```
 
-Expected: the seven historical branch comparisons still provide complementary
-commit, stat, and cherry evidence, and the four dirty snapshots now each have
-reviewable worktree, index, untracked, and ignored evidence files, so branch
-evidence covers all seven branch-backed workstreams and dirty evidence
-complements the four dirty rows. Empty worktree and index snapshot classes
-remain valid because they emit deterministic sentinel lines, while empty
-untracked or ignored inventories remain valid because their copied JSON
-evidence files still contain readable `[]`.
+Expected: every preserved-head file in the seven-row map verifies as a commit,
+every paired bundle still verifies, and each `<workstream-id>-commits.txt`,
+`<workstream-id>-stat.txt`, and `<workstream-id>-cherry.txt` file is generated
+from that immutable preserved snapshot head SHA rather than from a mutable live
+branch name. The four dirty snapshots still produce reviewable worktree, index,
+untracked, and ignored evidence files, so branch evidence covers all seven
+branch-backed workstreams and dirty evidence complements the four dirty rows.
+Empty worktree and index snapshot classes remain valid because they emit
+deterministic sentinel lines, while empty untracked or ignored inventories
+remain valid because their copied JSON evidence files still contain readable
+`[]`.
 
 - [ ] **Step 3: Write the ledger with one evidence-backed row per workstream**
 
@@ -1223,21 +1981,79 @@ Run:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -1274,21 +2090,79 @@ current source branch:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -1673,21 +2547,79 @@ matching exact issue title:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -1978,11 +2910,34 @@ an approved and committed design document.
 
 Use the writing-plans workflow separately for each approved design that reached
 Step 3 without being blocked. Each plan must include exact paths, failing
-tests, targeted commands, full repository gates, commit boundaries, explicit
-`git commit -s` usage, the session-required Copilot co-author trailer on child
-commits, push, and PR creation. Human contributor `Co-authored-by:` trailers
-remain conditional under `AGENTS.md` and are separate from the required
-Copilot trailer.
+tests, targeted commands, the applicable repository-native npm/package commands
+below instead of root-level placeholders, full repository gates, commit
+boundaries, explicit `git commit -s` usage, the session-required Copilot
+co-author trailer on child commits, push, and PR creation. Human contributor
+`Co-authored-by:` trailers remain conditional under `AGENTS.md` and are
+separate from the required Copilot trailer.
+
+When a child recovery plan touches npm or Node-delivered surfaces, its gate
+section must use these repository-native commands:
+
+- `packages/channels`: `npm ci`, `npm run build`, and `npm test` in
+  `packages/channels` (or the exact `npm --prefix packages/channels ...`
+  equivalents).
+- npm CLI wrapper or platform packaging (`packages/cli`, `npm/coven`, platform
+  package manifests, or the publish/prepublish scripts): run the supported
+  `node scripts/test-cli-prepublish.mjs` smoke for the affected target and pair
+  it with the matching release build plus the repository cargo gates. The
+  supported matrix is `macos`/`aarch64-apple-darwin`,
+  `linux-x64`/`x86_64-unknown-linux-gnu`, and
+  `windows`/`x86_64-pc-windows-msvc`. For the Intel macOS recovery row, keep
+  using `--target=macos` unless the child design intentionally introduces a new
+  target contract.
+- `packages/openclaw-coven`: `npm install` and `npm exec vitest run` in
+  `packages/openclaw-coven`; do not claim nonexistent package-local build or
+  test scripts there.
+- `packages/cli` and `npm/coven` have no package-local `npm run build` or
+  `npm test` scripts; validate them through the prepublish smoke and the
+  relevant Node tests that it already executes.
 
 Every child plan must reuse this exact child-commit pattern, replacing only
 the commit message and adding any conditional human contributor trailers as
@@ -2021,21 +2976,79 @@ Then run:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -2159,21 +3172,79 @@ verify that PR before Task 7 cleanup or Task 9 audit continues:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -2341,21 +3412,79 @@ Run:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -2374,21 +3503,79 @@ Run:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -2414,21 +3601,79 @@ Check each known linked worktree:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -2452,21 +3697,79 @@ and remove the five clean worktrees:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -2507,21 +3810,79 @@ Run:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -2561,21 +3922,79 @@ exact-path force-removal exception:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -2732,21 +4151,79 @@ Run this immediately before `branch -d`:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -2838,21 +4315,79 @@ same branch-ref proof immediately before `branch -D`:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -2965,21 +4500,79 @@ stops or the full issue #541 recovery effort is complete:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -3003,21 +4596,79 @@ Run:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -3067,21 +4718,79 @@ Run:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -3107,21 +4816,79 @@ Run:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -3150,21 +4917,79 @@ For every `viable` row, set `PR_URL` to the recorded pull-request URL and run:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -3184,21 +5009,79 @@ Run:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -3321,21 +5204,79 @@ Run:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -3363,21 +5304,79 @@ Run:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -3410,21 +5409,79 @@ links, non-viable evidence, and remaining human blockers. Do not post
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
@@ -3445,21 +5502,79 @@ been safely preserved or cleaned:
 ```bash
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo control_worktree
+  local start_common_dir repo target_path path branch_ref live_path stale_path
+  local target_registration_branch actual_branch
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
-  control_worktree="$(
-    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = substr($0, 10) }
-      $1 == "branch" && $2 == branch { print path; exit }
-    '
-  )"
-  if test -z "$control_worktree"; then
-    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
-      "$control_branch" >&2
+  target_path="$repo/.worktrees/issue-541-recovery"
+  while IFS="$(printf "\t")" read -r path branch_ref; do
+    test -n "$path" || continue
+    if test "$path" = "$target_path"; then
+      target_registration_branch="$branch_ref"
+    fi
+    if test "$branch_ref" != "refs/heads/$control_branch"; then
+      continue
+    fi
+    if test -d "$path"; then
+      live_path="$path"
+    else
+      stale_path="$path"
+    fi
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain | awk '
+  $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
+  $1 == "branch" { branch = $2; next }
+  END { if (path != "") print path "\t" branch }
+')
+EOF
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+    printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  printf '%s\n' "$control_worktree"
+  if test -n "$live_path"; then
+    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
+      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
+      exit 1
+    fi
+    actual_branch="$(git -C "$live_path" branch --show-current)"
+    if test "$actual_branch" != "$control_branch"; then
+      printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+      exit 1
+    fi
+    printf '%s\n' "$live_path"
+    return 0
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$repo" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$repo/.worktrees"
+  if test -e "$target_path"; then
+    printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  fi
+  if test -n "$stale_path"; then
+    git -C "$repo" worktree add --force "$target_path" "$control_branch"
+  else
+    git -C "$repo" worktree add "$target_path" "$control_branch"
+  fi
+  if ! test -d "$target_path"; then
+    printf 'Control worktree path is not present after resolution: %s\n' "$target_path" >&2
+    exit 1
+  fi
+  actual_branch="$(git -C "$target_path" branch --show-current)"
+  if test "$actual_branch" != "$control_branch"; then
+    printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
