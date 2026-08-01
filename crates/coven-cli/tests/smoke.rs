@@ -488,6 +488,34 @@ fn doctor_json_passes_with_fake_harness_and_engine() -> anyhow::Result<()> {
         .find(|check| check["id"] == "harness:codex")
         .expect("doctor JSON should report harness:codex");
     assert_eq!(codex["status"], "pass");
+    assert!(
+        codex["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("executable is available")),
+        "harness discovery must describe executable availability only: {codex}"
+    );
+    let codex_auth = checks
+        .iter()
+        .find(|check| check["id"] == "credentials:codex")
+        .expect("doctor JSON should report the unverified Codex auth boundary");
+    assert_eq!(codex_auth["status"], "warn");
+    assert_eq!(
+        codex_auth["message"],
+        "executable available; authentication not verified"
+    );
+    let engine_auth = checks
+        .iter()
+        .find(|check| check["id"] == "credentials:engine")
+        .expect("doctor JSON should report the engine's local auth state");
+    assert_eq!(engine_auth["status"], "warn");
+    assert_eq!(
+        engine_auth["message"],
+        "authentication configured; provider turn not verified"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("logged in"),
+        "doctor must not turn local configuration evidence into a live-auth claim"
+    );
     Ok(())
 }
 
@@ -595,6 +623,25 @@ fn doctor_reports_no_familiars_when_manifest_absent() -> anyhow::Result<()> {
     assert_success("doctor without familiars", &output);
     assert_stdout_contains("doctor without familiars", &output, "none configured");
     assert_stdout_contains("doctor without familiars", &output, "familiars.toml");
+    assert_stdout_contains(
+        "doctor without familiars",
+        &output,
+        "`codex` executable is available",
+    );
+    assert_stdout_contains(
+        "doctor without familiars",
+        &output,
+        "authentication not verified",
+    );
+    assert_stdout_contains(
+        "doctor without familiars",
+        &output,
+        "provider turn not verified",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("logged in"),
+        "doctor must not turn local configuration evidence into a live-auth claim"
+    );
     Ok(())
 }
 
@@ -1394,7 +1441,17 @@ printf 'fake grok reply\n'
 /// healthy environment plant a fake alongside the fake harness.
 fn write_fake_coven_code(fake_bin: &Path) -> anyhow::Result<()> {
     let coven_code = fake_bin.join("coven-code");
-    fs::write(&coven_code, "#!/bin/sh\nexit 0\n")?;
+    fs::write(
+        &coven_code,
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf 'coven-code 0.6.1\n'
+elif [ "$1" = "auth" ] && [ "$2" = "status" ] && [ "$3" = "--json" ]; then
+  printf '{"loggedIn":true}\n'
+fi
+exit 0
+"#,
+    )?;
     let mut permissions = fs::metadata(&coven_code)?.permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&coven_code, permissions)?;

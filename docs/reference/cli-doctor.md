@@ -26,13 +26,14 @@ found):
 {
   "ok": true,
   "blocking": false,
-  "store": "/home/alex/.coven",
-  "project": "/home/alex/src/app",
+  "store": "/path/to/coven-home",
+  "project": "/path/to/project",
   "checks": [
-    { "id": "daemon", "status": "pass", "message": "running (pid 12345, socket /home/alex/.coven/coven.sock)" },
-    { "id": "harness:codex", "status": "pass", "message": "`codex` is ready (built-in)" },
-    { "id": "harnesses", "status": "pass", "message": "1 of 3 configured harnesses available" },
-    { "id": "engine", "status": "pass", "message": "/home/alex/.coven/engine/bin/coven-code (managed install), version 0.6.1 (pin 0.6.1)" }
+    { "id": "daemon", "status": "pass", "message": "running (pid 12345, socket /path/to/coven-home/coven.sock)" },
+    { "id": "harness:codex", "status": "pass", "message": "`codex` executable is available (built-in)" },
+    { "id": "harnesses", "status": "pass", "message": "1 of 3 configured harness executables available" },
+    { "id": "engine", "status": "pass", "message": "/path/to/coven-home/engine/bin/coven-code (managed install), version 0.6.1 (pin 0.6.1)" },
+    { "id": "credentials:codex", "status": "warn", "message": "executable available; authentication not verified", "hint": "verify with: codex login" }
   ],
   "nextSteps": ["coven run codex \"explain this repo in 5 bullets\"", "coven sessions"]
 }
@@ -59,6 +60,7 @@ availability, where any missing adapter is a `fail`.
 | `Daemon` | Whether the background daemon is stopped, running, or stale. |
 | `Repos` | Configured repositories from Coven repo settings, if present. |
 | `Harnesses` | Supported harness executables that are visible on this shell's `PATH`. |
+| `Credentials` | Local engine auth configuration and explicit `authentication not verified` rows for external harnesses. Doctor never starts a provider turn or reads harness credentials. |
 | `Familiars` | Configured familiar identities from `familiars.toml`, if present. |
 | `Next steps` | The safest next command based on the detected state. |
 
@@ -110,7 +112,7 @@ coven daemon status --json
 Typical human output from `coven daemon status`:
 
 ```text
-Coven daemon: running (pid 12345, socket /home/alex/.coven/coven.sock)
+Coven daemon: running (pid 12345, socket /path/to/coven-home/coven.sock)
 ```
 
 `not running` means no background daemon is running yet. Start it with:
@@ -139,8 +141,9 @@ blocking problem:
 - `coven-code` is missing
 
 A missing harness prints a `[!!]` line with an install hint but does not fail
-the check while another harness is available — one working harness makes Coven
-usable.
+the check while another harness executable is available. Executable discovery
+does not prove provider authentication; verify that separately with the
+harness's own login/status command or an explicitly authorized test turn.
 
 `coven adapter doctor` is stricter about its own subject: it exits `1` if any
 listed adapter is unavailable. `coven wt --doctor` exits `1` when managed hooks

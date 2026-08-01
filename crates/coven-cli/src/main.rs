@@ -1794,19 +1794,21 @@ fn print_doctor_prose(report: &DoctorReport) {
 
     println!("\nHarnesses:");
     for harness in &report.harnesses {
-        let status = if harness.available {
-            "ready"
-        } else {
-            "missing"
-        };
         let marker = if harness.available { "OK" } else { "!!" };
-        println!(
-            "  [{marker}] {:<18} `{}` is {status} ({})",
-            harness.label,
-            harness.executable,
-            adapter_source_label(&harness.source)
-        );
-        if !harness.available {
+        if harness.available {
+            println!(
+                "  [{marker}] {:<18} `{}` executable is available ({})",
+                harness.label,
+                harness.executable,
+                adapter_source_label(&harness.source)
+            );
+        } else {
+            println!(
+                "  [{marker}] {:<18} `{}` is missing ({})",
+                harness.label,
+                harness.executable,
+                adapter_source_label(&harness.source)
+            );
             println!("       {}", harness.install_hint);
         }
     }
@@ -1960,7 +1962,10 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
         checks.push(if harness.available {
             DoctorCheck::pass(
                 format!("harness:{}", harness.id),
-                format!("`{}` is ready ({})", harness.executable, harness.source),
+                format!(
+                    "`{}` executable is available ({})",
+                    harness.executable, harness.source
+                ),
             )
         } else {
             DoctorCheck::warn(
@@ -1979,7 +1984,7 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
         DoctorCheck::pass(
             "harnesses",
             format!(
-                "{available} of {} configured harnesses available",
+                "{available} of {} configured harness executables available",
                 report.harnesses.len()
             ),
         )
@@ -2045,16 +2050,47 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
 
     if let Some(auth) = report.engine_auth {
         checks.push(match auth {
-            Some(true) => DoctorCheck::pass("credentials:engine", "logged in"),
+            Some(true) => DoctorCheck::warn(
+                "credentials:engine",
+                "authentication configured; provider turn not verified",
+                Some("run an explicitly authorized test turn to verify provider access".to_string()),
+            ),
             Some(false) => DoctorCheck::warn(
                 "credentials:engine",
-                "not logged in",
+                "authentication not configured",
                 Some(
                     "set ANTHROPIC_API_KEY, authenticate Claude Code, or configure OAuth then run: coven auth login"
                         .to_string(),
                 ),
             ),
-            None => DoctorCheck::warn("credentials:engine", "auth check skipped", None),
+            None => DoctorCheck::warn(
+                "credentials:engine",
+                "authentication status unavailable; provider turn not verified",
+                None,
+            ),
+        });
+    }
+
+    for harness in report
+        .harnesses
+        .iter()
+        .filter(|harness| harness.id != engine::ENGINE_HARNESS_ID)
+    {
+        checks.push(if harness.available {
+            DoctorCheck::warn(
+                format!("credentials:{}", harness.id),
+                "executable available; authentication not verified",
+                Some(format!(
+                    "verify with: {}",
+                    login_hint_for_harness(&harness.id)
+                )),
+            )
+        } else {
+            DoctorCheck::warn(
+                format!("credentials:{}", harness.id),
+                "authentication not checked because the executable is missing",
+                Some(harness.install_hint.trim().to_string()),
+            )
         });
     }
 
@@ -2756,10 +2792,11 @@ fn engine_source_label(source: &engine::EngineSource) -> &'static str {
     }
 }
 
-/// Query the engine's auth state via `auth status --json`, bounded to ~5s so a
-/// hung engine never hangs `coven doctor`. Returns `Some(logged_in)` on a clean
-/// parse, or `None` if the check couldn't be completed (spawn/timeout/parse
-/// failure) — the caller treats `None` as a skipped, non-blocking check.
+/// Query the engine's local auth state via `auth status --json`, bounded to ~5s
+/// so a hung engine never hangs `coven doctor`. Returns `Some(configured)` only
+/// when the JSON value agrees with the engine contract's exit status (0 for
+/// configured, 1 for not configured). This is local configuration evidence,
+/// not proof that a provider turn succeeds.
 fn engine_auth_summary(binary: &Path) -> Option<bool> {
     use std::io::Read;
     use std::process::Stdio;
@@ -2773,9 +2810,9 @@ fn engine_auth_summary(binary: &Path) -> Option<bool> {
         .ok()?;
 
     let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
@@ -2786,23 +2823,34 @@ fn engine_auth_summary(binary: &Path) -> Option<bool> {
             }
             Err(_) => return None,
         }
-    }
+    };
 
     // `auth status --json` output is a few hundred bytes — far under the pipe
     // buffer — so reading after exit cannot deadlock.
     let mut buf = String::new();
     child.stdout.take()?.read_to_string(&mut buf).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&buf).ok()?;
-    json.get("loggedIn")?.as_bool()
+    parse_engine_auth_summary(status.code(), &buf)
+}
+
+/// Parse only the engine's boolean auth summary and reject contradictory
+/// status/output pairs. Additional fields are deliberately ignored so Doctor
+/// never forwards provider metadata or credential material.
+fn parse_engine_auth_summary(exit_code: Option<i32>, stdout: &str) -> Option<bool> {
+    let json: serde_json::Value = serde_json::from_str(stdout).ok()?;
+    let configured = json.get("loggedIn")?.as_bool()?;
+    match (exit_code, configured) {
+        (Some(0), true) | (Some(1), false) => Some(configured),
+        _ => None,
+    }
 }
 
 /// Pure formatter for the "Credentials:" section of `coven doctor`.
 ///
 /// `engine_auth` is:
 /// - `None`          — engine binary is missing; skip engine auth row entirely
-/// - `Some(None)`    — engine present but auth probe returned no result (skipped)
-/// - `Some(Some(true))`  — engine present and logged in
-/// - `Some(Some(false))` — engine present but not logged in
+/// - `Some(None)`    — engine present but local auth status is unavailable
+/// - `Some(Some(true))`  — engine reports local authentication configured
+/// - `Some(Some(false))` — engine reports local authentication not configured
 ///
 /// Harnesses with `id == "coven-code"` are skipped (that is the engine, shown above).
 ///
@@ -2820,15 +2868,21 @@ fn credentials_lines(
                 .push("  [!!] Coven Code (engine) — missing; see Engine section above".to_string());
         }
         Some(Some(true)) => {
-            lines.push("  [OK] Coven Code (engine) — logged in".to_string());
+            lines.push(
+                "  [--] Coven Code (engine) — authentication configured; provider turn not verified"
+                    .to_string(),
+            );
         }
         Some(Some(false)) => {
             lines.push(
-                "  [!!] Coven Code (engine) — not logged in; set ANTHROPIC_API_KEY, use Claude Code, or configure OAuth".to_string(),
+                "  [!!] Coven Code (engine) — authentication not configured; set ANTHROPIC_API_KEY, use Claude Code, or configure OAuth".to_string(),
             );
         }
         Some(None) => {
-            lines.push("  [--] Coven Code (engine) — auth check skipped".to_string());
+            lines.push(
+                "  [--] Coven Code (engine) — authentication status unavailable; provider turn not verified"
+                    .to_string(),
+            );
         }
     }
 
@@ -2840,7 +2894,7 @@ fn credentials_lines(
         if h.available {
             let login_hint = login_hint_for_harness(&h.id);
             lines.push(format!(
-                "  [OK] {} — available; authenticate with `{}`",
+                "  [--] {} — executable available; authentication not verified; verify with `{}`",
                 h.label, login_hint
             ));
         } else {
@@ -6130,18 +6184,32 @@ mod tests {
     }
 
     #[test]
-    fn credentials_lines_engine_logged_in() {
+    fn credentials_lines_engine_configured_does_not_claim_a_provider_turn() {
         let lines = credentials_lines(Some(Some(true)), &[]);
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("logged in"), "got: {}", lines[0]);
-        assert!(lines[0].contains("[OK]"), "got: {}", lines[0]);
+        assert!(
+            lines[0].contains("authentication configured"),
+            "got: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("provider turn not verified"),
+            "got: {}",
+            lines[0]
+        );
+        assert!(lines[0].contains("[--]"), "got: {}", lines[0]);
+        assert!(!lines[0].contains("logged in"), "got: {}", lines[0]);
     }
 
     #[test]
-    fn credentials_lines_engine_not_logged_in() {
+    fn credentials_lines_engine_not_configured() {
         let lines = credentials_lines(Some(Some(false)), &[]);
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("not logged in"), "got: {}", lines[0]);
+        assert!(
+            lines[0].contains("authentication not configured"),
+            "got: {}",
+            lines[0]
+        );
         assert!(lines[0].contains("ANTHROPIC_API_KEY"), "got: {}", lines[0]);
         assert!(lines[0].contains("Claude Code"), "got: {}", lines[0]);
         assert!(lines[0].contains("[!!]"), "got: {}", lines[0]);
@@ -6194,11 +6262,47 @@ mod tests {
     }
 
     #[test]
-    fn credentials_lines_engine_auth_skipped() {
+    fn credentials_lines_engine_auth_unavailable() {
         let lines = credentials_lines(Some(None), &[]);
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("skipped"), "got: {}", lines[0]);
+        assert!(lines[0].contains("status unavailable"), "got: {}", lines[0]);
+        assert!(
+            lines[0].contains("provider turn not verified"),
+            "got: {}",
+            lines[0]
+        );
         assert!(lines[0].contains("[--]"), "got: {}", lines[0]);
+    }
+
+    #[test]
+    fn engine_auth_summary_requires_consistent_contract_output() {
+        let configured =
+            parse_engine_auth_summary(Some(0), r#"{"loggedIn":true,"account":"private-sentinel"}"#);
+        assert_eq!(configured, Some(true));
+        assert!(
+            credentials_lines(Some(configured), &[])
+                .iter()
+                .all(|line| !line.contains("private-sentinel")),
+            "Doctor must reduce engine output to the boolean boundary"
+        );
+        assert_eq!(
+            parse_engine_auth_summary(Some(1), r#"{"loggedIn":false}"#),
+            Some(false)
+        );
+        assert_eq!(
+            parse_engine_auth_summary(Some(1), r#"{"loggedIn":true}"#),
+            None,
+            "a contradictory exit status must not be presented as authenticated"
+        );
+        assert_eq!(
+            parse_engine_auth_summary(Some(0), r#"{"loggedIn":"yes"}"#),
+            None
+        );
+        assert_eq!(parse_engine_auth_summary(Some(0), "not-json"), None);
+        assert_eq!(
+            parse_engine_auth_summary(None, r#"{"loggedIn":true}"#),
+            None
+        );
     }
 
     #[test]
@@ -6335,7 +6439,7 @@ mod tests {
     }
 
     #[test]
-    fn doctor_passing_report_keeps_daemon_and_credentials_checks() {
+    fn doctor_passing_report_keeps_authentication_checks_non_blocking_and_unverified() {
         let body = doctor_json_body(&make_doctor_report());
         assert_eq!(body["ok"], serde_json::json!(true));
         assert_eq!(body["blocking"], serde_json::json!(false));
@@ -6356,7 +6460,20 @@ mod tests {
             .iter()
             .find(|check| check["id"] == "credentials:engine")
             .expect("credentials:engine check");
-        assert_eq!(credentials["status"], "pass");
+        assert_eq!(credentials["status"], "warn");
+        assert_eq!(
+            credentials["message"],
+            "authentication configured; provider turn not verified"
+        );
+        let codex_credentials = checks
+            .iter()
+            .find(|check| check["id"] == "credentials:codex")
+            .expect("credentials:codex check");
+        assert_eq!(codex_credentials["status"], "warn");
+        assert_eq!(
+            codex_credentials["message"],
+            "executable available; authentication not verified"
+        );
         assert!(
             checks.iter().all(|check| check["status"] != "fail"),
             "healthy report must not contain fail checks"
@@ -6381,10 +6498,18 @@ mod tests {
         // engine row + 2 harness rows
         assert_eq!(lines.len(), 3);
         let codex_line = &lines[1];
-        assert!(codex_line.contains("[OK]"), "got: {codex_line}");
+        assert!(codex_line.contains("[--]"), "got: {codex_line}");
+        assert!(
+            codex_line.contains("authentication not verified"),
+            "got: {codex_line}"
+        );
         assert!(codex_line.contains("codex login"), "got: {codex_line}");
         let claude_line = &lines[2];
-        assert!(claude_line.contains("[OK]"), "got: {claude_line}");
+        assert!(claude_line.contains("[--]"), "got: {claude_line}");
+        assert!(
+            claude_line.contains("authentication not verified"),
+            "got: {claude_line}"
+        );
         assert!(claude_line.contains("claude doctor"), "got: {claude_line}");
     }
 
