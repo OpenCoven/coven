@@ -142,9 +142,9 @@ blocking problem:
 - a registered repo entry points at a missing or non-git path
 - `coven-code` is missing
 
-A missing harness prints a `[!!]` line with an install hint but does not fail
-the check while another harness is available — one working harness makes Coven
-usable.
+Each missing harness prints an advisory `[--]` line with an install hint. When
+none is available, Doctor adds a blocking `[!!] No supported harness is
+available` line and exits 1; one working harness keeps the aggregate usable.
 
 `coven adapter doctor` is stricter about its own subject: it exits `1` if any
 listed adapter is unavailable. `coven wt --doctor` exits `1` when managed hooks

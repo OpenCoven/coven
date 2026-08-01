@@ -1653,7 +1653,6 @@ struct DoctorReport {
     home: PathBuf,
     project_root: Option<PathBuf>,
     daemon: Option<daemon::DaemonStatusState>,
-    repos_config_path: PathBuf,
     repos: Vec<DoctorRepoReport>,
     harnesses: Vec<harness::HarnessSummary>,
     engine: Option<DoctorEngineReport>,
@@ -1667,6 +1666,7 @@ struct DoctorReport {
 struct DoctorRepoReport {
     name: String,
     path: PathBuf,
+    config_path: PathBuf,
     ok: bool,
 }
 
@@ -1694,20 +1694,42 @@ impl DoctorReport {
     }
 }
 
+fn doctor_repo_config_path(
+    name: &str,
+    legacy_path: &Path,
+    settings_path: Option<&Path>,
+    loaded_settings: Option<&settings::Settings>,
+) -> PathBuf {
+    if loaded_settings.is_some_and(|value| value.coven_cli.repos.contains_key(name)) {
+        settings_path.unwrap_or(legacy_path).to_path_buf()
+    } else {
+        legacy_path.to_path_buf()
+    }
+}
+
 fn gather_doctor_report() -> Result<DoctorReport> {
     let home = coven_home_dir()?;
     let project_root = std::env::current_dir()
         .ok()
         .and_then(|cwd| project::canonical_project_root(&cwd).ok());
     let daemon = daemon::background_server_status(&home)?;
+    let legacy_repos_config_path = repos_config::config_path(&home);
+    let settings_config_path = settings::user_settings_path();
     let repos_config = repos_config::load_with_settings(&home, settings::cached())?;
     let repos = repos_config
         .entries()
         .map(|(name, path)| {
             let ok = path.is_dir() && path.join(".git").exists();
+            let config_path = doctor_repo_config_path(
+                name,
+                &legacy_repos_config_path,
+                settings_config_path.as_deref(),
+                settings::cached(),
+            );
             DoctorRepoReport {
                 name: name.to_string(),
                 path,
+                config_path,
                 ok,
             }
         })
@@ -1730,7 +1752,6 @@ fn gather_doctor_report() -> Result<DoctorReport> {
     let familiars = cockpit_sources::read_familiars(&home).map_err(|err| format!("{err:#}"));
     Ok(DoctorReport {
         familiars_manifest: home.join("familiars.toml"),
-        repos_config_path: repos_config::config_path(&home),
         home,
         project_root,
         daemon,
@@ -1789,15 +1810,12 @@ fn print_doctor_prose(report: &DoctorReport) {
     }
 
     if !report.repos.is_empty() {
-        println!("\nRepos ({}):", report.repos_config_path.display());
+        println!("\nRepos:");
         for repo in &report.repos {
             let marker = if repo.ok { "OK" } else { "!!" };
             println!("  [{marker}] {:<16} {}", repo.name, repo.path.display());
             if !repo.ok {
-                println!(
-                    "       fix the path in {}",
-                    report.repos_config_path.display()
-                );
+                println!("       fix the path in {}", repo.config_path.display());
             }
         }
     }
@@ -1963,10 +1981,7 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
             DoctorCheck::fail(
                 format!("repo:{}", repo.name),
                 format!("{} is missing or not a git repository", repo.path.display()),
-                Some(format!(
-                    "fix the path in {}",
-                    report.repos_config_path.display()
-                )),
+                Some(format!("fix the path in {}", repo.config_path.display())),
             )
         });
     }
@@ -2049,7 +2064,10 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
                 "could not read {}: {error}",
                 report.familiars_manifest.display()
             ),
-            None,
+            Some(format!(
+                "fix access to or contents of {}, then rerun coven doctor",
+                report.familiars_manifest.display()
+            )),
         ),
         Ok(familiars) if familiars.is_empty() => DoctorCheck::pass(
             "familiars",
@@ -2119,7 +2137,11 @@ fn print_familiars_section(
         Ok(familiars) => familiars,
         Err(err) => {
             println!("\nFamiliars:");
-            println!("  !! could not read {}: {err}", manifest.display());
+            println!("  [--] could not read {}: {err}", manifest.display());
+            println!(
+                "       fix access to or contents of {}, then rerun coven doctor",
+                manifest.display()
+            );
             return;
         }
     };
@@ -6240,7 +6262,6 @@ mod tests {
                 started_at: "2026-01-01T00:00:00Z".to_string(),
                 socket: "/tmp/coven-home/coven.sock".to_string(),
             })),
-            repos_config_path: PathBuf::from("/tmp/coven-home/repos.toml"),
             repos: vec![],
             harnesses: vec![make_harness_with_hint("codex", true, "npm i -g codex")],
             engine: Some(DoctorEngineReport {
@@ -6273,6 +6294,7 @@ mod tests {
         bad_repo.repos.push(DoctorRepoReport {
             name: "openclaw".to_string(),
             path: PathBuf::from("/does/not/exist"),
+            config_path: PathBuf::from("/tmp/settings.json"),
             ok: false,
         });
 
@@ -6306,6 +6328,49 @@ mod tests {
                 "{label}: check statuses disagree with healthy()"
             );
         }
+    }
+
+    #[test]
+    fn doctor_bad_repo_hint_names_the_entrys_actual_config_source() {
+        let mut report = make_doctor_report();
+        report.repos.push(DoctorRepoReport {
+            name: "openclaw".to_string(),
+            path: PathBuf::from("/does/not/exist"),
+            config_path: PathBuf::from("/tmp/settings.json"),
+            ok: false,
+        });
+
+        let check = doctor_checks(&report)
+            .into_iter()
+            .find(|check| check.id == "repo:openclaw")
+            .expect("repo check");
+        assert_eq!(check.status, "fail");
+        assert_eq!(
+            check.hint.as_deref(),
+            Some("fix the path in /tmp/settings.json")
+        );
+    }
+
+    #[test]
+    fn doctor_repo_config_path_tracks_settings_overrides() {
+        let legacy = Path::new("/tmp/repos.toml");
+        let settings_path = Path::new("/tmp/settings.json");
+        let mut loaded = settings::Settings::default();
+        loaded.coven_cli.repos.insert(
+            "settings-repo".to_string(),
+            settings::RepoSettings {
+                path: PathBuf::from("/tmp/repo"),
+            },
+        );
+
+        assert_eq!(
+            doctor_repo_config_path("settings-repo", legacy, Some(settings_path), Some(&loaded)),
+            settings_path
+        );
+        assert_eq!(
+            doctor_repo_config_path("legacy-repo", legacy, Some(settings_path), Some(&loaded)),
+            legacy
+        );
     }
 
     #[test]
