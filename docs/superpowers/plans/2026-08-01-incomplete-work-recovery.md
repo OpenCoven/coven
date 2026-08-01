@@ -145,7 +145,7 @@ coven claim status
 gh pr list --repo OpenCoven/coven --state open --limit 100
 CONTROL_WORKTREE="$(
   git -C "$REPO" worktree list --porcelain | awk -v branch="refs/heads/$CONTROL_BRANCH" '
-    $1 == "worktree" { path = $2 }
+    $1 == "worktree" { path = substr($0, 10) }
     $1 == "branch" && $2 == branch { print path; exit }
   '
 )"
@@ -215,7 +215,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -250,7 +250,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -286,7 +286,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -327,7 +327,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -358,7 +358,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -407,7 +407,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -463,7 +463,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -541,7 +541,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -618,7 +618,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -694,7 +694,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -769,7 +769,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -896,7 +896,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -940,7 +940,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -974,7 +974,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -1033,7 +1033,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -1080,7 +1080,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -1228,7 +1228,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -1279,7 +1279,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -1678,7 +1678,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -2026,7 +2026,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -2164,7 +2164,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -2346,7 +2346,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -2379,7 +2379,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -2419,7 +2419,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -2457,7 +2457,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -2512,7 +2512,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -2566,7 +2566,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -2737,7 +2737,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -2843,7 +2843,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -2970,7 +2970,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -3008,7 +3008,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -3072,7 +3072,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -3112,7 +3112,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -3155,7 +3155,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -3189,7 +3189,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -3326,7 +3326,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -3368,7 +3368,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -3415,7 +3415,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
@@ -3450,7 +3450,7 @@ resolve_control_worktree() {
   repo="$(cd "$start_common_dir/.." && pwd)"
   control_worktree="$(
     git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
-      $1 == "worktree" { path = $2 }
+      $1 == "worktree" { path = substr($0, 10) }
       $1 == "branch" && $2 == branch { print path; exit }
     '
   )"
