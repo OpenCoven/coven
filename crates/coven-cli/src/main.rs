@@ -1644,9 +1644,8 @@ fn interactive_shell_route(
 
 /// Exits 1 when a blocking problem is found (stale daemon, broken registered
 /// repo, no harness available, missing coven-code) so scripts can gate on
-/// `coven doctor && …`. Individual missing harnesses print `[!!]` but don't
-/// fail the check while another harness is available — one working harness
-/// makes coven usable.
+/// `coven doctor && …`. Individual missing harnesses print advisory `[--]`
+/// rows; the aggregate `[!!]` row blocks only when none is available.
 /// Everything `coven doctor` inspects, gathered before rendering so the
 /// prose and `--json` surfaces read the same probe results and cannot drift.
 struct DoctorReport {
@@ -1784,27 +1783,49 @@ fn run_doctor(json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Keep Doctor's line-oriented prose safe even when a user-controlled config
+/// value contains terminal controls. Static line breaks are emitted by
+/// `println!`; embedded control characters are rendered visibly instead of
+/// being passed through to the terminal.
+fn doctor_prose_line(value: impl AsRef<str>) -> String {
+    let mut output = String::with_capacity(value.as_ref().len());
+    for character in value.as_ref().chars() {
+        if character.is_control() {
+            use std::fmt::Write as _;
+            write!(&mut output, "\\u{{{:x}}}", character as u32)
+                .expect("writing to a String cannot fail");
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
+fn print_doctor_line(value: impl AsRef<str>) {
+    println!("{}", doctor_prose_line(value));
+}
+
 fn print_doctor_prose(report: &DoctorReport) {
     println!("Coven doctor");
-    println!("Store: {}", report.home.display());
+    print_doctor_line(format!("Store: {}", report.home.display()));
     match &report.project_root {
-        Some(root) => println!("Project: {}", root.display()),
+        Some(root) => print_doctor_line(format!("Project: {}", root.display())),
         None => println!("Project: not inside a git/project root yet"),
     }
 
     println!("\nDaemon:");
     match &report.daemon {
         Some(daemon::DaemonStatusState::Running(status)) => {
-            println!(
+            print_doctor_line(format!(
                 "  [OK] Running (pid {}, socket {})",
                 status.pid, status.socket
-            );
+            ));
         }
         Some(daemon::DaemonStatusState::Stale(status)) => {
-            println!(
+            print_doctor_line(format!(
                 "  [!!] Stale (pid {}, socket {}) — run: coven daemon restart",
                 status.pid, status.socket
-            );
+            ));
         }
         None => println!("  [--] Not running — run: coven daemon start"),
     }
@@ -1813,9 +1834,16 @@ fn print_doctor_prose(report: &DoctorReport) {
         println!("\nRepos:");
         for repo in &report.repos {
             let marker = if repo.ok { "OK" } else { "!!" };
-            println!("  [{marker}] {:<16} {}", repo.name, repo.path.display());
+            print_doctor_line(format!(
+                "  [{marker}] {:<16} {}",
+                repo.name,
+                repo.path.display()
+            ));
             if !repo.ok {
-                println!("       fix the path in {}", repo.config_path.display());
+                print_doctor_line(format!(
+                    "       fix the path in {}",
+                    repo.config_path.display()
+                ));
             }
         }
     }
@@ -1830,14 +1858,14 @@ fn print_doctor_prose(report: &DoctorReport) {
         // A single missing harness is advisory while another harness is
         // available. The aggregate row below is the blocking condition.
         let marker = if harness.available { "OK" } else { "--" };
-        println!(
+        print_doctor_line(format!(
             "  [{marker}] {:<18} `{}` is {status} ({})",
             harness.label,
             harness.executable,
             adapter_source_label(&harness.source)
-        );
+        ));
         if !harness.available {
-            println!("       {}", harness.install_hint);
+            print_doctor_line(format!("       {}", harness.install_hint));
         }
     }
     if !report.harnesses.iter().any(|harness| harness.available) {
@@ -1847,7 +1875,11 @@ fn print_doctor_prose(report: &DoctorReport) {
     println!("\nEngine:");
     match &report.engine {
         Some(engine) => {
-            println!("  [OK] {} ({})", engine.path.display(), engine.source_label);
+            print_doctor_line(format!(
+                "  [OK] {} ({})",
+                engine.path.display(),
+                engine.source_label
+            ));
             match engine.version {
                 Some(version) => {
                     let (a, b, c) = version;
@@ -1876,12 +1908,12 @@ fn print_doctor_prose(report: &DoctorReport) {
 
     println!("\nCredentials:");
     for line in credentials_lines(report.engine_auth, &report.harnesses) {
-        println!("{line}");
+        print_doctor_line(line);
     }
 
     println!("\nNext steps:");
     for line in doctor_next_steps(report.default_harness.as_deref()) {
-        println!("  {line}");
+        print_doctor_line(format!("  {line}"));
     }
 }
 
@@ -2137,18 +2169,21 @@ fn print_familiars_section(
         Ok(familiars) => familiars,
         Err(err) => {
             println!("\nFamiliars:");
-            println!("  [--] could not read {}: {err}", manifest.display());
-            println!(
+            print_doctor_line(format!(
+                "  [--] could not read {}: {err}",
+                manifest.display()
+            ));
+            print_doctor_line(format!(
                 "       fix access to or contents of {}, then rerun coven doctor",
                 manifest.display()
-            );
+            ));
             return;
         }
     };
 
     if familiars.is_empty() {
         println!("\nFamiliars:");
-        println!("  none configured ({})", manifest.display());
+        print_doctor_line(format!("  none configured ({})", manifest.display()));
         println!(
             "  Declare [[familiar]] entries there, then run with \
              `coven run <harness> --familiar <id> \"...\"`."
@@ -2156,7 +2191,8 @@ fn print_familiars_section(
         return;
     }
 
-    println!("\nFamiliars ({}):", manifest.display());
+    println!();
+    print_doctor_line(format!("Familiars ({}):", manifest.display()));
     let id_width = familiars
         .iter()
         .map(|familiar| familiar.id.len())
@@ -2168,10 +2204,10 @@ fn print_familiars_section(
         } else {
             format!(" — {}", familiar.role)
         };
-        println!(
+        print_doctor_line(format!(
             "  {:<id_width$} {}{}  (memory: {})",
             familiar.id, familiar.display_name, role, familiar.memory_freshness
-        );
+        ));
     }
 }
 

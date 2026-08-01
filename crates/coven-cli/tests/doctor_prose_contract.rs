@@ -101,3 +101,37 @@ fn doctor_prose_markers_match_json_severity_and_are_ansi_free() -> anyhow::Resul
     assert_eq!(repeated.stdout, prose_text.as_bytes());
     Ok(())
 }
+
+#[test]
+fn doctor_prose_escapes_terminal_controls_from_familiar_config() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let project = temp.path().join("project");
+    let coven_home = temp.path().join("coven-home");
+    fs::create_dir_all(project.join(".git"))?;
+    fs::create_dir_all(&coven_home)?;
+    fs::create_dir_all(temp.path().join("user-home"))?;
+    fs::write(
+        coven_home.join("familiars.toml"),
+        r#"[[familiar]]
+id = "wren"
+display_name = "Wr\u001ben"
+role = "Research\u009ber"
+description = "Exercises terminal-control escaping."
+"#,
+    )?;
+
+    let output = isolated_doctor_command(
+        temp.path(),
+        &project,
+        &coven_home,
+        &["--color=always", "doctor"],
+    )
+    .output()?;
+    assert_blocking_exit(&output);
+    let prose = String::from_utf8(output.stdout)?;
+    assert!(!prose.contains('\u{1b}'));
+    assert!(!prose.contains('\u{009b}'));
+    assert!(prose.contains(r"Wr\u{1b}en"), "{prose:?}");
+    assert!(prose.contains(r"Research\u{9b}er"), "{prose:?}");
+    Ok(())
+}
