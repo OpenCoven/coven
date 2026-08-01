@@ -111,10 +111,11 @@ Run:
 cd /tmp/coven-issue-541
 gh pr create \
   --title "docs: design incomplete work recovery" \
-  --body $'Closes #541\n\nDefines a preservation-first process for recovering dirty worktrees and orphan branches without losing data or duplicating shipped work.\n\nThe implementation is deliberately split into one issue/spec/plan/PR per viable subsystem after snapshot and classification.'
+  --body $'Tracks #541\n\nDefines a preservation-first process for recovering dirty worktrees and orphan branches without losing data or duplicating shipped work.\n\nThe implementation is deliberately split into one issue/spec/plan/PR per viable subsystem after snapshot and classification.'
 ```
 
-Expected: GitHub returns the URL of one open pull request linked to issue #541.
+Expected: GitHub returns the URL of one open pull request tracking issue #541
+without auto-closing it.
 
 ### Task 2: Snapshot Every Dirty Worktree
 
@@ -406,9 +407,24 @@ do
   git -C "$REPO" cherry -v origin/main "$branch" \
     > "$RECOVERY/$id-cherry.txt"
 done
+for id in memory-promote mobile-memory-gateway
+do
+  SNAPSHOT="$RECOVERY/dirty/$id"
+  git apply --stat --summary "$SNAPSHOT/worktree.patch" \
+    > "$RECOVERY/$id-worktree-evidence.txt"
+  git apply --stat --summary "$SNAPSHOT/index.patch" \
+    > "$RECOVERY/$id-index-evidence.txt"
+  (
+    cd "$SNAPSHOT/untracked" &&
+    find . -type f | sed 's#^\./##' | LC_ALL=C sort
+  ) > "$RECOVERY/$id-untracked-evidence.txt"
+done
 ```
 
-Expected: each branch has commit, stat, and patch-equivalence evidence.
+Expected: each branch-backed source has commit, stat, and patch-equivalence
+evidence, and `memory-promote` plus `mobile-memory-gateway` each have
+reviewable worktree, index, and untracked evidence files, so evidence exists
+for all seven rows.
 
 - [ ] **Step 3: Write the ledger with one evidence-backed row per workstream**
 
