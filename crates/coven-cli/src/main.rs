@@ -1644,9 +1644,9 @@ fn interactive_shell_route(
 
 /// Exits 1 when a blocking problem is found (stale daemon, broken registered
 /// repo, no harness available, missing coven-code) so scripts can gate on
-/// `coven doctor && …`. Individual missing harnesses print `[!!]` but don't
-/// fail the check while another harness is available — one working harness
-/// makes coven usable.
+/// `coven doctor && …`. Individual missing harnesses print advisory `[--]`
+/// rows; when none is available, one aggregate `[!!]` row marks the blocking
+/// failure. One working harness makes coven usable.
 /// Everything `coven doctor` inspects, gathered before rendering so the
 /// prose and `--json` surfaces read the same probe results and cannot drift.
 struct DoctorReport {
@@ -1794,7 +1794,9 @@ fn print_doctor_prose(report: &DoctorReport) {
 
     println!("\nHarnesses:");
     for harness in &report.harnesses {
-        let marker = if harness.available { "OK" } else { "!!" };
+        // Individual missing harnesses are advisory. The aggregate condition
+        // below is the blocking failure when every supported harness is absent.
+        let marker = if harness.available { "OK" } else { "--" };
         if harness.available {
             println!(
                 "  [{marker}] {:<18} `{}` executable is available ({})",
@@ -1811,6 +1813,9 @@ fn print_doctor_prose(report: &DoctorReport) {
             );
             println!("       {}", harness.install_hint);
         }
+    }
+    if !report.harnesses.iter().any(|harness| harness.available) {
+        println!("  [!!] No supported harness is available");
     }
 
     println!("\nEngine:");
@@ -2081,8 +2086,8 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
                 format!("credentials:{}", harness.id),
                 "executable available; authentication not verified",
                 Some(format!(
-                    "verify with: {}",
-                    login_hint_for_harness(&harness.id)
+                    "authenticate or inspect local setup with: {}; verify provider access with an explicitly authorized test turn",
+                    auth_setup_hint_for_harness(&harness.id)
                 )),
             )
         } else {
@@ -2821,7 +2826,11 @@ fn engine_auth_summary(binary: &Path) -> Option<bool> {
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(_) => return None,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
         }
     };
 
@@ -2875,7 +2884,7 @@ fn credentials_lines(
         }
         Some(Some(false)) => {
             lines.push(
-                "  [!!] Coven Code (engine) — authentication not configured; set ANTHROPIC_API_KEY, use Claude Code, or configure OAuth".to_string(),
+                "  [--] Coven Code (engine) — authentication not configured; set ANTHROPIC_API_KEY, use Claude Code, or configure OAuth".to_string(),
             );
         }
         Some(None) => {
@@ -2892,10 +2901,10 @@ fn credentials_lines(
             continue;
         }
         if h.available {
-            let login_hint = login_hint_for_harness(&h.id);
+            let setup_hint = auth_setup_hint_for_harness(&h.id);
             lines.push(format!(
-                "  [--] {} — executable available; authentication not verified; verify with `{}`",
-                h.label, login_hint
+                "  [--] {} — executable available; authentication not verified; authenticate or inspect local setup with `{}`; verify provider access with an explicitly authorized test turn",
+                h.label, setup_hint
             ));
         } else {
             lines.push(format!(
@@ -2909,8 +2918,9 @@ fn credentials_lines(
     lines
 }
 
-/// Return the canonical "how to log in" command for a harness by id.
-fn login_hint_for_harness(harness_id: &str) -> &'static str {
+/// Return the canonical authentication or local-status command for a harness.
+/// Running this command is not proof that a provider turn will succeed.
+fn auth_setup_hint_for_harness(harness_id: &str) -> &'static str {
     match harness_id {
         "codex" => "codex login",
         "claude" => "claude doctor",
@@ -6212,7 +6222,12 @@ mod tests {
         );
         assert!(lines[0].contains("ANTHROPIC_API_KEY"), "got: {}", lines[0]);
         assert!(lines[0].contains("Claude Code"), "got: {}", lines[0]);
-        assert!(lines[0].contains("[!!]"), "got: {}", lines[0]);
+        assert!(lines[0].contains("[--]"), "got: {}", lines[0]);
+        assert!(
+            !lines[0].contains("[!!]"),
+            "non-blocking auth guidance must not look blocking: {}",
+            lines[0]
+        );
     }
 
     #[test]
@@ -6300,9 +6315,25 @@ mod tests {
         );
         assert_eq!(parse_engine_auth_summary(Some(0), "not-json"), None);
         assert_eq!(
+            parse_engine_auth_summary(Some(2), r#"{"loggedIn":false}"#),
+            None,
+            "non-contract exit codes must report auth status as unavailable"
+        );
+        assert_eq!(
             parse_engine_auth_summary(None, r#"{"loggedIn":true}"#),
             None
         );
+    }
+
+    #[test]
+    fn engine_auth_summary_returns_unavailable_when_spawn_fails() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let missing = temp_dir.path().join(if cfg!(windows) {
+            "missing-coven-code.exe"
+        } else {
+            "missing-coven-code"
+        });
+        assert_eq!(engine_auth_summary(&missing), None);
     }
 
     #[test]
@@ -6489,7 +6520,7 @@ mod tests {
     }
 
     #[test]
-    fn credentials_lines_available_harness_shows_login_hint() {
+    fn credentials_lines_available_harness_separates_setup_from_turn_verification() {
         let harnesses = vec![
             make_harness_with_hint("codex", true, "npm install -g @openai/codex"),
             make_harness_with_hint("claude", true, "npm install -g @anthropic-ai/claude-code"),
@@ -6504,6 +6535,10 @@ mod tests {
             "got: {codex_line}"
         );
         assert!(codex_line.contains("codex login"), "got: {codex_line}");
+        assert!(
+            codex_line.contains("explicitly authorized test turn"),
+            "got: {codex_line}"
+        );
         let claude_line = &lines[2];
         assert!(claude_line.contains("[--]"), "got: {claude_line}");
         assert!(
@@ -6511,6 +6546,10 @@ mod tests {
             "got: {claude_line}"
         );
         assert!(claude_line.contains("claude doctor"), "got: {claude_line}");
+        assert!(
+            claude_line.contains("explicitly authorized test turn"),
+            "got: {claude_line}"
+        );
     }
 
     #[test]

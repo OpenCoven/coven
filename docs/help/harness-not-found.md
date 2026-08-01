@@ -95,19 +95,23 @@ coven doctor
 
 If `coven doctor` says the harness executable is available but `coven run` exits
 immediately, the binary is visible but the provider CLI may not be authenticated.
-Run the provider setup command directly:
+Run the provider setup or local-status command directly:
 
 ```sh
 codex login
 claude doctor
 ```
 
-Then verify again:
+Then, when a provider call is explicitly authorized, verify access with a test
+turn:
 
 ```sh
-coven doctor
 coven run codex "say hello"
 ```
+
+Running `coven doctor` again can confirm executable discovery and local engine
+state, but it deliberately does not call a provider or prove the external
+harness is authenticated.
 
 ## Still failing
 

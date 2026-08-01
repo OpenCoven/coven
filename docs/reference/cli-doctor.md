@@ -33,7 +33,7 @@ found):
     { "id": "harness:codex", "status": "pass", "message": "`codex` executable is available (built-in)" },
     { "id": "harnesses", "status": "pass", "message": "1 of 3 configured harness executables available" },
     { "id": "engine", "status": "pass", "message": "/path/to/coven-home/engine/bin/coven-code (managed install), version 0.6.1 (pin 0.6.1)" },
-    { "id": "credentials:codex", "status": "warn", "message": "executable available; authentication not verified", "hint": "verify with: codex login" }
+    { "id": "credentials:codex", "status": "warn", "message": "executable available; authentication not verified", "hint": "authenticate or inspect local setup with: codex login; verify provider access with an explicitly authorized test turn" }
   ],
   "nextSteps": ["coven run codex \"explain this repo in 5 bullets\"", "coven sessions"]
 }
@@ -60,7 +60,7 @@ availability, where any missing adapter is a `fail`.
 | `Daemon` | Whether the background daemon is stopped, running, or stale. |
 | `Repos` | Configured repositories from Coven repo settings, if present. |
 | `Harnesses` | Supported harness executables that are visible on this shell's `PATH`. |
-| `Credentials` | Local engine auth configuration and explicit `authentication not verified` rows for external harnesses. Doctor never starts a provider turn or reads harness credentials. |
+| `Credentials` | Advisory local engine auth configuration and explicit `authentication not verified` rows for external harnesses. Doctor calls only the engine's contractually offline `auth status --json`; it never launches a provider harness, starts a provider turn, contacts a provider, or reads harness credentials. |
 | `Familiars` | Configured familiar identities from `familiars.toml`, if present. |
 | `Next steps` | The safest next command based on the detected state. |
 
@@ -140,10 +140,12 @@ blocking problem:
 - a registered repo entry points at a missing or non-git path
 - `coven-code` is missing
 
-A missing harness prints a `[!!]` line with an install hint but does not fail
-the check while another harness executable is available. Executable discovery
-does not prove provider authentication; verify that separately with the
-harness's own login/status command or an explicitly authorized test turn.
+Each missing harness prints an advisory `[--]` line with an install hint. When
+none is available, Doctor adds a blocking `[!!] No supported harness is
+available` line and exits 1; one working harness keeps the aggregate usable.
+Executable discovery does not prove provider authentication. A harness's own
+login/status command can configure or inspect local authentication, while only
+an explicitly authorized test turn verifies provider access.
 
 `coven adapter doctor` is stricter about its own subject: it exits `1` if any
 listed adapter is unavailable. `coven wt --doctor` exits `1` when managed hooks

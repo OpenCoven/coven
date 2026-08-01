@@ -31,7 +31,7 @@ For scripts, gate on the JSON envelope instead of scraping prose:
 coven doctor --json | jq -e '.ok'
 ```
 
-`doctor` checks the active `COVEN_HOME`, harness executable visibility in this shell, and daemon condition. You need at least one visible harness executable. Follow the per-harness hint it prints; provider authentication happens in the harness's own CLI, and Doctor reports it as unverified until you run a deliberate provider turn.
+`doctor` checks the active `COVEN_HOME`, harness executable visibility in this shell, and daemon condition. You need at least one visible harness executable. A per-harness login/status hint configures or inspects local authentication; it does not verify provider access. Doctor reports provider access as unverified until you run an explicitly authorized provider turn.
 
 ## 3. Start or verify the local daemon
 
