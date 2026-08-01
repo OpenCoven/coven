@@ -25,6 +25,10 @@
   - `.git/agent-recovery/issue-541/viable/<workstream-id>-open-prs.json`
   - `.git/agent-recovery/issue-541/viable/<workstream-id>-pr-view.json`
   - `.git/agent-recovery/issue-541/viable/<workstream-id>-pr-adoption.txt`
+  - `.git/agent-recovery/issue-541/viable/<workstream-id>-recovery-open-prs.json`
+  - `.git/agent-recovery/issue-541/viable/<workstream-id>-recovery-pr-view.json`
+  - `.git/agent-recovery/issue-541/viable/<workstream-id>-recovery-pr-adoption.txt`
+  - `.git/agent-recovery/issue-541/viable/<workstream-id>-recovery-branch-refs.txt`
   - `.git/agent-recovery/issue-541/viable/<workstream-id>-issue-search.json`
   - `.git/agent-recovery/issue-541/viable/<workstream-id>-issue-view.json`
   - `.git/agent-recovery/issue-541/viable/<workstream-id>-issue-postcondition.json`
@@ -37,7 +41,7 @@
   - Authoritative source-branch fetch evidence, open-PR evidence, verified
     same-repository candidate evidence, verified PR-view evidence,
     preserved-head adoption ancestry evidence plus dirty-snapshot emptiness
-    evidence when applicable,
+    evidence when applicable, exact recovery-branch rerun adoption evidence,
     per-workstream exact-title open issue-match evidence derived from paginated
     `issues.json`, blocker evidence for each viable workstream, the
     postcondition revalidation evidence saved after selecting or creating
@@ -50,6 +54,10 @@
     including missing-ref outcomes and drift blockers recorded immediately
     before each deletion command.
 - Create only when Task 8 Step 4 runs:
+  - `.git/agent-recovery/issue-541/private-retire-proof/<workstream-id>/live-origin-main.txt`
+  - `.git/agent-recovery/issue-541/private-retire-proof/<workstream-id>/live-non-viable-pr-view.json`
+  - `.git/agent-recovery/issue-541/private-retire-proof/<workstream-id>/live-non-viable-pr-view.err`
+  - `.git/agent-recovery/issue-541/private-retire-proof/<workstream-id>/live-non-viable-commit.txt`
   - `.git/agent-recovery/issue-541/private-retire-proof/<workstream-id>/live-head.txt`
   - `.git/agent-recovery/issue-541/private-retire-proof/<workstream-id>/live-worktree.patch`
   - `.git/agent-recovery/issue-541/private-retire-proof/<workstream-id>/live-index.patch`
@@ -58,8 +66,10 @@
   - `.git/agent-recovery/issue-541/private-retire-proof/<workstream-id>/live-untracked.tar`
   - `.git/agent-recovery/issue-541/private-retire-proof/<workstream-id>/live-ignored.zlist`
   - `.git/agent-recovery/issue-541/private-retire-proof/<workstream-id>/live-ignored.json`
-  - Byte-for-byte pre-removal proof artifacts regenerated from the live source
-    worktree before any forced removal.
+  - Freshly fetched `origin/main` proof plus merged-PR or exact-main-commit
+    verification artifacts, followed by byte-for-byte pre-removal proof
+    artifacts regenerated from the live source worktree before any forced
+    removal.
 - Create only when Task 4 Step 2 runs:
   - `.git/agent-recovery/issue-541/<workstream-id>-commits.txt`
   - `.git/agent-recovery/issue-541/<workstream-id>-stat.txt`
@@ -1953,16 +1963,35 @@ directly into each row. Use `Preserved source` values such as
 private snapshot artifacts. A row is not complete until another engineer can
 reproduce its classification from the cited source.
 
+For `already-shipped` and `superseded` rows, use a machine-verifiable
+non-viable contract:
+
+- `Main/PR evidence` must be exactly one of these:
+  - the raw canonical merged PR URL for `OpenCoven/coven`, for example
+    `https://github.com/OpenCoven/coven/pull/542`; or
+  - the exact 40-character commit SHA that is already reachable from current
+    `main`.
+- `Recovery action` must use semicolon-delimited `key=value` fields with one
+  of these deterministic forms:
+  - `mode=non-viable-proof; classification=already-shipped; evidence_kind=merged-pr`
+  - `mode=non-viable-proof; classification=already-shipped; evidence_kind=main-commit`
+  - `mode=non-viable-proof; classification=superseded; evidence_kind=merged-pr`
+  - `mode=non-viable-proof; classification=superseded; evidence_kind=main-commit`
+- Optional narrative may remain only as extra keys such as `note=...`, but
+  cleanup authorization comes solely from the exact `Main/PR evidence` value
+  plus the parsed `mode`, `classification`, and `evidence_kind` fields.
+
 For viable rows, keep the column contract strict and deterministic:
 
 - `Main/PR evidence` may contain narrative non-terminal evidence only until a
   pull request is actually adopted or opened. Once Task 5 adopts an existing
-  PR or opens a new recovery PR, rewrite `Main/PR evidence` to the raw
-  canonical PR URL only, for example
-  `https://github.com/OpenCoven/coven/pull/542`.
+  source-branch PR, adopts an existing recovery-branch PR on rerun, or opens a
+  new recovery PR, rewrite `Main/PR evidence` to the raw canonical PR URL
+  only, for example `https://github.com/OpenCoven/coven/pull/542`.
 - `Recovery action` must use semicolon-delimited `key=value` fields rather
   than prose so retirement can parse it exactly. Use these modes only:
   - `mode=continue-existing-pr; pr_kind=adopted; issue_url=...; archive_id=...; expected_branch=...; preserved_head=...`
+  - `mode=continue-existing-pr; pr_kind=recovered; issue_url=...; archive_id=...; expected_branch=...`
   - `mode=awaiting-recovery-pr; pr_kind=recovered; issue_url=...; archive_id=...; expected_branch=...`
   - `mode=recovery-pr-open; pr_kind=recovered; issue_url=...; archive_id=...; expected_branch=...`
 - A viable row that has only reached issue reuse/creation remains explicitly
@@ -1975,12 +2004,13 @@ Use these deterministic rules:
 
 ```text
 already-shipped:
-  Current main contains equivalent behavior or documentation, with a merged PR
-  or direct file/commit evidence.
+  Current main contains equivalent behavior or documentation, proven by either
+  one merged `OpenCoven/coven` PR URL or one exact main-ancestor commit SHA.
 
 superseded:
-  A later merged change intentionally replaces the same contract, and applying
-  the old work would regress or duplicate it.
+  A later merged `OpenCoven/coven` PR or exact main-ancestor commit
+  intentionally replaces the same contract, and applying the old work would
+  regress or duplicate it.
 
 viable:
   The work's user-visible or authority-preserving intent is absent from current
@@ -1994,15 +2024,23 @@ blocked:
 
 Expected: Task 4 Step 4 replaces every `pending` row with exactly one terminal
 classification (`already-shipped`, `superseded`, `viable`, or `blocked`) and
-one next action before Task 4 Step 5 and Task 9 Step 1 verification. A viable
-row may later keep that classification while Task 5 first records
-`mode=awaiting-recovery-pr` after verified issue reuse/create, then rewrites
-the row to a terminal PR-backed state only after one of these outcomes:
+one next action before Task 4 Step 5 and Task 9 Step 1 verification.
+`already-shipped` and `superseded` rows are terminal only when `Main/PR
+evidence` is a raw merged PR URL or exact 40-character main commit SHA and
+`Recovery action` carries `mode=non-viable-proof` metadata matching that
+classification. A viable row may later keep that classification while Task 5
+first records `mode=awaiting-recovery-pr` after verified issue reuse/create,
+then rewrites the row to a terminal PR-backed state only after one of these
+outcomes:
 
-- `mode=continue-existing-pr` after a fully paginated same-repo open-PR
-  capture returns one exact-source-branch candidate and that single candidate
-  passes the fetched-tip, preserved-head ancestry, and empty-dirty-snapshot
-  checks; or
+- `mode=continue-existing-pr; pr_kind=adopted` after a fully paginated
+  same-repo open-PR capture returns one exact-source-branch candidate and that
+  single candidate passes the fetched-tip, preserved-head ancestry, and
+  empty-dirty-snapshot checks;
+- `mode=continue-existing-pr; pr_kind=recovered` after a fully paginated
+  same-repo open-PR capture returns one exact recovery-branch candidate for
+  `issue-<n>-<slug>` on rerun and that single candidate freshly verifies as the
+  OPEN `main` PR in `OpenCoven/coven`; or
 - `mode=recovery-pr-open` after the zero-candidate issue flow creates and
   verifies a new OPEN recovery PR from the expected recovery branch.
 
@@ -3167,7 +3205,8 @@ git commit -s --trailer "$COPILOT_TRAILER" -m "<child commit message>"
 ```
 
 Expected: independent plans exist only for viable rows that are not already
-continuing an adopted exact-source-branch PR.
+continuing an adopted exact-source-branch PR or an adopted exact
+recovery-branch PR from a rerun.
 
 - [ ] **Step 5: Recover and publish each viable concern sequentially**
 
@@ -3273,6 +3312,12 @@ REPO="$(cd "$COMMON_DIR/.." && pwd)"
 RECOVERY="$COMMON_DIR/agent-recovery/issue-541/viable"
 CLASSIFICATION="$COMMON_DIR/agent-recovery/issue-541/classification.md"
 CLAIM_BLOCKER_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-claim-blocker.txt"
+PR_BLOCKER_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-pr-blocker.txt"
+ISSUE_VIEW_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-issue-view.json"
+RECOVERY_OPEN_PR_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-recovery-open-prs.json"
+RECOVERY_PR_VIEW_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-recovery-pr-view.json"
+RECOVERY_PR_ADOPTION_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-recovery-pr-adoption.txt"
+RECOVERY_BRANCH_REF_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-recovery-branch-refs.txt"
 mkdir -p "$RECOVERY"
 update_classification_row() {
   python3 - "$CLASSIFICATION" "$WORKSTREAM_ID" "$1" "$2" "$3" <<'PY'
@@ -3298,8 +3343,179 @@ else:
     raise SystemExit(f"Missing classification row for {workstream}")
 PY
 }
+test -s "$ISSUE_VIEW_EVIDENCE"
+ISSUE_URL="$(jq -r '.url' "$ISSUE_VIEW_EVIDENCE")"
 RECOVERY_BRANCH="issue-$ISSUE_NUMBER-$BRANCH_SLUG"
 RECOVERY_WORKTREE="$REPO/.worktrees/coven-recovery-541-$ISSUE_NUMBER-$BRANCH_SLUG"
+{
+  printf 'Expected recovery branch: %s\n' "$RECOVERY_BRANCH"
+  printf 'Candidate discovery: capture every open PR for OpenCoven/coven via paginated REST API, then filter with jq only when head.ref matches the exact recovery branch and head.repo.full_name equals OpenCoven/coven.\n'
+  printf 'This rerun check runs before any new branch, worktree, or claim creation.\n'
+} > "$RECOVERY_PR_ADOPTION_EVIDENCE"
+if ! {
+  gh api --paginate --slurp \
+    "repos/OpenCoven/coven/pulls?state=open&per_page=100" | \
+  jq --arg RECOVERY_BRANCH "$RECOVERY_BRANCH" '
+    [ .[] | .[]
+      | select(.head.ref == $RECOVERY_BRANCH)
+      | select(.head.repo != null and .head.repo.full_name == "OpenCoven/coven")
+      | {
+          number,
+          title,
+          url: .html_url,
+          state,
+          headRefName: .head.ref,
+          headRefOid: .head.sha,
+          headRepoFullName: .head.repo.full_name,
+          baseRefName: .base.ref
+        }
+    ]
+  ' > "$RECOVERY_OPEN_PR_EVIDENCE"
+} 2> "$PR_BLOCKER_EVIDENCE"; then
+  API_ERROR="$(cat "$PR_BLOCKER_EVIDENCE")"
+  {
+    printf 'Blocked %s: exact recovery-branch open-PR capture failed before any new branch/worktree creation.\n' "$WORKSTREAM_ID"
+    printf 'Expected recovery branch: %s\n' "$RECOVERY_BRANCH"
+    printf 'Issue evidence: viable/%s-issue-view.json\n' "$WORKSTREAM_ID"
+    printf 'Failure follows:\n%s\n' "$API_ERROR"
+  } > "$PR_BLOCKER_EVIDENCE"
+  update_classification_row \
+    "blocked" \
+    "Recovery-branch PR capture failed for $RECOVERY_BRANCH; see viable/$WORKSTREAM_ID-recovery-pr-adoption.txt, viable/$WORKSTREAM_ID-recovery-open-prs.json, viable/$WORKSTREAM_ID-issue-view.json, and viable/$WORKSTREAM_ID-pr-blocker.txt." \
+    "Blocked: could not query same-repo recovery PRs before rerun branch creation."
+  exit 0
+fi
+RECOVERY_PR_COUNT="$(jq 'length' "$RECOVERY_OPEN_PR_EVIDENCE")"
+case "$RECOVERY_PR_COUNT" in
+  1)
+    printf 'Same-repo exact recovery-branch open PR count: 1\n' >> "$RECOVERY_PR_ADOPTION_EVIDENCE"
+    RECOVERY_PR_NUMBER="$(jq -r '.[0].number' "$RECOVERY_OPEN_PR_EVIDENCE")"
+    if ! gh pr view --repo OpenCoven/coven "$RECOVERY_PR_NUMBER" \
+      --json number,title,url,state,headRefName,headRepositoryOwner,isCrossRepository,baseRefName \
+      > "$RECOVERY_PR_VIEW_EVIDENCE" 2> "$PR_BLOCKER_EVIDENCE"; then
+      PR_VIEW_ERROR="$(cat "$PR_BLOCKER_EVIDENCE")"
+      {
+        printf 'Blocked %s: exact recovery-branch PR #%s disappeared or could not be read.\n' \
+          "$WORKSTREAM_ID" "$RECOVERY_PR_NUMBER"
+        printf 'Expected recovery branch: %s\n' "$RECOVERY_BRANCH"
+        printf 'Issue evidence: viable/%s-issue-view.json\n' "$WORKSTREAM_ID"
+        printf 'Open PR evidence: viable/%s-recovery-open-prs.json\n' "$WORKSTREAM_ID"
+        printf 'gh pr view failure follows:\n%s\n' "$PR_VIEW_ERROR"
+      } > "$PR_BLOCKER_EVIDENCE"
+      update_classification_row \
+        "blocked" \
+        "Recovery-branch PR view failed for $RECOVERY_BRANCH; see viable/$WORKSTREAM_ID-recovery-pr-adoption.txt, viable/$WORKSTREAM_ID-recovery-open-prs.json, viable/$WORKSTREAM_ID-recovery-pr-view.json, and viable/$WORKSTREAM_ID-pr-blocker.txt." \
+        "Blocked: exact recovery-branch PR could not be verified before rerun branch creation."
+      exit 0
+    fi
+    ACTUAL_RECOVERY_PR_URL="$(jq -r '.url' "$RECOVERY_PR_VIEW_EVIDENCE")"
+    ACTUAL_RECOVERY_PR_STATE="$(jq -r '.state' "$RECOVERY_PR_VIEW_EVIDENCE")"
+    ACTUAL_RECOVERY_PR_BRANCH="$(jq -r '.headRefName' "$RECOVERY_PR_VIEW_EVIDENCE")"
+    ACTUAL_RECOVERY_PR_OWNER="$(jq -r '.headRepositoryOwner.login' "$RECOVERY_PR_VIEW_EVIDENCE")"
+    ACTUAL_RECOVERY_PR_CROSS="$(jq -r '.isCrossRepository' "$RECOVERY_PR_VIEW_EVIDENCE")"
+    ACTUAL_RECOVERY_PR_BASE="$(jq -r '.baseRefName' "$RECOVERY_PR_VIEW_EVIDENCE")"
+    {
+      printf 'Existing recovery PR URL: %s\n' "$ACTUAL_RECOVERY_PR_URL"
+      printf 'Actual state: %s\n' "$ACTUAL_RECOVERY_PR_STATE"
+      printf 'Actual branch: %s\n' "$ACTUAL_RECOVERY_PR_BRANCH"
+      printf 'Actual owner: %s\n' "$ACTUAL_RECOVERY_PR_OWNER"
+      printf 'Actual cross-repo: %s\n' "$ACTUAL_RECOVERY_PR_CROSS"
+      printf 'Actual base: %s\n' "$ACTUAL_RECOVERY_PR_BASE"
+    } >> "$RECOVERY_PR_ADOPTION_EVIDENCE"
+    if [ "$ACTUAL_RECOVERY_PR_STATE" != "OPEN" ] || \
+       [ "$ACTUAL_RECOVERY_PR_BRANCH" != "$RECOVERY_BRANCH" ] || \
+       [ "$ACTUAL_RECOVERY_PR_OWNER" != "OpenCoven" ] || \
+       [ "$ACTUAL_RECOVERY_PR_CROSS" != "false" ] || \
+       [ "$ACTUAL_RECOVERY_PR_BASE" != "main" ]; then
+      {
+        printf 'Blocked %s: exact recovery-branch PR #%s failed OPEN/main/OpenCoven verification.\n' \
+          "$WORKSTREAM_ID" "$RECOVERY_PR_NUMBER"
+        printf 'Expected recovery branch: %s\n' "$RECOVERY_BRANCH"
+        printf 'Expected owner/cross-repo: OpenCoven / false\n'
+        printf 'Expected base branch: main\n'
+        printf 'Open PR evidence: viable/%s-recovery-open-prs.json\n' "$WORKSTREAM_ID"
+        printf 'PR view evidence: viable/%s-recovery-pr-view.json\n' "$WORKSTREAM_ID"
+      } > "$PR_BLOCKER_EVIDENCE"
+      update_classification_row \
+        "blocked" \
+        "Recovery-branch PR verification mismatch for $RECOVERY_BRANCH; see viable/$WORKSTREAM_ID-recovery-pr-adoption.txt, viable/$WORKSTREAM_ID-recovery-open-prs.json, viable/$WORKSTREAM_ID-recovery-pr-view.json, and viable/$WORKSTREAM_ID-pr-blocker.txt." \
+        "Blocked: exact recovery-branch PR was not the one OPEN/main same-repo track to continue."
+      exit 0
+    fi
+    update_classification_row \
+      "viable" \
+      "$ACTUAL_RECOVERY_PR_URL" \
+      "mode=continue-existing-pr; pr_kind=recovered; issue_url=$ISSUE_URL; archive_id=$ARCHIVE_ID; expected_branch=$RECOVERY_BRANCH"
+    exit 0
+    ;;
+  0)
+    printf 'Same-repo exact recovery-branch open PR count: 0\n' >> "$RECOVERY_PR_ADOPTION_EVIDENCE"
+    printf 'No same-repo OPEN recovery PR currently owns %s.\n' "$RECOVERY_BRANCH" >> "$RECOVERY_PR_ADOPTION_EVIDENCE"
+    ;;
+  *)
+    {
+      printf 'Blocked %s: expected 0 or 1 same-repo open PRs for recovery branch %s, found %s before creation.\n' \
+        "$WORKSTREAM_ID" "$RECOVERY_BRANCH" "$RECOVERY_PR_COUNT"
+      printf 'Recovery-branch PR evidence: viable/%s-recovery-open-prs.json\n' "$WORKSTREAM_ID"
+      printf 'Recovery-branch adoption evidence: viable/%s-recovery-pr-adoption.txt\n' "$WORKSTREAM_ID"
+    } > "$PR_BLOCKER_EVIDENCE"
+    update_classification_row \
+      "blocked" \
+      "Recovery-branch PR ambiguity for $RECOVERY_BRANCH; see viable/$WORKSTREAM_ID-recovery-pr-adoption.txt, viable/$WORKSTREAM_ID-recovery-open-prs.json, and viable/$WORKSTREAM_ID-pr-blocker.txt." \
+      "Blocked: multiple same-repo recovery PRs already claim the exact rerun branch."
+    exit 0
+    ;;
+esac
+{
+  printf 'Recovery branch: %s\n' "$RECOVERY_BRANCH"
+} > "$RECOVERY_BRANCH_REF_EVIDENCE"
+LOCAL_RECOVERY_HEAD=''
+if git -C "$REPO" show-ref --verify --quiet "refs/heads/$RECOVERY_BRANCH"; then
+  LOCAL_RECOVERY_HEAD="$(git -C "$REPO" rev-parse "refs/heads/$RECOVERY_BRANCH")"
+  printf 'Local recovery branch exists: yes (%s)\n' "$LOCAL_RECOVERY_HEAD" >> "$RECOVERY_BRANCH_REF_EVIDENCE"
+else
+  printf 'Local recovery branch exists: no\n' >> "$RECOVERY_BRANCH_REF_EVIDENCE"
+fi
+REMOTE_RECOVERY_PROOF="$RECOVERY_BRANCH_REF_EVIDENCE.remote"
+if ! git -C "$REPO" ls-remote --heads origin "refs/heads/$RECOVERY_BRANCH" > "$REMOTE_RECOVERY_PROOF" 2>> "$PR_BLOCKER_EVIDENCE"; then
+  REMOTE_LOOKUP_ERROR="$(cat "$PR_BLOCKER_EVIDENCE")"
+  rm -f "$REMOTE_RECOVERY_PROOF"
+  {
+    printf 'Blocked %s: could not query origin for recovery branch %s before creation.\n' \
+      "$WORKSTREAM_ID" "$RECOVERY_BRANCH"
+    printf 'Recovery-branch ref evidence: viable/%s-recovery-branch-refs.txt\n' "$WORKSTREAM_ID"
+    printf 'Failure follows:\n%s\n' "$REMOTE_LOOKUP_ERROR"
+  } > "$PR_BLOCKER_EVIDENCE"
+  update_classification_row \
+    "blocked" \
+    "Recovery-branch ref query failed for $RECOVERY_BRANCH; see viable/$WORKSTREAM_ID-recovery-branch-refs.txt and viable/$WORKSTREAM_ID-pr-blocker.txt." \
+    "Blocked: could not verify whether the exact recovery branch already exists remotely."
+  exit 0
+fi
+REMOTE_RECOVERY_HEAD=''
+if test -s "$REMOTE_RECOVERY_PROOF"; then
+  REMOTE_RECOVERY_HEAD="$(awk 'NR == 1 { print $1 }' "$REMOTE_RECOVERY_PROOF")"
+  printf 'Remote recovery branch exists: yes (%s)\n' "$REMOTE_RECOVERY_HEAD" >> "$RECOVERY_BRANCH_REF_EVIDENCE"
+else
+  printf 'Remote recovery branch exists: no\n' >> "$RECOVERY_BRANCH_REF_EVIDENCE"
+fi
+rm -f "$REMOTE_RECOVERY_PROOF"
+if [ -n "$LOCAL_RECOVERY_HEAD" ] || [ -n "$REMOTE_RECOVERY_HEAD" ]; then
+  {
+    printf 'Blocked %s: exact recovery branch %s already exists without exactly one adoptable OPEN recovery PR.\n' \
+      "$WORKSTREAM_ID" "$RECOVERY_BRANCH"
+    printf 'Local recovery branch head: %s\n' "${LOCAL_RECOVERY_HEAD:-absent}"
+    printf 'Remote recovery branch head: %s\n' "${REMOTE_RECOVERY_HEAD:-absent}"
+    printf 'Recovery-branch PR evidence: viable/%s-recovery-open-prs.json\n' "$WORKSTREAM_ID"
+    printf 'Recovery-branch ref evidence: viable/%s-recovery-branch-refs.txt\n' "$WORKSTREAM_ID"
+    printf 'Resume instruction: resume or reconcile the existing %s branch, publish or inspect its PR state, then rerun this step instead of creating a duplicate branch/worktree/claim.\n' "$RECOVERY_BRANCH"
+  } > "$PR_BLOCKER_EVIDENCE"
+  update_classification_row \
+    "blocked" \
+    "Recovery branch $RECOVERY_BRANCH already exists locally or remotely without exactly one adoptable OPEN recovery PR; see viable/$WORKSTREAM_ID-recovery-open-prs.json, viable/$WORKSTREAM_ID-recovery-branch-refs.txt, and viable/$WORKSTREAM_ID-pr-blocker.txt." \
+    "Blocked: reconcile or resume the existing exact recovery branch before rerunning child recovery creation."
+  exit 0
+fi
 if test -e "$RECOVERY_WORKTREE"; then
   printf 'Recovery worktree path already exists: %s\n' "$RECOVERY_WORKTREE" >&2
   exit 1
@@ -3316,7 +3532,7 @@ if ! git -C "$REPO" fetch origin main; then
   exit 1
 fi
 if ! git -C "$REPO" worktree add \
-  -b "issue-$ISSUE_NUMBER-$BRANCH_SLUG" \
+  -b "$RECOVERY_BRANCH" \
   "$RECOVERY_WORKTREE" \
   origin/main
 then
@@ -3394,8 +3610,11 @@ esac
 coven claim release "issue-$ISSUE_NUMBER"
 ```
 
-Continue into the child recovery plan only after `coven claim acquire`
-succeeds. If acquisition fails, persist
+Rows that rewrite to `mode=continue-existing-pr; pr_kind=recovered` after the
+rerun recovery-branch check already belong to one exact OPEN recovery PR and
+must skip new branch, worktree, and claim creation entirely. Continue into the
+child recovery plan only after `coven claim acquire` succeeds for a newly
+created branch/worktree. If acquisition fails, persist
 `viable/$WORKSTREAM_ID-claim-blocker.txt`, rewrite the classification row to
 `blocked`, remove the newly created still-clean child worktree and its exact
 local branch without force, and stop that row. If either cleanup command
@@ -3618,7 +3837,9 @@ update_classification_row \
 
 Expected: every viable row either continues one adopted same-repo
 exact-source-branch open pull request after the single-candidate verification
-and empty-dirty-snapshot flow, or rewrites its ledger row to stay `viable`
+and empty-dirty-snapshot flow, continues one adopted same-repo exact
+recovery-branch open pull request on rerun after the recovery-branch
+single-candidate verification, or rewrites its ledger row to stay `viable`
 with the raw canonical recovery PR URL in `Main/PR evidence` plus a
 deterministic `mode=recovery-pr-open; ... expected_branch=issue-<n>-<slug>`
 action after the zero-candidate normal flow, before Task 7 cleanup or Task 9
@@ -3629,29 +3850,30 @@ audit begins.
 **Artifacts:**
 - Modify: `.git/agent-recovery/issue-541/classification.md`
 
-- [ ] **Step 1: Record already-shipped evidence**
+- [ ] **Step 1: Record already-shipped proof**
 
-For each `already-shipped` row, add:
+For each `already-shipped` row, replace any narrative cleanup authorization
+with this structured ledger state:
 
-```markdown
-- Equivalent current file or behavior:
-- Merged pull request or commit:
-- Why replay would duplicate rather than extend main:
-```
+- `Main/PR evidence`: either the raw merged `https://github.com/OpenCoven/coven/pull/<n>`
+  URL or the exact 40-character commit SHA that is already on `main`.
+- `Recovery action`: `mode=non-viable-proof; classification=already-shipped; evidence_kind=merged-pr`
+  or `mode=non-viable-proof; classification=already-shipped; evidence_kind=main-commit`.
+- Optional human explanation may remain only as extra `key=value` metadata such
+  as `note=...`; it must not be the authorization for cleanup.
 
-Fill every field with a path and commit or pull-request URL.
+- [ ] **Step 2: Record supersession proof**
 
-- [ ] **Step 2: Record supersession evidence**
+For each `superseded` row, replace any narrative cleanup authorization with
+this structured ledger state:
 
-For each `superseded` row, add:
-
-```markdown
-- Superseding contract:
-- Superseding pull request or commit:
-- Regression or duplication caused by replay:
-```
-
-Fill every field with concrete evidence.
+- `Main/PR evidence`: either the raw merged `https://github.com/OpenCoven/coven/pull/<n>`
+  URL or the exact 40-character commit SHA that is already on `main` and
+  represents the superseding contract.
+- `Recovery action`: `mode=non-viable-proof; classification=superseded; evidence_kind=merged-pr`
+  or `mode=non-viable-proof; classification=superseded; evidence_kind=main-commit`.
+- Optional human explanation may remain only as extra `key=value` metadata such
+  as `note=...`; it must not be the authorization for cleanup.
 
 - [ ] **Step 3: Record blockers**
 
@@ -3665,9 +3887,12 @@ For each `blocked` row, add:
 ```
 
 Expected: no non-viable row relies on branch age or lack of a PR as its sole
-reason. Rows blocked because an active PR leaves preserved dirty delta behind
-must cite that PR URL, the preserved snapshot archive IDs, and the explicit
-resume condition to recover the delta later from current `main`.
+reason. `already-shipped` and `superseded` cleanup authorization now comes
+only from the exact merged PR URL or exact main commit SHA recorded in
+`Main/PR evidence` plus the parsed `mode=non-viable-proof` metadata in
+`Recovery action`. Rows blocked because an active PR leaves preserved dirty
+delta behind must cite that PR URL, the preserved snapshot archive IDs, and
+the explicit resume condition to recover the delta later from current `main`.
 
 ### Task 7: Clean Verified Git Residue
 
@@ -4278,6 +4503,11 @@ RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
 RETIRE_PROOF_ROOT="$RECOVERY/private-retire-proof"
 CLASSIFICATION="$RECOVERY/classification.md"
 mkdir -p "$RETIRE_PROOF_ROOT"
+if ! git -C "$REPO" fetch origin main; then
+  printf 'Blocked: could not refresh origin/main before retirement proof.\n' >&2
+  exit 1
+fi
+ORIGIN_MAIN_COMMIT="$(git -C "$REPO" rev-parse "refs/remotes/origin/main^{commit}")"
 parse_classification_row() {
   python3 - "$CLASSIFICATION" "$1" <<'PY'
 import sys
@@ -4325,11 +4555,18 @@ for raw_part in action.split(";"):
     fields[key] = value
 
 mode = fields.get("mode")
+pr_kind = fields.get("pr_kind")
 required = ["mode", "pr_kind", "issue_url", "archive_id", "expected_branch"]
 if mode == "continue-existing-pr":
-    required.append("preserved_head")
+    if pr_kind == "adopted":
+        required.append("preserved_head")
+    elif pr_kind == "recovered":
+        pass
+    else:
+        raise SystemExit(f"Unsupported continue-existing-pr kind: {pr_kind}")
 elif mode in {"awaiting-recovery-pr", "recovery-pr-open"}:
-    pass
+    if pr_kind != "recovered":
+        raise SystemExit(f"{mode} must declare pr_kind=recovered, got {pr_kind}")
 else:
     raise SystemExit(f"Unsupported recovery action mode: {mode}")
 
@@ -4343,6 +4580,43 @@ print(fields["issue_url"])
 print(fields["archive_id"])
 print(fields["expected_branch"])
 print(fields.get("preserved_head", ""))
+PY
+}
+parse_non_viable_action() {
+  python3 - "$1" "$2" <<'PY'
+import sys
+
+action = sys.argv[1].strip()
+expected_classification = sys.argv[2].strip()
+fields = {}
+for raw_part in action.split(";"):
+    part = raw_part.strip()
+    if not part:
+        continue
+    if "=" not in part:
+        raise SystemExit(f"Recovery action segment is not key=value: {part}")
+    key, value = part.split("=", 1)
+    key = key.strip()
+    value = value.strip()
+    if not key or not value:
+        raise SystemExit(f"Recovery action segment has an empty key or value: {part}")
+    if key in fields:
+        raise SystemExit(f"Recovery action repeats key {key}")
+    fields[key] = value
+
+if fields.get("mode") != "non-viable-proof":
+    raise SystemExit(f"Unsupported non-viable proof mode: {fields.get('mode')}")
+if fields.get("classification") != expected_classification:
+    raise SystemExit(
+        f"Non-viable proof classification mismatch: expected {expected_classification}, got {fields.get('classification')}"
+    )
+evidence_kind = fields.get("evidence_kind")
+if evidence_kind not in {"merged-pr", "main-commit"}:
+    raise SystemExit(f"Unsupported non-viable evidence_kind: {evidence_kind}")
+
+print(fields["mode"])
+print(fields["classification"])
+print(fields["evidence_kind"])
 PY
 }
 block_retirement() {
@@ -4403,37 +4677,88 @@ do
       "classification row could not be parsed safely before any live-state checks"
     continue
   fi
-  evidence='Narrative evidence: this PR was merged into main after review.'
-  case "$evidence" in
-    *"merged into main"*) ;;
-    *)
-      printf '%s\n' "merged-into-main pattern must match ordinary narrative evidence" >&2
-      exit 1
-      ;;
-  esac
+  printf '%s\n' "$ORIGIN_MAIN_COMMIT" > "$PROOF_DIR/live-origin-main.txt"
   CLASSIFICATION_LABEL="${CLASSIFICATION_ROW[0]}"
   MAIN_PR_EVIDENCE="${CLASSIFICATION_ROW[1]}"
   PRESERVED_SOURCE="${CLASSIFICATION_ROW[2]}"
   RECOVERY_ACTION="${CLASSIFICATION_ROW[3]}"
   case "$CLASSIFICATION_LABEL" in
-    already-shipped)
-      case "$MAIN_PR_EVIDENCE" in
-        *merged*main*|*main*merged*|*"merged into main"*)
+    already-shipped|superseded)
+      NON_VIABLE_ACTION_FIELDS_FILE="$RECOVERY/.non-viable-action-fields.$$"
+      if ! parse_non_viable_action "$RECOVERY_ACTION" "$CLASSIFICATION_LABEL" >"$NON_VIABLE_ACTION_FIELDS_FILE"; then
+        rm -f "$NON_VIABLE_ACTION_FIELDS_FILE"
+        block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+          "non-viable rows must encode deterministic cleanup-proof metadata"
+        continue
+      fi
+      NON_VIABLE_ACTION_ROW=()
+      NON_VIABLE_ACTION_FIELD=
+      while IFS= read -r NON_VIABLE_ACTION_FIELD || [ -n "$NON_VIABLE_ACTION_FIELD" ]; do
+        NON_VIABLE_ACTION_ROW+=("$NON_VIABLE_ACTION_FIELD")
+      done < "$NON_VIABLE_ACTION_FIELDS_FILE"
+      rm -f "$NON_VIABLE_ACTION_FIELDS_FILE"
+      if test "${#NON_VIABLE_ACTION_ROW[@]}" -ne 3; then
+        block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+          "non-viable proof parsing returned an unexpected field count"
+        continue
+      fi
+      NON_VIABLE_EVIDENCE_KIND="${NON_VIABLE_ACTION_ROW[2]}"
+      case "$NON_VIABLE_EVIDENCE_KIND" in
+        merged-pr)
+          case "$MAIN_PR_EVIDENCE" in
+            https://github.com/OpenCoven/coven/pull/*)
+              ;;
+            *)
+              block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+                "non-viable merged-pr rows must record a raw GitHub PR URL for OpenCoven/coven"
+              continue
+              ;;
+          esac
+          NON_VIABLE_PR_VIEW="$PROOF_DIR/live-non-viable-pr-view.json"
+          NON_VIABLE_PR_ERR="$PROOF_DIR/live-non-viable-pr-view.err"
+          if ! gh pr view --repo OpenCoven/coven "$MAIN_PR_EVIDENCE" \
+            --json number,url,state,baseRefName,mergedAt \
+            > "$NON_VIABLE_PR_VIEW" 2> "$NON_VIABLE_PR_ERR"; then
+            block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+              "recorded non-viable PR could not be freshly verified against OpenCoven/coven"
+            cat "$NON_VIABLE_PR_ERR" >> "$BLOCKER"
+            continue
+          fi
+          ACTUAL_NON_VIABLE_URL="$(jq -r '.url' "$NON_VIABLE_PR_VIEW")"
+          ACTUAL_NON_VIABLE_STATE="$(jq -r '.state' "$NON_VIABLE_PR_VIEW")"
+          ACTUAL_NON_VIABLE_BASE="$(jq -r '.baseRefName' "$NON_VIABLE_PR_VIEW")"
+          ACTUAL_NON_VIABLE_MERGED_AT="$(jq -r '.mergedAt // empty' "$NON_VIABLE_PR_VIEW")"
+          if [ "$ACTUAL_NON_VIABLE_URL" != "$MAIN_PR_EVIDENCE" ] || \
+             [ "$ACTUAL_NON_VIABLE_STATE" != "MERGED" ] || \
+             [ "$ACTUAL_NON_VIABLE_BASE" != "main" ] || \
+             [ -z "$ACTUAL_NON_VIABLE_MERGED_AT" ]; then
+            block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+              "recorded non-viable PR did not freshly verify as MERGED into main in OpenCoven/coven"
+            continue
+          fi
+          ;;
+        main-commit)
+          if ! printf '%s\n' "$MAIN_PR_EVIDENCE" | grep -Eq '^[0-9a-f]{40}$'; then
+            block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+              "non-viable main-commit rows must record an exact 40-character commit SHA"
+            continue
+          fi
+          if ! ACTUAL_NON_VIABLE_COMMIT="$(git -C "$REPO" rev-parse --verify "$MAIN_PR_EVIDENCE^{commit}" 2>/dev/null)"; then
+            block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+              "recorded non-viable commit could not be resolved as a commit object"
+            continue
+          fi
+          printf '%s\n' "$ACTUAL_NON_VIABLE_COMMIT" > "$PROOF_DIR/live-non-viable-commit.txt"
+          if [ "$ACTUAL_NON_VIABLE_COMMIT" != "$MAIN_PR_EVIDENCE" ] || \
+             ! git -C "$REPO" merge-base --is-ancestor "$ACTUAL_NON_VIABLE_COMMIT" "refs/remotes/origin/main"; then
+            block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+              "recorded non-viable commit must be an exact commit SHA and an ancestor of freshly fetched origin/main"
+            continue
+          fi
           ;;
         *)
           block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
-            "already-shipped rows require concrete merged/main evidence"
-          continue
-          ;;
-      esac
-      ;;
-    superseded)
-      case "$MAIN_PR_EVIDENCE" in
-        *supersed*|*replac*)
-          ;;
-        *)
-          block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
-            "superseded rows require concrete superseding evidence"
+            "non-viable evidence_kind is not eligible for forced retirement"
           continue
           ;;
       esac
@@ -4489,11 +4814,15 @@ do
       fi
       case "$ACTION_MODE" in
         continue-existing-pr)
-          if [ "$ACTION_PR_KIND" != "adopted" ]; then
-            block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
-              "continue-existing-pr rows must declare pr_kind=adopted"
-            continue
-          fi
+          case "$ACTION_PR_KIND" in
+            adopted|recovered)
+              ;;
+            *)
+              block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+                "continue-existing-pr rows must declare pr_kind=adopted or pr_kind=recovered"
+              continue
+              ;;
+          esac
           ;;
         recovery-pr-open)
           if [ "$ACTION_PR_KIND" != "recovered" ]; then
@@ -4541,21 +4870,37 @@ do
       fi
       case "$ACTION_MODE" in
         continue-existing-pr)
-          SNAPSHOT_HEAD="$(tr -d '\n' < "$SNAPSHOT/head.txt")"
-          if [ "$ACTION_EXPECTED_BRANCH" != "$ACTUAL_BRANCH" ] || \
-             [ "$ACTION_PRESERVED_HEAD" != "$SNAPSHOT_HEAD" ] || \
-             ! git -C "$REPO" merge-base --is-ancestor "$ACTION_PRESERVED_HEAD" "$ACTUAL_HEAD"; then
-            block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
-              "adopted PR no longer matches the expected source branch and preserved-head ancestry"
-            {
-              printf 'Expected branch from recovery action: %s\n' "$ACTION_EXPECTED_BRANCH"
-              printf 'Actual branch from PR: %s\n' "$ACTUAL_BRANCH"
-              printf 'Preserved head from recovery action: %s\n' "$ACTION_PRESERVED_HEAD"
-              printf 'Preserved head from snapshot: %s\n' "$SNAPSHOT_HEAD"
-              printf 'Current PR head: %s\n' "$ACTUAL_HEAD"
-            } >> "$BLOCKER"
-            continue
-          fi
+          case "$ACTION_PR_KIND" in
+            adopted)
+              SNAPSHOT_HEAD="$(tr -d '\n' < "$SNAPSHOT/head.txt")"
+              if [ "$ACTION_EXPECTED_BRANCH" != "$ACTUAL_BRANCH" ] || \
+                 [ "$ACTION_PRESERVED_HEAD" != "$SNAPSHOT_HEAD" ] || \
+                 ! git -C "$REPO" merge-base --is-ancestor "$ACTION_PRESERVED_HEAD" "$ACTUAL_HEAD"; then
+                block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+                  "adopted PR no longer matches the expected source branch and preserved-head ancestry"
+                {
+                  printf 'Expected branch from recovery action: %s\n' "$ACTION_EXPECTED_BRANCH"
+                  printf 'Actual branch from PR: %s\n' "$ACTUAL_BRANCH"
+                  printf 'Preserved head from recovery action: %s\n' "$ACTION_PRESERVED_HEAD"
+                  printf 'Preserved head from snapshot: %s\n' "$SNAPSHOT_HEAD"
+                  printf 'Current PR head: %s\n' "$ACTUAL_HEAD"
+                } >> "$BLOCKER"
+                continue
+              fi
+              ;;
+            recovered)
+              if [ "$ACTION_EXPECTED_BRANCH" != "$ACTUAL_BRANCH" ]; then
+                block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+                  "rerun-adopted recovery PR no longer matches the expected recovery branch"
+                {
+                  printf 'Expected recovery branch from recovery action: %s\n' "$ACTION_EXPECTED_BRANCH"
+                  printf 'Actual branch from PR: %s\n' "$ACTUAL_BRANCH"
+                  printf 'Current PR head: %s\n' "$ACTUAL_HEAD"
+                } >> "$BLOCKER"
+                continue
+              fi
+              ;;
+          esac
           ;;
         recovery-pr-open)
           if [ "$ACTION_EXPECTED_BRANCH" != "$ACTUAL_BRANCH" ]; then
@@ -4661,21 +5006,24 @@ done
 ```
 
 Expected: a row may retire only when its exact classification row says
-`already-shipped` with concrete merged/main evidence, `superseded` with concrete
-superseding evidence, or `viable` with `Main/PR evidence` set to a recorded
-GitHub PR URL and `Recovery action` set to a deterministic terminal PR mode.
-`pending`, `blocked`, and `mode=awaiting-recovery-pr` rows never retire. At
-retirement, every viable PR still has to freshly verify `OPEN`,
-`baseRefName=main`, and `OpenCoven/coven`. Adopted rows additionally require
-their parsed expected source branch to equal the current `headRefName`, and
-their parsed preserved head to remain equal to or an ancestor of the current
+`already-shipped` or `superseded` with structured `mode=non-viable-proof`
+metadata plus either a raw merged `OpenCoven/coven` PR URL or an exact
+40-character commit SHA that freshly verifies as an ancestor of fetched
+`origin/main`, or `viable` with `Main/PR evidence` set to a recorded GitHub PR
+URL and `Recovery action` set to a deterministic terminal PR mode. `pending`,
+`blocked`, and `mode=awaiting-recovery-pr` rows never retire. At retirement,
+every viable PR still has to freshly verify `OPEN`, `baseRefName=main`, and
+`OpenCoven/coven`. Adopted source-branch rows additionally require their
+parsed expected source branch to equal the current `headRefName`, and their
+parsed preserved head to remain equal to or an ancestor of the current
 `headRefOid`; a force-push or divergence blocks retirement with evidence.
-Newly recovered rows require the parsed expected recovery branch to equal the
-current `headRefName`, but do not require ancestry to the old preserved local
-snapshot head because that work may have been rebuilt on current `main`. Any
-unverifiable viable PR writes cleanup blocker evidence and leaves the original
-source worktree and branch untouched. After that gate, the existing snapshot,
-live-drift, and ignored-content comparisons still run before removal.
+Adopted or newly opened recovery-branch rows require the parsed expected
+recovery branch to equal the current `headRefName`, but do not require
+ancestry to the old preserved local snapshot head because that work may have
+been rebuilt on current `main`. Any unverifiable viable PR or non-viable proof
+writes cleanup blocker evidence and leaves the original source worktree and
+branch untouched. After that gate, the existing snapshot, live-drift, and
+ignored-content comparisons still run before removal.
 
 - [ ] **Step 5: Delete only proven local branch residue after worktree retirement**
 
@@ -5734,7 +6082,15 @@ block_restore() {
   exit 1
 }
 rollback_or_block() {
-  local message current_branch_after_rollback rollback_status
+  local message="$1" current_branch_after_rollback rollback_status
+  if [ -z "$message" ]; then
+    {
+      printf 'Critical: rollback_or_block requires a non-empty reason.\n'
+      record_state
+    } > "$AUDIT_EVIDENCE"
+    cat "$AUDIT_EVIDENCE"
+    exit 1
+  fi
   if [ "$SWITCHED_TO_MAIN" != "1" ]; then
     block_restore "$message"
   fi
