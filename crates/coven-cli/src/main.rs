@@ -1911,23 +1911,94 @@ impl DoctorCheck {
     }
 }
 
+/// Replace paths in the machine-readable doctor report with stable role
+/// tokens. Doctor JSON is commonly attached to CI logs and bug reports; raw
+/// absolute paths make otherwise identical reports host-specific and can leak
+/// account or project directory names. The prose report intentionally keeps
+/// the concrete paths for local troubleshooting.
+struct DoctorJsonPathRedactor {
+    replacements: Vec<(String, String)>,
+}
+
+impl DoctorJsonPathRedactor {
+    fn new(report: &DoctorReport) -> Self {
+        let mut replacements = Vec::new();
+        let mut add_path = |path: &Path, token: String| {
+            // Only redact rooted paths with a component below the root. A
+            // one-character relative path or filesystem root would otherwise
+            // act like an unsafe global substring replacement.
+            if path.has_root() && path.components().count() > 1 {
+                replacements.push((path.display().to_string(), token));
+            }
+        };
+
+        add_path(
+            &report.familiars_manifest,
+            "<familiars-manifest>".to_string(),
+        );
+        add_path(&report.repos_config_path, "<repos-config>".to_string());
+        if let Some(engine) = &report.engine {
+            add_path(&engine.path, "<engine>".to_string());
+        }
+        for repo in &report.repos {
+            add_path(&repo.path, format!("<repo:{}>", repo.name));
+        }
+        if let Some(project_root) = &report.project_root {
+            add_path(project_root, "<project>".to_string());
+        }
+        add_path(&report.home, "<coven-home>".to_string());
+
+        if let Some(status) = report.daemon.as_ref().map(|state| match state {
+            daemon::DaemonStatusState::Running(status)
+            | daemon::DaemonStatusState::Stale(status) => status,
+        }) {
+            let socket = Path::new(&status.socket);
+            add_path(socket, "<daemon-socket>".to_string());
+        }
+
+        // Replace children before parents, for example the manifest before
+        // COVEN_HOME. `sort_by` is stable, so equally long exact paths retain
+        // the role-specific insertion order above.
+        replacements.sort_by_key(|entry| std::cmp::Reverse(entry.0.len()));
+        Self { replacements }
+    }
+
+    fn text(&self, value: impl AsRef<str>) -> String {
+        self.replacements
+            .iter()
+            .fold(value.as_ref().to_string(), |redacted, (path, token)| {
+                redacted.replace(path, token)
+            })
+    }
+
+    fn path(&self, value: &Path) -> String {
+        self.text(value.display().to_string())
+    }
+}
+
 /// Derive the machine-readable check list from a gathered report. Statuses
 /// mirror the prose markers: `fail` is exactly the set of conditions that
 /// flip [`DoctorReport::healthy`], so `ok`/exit-code semantics stay identical
 /// across both output modes.
 fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
     let mut checks = Vec::new();
+    let paths = DoctorJsonPathRedactor::new(report);
 
     checks.push(match &report.daemon {
         Some(daemon::DaemonStatusState::Running(status)) => DoctorCheck::pass(
             "daemon",
-            format!("running (pid {}, socket {})", status.pid, status.socket),
+            format!(
+                "running (pid {}, socket {})",
+                status.pid,
+                paths.text(&status.socket)
+            ),
         ),
         Some(daemon::DaemonStatusState::Stale(status)) => DoctorCheck::fail(
             "daemon",
             format!(
                 "stale daemon record (pid {}, socket {})",
-                status.pid, status.socket
+                status.pid,
+                paths.text(&status.socket)
             ),
             Some("run: coven daemon restart".to_string()),
         ),
@@ -1940,17 +2011,17 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
 
     for repo in &report.repos {
         checks.push(if repo.ok {
-            DoctorCheck::pass(
-                format!("repo:{}", repo.name),
-                repo.path.display().to_string(),
-            )
+            DoctorCheck::pass(format!("repo:{}", repo.name), paths.path(&repo.path))
         } else {
             DoctorCheck::fail(
                 format!("repo:{}", repo.name),
-                format!("{} is missing or not a git repository", repo.path.display()),
+                format!(
+                    "{} is missing or not a git repository",
+                    paths.path(&repo.path)
+                ),
                 Some(format!(
                     "fix the path in {}",
-                    report.repos_config_path.display()
+                    paths.path(&report.repos_config_path)
                 )),
             )
         });
@@ -1998,7 +2069,7 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
             Some("run: coven engine install".to_string()),
         ),
         Some(engine) => {
-            let located = format!("{} ({})", engine.path.display(), engine.source_label);
+            let located = format!("{} ({})", paths.path(&engine.path), engine.source_label);
             match engine.version {
                 None => DoctorCheck::warn(
                     "engine",
@@ -2032,13 +2103,17 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
             "familiars",
             format!(
                 "could not read {}: {error}",
-                report.familiars_manifest.display()
+                paths.path(&report.familiars_manifest),
+                error = paths.text(error)
             ),
             None,
         ),
         Ok(familiars) if familiars.is_empty() => DoctorCheck::pass(
             "familiars",
-            format!("none configured ({})", report.familiars_manifest.display()),
+            format!(
+                "none configured ({})",
+                paths.path(&report.familiars_manifest)
+            ),
         ),
         Ok(familiars) => DoctorCheck::pass("familiars", format!("{} configured", familiars.len())),
     });
@@ -2072,11 +2147,8 @@ fn doctor_json_body(report: &DoctorReport) -> serde_json::Value {
     serde_json::json!({
         "ok": ok,
         "blocking": !ok,
-        "store": report.home.display().to_string(),
-        "project": report
-            .project_root
-            .as_ref()
-            .map(|root| root.display().to_string()),
+        "store": "<coven-home>",
+        "project": report.project_root.as_ref().map(|_| "<project>"),
         "checks": checks,
         "nextSteps": doctor_next_steps(report.default_harness.as_deref()),
     })
@@ -6299,8 +6371,8 @@ mod tests {
         let body = doctor_json_body(&report);
         assert_eq!(body["ok"], serde_json::json!(false));
         assert_eq!(body["blocking"], serde_json::json!(true));
-        assert_eq!(body["store"], serde_json::json!("/tmp/coven-home"));
-        assert_eq!(body["project"], serde_json::json!("/tmp/project"));
+        assert_eq!(body["store"], serde_json::json!("<coven-home>"));
+        assert_eq!(body["project"], serde_json::json!("<project>"));
         let checks = body["checks"].as_array().expect("checks array");
         let harness_check = checks
             .iter()
@@ -6319,6 +6391,18 @@ mod tests {
             .expect("engine check");
         assert_eq!(engine["status"], "fail");
         assert_eq!(engine["hint"], "run: coven engine install");
+        let familiars = checks
+            .iter()
+            .find(|check| check["id"] == "familiars")
+            .expect("familiars check");
+        assert_eq!(
+            familiars["message"],
+            "none configured (<familiars-manifest>)"
+        );
+        assert!(
+            !body.to_string().contains("/tmp/"),
+            "doctor JSON must not expose host-specific fixture paths: {body}"
+        );
         assert!(
             checks
                 .iter()
@@ -6349,8 +6433,18 @@ mod tests {
             daemon["message"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("pid 42"),
+                .contains("pid 42, socket <daemon-socket>"),
             "daemon message should carry the pid: {daemon}"
+        );
+        let engine = checks
+            .iter()
+            .find(|check| check["id"] == "engine")
+            .expect("engine check");
+        assert!(
+            engine["message"]
+                .as_str()
+                .is_some_and(|message| message.starts_with("<engine>")),
+            "engine path should be role-redacted: {engine}"
         );
         let credentials = checks
             .iter()

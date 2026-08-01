@@ -26,17 +26,23 @@ found):
 {
   "ok": true,
   "blocking": false,
-  "store": "/home/alex/.coven",
-  "project": "/home/alex/src/app",
+  "store": "<coven-home>",
+  "project": "<project>",
   "checks": [
-    { "id": "daemon", "status": "pass", "message": "running (pid 12345, socket /home/alex/.coven/coven.sock)" },
+    { "id": "daemon", "status": "pass", "message": "running (pid 12345, socket <daemon-socket>)" },
     { "id": "harness:codex", "status": "pass", "message": "`codex` is ready (built-in)" },
     { "id": "harnesses", "status": "pass", "message": "1 of 3 configured harnesses available" },
-    { "id": "engine", "status": "pass", "message": "/home/alex/.coven/engine/bin/coven-code (managed install), version 0.6.1 (pin 0.6.1)" }
+    { "id": "engine", "status": "pass", "message": "<engine> (managed install), version 0.6.1 (pin 0.6.1)" }
   ],
   "nextSteps": ["coven run codex \"explain this repo in 5 bullets\"", "coven sessions"]
 }
 ```
+
+Absolute paths are replaced with stable role tokens such as `<coven-home>`,
+`<project>`, `<engine>`, and `<daemon-socket>`. This keeps repeated output
+comparable across machines and safer to attach to CI logs or bug reports. Run
+the prose form locally when you need the concrete paths. `project` is `null`
+when the command runs outside a project root.
 
 Check `status` is `pass`, `warn`, or `fail`. Every `fail` is blocking — `ok`
 is false and the command exits 1 — while `warn` needs attention but does not
@@ -110,7 +116,7 @@ coven daemon status --json
 Typical human output from `coven daemon status`:
 
 ```text
-Coven daemon: running (pid 12345, socket /home/alex/.coven/coven.sock)
+Coven daemon: running (pid 12345, socket <coven-home>/coven.sock)
 ```
 
 `not running` means no background daemon is running yet. Start it with:
