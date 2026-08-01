@@ -50,7 +50,7 @@ fn preview_native_reports_a_sorted_redacted_plan_without_creating_targets() -> R
     assert_eq!(report["conflict_count"], 0);
     assert!(report["bundle_id"]
         .as_str()
-        .is_some_and(|bundle| bundle.starts_with("blake3:") && bundle.len() == 71));
+        .is_some_and(|bundle| bundle.starts_with("blake3-") && bundle.len() == 71));
     assert_eq!(
         report["entries"],
         serde_json::json!([
@@ -93,7 +93,7 @@ fn preview_native_reports_a_sorted_redacted_plan_without_creating_targets() -> R
     assert!(human.contains("Preview"), "{human}");
     assert!(human.contains("memory/a.md"), "{human}");
     assert!(human.contains("memory-a.md"), "{human}");
-    assert!(human.contains("Bundle: blake3:"), "{human}");
+    assert!(human.contains("Bundle: blake3-"), "{human}");
     assert!(human.contains("eligible"), "{human}");
     assert!(!human.contains("root secret"), "{human}");
     assert!(!human.contains(&workspace.to_string_lossy().into_owned()));
@@ -180,7 +180,7 @@ fn preview_openclaw_uses_explicit_root_and_registered_target_without_leaks() -> 
     let human = String::from_utf8(human.stdout)?;
     assert!(human.contains("Preview for familiar `sage`"), "{human}");
     assert!(human.contains("DREAMS.md -> dreams.md [create]"), "{human}");
-    assert!(human.contains("Bundle: blake3:"), "{human}");
+    assert!(human.contains("Bundle: blake3-"), "{human}");
     assert!(!human.contains("dream secret"), "{human}");
     assert!(!human.contains(openclaw.to_str().expect("fixture path is UTF-8")));
     assert!(!temp.path().join("memory").exists());
@@ -216,23 +216,170 @@ fn preview_conflict_is_whole_plan_ineligible_and_creates_nothing() -> Result<()>
 }
 
 #[test]
-fn apply_remains_not_implemented_and_does_not_create_preview_outputs() -> Result<()> {
+fn apply_publishes_a_private_redacted_bundle_and_leaves_sources_unchanged() -> Result<()> {
     let temp = trusted_tempdir()?;
     let workspace = temp.path().join("native-workspace");
     write_familiar(temp.path(), "sage", &workspace)?;
     write_file(&workspace.join("MEMORY.md"), b"secret")?;
+    let source_before = fs::read(workspace.join("MEMORY.md"))?;
+
+    let output = run_coven(
+        temp.path(),
+        &[
+            "memory",
+            "import",
+            "--familiar",
+            "sage",
+            "--apply",
+            "--json",
+        ],
+    )?;
+
+    assert_success(&output);
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["status"], "verified");
+    assert_eq!(report["created_count"], 1);
+    assert_eq!(report["unchanged_count"], 0);
+    assert_eq!(report["entries"][0]["status"], "create");
+    assert_eq!(
+        fs::read(temp.path().join("memory/sage/memory.md"))?,
+        b"secret"
+    );
+    assert_eq!(fs::read(workspace.join("MEMORY.md"))?, source_before);
+    let rendered = String::from_utf8(output.stdout)?;
+    assert!(!rendered.contains("secret"));
+    assert!(!rendered.contains(&workspace.to_string_lossy().into_owned()));
+    assert!(temp.path().join("memory-migrations/sage").is_dir());
+    Ok(())
+}
+
+#[test]
+fn apply_conflict_creates_no_bundle_or_additional_target() -> Result<()> {
+    let temp = trusted_tempdir()?;
+    let workspace = temp.path().join("native-workspace");
+    write_familiar(temp.path(), "sage", &workspace)?;
+    write_file(&workspace.join("MEMORY.md"), b"new bytes")?;
+    write_file(&workspace.join("notes/new.md"), b"would create")?;
+    write_file(&temp.path().join("memory/sage/memory.md"), b"old bytes")?;
+
+    let output = run_coven(
+        temp.path(),
+        &[
+            "memory",
+            "import",
+            "--familiar",
+            "sage",
+            "--apply",
+            "--json",
+        ],
+    )?;
+
+    assert!(!output.status.success());
+    assert!(!temp.path().join("memory/sage/notes-new.md").exists());
+    assert!(!temp.path().join("memory-migrations").exists());
+    assert_eq!(
+        fs::read(temp.path().join("memory/sage/memory.md"))?,
+        b"old bytes"
+    );
+    Ok(())
+}
+
+#[test]
+fn apply_rerun_is_idempotent_and_isolated_to_one_familiar() -> Result<()> {
+    let temp = trusted_tempdir()?;
+    let sage_workspace = temp.path().join("sage-workspace");
+    let cody_workspace = temp.path().join("cody-workspace");
+    write_familiars(
+        temp.path(),
+        &[("sage", &sage_workspace), ("cody", &cody_workspace)],
+    )?;
+    write_file(&sage_workspace.join("MEMORY.md"), b"sage bytes")?;
+    write_file(&cody_workspace.join("MEMORY.md"), b"cody bytes")?;
+    write_file(
+        &temp.path().join("memory/cody/existing.md"),
+        b"cody sentinel",
+    )?;
+
+    let first = run_coven(
+        temp.path(),
+        &[
+            "memory",
+            "import",
+            "--familiar",
+            "sage",
+            "--apply",
+            "--json",
+        ],
+    )?;
+    assert_success(&first);
+    let first_report: Value = serde_json::from_slice(&first.stdout)?;
+    let second = run_coven(
+        temp.path(),
+        &[
+            "memory",
+            "import",
+            "--familiar",
+            "sage",
+            "--apply",
+            "--json",
+        ],
+    )?;
+    assert_success(&second);
+    let second_report: Value = serde_json::from_slice(&second.stdout)?;
+
+    assert_eq!(first_report["bundle_id"], second_report["bundle_id"]);
+    assert_eq!(second_report["created_count"], 0);
+    assert_eq!(second_report["unchanged_count"], 1);
+    assert_eq!(
+        fs::read(temp.path().join("memory/sage/memory.md"))?,
+        b"sage bytes"
+    );
+    assert_eq!(
+        fs::read(temp.path().join("memory/cody/existing.md"))?,
+        b"cody sentinel"
+    );
+    assert!(!temp.path().join("memory/cody/memory.md").exists());
+    assert!(!temp.path().join("memory-migrations/cody").exists());
+    Ok(())
+}
+
+#[test]
+fn apply_preserves_an_existing_exact_target_and_human_output_is_redacted() -> Result<()> {
+    let temp = trusted_tempdir()?;
+    let workspace = temp.path().join("native-workspace");
+    write_familiar(temp.path(), "sage", &workspace)?;
+    write_file(&workspace.join("MEMORY.md"), b"same bytes")?;
+    let target = temp.path().join("memory/sage/memory.md");
+    write_file(&target, b"same bytes")?;
+    let before = fs::metadata(&target)?;
 
     let output = run_coven(
         temp.path(),
         &["memory", "import", "--familiar", "sage", "--apply"],
     )?;
 
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr)?;
-    assert!(stderr.contains("apply is not implemented yet"), "{stderr}");
-    assert!(!stderr.contains("secret"));
-    assert!(!temp.path().join("memory").exists());
-    assert!(!temp.path().join("memory-import").exists());
+    assert_success(&output);
+    let human = String::from_utf8(output.stdout)?;
+    assert!(
+        human.contains("Verified import for familiar `sage`"),
+        "{human}"
+    );
+    assert!(human.contains("0 create, 1 unchanged"), "{human}");
+    assert!(
+        human.contains("source files were left unchanged"),
+        "{human}"
+    );
+    assert!(!human.contains("same bytes"), "{human}");
+    assert!(!human.contains(&workspace.to_string_lossy().into_owned()));
+    let after = fs::metadata(&target)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+    }
+    #[cfg(not(unix))]
+    let _ = (before, after);
+    assert_eq!(fs::read(target)?, b"same bytes");
     Ok(())
 }
 
@@ -496,10 +643,14 @@ fn trusted_tempdir() -> Result<tempfile::TempDir> {
 }
 
 fn write_familiar(coven_home: &Path, id: &str, workspace: &Path) -> Result<()> {
-    let workspace = serde_json::to_string(&workspace.to_string_lossy())?;
-    fs::write(
-        coven_home.join("familiars.toml"),
-        format!(
+    write_familiars(coven_home, &[(id, workspace)])
+}
+
+fn write_familiars(coven_home: &Path, familiars: &[(&str, &Path)]) -> Result<()> {
+    let mut config = String::new();
+    for (id, workspace) in familiars {
+        let workspace = serde_json::to_string(&workspace.to_string_lossy())?;
+        config.push_str(&format!(
             r#"
 [[familiar]]
 id = "{id}"
@@ -508,8 +659,9 @@ role = "test"
 description = "test"
 workspace = {workspace}
 "#
-        ),
-    )?;
+        ));
+    }
+    fs::write(coven_home.join("familiars.toml"), config)?;
     Ok(())
 }
 
