@@ -1,6 +1,6 @@
 # Psyche Familiar Runtime Design
 
-**Status:** Approved architecture baseline - specification reconciliation required
+**Status:** Approved architecture baseline - W0 reconciled and G1 verified 2026-08-01
 
 **Design owner:** Psyche maintainers
 
@@ -20,11 +20,11 @@
 [Coven prerequisites](./COVEN_PREREQUISITES.md), and
 [Program plan](./PLAN.md)
 
-> This document defines the approved product and architecture direction. The
-> companion documents still contain an earlier Telegram-scoped product
-> boundary. They remain useful implementation evidence but are not canonical
-> where they conflict with this design. Reconciliation is required before an
-> implementation plan or production code begins.
+> This document defines the approved product and architecture direction. W0
+> reconciles the companion documents to this surface-neutral boundary while
+> preserving Telegram detail as adapter evidence. G1 is required before
+> repository creation and W1; G3 is required before implementation planning,
+> issues, or production code.
 
 ## 1. Product decision
 
@@ -752,17 +752,20 @@ adopted by this document.
 
 ## 14. Acceptance criteria for this design
 
-This design is ready to drive specification reconciliation only when:
+The W0 package is ready for G1 specification-coherence verification only when:
 
 1. Val approves the product boundary, ownership matrix, components, lifecycle,
    verification model, and release gates;
 2. Nova confirms identity, authority, approval, adoption, and recovery
    coherence;
 3. Sage confirms the research claims and confidence labels are faithful;
-4. Coven maintainers classify every proposed prerequisite as current, planned,
-   optional, or rejected and assign owners to accepted work;
-5. the companion Psyche documents are reconciled without preserving
-   contradictory Telegram-only product claims; and
-6. each subsystem receives its own dependency-gated implementation plan.
+4. the six companion Psyche documents share this product and ownership model;
+5. Telegram remains an adapter rather than a core product boundary;
+6. Coven prerequisites are behavior-level W1 hypotheses, not assumed current
+   contracts or implementation assignments; and
+7. repository creation and W1 remain blocked until G1, while implementation
+   plans, issues, and production code remain blocked until G3.
 
-No production implementation begins from this design document alone.
+W1 classifies current Coven contracts before G3; each implementation
+workstream then receives its own dependency-gated child plan. No production
+implementation begins from this design document alone.

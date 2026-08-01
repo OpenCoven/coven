@@ -1,40 +1,46 @@
 # Psyche Technical Architecture
 
-**Status:** Proposed v1 - design approval required
+**Status:** Approved technical baseline - W0 reconciled and G1 verified 2026-08-01
 **Work unit:** `coven-psy0`
-**Companion to:** [Product specification](./PRODUCT.md)
+**Canonical decision:** [Familiar runtime design](./RUNTIME_DESIGN.md)
+**Companions:** [Decision dossier](./DECISION_DOSSIER.md), [Product specification](./PRODUCT.md), [Threat model](./THREAT_MODEL.md), [Telegram parity ledger](./TELEGRAM_PARITY.md), [Coven prerequisites](./COVEN_PREREQUISITES.md), [Program plan](./PLAN.md)
 
 ## Architecture decision
 
-Psyche ships from a standalone `OpenCoven/psyche` repository as a Rust
-workspace. The long-running process is `psyched`; the operator CLI is `psyche`.
+Psyche is a surface-neutral familiar runtime implemented as a Rust workspace.
+The long-running process is `psyched`; the operator CLI is `psyche`.
 The canonical npm package is `@opencoven/psyche`. If npm needs native binary
 packages, they use `@opencoven/psyche-<platform>-<arch>` and remain
 implementation details of the canonical wrapper. The `@psyches/*` namespace is
 outside v1.
 
-This specification is stored in Coven until that repository exists because
-Psyche's most important contract is the Coven authority boundary.
+This specification remains in Coven through G1 because the execution boundary
+must be coherent before repository creation. The standalone
+`OpenCoven/psyche` repository is created after G1 and before W2; no production
+implementation begins in this repository.
 
 ## System context
 
 ```mermaid
 flowchart LR
-  TG[Telegram Bot API] <--> TR[Psyche Telegram adapters]
-  TR <--> DB[(Psyche SQLite)]
-  DB <--> RT[Psyche runtime]
-  ID[Identity files] --> RT
-  RT -->|HTTP over same-user Unix socket| CV{{Coven daemon}}
-  CV --> HS[Harness adapters]
-  CV --> MEM[Coven memory]
-  CV --> POL[Coven policy and approvals]
-  HS --> CV
-  CV -->|redacted events| RT
-  RT --> TR
+  SF[Telegram, Cave, CLI, mobile, webhooks] <--> SA[Psyche surface adapters]
+  SA <--> RT[Psyche runtime]
+  ID[Identity files] --> IK[Identity kernel]
+  IK --> RT
+  RT <--> DB[(Psyche SQLite)]
+  RT <--> VE[Verification engine]
+  RT <--> AH[Trusted add-on host]
+  RT -->|versioned session contracts| CV{{Coven daemon}}
+  CV --> HS[Supervised harness session]
+  HS <--> MP[Model provider and harness-owned tools]
+  CV -->|ordered events and terminal state| RT
 ```
 
-Psyche is authoritative only for its own channel ledger. The Coven daemon is
-authoritative for every local execution or policy effect.
+Psyche is authoritative for familiar identity resolution, principal mapping,
+intent, graph, verification, add-on, and surface state. Coven is authoritative
+for admitted session execution, ordered execution events, terminal state, and
+protected resources exposed through versioned contracts. Harnesses remain
+authoritative for provider conversations and harness-native tool behavior.
 
 ## Repository and crate boundaries
 
@@ -42,16 +48,25 @@ authoritative for every local execution or policy effect.
 psyche/
   Cargo.toml
   crates/
-    psyche-core/       # versioned domain types, IDs, errors, route semantics
-    psyche-config/     # strict config parsing and validation
-    psyche-identity/   # no-follow identity reads, coherence checks, digests
+    psyche-core/       # versioned IDs, schemas, errors, invariants
+    psyche-config/     # strict configuration and secret references
+    psyche-identity/   # identity snapshots, revisions, provenance
     psyche-store/      # SQLite migrations, transactions, leases, retention
-    psyche-telegram/   # Bot API client, polling, webhook, normalization
-    psyche-coven/      # coven.daemon.v1 client and capability profile
-    psyche-runtime/    # authorization, lanes, orchestration, delivery state
+    psyche-intent/     # immutable intent ledger
+    psyche-graph/      # graph, node, attempt, budget, cancellation, recovery
+    psyche-coven/      # negotiation, execution binding, conformance
+    psyche-context/    # surface-neutral conversation and memory coordination
+    psyche-verify/     # evidence sets, deterministic gates, verifier policy
+    psyche-addons/     # pinned manifests, worker protocol, supervision
+    psyche-surfaces/   # adapter-neutral ingress and effect contracts
+    psyche-telegram/   # Bot API adapter and parity behavior
+    psyche-ops/        # diagnostics, audit, export, restore, migration
+    psyche-runtime/    # composition root
     psyche-cli/        # psyche and psyched entry points
-  npm/
+  packages/
     psyche/            # @opencoven/psyche wrapper
+    psyche-sdk/        # typed trusted add-on SDK
+    openclaw-compat/   # bounded declaration/config compatibility
     native/            # optional platform packages
   tests/
     contract/          # schema and API compatibility
@@ -63,18 +78,23 @@ psyche/
 Dependency direction is inward:
 
 ```text
-config/identity/store/telegram/coven -> core
-runtime -> core + config + identity + store + telegram + coven
+config/identity/intent/graph/surfaces/coven/verify/addons -> core
+store implements persistence for domain crates
+telegram -> surfaces + core
+runtime -> all domain crates as the only composition root
 cli -> runtime
 ```
 
 `psyche-telegram` has no Coven knowledge. `psyche-coven` has no Telegram
-knowledge. `psyche-runtime` is the only crate that joins a normalized channel
-event to a Coven intent.
+knowledge. Surface adapters do not depend on graph internals. TypeScript
+workers use only a versioned Rust-owned protocol. `psyche-runtime` is the only
+composition root that joins an authenticated observation, principal, familiar
+snapshot, intent, graph node, execution request, evidence policy, and effect.
 
 ## Process model
 
-- One `psyched` process may host multiple accounts.
+- One `psyched` process owns the local intent/graph store and may host multiple
+  adapters and Telegram accounts.
 - An account token is resolved once at startup or explicit reload and remains
   in locked process memory for the account lifetime.
 - Every account pins an expected numeric Telegram bot ID. Startup and reload
@@ -84,9 +104,11 @@ event to a Coven intent.
 - Horizontal multi-host ownership is not a v1 feature. The database refuses to
   open from a network filesystem unless explicitly supported by a later
   storage profile.
-- The webhook listener and Coven socket client are separate trust boundaries.
+- Surface listeners, the Coven socket client, harnesses, and add-on workers are
+  separate trust boundaries.
 - Graceful shutdown stops intake, finishes the durable commit in progress,
-  releases leases, records delivery ambiguity, and then exits.
+  releases only safe leases, records execution/evidence/delivery ambiguity,
+  and then exits.
 
 ## Configuration contract
 
@@ -101,6 +123,16 @@ data_dir = "/path/to/psyche-data"
 [coven]
 socket = "/path/to/coven.sock"
 required_api_version = "coven.daemon.v1"
+
+[streaming]
+preview_max_age_seconds = 600
+
+[[principal_bindings]]
+principal_id = "principal:val"
+surface = "telegram"
+account = "main"
+actor_type = "user"
+actor_id = "123456789"
 
 [accounts.main]
 secret_ref = "op://VAULT/ITEM/token"
@@ -155,6 +187,7 @@ Config validation rejects:
 - a missing or non-numeric expected bot ID;
 - multiple default accounts;
 - equal-precedence route matches;
+- missing, duplicate, stale, or conflicting principal bindings;
 - a wildcard DM allowlist without `dm_policy = "open"`;
 - empty allowlists under an allowlist policy;
 - polling and webhook configuration on the same account;
@@ -162,8 +195,9 @@ Config validation rejects:
   address;
 - a webhook bound beyond loopback without an explicit public-listener flag;
 - an unknown schema version, transport, policy, or streaming mode; and
-- any route whose project root, identity, or Coven familiar binding cannot be
-  validated.
+- any route whose project root or Psyche identity snapshot cannot be validated;
+  execution additionally remains disabled until its W1-classified Coven
+  binding passes G4.
 
 Resolving a token for a different bot ID is not an in-place rotation. The
 operator must configure a new account ID or run an explicit audited rebind
@@ -182,17 +216,165 @@ succeeds; a failed update leaves the old version active. Logs and health expose
 only a version ID and digest prefix. Both secret buffers follow the bot-token
 memory and redaction rules.
 
+`streaming.preview_max_age_seconds` defaults to `600` and must be between 30
+and 3600. The value is persisted with each logical response so config reload
+cannot silently extend an already-open preview.
+
 ## Versioned domain schemas
 
 All persisted envelopes carry a schema version. Additive fields may be ignored
 only when their containing schema explicitly allows it. Unknown major versions
 are quarantined and not dispatched.
 
+The W0 surface-neutral contract set is:
+
+| Contract | Purpose |
+|---|---|
+| `psyche.identity_snapshot.v1` | Familiar, source digests, provenance, and immutable revision. |
+| `psyche.intent.v1` | Immutable operator or surface request, constraints, required outcome/evidence, provenance, and digest. |
+| `psyche.surface_event.v1` | Authenticated adapter observation with adapter-owned actor and locator data. |
+| `psyche.graph.v1` | Graph identity, owner principal, root intent, policy, state, and aggregate result. |
+| `psyche.graph_node.v1` | Task, familiar snapshot, dependencies, limits, acceptance evidence, state, and result. |
+| `psyche.delegation.v1` | Parent-child scope, non-widening constraints, budget, evidence access, and cancellation policy. |
+| `psyche.budget.v1` | Reserved, consumed, and released accounting by enforceable resource class. |
+| `psyche.approval.v1` | Psyche orchestration approval request, provenance, decision, and expiry. |
+| `psyche.execution_binding.v1` | Graph attempt, stable request digest, Coven adoption state, event cursor, cancellation, and terminal correlation. |
+| `psyche.evidence.v1` | Immutable check, artifact, trajectory, verifier, or human evidence reference. |
+| `psyche.verdict.v1` | Verification policy, sealed evidence set, independent verifier, confidence class, and decision. |
+| `psyche.recovery.v1` | Lease, ambiguity, fence, reconciliation, and operator disposition. |
+| `psyche.addon.v1` | Pinned package identity, provenance, contributions, allowlist, and revocation state. |
+| `psyche.surface_effect.v1` | Canonical presentation or interaction intent before adapter translation. |
+| `psyche.delivery.v1` | Logical effect, physical attempts, surface-policy decision, ambiguity, and resolution. |
+
+Adapter schemas extend rather than replace these contracts. Telegram uses
+`psyche.telegram_event.v1` and `psyche.telegram_effect.v1`, both of which map
+to a canonical surface event or effect. No Telegram identifier appears in the
+graph, identity, execution-binding, evidence, or verdict schema.
+
+Minimum lifecycle invariants are frozen in W0:
+
+- an intent is immutable after durable acceptance; corrections supersede it;
+- a graph transition is append-only and versioned;
+- a node attempt binds one familiar snapshot and at most one Coven session;
+- dependency edges are acyclic and cannot be rewritten after admission;
+- delegation cannot widen authority, budget, evidence access, or surface scope;
+- lease expiry never proves an attempt safe to redispatch;
+- cancellation is unresolved until every affected execution boundary returns
+  authoritative terminal acknowledgement or an explicit unknown state;
+- evidence is content-addressed and sealed before a verdict;
+- a generator cannot issue its own independent-verification verdict; and
+- a logical surface effect and every physical delivery attempt have distinct
+  durable identities.
+
+`psyche.intent.v1`, `psyche.graph.v1`, and `psyche.graph_node.v1` require the
+following stable fields. Specific child implementation plans may add
+forward-compatible fields but may not weaken these bindings:
+
+```json
+{
+  "intent": {
+    "schema_version": "psyche.intent.v1",
+    "intent_id": "int_01J...",
+    "principal_id": "principal:val",
+    "familiar_snapshot_id": "ids_01J...",
+    "project_id": "project:sha256:...",
+    "requested_outcome": "Review and verify the scoped change.",
+    "constraints": {},
+    "required_evidence": ["tests", "diff_review"],
+    "surface_event_id": "sev_01J...",
+    "created_at": "2026-08-01T00:00:00Z",
+    "digest": "sha256:..."
+  },
+  "graph": {
+    "schema_version": "psyche.graph.v1",
+    "graph_id": "grf_01J...",
+    "root_intent_id": "int_01J...",
+    "owner_principal_id": "principal:val",
+    "policy_revision": "policy:sha256:...",
+    "state": "admitted",
+    "version": 1
+  },
+  "node": {
+    "schema_version": "psyche.graph_node.v1",
+    "node_id": "nod_01J...",
+    "graph_id": "grf_01J...",
+    "familiar_snapshot_id": "ids_01J...",
+    "dependencies": [],
+    "delegation_id": null,
+    "budget_id": "bud_01J...",
+    "required_evidence": ["tests", "diff_review"],
+    "state": "ready",
+    "version": 1
+  }
+}
+```
+
+An absent `surface_event_id` represents locally authored operator intent. An
+absent `delegation_id` represents a root node. Nullability is allowed only for
+those two fields in these minimum examples; unknown fields and unknown major
+versions fail closed until the child schema explicitly declares compatibility.
+
+### Graph, attempt, and verification lifecycles
+
+```text
+graph: draft -> admitted | rejected
+       admitted -> running
+       running -> waiting_approval | waiting_evidence | cancelling
+       running -> completed | failed
+       waiting_approval | waiting_evidence -> running | cancelling | failed
+       cancelling -> cancelled | recovery_required
+       recovery_required -> running | completed | failed | cancelling
+
+node: proposed -> admitted | rejected
+      admitted -> blocked | ready
+      blocked -> ready | skipped
+      ready -> reserved -> dispatching
+      dispatching -> adopted | adoption_unknown | proven_not_adopted | failed
+      adoption_unknown -> adopted | proven_not_adopted | recovery_required
+      proven_not_adopted -> ready | failed
+      adopted -> running | candidate | failed
+      running -> waiting_approval | candidate | failed
+      waiting_approval -> running | candidate | failed
+      candidate -> awaiting_verification
+      awaiting_verification -> verified | rejected | escalation_required
+      escalation_required -> awaiting_verification | verified | rejected
+      cancelling -> cancelled | termination_unknown
+      termination_unknown -> cancelled | candidate | failed | recovery_required
+      recovery_required -> adopted | running | candidate | failed | cancelled
+
+attempt adoption: not_submitted -> submitting -> adopted | proven_not_adopted
+                  submitting -> adoption_unknown
+                  adoption_unknown -> adopted | proven_not_adopted | fenced
+```
+
+Terminal graph success requires every required node terminal, every required
+evidence set sealed, and every required verdict allowed. A failed process, an
+unresolved cancellation, or an unknown adoption cannot be converted to success
+by another node or an operator database edit.
+
+Budget reservations use `(graph_id, node_id, attempt_id, resource_class)` as an
+idempotency key. Reserve, consume, and release are once-only transitions.
+Psyche calls a resource limit `hard` only when the W1-classified execution
+boundary can enforce it and report trustworthy consumption; other limits are
+admission estimates or accounting controls.
+
+`psyche.evidence.v1` binds evidence ID, node/attempt, content digest, producer,
+collection method, media type, size, creation time, and retention policy.
+`psyche.verdict.v1` binds the sealed evidence-set digest, policy revision,
+verdict type (`deterministic`, `human`, or `independent_verifier`), reviewer
+identity/session when applicable, outcome, reason codes, and creation time.
+Independent verifier execution remains disabled until G5 local calibration;
+the initial release may use deterministic checks and human review.
+
 ### Normalized Telegram event
 
-`psyche.telegram_event.v1` is a discriminated union and the durable input to
-authorization and routing. Fields unavailable in a Telegram update are
-represented explicitly rather than invented.
+`psyche.telegram_event.v1` is a discriminated adapter union and the durable
+Telegram input to canonical normalization. Fields unavailable in a Telegram
+update are represented explicitly rather than invented. The adapter creates a
+`psyche.surface_event.v1` containing the adapter ID, authenticated actor and
+locator references, Telegram event digest, receive time, and normalized
+content. Psyche then maps the actor to a principal and separately admits an
+intent; the Telegram event itself grants neither identity nor authority.
 
 ```json
 {
@@ -316,175 +498,159 @@ otherwise corrupt them.
 
 ### Identity snapshot
 
-`psyche.identity_snapshot.v1` is computed before route activation and pinned to
-each turn.
+`psyche.identity_snapshot.v1` is resolved by Psyche before intent admission and
+pinned to every graph node and execution attempt.
 
 ```json
 {
   "schema_version": "psyche.identity_snapshot.v1",
+  "snapshot_id": "ids_01J...",
   "familiar_id": "cody",
+  "principal_id": "principal:val",
+  "revision": 7,
   "declaration_digest": "sha256:...",
   "identity_file_digest": "sha256:...",
   "identity_digest": "sha256:...",
   "soul_digest": "sha256:...",
   "role_skill_digest": "sha256:...",
-  "coven_familiar_id": "cody",
-  "coven_identity_digest": "sha256:...",
-  "coven_ward_revision": "ward_01J...",
-  "resolved_at": "2026-07-27T00:00:00Z"
+  "provenance": {
+    "familiar_home_id": "home:sha256:...",
+    "resolver_version": "psyche.identity_resolver.v1"
+  },
+  "resolved_at": "2026-08-01T00:00:00Z"
 }
 ```
 
 `identity_file_digest` covers the exact `IDENTITY.md` bytes.
 `identity_digest` is the aggregate over all named identity inputs. The snapshot
-stores digests and identifiers, not a second mutable copy of the identity. Turn
-construction reads the validated file handles and verifies the digests again
-immediately before the Coven request. The route activates only when every
-per-input digest and `identity_digest == coven_identity_digest`.
+stores digests, provenance, and identifiers, not a second mutable identity.
+Psyche reads validated handles and verifies digests before graph admission and
+again before execution request construction.
 
-Coven returns the canonical comparison as `coven.identity_binding.v1`:
+If W1 proves a compatible Coven snapshot-validation contract, Psyche records
+its result in `psyche.execution_binding.v1`:
 
 ```json
 {
-  "schema_version": "coven.identity_binding.v1",
-  "familiar_id": "cody",
-  "inputs": {
-    "declaration": "sha256:...",
-    "identity": "sha256:...",
-    "soul": "sha256:...",
-    "role_skill": "sha256:..."
-  },
-  "identity_digest": "sha256:...",
-  "ward_revision": "ward_01J..."
+  "schema_version": "psyche.execution_binding.v1",
+  "attempt_id": "att_01J...",
+  "familiar_snapshot_id": "ids_01J...",
+  "project_id": "project:sha256:...",
+  "request_id": "req_01J...",
+  "request_digest": "sha256:...",
+  "coven_contract_version": "classified-by-w1",
+  "coven_session_id": null,
+  "adoption_state": "not_submitted",
+  "event_cursor": null,
+  "cancellation_state": "not_requested",
+  "terminal_state": null
 }
 ```
 
-Missing or additional protected inputs, digest disagreement, an unknown schema
-version, or a changed Ward revision blocks route activation.
+This binding does not make Coven the identity source. It records whether Coven
+accepted the exact Psyche snapshot for one execution request. Missing inputs,
+digest disagreement, an unknown contract version, or a stale protected-write
+generation blocks execution and cannot be replaced with a local success.
+
+Ward is Coven's protected-familiar write gate and audit authority; its declared
+surface and decision lifecycle are described in
+[`specs/coven-familiar-spec/PRODUCT.md`](../coven-familiar-spec/PRODUCT.md) and
+[`docs/reference/cli-ward.md`](../../docs/reference/cli-ward.md). Ward may issue
+an opaque generation token for protected execution validation, but it never
+defines familiar identity, principal mapping, graph ownership, or surface
+policy. W1 must classify the actual current token and binding semantics before
+an implementation plan names a Coven contract.
 
 ### Familiar identity rebind
 
-An intentional change to any protected familiar identity input is a controlled
-security migration, not a permissive reload. File watching may detect the
-change, but detection only moves every affected route to `blocked` with
-`identity_changed`; it grants no authority to adopt the new identity.
+An intentional change to familiar identity is a controlled Psyche identity
+migration, not a permissive reload. Detection blocks affected graph admission
+and surface routes; it grants no authority to adopt the new snapshot.
 
-Reactivation requires the operator to invoke the versioned
-`coven.familiar.identityRebind.v1` control action through
-`coven.control.actions` using a current `coven.operatorIdentity.v1` context.
-Coven is authoritative for policy and approval. The request contains:
+Reactivation requires a current Psyche operator context and an audited
+`psyche.identity_rebind.v1` orchestration approval containing:
 
-- canonical familiar ID and project binding;
-- old and proposed `psyche.identity_snapshot.v1` input and aggregate digests;
-- old and proposed Ward revisions;
-- affected route and conversation IDs;
-- every `coven_adoption_unknown` client intent ID under the old binding;
-- a human-supplied reason and client intent ID; and
+- familiar ID, principal, and project binding;
+- old and proposed identity snapshot IDs, input digests, and aggregate digests;
+- affected graph, route, and conversation IDs;
+- every unresolved execution binding under the old snapshot;
+- a human-supplied reason and stable request ID; and
 - a digest of the exact proposed rebind record.
 
 Psyche first stops new admissions for the affected routes and waits for every
-lane to reach a durable local boundary. A rebind is rejected while a known turn
-submission, output adoption, approval, callback, or Telegram delivery remains
-active. A `delivery_unknown` must first use its normal audited resolution path.
-A `coven_adoption_unknown` row is already a durable local boundary, but it does
-not authorize rebind locally: Coven must atomically resolve or quarantine every
-listed intent, fence the old familiar/identity/Ward binding from new input, and
-guarantee that no adopted old-bound session can continue before allowing the
-rebind. If Coven cannot prove that fence, the route remains blocked.
+graph and adapter lane to reach a durable boundary. A rebind is rejected while
+a known execution, approval, callback, verification, or delivery remains
+active. Delivery ambiguity uses its adapter recovery path. Execution ambiguity
+requires Coven to resolve or fence every possible old-bound session through a
+W1-classified contract. If Coven cannot prove that fence, execution and route
+reactivation remain blocked.
 
-After Coven returns an adopted allow result bound to every request field and
-the old-binding fence, Psyche atomically archives the old
+After the Psyche approval commits and every execution boundary returns the
+required disposition, Psyche atomically archives the old
 route-to-conversation bindings, invalidates pairings and callback nonces whose
 policy/identity binding changed, records the old/new snapshots, intent
-dispositions, and Coven correlation IDs in the audit ledger, and activates the
-new snapshot. Existing Coven sessions remain permanently bound to the old
-identity digest and Ward revision; they may be inspected or terminated but
-never resumed or receive input under the new identity. The next accepted turn
-creates a new conversation generation and session binding.
+dispositions, and execution correlations, and activates the new snapshot.
+Existing sessions remain permanently bound to the old snapshot; they may be
+inspected or terminated but never resumed under the new identity.
 
-Lost rebind responses use the same client-intent adoption lookup discipline as
-turns. An inconclusive result leaves the route blocked; Psyche never repeats
-the action with another digest or locally declares the new identity active.
+Lost rebind responses use stable request adoption within Psyche. An
+inconclusive result leaves admission blocked; neither Psyche nor Coven may
+infer the new identity active from file state alone.
 
-### Coven turn intent
+### Coven execution request
 
-`psyche.coven_turn.v1` is an internal request record, not a replacement for the
-Coven API:
+`psyche.execution_request.v1` is Psyche's immutable internal record for one
+graph attempt. W1 maps it to the smallest compatible Coven API contract; it
+does not invent daemon capabilities or surface authority.
 
 ```json
 {
-  "schema_version": "psyche.coven_turn.v1",
-  "intent_id": "intent_01J...",
+  "schema_version": "psyche.execution_request.v1",
+  "request_id": "req_01J...",
+  "graph_id": "grf_01J...",
+  "node_id": "nod_01J...",
+  "attempt_id": "att_01J...",
   "operation": "launch",
-  "event_id": "evt_01J...",
-  "conversation_key": "conv_01J...",
-  "action_class": "telegram.turn.dispatch",
-  "requester": {
-    "type": "telegram_user",
-    "account_id": "main",
-    "user_id": "123456789"
-  },
-  "familiar_id": "cody",
-  "identity_digest": "sha256:...",
-  "ward_revision": "ward_01J...",
-  "project_root": "/path/to/project",
+  "principal_id": "principal:val",
+  "familiar_snapshot_id": "ids_01J...",
+  "project_id": "project:sha256:...",
+  "project_root": "/absolute/project",
+  "cwd": "/absolute/project",
   "harness": "codex",
-  "surface": {
-    "account_id": "main",
-    "chat_id": "-1001234567890",
-    "topic_kind": "forum",
-    "topic_id": "42",
-    "relationship": "reply_same_topic"
-  },
-  "event_digest": "sha256:...",
-  "authorization": {
-    "decision_id": "decision_01J...",
-    "effect_digest": "sha256:...",
-    "request_digest": "sha256:...",
-    "policy_revision": "policy_01J...",
-    "ward_revision": "ward_01J...",
-    "expires_at": "2026-07-27T00:05:00Z"
-  },
-  "session_request": {
-    "project_root": "/path/to/project",
-    "cwd": "/path/to/project",
-    "harness": "codex",
-    "prompt": "Typed current message and bounded observed context.",
-    "familiar_id": "cody",
-    "familiar_identity_digest": "sha256:...",
-    "familiar_ward_revision": "ward_01J...",
-    "conversation": { "mode": "init", "id": "conv_01J..." }
-  },
-  "session_request_digest": "sha256:...",
-  "expires_at": "2026-07-27T00:05:00Z",
-  "state": "ready",
-  "submit_attempt": 0
+  "context_manifest_digest": "sha256:...",
+  "delegation_digest": null,
+  "budget_digest": "sha256:...",
+  "required_artifact_bindings": [],
+  "payload_digest": "sha256:...",
+  "created_at": "2026-08-01T00:00:00Z"
 }
 ```
 
-The prompt sent to Coven contains normalized current-message content and
-bounded observed context. It does not contain a competing persona, hidden
-permission grant, bot token, or untrusted text represented as system
-instruction. `operation` is `launch` or `input`; input records additionally
-name the existing session. The encrypted `turn_intents` row stores this exact
-request and all bindings before network submission.
+The execution payload contains a typed task and bounded context manifest. It
+does not contain a competing persona, hidden permission grant, surface secret,
+or untrusted text represented as system instruction. `operation` is `launch`
+or `input`; input also names the adopted session. Psyche persists the exact
+request and digest before submission, then records adoption and event progress
+in `psyche.execution_binding.v1`.
 
-### Coven authorization request and decision
+### Surface policy request and decision
 
-Capability presence is discovery only. Psyche sends
-`psyche.coven_authorization.v1` in the `args` of the advertised
-`coven.psyche.authorize` action before every effect:
+Psyche, not Coven, owns surface policy. Before an adapter performs a canonical
+effect, Psyche evaluates `psyche.surface_policy_request.v1` against the mapped
+principal, familiar snapshot, graph provenance, exact destination, payload
+digest, and configured surface policy. Capability presence is discovery only.
 
 ```json
 {
-  "schema_version": "psyche.coven_authorization.v1",
+  "schema_version": "psyche.surface_policy_request.v1",
   "intent_id": "intent_01J...",
   "action_class": "telegram.reply.send",
   "requester": {
-    "type": "familiar_session",
-    "session_id": "session-1",
-    "familiar_id": "cody",
-    "caused_by_intent_id": "intent_01J..."
+    "type": "graph_attempt",
+    "principal_id": "principal:val",
+    "graph_id": "grf_01J...",
+    "node_id": "nod_01J...",
+    "attempt_id": "att_01J..."
   },
   "surface": {
     "channel": "telegram",
@@ -496,11 +662,10 @@ Capability presence is discovery only. Psyche sends
     "relationship": "reply_same_topic"
   },
   "binding": {
-    "type": "familiar_effect",
-    "familiar_id": "cody",
-    "identity_digest": "sha256:...",
-    "ward_revision": "ward_01J...",
-    "project_root": "/path/to/project"
+    "type": "surface_effect",
+    "familiar_snapshot_id": "ids_01J...",
+    "project_id": "project:sha256:...",
+    "policy_revision": "policy:sha256:..."
   },
   "effect": {
     "schema_version": "psyche.telegram_effect.v1",
@@ -511,52 +676,53 @@ Capability presence is discovery only. Psyche sends
     "buttons": [],
     "link_preview": { "enabled": true }
   },
-  "claimed_effect_digest": "sha256:...",
-  "claimed_request_digest": "sha256:...",
-  "expires_at": "2026-07-27T00:05:00Z"
+  "effect_digest": "sha256:...",
+  "request_digest": "sha256:...",
+  "expires_at": "2026-08-01T00:05:00Z"
 }
 ```
 
-`requester.type` is `telegram_user` for inbound turn dispatch and pairing
-requests, `familiar_session` for model-originated replies/actions, and
-`telegram_approver` for Telegram approval decisions. `local_operator` carries
-only an opaque, unexpired `operator_context_id` minted by Coven; Psyche may not
-self-assert a principal ID. The corresponding numeric user ID, account, and
-callback binding are required for Telegram actors.
+`requester.type` is `surface_principal`, `graph_attempt`, or `local_operator`.
+Surface principals include the authenticated adapter actor and mapping
+revision. Graph attempts include immutable graph/node/attempt correlation.
+`local_operator` carries an opaque, unexpired Psyche operator context produced
+by the configured local authentication policy.
 
-`coven.operatorIdentity.v1` lets the local `psyche` CLI request
-`coven.operator_context.v1` over the same-user socket:
+`psyche.operator_context.v1` is local to Psyche orchestration and surface
+policy:
 
 ```json
 {
-  "schema_version": "coven.operator_context.v1",
+  "schema_version": "psyche.operator_context.v1",
   "operator_context_id": "operator_01J...",
   "principal_id": "principal-local-owner",
   "auth_strength": "same_user_local",
-  "expires_at": "2026-07-27T00:10:00Z"
+  "expires_at": "2026-08-01T00:10:00Z"
 }
 ```
 
-Coven derives the principal and revalidates the context on every action.
+Psyche derives the principal and revalidates the context on every action.
 Required CLI sends, polls, buttons, pins, force-document sends, and local
-pairing approvals use `local_operator`. Missing operator identity capability
-disables those commands and blocks Telegram parity release.
+pairing approvals use `local_operator`. Missing local authentication disables
+those commands and blocks Telegram parity release. This context never grants
+Coven execution or protected-resource authority.
 
-`telegram.account.activate` is the only non-per-effect decision. Its requester
+`telegram.account.activate` is the only adapter-lifecycle rather than visible-
+effect decision. Its requester
 is `operator_config`; its surface contains account ID, expected numeric bot ID,
-transport mode, and API root; and its binding contains Coven client identity
+transport mode, and API root; and its binding contains Psyche adapter identity
 and the full account config digest instead of familiar/project fields. It
 permits only the listed protocol administration needed to receive updates or
 fetch media for a locally ACL-admitted event; it cannot send message content,
 typing, callback answers, reactions, or other familiar-visible effects. Psyche
 renews it on config reload and at least daily. All other action classes require
-the full actor/session, familiar, identity, Ward, project, and conversation
-surface binding shown above.
+the full principal, graph attempt or operator provenance, familiar snapshot,
+project, policy revision, and conversation-surface binding shown above.
 
 The account-activation request and response use
-`binding.type = "account_activation"` with `coven_client_id`, `account_id`,
+`binding.type = "account_activation"` with `psyche_adapter_id`, `account_id`,
 `expected_bot_id`, `transport`, `api_root`, and `config_digest`. Every other
-request and decision uses `binding.type = "familiar_effect"`. Unknown binding
+request and decision uses `binding.type = "surface_effect"`. Unknown binding
 types or fields are denied.
 
 Every send-like request has a target `relationship`:
@@ -565,7 +731,7 @@ Every send-like request has a target `relationship`:
 - `cross_chat`; or
 - `broadcast`.
 
-Psyche supplies a claimed relationship. Coven derives it from the originating
+The adapter supplies a claimed relationship. Psyche derives it from the originating
 event/session, target surface, and optional broadcast batch, rejects a
 mismatch, and returns the derived value in the decision binding. Generic media,
 sticker, location, poll, and pin action classes therefore cannot hide whether
@@ -577,11 +743,9 @@ Known v1 action classes are:
 - `telegram.account.activate`, which alone covers `getMe`, `getUpdates`,
   webhook setup/cleanup, command-menu synchronization, and Telegram file
   metadata/download for one exact account configuration;
-- `telegram.turn.dispatch`, `telegram.reply.send`,
-  `telegram.group_reply.send`, `telegram.broadcast.send`,
+- `telegram.reply.send`, `telegram.group_reply.send`, `telegram.broadcast.send`,
   `telegram.cross_chat.send`;
 - `telegram.chat_action.send`, `telegram.callback.answer`;
-- `telegram.artifact.admit`;
 - `telegram.message.edit`, `telegram.message.delete`,
   `telegram.message.react`, `telegram.poll.create`,
   `telegram.message.pin`;
@@ -598,8 +762,6 @@ Each action class accepts exactly one `psyche.telegram_effect.v1` type:
 | Action class | `effect.type` | Required effect fields |
 |---|---|---|
 | `telegram.account.activate` | `account_activation` | account ID, expected bot ID, transport, API root, webhook/command config digest |
-| `telegram.artifact.admit` | `admit_artifact` | source event/surface, media metadata and byte hash, prospective turn intent, project/familiar/identity/Ward binding, expiry |
-| `telegram.turn.dispatch` | `turn` | complete `psyche.telegram_event.v1`, route ID, conversation key, ordered Coven artifact IDs, exact session-request digest |
 | `telegram.reply.send`, `telegram.group_reply.send`, `telegram.broadcast.send`, `telegram.cross_chat.send` | `send_message` | format, exact text, target relationship, and materialized link-preview object; optional reply/quote metadata and buttons |
 | `telegram.chat_action.send` | `chat_action` | Telegram chat action and bounded duration |
 | `telegram.callback.answer` | `callback_answer` | callback query ID, optional exact text, alert flag, cache seconds |
@@ -608,24 +770,22 @@ Each action class accepts exactly one `psyche.telegram_effect.v1` type:
 | `telegram.message.react` | `set_reaction` | message ID, ordered typed reactions |
 | `telegram.poll.create` | `create_poll` | question, 1-12 options, anonymity, multi-answer, duration |
 | `telegram.message.pin` | `pin_message` | message ID and notification flag |
-| `telegram.media.send` | `send_media` | media kind, ordered Coven artifact IDs with hash/size/type, caption, force-document flag |
+| `telegram.media.send` | `send_media` | media kind, ordered immutable artifact references with hash/size/type, caption, force-document flag |
 | `telegram.sticker.send` | `send_sticker` | Telegram file ID |
 | `telegram.location.send` | `send_location` | coordinates and optional venue |
 | `telegram.topic.create` | `create_topic` | name and optional icon fields |
 | `telegram.topic.edit` | `edit_topic` | topic ID and explicit rename/icon/close/reopen mutation |
 | `telegram.pairing.prompt` | `pairing_prompt` | pairing request ID, numeric sender, DM surface, expiry |
 | `telegram.pairing.approve` | `pairing_decision` | pairing request ID, numeric sender, DM scope, approve/reject |
-| `telegram.approval.prompt` | `approval_prompt` | Coven approval ID, action digest, redacted summary, destination, expiry |
-| `telegram.approval.resolve` | `approval_decision` | Coven approval ID, action digest, approve/reject, callback nonce hash |
+| `telegram.approval.prompt` | `approval_prompt` | authority domain, opaque approval ID, action digest, redacted summary, destination, expiry |
+| `telegram.approval.resolve` | `approval_decision` | authority domain, opaque approval ID, action digest, approve/reject, callback nonce hash |
 | `telegram.delivery.resolve_unknown` | `resolve_delivery_unknown` | original delivery/effect/attempt IDs, `abandon`/`retry`/`send_clarification`, explicit duplicate-risk acknowledgement |
 
 All effect variants reject unknown fields. Fields listed as exact are included
-verbatim in policy evaluation; binary media is represented only by
-Coven-owned artifact IDs and hashes. The outer surface and binding must equal
-the effect's target and authority fields. For `turn`, `session_request_digest`
-is computed over the exact prompt, project root, cwd, harness, familiar
-ID/identity/Ward binding, and conversation descriptor that will be submitted to
-the session API.
+verbatim in policy evaluation; binary media is represented only by immutable
+artifact references and hashes. The outer surface and binding must equal the
+effect's target and authority fields. Surface authorization never substitutes
+for Coven execution admission or protected-resource access.
 
 `send_message.link_preview` and text-bearing `edit_message.link_preview`
 contain `enabled` plus optional `url`, `prefer_small_media`,
@@ -651,22 +811,21 @@ A send-like effect created to resolve an unknown delivery must include:
 }
 ```
 
-The recovery object is part of the effect digest. Coven verifies the resolution
-decision and ancestry before authorizing the new physical send. It is forbidden
+The recovery object is part of the effect digest. Psyche verifies the surface-
+policy decision and ancestry before authorizing the new physical send. It is forbidden
 on a delivery that has no unknown parent.
 
 Unknown action classes, effect types, or class/effect combinations are denied.
-Psyche computes `claimed_effect_digest` as SHA-256 over RFC 8785 canonical JSON
-of `effect`. It computes `claimed_request_digest` over the complete request with
-that field omitted. Coven independently parses the typed effect, recomputes
-both digests, rejects disagreement, evaluates the actual fields, and returns
-only its computed values.
+Psyche computes `effect_digest` as SHA-256 over RFC 8785 canonical JSON of
+`effect`. It computes `request_digest` over the complete request with that
+field omitted. The surface-policy engine independently parses the typed effect,
+recomputes both digests, rejects disagreement, and evaluates the actual fields.
 
-Coven returns `coven.psyche_decision.v1`:
+Psyche records `psyche.surface_decision.v1`:
 
 ```json
 {
-  "schema_version": "coven.psyche_decision.v1",
+  "schema_version": "psyche.surface_decision.v1",
   "decision_id": "decision_01J...",
   "intent_id": "intent_01J...",
   "action_class": "telegram.reply.send",
@@ -674,26 +833,27 @@ Coven returns `coven.psyche_decision.v1`:
   "request_digest": "sha256:...",
   "effect_digest": "sha256:...",
   "binding": {
-    "type": "familiar_effect",
-    "familiar_id": "cody",
-    "identity_digest": "sha256:...",
-    "ward_revision": "ward_01J...",
-    "project_root": "/path/to/project",
+    "type": "surface_effect",
+    "principal_id": "principal:val",
+    "familiar_snapshot_id": "ids_01J...",
+    "project_id": "project:sha256:...",
+    "graph_id": "grf_01J...",
+    "attempt_id": "att_01J...",
     "account_id": "main",
     "chat_id": "-1001234567890",
     "topic_kind": "forum",
     "topic_id": "42",
     "relationship": "reply_same_topic"
   },
-  "policy_revision": "policy_01J...",
-  "expires_at": "2026-07-27T00:05:00Z",
+  "policy_revision": "policy:sha256:...",
+  "expires_at": "2026-08-01T00:05:00Z",
   "approval_id": null
 }
 ```
 
 `outcome` is `allow`, `deny`, or `requires_approval`. Psyche proceeds only on
 `allow` after verifying every echoed binding, request digest, action class, and
-effect digest, including the Ward revision and expiry. `requires_approval` must
+effect digest, including the policy revision and expiry. `requires_approval` must
 include an opaque `approval_id`; it does not authorize the effect. A later
 approval decision produces a new allow decision for the same effect digest.
 Decisions are single-effect and cannot authorize a different message part,
@@ -723,12 +883,11 @@ target, or mutation.
     "link_preview": { "enabled": true }
   },
   "effect_digest": "sha256:...",
-  "authorization": {
+  "surface_decision": {
     "decision_id": "decision_01J...",
     "request_digest": "sha256:...",
-    "policy_revision": "policy_01J...",
-    "ward_revision": "ward_01J...",
-    "expires_at": "2026-07-27T00:05:00Z",
+    "policy_revision": "policy:sha256:...",
+    "expires_at": "2026-08-01T00:05:00Z",
     "state": "reserved"
   },
   "logical_response_id": "response_01J...",
@@ -741,17 +900,17 @@ target, or mutation.
 
 The canonical effect object and its digest are immutable. One decision ID
 authorizes exactly one physical Bot API request.
-`delivery_authorizations.decision_id` is globally unique, and each row moves
+`delivery_surface_decisions.decision_id` is globally unique, and each row moves
 once from `reserved` to `consumed` in the same transaction that records the
 physical attempt ID and moves its delivery to `sending`. A consumed decision
 can never be attached to another delivery or attempt. Each formatted chunk,
 preview create/edit/delete, and fallback is a separate effect, decision, and
 delivery row linked by `logical_response_id` and ordered by `logical_part`. A
 renewed decision for the same unsent/retryable effect is appended to
-`delivery_authorizations` and becomes current; it does not rewrite the effect
+`delivery_surface_decisions` and becomes current; it does not rewrite the effect
 or any prior decision record. Each append-only authorization stores its own
 request digest because intent ID and expiry change on renewal.
-`delivery_intents` points to the current authorization row.
+`delivery_intents` points to the current surface-decision row.
 Recovery rows additionally persist acyclic `recovery_root_id`,
 `recovery_parent_id`, and `resolution_decision_id` foreign keys.
 
@@ -780,7 +939,7 @@ it is never silently converted to `sent`. Authorization denial, mismatch, or
 expiry before a send uses `ready/retryable -> failed`. Attempt/age exhaustion
 uses `retryable -> dead_letter`. Acquiring a retry lease and incrementing the attempt
 counter occur in the same transaction as `retryable -> sending`, and that
-transaction requires a fresh Coven decision for the same immutable
+transaction requires a fresh Psyche surface decision for the same immutable
 effect/surface. The decision attached to `ready` is marked consumed by the first
 `ready -> sending` transaction, even if the process later proves no bytes were
 written. A crash before that transaction leaves the decision unused and
@@ -805,6 +964,26 @@ chain: a child reaching `sent` or `compensated` marks every unresolved ancestor
 its parent to `delivery_unknown` and applies the same rule upward; an unknown or
 resolving child keeps ancestors `resolving_unknown`. These rules leave no
 parent permanently stranded.
+
+### Delivery-unknown operator recovery
+
+The normative v1 operator surface is:
+
+```text
+psyche delivery inspect <delivery-id> [--json]
+psyche delivery resolve <delivery-id> --action <abandon|retry|send-clarification> \
+  --reason <text> [--acknowledge-duplicate-risk]
+```
+
+`inspect` is read-only and displays the immutable effect digest, surface,
+attempt write-state classifications, recovery ancestry, and redacted
+correlation IDs. `resolve` obtains a current Coven operator context and the
+`telegram.delivery.resolve_unknown` decision described above. `retry` and
+`send-clarification` require `--acknowledge-duplicate-risk`; `abandon` forbids
+it. Psyche persists the reason, operator context reference, decision, and state
+transition before any recovery send. Cave may render this same typed local
+admin action, but may not define different recovery semantics or bypass the
+CLI contract.
 
 ### Poll and reaction payloads
 
@@ -895,123 +1074,103 @@ At startup Psyche calls `GET /api/v1/health`, requires
 `apiVersion == "coven.daemon.v1"`, then calls `GET /api/v1/capabilities`.
 Psyche never assumes an endpoint is authorized merely because it exists.
 
-### Required to activate any route
+W0 freezes behavior requirements, not speculative Coven names. W1 must classify
+each requirement as `current`, `current_but_undocumented`, `planned`,
+`optional`, or `rejected`, with a code/test citation and owner. Only `current`
+or `current_but_undocumented` behavior with executable conformance can satisfy
+G4.
 
-| Capability | Required behavior |
+The single-node execution profile requires:
+
+| Behavior | Required evidence |
 |---|---|
-| `sessions: true` | Launch, resume/input, inspect, and terminate daemon-owned sessions. |
-| `events: true` | Read redacted session events. |
-| `eventCursor: "sequence"` | Resume event consumption from a monotonic cursor. |
-| `structuredErrors: true` | Branch on stable daemon error codes. |
-| `coven.familiars.identityBinding.v1` | Return the canonical familiar ID, protected-input digests, aggregate identity digest, and Ward revision. |
-| `coven.sessions.familiarBinding.v1` | Bind and return familiar ID, identity digest, and Ward revision on sessions. |
-| `coven.sessions.idempotency.v1` | Adopt launch/input once by client intent ID and expose adoption lookup. |
-| `coven.psyche.authorize.v1` | Return a per-effect `coven.psyche_decision.v1`; capability presence alone grants nothing. |
-| `coven.control.actions` | Accept only advertised versioned action IDs through the daemon policy boundary, including `coven.familiar.identityRebind.v1`; absence of that action blocks route activation as `coven_capability_missing`. |
+| Exact API/capability negotiation | Version and unknown-capability denial tests. |
+| Session create, input, inspect, events, and terminate | Public contract tests against a pinned daemon. |
+| Familiar snapshot validation and immutable execution binding | Match, mismatch, protected-change, and restart tests. |
+| Stable request adoption and lookup | Same-request replay, digest conflict, lost response, retention, and restart tests. |
+| Authoritative non-adoption or ambiguity fencing | Concurrent adoption, disconnect, operator recovery, and no-local-unblock tests. |
+| Ordered event cursor and authoritative terminal state | Pagination, replay, cursor persistence, and stale-event tests. |
+| Cancellation acknowledgement | Terminal acknowledgement or explicit unresolved-state tests. |
+| Result and required artifact association | Cross-attempt/session mismatch and immutable-reference tests. |
+| Structured denial | Unknown version, missing capability, policy denial, and mid-flight authority-loss tests. |
 
-The current Coven API exposes familiar reads and familiar-bound session
-records, but not all of these are advertised in the health capability block.
-Production Psyche remains blocked until Coven advertises the complete profile;
-route probing or successful HTTP status is not a substitute for capability
-discovery.
+Production child dispatch additionally requires parent graph/child node
+correlation, one-attempt/one-session binding, idempotent child adoption,
+descendant cancellation acknowledgement, orphan discovery, ambiguity fencing,
+safe restart recovery, and exact project/identity/attempt/digest rejection.
 
-### Feature-gated capabilities
-
-| Capability | Psyche behavior when absent |
-|---|---|
-| `coven.memory.read` | Omit Coven memory context; report the route degraded if its declaration requires memory. |
-| `coven.memory.write` | Disable memory mutations; never write familiar memory directly. |
-| `coven.approvals.v1` | Reject approval-required actions and Telegram approval decisions. |
-| `coven.artifacts.channelInput.v1` | Persist but reject media turns; comprehensive Telegram release remains blocked. |
-| `coven.artifacts.outputRead.v1` | Disable outbound Coven artifacts/media; comprehensive Telegram release remains blocked. |
-| `coven.operatorIdentity.v1` | Disable local operator sends, polls, buttons, pins, force-document actions, and pairing decisions; comprehensive Telegram release remains blocked. |
-| Action class omitted from `coven.psyche.authorize.v1` | Disable that exact reply or mutation class. |
-
-Feature-gated means the feature fails closed, not that Psyche invents a local
-fallback. Advertising a capability or action class means Coven can evaluate
-it; Psyche still requires an unexpired matching allow decision for each effect.
-A route may remain ready for plain replies only if turn dispatch and routine
-reply authorization are both advertised and decided per request.
+Memory and artifact operations are feature-gated by their actual W1
+classification. Missing memory support degrades only declarations that require
+it. Missing safe artifact input/output blocks the affected media or evidence
+path. Psyche never implements a direct fallback into Coven-owned protected
+resources. Coven does not authorize Telegram or another surface effect.
 
 ## Coven session protocol
 
-1. Resolve and pin `psyche.identity_snapshot.v1`.
-2. For each media item, apply local ACL/size/origin checks, download and hash
-   the quarantined bytes under `telegram.account.activate`, obtain an allow
-   decision for `telegram.artifact.admit`, and upload through
-   `coven.artifacts.channelInput.v1`. Persist the returned opaque artifact IDs.
-3. Build the exact prompt/session request using those artifact IDs and compute
-   its digest.
-4. Obtain an `allow` decision for `telegram.turn.dispatch`; its `turn` effect
-   contains the ordered artifact IDs and exact session-request digest.
-5. In one SQLite transaction, insert the complete `psyche.coven_turn.v1` into
-   `turn_intents` with state `ready`, exact request JSON, client intent ID,
-   request/event/effect digests, decision binding, artifact IDs, and expiry.
-6. Atomically move `ready -> submitting`, increment `submit_attempt`, and submit
-   `POST /api/v1/sessions` with canonical `projectRoot`, optional
-   in-root `cwd`, allowlisted `harness`, prompt, `familiarId`,
-   `familiarIdentityDigest`, `familiarWardRevision`, `clientIntentId`,
-   `requestDigest`, `authorizationDecisionId`, `authorizationEffectDigest`,
-   title, and a conversation resume/init descriptor. Input requests carry the
-   same idempotency, authorization, and identity fields. Coven revalidates the
-   unexpired decision and recomputes the session request digest before adoption.
-7. Require Coven's idempotency store to scope `clientIntentId` to Psyche's
-   client identity. Repeating the same ID and request digest returns the
-   original adoption; repeating the ID with another digest returns
-   `409 intent_conflict`.
-8. On restart, timeout, or disconnect, every `submitting` row first queries
-   `GET /api/v1/intents/:clientIntentId`. After authoritative
-   `404 intent_not_found`, retry the exact stored request only while its
-   decision remains valid. If expired, mark it failed and create a new
-   authorization and client intent; never reuse the old ID with a new digest.
-   If lookup is unavailable or inconclusive, mark the row
-   `coven_adoption_unknown`, block its lane, and do not submit again.
-9. Require the returned session/adoption record's `project_root`,
-   `familiar_id`, `familiar_identity_digest`, `familiar_ward_revision`,
-   `client_intent_id`, `request_digest`, `authorization_decision_id`, and
-   `authorization_effect_digest` to equal the request. A mismatch is
-   `coven_binding_mismatch`, the session is killed, and the route is blocked.
-10. Read `GET /api/v1/sessions/:id/events?afterSeq=...`. For each returned event,
-   derive its ordered effect plan and, in one SQLite transaction, insert a
-   `session_output_adoptions` row keyed by `(session_id, seq)`, insert each
-   immutable `output_effects` row keyed by `(session_id, seq, effect_index)`,
-   and advance the session cursor to `seq`. An event with no effect still gets
-   an adoption row and cursor advance.
-11. After that transaction commits, obtain a separate matching Coven allow
-    decision for each durable output effect before creating its ready delivery
-    intent. Replay uses the unique keys and creates neither lost nor duplicate
-    effects.
-12. Forward later turns only when the session remains live, the same identity
-   snapshot is valid, and idempotent input adoption is available.
-13. Treat session terminal events as authoritative. Psyche does not infer
-    completion from Telegram delivery.
+1. Resolve and pin `psyche.identity_snapshot.v1`, intent, graph, node,
+   delegation, budget, context-manifest, and required-evidence digests.
+2. Resolve required media or evidence references through only the protected-
+   resource contracts that W1 and G4 prove. Missing support blocks that node;
+   Psyche never writes directly into a Coven-owned store.
+3. Build and persist the exact `psyche.execution_request.v1` and
+   `psyche.execution_binding.v1` with `adoption_state = not_submitted`.
+4. Submit through the W1-classified session-create or input contract using one
+   stable request ID and digest. Surface policy does not participate in Coven
+   execution admission.
+5. Require Coven to validate project/cwd, harness, familiar snapshot binding,
+   attempt correlation, and any protected-resource references supported by the
+   negotiated contract.
+6. Repeating one request ID and digest must return the original adoption;
+   reusing the ID with another digest must fail as conflict.
+7. After timeout, disconnect, or restart, query authoritative adoption before
+   any retry. Retry the exact request only after proof of non-adoption. An
+   unavailable or inconclusive result becomes `adoption_unknown` and blocks the
+   node without redispatch.
+8. Require every returned session/adoption binding to match graph, node,
+   attempt, project, familiar snapshot, request ID, and digest. A mismatch
+   triggers termination request, explicit unresolved handling if termination
+   is not acknowledged, and graph blocking.
+9. Consume ordered events from the persisted cursor. In one transaction,
+   adopt each event, correlate any result/artifact references to the attempt,
+   and advance the cursor. Replay creates no duplicate result or effect.
+10. Apply verification policy to the candidate and sealed evidence. Only a
+    resulting allowed canonical effect enters surface policy and delivery.
+11. Forward later input only while the session remains live, the same attempt
+    and identity snapshot remain valid, and idempotent input adoption is
+    proven.
+12. Treat Coven terminal state as authoritative for execution. Psyche derives
+    graph disposition only after execution correlation and required evidence;
+    it never infers completion from surface delivery or process output alone.
 
-The idempotency extension is a production prerequisite, not a claim about the
-current daemon. `GET /api/v1/intents/:clientIntentId` returns
-`coven.intent_adoption.v1` with `accepted`, `applied`, or `terminal` state plus
-the bound resource ID and request digest. Coven retains adoption keys for at
-least Psyche's 30-day deduplication window.
+Psyche uses daemon-managed sessions, not external sessions, because Coven owns
+the admitted process lifecycle. Exact endpoint, capability, and error names are
+W1 outputs and remain absent from this W0 protocol.
 
-```json
-{
-  "schema_version": "coven.intent_adoption.v1",
-  "client_intent_id": "intent_01J...",
-  "request_digest": "sha256:...",
-  "state": "accepted",
-  "resource": {
-    "type": "session",
-    "id": "session-1"
-  },
-  "familiar_id": "cody",
-  "familiar_identity_digest": "sha256:...",
-  "familiar_ward_revision": "ward_01J...",
-  "authorization_decision_id": "decision_01J...",
-  "authorization_effect_digest": "sha256:..."
-}
+### Adoption-unknown operator recovery
+
+An inconclusive adoption lookup blocks exactly one graph node and any dependent
+nodes. Psyche exposes:
+
+```text
+psyche node inspect <attempt-id> [--json]
+psyche node reconcile <attempt-id>
+psyche node quarantine <attempt-id> --reason <text> \
+  --acknowledge-possible-adoption
 ```
 
-Psyche uses daemon-managed sessions, not external sessions, because Coven must
-own the process lifecycle.
+`inspect` is read-only and returns the stored request digest, graph/node,
+familiar snapshot, project binding, submission attempts, lookup history, and redacted
+correlation IDs. `reconcile` performs one authoritative adoption lookup and
+durably applies only `adopted` or `intent_not_found`; an unavailable or
+inconclusive result leaves the lane blocked and never resubmits.
+
+`quarantine` obtains a current Psyche operator context and invokes the W1-
+classified Coven recovery contract with the exact attempt/request digest,
+project, familiar snapshot, graph/node binding, reason, and possible-adoption
+acknowledgement. Coven must atomically return the adopted resource, prove
+non-adoption, or fence every resource that may have been adopted. Psyche
+records that disposition before unblocking dependencies. There is no local-
+only `unblock`, state edit, or force-retry path.
 
 ## Identity resolution algorithm
 
@@ -1030,16 +1189,16 @@ The identity resolver:
 8. checks familiar ID, principal, roles, governance, and protected-surface
    declarations for contradiction;
 9. hashes the exact bytes and validated metadata; and
-10. fetches `coven.identity_binding.v1` and compares every protected-input
-    digest, resolved role/skill digest, aggregate identity digest, familiar ID,
-    and Ward revision.
+10. persists the snapshot, provenance, principal mapping, and revision before
+    intent admission.
 
 Each input digest is SHA-256 over exact file bytes or RFC 8785 canonical JSON
 for resolved structured role/skill data. The aggregate identity digest is
 SHA-256 over RFC 8785 canonical JSON containing the schema version, familiar
-ID, and sorted named input digests. Ward revision is compared and bound
-separately to policy decisions. Psyche and Coven use the same published test
-vectors; same ID with different bytes is a mismatch.
+ID, principal mapping revision, and sorted named input digests. If W1 proves a
+Coven snapshot-validation contract, Psyche and Coven use published test vectors
+for the execution binding; disagreement blocks execution but does not replace
+the Psyche identity source.
 
 Psyche reloads identity only between turns. A detected change blocks new work
 until a complete new snapshot validates; an in-flight turn retains its pinned
@@ -1101,15 +1260,16 @@ updates normalize to topic ID 1 whether Telegram supplies the explicit thread
 ID or the General-topic marker. No non-General topic may use this omission as a
 fallback.
 
-One worker owns a lane lease at a time. Different lanes may progress
-concurrently. A lane event is complete at Coven turn adoption, not after model
-settlement; the active conversation state then serializes later input as
-required by the Coven session contract.
+One worker owns an adapter-lane lease at a time. Different lanes may progress
+concurrently. An ingress event leaves the adapter lane only after its surface
+event, principal mapping, intent, graph, and initial node are durably committed.
+Conversation and graph scheduling then serialize dependent execution without
+holding the transport cursor open through model settlement.
 
 ## Authorization pipeline
 
-Local channel admission runs before prompt construction. Coven turn
-authorization runs only after the exact prompt/session request is immutable:
+Surface admission runs before intent creation. Coven execution admission is a
+separate later boundary after the exact execution request is immutable:
 
 ```text
 account enabled
@@ -1118,11 +1278,13 @@ account enabled
   -> actor is a human or explicitly allowed bot
   -> apply that route's DM/group/chat and numeric sender policy
   -> apply that route's topic and mention/command activation policy
-  -> valid identity snapshot
-  -> admit media artifacts, if any
-  -> build and digest exact prompt/session request
-  -> matching Coven per-turn allow decision
-  -> dispatch
+  -> map actor to one principal
+  -> resolve and pin one familiar identity snapshot
+  -> commit immutable intent and graph node
+  -> resolve required evidence/artifact references
+  -> build and digest exact execution request
+  -> Coven session admission through a W1-classified contract
+  -> persist adoption and ordered event cursor
 ```
 
 Every denial is persisted with a stable reason code and redacted identifiers.
@@ -1136,20 +1298,25 @@ Callback decisions additionally bind:
 - chat and topic;
 - originating message;
 - opaque callback nonce;
-- Coven approval ID and action digest;
+- authority domain, opaque approval ID, and action digest;
 - allowed decision set; and
 - expiry.
 
-The nonce is single-use. Coven revalidates the decision; passing Psyche checks
-does not make it approved.
+The nonce is single-use. The owning authority revalidates the decision; passing
+Telegram adapter checks does not make an approval valid, and approval in one
+domain grants nothing in another.
 
 ## Conversation and context model
 
-The stable conversation key is a hash of:
+The stable canonical conversation key is a hash of:
 
 ```text
-familiar_id | account_id | chat_id | topic_kind | topic_id
+familiar_snapshot_id | principal_id | surface_id | canonical_location_digest
 ```
+
+For Telegram, `canonical_location_digest` covers account, chat, topic kind, and
+topic ID. Other adapters define their own locator digest without changing the
+conversation schema.
 
 Stored context separates:
 
@@ -1165,6 +1332,14 @@ destructively cleared after a reply. Context limits apply by UTF-8 bytes,
 message count, and age. Text derived from voice, OCR, stickers, or images is
 tagged as untrusted machine output.
 
+A `group_migrated` service event changes `chat_id`, so the new supergroup
+necessarily has a different conversation key. Psyche blocks the affected route
+and emits an operator proposal containing the old/new numeric IDs and
+content-free state counts. The old conversation remains retained under its
+original key, but its history is never copied, summarized, or injected into the
+new conversation automatically. After explicit route reconfiguration, the new
+supergroup starts with fresh context.
+
 ## Output and streaming
 
 ### Text formatting
@@ -1172,9 +1347,10 @@ tagged as untrusted machine output.
 Psyche parses model output into an original intermediate representation and
 renders Telegram HTML. It escapes all model text by default and emits only
 allowlisted entities. Psyche renders and chunks the complete non-streaming
-delivery plan before authorization; every physical Telegram request becomes
-its own immutable effect and decision. If Telegram rejects entities or
-captions, Psyche creates a new plain-text effect and obtains a new decision
+delivery plan before surface authorization; every physical Telegram request
+becomes its own immutable effect and surface decision. If Telegram rejects
+entities or captions, Psyche creates a new plain-text effect and obtains a new
+surface decision
 before one fallback attempt. A quote-specific 400 similarly creates a new
 normal-reply effect and decision. Topic metadata is never removed as a retry
 strategy.
@@ -1188,13 +1364,19 @@ authorize more than one chunk.
 
 ```text
 idle -> debouncing -> preview_sent -> editing -> finalized
-                                  \-> cleanup -> fallback_sent
+                         |             |
+                         +-------------+-> max_age_finalizing -> finalized
+                                                  |          \-> fallback_sent
+                                                  |          \-> delivery_unknown
+                                                  \-> preview_finalize_blocked
+preview_finalize_blocked -> max_age_finalizing
+editing -> cleanup -> fallback_sent
 ```
 
 - Token-sized deltas are coalesced before the first preview.
 - One preview message owns one logical answer.
 - Every preview create, cumulative edit, final edit, and cleanup delete is a
-  separate typed effect with its own Coven decision and delivery row.
+  separate typed effect with its own Psyche surface decision and delivery row.
 - A short text final edits the preview in place.
 - A long final uses the preview as the first chunk and sends only remaining
   chunks.
@@ -1204,25 +1386,45 @@ idle -> debouncing -> preview_sent -> editing -> finalized
   cannot confirm the preview contains the final content.
 - Cleanup failures are visible but do not produce another answer.
 
+The maximum age starts when the first preview delivery commits `sent`. That
+transaction stores `preview_started_at`, the configured maximum age, and the
+absolute deadline on the logical response. If no terminal Coven output arrives
+before the deadline, Psyche atomically moves to `max_age_finalizing`, freezes
+the latest cumulative content and its digest, and creates an exact
+`edit_message` effect that appends a stable interrupted-output marker. Later
+model output cannot alter that frozen effect.
+
+The edit requires a fresh Psyche surface decision. A definitive edit rejection or
+proven pre-write failure may use the normal authorized final-delivery fallback.
+An ambiguous edit moves the logical response and its physical delivery to
+`delivery_unknown` and sends no second message. If surface policy is unavailable
+or denies the effect, Psyche leaves the existing preview unchanged, persists
+`preview_finalize_blocked`, and reports degraded health; it never mutates
+Telegram without authority. The blocked state is non-terminal. A worker may
+return it to `max_age_finalizing` only after surface policy and the required
+action class recover, using the same frozen content with a newly authorized
+effect. Restart reloads the persisted deadline and immediately processes any
+overdue or blocked response; config reload never extends it.
+
 Raw provider reasoning is never streamed. Tool progress uses stable,
-operator-safe labels unless Coven explicitly supplies approved display text.
+operator-safe labels produced by configured Psyche presentation policy.
 
 ## Outbound reliability
 
 Before any familiar- or user-visible Bot API mutation, Psyche persists the
-canonical effect, obtains a matching unexpired Coven allow decision for the
-exact action class, effect digest, and surface, then persists the complete
-delivery/decision binding and attempt number. Every retry after entering
+canonical effect, obtains a matching unexpired Psyche surface-policy allow
+decision for the exact action class, effect digest, and surface, then persists
+the complete delivery/decision binding and attempt number. Every retry after entering
 `sending` obtains a fresh decision, even when the previous attempt received a
 retryable Telegram response. The bounded
 protocol-administration calls listed under
-`telegram.account.activate` use that account decision instead. All Telegram API
+`telegram.account.activate` use that adapter-lifecycle decision instead. All Telegram API
 clients sharing a token use one token-scoped limiter.
 
 | Telegram result | Classification | Behavior |
 |---|---|---|
 | 2xx with valid result | success | Persist returned message ID and terminal `sent`. |
-| 400 entity/caption/quote compatibility error | recoverable once | Build a new safe-fallback effect for the same surface and obtain a new Coven decision before sending. |
+| 400 entity/caption/quote compatibility error | recoverable once | Build a new safe-fallback effect for the same surface and obtain a new Psyche surface decision before sending. |
 | 401 or 404 on account identity endpoint | fatal account auth | Block account until secret/config changes. |
 | 403 | permanent target denial | Fail delivery and expose redacted target reason. |
 | 409 polling conflict | fatal transport conflict | Stop poller; operator recovery required. |
@@ -1240,24 +1442,23 @@ ceiling.
 
 ## Media pipeline
 
-Media transfer requires `coven.artifacts.channelInput.v1`. After local channel
-ACL admission and an allow decision for `telegram.artifact.admit`, Psyche
-streams a multipart request to `POST /api/v1/artifacts/channel-input` over the
-Coven Unix socket. The metadata part is `psyche.channel_artifact.v1`; the binary
-part is the exact quarantined file bytes:
+Media transfer into execution requires a safe artifact-admission contract that
+W1 classifies and G4 proves. The `psyche.execution_artifact_request.v1` shape
+below is Psyche's required binding, not a claim that a named Coven endpoint or
+capability already exists. Without a conformant protected-resource contract,
+Psyche may quarantine media locally but must block any execution that requires
+those bytes.
 
 ```json
 {
-  "schema_version": "psyche.channel_artifact.v1",
-  "artifact_intent_id": "artifact_intent_01J...",
-  "turn_intent_id": "intent_01J...",
-  "artifact_authorization_decision_id": "decision_01J...",
-  "artifact_effect_digest": "sha256:...",
-  "event_id": "evt_01J...",
-  "familiar_id": "cody",
-  "identity_digest": "sha256:...",
-  "ward_revision": "ward_01J...",
-  "project_root": "/path/to/project",
+  "schema_version": "psyche.execution_artifact_request.v1",
+  "artifact_request_id": "areq_01J...",
+  "graph_id": "grf_01J...",
+  "node_id": "nod_01J...",
+  "attempt_id": "att_01J...",
+  "surface_event_id": "sev_01J...",
+  "familiar_snapshot_id": "ids_01J...",
+  "project_id": "project:sha256:...",
   "source": {
     "channel": "telegram",
     "account_id": "main",
@@ -1269,31 +1470,29 @@ part is the exact quarantined file bytes:
   "size_bytes": 1024,
   "sha256": "sha256:...",
   "request_digest": "sha256:...",
-  "expires_at": "2026-07-28T00:00:00Z"
+  "expires_at": "2026-08-02T00:00:00Z"
 }
 ```
 
-Coven streams into a Coven-owned private artifact store, verifies size/hash and
-all familiar/project/Ward bindings, and returns
-`coven.channel_artifact.v1`:
+The conformant Coven boundary streams into its private artifact store, verifies
+size/hash and every execution binding, and returns an opaque reference wrapped
+as `psyche.execution_artifact_ref.v1`:
 
 ```json
 {
-  "schema_version": "coven.channel_artifact.v1",
+  "schema_version": "psyche.execution_artifact_ref.v1",
   "artifact_id": "artifact_01J...",
-  "artifact_intent_id": "artifact_intent_01J...",
-  "turn_intent_id": "intent_01J...",
-  "artifact_authorization_decision_id": "decision_01J...",
-  "artifact_effect_digest": "sha256:...",
-  "event_id": "evt_01J...",
+  "provider_contract": "classified-by-w1",
+  "artifact_request_id": "areq_01J...",
+  "graph_id": "grf_01J...",
+  "node_id": "nod_01J...",
+  "attempt_id": "att_01J...",
   "request_digest": "sha256:...",
   "sha256": "sha256:...",
   "size_bytes": 1024,
   "media_type": "image/jpeg",
-  "familiar_id": "cody",
-  "identity_digest": "sha256:...",
-  "ward_revision": "ward_01J...",
-  "project_root": "/path/to/project",
+  "familiar_snapshot_id": "ids_01J...",
+  "project_id": "project:sha256:...",
   "source": {
     "channel": "telegram",
     "account_id": "main",
@@ -1301,17 +1500,17 @@ all familiar/project/Ward bindings, and returns
     "topic_kind": "forum",
     "topic_id": "42"
   },
-  "expires_at": "2026-07-28T00:00:00Z"
+  "expires_at": "2026-08-02T00:00:00Z"
 }
 ```
 
 Psyche passes only the opaque artifact ID to the session prompt/intent. It never
 passes a local file path. `request_digest` is SHA-256 over RFC 8785 canonical
 metadata with that field omitted; the metadata includes the byte hash, every
-project/familiar/Ward/source binding, both intent IDs, the artifact-admission
-decision/effect digest, and expiry. Coven
+project/familiar-snapshot/graph/attempt/source binding, request ID, and expiry.
+Coven
 recomputes the metadata digest and streamed-byte hash. Repeating the same
-client-scoped `artifact_intent_id` and request digest returns the original
+client-scoped `artifact_request_id` and request digest returns the original
 artifact; any field or byte change returns `409 intent_conflict`. Psyche
 verifies every echoed response field before use. Coven expiry may shorten but
 never extend Psyche's requested lifetime. Without the capability, no media
@@ -1324,8 +1523,8 @@ bytes or path enter Coven and the media parity release gate cannot pass.
    loopback and rejecting origin-changing redirects.
 4. Stream into a private temporary file with byte and time limits.
 5. Verify actual size, file type, and decompression budget.
-6. Upload the quarantined bytes through
-   `coven.artifacts.channelInput.v1` and retain only its opaque artifact ID.
+6. Upload the quarantined bytes through the W1-classified protected-resource
+   contract and retain only its opaque artifact ID and immutable binding.
 7. Delete it according to retention policy.
 
 No inbound filename becomes a filesystem path. Archives are not extracted by
@@ -1336,31 +1535,33 @@ Media-group correlation waits a bounded interval for adjacent items with the
 same group ID, then emits one event. Late items become a follow-up event in the
 same lane.
 
-### Outbound Coven artifacts
+### Outbound execution artifacts
 
-Outbound media requires `coven.artifacts.outputRead.v1`. A Coven session event
-references an opaque artifact ID. Psyche first reads bounded metadata from
-`GET /api/v1/sessions/:sessionId/artifacts/:artifactId/metadata`:
+Outbound media requires a W1-classified, G4-proven artifact-read contract. A
+Coven session event references an opaque artifact ID. Psyche reads bounded
+metadata through that negotiated contract:
 
 ```json
 {
-  "schema_version": "coven.output_artifact.v1",
+  "schema_version": "psyche.execution_output_artifact_ref.v1",
+  "provider_contract": "classified-by-w1",
   "artifact_id": "artifact_01J...",
   "session_id": "session-1",
-  "familiar_id": "cody",
-  "identity_digest": "sha256:...",
-  "ward_revision": "ward_01J...",
-  "project_root": "/path/to/project",
+  "graph_id": "grf_01J...",
+  "node_id": "nod_01J...",
+  "attempt_id": "att_01J...",
+  "familiar_snapshot_id": "ids_01J...",
+  "project_id": "project:sha256:...",
   "sha256": "sha256:...",
   "size_bytes": 1024,
   "media_type": "image/png",
-  "expires_at": "2026-07-28T00:00:00Z"
+  "expires_at": "2026-08-02T00:00:00Z"
 }
 ```
 
 The `telegram.media.send` effect contains this complete immutable artifact
-reference. After Coven allows that exact effect, Psyche requests bytes with
-`POST /api/v1/sessions/:sessionId/artifacts/:artifactId/read`:
+reference. After Psyche surface policy allows that exact effect, Psyche
+requests bytes through the negotiated protected-resource contract:
 
 ```json
 {
@@ -1375,9 +1576,9 @@ reference. After Coven allows that exact effect, Psyche requests bytes with
 }
 ```
 
-Coven revalidates the decision, session, familiar, project, identity, Ward,
-expiry, and artifact reference, then streams `application/octet-stream` over
-the Unix socket with the immutable metadata in authenticated response headers.
+The Coven boundary revalidates the session, graph attempt, familiar snapshot,
+project, expiry, and artifact reference, then streams bytes with authenticated
+immutable metadata.
 Psyche enforces the configured size limit while streaming and verifies the
 exact hash, size, and type before Telegram upload. Bytes never cross a local
 path boundary. A mismatch is `coven_artifact_rejected`; missing capability
@@ -1390,20 +1591,34 @@ an exclusive startup lock.
 
 | Table | Purpose |
 |---|---|
+| `identity_snapshots` | Immutable familiar inputs, provenance, principal mapping, and revision. |
+| `intents` | Immutable operator/surface request, constraints, required evidence, provenance, and digest. |
+| `graphs` | Root intent, owner, policy revision, aggregate state, and version. |
+| `graph_nodes` | Familiar snapshot, dependencies, delegation, budget, evidence requirements, state, and result. |
+| `graph_edges` | Immutable dependency relationships with acyclic admission checks. |
+| `attempts` | One node execution attempt and its immutable request binding. |
+| `delegations` | Non-widening parent-child envelope and cancellation policy. |
+| `budgets` | Idempotent reserve/consume/release accounting by resource class. |
+| `execution_bindings` | Request digest, Coven adoption, session, event cursor, cancellation, terminal state, and ambiguity. |
+| `evidence_sets` | Sealed content-addressed evidence inventory per node attempt. |
+| `verdicts` | Policy, deterministic/human/independent-verifier provenance, confidence class, and decision. |
+| `recovery_records` | Lease, fence, unknown state, reconciliation attempts, and operator disposition. |
+| `surface_events` | Authenticated adapter observation and principal-mapping result. |
+| `surface_effects` | Immutable canonical effect and surface-policy decision. |
 | `accounts` | Non-secret account identity, transport state, health, and lease. |
 | `ingress_updates` | Raw accepted update, hash, schema version, retention time. |
-| `events` | Normalized event, authorization state, lane, and disposition. |
+| `events` | Telegram adapter event, surface-event mapping, lane, and disposition. |
 | `poll_offsets` | Next Telegram polling offset per account. |
 | `lane_leases` | Time-bounded ordered-worker ownership. |
-| `routes` | Validated config revision and identity digest, not secret values. |
-| `conversations` | Conversation key to Coven conversation/session metadata. |
-| `turn_intents` | Encrypted exact launch/input requests, idempotency IDs, authorization bindings, submit state, and adoption result. |
+| `routes` | Validated adapter config, principal mapping, and familiar snapshot reference, not secret values. |
+| `conversations` | Surface-neutral conversation key and adapter locator reference. |
 | `session_output_adoptions` | Atomic Coven event-sequence adoption and cursor state. |
 | `output_effects` | Immutable effects keyed by session, event sequence, and effect index before authorization. |
+| `logical_responses` | Streaming state, first-preview time, persisted maximum age/deadline, frozen max-age content/digest, and terminal or blocked disposition. |
 | `observed_messages` | Bounded reply and history context for messages Psyche saw. |
 | `pairings` | DM-scoped request/approval state keyed by numeric sender. |
-| `delivery_intents` | Immutable typed outbound effects, digests, current decision, and terminal/ambiguous state. |
-| `delivery_authorizations` | Append-only, globally decision-unique bindings with reserved/consumed state, physical attempt ID, and expiry history. |
+| `delivery_intents` | Immutable typed outbound effects, digests, current surface decision, and terminal/ambiguous state. |
+| `delivery_surface_decisions` | Append-only, globally decision-unique bindings with reserved/consumed state, physical attempt ID, and expiry history. |
 | `delivery_attempts` | Redacted attempt classifications and timing. |
 | `message_map` | Logical delivery parts to Telegram message IDs. |
 | `callback_nonces` | One-time typed callback bindings and expiry. |
@@ -1431,6 +1646,12 @@ Stable v1 error codes:
 | `webhook_auth_failed` | No | Secret header validation failed. |
 | `storage_unavailable` | Yes | A required durable transaction failed. |
 | `event_schema_unsupported` | No | Persisted event major version is unknown. |
+| `principal_mapping_invalid` | No | A surface actor has no unique current principal mapping. |
+| `graph_invalid` | No | Graph admission found a cycle, missing binding, or invalid transition. |
+| `delegation_widened` | No | A child envelope exceeds its parent's scope, budget, evidence access, or surface rights. |
+| `budget_unenforceable` | No | A requested hard resource limit lacks trustworthy enforcement/reporting. |
+| `evidence_incomplete` | No automatic success | Required evidence is missing, changed, or unsealed. |
+| `verdict_invalid` | No | Generator self-certification, stale evidence, or verifier-binding mismatch. |
 | `route_not_found` | No | No route matches the authorized surface. |
 | `route_ambiguous` | No | More than one equal-precedence route matches. |
 | `sender_unauthorized` | No | Numeric sender policy denied the event. |
@@ -1440,13 +1661,15 @@ Stable v1 error codes:
 | `coven_version_unsupported` | No | Daemon API version is not exactly supported. |
 | `coven_capability_missing` | No | A required capability is not advertised. |
 | `coven_policy_denied` | No | Coven rejected the intent. |
-| `coven_decision_invalid` | No | A decision is stale, unknown, or does not match every request binding. |
+| `coven_execution_binding_invalid` | No | Execution admission or result does not match every request binding. |
 | `coven_binding_mismatch` | No | Returned project or familiar binding differs. |
 | `coven_artifact_rejected` | Depends on Coven code | Coven rejected media metadata, bytes, binding, or lifetime. |
 | `coven_intent_conflict` | No | A client intent ID was reused with another request digest. |
 | `coven_adoption_unknown` | No automatic retry | Coven may have adopted a turn but lookup cannot reconcile it. |
+| `coven_cancellation_unknown` | No automatic redispatch | Coven has not authoritatively acknowledged terminal cancellation. |
 | `coven_session_failed` | Depends on daemon code | Daemon session launch or runtime failed. |
 | `delivery_unknown` | No automatic retry | Telegram may have accepted a non-idempotent mutation. |
+| `preview_finalize_blocked` | No automatic Telegram mutation | Preview maximum age expired, but Psyche surface policy is unavailable or denied. |
 | `media_rejected` | No | Media violates size, type, origin, or safety policy. |
 | `callback_invalid` | No | Callback is unknown, expired, reused, or misbound. |
 
@@ -1459,7 +1682,8 @@ Structured logs contain:
 
 - timestamp, severity, component, account alias, event kind;
 - hashed lane and route identifiers;
-- correlation, event, intent, session, and delivery IDs;
+- correlation, surface-event, intent, graph, node, attempt, session, evidence,
+  verdict, effect, and delivery IDs;
 - state transition and stable reason code; and
 - latency, retry count, and queue age.
 
@@ -1472,15 +1696,59 @@ They exclude:
 - media bytes and transcripts; and
 - unredacted Coven events.
 
-Metrics cover accepted/duplicate/rejected updates, queue depth and age, lane
-stall time, Coven request outcomes, delivery states, rate limits, ambiguous
-deliveries, webhook latency, polling liveness, and retention cleanup.
+Metrics cover accepted/duplicate/rejected intents, graph/node/attempt states,
+dependency stalls, budget accounting, evidence/verdict states, Coven request
+outcomes, delivery states, rate limits, ambiguous adoption/cancellation/
+delivery, adapter latency, polling liveness, and retention cleanup.
 
 Health states:
 
-- `ready`: all required dependencies and identity snapshots valid;
+- `ready`: required stores, identity/principal mappings, and enabled capability
+  gates are valid;
 - `degraded`: optional feature unavailable without unsafe fallback; and
 - `blocked`: account/route cannot accept work safely.
+
+`psyche doctor --json` returns `psyche.doctor_report.v1`; human-readable output
+is a deterministic rendering of the same object:
+
+```json
+{
+  "schema_version": "psyche.doctor_report.v1",
+  "generated_at": "2026-07-28T00:00:00Z",
+  "overall_status": "blocked",
+  "checks": [
+    {
+      "check_id": "account.main.telegram_auth",
+      "component": "telegram",
+      "scope": { "type": "account", "id": "main" },
+      "status": "blocked",
+      "reason_code": "telegram_unauthorized",
+      "blocking": true,
+      "retryable": false,
+      "summary": "Telegram rejected the configured account credentials.",
+      "remediation": "Replace the secret reference or expected bot ID, then rerun doctor.",
+      "correlation_id": "corr_01J..."
+    },
+    {
+      "check_id": "capability.coven.memory.read",
+      "component": "coven",
+      "scope": { "type": "capability", "id": "coven.memory.read" },
+      "status": "degraded",
+      "reason_code": "optional_capability_missing",
+      "blocking": false,
+      "retryable": false,
+      "summary": "Optional Coven memory reads are unavailable.",
+      "remediation": "Enable the capability or remove the route memory requirement.",
+      "correlation_id": "corr_01K..."
+    }
+  ]
+}
+```
+
+Checks are sorted by scope type, scope ID, and check ID. `status` is `ready`,
+`degraded`, or `blocked`. Every non-ready check has a stable `reason_code`,
+redacted summary, and concrete remediation. Reports exclude tokens, secret
+values, message content, callback values, raw user/chat IDs, and absolute paths.
 
 ## Testing strategy
 
@@ -1492,6 +1760,13 @@ Health states:
 - actor/locator requirements for message, poll, callback, and reaction events;
 - poll option/answer and reaction-change/count payload invariants;
 - identity no-follow reads, digests, and contradiction matrix;
+- intent immutability and supersession;
+- graph acyclicity, transition validity, and restart replay;
+- non-widening delegation and hierarchical once-only budget accounting;
+- one-node/one-attempt/one-session correlation and lease fencing;
+- evidence sealing, artifact-reference immutability, generator/verifier
+  separation, and verdict policy;
+- surface-event principal mapping and canonical effect isolation;
 - Telegram update normalization for every parity row;
 - HTML escaping, entity fallback, Unicode chunking, and quote limits;
 - retry classification and state-machine transitions; and
@@ -1499,19 +1774,19 @@ Health states:
 
 ### Integration tests
 
-An original fake Telegram service verifies polling, webhook auth, API results,
-rate limits, media, callbacks, topics, and malformed HTTP responses. A fake
-Coven Unix-socket service verifies health negotiation, capability profiles,
-structured errors, full identity binding, idempotent adoption and lookup,
-per-effect policy decisions, channel-artifact streaming, event cursors, policy
-denials, capability-present-but-denied behavior, identity rebind adoption, and
-approval flows. Every denial test asserts that no session, Telegram request, or
-local authority fallback occurs.
+Original fake surface and Telegram services verify canonical normalization,
+principal mapping, polling, webhook auth, API results, rate limits, media,
+callbacks, topics, and malformed responses. A fake Coven service implements
+the behavior-level single-node profile, not assumed current endpoint names.
+The same suite verifies negotiation, structured errors, snapshot binding,
+stable adoption and lookup, ambiguity fencing, event cursors, cancellation,
+terminal/result/artifact association, denials, and authority loss. Every denial
+test asserts that no session, surface request, graph-success state, or local
+authority fallback occurs.
 
-Before `coven-psy2` begins, the complete required capability profile and these
-negative authorization cases must pass the same conformance suite against a
-real Coven daemon build. Merging the Coven contract changes or passing only the
-fake service is insufficient evidence for this checkpoint.
+G4 requires the unmodified fake-service suite to pass against a pinned real
+Coven build using the W1-classified adapter. Merging Coven changes, probing an
+undocumented endpoint, or passing only the fake service is insufficient.
 
 ### Crash tests
 
@@ -1521,16 +1796,21 @@ The test runner terminates the process at each durable boundary:
 - before and after webhook response;
 - before and after poll-offset commit;
 - during lane lease refresh;
+- before and after intent, graph, node, delegation, and budget commits;
+- at node lease expiry before any authoritative adoption result;
 - before and after Coven session/input adoption, including a lost response and
   adoption lookup;
-- while Coven terminates or stalls after capability discovery, authorization,
-  rebind adoption, and turn/input submission, proving the affected route or lane
-  blocks without local fallback;
-- with a pre-existing `coven_adoption_unknown`, proving Coven either fences and
-  quarantines the old binding before rebind or leaves the route blocked;
+- while Coven terminates or stalls after capability discovery, snapshot
+  validation, session/input submission, and cancellation, proving the affected
+  node blocks without local fallback;
+- with a pre-existing `coven_adoption_unknown`, proving Coven either returns an
+  authoritative disposition/fence or leaves the graph blocked;
 - before and after atomic Coven output-event/effect/cursor adoption;
+- before and after evidence sealing and verdict commit;
 - before send, after request write, and after Telegram response;
 - during preview edit/finalize; and
+- before and after preview deadline persistence, max-age freeze, blocked
+  recovery, and restart of an overdue response; and
 - during retention cleanup.
 
 Each case asserts no acknowledged update loss, preserved ordering, correct
@@ -1557,20 +1837,45 @@ production token.
 
 ## Migration and rollback
 
-Psyche imports operator-authored concepts only: account aliases, secret
+Psyche imports reviewable operator-authored concepts only: prompts,
+declarations, hooks, commands, configuration, account aliases, secret
 references, numeric ACLs, route policy, and familiar mapping. It does not read
-OpenClaw databases or runtime files.
+OpenClaw credentials, databases, conversations, hidden memory, caches, or
+runtime files.
 
 Cutover:
 
 1. Pass live tests on a dedicated token.
 2. Export a human-reviewable, secret-free migration manifest.
-3. Quiesce the previous runtime and wait for its visible in-flight responses.
-4. Record the cutover time and operator.
-5. Ensure no webhook or poller remains active.
-6. Start Psyche and verify `getMe`, transport ownership, Coven profile, routes,
+3. Run `psyche export --output <path>` and restore it on a clean host profile.
+4. Verify the archive manifest and checksums before recording the artifact ID.
+5. Quiesce the previous runtime and wait for its visible in-flight responses.
+6. Record the cutover time and operator.
+7. Ensure no webhook or poller remains active.
+8. Start Psyche and verify `getMe`, transport ownership, Coven profile, routes,
    and identity.
-7. Enable one DM route, then one group/topic route under the product gates.
+9. Enable one DM route, then one group/topic route under the product gates.
+
+The minimum export is a mode-`0600` encrypted archive containing:
+
+- `manifest.json` with `psyche.export.v1`, Psyche/Coven versions, schema
+  versions, creation time, retention policy, identity/route digests, inventory,
+  and archive-content checksums;
+- a transactionally consistent SQLite backup after retention cleanup, including
+  unresolved ingress, intents, graphs, nodes, attempts, delegations, budgets,
+  execution adoption/cancellation, evidence, verdicts, effects, delivery/dead-
+  letter, route, conversation, message-map, callback, and audit state required
+  for recovery; and
+- `checksums.sha256` covering every other archive member; and
+- a detached `<archive>.sha256` sidecar covering the complete encrypted archive
+  bytes, including the internal checksum manifest.
+
+The export excludes bot tokens, resolved secret values, secret-provider
+references, raw process diagnostics, and unretained content. Production export
+fails rather than writing content-bearing state without encryption. Restore
+requires the operator to configure secret references separately, verifies all
+checksums and schema versions before opening the database, and never activates
+an account until `psyche doctor` passes.
 
 Rollback:
 
@@ -1598,18 +1903,30 @@ allowed.
 
 ## Technical acceptance
 
-Implementation may begin only after the four `coven-psy0` documents receive
-explicit design approval. The technical design is complete when:
+Repository creation and W1 remain blocked until G1 proves all six companion
+documents coherent. Implementation planning, issues, and production code
+remain blocked until G3. The technical design is reconciled when:
 
 1. every crate and process has one owner and dependency direction;
 2. schemas, state machines, and stable error codes are versioned;
 3. durable acknowledgement and ordering have explicit transaction boundaries;
-4. Coven capability absence has no local authority fallback;
-5. identity disagreement blocks dispatch;
-6. non-idempotent Telegram ambiguity is represented honestly;
-7. storage, retention, testing, migration, and rollback are measurable; and
-8. the parity ledger maps every required behavior to test evidence;
-9. intentional familiar identity changes use an audited Coven-authorized
-   rebind and never resume an old session under a new identity; and
-10. `coven-psy2` is gated on real-Coven conformance for the complete required
-    capability profile, explicit denials, and mid-flight authority loss.
+4. intent, graph, node, delegation, budget, execution, evidence, verdict,
+   recovery, surface, and delivery contracts are surface-neutral;
+5. Coven contract absence has no local execution-authority fallback;
+6. Psyche resolves identity and surface principals while Coven only validates
+   supported execution bindings;
+7. graph authoring/simulation is separate from G6-gated child dispatch;
+8. non-idempotent Telegram ambiguity is represented honestly;
+9. storage, retention, testing, migration, and rollback are measurable;
+10. the parity ledger maps every required adapter behavior to test evidence;
+11. intentional familiar identity changes use an audited Psyche rebind and
+    never resume an old session under a new snapshot;
+12. G4 is gated on real-Coven conformance for the W1-classified profile,
+    explicit denials, and mid-flight authority loss;
+13. adoption, cancellation, verification, and delivery ambiguity have audited recovery
+    commands with no local force-unblock path;
+14. streaming previews have a persisted maximum age and surface-policy-safe expiry
+    behavior; and
+15. doctor output and the minimum export/restore artifact have versioned,
+    testable contracts; and
+16. no proposed Coven capability or endpoint is presented as current before W1.

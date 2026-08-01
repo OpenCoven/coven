@@ -1,6 +1,6 @@
 # Psyche Program Decision Dossier
 
-**Status:** Approved program baseline - W0 reconciliation authorized
+**Status:** Approved program baseline - W0 reconciled and G1 verified 2026-08-01
 
 **Decision owner:** Val
 
@@ -31,16 +31,14 @@ each stage of the Psyche program may proceed.
   dossier's evidence/inference separation, local benchmark gates, and deferred
   research claims are accepted.
 - **Val:** Approved the dossier based on the Coven's final conclusion. G0 is
-  satisfied; W0 specification reconciliation may begin. Evidence-blocked O-*
-  decisions remain unresolved until their named gates produce the required
-  evidence.
+  satisfied and W0 reconciliation is authorized. Evidence-blocked O-* decisions
+  remain unresolved until their named gates produce the required evidence.
 
 > This dossier is the program-level decision record. It does not replace the
 > detailed runtime design, Telegram parity ledger, threat model, or future
-> subsystem implementation plans. Where older companion documents define
-> Psyche as a Telegram product or assign identity, graph, verification, or
-> surface authority differently, the runtime design and this dossier supersede
-> them pending formal specification reconciliation.
+> subsystem implementation plans. W0 reconciles the older Telegram-scoped
+> companion material to this dossier; this document remains authoritative if a
+> later child plan attempts to reopen a fixed boundary.
 
 ## 1. Executive decision
 
@@ -50,9 +48,9 @@ Proceed with Psyche as the **local-first, surface-neutral, durable familiar
 runtime for a Coven**, with comprehensive multi-agent orchestration in the
 architecture and capability-gated production execution.
 
-Do not proceed directly to implementation. First reconcile the existing
-Telegram-era specifications, audit Coven's actual current contracts, and freeze
-the minimum surface-neutral schemas. Then build in independently testable
+Do not proceed directly to implementation. W0 reconciles the Telegram-era
+specifications and freezes minimum surface-neutral schemas; W1 separately
+audits Coven's actual current contracts. After G1/G3, build in independently testable
 vertical stages:
 
 1. identity, intent, graph, and storage foundations against fakes;
@@ -98,12 +96,13 @@ keeping Coven's Rust authority layer and harness neutrality intact.
 | Runtime architecture | Written and reviewed with corrections | `RUNTIME_DESIGN.md` is the canonical design artifact. |
 | Research review | Approved with corrections applied | Verification claims are evidence-calibrated. |
 | Identity and authority review | Approved with corrections applied | Ownership, adoption, cancellation, and recovery invariants are explicit. |
-| Telegram product specification | Detailed but conceptually stale | Preserve its adapter requirements; replace its product framing. |
-| Technical architecture | Rich Telegram implementation detail but stale core model | Extract reusable contracts and move Telegram schemas behind the adapter boundary. |
-| Threat model | Strong Telegram boundary coverage but incomplete graph scope | Add graph, delegation, verifier, add-on, and multi-surface threats. |
-| Coven prerequisites | Detailed but based on the older authority model | Reclassify against actual current Coven capabilities and the corrected ownership boundary. |
-| Program plan | Detailed but superseded by broader architecture | Rewrite workstreams; do not execute P0-P6 as currently written. |
-| Implementation | Not started by this design | No production implementation should begin until reconciliation and planning gates pass. |
+| Product specification | W0 reconciled | Surface-neutral product; Telegram is the first adapter; core and adapter objectives are separate. |
+| Technical architecture | W0 reconciled | Canonical intent/graph/evidence/surface contracts own the core; Telegram schemas remain adapter-scoped. |
+| Threat model | W0 reconciled | Graph, delegation, verifier, evidence, add-on, principal, and multi-surface threats are included. |
+| Telegram parity | W0 reconciled | Adapter evidence maps to common contracts and G8-G11. |
+| Coven prerequisites | W0 boundary reconciled; W1 audit pending | Behavior requirements are hypotheses until code/test classification and G3. |
+| Program plan | W0 reconciled | W0-W11 workstreams and G0-G12 gates replace the old program. |
+| Implementation | Not started | No implementation child plan, issue, or production code begins before G3 and the applicable downstream gate. |
 
 ## 2. Canonical product definition
 
@@ -859,9 +858,9 @@ release slice of that architecture.
 | Gate | Required evidence | Blocks |
 |---|---|---|
 | G0 - Decision approval | **Passed 2026-07-31.** Val approved this dossier and `RUNTIME_DESIGN.md` after Nova and Sage corrections were incorporated. | All reconciliation and planning. |
-| G1 - Specification coherence | Product, technical, threat, prerequisites, parity, and program docs share one product and ownership model. | Repository creation and implementation plans. |
+| G1 - Specification coherence | Product, technical, threat, prerequisites, parity, and program docs share one product and ownership model. | Repository creation and the W1 contract audit. |
 | G2 - Contract foundation | Schemas, migrations, fake services, state-machine/property tests, and unknown-version denial pass. | Real execution integration. |
-| G3 - Coven audit | Every needed contract is classified; accepted gaps have owners and order. | Coven implementation assignments. |
+| G3 - Coven audit | Every needed contract is classified; accepted gaps have owners and order. | Implementation child plans, issues, code, and Coven assignments. |
 | G4 - Single-node conformance | Unmodified fake contract suite passes against pinned real Coven, including denial, restart, cancellation, one-to-one attempt/session binding, digest mismatch, and ambiguity. | Real surface routes. |
 | G5 - Verification | Deterministic gates pass. Independent verification additionally requires distinct familiar identity/session, sealed evidence, declared policy, and approved benchmark thresholds measured on Psyche's task distribution. | Automated verified-success claims. |
 | G6 - Multi-agent conformance | Bounded non-widening delegation, child correlation and adoption, one-to-one attempt/session binding, lease fencing, once-only budget accounting, descendant cancellation acknowledgement, result/artifact association, and orphan recovery pass. | Production child dispatch. |
@@ -869,7 +868,7 @@ release slice of that architecture.
 | G8 - Adapter reliability | Fake surface, crash, security, ambiguity, and parity evidence pass repeatedly. | Live Telegram. |
 | G9 - Live Telegram | Required live rows pass twice on dedicated non-production accounts and two client families. | Canary. |
 | G10 - Operations | Doctor, retention, privacy, export/restore, incident response, and rollback drills pass. | Production cutover. |
-| G11 - Canary | The adapter meets approved service objectives for the approved observation window and update volume with zero unauthorized dispatch. The prior seven-day and 1,000-update values are provisional until O-005 is decided. | General release. |
+| G11 - Canary | Core and Telegram adapter service objectives hold for the operator-approved observation window and update volume with zero unauthorized dispatch. The prior seven-day and 1,000-update values remain provisional until operators approve the canary. | General release. |
 | G12 - Distribution | Signed/checksummed artifacts, SBOM, provenance, clean-host install, and rollback under threshold pass. | Publication. |
 
 No calendar date overrides a gate.
@@ -904,22 +903,22 @@ new approval. An unmet gate means the related capability is blocked.
 | R-001 | Ratified 2026-07-31 | Surface-effect authority | Psyche authorizes surface effects under configured surface policy. Coven authorizes only execution and protected resources exposed by versioned contracts. | Val + Coven |
 | R-002 | Ratified 2026-07-31 | Ward role | Ward is Coven's protected-familiar write and audit gate, never the source of familiar identity. | Val + Coven |
 
-### 15.2 Decisions required before W0 completes
+### 15.2 W0 decisions and W1 evidence boundary
 
 | ID | State | Decision | Options | Recommendation | Owner | Blocker or evidence |
 |---|---|---|---|---|---|---|
 | O-001 | Decided 2026-07-31 | Is production multi-agent execution required for the first release? | Required at launch; architecture plus simulation; defer all graph work | **Architecture, authoring, and simulation at launch; production child dispatch only if G6 passes without delaying the Telegram vertical slice.** | Val | Adopted through the final Coven consensus. |
 | O-002 | Blocked | Which current Coven contracts actually satisfy G4? | Trust docs; code audit; implement proposed profile wholesale | **Code audit plus executable conformance; implement only proven gaps.** | Coven + Psyche | W1 code and test evidence; earliest resolution G3. |
-| O-005 | Open | Which existing service objectives survive the product reframing? | Keep all Telegram values; drop metrics; adapter-specific plus core objectives | **Separate core durability/security objectives from Telegram adapter latency and duplicate-delivery objectives.** | Val + operators | Decide during W0 before G1. |
-| O-006 | Open | When does the standalone repository get created? | Before reconciliation; after reconciliation; after first code | **After G1, before W2 implementation.** | Val | Can be decided at G0. |
+| O-005 | Decided 2026-08-01 | Which existing service objectives survive the product reframing? | Keep all Telegram values; drop metrics; adapter-specific plus core objectives | **Separate core durability/security objectives from Telegram adapter latency and duplicate-delivery objectives.** | Val + operators | Adopted for W0; G11 window and volume remain operator-approved before canary. |
+| O-006 | Decided 2026-08-01 | When does the standalone repository get created? | Before reconciliation; after reconciliation; after first code | **After G1, before W2 implementation.** | Val | Adopted for W0. |
 
 ### 15.3 Decisions required before W5
 
 | ID | State | Decision | Recommendation | Owner | Blocker or evidence |
 |---|---|---|---|---|---|
-| O-007 | Blocked | Exact session idempotency and adoption retention | Retain through the maximum Psyche recovery/dedupe window; specify it rather than assume 30 days. | Psyche + Coven | W0 retention policy and W1 current-contract evidence. |
-| O-008 | Open | Cancellation acknowledgement semantics | Require authoritative terminal acknowledgement or explicit unresolved state. | Psyche + Coven | Freeze in W0; verify at G4. |
-| O-009 | Open | Artifact model for results and verification | Use opaque content-addressed references bound to session, attempt, identity, and project. | Psyche + Coven | Freeze in W0; verify at G4-G5. |
+| O-007 | Blocked | Exact session idempotency and adoption retention | Retain through the greater of the configured graph-recovery window and every enabled adapter deduplication window. | Psyche + Coven | Psyche requirement frozen in W0; W1 must prove compatible current Coven retention. |
+| O-008 | Decided 2026-08-01 | Cancellation acknowledgement semantics | Require authoritative terminal acknowledgement or explicit unresolved state. | Psyche + Coven | Frozen in W0; verify at G4/G6. |
+| O-009 | Decided 2026-08-01 | Artifact model for results and verification | Use opaque content-addressed references bound to session, graph/node/attempt, familiar snapshot, project, digest, type, size, and lifetime. | Psyche + Coven | Frozen in W0; verify at G4-G5. |
 | O-010 | Open | Memory integration in first release | Feature-gate; make required only for familiars whose declaration requires it. | Val + Psyche | Decide before W5 planning. |
 | O-011 | Blocked | Runtime registry integration | Consume accepted runtime capabilities through Coven; do not make Psyche depend directly on registry internals. | Coven | Current Coven registry-adoption plan and W1 evidence. |
 
@@ -931,7 +930,7 @@ new approval. An unmet gate means the related capability is blocked.
 | O-013 | Blocked | Automated verifier threshold | Instrument verbalized confidence against task outcomes before W7. Pilot at least 50 representative tasks with human comparison and set task-class thresholds from local results, not external benchmarks. | Psyche + human reviewers | Local calibration data and pilot evidence; earliest resolution G5. |
 | O-014 | Blocked | Hard budget resource classes | Enable one flag per enforceable resource; label all others admission/accounting controls. | Psyche + Coven | Enforceable limit and trustworthy usage evidence per resource. |
 | O-015 | Open | Add-on inclusion in first release | Include only if W9 does not block W6; ship core without add-ons rather than weaken trust controls. | Val | Decide before W9 joins the release critical path. |
-| O-016 | Open | OpenClaw compatibility surface | Support reviewable prompts, declarations, hooks, commands, and config only; reject direct clients, secrets, databases, and gateway internals. | Val + Psyche | Freeze during W0. |
+| O-016 | Decided 2026-08-01 | OpenClaw compatibility surface | Support separately reviewed operator-authored prompts, declarations, hooks, commands, and config only; reject source, direct clients, credentials, databases, conversations, hidden memory, caches, runtime state, and gateway internals. | Val + Psyche | Frozen in W0. |
 
 ### 15.5 Explicitly deferred decisions
 
@@ -1081,18 +1080,18 @@ Psyche database plus redacted audit evidence.
 
 ## 19. Documentation reconciliation map
 
-| Document | Preserve | Replace or add |
+| Document | Preserved specialist purpose | W0 result |
 |---|---|---|
-| `RUNTIME_DESIGN.md` | Canonical product boundary, architecture, lifecycle, verification, and gates. | Incorporate only corrections approved through dossier review. |
-| `PRODUCT.md` | Users, Telegram journeys, service objectives, migration gates. | Rewrite product decision, goals, non-goals, users, and authority matrix for the surface-neutral runtime. |
-| `TECH.md` | Telegram schemas, durability, storage, errors, observability, tests, migration detail. | Add intent/graph/verification core, new crate boundaries, surface contracts, and corrected authority. |
-| `THREAT_MODEL.md` | Telegram, secrets, media, delivery, migration, and local-process threats. | Add graph, delegation, verifier, evidence, marketplace, principal mapping, and multi-surface threats. |
-| `TELEGRAM_PARITY.md` | Keep as adapter evidence ledger. | Remove product-level authority assumptions and map rows to common surface contracts. |
-| `COVEN_PREREQUISITES.md` | Conformance method and explicit fail-closed expectations. | Reclassify actual contracts; remove Psyche identity/source and generic surface authority from Coven. |
-| `PLAN.md` | Child-plan discipline, focused PRs, release evidence, migration detail. | Replace Telegram P0-P6 program with W0-W11 decomposition and corrected critical path. |
+| `RUNTIME_DESIGN.md` | Canonical product boundary, architecture, lifecycle, verification, and gates. | Remains authoritative; companion coherence is verified at G1. |
+| `PRODUCT.md` | Users, Telegram journeys, objectives, migration gates. | Product/authority model is surface-neutral; first-release and W0 decisions are fixed. |
+| `TECH.md` | Telegram schemas, durability, storage, errors, observability, tests, migration detail. | Adds canonical core contracts and corrected authority; proposed Coven names are removed. |
+| `THREAT_MODEL.md` | Telegram, secrets, media, delivery, migration, and local-process threats. | Adds graph/delegation/verifier/evidence/add-on/principal/multi-surface threats. |
+| `TELEGRAM_PARITY.md` | Adapter evidence ledger. | Maps Telegram behavior to common contracts and G8-G11 without product authority. |
+| `COVEN_PREREQUISITES.md` | Conformance and fail-closed expectations. | Defines W1 classifications and behavior IDs; assigns no speculative implementation. |
+| `PLAN.md` | Child-plan discipline, focused delivery, release evidence, migration detail. | Uses W0-W11, G0-G12, corrected critical path, and issue-creation gates. |
 
-Reconciliation should be one documentation workstream but not one blind
-repository-wide rewrite. Each document keeps its specialist purpose.
+W0 remains one documentation workstream rather than a blind repository-wide
+rewrite; each reconciled document retains its specialist purpose.
 
 ## 20. Progression recommendation
 
@@ -1112,10 +1111,10 @@ Approve:
 
 ### 20.2 Decide during reconciliation
 
-Ratify R-001 and R-002 at G0. Resolve O-001, O-005, and O-006 while editing
-canonical specifications. O-002 remains blocked until W1 produces code and test
-evidence. These choices affect scope, repository timing, and release claims and
-should not be deferred into implementation review.
+R-001 and R-002 were ratified at G0. O-001, O-005, O-006, O-008, O-009, and
+O-016 are frozen through the reconciled specifications. O-002 and the
+Coven-retention half of O-007 remain blocked until W1 produces code and test
+evidence; no implementation review may infer their answer.
 
 ### 20.3 Audit before assigning Coven work
 
@@ -1171,15 +1170,17 @@ This dossier was approved on 2026-07-31 to drive specification reconciliation:
 - [x] W0-W11 is the right program decomposition.
 - [x] The first release recommendation is sufficiently useful.
 - [x] Open decisions have owners, and blocked decisions name required evidence.
+- [x] All six companion specifications are reconciled and pass the local G1
+      coherence and repository verification gates.
 
-After approval:
+After G0:
 
-1. reconcile the companion specifications;
-2. audit current Coven contracts;
-3. review the reconciled package with Nova and Sage;
-4. create the standalone repository;
-5. write a dependency-gated implementation plan for W2; and
-6. create separate Coven plans only for confirmed contract gaps.
+1. reconcile and verify the companion specifications (W0/G1);
+2. review the reconciled package with Nova and Sage;
+3. create the standalone repository after G1;
+4. audit current Coven contracts (W1/G3);
+5. write a dependency-gated implementation plan for W2 after G3; and
+6. create separate Coven plans only for G3-confirmed contract gaps.
 
 No implementation plan should silently reopen a fixed decision or bypass an
 unresolved gate in this dossier.
