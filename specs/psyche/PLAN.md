@@ -279,7 +279,7 @@ Capability flags remain false until their gates pass:
 | `psyche.independentVerification.v1` | G5 |
 | `psyche.multiAgentExecution.v1` | G6 |
 | `psyche.addons.trusted.v1` | G7 |
-| `psyche.surface.telegram.v1` | G8-G10; production use additionally G11. |
+| `psyche.surface.telegram.v1` | G8 and G9; production use additionally requires G10-G11. |
 | `psyche.hardBudgets.<resource>.v1` | Separate resource-specific enforcement/reporting evidence. |
 
 ## 6. Child-plan standard
