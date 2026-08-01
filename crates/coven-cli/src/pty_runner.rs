@@ -13,8 +13,10 @@ use std::sync::atomic::AtomicI32;
 use std::sync::MutexGuard;
 
 use anyhow::{Context, Result};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, PtySize, PtySystem};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, size as terminal_cell_size, window_size,
+};
+use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize, PtySystem};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessCommand {
@@ -2213,12 +2215,108 @@ fn wait_for_child(child: &mut Box<dyn portable_pty::Child + Send + Sync>) -> Pty
     }
 }
 
+trait PtyResizeTarget: Send {
+    fn resize_pty(&self, size: PtySize) -> Result<()>;
+}
+
+impl PtyResizeTarget for Box<dyn MasterPty + Send> {
+    fn resize_pty(&self, size: PtySize) -> Result<()> {
+        self.resize(size)
+    }
+}
+
+fn apply_pty_resize(
+    target: &dyn PtyResizeTarget,
+    current: &mut PtySize,
+    next: Option<PtySize>,
+) -> bool {
+    let Some(next) = next.and_then(valid_pty_size) else {
+        return true;
+    };
+    if next == *current {
+        return true;
+    }
+    if target.resize_pty(next).is_err() {
+        return false;
+    }
+    *current = next;
+    true
+}
+
+const PTY_RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+struct PtyResizeWatcher {
+    stop: Option<mpsc::Sender<()>>,
+    join: Option<thread::JoinHandle<Box<dyn PtyResizeTarget>>>,
+}
+
+impl PtyResizeWatcher {
+    fn spawn(master: Box<dyn MasterPty + Send>, initial: PtySize) -> Self {
+        Self::spawn_with_source(
+            master,
+            initial,
+            detected_terminal_size,
+            PTY_RESIZE_POLL_INTERVAL,
+        )
+    }
+
+    fn spawn_with_source<T, S>(
+        target: T,
+        initial: PtySize,
+        mut size_source: S,
+        interval: Duration,
+    ) -> Self
+    where
+        T: PtyResizeTarget + 'static,
+        S: FnMut() -> Option<PtySize> + Send + 'static,
+    {
+        let (stop, stopped) = mpsc::channel();
+        let target: Box<dyn PtyResizeTarget> = Box::new(target);
+        let join = thread::spawn(move || {
+            let mut current = initial;
+            loop {
+                match stopped.recv_timeout(interval) {
+                    Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                    Err(RecvTimeoutError::Timeout) => {}
+                }
+                if !apply_pty_resize(target.as_ref(), &mut current, size_source()) {
+                    break;
+                }
+            }
+            // Retain the PTY master in the completed join result until `stop`
+            // joins and drops it after child teardown. Dropping it in this worker
+            // can close an otherwise-active Windows ConPTY on resize failure.
+            target
+        });
+        Self {
+            stop: Some(stop),
+            join: Some(join),
+        }
+    }
+
+    fn stop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+impl Drop for PtyResizeWatcher {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 fn run_attached_with_pty_system(
     command: &HarnessCommand,
     pty_system: &(dyn PtySystem + Send),
 ) -> Result<PtyRunResult> {
+    let initial_size = attached_terminal_size();
     let pair = pty_system
-        .openpty(terminal_size())
+        .openpty(initial_size)
         .context("failed to open PTY")?;
     let mut child = pair
         .slave
@@ -2227,14 +2325,20 @@ fn run_attached_with_pty_system(
 
     drop(pair.slave);
 
-    let mut reader = pair
-        .master
+    let master = pair.master;
+    let mut reader = master
         .try_clone_reader()
         .context("failed to clone PTY reader")?;
-    let mut writer = pair
-        .master
-        .take_writer()
-        .context("failed to open PTY writer")?;
+    let mut writer = master.take_writer().context("failed to open PTY writer")?;
+    let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+    let mut master = Some(master);
+    let mut resize_watcher = interactive.then(|| {
+        PtyResizeWatcher::spawn(
+            master.take().expect("interactive PTY master is available"),
+            initial_size,
+        )
+    });
+    let _held_master = master;
     let _raw_mode =
         RawModeGuard::enable_if_terminal().context("failed to enable raw terminal mode")?;
 
@@ -2258,6 +2362,9 @@ fn run_attached_with_pty_system(
     }
 
     let exit_status = child.wait().context("failed to wait for harness process")?;
+    if let Some(watcher) = resize_watcher.as_mut() {
+        watcher.stop();
+    }
     let _ = output_thread.join();
     let exit_code = i32::try_from(exit_status.exit_code()).unwrap_or(i32::MAX);
     let status = if exit_status.success() {
@@ -2294,13 +2401,65 @@ impl Drop for RawModeGuard {
     }
 }
 
-fn terminal_size() -> PtySize {
-    PtySize {
-        rows: env_u16("LINES").unwrap_or(24),
-        cols: env_u16("COLUMNS").unwrap_or(80),
+const DEFAULT_PTY_ROWS: u16 = 24;
+const DEFAULT_PTY_COLS: u16 = 80;
+
+fn detected_terminal_size() -> Option<PtySize> {
+    if !io::stdout().is_terminal() {
+        return None;
+    }
+    let window = window_size().ok().map(|window| PtySize {
+        rows: window.rows,
+        cols: window.columns,
+        pixel_width: window.width,
+        pixel_height: window.height,
+    });
+    detected_terminal_size_from_sources(window, terminal_cell_size().ok())
+}
+
+fn detected_terminal_size_from_sources(
+    window: Option<PtySize>,
+    cells: Option<(u16, u16)>,
+) -> Option<PtySize> {
+    window.and_then(valid_pty_size).or_else(|| {
+        cells.and_then(|(cols, rows)| {
+            valid_pty_size(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+        })
+    })
+}
+
+fn valid_pty_size(size: PtySize) -> Option<PtySize> {
+    (size.rows > 0 && size.cols > 0).then_some(size)
+}
+
+fn terminal_size_from_sources(
+    terminal: Option<PtySize>,
+    env_rows: Option<u16>,
+    env_cols: Option<u16>,
+) -> PtySize {
+    terminal.and_then(valid_pty_size).unwrap_or(PtySize {
+        rows: env_rows.unwrap_or(DEFAULT_PTY_ROWS),
+        cols: env_cols.unwrap_or(DEFAULT_PTY_COLS),
         pixel_width: 0,
         pixel_height: 0,
-    }
+    })
+}
+
+fn terminal_size() -> PtySize {
+    terminal_size_from_sources(None, env_u16("LINES"), env_u16("COLUMNS"))
+}
+
+fn attached_terminal_size() -> PtySize {
+    terminal_size_from_sources(
+        detected_terminal_size(),
+        env_u16("LINES"),
+        env_u16("COLUMNS"),
+    )
 }
 
 fn env_u16(name: &str) -> Option<u16> {
@@ -2313,7 +2472,421 @@ fn env_u16(name: &str) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use super::*;
+
+    fn pty_size(rows: u16, cols: u16, pixel_width: u16, pixel_height: u16) -> PtySize {
+        PtySize {
+            rows,
+            cols,
+            pixel_width,
+            pixel_height,
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecordingResizeTarget {
+        sizes: Arc<Mutex<Vec<PtySize>>>,
+        fail: bool,
+    }
+
+    impl PtyResizeTarget for RecordingResizeTarget {
+        fn resize_pty(&self, size: PtySize) -> Result<()> {
+            if self.fail {
+                anyhow::bail!("synthetic resize failure");
+            }
+            self.sizes.lock().unwrap().push(size);
+            Ok(())
+        }
+    }
+
+    struct DropAwareResizeTarget {
+        sizes: mpsc::Sender<PtySize>,
+        dropped: Option<mpsc::Sender<()>>,
+        fail: bool,
+    }
+
+    impl PtyResizeTarget for DropAwareResizeTarget {
+        fn resize_pty(&self, size: PtySize) -> Result<()> {
+            self.sizes
+                .send(size)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            if self.fail {
+                anyhow::bail!("synthetic resize failure");
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for DropAwareResizeTarget {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.dropped.take() {
+                let _ = dropped.send(());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn read_pty_line_with_timeout<R: BufRead>(
+        reader: &mut R,
+        raw_fd: libc::c_int,
+        timeout: Duration,
+    ) -> io::Result<String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for PTY output",
+                ));
+            }
+            let timeout_ms = i32::try_from(remaining.as_millis().max(1)).unwrap_or(i32::MAX);
+            let mut descriptor = libc::pollfd {
+                fd: raw_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: descriptor points to one valid pollfd for the duration of the call.
+            let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+            if ready > 0 {
+                let mut line = String::new();
+                if reader.read_line(&mut line)? == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "PTY closed before a complete line arrived",
+                    ));
+                }
+                return Ok(line.trim().to_string());
+            }
+            if ready == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for PTY output",
+                ));
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_pty_child_until(
+        child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+        deadline: Instant,
+    ) -> io::Result<Option<portable_pty::ExitStatus>> {
+        while Instant::now() < deadline {
+            if let Some(status) = child.try_wait()? {
+                return Ok(Some(status));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        child.try_wait()
+    }
+
+    #[cfg(unix)]
+    fn finalize_pty_child(
+        child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+    ) -> anyhow::Result<portable_pty::ExitStatus> {
+        if let Some(status) =
+            wait_for_pty_child_until(child, Instant::now() + Duration::from_secs(5))?
+        {
+            return Ok(status);
+        }
+
+        if let Err(kill_error) = child.kill() {
+            if let Some(status) = child.try_wait()? {
+                return Ok(status);
+            }
+            return Err(kill_error).context("failed to kill PTY child during test cleanup");
+        }
+
+        wait_for_pty_child_until(child, Instant::now() + Duration::from_secs(5))?
+            .context("PTY child was not reaped after cleanup kill")
+    }
+
+    #[test]
+    fn pty_resize_watcher_skips_duplicates_and_survives_missing_samples() {
+        let initial = pty_size(24, 80, 0, 0);
+        let resized = pty_size(40, 120, 1440, 800);
+        let resized_again = pty_size(48, 132, 1584, 960);
+        let samples = Arc::new(Mutex::new(VecDeque::from([
+            None,
+            Some(pty_size(0, 120, 0, 0)),
+            Some(initial),
+            Some(resized),
+            Some(resized),
+            None,
+            Some(resized_again),
+        ])));
+        let samples_for_source = Arc::clone(&samples);
+        let (sizes_tx, sizes_rx) = mpsc::channel();
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let target = DropAwareResizeTarget {
+            sizes: sizes_tx,
+            dropped: Some(dropped_tx),
+            fail: false,
+        };
+
+        let mut watcher = PtyResizeWatcher::spawn_with_source(
+            target,
+            initial,
+            move || samples_for_source.lock().unwrap().pop_front().flatten(),
+            Duration::from_millis(1),
+        );
+
+        assert_eq!(
+            sizes_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            resized,
+        );
+        assert_eq!(
+            sizes_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            resized_again,
+        );
+        assert!(sizes_rx.recv_timeout(Duration::from_millis(25)).is_err());
+        watcher.stop();
+        dropped_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn pty_resize_watcher_drop_interrupts_long_poll_and_drops_target() {
+        let (sizes_tx, _sizes_rx) = mpsc::channel();
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let target = DropAwareResizeTarget {
+            sizes: sizes_tx,
+            dropped: Some(dropped_tx),
+            fail: false,
+        };
+        let watcher = PtyResizeWatcher::spawn_with_source(
+            target,
+            pty_size(24, 80, 0, 0),
+            || None,
+            Duration::from_secs(60),
+        );
+        let started = Instant::now();
+        drop(watcher);
+
+        dropped_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn pty_resize_watcher_exits_and_drops_target_after_resize_failure() {
+        let resized = pty_size(40, 120, 0, 0);
+        let (sizes_tx, sizes_rx) = mpsc::channel();
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let target = DropAwareResizeTarget {
+            sizes: sizes_tx,
+            dropped: Some(dropped_tx),
+            fail: true,
+        };
+
+        let mut watcher = PtyResizeWatcher::spawn_with_source(
+            target,
+            pty_size(24, 80, 0, 0),
+            move || Some(resized),
+            Duration::from_millis(1),
+        );
+
+        assert_eq!(
+            sizes_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            resized,
+        );
+        assert!(sizes_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        assert!(dropped_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        watcher.stop();
+        dropped_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pty_resize_watcher_updates_real_child_geometry() -> anyhow::Result<()> {
+        let initial = pty_size(24, 80, 0, 0);
+        let resized = pty_size(40, 120, 0, 0);
+        let pair = native_pty_system().openpty(initial)?;
+        let raw_fd = pair
+            .master
+            .as_raw_fd()
+            .context("real PTY master did not expose a file descriptor")?;
+        let reader = pair.master.try_clone_reader()?;
+        let mut writer = pair.master.take_writer()?;
+        let mut command = CommandBuilder::new("sh");
+        command.args(["-c", "stty -echo; stty size; IFS= read -r _; stty size"]);
+        let mut child = pair.slave.spawn_command(command)?;
+        drop(pair.slave);
+        let mut reader = BufReader::new(reader);
+        let first = read_pty_line_with_timeout(&mut reader, raw_fd, Duration::from_secs(5));
+        let (sampled_tx, sampled_rx) = mpsc::channel();
+        let mut samples = 0;
+        let mut watcher = PtyResizeWatcher::spawn_with_source(
+            pair.master,
+            initial,
+            move || {
+                samples += 1;
+                if samples == 2 {
+                    let _ = sampled_tx.send(());
+                }
+                Some(resized)
+            },
+            Duration::from_millis(1),
+        );
+        let sampled_twice = sampled_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|error| anyhow::anyhow!("resize source did not run twice: {error}"));
+        let input_sent = writer
+            .write_all(b"\n")
+            .and_then(|_| writer.flush())
+            .context("failed to release child after resize");
+        let second = read_pty_line_with_timeout(&mut reader, raw_fd, Duration::from_secs(5));
+
+        watcher.stop();
+        drop(writer);
+        let status = finalize_pty_child(&mut child);
+
+        let first = first.context("failed to read initial stty size")?;
+        sampled_twice?;
+        input_sent?;
+        let second = second.context("failed to read resized stty size")?;
+        anyhow::ensure!(first == "24 80", "unexpected initial geometry: {first}");
+        anyhow::ensure!(second == "40 120", "unexpected resized geometry: {second}");
+        anyhow::ensure!(
+            status?.success(),
+            "PTY child did not exit successfully after resize"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pty_resize_ignores_missing_invalid_and_unchanged_samples() {
+        let sizes = Arc::new(Mutex::new(Vec::new()));
+        let target = RecordingResizeTarget {
+            sizes: Arc::clone(&sizes),
+            fail: false,
+        };
+        let initial = pty_size(24, 80, 0, 0);
+        let mut current = initial;
+
+        assert!(apply_pty_resize(&target, &mut current, None));
+        assert!(apply_pty_resize(
+            &target,
+            &mut current,
+            Some(pty_size(0, 120, 0, 0)),
+        ));
+        assert!(apply_pty_resize(&target, &mut current, Some(initial),));
+        assert!(sizes.lock().unwrap().is_empty());
+        assert_eq!(current, initial);
+    }
+
+    #[test]
+    fn pty_resize_applies_each_distinct_complete_geometry_once() {
+        let sizes = Arc::new(Mutex::new(Vec::new()));
+        let target = RecordingResizeTarget {
+            sizes: Arc::clone(&sizes),
+            fail: false,
+        };
+        let mut current = pty_size(24, 80, 0, 0);
+        let first = pty_size(40, 120, 1440, 800);
+        let second = pty_size(40, 120, 1680, 900);
+
+        assert!(apply_pty_resize(&target, &mut current, Some(first)));
+        assert!(apply_pty_resize(&target, &mut current, Some(first)));
+        assert!(apply_pty_resize(&target, &mut current, Some(second)));
+        assert_eq!(*sizes.lock().unwrap(), vec![first, second]);
+        assert_eq!(current, second);
+    }
+
+    #[test]
+    fn pty_resize_failure_stops_relay_without_advancing_geometry() {
+        let target = RecordingResizeTarget {
+            sizes: Arc::new(Mutex::new(Vec::new())),
+            fail: true,
+        };
+        let initial = pty_size(24, 80, 0, 0);
+        let mut current = initial;
+
+        assert!(!apply_pty_resize(
+            &target,
+            &mut current,
+            Some(pty_size(40, 120, 0, 0)),
+        ));
+        assert_eq!(current, initial);
+    }
+
+    #[test]
+    fn pty_geometry_prefers_live_terminal_size_and_pixels() {
+        let live = pty_size(52, 151, 1812, 936);
+
+        assert_eq!(
+            terminal_size_from_sources(Some(live), Some(24), Some(80)),
+            live,
+        );
+    }
+
+    #[test]
+    fn pty_geometry_falls_back_to_cell_size_when_pixels_are_unavailable() {
+        let live = pty_size(52, 151, 1812, 936);
+
+        assert_eq!(
+            detected_terminal_size_from_sources(None, Some((151, 52))),
+            Some(pty_size(52, 151, 0, 0)),
+        );
+        assert_eq!(
+            detected_terminal_size_from_sources(Some(live), Some((80, 24))),
+            Some(live),
+        );
+    }
+
+    #[test]
+    fn pty_geometry_rejects_zero_detected_sources() {
+        let invalid_window = pty_size(0, 151, 1812, 936);
+
+        assert_eq!(detected_terminal_size_from_sources(None, None), None);
+        assert_eq!(
+            detected_terminal_size_from_sources(Some(invalid_window), Some((132, 41))),
+            Some(pty_size(41, 132, 0, 0)),
+        );
+        assert_eq!(
+            detected_terminal_size_from_sources(None, Some((132, 0))),
+            None,
+        );
+        assert_eq!(
+            detected_terminal_size_from_sources(None, Some((0, 41))),
+            None,
+        );
+    }
+
+    #[test]
+    fn pty_geometry_rejects_zero_live_dimensions() {
+        let invalid = pty_size(0, 151, 1812, 936);
+
+        assert_eq!(
+            terminal_size_from_sources(Some(invalid), Some(41), Some(132)),
+            pty_size(41, 132, 0, 0),
+        );
+    }
+
+    #[test]
+    fn pty_geometry_uses_each_environment_fallback_independently() {
+        assert_eq!(
+            terminal_size_from_sources(None, Some(41), None),
+            pty_size(41, 80, 0, 0),
+        );
+        assert_eq!(
+            terminal_size_from_sources(None, None, Some(132)),
+            pty_size(24, 132, 0, 0),
+        );
+    }
+
+    #[test]
+    fn pty_geometry_defaults_when_every_source_is_unavailable() {
+        assert_eq!(
+            terminal_size_from_sources(None, None, None),
+            pty_size(24, 80, 0, 0),
+        );
+    }
 
     #[test]
     fn builds_codex_command_without_shell_interpolation() {
