@@ -4,7 +4,7 @@
 
 **Goal:** Preserve and classify every discovered local workstream, recover each viable concern through its own issue and implementation plan, and safely remove only proven stale residue.
 
-**Architecture:** Use the repository's shared Git common directory as a non-worktree recovery archive. Run a preservation and classification phase before any cleanup, then hand each viable subsystem to an isolated issue/spec/plan/PR flow based on current `origin/main`.
+**Architecture:** Use the repository's shared Git common directory as a non-worktree recovery archive with a fixed current-run root at `agent-recovery/issue-541` and immutable private rerun archives for older runs. Run a preservation and classification phase before any cleanup, then hand each viable subsystem to an isolated issue/spec/plan/PR flow based on current `origin/main`.
 
 **Tech Stack:** Git worktrees and bundles, GitHub CLI, Coven claims, Markdown recovery ledger, Rust/Cargo, npm, repository secret and privacy guards.
 
@@ -31,7 +31,9 @@
   - `.git/agent-recovery/issue-541/viable/<workstream-id>-issue-blocker.txt`
   - `.git/agent-recovery/issue-541/private/issue-ledger-refresh/<workstream-id>-issues.stage.json`
   - Authoritative source-branch fetch evidence, open-PR evidence, verified
-    PR-view evidence, preserved-head adoption ancestry evidence,
+    same-repository candidate evidence, verified PR-view evidence,
+    preserved-head adoption ancestry evidence plus dirty-snapshot emptiness
+    evidence when applicable,
     per-workstream exact-title open issue-match evidence derived from paginated
     `issues.json`, blocker evidence for each viable workstream, and the
     private staged ledger used to atomically refresh `issues.json`.
@@ -41,6 +43,12 @@
   - Private branch-ref recheck evidence for each recovered source branch,
     including missing-ref outcomes and drift blockers recorded immediately
     before each deletion command.
+- Create only when Task 2 Step 1 reruns after a prior current root exists:
+  - `.git/agent-recovery/private/reruns/<rerun-id>/issue-541/`
+  - `.git/agent-recovery/private/reruns/<rerun-id>/archive-record.txt`
+  - Immutable archive of the former current `issue-541` run, including its
+    prior fixed location and archival timestamp, so reruns create a fresh
+    current root without truncating earlier manifests or snapshots.
 - Create only when Task 9 runs:
   - `.git/agent-recovery/issue-541/final-audit-primary-checkout.txt`
   - Primary-checkout restore and blocker evidence for the final audit.
@@ -203,18 +211,38 @@ without auto-closing it.
 Run:
 
 ```bash
+set -euo pipefail
 COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 git -C "$REPO" fetch origin main
-RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
-mkdir -p "$RECOVERY/dirty" "$RECOVERY/branches"
+RECOVERY_PARENT="$COMMON_DIR/agent-recovery"
+RECOVERY="$RECOVERY_PARENT/issue-541"
+RERUN_ARCHIVE_ROOT="$RECOVERY_PARENT/private/reruns"
+if test -e "$RECOVERY"; then
+  mkdir -p "$RERUN_ARCHIVE_ROOT"
+  RERUN_ARCHIVE_DIR="$(mktemp -d "$RERUN_ARCHIVE_ROOT/issue-541-rerun-XXXXXX")"
+  ARCHIVED_RECOVERY="$RERUN_ARCHIVE_DIR/issue-541"
+  mv "$RECOVERY" "$ARCHIVED_RECOVERY"
+  printf 'Former current root: %s\nArchived root: %s\nArchived at (UTC): %s\n' \
+    "$RECOVERY" \
+    "$ARCHIVED_RECOVERY" \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$RERUN_ARCHIVE_DIR/archive-record.txt"
+fi
+mkdir -p "$RECOVERY/dirty" "$RECOVERY/branches" "$RECOVERY/private"
 printf 'id\ttype\tsource\thead\tmerge_base\tsnapshot\n' > "$RECOVERY/manifest.tsv"
 ```
 
 Expected: the recovery root exists under
 `$COMMON_DIR/agent-recovery/issue-541`, and that fetched `origin/main`
-becomes the baseline for every Task 2 and Task 3 `merge_base` record. Task 4
-may fetch `origin/main` again before classification.
+becomes the baseline for every Task 2 and Task 3 `merge_base` record. If a
+prior current root already existed, it is first moved atomically into a unique
+private rerun archive created with `mktemp -d` under
+`$COMMON_DIR/agent-recovery/private/reruns`, its former fixed location and
+archival time are recorded in `archive-record.txt`, and the rerun then creates
+a fresh current root at the same fixed path so downstream `issue-541/...`
+paths stay valid. If the archival move or fresh-root creation fails, stop
+before writing any new manifest or snapshot. Task 4 may fetch `origin/main`
+again before classification.
 
 - [ ] **Step 2: Snapshot `docs-psyche-specs`**
 
@@ -661,10 +689,11 @@ Expected: Task 4 Step 4 replaces every `pending` row with exactly one terminal
 classification (`already-shipped`, `superseded`, `viable`, or `blocked`) and
 one next action before Task 4 Step 5 and Task 9 Step 1 verification. A viable
 row may later keep that classification while Task 5 updates its action to
-`continue existing PR` only after an exact-head query returns one open PR from
-the source branch and that single candidate passes the fetched-tip and
-preserved-head ancestry checks. Rows with zero exact-head candidates keep the
-normal issue-reuse-or-create flow.
+`continue existing PR` only after a fully paginated same-repo open-PR capture
+returns one exact-source-branch candidate and that single candidate passes the
+fetched-tip, preserved-head ancestry, and empty-dirty-snapshot checks. Rows
+with zero same-repo exact-head candidates keep the normal issue-reuse-or-create
+flow.
 
 - [ ] **Step 5: Review the ledger against the manifest**
 
@@ -701,6 +730,7 @@ Set `WORKSTREAM_ID` to the viable row's exact workstream ID, then map it to its
 current source branch:
 
 ```bash
+set -euo pipefail
 COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 RECOVERY="$COMMON_DIR/agent-recovery/issue-541/viable"
@@ -734,30 +764,44 @@ case "$WORKSTREAM_ID" in
   mobile-memory-gateway)
     SOURCE_BRANCH="feat/mobile-memory-gateway"
     SOURCE_HEAD_FILE="$COMMON_DIR/agent-recovery/issue-541/dirty/mobile-memory-gateway/head.txt"
+    DIRTY_SNAPSHOT_ID="dirty/mobile-memory-gateway"
+    DIRTY_SNAPSHOT_ROOT="$COMMON_DIR/agent-recovery/issue-541/$DIRTY_SNAPSHOT_ID"
     ;;
   feat-npm-macos-x64)
     SOURCE_BRANCH="feat/npm-macos-x64"
     SOURCE_HEAD_FILE="$COMMON_DIR/agent-recovery/issue-541/branches/feat-npm-macos-x64/head.txt"
+    DIRTY_SNAPSHOT_ID=""
+    DIRTY_SNAPSHOT_ROOT=""
     ;;
   fix-521-ward-surface-confinement)
     SOURCE_BRANCH="fix/521-ward-surface-confinement"
     SOURCE_HEAD_FILE="$COMMON_DIR/agent-recovery/issue-541/branches/fix-521-ward-surface-confinement/head.txt"
+    DIRTY_SNAPSHOT_ID=""
+    DIRTY_SNAPSHOT_ROOT=""
     ;;
   memory-promote)
     SOURCE_BRANCH="feat/cmem-1ev-memory-promote"
     SOURCE_HEAD_FILE="$COMMON_DIR/agent-recovery/issue-541/dirty/memory-promote/head.txt"
+    DIRTY_SNAPSHOT_ID="dirty/memory-promote"
+    DIRTY_SNAPSHOT_ROOT="$COMMON_DIR/agent-recovery/issue-541/$DIRTY_SNAPSHOT_ID"
     ;;
   docs-psyche-specs)
     SOURCE_BRANCH="docs/psyche-specs"
     SOURCE_HEAD_FILE="$COMMON_DIR/agent-recovery/issue-541/dirty/docs-psyche-specs/head.txt"
+    DIRTY_SNAPSHOT_ID="dirty/docs-psyche-specs"
+    DIRTY_SNAPSHOT_ROOT="$COMMON_DIR/agent-recovery/issue-541/$DIRTY_SNAPSHOT_ID"
     ;;
   docs-universal-runtime-capability-design)
     SOURCE_BRANCH="docs/universal-runtime-capability-design"
     SOURCE_HEAD_FILE="$COMMON_DIR/agent-recovery/issue-541/branches/docs-universal-runtime-capability-design/head.txt"
+    DIRTY_SNAPSHOT_ID=""
+    DIRTY_SNAPSHOT_ROOT=""
     ;;
   pr-476-review)
     SOURCE_BRANCH="fix/476-review-threads"
     SOURCE_HEAD_FILE="$COMMON_DIR/agent-recovery/issue-541/dirty/pr-476-review/head.txt"
+    DIRTY_SNAPSHOT_ID="dirty/pr-476-review"
+    DIRTY_SNAPSHOT_ROOT="$COMMON_DIR/agent-recovery/issue-541/$DIRTY_SNAPSHOT_ID"
     ;;
   *)
     printf 'Unknown WORKSTREAM_ID: %s\n' "$WORKSTREAM_ID" >&2
@@ -774,13 +818,44 @@ EXPECTED_HEAD="$(tr -d '\n' < "$SOURCE_HEAD_FILE")"
 {
   printf 'Source branch: %s\n' "$SOURCE_BRANCH"
   printf 'Preserved local head: %s\n' "$EXPECTED_HEAD"
-  printf 'Exact-head PR query runs before any source-branch fetch.\n'
+  printf 'Candidate discovery: capture every open PR for OpenCoven/coven via paginated REST API, then filter with jq only when head.ref matches the source branch and head.repo.full_name equals OpenCoven/coven.\n'
+  printf 'Same-named fork PRs do not count as same-repository candidates.\n'
+  printf 'Candidate discovery runs before any source-branch fetch.\n'
 } > "$BRANCH_FETCH_EVIDENCE"
-gh pr list \
-  --repo OpenCoven/coven \
-  --state open \
-  --head "$SOURCE_BRANCH" \
-  --json number,title,url,headRefName > "$OPEN_PR_EVIDENCE"
+if ! {
+  gh api --paginate --slurp \
+    "repos/OpenCoven/coven/pulls?state=open&per_page=100" | \
+  jq --arg SOURCE_BRANCH "$SOURCE_BRANCH" '
+    [ .[] | .[]
+      | select(.head.ref == $SOURCE_BRANCH)
+      | select(.head.repo != null and .head.repo.full_name == "OpenCoven/coven")
+      | {
+          number,
+          title,
+          url: .html_url,
+          state,
+          headRefName: .head.ref,
+          headRefOid: .head.sha,
+          headRepoFullName: .head.repo.full_name,
+          baseRefName: .base.ref
+        }
+    ]
+  ' > "$OPEN_PR_EVIDENCE"
+} 2> "$PR_BLOCKER_EVIDENCE"; then
+  API_ERROR="$(cat "$PR_BLOCKER_EVIDENCE")"
+  {
+    printf 'Blocked %s: open-PR candidate capture failed before source-branch verification.\n' "$WORKSTREAM_ID"
+    printf 'Expected source branch: %s\n' "$SOURCE_BRANCH"
+    printf 'Preserved local head: %s\n' "$EXPECTED_HEAD"
+    printf 'Candidate discovery uses repos/OpenCoven/coven/pulls?state=open with --paginate --slurp and jq same-repo filtering.\n'
+    printf 'Failure follows:\n%s\n' "$API_ERROR"
+  } > "$PR_BLOCKER_EVIDENCE"
+  update_classification_row \
+    "blocked" \
+    "Open PR candidate capture failed for preserved head $EXPECTED_HEAD before any source-branch verification; see viable/$WORKSTREAM_ID-branch-fetch.txt and viable/$WORKSTREAM_ID-pr-blocker.txt." \
+    "Blocked: could not capture same-repo open PR candidates from GitHub."
+  exit 0
+fi
 PR_COUNT="$(jq 'length' "$OPEN_PR_EVIDENCE")"
 ```
 
@@ -789,7 +864,7 @@ Then branch on the exact-source-branch result:
 ```bash
 case "$PR_COUNT" in
   1)
-    printf 'Exact-head open PR count: 1\n' >> "$BRANCH_FETCH_EVIDENCE"
+    printf 'Same-repo exact-head open PR count: 1\n' >> "$BRANCH_FETCH_EVIDENCE"
     printf 'Fetching origin/%s for candidate identity verification.\n' \
       "$SOURCE_BRANCH" >> "$BRANCH_FETCH_EVIDENCE"
     if ! git -C "$REPO" fetch --no-tags origin \
@@ -797,7 +872,7 @@ case "$PR_COUNT" in
       >> "$BRANCH_FETCH_EVIDENCE" 2>&1; then
       FETCH_OUTPUT="$(cat "$BRANCH_FETCH_EVIDENCE")"
       {
-        printf 'Blocked %s: exact-head candidate exists, but origin/%s could not be fetched for identity verification.\n' \
+        printf 'Blocked %s: same-repo exact-head candidate exists, but origin/%s could not be fetched for identity verification.\n' \
           "$WORKSTREAM_ID" "$SOURCE_BRANCH"
         printf 'Preserved local head: %s\n' "$EXPECTED_HEAD"
         printf 'Branch fetch evidence: viable/%s-branch-fetch.txt\n' "$WORKSTREAM_ID"
@@ -805,7 +880,7 @@ case "$PR_COUNT" in
       } > "$PR_BLOCKER_EVIDENCE"
       update_classification_row \
         "blocked" \
-        "Single PR candidate could not be verified because origin/$SOURCE_BRANCH fetch failed for preserved head $EXPECTED_HEAD; see viable/$WORKSTREAM_ID-branch-fetch.txt and viable/$WORKSTREAM_ID-pr-blocker.txt." \
+        "Single same-repo PR candidate could not be verified because origin/$SOURCE_BRANCH fetch failed for preserved head $EXPECTED_HEAD; see viable/$WORKSTREAM_ID-branch-fetch.txt, viable/$WORKSTREAM_ID-open-prs.json, and viable/$WORKSTREAM_ID-pr-blocker.txt." \
         "Blocked: candidate PR source branch could not be fetched from origin."
       exit 0
     fi
@@ -818,7 +893,7 @@ case "$PR_COUNT" in
       > "$PR_VIEW_EVIDENCE" 2> "$PR_BLOCKER_EVIDENCE"; then
       PR_VIEW_ERROR="$(cat "$PR_BLOCKER_EVIDENCE")"
       {
-        printf 'Blocked %s: candidate PR #%s disappeared or could not be read between gh pr list and gh pr view.\n' \
+        printf 'Blocked %s: candidate PR #%s disappeared or could not be read between paginated gh api capture and gh pr view.\n' \
           "$WORKSTREAM_ID" "$PR_NUMBER"
         printf 'Expected source branch: %s\n' "$SOURCE_BRANCH"
         printf 'Preserved local head: %s\n' "$EXPECTED_HEAD"
@@ -890,6 +965,50 @@ case "$PR_COUNT" in
       exit 0
     fi
     PR_URL="$(jq -r '.url' "$PR_VIEW_EVIDENCE")"
+    printf 'Existing PR URL: %s\n' "$PR_URL" >> "$PR_ADOPTION_EVIDENCE"
+    if test -n "$DIRTY_SNAPSHOT_ROOT"; then
+      test -f "$DIRTY_SNAPSHOT_ROOT/worktree.patch"
+      test -f "$DIRTY_SNAPSHOT_ROOT/index.patch"
+      test -f "$DIRTY_SNAPSHOT_ROOT/untracked-files.txt"
+      WORKTREE_BYTES="$(wc -c < "$DIRTY_SNAPSHOT_ROOT/worktree.patch" | tr -d ' ')"
+      INDEX_BYTES="$(wc -c < "$DIRTY_SNAPSHOT_ROOT/index.patch" | tr -d ' ')"
+      UNTRACKED_BYTES="$(wc -c < "$DIRTY_SNAPSHOT_ROOT/untracked-files.txt" | tr -d ' ')"
+      DIRTY_CLASS_LIST=""
+      if [ "$WORKTREE_BYTES" -gt 0 ]; then DIRTY_CLASS_LIST="worktree.patch"; fi
+      if [ "$INDEX_BYTES" -gt 0 ]; then DIRTY_CLASS_LIST="${DIRTY_CLASS_LIST:+$DIRTY_CLASS_LIST, }index.patch"; fi
+      if [ "$UNTRACKED_BYTES" -gt 0 ]; then DIRTY_CLASS_LIST="${DIRTY_CLASS_LIST:+$DIRTY_CLASS_LIST, }untracked-files.txt"; fi
+      {
+        printf 'Preserved dirty snapshot: %s\n' "$DIRTY_SNAPSHOT_ID"
+        printf 'worktree.patch bytes: %s\n' "$WORKTREE_BYTES"
+        printf 'index.patch bytes: %s\n' "$INDEX_BYTES"
+        printf 'untracked-files.txt bytes: %s\n' "$UNTRACKED_BYTES"
+      } >> "$PR_ADOPTION_EVIDENCE"
+      if [ -n "$DIRTY_CLASS_LIST" ]; then
+        {
+          printf 'Blocked %s: existing PR #%s passed identity checks, but preserved dirty delta remains.\n' \
+            "$WORKSTREAM_ID" "$PR_NUMBER"
+          printf 'Existing PR URL: %s\n' "$PR_URL"
+          printf 'Preserved local head: %s\n' "$EXPECTED_HEAD"
+          printf 'Preserved snapshot archive IDs: %s/worktree.patch, %s/index.patch, %s/untracked-files.txt\n' \
+            "$DIRTY_SNAPSHOT_ID" "$DIRTY_SNAPSHOT_ID" "$DIRTY_SNAPSHOT_ID"
+          printf 'Non-empty preserved dirty classes: %s\n' "$DIRTY_CLASS_LIST"
+          printf 'Resume condition: land or reconcile PR #%s, then recover the preserved delta from current main in a separate scoped track.\n' "$PR_NUMBER"
+          printf 'Do not force-remove or delete the original source worktree or branch while this blocker remains.\n'
+          printf 'Branch fetch evidence: viable/%s-branch-fetch.txt\n' "$WORKSTREAM_ID"
+          printf 'Open PR evidence: viable/%s-open-prs.json\n' "$WORKSTREAM_ID"
+          printf 'PR view evidence: viable/%s-pr-view.json\n' "$WORKSTREAM_ID"
+          printf 'PR adoption evidence: viable/%s-pr-adoption.txt\n' "$WORKSTREAM_ID"
+        } > "$PR_BLOCKER_EVIDENCE"
+        update_classification_row \
+          "blocked" \
+          "Existing PR #$PR_NUMBER ($PR_URL) matches preserved head $EXPECTED_HEAD, but preserved dirty snapshot $DIRTY_SNAPSHOT_ID still has non-empty classes ($DIRTY_CLASS_LIST); see viable/$WORKSTREAM_ID-branch-fetch.txt, viable/$WORKSTREAM_ID-open-prs.json, viable/$WORKSTREAM_ID-pr-view.json, viable/$WORKSTREAM_ID-pr-adoption.txt, and viable/$WORKSTREAM_ID-pr-blocker.txt." \
+          "Blocked: land or reconcile PR #$PR_NUMBER, then recover preserved delta from current main in a separate scoped track. Leave source worktree and branch untouched."
+        exit 0
+      fi
+      printf 'Dirty snapshot check: all preserved dirty classes are empty, so existing-PR adoption may continue.\n' >> "$PR_ADOPTION_EVIDENCE"
+    else
+      printf 'Dirty snapshot check: not applicable for branch-only preserved source.\n' >> "$PR_ADOPTION_EVIDENCE"
+    fi
     update_classification_row \
       "viable" \
       "Preserved head $EXPECTED_HEAD is ancestor of PR head $ACTUAL_HEAD, which matches fetched origin/$SOURCE_BRANCH tip $FRESH_BRANCH_TIP; see viable/$WORKSTREAM_ID-branch-fetch.txt, viable/$WORKSTREAM_ID-open-prs.json, viable/$WORKSTREAM_ID-pr-view.json, and viable/$WORKSTREAM_ID-pr-adoption.txt." \
@@ -897,64 +1016,78 @@ case "$PR_COUNT" in
     exit 0
     ;;
   0)
-    printf 'Exact-head open PR count: 0\n' >> "$BRANCH_FETCH_EVIDENCE"
-    printf 'No exact-head open PR candidate; skipping source-branch fetch and continuing to issue reuse/create.\n' >> "$BRANCH_FETCH_EVIDENCE"
+    printf 'Same-repo exact-head open PR count: 0\n' >> "$BRANCH_FETCH_EVIDENCE"
+    printf 'No same-repo exact-head open PR candidate; skipping source-branch fetch and continuing to issue reuse/create.\n' >> "$BRANCH_FETCH_EVIDENCE"
     ;;
   *)
     {
-      printf 'Blocked %s: expected 0 or 1 open PRs for source branch %s, found %s before identity verification.\n' \
+      printf 'Blocked %s: expected 0 or 1 same-repo open PRs for source branch %s, found %s before identity verification.\n' \
         "$WORKSTREAM_ID" "$SOURCE_BRANCH" "$PR_COUNT"
       printf 'Preserved local head: %s\n' "$EXPECTED_HEAD"
-      printf 'No source-branch fetch was attempted because the exact-head query was already ambiguous.\n'
+      printf 'No source-branch fetch was attempted because the same-repo exact-head query was already ambiguous.\n'
       printf 'Branch fetch evidence: viable/%s-branch-fetch.txt\n' "$WORKSTREAM_ID"
       printf 'Open PR evidence: viable/%s-open-prs.json\n' "$WORKSTREAM_ID"
     } > "$PR_BLOCKER_EVIDENCE"
     update_classification_row \
       "blocked" \
       "Open PR ambiguity for preserved head $EXPECTED_HEAD before any source-branch verification; see viable/$WORKSTREAM_ID-branch-fetch.txt, viable/$WORKSTREAM_ID-open-prs.json, and viable/$WORKSTREAM_ID-pr-blocker.txt." \
-      "Blocked: multiple open PRs claim $SOURCE_BRANCH."
+      "Blocked: multiple same-repo open PRs claim $SOURCE_BRANCH."
     exit 0
     ;;
 esac
 ```
 
 If `PR_COUNT=0`, do not fetch the source branch; record in
-`viable/$WORKSTREAM_ID-branch-fetch.txt` that the exact-head query found no
-candidate and continue directly to Step 2's issue reuse or creation flow. If
-`PR_COUNT=1`, verify the candidate PR before adopting it: fetch the exact
-expected source branch from `origin`, record the freshly fetched tip in
+`viable/$WORKSTREAM_ID-branch-fetch.txt` that the same-repo exact-head query
+found no candidate and continue directly to Step 2's issue reuse or creation
+flow. If `PR_COUNT=1`, verify the candidate PR before adopting it: fetch the
+exact expected source branch from `origin`, record the freshly fetched tip in
 `viable/$WORKSTREAM_ID-branch-fetch.txt`, then require `.state=OPEN`,
 `headRefName=$SOURCE_BRANCH`, `headRepositoryOwner.login=OpenCoven`,
 `isCrossRepository=false`, `baseRefName=main`, and `headRefOid` equal to that
 freshly fetched branch tip. Only after the PR head matches the authoritative
 fetched tip may the plan compare the preserved local `head.txt` to the PR head
 with `git merge-base --is-ancestor`; equality or ancestry is acceptable, but a
-diverged local head blocks adoption. Record the preserved local head, fresh
-branch tip, PR head, and ancestry result in
+diverged local head blocks adoption. For dirty-worktree sources, identity and
+ancestry success is still insufficient: inspect the preserved
+`worktree.patch`, `index.patch`, and `untracked-files.txt`, and adopt the PR
+only when all three classes are empty. If any preserved dirty class is
+non-empty, write `viable/$WORKSTREAM_ID-pr-blocker.txt` with the existing PR
+URL, the snapshot archive IDs, and the safe resume condition to land or
+reconcile that PR first and then recover the preserved delta from current
+`main` in a separate scoped track; the original source worktree and branch stay
+untouched while blocked. Record the preserved local head, fresh branch tip, PR
+head, ancestry result, PR URL, and any dirty-class byte counts in
 `viable/$WORKSTREAM_ID-pr-adoption.txt`, and record `continue existing PR`
 only after all of those checks pass. If `PR_COUNT>1`, block immediately with
-open-PR evidence because the exact-head query is already ambiguous. If
-`gh pr view` fails because the candidate disappears or cannot be read after
-`gh pr list`, if the single-candidate branch fetch fails, or if any other
-identity or ancestry check fails, write
-`viable/$WORKSTREAM_ID-pr-blocker.txt`, update the classification row to
-`blocked`, and stop that row only after the blocker evidence is persisted.
-This deterministically avoids duplicating possibly delivered work while still
-allowing a clean local worktree to adopt its open PR after that PR has advanced
-beyond the preserved local snapshot. A later rerun must reclassify against
-current main and GitHub history before deciding whether any replacement issue
-or PR is still needed. Continue to Step 2 only when `PR_COUNT=0`.
+open-PR evidence because the same-repo exact-head query is already ambiguous.
+If `gh pr view` fails because the candidate disappears or cannot be read after
+the paginated REST capture, if the single-candidate branch fetch fails, if the
+GitHub capture itself fails, or if any other identity, ancestry, or dirty
+snapshot check fails, update the classification row to `blocked` and stop that
+row only after the blocker evidence is persisted. This deterministically avoids
+duplicating possibly delivered work while still allowing a clean local worktree
+to adopt its open PR after that PR has advanced beyond the preserved local
+snapshot. A later rerun must reclassify against current main and GitHub history
+before deciding whether any replacement issue or PR is still needed. Continue
+to Step 2 only when `PR_COUNT=0`.
 
-Expected: every viable row records the exact-head open-PR query before any
-issue reuse or creation begins. Rows with one candidate add an evidence-backed
-authoritative-source-branch fetch and a `main`-targeting PR decision; rows
-with zero candidates skip fetch and continue normally; rows with multiple
-candidates block before branch verification. If `docs/psyche-specs` still has
-exactly one open PR from branch `docs/psyche-specs` at execution time, its
-`headRefOid` matches the freshly fetched `origin/docs/psyche-specs` tip, and
-the preserved local `head.txt` is equal to or an ancestor of that PR head,
-this step adopts the exact-source-branch PR that GitHub returns at that moment
-rather than hardcoding a PR number.
+Expected: every viable row records a paginated same-repo open-PR capture before
+any issue reuse or creation begins, and `viable/$WORKSTREAM_ID-open-prs.json`
+contains only same-repository candidates whose `head.ref` exactly matches
+`$SOURCE_BRANCH`. Same-named fork PRs remain excluded from the candidate count.
+Rows with one candidate add an evidence-backed authoritative-source-branch
+fetch and a `main`-targeting PR decision; rows with zero candidates skip fetch
+and continue normally; rows with multiple candidates block before branch
+verification. If `docs/psyche-specs` still has exactly one same-repo open PR
+from branch `docs/psyche-specs` at execution time, its `headRefOid` matches
+the freshly fetched `origin/docs/psyche-specs` tip, the preserved local
+`head.txt` is equal to or an ancestor of that PR head, and the preserved
+`worktree.patch`, `index.patch`, and `untracked-files.txt` are all empty, this
+step adopts the exact-source-branch PR that GitHub returns at that moment
+rather than hardcoding a PR number. If any of those three preserved dirty
+classes are non-empty, the row blocks with resume instructions instead of being
+treated as fully covered by the existing PR.
 
 - [ ] **Step 2: Reuse or create one issue per viable row that does not already have an adopted PR**
 
@@ -1511,11 +1644,12 @@ update_classification_row \
   "Recover via issue #$ISSUE_NUMBER ($ISSUE_URL) with open PR #$RECOVERY_PR_NUMBER ($ACTUAL_PR_URL)."
 ```
 
-Expected: every viable row either continues one adopted exact-source-branch
-open pull request after the single-candidate verification flow, or rewrites
-its ledger row to stay `viable` with one verified OPEN recovery PR URL from
-the expected current-main recovery branch after the zero-candidate normal
-flow, before Task 7 cleanup or Task 9 audit begins.
+Expected: every viable row either continues one adopted same-repo
+exact-source-branch open pull request after the single-candidate verification
+and empty-dirty-snapshot flow, or rewrites its ledger row to stay `viable`
+with one verified OPEN recovery PR URL from the expected current-main recovery
+branch after the zero-candidate normal flow, before Task 7 cleanup or Task 9
+audit begins.
 
 ### Task 6: Record Non-Viable Outcomes
 
@@ -1558,7 +1692,9 @@ For each `blocked` row, add:
 ```
 
 Expected: no non-viable row relies on branch age or lack of a PR as its sole
-reason.
+reason. Rows blocked because an active PR leaves preserved dirty delta behind
+must cite that PR URL, the preserved snapshot archive IDs, and the explicit
+resume condition to recover the delta later from current `main`.
 
 ### Task 7: Clean Verified Git Residue
 
@@ -1648,8 +1784,11 @@ step, only for these four exact paths, and only after the worktree and index
 patch evidence, verified branch bundle, untracked inventory, terminal ledger
 classification, and either an adopted exact-source-branch open PR, an open
 replacement PR, or recorded non-viable/blocker evidence are all present.
-Unrelated or
-unsnapshotted worktrees must never use force.
+Rows blocked because an existing PR already covers the preserved head while
+`worktree.patch`, `index.patch`, or `untracked-files.txt` remains non-empty are
+explicitly excluded from forced source cleanup and leave their original
+worktree and branch untouched. Unrelated or unsnapshotted worktrees must never
+use force.
 
 Run:
 
@@ -1686,6 +1825,7 @@ COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
 RETIRE_PROOF_ROOT="$RECOVERY/private-retire-proof"
+CLASSIFICATION="$RECOVERY/classification.md"
 mkdir -p "$RETIRE_PROOF_ROOT"
 for id in \
   docs-psyche-specs \
@@ -1711,6 +1851,13 @@ do
       SOURCE="$REPO/.worktrees/pr-476-review"
       ;;
   esac
+  if grep -F "| $id | blocked |" "$CLASSIFICATION" | \
+    grep -Fq 'Leave source worktree and branch untouched.'
+  then
+    printf 'Skip forced retirement for %s: classification is blocked because preserved dirty delta remains behind an existing PR. Leave the original source worktree and branch untouched.\n' \
+      "$id" > "$BLOCKER"
+    continue
+  fi
   if ! test -d "$SOURCE"; then
     printf 'Blocked %s: source worktree is missing before retirement proof; take a fresh snapshot and reclassify.\n' \
       "$id" > "$BLOCKER"
@@ -1758,14 +1905,7 @@ do
       exit 1
     fi
   done < "$SNAPSHOT/untracked-files.txt"
-done
-for path in \
-  "$REPO/.worktrees/docs-psyche-specs" \
-  "$REPO/.worktrees/feat-cmem-1ev-memory-promote" \
-  "$REPO/.worktrees/mobile-memory-gateway" \
-  "$REPO/.worktrees/pr-476-review"
-do
-  git -C "$REPO" worktree remove --force "$path"
+  git -C "$REPO" worktree remove --force "$SOURCE"
 done
 ```
 
@@ -1776,18 +1916,23 @@ preserved snapshot immediately before removal. Empty worktree, index, and
 untracked snapshot classes are still acceptable, but the retirement proof now
 requires non-empty evidence files populated either with captured change
 summaries or deterministic sentinel lines, plus matching live proof files under
-`private-retire-proof/`.
+`private-retire-proof/`. Any row blocked because preserved dirty delta remains
+behind an active PR writes a skip blocker and leaves its original source
+worktree in place.
 
 - [ ] **Step 5: Delete only proven local branch residue after worktree retirement**
 
 For each branch in the ledger with merged or superseded evidence, or each of
 the four dirty source branches once Step 4 has removed its worktree and proven
 either the verified bundle or a pushed replacement recovery ref, set
-`BRANCH_TO_DELETE` to its exact local branch name. Recheck that exact branch
-ref immediately before every deletion command against the preserved head source
-for that branch; do not rely only on the earlier worktree-retirement proof.
-Task 3 Step 3 already creates the explicit orphan-branch `head.txt` files used
-below. Use this exact mapping for all seven recovered source branches:
+`BRANCH_TO_DELETE` to its exact local branch name. Do not run this step for any
+dirty-source branch whose classification action says `Leave source worktree and
+branch untouched.` because preserved dirty delta remains behind an active PR.
+Recheck that exact branch ref immediately before every deletion command against
+the preserved head source for that branch; do not rely only on the earlier
+worktree-retirement proof. Task 3 Step 3 already creates the explicit
+orphan-branch `head.txt` files used below. Use this exact mapping for all seven
+recovered source branches:
 
 - `docs/psyche-specs` -> `dirty/docs-psyche-specs/head.txt`
 - `docs/universal-runtime-capability-design` -> `branches/docs-universal-runtime-capability-design/head.txt`

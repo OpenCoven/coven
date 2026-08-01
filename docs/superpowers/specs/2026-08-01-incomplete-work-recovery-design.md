@@ -59,9 +59,14 @@ whether to continue the existing pull request or create a new recovery track.
 
 ### 1. Preserve before mutation
 
-Create a durable recovery directory outside the repository worktrees. For each
-source worktree, store its current state even if it is now clean because its
-changes were already committed to an active pull request:
+Create a durable recovery directory outside the repository worktrees. The fixed
+current-run path remains `agent-recovery/issue-541`, but reruns must never
+reuse it in place: if that path already exists, move the entire prior run into
+an immutable private archive directory under the shared recovery archive, record
+its former location and archival time, then create a fresh current root at the
+same fixed path before writing any new manifest or snapshot. For each source
+worktree, store its current state even if it is now clean because its changes
+were already committed to an active pull request:
 
 - `git status --short --branch`
 - the base and head commit identifiers
@@ -71,8 +76,10 @@ changes were already committed to an active pull request:
 For each orphan branch, create a Git bundle or equivalent ref-preserving
 archive and record its commits relative to current `origin/main`.
 
-Snapshots remain until the corresponding pull request is open and its source
-branch is pushed, or until the work is explicitly recorded as blocked.
+Reruns therefore create a new current run while every prior run remains
+immutable under the archive directory. Snapshots remain until the corresponding
+pull request is open and its source branch is pushed, or until the work is
+explicitly recorded as blocked.
 
 ### 2. Classify against current authority
 
@@ -93,9 +100,13 @@ squash merges make many merged branches appear unmerged.
 
 Before creating a child issue, branch, or worktree, each viable concern maps to
 its exact current source branch, reads that workstream's preserved local
-`head.txt`, and first runs an exact-source-branch open-pull-request query. If
-that query returns zero candidates, the concern follows the normal
-issue-reuse-or-create flow without fetching the source branch. If the query
+`head.txt`, and first captures a fully paginated REST/API list of open pull
+requests for `OpenCoven/coven`. Candidate selection then happens with local
+`jq` filtering only when `.head.ref` equals the expected source branch and
+`.head.repo.full_name` equals `OpenCoven/coven`, so same-named fork PRs never
+count as same-repository candidates. If that same-repo exact-source-branch
+filter returns zero candidates, the concern follows the normal
+issue-reuse-or-create flow without fetching the source branch. If the filter
 returns exactly one candidate open pull request, the recovery then fetches that
 exact branch from `origin`, records the freshly fetched authoritative remote
 tip, and verifies that the candidate's `state` is `OPEN`, its `headRefName`
@@ -105,14 +116,24 @@ matches the expected branch, its `headRepositoryOwner` is `OpenCoven`,
 tip. Only after the PR head matches the fetched authoritative tip does the
 recovery verify via ancestry that the preserved local `head.txt` equals or is
 an ancestor of that PR head, so a clean local worktree that is behind its open
-PR by commits can still be adopted safely. If more than one
-exact-source-branch pull request exists, the row moves directly to `blocked`
-with saved evidence rather than fetching or guessing. If the single-candidate
-branch fetch fails, if the PR head differs from the fetched branch tip, if the
-preserved local head is not an ancestor of the PR head, or if the candidate
-pull request fails any other identity check including closing or merging
-between list and view, the row also moves to `blocked` with saved evidence
-rather than falling through to duplicate-recovery work.
+PR by commits can still be adopted safely.
+
+For dirty-worktree sources, successful identity and ancestry verification is
+still not enough to adopt the existing PR. The recovery must next inspect the
+preserved snapshot's `worktree.patch`, `index.patch`, and
+`untracked-files.txt`; adoption is allowed only when all three dirty classes
+are empty. If any preserved dirty delta remains, the row moves to `blocked`
+with evidence naming the existing PR URL, the preserved snapshot archive IDs,
+and the safe resume condition: land or reconcile that PR first, then recover
+the preserved delta from current `main` in a separate scoped track. While that
+blocker stands, the original source worktree and branch remain untouched. If
+more than one same-repo exact-source-branch pull request exists, the row moves
+directly to `blocked` with saved evidence rather than fetching or guessing. If
+the single-candidate branch fetch fails, if the PR head differs from the
+fetched branch tip, if the preserved local head is not an ancestor of the PR
+head, or if the candidate pull request fails any other identity check including
+closing or merging between list and view, the row also moves to `blocked` with
+saved evidence rather than falling through to duplicate-recovery work.
 
 Each viable concern without an adopted exact-source-branch open pull request
 receives:
@@ -138,11 +159,13 @@ unrelated or closed result remains preserved in `issues.json` but does not get
 reused.
 
 For example, if the source branch `docs/psyche-specs` still has exactly one
-open pull request from that exact source when the query runs, its
-`headRefOid` matches the freshly fetched `origin/docs/psyche-specs` tip, and
-the preserved local `head.txt` is equal to or an ancestor of that PR head, the
-recovery adopts whichever PR GitHub returns at execution time instead of
-creating a duplicate issue, branch, worktree, claim, or pull request.
+same-repo open pull request from that exact source when the query runs, its
+`headRefOid` matches the freshly fetched `origin/docs/psyche-specs` tip, the
+preserved local `head.txt` is equal to or an ancestor of that PR head, and the
+preserved `worktree.patch`, `index.patch`, and `untracked-files.txt` are all
+empty, the recovery adopts whichever PR GitHub returns at execution time
+instead of creating a duplicate issue, branch, worktree, claim, or pull
+request.
 
 Old commits are not blindly rebased or cherry-picked when current contracts
 have changed. The recovered implementation is rebuilt around current code and
@@ -158,8 +181,11 @@ after one of these proofs exists:
 - its snapshot and blocker record preserve all remaining value.
 
 Cleanup includes stale `/tmp` worktree registrations, merged local branches,
-gone upstream references, and expired claims. Unrelated user changes are never
-discarded.
+gone upstream references, and expired claims. Rows blocked because an existing
+PR already covers the preserved head while additional dirty snapshot state
+remains do not qualify for source-worktree or source-branch cleanup; those
+original sources stay in place until the blocked delta is recovered separately.
+Unrelated user changes are never discarded.
 
 Before the final audit, the primary checkout is restored non-destructively to a
 clean `main`. If it is already on `main`, the recovery fetches `origin/main`
@@ -225,12 +251,16 @@ after staging the intended change so it evaluates the actual proposed commit.
 - Rebase or transplant conflicts are resolved from current contracts; old code
   never wins automatically.
 - A failing required gate blocks push and pull-request creation.
-- More than one exact-source-branch open pull request, any candidate PR state,
-  branch, owner, base, or cross-repo mismatch, any single-candidate branch
-  fetch failure, any PR head that differs from the freshly fetched
+- More than one same-repo exact-source-branch open pull request, any candidate
+  PR state, branch, owner, base, or cross-repo mismatch, any single-candidate
+  branch fetch failure, any PR head that differs from the freshly fetched
   authoritative branch tip, any preserved local head that is not an ancestor
-  of the PR head, or more than one exact-title open matching recovery issue
-  blocks the row with evidence rather than choosing a duplicate target.
+  of the PR head, any non-empty preserved dirty snapshot class behind an active
+  PR, or more than one exact-title open matching recovery issue blocks the row
+  with evidence rather than choosing a duplicate target.
+- If `agent-recovery/issue-541` already exists, archival move or fresh-current
+  root creation failure blocks the rerun before any new manifest or snapshot is
+  written.
 - Any unsafe primary-checkout restore condition blocks the final audit rather
   than forcing a branch switch or reset.
 - Ambiguous ownership, policy, or human approval moves the workstream to
@@ -244,13 +274,16 @@ after staging the intended change so it evaluates the actual proposed commit.
 
 - Every dirty, formerly dirty, or orphaned workstream has a durable snapshot
   and classification.
-- Every viable concern either adopts one accurate exact-source-branch open pull
-  request whose queried single candidate survived authoritative branch-tip and
-  ancestry verification, or has its own validated, pushed branch and open pull
-  request after the zero-candidate normal flow.
+- Every viable concern either adopts one accurate same-repo exact-source-branch
+  open pull request whose queried single candidate survived authoritative
+  branch-tip, ancestry, and empty-dirty-snapshot verification, or has its own
+  validated, pushed branch and open pull request after the zero-candidate
+  normal flow.
 - Already-shipped and superseded work has concrete GitHub or main-branch
   evidence.
 - No uncommitted work is deleted.
 - Stale worktrees, branches, and claims are removed only after proof.
+- Every rerun leaves the prior `issue-541` recovery root immutable under the
+  private archive and recreates a fresh current root at the fixed path.
 - `.copilot/goals.md` matches current issue and pull-request reality.
 - The primary checkout remains clean and on `main`.
