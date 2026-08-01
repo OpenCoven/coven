@@ -439,15 +439,19 @@ git -C "$REPO" fetch origin main
 git -C "$REPO" --no-pager branch -vv > "$RECOVERY/branches.txt"
 git -C "$REPO" worktree list --porcelain > "$RECOVERY/worktrees.txt"
 coven claim status > "$RECOVERY/claims.txt"
-gh pr list --repo OpenCoven/coven --state all --limit 200 \
-  --json number,state,title,headRefName,baseRefName,mergedAt,url \
+gh api --paginate --slurp \
+  "repos/OpenCoven/coven/pulls?state=all&per_page=100" \
   > "$RECOVERY/pulls.json"
-gh issue list --repo OpenCoven/coven --state all --limit 200 \
-  --json number,state,title,closedAt,url \
+gh api --paginate --slurp \
+  "repos/OpenCoven/coven/issues?state=all&per_page=100" \
   > "$RECOVERY/issues.json"
 ```
 
-Expected: all five evidence files exist and are non-empty.
+Expected: all five evidence files exist and are non-empty, and both
+`pulls.json` and `issues.json` are valid paginated GitHub API JSON captures.
+Because the issues API returns both issues and pull requests, PR-specific
+classification must use `pulls.json` as the dedicated pull-request evidence
+source and treat `issues.json` as the broader issue-history ledger.
 
 - [ ] **Step 2: Compare each source with current main**
 
@@ -481,14 +485,32 @@ for id in \
   pr-476-review
 do
   SNAPSHOT="$RECOVERY/dirty/$id"
-  git apply --stat --summary "$SNAPSHOT/worktree.patch" \
-    > "$RECOVERY/$id-worktree-evidence.txt"
+  if test -s "$SNAPSHOT/worktree.patch"; then
+    git apply --stat --summary "$SNAPSHOT/worktree.patch" \
+      > "$RECOVERY/$id-worktree-evidence.txt"
+  else
+    printf 'No unstaged tracked changes in snapshot.\n' \
+      > "$RECOVERY/$id-worktree-evidence.txt"
+  fi
   test -f "$RECOVERY/$id-worktree-evidence.txt"
-  git apply --stat --summary "$SNAPSHOT/index.patch" \
-    > "$RECOVERY/$id-index-evidence.txt"
+  test -s "$RECOVERY/$id-worktree-evidence.txt"
+  if test -s "$SNAPSHOT/index.patch"; then
+    git apply --stat --summary "$SNAPSHOT/index.patch" \
+      > "$RECOVERY/$id-index-evidence.txt"
+  else
+    printf 'No staged changes in snapshot.\n' \
+      > "$RECOVERY/$id-index-evidence.txt"
+  fi
   test -f "$RECOVERY/$id-index-evidence.txt"
-  cp "$SNAPSHOT/untracked-files.txt" "$RECOVERY/$id-untracked-evidence.txt"
+  test -s "$RECOVERY/$id-index-evidence.txt"
+  if test -s "$SNAPSHOT/untracked-files.txt"; then
+    cp "$SNAPSHOT/untracked-files.txt" "$RECOVERY/$id-untracked-evidence.txt"
+  else
+    printf 'No untracked files in snapshot.\n' \
+      > "$RECOVERY/$id-untracked-evidence.txt"
+  fi
   test -f "$RECOVERY/$id-untracked-evidence.txt"
+  test -s "$RECOVERY/$id-untracked-evidence.txt"
 done
 ```
 
@@ -496,8 +518,10 @@ Expected: the seven historical branch comparisons still provide complementary
 commit, stat, and cherry evidence, and the four dirty snapshots now each have
 reviewable worktree, index, and inventory-backed untracked evidence files, so
 branch evidence covers all seven branch-backed workstreams and dirty evidence
-complements the four dirty rows. Empty worktree, index, and untracked evidence
-classes are valid and remain as existing zero-byte files.
+complements the four dirty rows. Empty worktree, index, and untracked snapshot
+classes remain valid, but each generated evidence file is still non-empty
+because it contains either `git apply --stat --summary` output or a
+deterministic sentinel line documenting that the snapshot class was empty.
 
 - [ ] **Step 3: Write the ledger with one evidence-backed row per workstream**
 
@@ -832,9 +856,9 @@ for id in \
   mobile-memory-gateway \
   pr-476-review
 do
-  test -f "$RECOVERY/$id-worktree-evidence.txt"
-  test -f "$RECOVERY/$id-index-evidence.txt"
-  test -f "$RECOVERY/$id-untracked-evidence.txt"
+  test -s "$RECOVERY/$id-worktree-evidence.txt"
+  test -s "$RECOVERY/$id-index-evidence.txt"
+  test -s "$RECOVERY/$id-untracked-evidence.txt"
   git -C "$REPO" bundle verify "$RECOVERY/dirty/$id/branch.bundle" > /dev/null
   grep -E "^\| $id \| (already-shipped|superseded|viable|blocked) \|" \
     "$RECOVERY/classification.md"
@@ -862,8 +886,9 @@ done
 Expected: only those four exact dirty source paths are force-removed, because
 their committed history, dirty state, and recovery disposition have already
 been proven elsewhere in the archive. Empty worktree, index, and untracked
-evidence classes are valid and remain as existing zero-byte files, and these
-proof checks use the same file-existence semantics as Task 2.
+snapshot classes are still acceptable, but the retirement proof now requires
+non-empty evidence files populated either with captured change summaries or
+deterministic sentinel lines.
 
 - [ ] **Step 5: Delete only proven local branch residue after worktree retirement**
 
