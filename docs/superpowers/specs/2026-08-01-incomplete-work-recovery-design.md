@@ -94,31 +94,37 @@ squash merges make many merged branches appear unmerged.
 Before creating a child issue, branch, or worktree, each viable concern maps to
 its exact current source branch, reads that workstream's snapshotted source
 head, and runs an exact-head open-pull-request query. If exactly one candidate
-open pull request exists, the recovery verifies that its `headRefOid` matches
-the snapshotted source head, its `headRefName` matches the expected branch, its
-`headRepositoryOwner` is `OpenCoven`, `isCrossRepository` is false, and
-`baseRefName` is `main` before adopting it. If no exact-head pull request
-exists, the concern follows the
-normal issue-reuse-or-create flow. If more than one exact-head pull request
-exists, or if the candidate pull request fails any identity check, the row
-moves to `blocked` with saved evidence rather than guessing.
+open pull request exists, the recovery verifies that its `state` is `OPEN`,
+its `headRefOid` matches the snapshotted source head, its `headRefName`
+matches the expected branch, its `headRepositoryOwner` is `OpenCoven`,
+`isCrossRepository` is false, and `baseRefName` is `main` before adopting it.
+If no exact-head pull request exists, the concern follows the normal
+issue-reuse-or-create flow. If more than one exact-head pull request exists, or
+if the candidate pull request fails any identity check, including closing or
+merging between list and view, the row moves to `blocked` with saved evidence
+rather than guessing or falling through to duplicate-recovery work.
 
 Each viable concern without an adopted exact-head open pull request receives:
 
-1. A dedicated GitHub issue, unless exactly one OPEN issue already exists whose
-   title exactly equals that concern's fixed recovery title.
+1. A dedicated GitHub issue, unless Task 4's paginated issue ledger contains
+   exactly one non-PR open issue whose title exactly equals that concern's
+   fixed recovery title.
 2. A fresh branch and worktree based on current `origin/main`.
 3. An issue-keyed Coven claim acquired from that worktree.
 4. A minimal transplant of only the still-relevant changes.
 5. Targeted tests followed by all repository-required gates.
 6. A conventional commit, push, and scoped pull request.
 
-Broad issue-search results are still saved for evidence, but only OPEN issues
-whose title exactly matches the fixed `ISSUE_TITLE` count as reusable:
-zero exact-open matches create a new issue, one exact-open match is reused and
-re-verified, and more than one exact-open match blocks the row with evidence.
-A sole unrelated or closed search result is preserved in the evidence files but
-does not get reused.
+Task 4's fully paginated `issues.json` capture is the authoritative reuse
+source. Each workstream derives its own filtered issue-search evidence by
+running `jq` across every page and keeping only non-PR issues whose title
+exactly matches the fixed `ISSUE_TITLE` and whose state is `open`.
+Zero exact-title open matches create a new issue, one exact-title open match is
+reused and re-verified, and more than one exact-title open match blocks the row
+with evidence. Human-friendly `gh issue list` output may still be useful for
+operators, but it is informational only and never drives reuse. A sole
+unrelated or closed result remains preserved in `issues.json` but does not get
+reused.
 
 For example, if the source branch `docs/psyche-specs` still has exactly one
 open pull request from that exact source when the query runs and its identity
@@ -207,9 +213,9 @@ after staging the intended change so it evaluates the actual proposed commit.
 - Rebase or transplant conflicts are resolved from current contracts; old code
   never wins automatically.
 - A failing required gate blocks push and pull-request creation.
-- More than one exact-head open pull request, any candidate PR identity
-  mismatch, or more than one exact-open matching recovery issue blocks the row
-  with evidence rather than choosing a duplicate target.
+- More than one exact-head open pull request, any candidate PR state or
+  identity mismatch, or more than one exact-title open matching recovery issue
+  blocks the row with evidence rather than choosing a duplicate target.
 - Any unsafe primary-checkout restore condition blocks the final audit rather
   than forcing a branch switch or reset.
 - Ambiguous ownership, policy, or human approval moves the workstream to

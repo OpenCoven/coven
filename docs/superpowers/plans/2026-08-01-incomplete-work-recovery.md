@@ -24,12 +24,12 @@
   - `.git/agent-recovery/issue-541/viable/<workstream-id>-open-prs.json`
   - `.git/agent-recovery/issue-541/viable/<workstream-id>-pr-view.json`
   - `.git/agent-recovery/issue-541/viable/<workstream-id>-issue-search.json`
-  - `.git/agent-recovery/issue-541/viable/<workstream-id>-issue-search-exact-open.json`
   - `.git/agent-recovery/issue-541/viable/<workstream-id>-issue-view.json`
   - `.git/agent-recovery/issue-541/viable/<workstream-id>-pr-blocker.txt`
   - `.git/agent-recovery/issue-541/viable/<workstream-id>-issue-blocker.txt`
-  - Exact-head open-PR evidence, exact-open issue-match evidence, and blocker
-    evidence for each viable workstream.
+  - Exact-head open-PR evidence, per-workstream exact-title open issue-match
+    evidence derived from paginated `issues.json`, and blocker evidence for
+    each viable workstream.
 - Create only when Task 9 runs:
   - `.git/agent-recovery/issue-541/final-audit-primary-checkout.txt`
   - Primary-checkout restore and blocker evidence for the final audit.
@@ -519,7 +519,8 @@ Expected: all five evidence files exist and are non-empty, and both
 `pulls.json` and `issues.json` are valid paginated GitHub API JSON captures.
 Because the issues API returns both issues and pull requests, PR-specific
 classification must use `pulls.json` as the dedicated pull-request evidence
-source and treat `issues.json` as the broader issue-history ledger.
+source and treat `issues.json` as the broader issue-history ledger and the
+authoritative fully paginated source for later exact-title issue-reuse filters.
 
 - [ ] **Step 2: Compare each source with current main**
 
@@ -769,12 +770,14 @@ case "$PR_COUNT" in
       --json number,title,url,state,headRefOid,headRefName,headRepositoryOwner,isCrossRepository,baseRefName \
       > "$PR_VIEW_EVIDENCE"
     EXPECTED_HEAD="$(tr -d '\n' < "$SOURCE_HEAD_FILE")"
+    ACTUAL_STATE="$(jq -r '.state' "$PR_VIEW_EVIDENCE")"
     ACTUAL_HEAD="$(jq -r '.headRefOid' "$PR_VIEW_EVIDENCE")"
     ACTUAL_BRANCH="$(jq -r '.headRefName' "$PR_VIEW_EVIDENCE")"
     ACTUAL_OWNER="$(jq -r '.headRepositoryOwner.login' "$PR_VIEW_EVIDENCE")"
     ACTUAL_CROSS="$(jq -r '.isCrossRepository' "$PR_VIEW_EVIDENCE")"
     ACTUAL_BASE="$(jq -r '.baseRefName' "$PR_VIEW_EVIDENCE")"
-    if [ "$ACTUAL_HEAD" != "$EXPECTED_HEAD" ] || \
+    if [ "$ACTUAL_STATE" != "OPEN" ] || \
+       [ "$ACTUAL_HEAD" != "$EXPECTED_HEAD" ] || \
        [ "$ACTUAL_BRANCH" != "$SOURCE_BRANCH" ] || \
        [ "$ACTUAL_OWNER" != "OpenCoven" ] || \
        [ "$ACTUAL_CROSS" != "false" ] || \
@@ -782,10 +785,12 @@ case "$PR_COUNT" in
       {
         printf 'Blocked %s: candidate PR #%s failed identity checks.\n' \
           "$WORKSTREAM_ID" "$PR_NUMBER"
+        printf 'Expected state: OPEN\n'
         printf 'Expected source head: %s\n' "$EXPECTED_HEAD"
         printf 'Expected source branch: %s\n' "$SOURCE_BRANCH"
         printf 'Expected owner/cross-repo: OpenCoven / false\n'
         printf 'Expected base branch: main\n'
+        printf 'Actual state: %s\n' "$ACTUAL_STATE"
         printf 'Actual head: %s\n' "$ACTUAL_HEAD"
         printf 'Actual branch: %s\n' "$ACTUAL_BRANCH"
         printf 'Actual owner: %s\n' "$ACTUAL_OWNER"
@@ -797,7 +802,7 @@ case "$PR_COUNT" in
       update_classification_row \
         "blocked" \
         "PR identity mismatch; see viable/$WORKSTREAM_ID-open-prs.json, viable/$WORKSTREAM_ID-pr-view.json, and viable/$WORKSTREAM_ID-pr-blocker.txt." \
-        "Blocked: candidate PR failed exact-head SHA/branch/owner/non-cross-repo/base validation."
+        "Blocked: candidate PR failed OPEN-state/SHA/branch/owner/non-cross-repo/base validation."
       exit 0
     fi
     PR_URL="$(jq -r '.url' "$PR_VIEW_EVIDENCE")"
@@ -824,15 +829,19 @@ case "$PR_COUNT" in
 esac
 ```
 
-If `PR_COUNT=1`, verify the candidate PR before adopting it: `headRefOid` must
-equal the snapshotted source `head.txt`, `headRefName` must equal
-`$SOURCE_BRANCH`, `headRepositoryOwner.login` must equal `OpenCoven`, and
-`isCrossRepository` must be `false`, and `baseRefName` must equal `main`.
-Record `continue existing PR` only after those checks pass. If `PR_COUNT>1`,
-or if the single candidate fails any
-identity check, write `viable/$WORKSTREAM_ID-pr-blocker.txt`, update the
-classification row to `blocked`, and stop that row without creating or
-adopting anything. Continue to Step 2 only when `PR_COUNT=0`.
+If `PR_COUNT=1`, verify the candidate PR before adopting it: `.state` must be
+`OPEN`, `headRefOid` must equal the snapshotted source `head.txt`,
+`headRefName` must equal `$SOURCE_BRANCH`,
+`headRepositoryOwner.login` must equal `OpenCoven`, `isCrossRepository` must
+be `false`, and `baseRefName` must equal `main`. Record `continue existing PR`
+only after all of those checks pass. If the PR closes or merges between
+`gh pr list` and `gh pr view`, or if any other identity check fails, write
+`viable/$WORKSTREAM_ID-pr-blocker.txt`, update the classification row to
+`blocked`, and stop that row without creating or adopting anything. This
+deterministically avoids duplicating possibly delivered work; a later rerun
+must reclassify against current main and GitHub history before deciding whether
+any replacement issue or PR is still needed. Continue to Step 2 only when
+`PR_COUNT=0`.
 
 Expected: every viable row has an evidence-backed exact-head, `main`-targeting
 PR decision before issue reuse or creation begins. If `docs/psyche-specs`
@@ -843,12 +852,13 @@ GitHub returns then rather than hardcoding a PR number.
 - [ ] **Step 2: Reuse or create one issue per viable row that does not already have an adopted PR**
 
 Set `WORKSTREAM_ID` to the viable row's exact workstream ID, then use the
-matching exact issue title and search query:
+matching exact issue title:
 
 ```bash
 COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
 RECOVERY="$COMMON_DIR/agent-recovery/issue-541/viable"
 CLASSIFICATION="$COMMON_DIR/agent-recovery/issue-541/classification.md"
+ALL_ISSUES_EVIDENCE="$COMMON_DIR/agent-recovery/issue-541/issues.json"
 mkdir -p "$RECOVERY"
 update_classification_row() {
   python3 - "$CLASSIFICATION" "$WORKSTREAM_ID" "$1" "$2" "$3" <<'PY'
@@ -877,31 +887,24 @@ PY
 case "$WORKSTREAM_ID" in
   mobile-memory-gateway)
     ISSUE_TITLE="Recover mobile pairing workstream"
-    ISSUE_SEARCH='"mobile pairing"'
     ;;
   feat-npm-macos-x64)
     ISSUE_TITLE="Recover Intel macOS npm packaging workstream"
-    ISSUE_SEARCH='"Intel macOS" npm'
     ;;
   fix-521-ward-surface-confinement)
     ISSUE_TITLE="Recover Ward surface confinement workstream"
-    ISSUE_SEARCH='"Ward surface confinement"'
     ;;
   memory-promote)
     ISSUE_TITLE="Recover memory promotion workstream"
-    ISSUE_SEARCH='"memory promotion"'
     ;;
   docs-psyche-specs)
     ISSUE_TITLE="Recover Psyche specification workstream"
-    ISSUE_SEARCH='"Psyche" specs'
     ;;
   docs-universal-runtime-capability-design)
     ISSUE_TITLE="Recover universal runtime capability design workstream"
-    ISSUE_SEARCH='"universal runtime" capability'
     ;;
   pr-476-review)
     ISSUE_TITLE="Recover runtime model parity plan workstream"
-    ISSUE_SEARCH='"runtime model parity"'
     ;;
   *)
     printf 'Unknown WORKSTREAM_ID: %s\n' "$WORKSTREAM_ID" >&2
@@ -909,31 +912,28 @@ case "$WORKSTREAM_ID" in
     ;;
 esac
 ISSUE_SEARCH_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-issue-search.json"
-EXACT_OPEN_ISSUE_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-issue-search-exact-open.json"
 ISSUE_VIEW_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-issue-view.json"
 ISSUE_BLOCKER_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-issue-blocker.txt"
-gh issue list \
-  --repo OpenCoven/coven \
-  --state all \
-  --search "$ISSUE_SEARCH" \
-  --json number,title,url,state > "$ISSUE_SEARCH_EVIDENCE"
+test -s "$ALL_ISSUES_EVIDENCE"
 jq --arg title "$ISSUE_TITLE" \
-  '[.[] | select(.title == $title and .state == "OPEN")]' \
-  "$ISSUE_SEARCH_EVIDENCE" > "$EXACT_OPEN_ISSUE_EVIDENCE"
-ISSUE_COUNT="$(jq 'length' "$EXACT_OPEN_ISSUE_EVIDENCE")"
+  '[.[] | .[] | select(.pull_request? | not) | select(.title == $title and .state == "open") | {number, title, url, state}]' \
+  "$ALL_ISSUES_EVIDENCE" > "$ISSUE_SEARCH_EVIDENCE"
+ISSUE_COUNT="$(jq 'length' "$ISSUE_SEARCH_EVIDENCE")"
 ```
 
-Broad search results are preserved for evidence, but only exact-title OPEN
-matches are reusable. A sole unrelated or closed search hit leaves
-`ISSUE_COUNT=0` and must not be reused.
+Task 4's paginated `issues.json` is the authoritative reuse source. Each
+workstream's `viable/$WORKSTREAM_ID-issue-search.json` stores only the filtered
+non-PR exact-title `open` matches from that full ledger, so default-limited
+`gh issue list` output never drives reuse. A sole unrelated or closed result in
+`issues.json` leaves `ISSUE_COUNT=0` and must not be reused.
 
-If exactly one exact-title OPEN issue already exists, reuse it without creating
+If exactly one exact-title open issue already exists, reuse it without creating
 a duplicate:
 
 ```bash
 case "$ISSUE_COUNT" in
   1)
-    ISSUE_NUMBER="$(jq -r '.[0].number' "$EXACT_OPEN_ISSUE_EVIDENCE")"
+    ISSUE_NUMBER="$(jq -r '.[0].number' "$ISSUE_SEARCH_EVIDENCE")"
     gh issue view --repo OpenCoven/coven "$ISSUE_NUMBER" \
       --json number,state,title,url > "$ISSUE_VIEW_EVIDENCE"
     if ! jq -e --arg title "$ISSUE_TITLE" \
@@ -943,13 +943,13 @@ case "$ISSUE_COUNT" in
       {
         printf 'Blocked %s: issue #%s did not verify as exact-title OPEN.\n' \
           "$WORKSTREAM_ID" "$ISSUE_NUMBER"
-        printf 'Broad issue evidence: viable/%s-issue-search.json\n' "$WORKSTREAM_ID"
-        printf 'Exact-open issue evidence: viable/%s-issue-search-exact-open.json\n' "$WORKSTREAM_ID"
+        printf 'Task 4 paginated issue evidence: issue-541/issues.json\n'
+        printf 'Filtered issue evidence: viable/%s-issue-search.json\n' "$WORKSTREAM_ID"
         printf 'Issue view evidence: viable/%s-issue-view.json\n' "$WORKSTREAM_ID"
       } > "$ISSUE_BLOCKER_EVIDENCE"
       update_classification_row \
         "blocked" \
-        "Issue verification mismatch; see viable/$WORKSTREAM_ID-issue-search.json, viable/$WORKSTREAM_ID-issue-search-exact-open.json, viable/$WORKSTREAM_ID-issue-view.json, and viable/$WORKSTREAM_ID-issue-blocker.txt." \
+        "Issue verification mismatch; see issue-541/issues.json, viable/$WORKSTREAM_ID-issue-search.json, viable/$WORKSTREAM_ID-issue-view.json, and viable/$WORKSTREAM_ID-issue-blocker.txt." \
         "Blocked: candidate issue failed exact-title OPEN verification."
       exit 0
     fi
@@ -1001,13 +1001,13 @@ EOF
       {
         printf 'Blocked %s: created issue #%s did not verify as exact-title OPEN.\n' \
           "$WORKSTREAM_ID" "$ISSUE_NUMBER"
-        printf 'Broad issue evidence: viable/%s-issue-search.json\n' "$WORKSTREAM_ID"
-        printf 'Exact-open issue evidence: viable/%s-issue-search-exact-open.json\n' "$WORKSTREAM_ID"
+        printf 'Task 4 paginated issue evidence: issue-541/issues.json\n'
+        printf 'Filtered issue evidence: viable/%s-issue-search.json\n' "$WORKSTREAM_ID"
         printf 'Issue view evidence: viable/%s-issue-view.json\n' "$WORKSTREAM_ID"
       } > "$ISSUE_BLOCKER_EVIDENCE"
       update_classification_row \
         "blocked" \
-        "Created issue verification mismatch; see viable/$WORKSTREAM_ID-issue-search.json, viable/$WORKSTREAM_ID-issue-search-exact-open.json, viable/$WORKSTREAM_ID-issue-view.json, and viable/$WORKSTREAM_ID-issue-blocker.txt." \
+        "Created issue verification mismatch; see issue-541/issues.json, viable/$WORKSTREAM_ID-issue-search.json, viable/$WORKSTREAM_ID-issue-view.json, and viable/$WORKSTREAM_ID-issue-blocker.txt." \
         "Blocked: created issue did not verify as exact-title OPEN."
       exit 0
     fi
@@ -1016,15 +1016,15 @@ EOF
     ;;
   *)
     {
-      printf 'Blocked %s: expected 0 or 1 exact-title OPEN issues for %s, found %s.\n' \
+      printf 'Blocked %s: expected 0 or 1 exact-title open issues for %s, found %s.\n' \
         "$WORKSTREAM_ID" "$ISSUE_TITLE" "$ISSUE_COUNT"
-      printf 'Broad issue evidence: viable/%s-issue-search.json\n' "$WORKSTREAM_ID"
-      printf 'Exact-open issue evidence: viable/%s-issue-search-exact-open.json\n' "$WORKSTREAM_ID"
+      printf 'Task 4 paginated issue evidence: issue-541/issues.json\n'
+      printf 'Filtered issue evidence: viable/%s-issue-search.json\n' "$WORKSTREAM_ID"
     } > "$ISSUE_BLOCKER_EVIDENCE"
     update_classification_row \
       "blocked" \
-      "Issue ambiguity; see viable/$WORKSTREAM_ID-issue-search.json, viable/$WORKSTREAM_ID-issue-search-exact-open.json, and viable/$WORKSTREAM_ID-issue-blocker.txt." \
-      "Blocked: multiple OPEN issues exactly match $ISSUE_TITLE."
+      "Issue ambiguity; see issue-541/issues.json, viable/$WORKSTREAM_ID-issue-search.json, and viable/$WORKSTREAM_ID-issue-blocker.txt." \
+      "Blocked: multiple open issues exactly match $ISSUE_TITLE."
     exit 0
     ;;
 esac
@@ -1032,7 +1032,7 @@ ISSUE_NUMBER="$(jq -r '.number' "$ISSUE_VIEW_EVIDENCE")"
 ISSUE_URL="$(jq -r '.url' "$ISSUE_VIEW_EVIDENCE")"
 update_classification_row \
   "viable" \
-  "Issue verified via viable/$WORKSTREAM_ID-issue-search.json, viable/$WORKSTREAM_ID-issue-search-exact-open.json, and viable/$WORKSTREAM_ID-issue-view.json." \
+  "Issue verified via issue-541/issues.json, viable/$WORKSTREAM_ID-issue-search.json, and viable/$WORKSTREAM_ID-issue-view.json." \
   "Recover via issue #$ISSUE_NUMBER ($ISSUE_URL)."
 ```
 
@@ -1040,8 +1040,8 @@ If `ISSUE_COUNT>1`, write `viable/$WORKSTREAM_ID-issue-blocker.txt`, update
 the row to `blocked`, and stop that row rather than choosing one arbitrarily.
 
 Expected: every viable row without an adopted PR has exactly one verified issue
-number, and every reuse, create, or block decision cites saved broad-search,
-exact-open-filter, and verification evidence files.
+number, and every reuse, create, or block decision cites the saved paginated
+issue ledger, per-workstream filtered search evidence, and verification files.
 
 - [ ] **Step 3: Create one approved design per viable issue**
 
