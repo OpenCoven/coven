@@ -6289,6 +6289,14 @@ mod tests {
 
     // --- doctor report/check unit tests ---
 
+    #[test]
+    fn doctor_prose_line_escapes_controls_and_preserves_printable_unicode() {
+        assert_eq!(
+            doctor_prose_line("safe\t\n\r\u{1b}\u{009b} —"),
+            r"safe\u{9}\u{a}\u{d}\u{1b}\u{9b} —"
+        );
+    }
+
     fn make_doctor_report() -> DoctorReport {
         DoctorReport {
             home: PathBuf::from("/tmp/coven-home"),
