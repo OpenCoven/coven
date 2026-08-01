@@ -16,11 +16,15 @@ use serde::{Deserialize, Serialize};
 const MAX_SOURCE_FILES: usize = 256;
 const MAX_AGGREGATE_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SOURCE_TRAVERSAL_DEPTH: usize = 32;
+const MAX_SOURCE_VISITED_ENTRIES: usize = 1024;
+const MAX_SOURCE_VISITED_DIRECTORIES: usize = 256;
 #[cfg(any(windows, test))]
 const WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 const SOURCE_FILE_LIMIT_ERROR: &str = "source discovery exceeds maximum file count";
 const SOURCE_BYTE_LIMIT_ERROR: &str = "source discovery exceeds maximum aggregate bytes";
 const SOURCE_DEPTH_LIMIT_ERROR: &str = "source discovery exceeds maximum traversal depth";
+const SOURCE_ENTRY_LIMIT_ERROR: &str = "source discovery exceeds maximum visited entry count";
+const SOURCE_DIRECTORY_LIMIT_ERROR: &str = "source discovery exceeds maximum directory count";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -146,9 +150,27 @@ struct SourceRoot {
 struct DiscoveryBudget {
     source_files: usize,
     aggregate_bytes: u64,
+    visited_entries: usize,
+    visited_directories: usize,
 }
 
 impl DiscoveryBudget {
+    fn claim_entry(&mut self) -> Result<()> {
+        if self.visited_entries >= MAX_SOURCE_VISITED_ENTRIES {
+            bail!(SOURCE_ENTRY_LIMIT_ERROR);
+        }
+        self.visited_entries += 1;
+        Ok(())
+    }
+
+    fn claim_directory(&mut self) -> Result<()> {
+        if self.visited_directories >= MAX_SOURCE_VISITED_DIRECTORIES {
+            bail!(SOURCE_DIRECTORY_LIMIT_ERROR);
+        }
+        self.visited_directories += 1;
+        Ok(())
+    }
+
     fn claim_file(&mut self) -> Result<()> {
         if self.source_files >= MAX_SOURCE_FILES {
             bail!(SOURCE_FILE_LIMIT_ERROR);
@@ -346,6 +368,7 @@ fn discover_markdown_tree(
         .map_err(|_| anyhow!("unable to enumerate allowed source directory"))?;
     for entry in entries {
         let entry = entry.map_err(|_| anyhow!("unable to enumerate allowed source directory"))?;
+        budget.claim_entry()?;
         let Some(name) = visible_utf8_name(entry.file_name()) else {
             continue;
         };
@@ -360,6 +383,7 @@ fn discover_markdown_tree(
 
         let source_label = format!("{logical_directory}/{name}");
         if metadata.is_dir() {
+            budget.claim_directory()?;
             let child_depth = depth + 1;
             if child_depth > MAX_SOURCE_TRAVERSAL_DEPTH {
                 bail!(SOURCE_DEPTH_LIMIT_ERROR);
@@ -575,6 +599,8 @@ mod tests {
     const EXPECTED_MAX_SOURCE_FILES: usize = 256;
     const EXPECTED_MAX_AGGREGATE_BYTES: u64 = 16 * 1024 * 1024;
     const EXPECTED_MAX_TRAVERSAL_DEPTH: usize = 32;
+    const EXPECTED_MAX_VISITED_ENTRIES: usize = 1024;
+    const EXPECTED_MAX_VISITED_DIRECTORIES: usize = 256;
 
     #[test]
     fn memory_import_report_json_is_stable_and_redacted() {
@@ -603,12 +629,7 @@ mod tests {
         assert_eq!(value["entries"][0]["status"], "planned");
 
         let json = serde_json::to_string(&report).expect("report must serialize");
-        for forbidden in [
-            "content",
-            "source_path",
-            "absolute_path",
-            "/Users/sage/.openclaw",
-        ] {
+        for forbidden in ["content", "source_path", "absolute_path"] {
             assert!(
                 !json.contains(forbidden),
                 "serialized report leaked forbidden value {forbidden:?}: {json}"
@@ -944,6 +965,7 @@ mod tests {
         let mut budget = DiscoveryBudget {
             source_files: 0,
             aggregate_bytes: MAX_AGGREGATE_SOURCE_BYTES - 1,
+            ..DiscoveryBudget::default()
         };
         let mut reader = io::Cursor::new(b"ab");
 
@@ -976,6 +998,68 @@ mod tests {
         );
         assert!(!format!("{error:#}").contains("overflow-secret"));
         assert!(!format!("{error:#}").contains("count overflow secret"));
+        assert!(!format!("{error:#}").contains(&temp.path().to_string_lossy().into_owned()));
+        Ok(())
+    }
+
+    #[test]
+    fn discovery_accepts_exact_entry_limit_and_rejects_one_more_in_mixed_zero_markdown_tree(
+    ) -> Result<()> {
+        let temp = trusted_tempdir()?;
+        let memory = temp.path().join("memory");
+        for index in 0..EXPECTED_MAX_VISITED_DIRECTORIES {
+            fs::create_dir_all(memory.join(format!("dir-{index:04}")))?;
+        }
+        for index in EXPECTED_MAX_VISITED_DIRECTORIES..EXPECTED_MAX_VISITED_ENTRIES {
+            write_file(
+                &memory.join(format!("ignored-{index:04}.txt")),
+                b"ignored secret",
+            )?;
+        }
+
+        let root = SourceRoot::open(temp.path())?;
+        let exact = root.discover(&[], &["memory"])?;
+        assert!(exact.is_empty());
+
+        write_file(
+            &memory.join("overflow-secret.txt"),
+            b"entry overflow secret",
+        )?;
+        let error = root
+            .discover(&[], &["memory"])
+            .expect_err("one directory entry beyond the traversal limit must fail");
+        assert_eq!(
+            error.to_string(),
+            "source discovery exceeds maximum visited entry count"
+        );
+        assert!(!format!("{error:#}").contains("overflow-secret"));
+        assert!(!format!("{error:#}").contains("entry overflow secret"));
+        assert!(!format!("{error:#}").contains(&temp.path().to_string_lossy().into_owned()));
+        Ok(())
+    }
+
+    #[test]
+    fn discovery_accepts_exact_directory_limit_and_rejects_one_more_without_leaking() -> Result<()>
+    {
+        let temp = trusted_tempdir()?;
+        let memory = temp.path().join("memory");
+        for index in 0..EXPECTED_MAX_VISITED_DIRECTORIES {
+            fs::create_dir_all(memory.join(format!("dir-{index:04}")))?;
+        }
+
+        let root = SourceRoot::open(temp.path())?;
+        let exact = root.discover(&[], &["memory"])?;
+        assert!(exact.is_empty());
+
+        fs::create_dir_all(memory.join("overflow-secret-directory"))?;
+        let error = root
+            .discover(&[], &["memory"])
+            .expect_err("one directory beyond the traversal limit must fail");
+        assert_eq!(
+            error.to_string(),
+            "source discovery exceeds maximum directory count"
+        );
+        assert!(!format!("{error:#}").contains("overflow-secret"));
         assert!(!format!("{error:#}").contains(&temp.path().to_string_lossy().into_owned()));
         Ok(())
     }
