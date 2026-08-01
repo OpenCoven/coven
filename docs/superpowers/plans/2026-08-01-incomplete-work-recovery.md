@@ -21,8 +21,14 @@
 - Create: `.git/agent-recovery/issue-541/dirty/memory-promote/`
 - Create: `.git/agent-recovery/issue-541/dirty/mobile-memory-gateway/`
 - Create: `.git/agent-recovery/issue-541/dirty/pr-476-review/`
-  - Status, commit identifiers, binary patches, and copied untracked files for
-    each dirty worktree.
+- Create: `.git/agent-recovery/issue-541/dirty/docs-psyche-specs/branch.bundle`
+- Create: `.git/agent-recovery/issue-541/dirty/memory-promote/branch.bundle`
+- Create: `.git/agent-recovery/issue-541/dirty/mobile-memory-gateway/branch.bundle`
+- Create: `.git/agent-recovery/issue-541/dirty/pr-476-review/branch.bundle`
+  - Status, commit identifiers, exact branch-name marker, verified
+    `branch.bundle`, binary patches, and copied untracked files for each dirty
+    worktree, so committed branch history is preserved before any later source
+    branch deletion.
 - Create: `.git/agent-recovery/issue-541/branches/docs-universal-runtime-capability-design.bundle`
 - Create: `.git/agent-recovery/issue-541/branches/feat-npm-macos-x64.bundle`
 - Create: `.git/agent-recovery/issue-541/branches/fix-521-ward-surface-confinement.bundle`
@@ -124,6 +130,10 @@ without auto-closing it.
 - Create: `.git/agent-recovery/issue-541/dirty/memory-promote/`
 - Create: `.git/agent-recovery/issue-541/dirty/mobile-memory-gateway/`
 - Create: `.git/agent-recovery/issue-541/dirty/pr-476-review/`
+- Create: `.git/agent-recovery/issue-541/dirty/docs-psyche-specs/branch.bundle`
+- Create: `.git/agent-recovery/issue-541/dirty/memory-promote/branch.bundle`
+- Create: `.git/agent-recovery/issue-541/dirty/mobile-memory-gateway/branch.bundle`
+- Create: `.git/agent-recovery/issue-541/dirty/pr-476-review/branch.bundle`
 - Create: `.git/agent-recovery/issue-541/manifest.tsv`
 
 - [ ] **Step 1: Create the recovery archive root**
@@ -150,10 +160,14 @@ COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 SOURCE="$REPO/.worktrees/docs-psyche-specs"
 DEST="$COMMON_DIR/agent-recovery/issue-541/dirty/docs-psyche-specs"
+BRANCH="$(git -C "$SOURCE" branch --show-current)"
 mkdir -p "$DEST/untracked"
 git -C "$SOURCE" status --short --branch > "$DEST/status.txt"
+printf '%s\n' "$BRANCH" > "$DEST/branch.txt"
 git -C "$SOURCE" rev-parse HEAD > "$DEST/head.txt"
 git -C "$SOURCE" merge-base HEAD origin/main > "$DEST/merge-base.txt"
+git -C "$REPO" bundle create "$DEST/branch.bundle" "$BRANCH"
+git -C "$REPO" bundle verify "$DEST/branch.bundle"
 git -C "$SOURCE" diff --binary > "$DEST/worktree.patch"
 git -C "$SOURCE" diff --cached --binary > "$DEST/index.patch"
 git -C "$SOURCE" ls-files --others --exclude-standard -z |
@@ -168,9 +182,10 @@ printf 'docs-psyche-specs\tdirty-worktree\t%s\t%s\t%s\t%s\n' \
   "$DEST" >> "$COMMON_DIR/agent-recovery/issue-541/manifest.tsv"
 ```
 
-Expected: both patch files exist and the copied untracked tree contains
-`specs/psyche/COVEN_PREREQUISITES.md`, `specs/psyche/PLAN.md`, and the Psyche
-reconciliation plan.
+Expected: `branch.bundle` verifies against `docs/psyche-specs`, preserving its
+committed history before any later branch deletion; both patch files exist; and
+the copied untracked tree contains `specs/psyche/COVEN_PREREQUISITES.md`,
+`specs/psyche/PLAN.md`, and the Psyche reconciliation plan.
 
 - [ ] **Step 3: Snapshot `feat-cmem-1ev-memory-promote`**
 
@@ -181,10 +196,14 @@ COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 SOURCE="$REPO/.worktrees/feat-cmem-1ev-memory-promote"
 DEST="$COMMON_DIR/agent-recovery/issue-541/dirty/memory-promote"
+BRANCH="$(git -C "$SOURCE" branch --show-current)"
 mkdir -p "$DEST/untracked"
 git -C "$SOURCE" status --short --branch > "$DEST/status.txt"
+printf '%s\n' "$BRANCH" > "$DEST/branch.txt"
 git -C "$SOURCE" rev-parse HEAD > "$DEST/head.txt"
 git -C "$SOURCE" merge-base HEAD origin/main > "$DEST/merge-base.txt"
+git -C "$REPO" bundle create "$DEST/branch.bundle" "$BRANCH"
+git -C "$REPO" bundle verify "$DEST/branch.bundle"
 git -C "$SOURCE" diff --binary > "$DEST/worktree.patch"
 git -C "$SOURCE" diff --cached --binary > "$DEST/index.patch"
 git -C "$SOURCE" ls-files --others --exclude-standard -z |
@@ -202,8 +221,11 @@ printf 'memory-promote\tdirty-worktree\t%s\t%s\t%s\t%s\n' \
   "$DEST" >> "$COMMON_DIR/agent-recovery/issue-541/manifest.tsv"
 ```
 
-Expected: the untracked tree includes `crates/coven-memory/src/promotion.rs`,
-`scripts/check-coven-privacy.py`, and `scripts/check-coven-privacy-test.py`.
+Expected: `branch.bundle` verifies against
+`feat/cmem-1ev-memory-promote`, preserving committed branch history before any
+later branch deletion, and the untracked tree includes
+`crates/coven-memory/src/promotion.rs`, `scripts/check-coven-privacy.py`, and
+`scripts/check-coven-privacy-test.py`.
 
 - [ ] **Step 4: Snapshot `feat/mobile-memory-gateway`**
 
@@ -214,10 +236,14 @@ COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 SOURCE="$REPO/.worktrees/mobile-memory-gateway"
 DEST="$COMMON_DIR/agent-recovery/issue-541/dirty/mobile-memory-gateway"
+BRANCH="$(git -C "$SOURCE" branch --show-current)"
 mkdir -p "$DEST/untracked"
 git -C "$SOURCE" status --short --branch > "$DEST/status.txt"
+printf '%s\n' "$BRANCH" > "$DEST/branch.txt"
 git -C "$SOURCE" rev-parse HEAD > "$DEST/head.txt"
 git -C "$SOURCE" merge-base HEAD origin/main > "$DEST/merge-base.txt"
+git -C "$REPO" bundle create "$DEST/branch.bundle" "$BRANCH"
+git -C "$REPO" bundle verify "$DEST/branch.bundle"
 git -C "$SOURCE" diff --binary > "$DEST/worktree.patch"
 git -C "$SOURCE" diff --cached --binary > "$DEST/index.patch"
 git -C "$SOURCE" ls-files --others --exclude-standard -z |
@@ -235,7 +261,9 @@ printf 'mobile-memory-gateway\tdirty-worktree\t%s\t%s\t%s\t%s\n' \
   "$DEST" >> "$COMMON_DIR/agent-recovery/issue-541/manifest.tsv"
 ```
 
-Expected: `worktree.patch` contains the changes to
+Expected: `branch.bundle` verifies against `feat/mobile-memory-gateway`,
+preserving committed branch history before any later branch deletion, and
+`worktree.patch` contains the changes to
 `crates/coven-cli/src/mobile_memory/pairing.rs`.
 
 - [ ] **Step 5: Snapshot `fix/476-review-threads`**
@@ -247,10 +275,14 @@ COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 SOURCE="$REPO/.worktrees/pr-476-review"
 DEST="$COMMON_DIR/agent-recovery/issue-541/dirty/pr-476-review"
+BRANCH="$(git -C "$SOURCE" branch --show-current)"
 mkdir -p "$DEST/untracked"
 git -C "$SOURCE" status --short --branch > "$DEST/status.txt"
+printf '%s\n' "$BRANCH" > "$DEST/branch.txt"
 git -C "$SOURCE" rev-parse HEAD > "$DEST/head.txt"
 git -C "$SOURCE" merge-base HEAD origin/main > "$DEST/merge-base.txt"
+git -C "$REPO" bundle create "$DEST/branch.bundle" "$BRANCH"
+git -C "$REPO" bundle verify "$DEST/branch.bundle"
 git -C "$SOURCE" diff --binary > "$DEST/worktree.patch"
 git -C "$SOURCE" diff --cached --binary > "$DEST/index.patch"
 git -C "$SOURCE" ls-files --others --exclude-standard -z |
@@ -268,7 +300,9 @@ printf 'pr-476-review\tdirty-worktree\t%s\t%s\t%s\t%s\n' \
   "$DEST" >> "$COMMON_DIR/agent-recovery/issue-541/manifest.tsv"
 ```
 
-Expected: the untracked tree contains all three runtime parity plan files.
+Expected: `branch.bundle` verifies against `fix/476-review-threads`,
+preserving committed branch history before any later branch deletion, and the
+untracked tree contains all three runtime parity plan files.
 
 - [ ] **Step 6: Verify snapshot completeness**
 
@@ -276,18 +310,24 @@ Run:
 
 ```bash
 COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
 RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
 test "$(wc -l < "$RECOVERY/manifest.tsv" | tr -d ' ')" = 5
 for id in docs-psyche-specs memory-promote mobile-memory-gateway pr-476-review; do
   test -s "$RECOVERY/dirty/$id/status.txt"
+  test -s "$RECOVERY/dirty/$id/branch.txt"
   test -s "$RECOVERY/dirty/$id/head.txt"
   test -s "$RECOVERY/dirty/$id/merge-base.txt"
-  test -f "$RECOVERY/dirty/$id/worktree.patch"
-  test -f "$RECOVERY/dirty/$id/index.patch"
+  test -s "$RECOVERY/dirty/$id/branch.bundle"
+  test -s "$RECOVERY/dirty/$id/worktree.patch"
+  test -s "$RECOVERY/dirty/$id/index.patch"
+  git -C "$REPO" bundle verify "$RECOVERY/dirty/$id/branch.bundle" > /dev/null
 done
 ```
 
-Expected: every assertion exits zero.
+Expected: every dirty snapshot includes status, branch, head, merge-base, both
+patches, and a verified `branch.bundle`, so committed branch history is
+preserved before any later branch deletion.
 
 ### Task 3: Archive Every Orphan Branch
 
@@ -407,24 +447,34 @@ do
   git -C "$REPO" cherry -v origin/main "$branch" \
     > "$RECOVERY/$id-cherry.txt"
 done
-for id in memory-promote mobile-memory-gateway
+for id in \
+  docs-psyche-specs \
+  memory-promote \
+  mobile-memory-gateway \
+  pr-476-review
 do
   SNAPSHOT="$RECOVERY/dirty/$id"
   git apply --stat --summary "$SNAPSHOT/worktree.patch" \
     > "$RECOVERY/$id-worktree-evidence.txt"
+  test -s "$RECOVERY/$id-worktree-evidence.txt" || \
+    printf '<no unstaged diff>\n' > "$RECOVERY/$id-worktree-evidence.txt"
   git apply --stat --summary "$SNAPSHOT/index.patch" \
     > "$RECOVERY/$id-index-evidence.txt"
+  test -s "$RECOVERY/$id-index-evidence.txt" || \
+    printf '<no staged diff>\n' > "$RECOVERY/$id-index-evidence.txt"
   (
     cd "$SNAPSHOT/untracked" &&
     find . -type f | sed 's#^\./##' | LC_ALL=C sort
   ) > "$RECOVERY/$id-untracked-evidence.txt"
+  test -s "$RECOVERY/$id-untracked-evidence.txt" || \
+    printf '<no untracked files>\n' > "$RECOVERY/$id-untracked-evidence.txt"
 done
 ```
 
-Expected: each branch-backed source has commit, stat, and patch-equivalence
-evidence, and `memory-promote` plus `mobile-memory-gateway` each have
+Expected: the five historical branch comparisons still provide complementary
+commit, stat, and cherry evidence, and all four dirty snapshots now each have
 reviewable worktree, index, and untracked evidence files, so evidence exists
-for all seven rows.
+for all seven workstreams.
 
 - [ ] **Step 3: Write the ledger with one evidence-backed row per workstream**
 
@@ -724,9 +774,63 @@ done
 
 Do not use `--force`. Any non-empty status blocks removal.
 
-- [ ] **Step 4: Delete only proven local branch residue**
+- [ ] **Step 4: Retire the original dirty source worktrees only after proof checks**
 
-For each branch in the ledger with merged or superseded evidence, set
+These four source worktrees remain intentionally dirty until their proof is
+complete. `git worktree remove --force` is allowed only in this step, only for
+these four exact paths, and only after the worktree and index patch evidence,
+verified branch bundle, untracked inventory, terminal ledger classification,
+and either an open replacement PR or recorded non-viable/blocker evidence are
+all present. Unrelated or unsnapshotted worktrees must never use force.
+
+Run:
+
+```bash
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
+RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
+for id in \
+  docs-psyche-specs \
+  memory-promote \
+  mobile-memory-gateway \
+  pr-476-review
+do
+  test -s "$RECOVERY/$id-worktree-evidence.txt"
+  test -s "$RECOVERY/$id-index-evidence.txt"
+  test -s "$RECOVERY/$id-untracked-evidence.txt"
+  git -C "$REPO" bundle verify "$RECOVERY/dirty/$id/branch.bundle" > /dev/null
+  grep -E "^\| $id \| (already-shipped|superseded|viable|blocked) \|" \
+    "$RECOVERY/classification.md"
+done
+```
+
+If a row is `viable`, confirm its classification row cites the open replacement
+PR URL before removal. Otherwise confirm the row already records its
+`already-shipped`, `superseded`, or `blocked` evidence. Then remove only the
+four original dirty source worktrees:
+
+```bash
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
+for path in \
+  "$REPO/.worktrees/docs-psyche-specs" \
+  "$REPO/.worktrees/feat-cmem-1ev-memory-promote" \
+  "$REPO/.worktrees/mobile-memory-gateway" \
+  "$REPO/.worktrees/pr-476-review"
+do
+  git -C "$REPO" worktree remove --force "$path"
+done
+```
+
+Expected: only those four exact dirty source paths are force-removed, because
+their committed history, dirty state, and recovery disposition have already
+been proven elsewhere in the archive.
+
+- [ ] **Step 5: Delete only proven local branch residue after worktree retirement**
+
+For each branch in the ledger with merged or superseded evidence, or each of
+the four dirty source branches once Step 4 has removed its worktree and proven
+either the verified bundle or a pushed replacement recovery ref, set
 `BRANCH_TO_DELETE` to its exact local branch name and run:
 
 ```bash
@@ -741,9 +845,10 @@ If squash history makes `-d` refuse, recheck the ledger evidence and use:
 git -C "$REPO" branch -D "$BRANCH_TO_DELETE"
 ```
 
-only after confirming its snapshot or pushed replacement branch exists.
+only after confirming its source worktree is already removed and its verified
+snapshot bundle or pushed replacement branch still proves the committed history.
 
-- [ ] **Step 5: Release stopped recovery claims**
+- [ ] **Step 6: Release stopped recovery claims**
 
 After each child pull request is opened, release its claim from that worktree:
 
