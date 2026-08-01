@@ -805,7 +805,7 @@ fn child_job_object_for_process(
 fn resume_suspended_child(child: &std::process::Child) -> bool {
     use std::mem::size_of;
     use windows_sys::Win32::{
-        Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+        Foundation::{CloseHandle, GetLastError, ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE},
         System::{
             Diagnostics::ToolHelp::{
                 CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD,
@@ -826,14 +826,21 @@ fn resume_suspended_child(child: &std::process::Child) -> bool {
     };
     let mut thread_ids = Vec::new();
     let mut has_entry = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+    let mut enumeration_complete = false;
     while has_entry {
         if entry.th32OwnerProcessID == child.id() {
             thread_ids.push(entry.th32ThreadID);
         }
         has_entry = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+        if !has_entry {
+            enumeration_complete = unsafe { GetLastError() } == ERROR_NO_MORE_FILES;
+        }
     }
     unsafe { CloseHandle(snapshot) };
 
+    if !enumeration_complete {
+        return false;
+    }
     // CREATE_SUSPENDED creates exactly one primary thread. Anything else is
     // inconsistent with the promised before-first-instruction boundary.
     let [thread_id] = thread_ids.as_slice() else {
