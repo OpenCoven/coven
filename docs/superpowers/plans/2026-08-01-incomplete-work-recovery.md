@@ -27,9 +27,17 @@
   - `.git/agent-recovery/issue-541/viable/<workstream-id>-issue-view.json`
   - `.git/agent-recovery/issue-541/viable/<workstream-id>-pr-blocker.txt`
   - `.git/agent-recovery/issue-541/viable/<workstream-id>-issue-blocker.txt`
+  - `.git/agent-recovery/issue-541/private/issue-ledger-refresh/<workstream-id>-issues.stage.json`
   - Exact-head open-PR evidence, verified replacement-PR view evidence,
     per-workstream exact-title open issue-match evidence derived from paginated
-    `issues.json`, and blocker evidence for each viable workstream.
+    `issues.json`, blocker evidence for each viable workstream, and the
+    private staged ledger used to atomically refresh `issues.json`.
+- Create only when Task 8 Step 5 runs:
+  - `.git/agent-recovery/issue-541/private/branch-delete-proof/<branch-proof-id>-pre-delete-d.txt`
+  - `.git/agent-recovery/issue-541/private/branch-delete-proof/<branch-proof-id>-pre-delete-D.txt`
+  - Private branch-ref recheck evidence for each recovered source branch,
+    including missing-ref outcomes and drift blockers recorded immediately
+    before each deletion command.
 - Create only when Task 9 runs:
   - `.git/agent-recovery/issue-541/final-audit-primary-checkout.txt`
   - Primary-checkout restore and blocker evidence for the final audit.
@@ -873,9 +881,10 @@ matching exact issue title:
 ```bash
 COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
 RECOVERY="$COMMON_DIR/agent-recovery/issue-541/viable"
+PRIVATE_RECOVERY="$COMMON_DIR/agent-recovery/issue-541/private"
 CLASSIFICATION="$COMMON_DIR/agent-recovery/issue-541/classification.md"
 ALL_ISSUES_EVIDENCE="$COMMON_DIR/agent-recovery/issue-541/issues.json"
-mkdir -p "$RECOVERY"
+mkdir -p "$RECOVERY" "$PRIVATE_RECOVERY/issue-ledger-refresh"
 update_classification_row() {
   python3 - "$CLASSIFICATION" "$WORKSTREAM_ID" "$1" "$2" "$3" <<'PY'
 from pathlib import Path
@@ -931,46 +940,71 @@ ISSUE_SEARCH_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-issue-search.json"
 ISSUE_VIEW_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-issue-view.json"
 ISSUE_BLOCKER_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-issue-blocker.txt"
 ISSUE_LEDGER_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-issues.json"
+ISSUE_LEDGER_STAGE="$PRIVATE_RECOVERY/issue-ledger-refresh/$WORKSTREAM_ID-issues.stage.json"
+rm -f "$ISSUE_LEDGER_STAGE"
 if ! gh api --paginate --slurp \
   "repos/OpenCoven/coven/issues?state=all&per_page=100" \
-  > "$ALL_ISSUES_EVIDENCE"
+  > "$ISSUE_LEDGER_STAGE"
 then
+  rm -f "$ISSUE_LEDGER_STAGE"
   {
     printf 'Blocked %s: could not refresh the paginated issue ledger before reuse/create.\n' \
       "$WORKSTREAM_ID"
-    printf 'Latest shared issue ledger: issue-541/issues.json\n'
-    printf 'Per-workstream issue ledger: viable/%s-issues.json\n' "$WORKSTREAM_ID"
+    printf 'Preserved shared issue ledger: issue-541/issues.json\n'
+    printf 'Per-workstream issue ledger target: viable/%s-issues.json\n' "$WORKSTREAM_ID"
+    printf 'Staging file removed after gh api failure: private/issue-ledger-refresh/%s-issues.stage.json\n' "$WORKSTREAM_ID"
   } > "$ISSUE_BLOCKER_EVIDENCE"
   update_classification_row \
     "blocked" \
-    "Issue ledger refresh failed; see issue-541/issues.json, viable/$WORKSTREAM_ID-issues.json, and viable/$WORKSTREAM_ID-issue-blocker.txt." \
+    "Issue ledger refresh failed without replacing issue-541/issues.json; see viable/$WORKSTREAM_ID-issue-blocker.txt." \
     "Blocked: could not refresh live issue evidence before exact-title reuse/create."
   exit 0
 fi
-if ! cp "$ALL_ISSUES_EVIDENCE" "$ISSUE_LEDGER_EVIDENCE"; then
+if ! test -s "$ISSUE_LEDGER_STAGE" || \
+   ! jq -e 'type == "array" and length > 0 and all(.[]; type == "array")' "$ISSUE_LEDGER_STAGE" > /dev/null
+then
+  rm -f "$ISSUE_LEDGER_STAGE"
   {
-    printf 'Blocked %s: could not persist the refreshed issue ledger copy.\n' \
+    printf 'Blocked %s: staged issue ledger was empty or not a valid paginated slurped array.\n' \
       "$WORKSTREAM_ID"
-    printf 'Latest shared issue ledger: issue-541/issues.json\n'
-    printf 'Per-workstream issue ledger: viable/%s-issues.json\n' "$WORKSTREAM_ID"
+    printf 'Preserved shared issue ledger: issue-541/issues.json\n'
+    printf 'Per-workstream issue ledger target: viable/%s-issues.json\n' "$WORKSTREAM_ID"
+    printf 'Expected staging shape: JSON array whose elements are page arrays.\n'
   } > "$ISSUE_BLOCKER_EVIDENCE"
   update_classification_row \
     "blocked" \
-    "Issue ledger persistence failed; see issue-541/issues.json, viable/$WORKSTREAM_ID-issues.json, and viable/$WORKSTREAM_ID-issue-blocker.txt." \
-    "Blocked: could not persist live issue evidence before exact-title reuse/create."
+    "Issue ledger staging validation failed without replacing issue-541/issues.json; see viable/$WORKSTREAM_ID-issue-blocker.txt." \
+    "Blocked: live issue evidence failed validation before exact-title reuse/create."
   exit 0
 fi
-if ! test -s "$ALL_ISSUES_EVIDENCE" || ! test -s "$ISSUE_LEDGER_EVIDENCE"; then
+if ! mv "$ISSUE_LEDGER_STAGE" "$ALL_ISSUES_EVIDENCE"; then
+  rm -f "$ISSUE_LEDGER_STAGE"
   {
-    printf 'Blocked %s: refreshed issue ledger evidence is empty.\n' \
+    printf 'Blocked %s: could not atomically replace the shared issue ledger.\n' \
       "$WORKSTREAM_ID"
-    printf 'Latest shared issue ledger: issue-541/issues.json\n'
-    printf 'Per-workstream issue ledger: viable/%s-issues.json\n' "$WORKSTREAM_ID"
+    printf 'Shared issue ledger path: issue-541/issues.json\n'
+    printf 'Per-workstream issue ledger target: viable/%s-issues.json\n' "$WORKSTREAM_ID"
   } > "$ISSUE_BLOCKER_EVIDENCE"
   update_classification_row \
     "blocked" \
-    "Issue ledger evidence was empty; see issue-541/issues.json, viable/$WORKSTREAM_ID-issues.json, and viable/$WORKSTREAM_ID-issue-blocker.txt." \
-    "Blocked: live issue evidence was empty before exact-title reuse/create."
+    "Issue ledger replacement failed; see issue-541/issues.json and viable/$WORKSTREAM_ID-issue-blocker.txt." \
+    "Blocked: could not atomically replace shared live issue evidence before exact-title reuse/create."
+  exit 0
+fi
+if ! cp "$ALL_ISSUES_EVIDENCE" "$ISSUE_LEDGER_EVIDENCE" || \
+   ! cmp -s "$ALL_ISSUES_EVIDENCE" "$ISSUE_LEDGER_EVIDENCE"
+then
+  rm -f "$ISSUE_LEDGER_EVIDENCE"
+  {
+    printf 'Blocked %s: could not persist an exact per-workstream copy of the verified issue ledger.\n' \
+      "$WORKSTREAM_ID"
+    printf 'Verified shared issue ledger: issue-541/issues.json\n'
+    printf 'Per-workstream issue ledger target: viable/%s-issues.json\n' "$WORKSTREAM_ID"
+  } > "$ISSUE_BLOCKER_EVIDENCE"
+  update_classification_row \
+    "blocked" \
+    "Issue ledger persistence failed after shared refresh; see issue-541/issues.json and viable/$WORKSTREAM_ID-issue-blocker.txt." \
+    "Blocked: could not persist verified live issue evidence before exact-title reuse/create."
   exit 0
 fi
 jq --arg title "$ISSUE_TITLE" \
@@ -980,14 +1014,20 @@ ISSUE_COUNT="$(jq 'length' "$ISSUE_SEARCH_EVIDENCE")"
 ```
 
 Immediately before every exact-title reuse/create decision, refresh the fully
-paginated shared `issue-541/issues.json` ledger with `gh api --paginate
---slurp`, then persist that row's exact live capture to
-`viable/$WORKSTREAM_ID-issues.json`. Only after that refresh may the plan
-filter and count exact-title non-PR `open` matches. Each workstream's
-`viable/$WORKSTREAM_ID-issue-search.json` stores only the filtered matches from
-that persisted live ledger, so default-limited `gh issue list` output never
-drives reuse. A sole unrelated or closed result in the refreshed ledger leaves
-`ISSUE_COUNT=0` and must not be reused.
+paginated shared `issue-541/issues.json` ledger into
+`private/issue-ledger-refresh/$WORKSTREAM_ID-issues.stage.json`. If `gh api`
+fails, preserve the existing `issue-541/issues.json`, remove the staging file,
+persist blocker evidence, and stop that row. Only a non-empty JSON value that
+passes `jq -e 'type == "array" and length > 0 and all(.[]; type == "array")'` may replace the
+shared ledger, and that replacement must happen atomically with `mv`. Only
+after the verified shared ledger is in place may the plan copy it to
+`viable/$WORKSTREAM_ID-issues.json`, filter exact-title non-PR `open` matches,
+and count them. Each workstream's `viable/$WORKSTREAM_ID-issue-search.json`
+stores only the filtered matches from that verified persisted ledger, so
+default-limited `gh issue list` output never drives reuse, and a refresh
+failure never truncates the last known-good shared ledger. A sole unrelated or
+closed result in the refreshed ledger leaves `ISSUE_COUNT=0` and must not be
+reused.
 
 If exactly one exact-title open issue already exists, reuse it without creating
 a duplicate:
@@ -1658,22 +1698,195 @@ summaries or deterministic sentinel lines, plus matching live proof files under
 For each branch in the ledger with merged or superseded evidence, or each of
 the four dirty source branches once Step 4 has removed its worktree and proven
 either the verified bundle or a pushed replacement recovery ref, set
-`BRANCH_TO_DELETE` to its exact local branch name and run:
+`BRANCH_TO_DELETE` to its exact local branch name. Recheck that exact branch
+ref immediately before every deletion command against the preserved head source
+for that branch; do not rely only on the earlier worktree-retirement proof.
+Task 3 Step 3 already creates the explicit orphan-branch `head.txt` files used
+below. Use this exact mapping for all seven recovered source branches:
+
+- `docs/psyche-specs` -> `dirty/docs-psyche-specs/head.txt`
+- `docs/universal-runtime-capability-design` -> `branches/docs-universal-runtime-capability-design/head.txt`
+- `feat/cmem-1ev-memory-promote` -> `dirty/memory-promote/head.txt`
+- `feat/mobile-memory-gateway` -> `dirty/mobile-memory-gateway/head.txt`
+- `feat/npm-macos-x64` -> `branches/feat-npm-macos-x64/head.txt`
+- `fix/476-review-threads` -> `dirty/pr-476-review/head.txt`
+- `fix/521-ward-surface-confinement` -> `branches/fix-521-ward-surface-confinement/head.txt`
+
+Run this immediately before `branch -d`:
 
 ```bash
 COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
+BRANCH_DELETE_PROOF_ROOT="$COMMON_DIR/agent-recovery/issue-541/private/branch-delete-proof"
+mkdir -p "$BRANCH_DELETE_PROOF_ROOT"
+recheck_branch_ref_tip() {
+  MODE="$1"
+  BRANCH_PROOF_ID="$(printf '%s' "$BRANCH_TO_DELETE" | tr '/' '_')"
+  case "$BRANCH_TO_DELETE" in
+    docs/psyche-specs)
+      PRESERVED_HEAD_SOURCE="dirty/docs-psyche-specs/head.txt"
+      ;;
+    docs/universal-runtime-capability-design)
+      PRESERVED_HEAD_SOURCE="branches/docs-universal-runtime-capability-design/head.txt"
+      ;;
+    feat/cmem-1ev-memory-promote)
+      PRESERVED_HEAD_SOURCE="dirty/memory-promote/head.txt"
+      ;;
+    feat/mobile-memory-gateway)
+      PRESERVED_HEAD_SOURCE="dirty/mobile-memory-gateway/head.txt"
+      ;;
+    feat/npm-macos-x64)
+      PRESERVED_HEAD_SOURCE="branches/feat-npm-macos-x64/head.txt"
+      ;;
+    fix/476-review-threads)
+      PRESERVED_HEAD_SOURCE="dirty/pr-476-review/head.txt"
+      ;;
+    fix/521-ward-surface-confinement)
+      PRESERVED_HEAD_SOURCE="branches/fix-521-ward-surface-confinement/head.txt"
+      ;;
+    *)
+      printf 'Blocked: unknown recovered source branch %s.\n' "$BRANCH_TO_DELETE" \
+        > "$BRANCH_DELETE_PROOF_ROOT/$BRANCH_PROOF_ID-$MODE.txt"
+      return 1
+      ;;
+  esac
+  PRESERVED_HEAD_FILE="$COMMON_DIR/agent-recovery/issue-541/$PRESERVED_HEAD_SOURCE"
+  PROOF_FILE="$BRANCH_DELETE_PROOF_ROOT/$BRANCH_PROOF_ID-$MODE.txt"
+  LIVE_HEAD_FILE="$BRANCH_DELETE_PROOF_ROOT/$BRANCH_PROOF_ID-$MODE-live-head.txt"
+  LIVE_ERR_FILE="$BRANCH_DELETE_PROOF_ROOT/$BRANCH_PROOF_ID-$MODE-live-head.err"
+  if ! test -s "$PRESERVED_HEAD_FILE"; then
+    printf 'Blocked %s: preserved head file is missing: %s\n' \
+      "$BRANCH_TO_DELETE" "$PRESERVED_HEAD_SOURCE" > "$PROOF_FILE"
+    return 1
+  fi
+  if ! git -C "$REPO" rev-parse --verify "refs/heads/$BRANCH_TO_DELETE" \
+    > "$LIVE_HEAD_FILE" 2> "$LIVE_ERR_FILE"
+  then
+    {
+      printf 'Branch: %s\n' "$BRANCH_TO_DELETE"
+      printf 'Preserved head source: %s\n' "$PRESERVED_HEAD_SOURCE"
+      printf 'Outcome: local branch ref is already missing immediately before %s; no deletion command ran.\n' "$MODE"
+    } > "$PROOF_FILE"
+    rm -f "$LIVE_HEAD_FILE" "$LIVE_ERR_FILE"
+    return 2
+  fi
+  PRESERVED_HEAD="$(tr -d '\n' < "$PRESERVED_HEAD_FILE")"
+  LIVE_HEAD="$(tr -d '\n' < "$LIVE_HEAD_FILE")"
+  {
+    printf 'Branch: %s\n' "$BRANCH_TO_DELETE"
+    printf 'Preserved head source: %s\n' "$PRESERVED_HEAD_SOURCE"
+    printf 'Preserved head: %s\n' "$PRESERVED_HEAD"
+    printf 'Live branch ref tip: %s\n' "$LIVE_HEAD"
+  } > "$PROOF_FILE"
+  if [ "$LIVE_HEAD" != "$PRESERVED_HEAD" ]; then
+    printf 'Blocked: live branch ref tip differs from the preserved head; newer commits are unpreserved.\n' \
+      >> "$PROOF_FILE"
+    return 1
+  fi
+  return 0
+}
+recheck_branch_ref_tip pre-delete-d
+CHECK_STATUS=$?
+if [ "$CHECK_STATUS" -eq 2 ]; then
+  exit 0
+fi
+if [ "$CHECK_STATUS" -ne 0 ]; then
+  exit "$CHECK_STATUS"
+fi
 git -C "$REPO" branch -d "$BRANCH_TO_DELETE"
 ```
 
-If squash history makes `-d` refuse, recheck the ledger evidence and use:
+If squash history makes `-d` refuse, recheck the ledger evidence, reconfirm
+its source worktree is already removed and its verified snapshot bundle or
+pushed replacement branch still proves the committed history, then rerun the
+same branch-ref proof immediately before `branch -D`:
 
 ```bash
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
+BRANCH_DELETE_PROOF_ROOT="$COMMON_DIR/agent-recovery/issue-541/private/branch-delete-proof"
+mkdir -p "$BRANCH_DELETE_PROOF_ROOT"
+recheck_branch_ref_tip() {
+  MODE="$1"
+  BRANCH_PROOF_ID="$(printf '%s' "$BRANCH_TO_DELETE" | tr '/' '_')"
+  case "$BRANCH_TO_DELETE" in
+    docs/psyche-specs)
+      PRESERVED_HEAD_SOURCE="dirty/docs-psyche-specs/head.txt"
+      ;;
+    docs/universal-runtime-capability-design)
+      PRESERVED_HEAD_SOURCE="branches/docs-universal-runtime-capability-design/head.txt"
+      ;;
+    feat/cmem-1ev-memory-promote)
+      PRESERVED_HEAD_SOURCE="dirty/memory-promote/head.txt"
+      ;;
+    feat/mobile-memory-gateway)
+      PRESERVED_HEAD_SOURCE="dirty/mobile-memory-gateway/head.txt"
+      ;;
+    feat/npm-macos-x64)
+      PRESERVED_HEAD_SOURCE="branches/feat-npm-macos-x64/head.txt"
+      ;;
+    fix/476-review-threads)
+      PRESERVED_HEAD_SOURCE="dirty/pr-476-review/head.txt"
+      ;;
+    fix/521-ward-surface-confinement)
+      PRESERVED_HEAD_SOURCE="branches/fix-521-ward-surface-confinement/head.txt"
+      ;;
+    *)
+      printf 'Blocked: unknown recovered source branch %s.\n' "$BRANCH_TO_DELETE" \
+        > "$BRANCH_DELETE_PROOF_ROOT/$BRANCH_PROOF_ID-$MODE.txt"
+      return 1
+      ;;
+  esac
+  PRESERVED_HEAD_FILE="$COMMON_DIR/agent-recovery/issue-541/$PRESERVED_HEAD_SOURCE"
+  PROOF_FILE="$BRANCH_DELETE_PROOF_ROOT/$BRANCH_PROOF_ID-$MODE.txt"
+  LIVE_HEAD_FILE="$BRANCH_DELETE_PROOF_ROOT/$BRANCH_PROOF_ID-$MODE-live-head.txt"
+  LIVE_ERR_FILE="$BRANCH_DELETE_PROOF_ROOT/$BRANCH_PROOF_ID-$MODE-live-head.err"
+  if ! test -s "$PRESERVED_HEAD_FILE"; then
+    printf 'Blocked %s: preserved head file is missing: %s\n' \
+      "$BRANCH_TO_DELETE" "$PRESERVED_HEAD_SOURCE" > "$PROOF_FILE"
+    return 1
+  fi
+  if ! git -C "$REPO" rev-parse --verify "refs/heads/$BRANCH_TO_DELETE" \
+    > "$LIVE_HEAD_FILE" 2> "$LIVE_ERR_FILE"
+  then
+    {
+      printf 'Branch: %s\n' "$BRANCH_TO_DELETE"
+      printf 'Preserved head source: %s\n' "$PRESERVED_HEAD_SOURCE"
+      printf 'Outcome: local branch ref is already missing immediately before %s; no deletion command ran.\n' "$MODE"
+    } > "$PROOF_FILE"
+    rm -f "$LIVE_HEAD_FILE" "$LIVE_ERR_FILE"
+    return 2
+  fi
+  PRESERVED_HEAD="$(tr -d '\n' < "$PRESERVED_HEAD_FILE")"
+  LIVE_HEAD="$(tr -d '\n' < "$LIVE_HEAD_FILE")"
+  {
+    printf 'Branch: %s\n' "$BRANCH_TO_DELETE"
+    printf 'Preserved head source: %s\n' "$PRESERVED_HEAD_SOURCE"
+    printf 'Preserved head: %s\n' "$PRESERVED_HEAD"
+    printf 'Live branch ref tip: %s\n' "$LIVE_HEAD"
+  } > "$PROOF_FILE"
+  if [ "$LIVE_HEAD" != "$PRESERVED_HEAD" ]; then
+    printf 'Blocked: live branch ref tip differs from the preserved head; newer commits are unpreserved.\n' \
+      >> "$PROOF_FILE"
+    return 1
+  fi
+  return 0
+}
+recheck_branch_ref_tip pre-delete-D
+CHECK_STATUS=$?
+if [ "$CHECK_STATUS" -eq 2 ]; then
+  exit 0
+fi
+if [ "$CHECK_STATUS" -ne 0 ]; then
+  exit "$CHECK_STATUS"
+fi
 git -C "$REPO" branch -D "$BRANCH_TO_DELETE"
 ```
 
-only after confirming its source worktree is already removed and its verified
-snapshot bundle or pushed replacement branch still proves the committed history.
+If the local branch ref is already missing, record that outcome in the private
+proof file and succeed without failing the step. If the live branch ref tip
+exists but differs from the preserved head, stop and do not use `-D`; newer
+commits are unpreserved until a fresh archive captures them.
 
 - [ ] **Step 6: Release only merged or stopped recovery claims**
 
