@@ -1917,13 +1917,18 @@ impl DoctorCheck {
 /// account or project directory names. The prose report intentionally keeps
 /// the concrete paths for local troubleshooting.
 struct DoctorJsonPathRedactor {
+    role_replacements: Vec<(String, String)>,
     replacements: Vec<(String, String)>,
 }
 
 impl DoctorJsonPathRedactor {
     fn new(report: &DoctorReport) -> Self {
+        let mut role_replacements = Vec::new();
         let mut replacements = Vec::new();
         let mut add_path = |path: &Path, token: String| {
+            let rendered = path.display().to_string();
+            role_replacements.push((rendered.clone(), token.clone()));
+
             // Only redact rooted paths with a normal component below the root.
             // Checking components rather than their count rejects Unix `/`,
             // Windows drive roots, and UNC share roots; prefix/root components
@@ -1935,7 +1940,7 @@ impl DoctorJsonPathRedactor {
                     .components()
                     .any(|component| matches!(component, std::path::Component::Normal(_)))
             {
-                replacements.push((path.display().to_string(), token));
+                replacements.push((rendered, token));
             }
         };
 
@@ -1970,7 +1975,10 @@ impl DoctorJsonPathRedactor {
         // COVEN_HOME. `sort_by` is stable, so equally long exact paths retain
         // the role-specific insertion order above.
         replacements.sort_by_key(|entry| std::cmp::Reverse(entry.0.len()));
-        Self { replacements }
+        Self {
+            role_replacements,
+            replacements,
+        }
     }
 
     fn text(&self, value: impl AsRef<str>) -> String {
@@ -1981,15 +1989,18 @@ impl DoctorJsonPathRedactor {
             })
     }
 
-    /// Render a value that is itself a known path role. Exact absolute roles
-    /// can always become their semantic token, including filesystem roots;
-    /// unlike `text`, this never performs a broad root substring replacement.
+    /// Render a value that is itself a known path role. Exact roles can always
+    /// become their semantic token, including relative paths and filesystem
+    /// roots; unlike `text`, this never performs a broad substring replacement
+    /// with those otherwise unsafe values.
     fn role_path(&self, value: &Path, token: &str) -> String {
-        if value.is_absolute() {
-            token.to_string()
-        } else {
-            self.text(value.display().to_string())
-        }
+        let rendered = value.display().to_string();
+        self.role_replacements
+            .iter()
+            .find(|(path, registered_token)| {
+                path == &rendered && registered_token.as_str() == token
+            })
+            .map_or_else(|| self.text(rendered), |(_, token)| token.clone())
     }
 }
 
@@ -6383,6 +6394,40 @@ mod tests {
             .find(|check| check.id == "repo:unc-root")
             .expect("UNC-root repository check");
         assert_eq!(unc_check.message, "<repo>");
+    }
+
+    #[test]
+    fn doctor_json_redacts_relative_daemon_socket_without_broad_replacement() {
+        let mut report = make_doctor_report();
+        let private_hash = "0123456789abcdef0123456789abcdef";
+        let socket = format!("coven-daemon-{private_hash}.sock");
+        report.daemon = Some(daemon::DaemonStatusState::Running(daemon::DaemonStatus {
+            pid: 42,
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            socket: socket.clone(),
+        }));
+
+        let redactor = DoctorJsonPathRedactor::new(&report);
+        assert_eq!(
+            redactor.text(format!("socket={socket}")),
+            format!("socket={socket}"),
+            "relative paths must not become broad substring replacements"
+        );
+
+        let body = doctor_json_body(&report);
+        let daemon = body["checks"]
+            .as_array()
+            .expect("checks array")
+            .iter()
+            .find(|check| check["id"] == "daemon")
+            .expect("daemon check");
+        assert_eq!(
+            daemon["message"],
+            "running (pid 42, socket <daemon-socket>)"
+        );
+        let serialized = body.to_string();
+        assert!(!serialized.contains(private_hash));
+        assert!(!serialized.contains(&socket));
     }
 
     fn make_doctor_report() -> DoctorReport {
