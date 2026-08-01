@@ -73,4 +73,4 @@
 - [x] **Step 4:** Run `cargo clippy --workspace --all-targets -- -D warnings`.
 - [x] **Step 5:** Run `cargo test --workspace --locked`.
 - [x] **Step 6:** Run `python scripts/check-secrets.py`.
-- [x] **Step 7:** Stage only the W0 documentation paths, run `python3 scripts/check-coven-privacy.py --staged`, then leave the verified changes uncommitted as requested.
+- [x] **Step 7:** Stage only the W0 documentation paths, run `python3 scripts/check-coven-privacy.py --staged`, and commit the verified changes.

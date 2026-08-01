@@ -977,7 +977,7 @@ psyche delivery resolve <delivery-id> --action <abandon|retry|send-clarification
 
 `inspect` is read-only and displays the immutable effect digest, surface,
 attempt write-state classifications, recovery ancestry, and redacted
-correlation IDs. `resolve` obtains a current Coven operator context and the
+correlation IDs. `resolve` obtains a current Psyche operator context and the
 `telegram.delivery.resolve_unknown` decision described above. `retry` and
 `send-clarification` require `--acknowledge-duplicate-risk`; `abandon` forbids
 it. Psyche persists the reason, operator context reference, decision, and state
