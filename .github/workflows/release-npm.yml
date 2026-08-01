@@ -52,14 +52,23 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    outputs:
+      release_mode: ${{ steps.release-context.outputs.release_mode }}
+      release_tag: ${{ steps.release-context.outputs.release_tag }}
+      npm_version: ${{ steps.release-context.outputs.npm_version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6.0.0
         with:
           fetch-depth: 0
+      - name: Derive stable or recovery release context
+        id: release-context
+        run: node scripts/release-npm-context.mjs "$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
       - name: Confirm tag is annotated, signer-authorized, and points to main
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_RELEASE_ALLOWED_SIGNERS: ${{ vars.NPM_RELEASE_ALLOWED_SIGNERS }}
+          RELEASE_MODE: ${{ steps.release-context.outputs.release_mode }}
+          RELEASE_TAG: ${{ steps.release-context.outputs.release_tag }}
         run: |
           set -euo pipefail
           TAG_NAME="${GITHUB_REF#refs/tags/}"
@@ -111,6 +120,51 @@ jobs:
             echo "::error::Refusing release: tagged commit $TAGGED_COMMIT_SHA is not contained in origin/main."
             exit 1
           fi
+          if [ "$RELEASE_MODE" != "recovery" ]; then
+            exit 0
+          fi
+          if ! BASE_TAG_OBJECT_SHA=$(git rev-parse "$RELEASE_TAG^{tag}" 2>/dev/null); then
+            echo "::error::Base release tag $RELEASE_TAG is missing or is not annotated."
+            exit 1
+          fi
+          BASE_TAG_PAYLOAD=$(gh api "/repos/$GITHUB_REPOSITORY/git/tags/$BASE_TAG_OBJECT_SHA")
+          BASE_VERIFIED=$(jq -r '.verification.verified' <<<"$BASE_TAG_PAYLOAD")
+          BASE_REASON=$(jq -r '.verification.reason' <<<"$BASE_TAG_PAYLOAD")
+          BASE_OBJECT_TYPE=$(jq -r '.object.type // ""' <<<"$BASE_TAG_PAYLOAD")
+          BASE_COMMIT_SHA=$(jq -r '.object.sha // ""' <<<"$BASE_TAG_PAYLOAD")
+          if [ "$BASE_VERIFIED" != "true" ]; then
+            echo "::error::Base release tag $RELEASE_TAG is not GitHub-verified (reason=$BASE_REASON)."
+            exit 1
+          fi
+          if [ "$BASE_OBJECT_TYPE" != "commit" ] || [ -z "$BASE_COMMIT_SHA" ]; then
+            echo "::error::Base release tag $RELEASE_TAG does not target a commit."
+            exit 1
+          fi
+          if ! base_verify_output=$(git verify-tag "$RELEASE_TAG" 2>&1); then
+            printf '%s\n' "$base_verify_output"
+            echo "::error::Base release tag $RELEASE_TAG is not signed by a key in NPM_RELEASE_ALLOWED_SIGNERS."
+            exit 1
+          fi
+          printf '%s\n' "$base_verify_output"
+          if ! git merge-base --is-ancestor "$BASE_COMMIT_SHA" "$TAGGED_COMMIT_SHA"; then
+            echo "::error::Recovery tag $TAG_NAME does not descend from $RELEASE_TAG."
+            exit 1
+          fi
+          while IFS= read -r changed_path; do
+            case "$changed_path" in
+              .github/workflows/release-npm.yml|\
+              scripts/release-npm-context.mjs|\
+              scripts/publish-npm-test.mjs|\
+              docs/reference/releasing.md|\
+              docs/superpowers/specs/2026-08-01-release-partial-publish-recovery-design.md|\
+              docs/superpowers/plans/2026-08-01-release-partial-publish-recovery.md)
+                ;;
+              *)
+                echo "::error::Refusing recovery: changed path $changed_path is not release-only."
+                exit 1
+                ;;
+            esac
+          done < <(git diff --name-only "$BASE_COMMIT_SHA..$TAGGED_COMMIT_SHA")
 
   build-platform:
     name: Build ${{ matrix.npm-target }}

@@ -658,6 +658,55 @@ test('release workflow verifies the signed release tag before building or publis
   );
 });
 
+test('release workflow fail-closes signed recovery tags', () => {
+  const workflowPath = new URL(
+    ['..', '.github', 'workflows', 'release-npm.yml'].join('/'),
+    import.meta.url
+  );
+  const workflow = readFileSync(workflowPath, 'utf8');
+
+  assert.match(
+    workflow,
+    /node scripts\/release-npm-context\.mjs "\$GITHUB_REF_NAME"/,
+    'workflow must derive stable release context from the pushed signed tag'
+  );
+  assert.match(
+    workflow,
+    /outputs:[\s\S]*release_mode:[\s\S]*release_tag:[\s\S]*npm_version:/,
+    'verify-tag must expose validated release context to downstream jobs'
+  );
+  assert.match(
+    workflow,
+    /git verify-tag "\$RELEASE_TAG"/,
+    'recovery must locally verify the original stable release tag'
+  );
+  assert.match(
+    workflow,
+    /BASE_TAG_PAYLOAD=.*gh api/,
+    'recovery must query GitHub verification for the original release tag'
+  );
+  assert.match(
+    workflow,
+    /BASE_OBJECT_TYPE.*commit/s,
+    'recovery must reject a base tag that does not target a commit'
+  );
+  assert.match(
+    workflow,
+    /git merge-base --is-ancestor "\$BASE_COMMIT_SHA" "\$TAGGED_COMMIT_SHA"/,
+    'recovery tag must descend from the stable release tag'
+  );
+  assert.match(
+    workflow,
+    /git diff --name-only "\$BASE_COMMIT_SHA\.\.\$TAGGED_COMMIT_SHA"/,
+    'recovery must inspect every changed path after the stable release'
+  );
+  assert.match(
+    workflow,
+    /Refusing recovery: changed path/,
+    'recovery must fail closed on product or package drift'
+  );
+});
+
 test('release workflow triggers only on signed v* tag pushes (no workflow_dispatch fallback)', () => {
   const workflowPath = new URL(
     ['..', '.github', 'workflows', 'release-npm.yml'].join('/'),
