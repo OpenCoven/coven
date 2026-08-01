@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, size as terminal_cell_size, window_size,
 };
-use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, PtySize, PtySystem};
+use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize, PtySystem};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessCommand {
@@ -2215,6 +2215,36 @@ fn wait_for_child(child: &mut Box<dyn portable_pty::Child + Send + Sync>) -> Pty
     }
 }
 
+trait PtyResizeTarget: Send {
+    fn resize_pty(&self, size: PtySize) -> Result<()>;
+}
+
+impl PtyResizeTarget for Box<dyn MasterPty + Send> {
+    fn resize_pty(&self, size: PtySize) -> Result<()> {
+        self.resize(size)
+    }
+}
+
+// Task 3 removes this temporary allowance when the resize watcher is wired.
+#[allow(dead_code)]
+fn apply_pty_resize(
+    target: &dyn PtyResizeTarget,
+    current: &mut PtySize,
+    next: Option<PtySize>,
+) -> bool {
+    let Some(next) = next.and_then(valid_pty_size) else {
+        return true;
+    };
+    if next == *current {
+        return true;
+    }
+    if target.resize_pty(next).is_err() {
+        return false;
+    }
+    *current = next;
+    true
+}
+
 fn run_attached_with_pty_system(
     command: &HarnessCommand,
     pty_system: &(dyn PtySystem + Send),
@@ -2380,6 +2410,78 @@ mod tests {
             pixel_width,
             pixel_height,
         }
+    }
+
+    #[derive(Clone)]
+    struct RecordingResizeTarget {
+        sizes: Arc<Mutex<Vec<PtySize>>>,
+        fail: bool,
+    }
+
+    impl PtyResizeTarget for RecordingResizeTarget {
+        fn resize_pty(&self, size: PtySize) -> Result<()> {
+            if self.fail {
+                anyhow::bail!("synthetic resize failure");
+            }
+            self.sizes.lock().unwrap().push(size);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn pty_resize_ignores_missing_invalid_and_unchanged_samples() {
+        let sizes = Arc::new(Mutex::new(Vec::new()));
+        let target = RecordingResizeTarget {
+            sizes: Arc::clone(&sizes),
+            fail: false,
+        };
+        let initial = pty_size(24, 80, 0, 0);
+        let mut current = initial;
+
+        assert!(apply_pty_resize(&target, &mut current, None));
+        assert!(apply_pty_resize(
+            &target,
+            &mut current,
+            Some(pty_size(0, 120, 0, 0)),
+        ));
+        assert!(apply_pty_resize(&target, &mut current, Some(initial),));
+        assert!(sizes.lock().unwrap().is_empty());
+        assert_eq!(current, initial);
+    }
+
+    #[test]
+    fn pty_resize_applies_each_distinct_complete_geometry_once() {
+        let sizes = Arc::new(Mutex::new(Vec::new()));
+        let target = RecordingResizeTarget {
+            sizes: Arc::clone(&sizes),
+            fail: false,
+        };
+        let mut current = pty_size(24, 80, 0, 0);
+        let first = pty_size(40, 120, 1440, 800);
+        let second = pty_size(40, 120, 1680, 900);
+
+        assert!(apply_pty_resize(&target, &mut current, Some(first)));
+        assert!(apply_pty_resize(&target, &mut current, Some(first)));
+        assert!(apply_pty_resize(&target, &mut current, Some(second)));
+        assert_eq!(*sizes.lock().unwrap(), vec![first, second]);
+        assert_eq!(current, second);
+    }
+
+    #[test]
+    fn pty_resize_failure_stops_relay_without_advancing_geometry() {
+        let target = RecordingResizeTarget {
+            sizes: Arc::new(Mutex::new(Vec::new())),
+            fail: true,
+        };
+        let initial = pty_size(24, 80, 0, 0);
+        let mut current = initial;
+
+        assert!(!apply_pty_resize(
+            &target,
+            &mut current,
+            Some(pty_size(40, 120, 0, 0)),
+        ));
+        assert_eq!(current, initial);
     }
 
     #[test]
