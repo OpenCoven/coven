@@ -6,7 +6,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 #[test]
-fn source_boundaries_native_preview_reports_only_sorted_logical_labels() -> Result<()> {
+fn preview_native_reports_a_sorted_redacted_plan_without_creating_targets() -> Result<()> {
     let temp = trusted_tempdir()?;
     let workspace = temp.path().join("native-workspace");
     write_familiar(temp.path(), "sage", &workspace)?;
@@ -25,15 +25,38 @@ fn source_boundaries_native_preview_reports_only_sorted_logical_labels() -> Resu
     )?;
     assert_success(&output);
     let report: Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(report["status"], "discovered");
+    assert_eq!(report["status"], "preview");
     assert_eq!(report["familiar_id"], "sage");
     assert_eq!(report["source_kind"], "native");
+    assert_eq!(report["apply_eligible"], true);
+    assert_eq!(report["file_count"], 3);
+    assert_eq!(report["create_count"], 3);
+    assert_eq!(report["unchanged_count"], 0);
+    assert_eq!(report["conflict_count"], 0);
+    assert!(report["bundle_id"]
+        .as_str()
+        .is_some_and(|bundle| bundle.starts_with("blake3:") && bundle.len() == 71));
     assert_eq!(
         report["entries"],
         serde_json::json!([
-            {"source_label": "MEMORY.md"},
-            {"source_label": "memory/a.md"},
-            {"source_label": "notes/z.md"}
+            {
+                "logical_label": "MEMORY.md",
+                "target_name": "memory.md",
+                "digest": format!("blake3:{}", blake3::hash(b"root secret").to_hex()),
+                "status": "create"
+            },
+            {
+                "logical_label": "memory/a.md",
+                "target_name": "memory-a.md",
+                "digest": format!("blake3:{}", blake3::hash(b"a").to_hex()),
+                "status": "create"
+            },
+            {
+                "logical_label": "notes/z.md",
+                "target_name": "notes-z.md",
+                "digest": format!("blake3:{}", blake3::hash(b"z").to_hex()),
+                "status": "create"
+            }
         ])
     );
     let rendered = String::from_utf8(output.stdout)?;
@@ -45,15 +68,19 @@ fn source_boundaries_native_preview_reports_only_sorted_logical_labels() -> Resu
     let human = run_coven(temp.path(), &["memory", "import", "--familiar", "sage"])?;
     assert_success(&human);
     let human = String::from_utf8(human.stdout)?;
-    assert!(human.contains("Discovery only"), "{human}");
+    assert!(human.contains("Preview"), "{human}");
     assert!(human.contains("memory/a.md"), "{human}");
+    assert!(human.contains("memory-a.md"), "{human}");
+    assert!(human.contains("Bundle: blake3:"), "{human}");
+    assert!(human.contains("eligible"), "{human}");
     assert!(!human.contains("root secret"), "{human}");
     assert!(!human.contains(&workspace.to_string_lossy().into_owned()));
+    assert!(!temp.path().join("memory").exists());
     Ok(())
 }
 
 #[test]
-fn source_boundaries_openclaw_preview_uses_explicit_root_and_target() -> Result<()> {
+fn preview_openclaw_uses_explicit_root_and_registered_target_without_leaks() -> Result<()> {
     let temp = trusted_tempdir()?;
     let workspace = temp.path().join("native-workspace");
     let openclaw = temp.path().join("openclaw-workspace");
@@ -81,16 +108,26 @@ fn source_boundaries_openclaw_preview_uses_explicit_root_and_target() -> Result<
     )?;
     assert_success(&output);
     let report: Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(report["status"], "discovered");
+    assert_eq!(report["status"], "preview");
     assert_eq!(report["familiar_id"], "sage");
     assert_eq!(report["source_kind"], "openclaw");
+    assert_eq!(report["apply_eligible"], true);
     assert_eq!(
-        report["entries"],
-        serde_json::json!([
-            {"source_label": "DREAMS.md"},
-            {"source_label": "MEMORY.md"},
-            {"source_label": "memory/topic.md"}
-        ])
+        report["entries"]
+            .as_array()
+            .expect("entries must be an array")
+            .iter()
+            .map(|entry| (
+                entry["logical_label"].as_str().unwrap(),
+                entry["target_name"].as_str().unwrap(),
+                entry["status"].as_str().unwrap()
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("DREAMS.md", "dreams.md", "create"),
+            ("MEMORY.md", "memory.md", "create"),
+            ("memory/topic.md", "memory-topic.md", "create")
+        ]
     );
     let rendered = String::from_utf8(output.stdout)?;
     for forbidden in [
@@ -104,6 +141,102 @@ fn source_boundaries_openclaw_preview_uses_explicit_root_and_target() -> Result<
     ] {
         assert!(!rendered.contains(forbidden), "leaked {forbidden:?}");
     }
+
+    let human = run_coven(
+        temp.path(),
+        &[
+            "memory",
+            "import",
+            "--familiar",
+            "sage",
+            "--source",
+            "openclaw",
+            "--openclaw-root",
+            openclaw.to_str().expect("fixture path is UTF-8"),
+        ],
+    )?;
+    assert_success(&human);
+    let human = String::from_utf8(human.stdout)?;
+    assert!(human.contains("Preview for familiar `sage`"), "{human}");
+    assert!(human.contains("DREAMS.md -> dreams.md [create]"), "{human}");
+    assert!(human.contains("Bundle: blake3:"), "{human}");
+    assert!(!human.contains("dream secret"), "{human}");
+    assert!(!human.contains(openclaw.to_str().expect("fixture path is UTF-8")));
+    assert!(!temp.path().join("memory").exists());
+    Ok(())
+}
+
+#[test]
+fn preview_conflict_is_whole_plan_ineligible_and_creates_nothing() -> Result<()> {
+    let temp = trusted_tempdir()?;
+    let workspace = temp.path().join("native-workspace");
+    write_familiar(temp.path(), "sage", &workspace)?;
+    write_file(&workspace.join("MEMORY.md"), b"new bytes")?;
+    write_file(&workspace.join("notes/new.md"), b"create bytes")?;
+    write_file(&temp.path().join("memory/sage/memory.md"), b"old bytes")?;
+
+    let output = run_coven(
+        temp.path(),
+        &["memory", "import", "--familiar", "sage", "--json"],
+    )?;
+    assert_success(&output);
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+
+    assert_eq!(report["status"], "conflict");
+    assert_eq!(report["apply_eligible"], false);
+    assert_eq!(report["create_count"], 1);
+    assert_eq!(report["conflict_count"], 1);
+    assert_eq!(report["entries"][0]["status"], "conflict");
+    assert_eq!(report["entries"][1]["status"], "create");
+    assert!(!temp.path().join("memory/sage/notes-new.md").exists());
+    assert!(!temp.path().join("memory-import").exists());
+    assert!(!temp.path().join("journal").exists());
+    Ok(())
+}
+
+#[test]
+fn apply_remains_not_implemented_and_does_not_create_preview_outputs() -> Result<()> {
+    let temp = trusted_tempdir()?;
+    let workspace = temp.path().join("native-workspace");
+    write_familiar(temp.path(), "sage", &workspace)?;
+    write_file(&workspace.join("MEMORY.md"), b"secret")?;
+
+    let output = run_coven(
+        temp.path(),
+        &["memory", "import", "--familiar", "sage", "--apply"],
+    )?;
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("apply is not implemented yet"), "{stderr}");
+    assert!(!stderr.contains("secret"));
+    assert!(!temp.path().join("memory").exists());
+    assert!(!temp.path().join("memory-import").exists());
+    Ok(())
+}
+
+#[test]
+fn restore_remains_not_implemented() -> Result<()> {
+    let temp = trusted_tempdir()?;
+    let output = run_coven(
+        temp.path(),
+        &[
+            "memory",
+            "restore",
+            "--familiar",
+            "sage",
+            "--bundle",
+            "blake3:example",
+        ],
+    )?;
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("restore is not implemented yet"),
+        "{stderr}"
+    );
+    assert!(!temp.path().join("memory").exists());
     Ok(())
 }
 

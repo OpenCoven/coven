@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Read};
@@ -6,12 +7,13 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{anyhow, bail, Result};
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
 use cap_std::ambient_authority;
-#[cfg(windows)]
+#[cfg(any(unix, windows))]
 use cap_std::fs::MetadataExt;
 #[cfg(unix)]
 use cap_std::fs::OpenOptionsExt;
 use cap_std::fs::{Dir, OpenOptions};
 use serde::{Deserialize, Serialize};
+use unicode_normalization::UnicodeNormalization;
 
 const MAX_SOURCE_FILES: usize = 256;
 const MAX_AGGREGATE_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
@@ -35,48 +37,39 @@ pub(crate) enum MemoryImportSourceKind {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-#[allow(dead_code)]
-pub(crate) enum MemoryImportStatus {
+pub(crate) enum ImportPlanStatus {
     Preview,
-    Applied,
-    Restored,
     Conflict,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-#[allow(dead_code)]
-pub(crate) enum MemoryImportEntryStatus {
-    Planned,
-    Created,
+pub(crate) enum PlanEntryStatus {
+    Create,
     Unchanged,
-    Restored,
     Conflict,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[allow(dead_code)]
-pub(crate) struct MemoryImportEntry {
-    pub(crate) source_label: String,
+pub(crate) struct PlanEntry {
+    pub(crate) logical_label: String,
     pub(crate) target_name: String,
     pub(crate) digest: String,
-    pub(crate) status: MemoryImportEntryStatus,
+    pub(crate) status: PlanEntryStatus,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[allow(dead_code)]
-pub(crate) struct MemoryImportReport {
+pub(crate) struct ImportPlan {
     pub(crate) familiar_id: String,
     pub(crate) source_kind: MemoryImportSourceKind,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) bundle_id: Option<String>,
-    pub(crate) status: MemoryImportStatus,
+    pub(crate) bundle_id: String,
+    pub(crate) status: ImportPlanStatus,
+    pub(crate) apply_eligible: bool,
     pub(crate) file_count: usize,
-    pub(crate) created_count: usize,
+    pub(crate) create_count: usize,
     pub(crate) unchanged_count: usize,
-    pub(crate) restored_count: usize,
     pub(crate) conflict_count: usize,
-    pub(crate) entries: Vec<MemoryImportEntry>,
+    pub(crate) entries: Vec<PlanEntry>,
 }
 
 #[derive(Clone, Copy)]
@@ -525,18 +518,517 @@ fn windows_attributes_are_reparse_point(attributes: u32) -> bool {
     attributes & WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
-#[derive(Serialize)]
-struct DiscoveryReport<'a> {
-    familiar_id: &'a str,
-    source_kind: MemoryImportSourceKind,
-    status: &'static str,
-    file_count: usize,
-    entries: Vec<DiscoveryReportEntry<'a>>,
+struct ProposedEntry<'a> {
+    source: &'a DiscoveredSource,
+    target_name: String,
+    digest: String,
 }
 
-#[derive(Serialize)]
-struct DiscoveryReportEntry<'a> {
-    source_label: &'a str,
+enum TargetRoot {
+    Missing,
+    Unsafe,
+    Ready(Dir),
+}
+
+pub(crate) fn build_import_plan(
+    coven_home: &Path,
+    familiar: &str,
+    source_kind: MemoryImportSourceKind,
+    discovered: &[DiscoveredSource],
+) -> Result<ImportPlan> {
+    validate_familiar_component(familiar)?;
+    validate_registered_familiar(coven_home, familiar)?;
+
+    let mut sorted = discovered.iter().collect::<Vec<_>>();
+    sorted.sort_by(|left, right| left.source_label.cmp(&right.source_label));
+    let mut logical_keys = HashSet::with_capacity(sorted.len());
+    for source in &sorted {
+        validate_logical_label(&source.source_label)?;
+        if !logical_keys.insert(crate::ward::portable_surface_key(&source.source_label)) {
+            bail!("logical label collision in discovered sources");
+        }
+    }
+
+    let mut base_names = Vec::with_capacity(sorted.len());
+    let mut base_counts = HashMap::with_capacity(sorted.len());
+    for source in &sorted {
+        let (stem, lossy) = normalized_target_stem(&source.source_label);
+        let base_name = format!("{stem}.md");
+        *base_counts
+            .entry(crate::ward::portable_surface_key(&base_name))
+            .or_insert(0_usize) += 1;
+        base_names.push((base_name, lossy));
+    }
+
+    let mut proposed = Vec::with_capacity(sorted.len());
+    for (source, (base_name, lossy)) in sorted.into_iter().zip(base_names) {
+        let base_key = crate::ward::portable_surface_key(&base_name);
+        let base_stem = base_name
+            .strip_suffix(".md")
+            .expect("planner always creates Markdown names");
+        let needs_suffix = lossy || base_counts[&base_key] > 1 || is_windows_device_stem(base_stem);
+        let target_name = if needs_suffix {
+            let label_digest = blake3::hash(source.source_label.as_bytes()).to_hex();
+            let suffix = &label_digest.as_str()[..12];
+            format!("{}-{suffix}.md", truncate_ascii_stem(base_stem, 96))
+        } else {
+            base_name
+        };
+        validate_target_name(&target_name)?;
+        proposed.push(ProposedEntry {
+            source,
+            target_name,
+            digest: blake3_digest(&source.bytes),
+        });
+    }
+    validate_unique_target_names(
+        &proposed
+            .iter()
+            .map(|entry| entry.target_name.clone())
+            .collect::<Vec<_>>(),
+    )?;
+
+    let bundle_id = bundle_id(familiar, source_kind, &proposed);
+    let target_root = inspect_target_root(coven_home, familiar);
+    let statuses = inspect_proposed_targets(&target_root, &proposed);
+    let entries = proposed
+        .into_iter()
+        .zip(statuses)
+        .map(|(proposed, status)| PlanEntry {
+            logical_label: proposed.source.source_label.clone(),
+            target_name: proposed.target_name,
+            digest: proposed.digest,
+            status,
+        })
+        .collect::<Vec<_>>();
+    let create_count = entries
+        .iter()
+        .filter(|entry| entry.status == PlanEntryStatus::Create)
+        .count();
+    let unchanged_count = entries
+        .iter()
+        .filter(|entry| entry.status == PlanEntryStatus::Unchanged)
+        .count();
+    let conflict_count = entries
+        .iter()
+        .filter(|entry| entry.status == PlanEntryStatus::Conflict)
+        .count();
+    let apply_eligible = conflict_count == 0;
+
+    Ok(ImportPlan {
+        familiar_id: familiar.to_owned(),
+        source_kind,
+        bundle_id,
+        status: if apply_eligible {
+            ImportPlanStatus::Preview
+        } else {
+            ImportPlanStatus::Conflict
+        },
+        apply_eligible,
+        file_count: entries.len(),
+        create_count,
+        unchanged_count,
+        conflict_count,
+        entries,
+    })
+}
+
+fn validate_familiar_component(familiar: &str) -> Result<()> {
+    let valid = !familiar.is_empty()
+        && familiar.len() <= 64
+        && familiar
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        && !is_windows_device_stem(familiar);
+    if !valid {
+        bail!("familiar ID must be a safe single component");
+    }
+    Ok(())
+}
+
+fn validate_registered_familiar(coven_home: &Path, familiar: &str) -> Result<()> {
+    let registered = crate::cockpit_sources::read_familiars(coven_home)
+        .map_err(|_| anyhow!("unable to read familiar registry"))?
+        .into_iter()
+        .any(|candidate| candidate.id == familiar);
+    if !registered {
+        bail!("unknown familiar `{familiar}`");
+    }
+    Ok(())
+}
+
+fn validate_logical_label(label: &str) -> Result<()> {
+    let valid = !label.is_empty()
+        && !label.starts_with('/')
+        && !label.ends_with('/')
+        && !label.contains(['\\', ':'])
+        && !label.chars().any(char::is_control)
+        && label.ends_with(".md")
+        && label
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..");
+    if !valid {
+        bail!("discovered source has an invalid logical label");
+    }
+    Ok(())
+}
+
+fn normalized_target_stem(label: &str) -> (String, bool) {
+    use unicode_normalization::char::is_combining_mark;
+
+    let logical_stem = label
+        .strip_suffix(".md")
+        .expect("validated logical labels retain .md");
+    let mut normalized = String::new();
+    let mut separator_pending = false;
+    let mut lossy = false;
+    for original in logical_stem.chars() {
+        let mut original_had_ascii_alphanumeric = false;
+        let mut original_was_only_combining = true;
+        for character in original.to_string().nfkd() {
+            if character.is_ascii_alphanumeric() {
+                if separator_pending && !normalized.is_empty() {
+                    normalized.push('-');
+                }
+                separator_pending = false;
+                normalized.push(character.to_ascii_lowercase());
+                original_had_ascii_alphanumeric = true;
+                original_was_only_combining = false;
+            } else if is_combining_mark(character) {
+                continue;
+            } else {
+                separator_pending = true;
+                original_was_only_combining = false;
+            }
+        }
+        if !original.is_ascii() && !original_had_ascii_alphanumeric && !original_was_only_combining
+        {
+            lossy = true;
+        }
+    }
+    let normalized = normalized.trim_matches('-');
+    if normalized.is_empty() {
+        ("memory".to_owned(), true)
+    } else {
+        (truncate_ascii_stem(normalized, 108).to_owned(), lossy)
+    }
+}
+
+fn truncate_ascii_stem(stem: &str, max_len: usize) -> &str {
+    let end = stem.len().min(max_len);
+    stem[..end].trim_end_matches('-')
+}
+
+fn validate_target_name(name: &str) -> Result<()> {
+    let stem = name.strip_suffix(".md").unwrap_or_default();
+    let valid = name.is_ascii()
+        && !stem.is_empty()
+        && name.len() <= 128
+        && Path::new(name).components().count() == 1
+        && name != "."
+        && name != ".."
+        && !name.contains(['/', '\\', ':'])
+        && !name.ends_with(['.', ' '])
+        && !name.chars().any(char::is_control)
+        && !is_windows_device_stem(stem);
+    if !valid {
+        bail!("planner generated an unsafe target name");
+    }
+    Ok(())
+}
+
+fn validate_unique_target_names(names: &[String]) -> Result<()> {
+    let mut keys = HashSet::with_capacity(names.len());
+    for name in names {
+        if !keys.insert(crate::ward::portable_surface_key(name)) {
+            bail!("target-name collision in import plan");
+        }
+    }
+    for name in names {
+        validate_target_name(name)?;
+    }
+    Ok(())
+}
+
+fn is_windows_device_stem(stem: &str) -> bool {
+    matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
+fn blake3_digest(bytes: &[u8]) -> String {
+    format!("blake3:{}", blake3::hash(bytes).to_hex())
+}
+
+fn bundle_id(
+    familiar: &str,
+    source_kind: MemoryImportSourceKind,
+    entries: &[ProposedEntry<'_>],
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    update_framed(&mut hasher, b"coven-memory-import-plan-v1");
+    update_framed(&mut hasher, familiar.as_bytes());
+    update_framed(
+        &mut hasher,
+        match source_kind {
+            MemoryImportSourceKind::Native => b"native",
+            MemoryImportSourceKind::Openclaw => b"openclaw",
+        },
+    );
+    hasher.update(&(entries.len() as u64).to_le_bytes());
+    for entry in entries {
+        update_framed(&mut hasher, entry.source.source_label.as_bytes());
+        update_framed(&mut hasher, entry.target_name.as_bytes());
+        update_framed(&mut hasher, entry.digest.as_bytes());
+    }
+    format!("blake3:{}", hasher.finalize().to_hex())
+}
+
+fn update_framed(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+fn inspect_target_root(coven_home: &Path, familiar: &str) -> TargetRoot {
+    let coven_dir = match open_dir_path_nofollow(coven_home) {
+        Ok(directory) => directory,
+        Err(_) => return TargetRoot::Unsafe,
+    };
+    let memory_metadata = match coven_dir.symlink_metadata("memory") {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return TargetRoot::Missing,
+        Err(_) => return TargetRoot::Unsafe,
+    };
+    if !memory_metadata.is_dir() || metadata_is_windows_reparse_point(&memory_metadata) {
+        return TargetRoot::Unsafe;
+    }
+    let memory_dir = match coven_dir.open_dir_nofollow("memory") {
+        Ok(directory) => directory,
+        Err(_) => return TargetRoot::Unsafe,
+    };
+    let opened_memory_metadata = match memory_dir.dir_metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return TargetRoot::Unsafe,
+    };
+    if !opened_memory_metadata.is_dir()
+        || metadata_is_windows_reparse_point(&opened_memory_metadata)
+    {
+        return TargetRoot::Unsafe;
+    }
+
+    let familiar_key = crate::ward::portable_surface_key(familiar);
+    let memory_entries = match memory_dir.entries() {
+        Ok(entries) => entries,
+        Err(_) => return TargetRoot::Unsafe,
+    };
+    for entry in memory_entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => return TargetRoot::Unsafe,
+        };
+        let Some(name) = entry.file_name().into_string().ok() else {
+            continue;
+        };
+        if crate::ward::portable_surface_key(&name) == familiar_key && name != familiar {
+            return TargetRoot::Unsafe;
+        }
+    }
+
+    let familiar_metadata = match memory_dir.symlink_metadata(familiar) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return TargetRoot::Missing,
+        Err(_) => return TargetRoot::Unsafe,
+    };
+    if !familiar_metadata.is_dir() || metadata_is_windows_reparse_point(&familiar_metadata) {
+        return TargetRoot::Unsafe;
+    }
+    let familiar_dir = match memory_dir.open_dir_nofollow(familiar) {
+        Ok(directory) => directory,
+        Err(_) => return TargetRoot::Unsafe,
+    };
+    let opened_familiar_metadata = match familiar_dir.dir_metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return TargetRoot::Unsafe,
+    };
+    if !opened_familiar_metadata.is_dir()
+        || metadata_is_windows_reparse_point(&opened_familiar_metadata)
+    {
+        return TargetRoot::Unsafe;
+    }
+    TargetRoot::Ready(familiar_dir)
+}
+
+fn inspect_proposed_targets(
+    target_root: &TargetRoot,
+    proposed: &[ProposedEntry<'_>],
+) -> Vec<PlanEntryStatus> {
+    match target_root {
+        TargetRoot::Missing => vec![PlanEntryStatus::Create; proposed.len()],
+        TargetRoot::Unsafe => vec![PlanEntryStatus::Conflict; proposed.len()],
+        TargetRoot::Ready(directory) => inspect_ready_target_root(directory, proposed),
+    }
+}
+
+fn inspect_ready_target_root(
+    directory: &Dir,
+    proposed: &[ProposedEntry<'_>],
+) -> Vec<PlanEntryStatus> {
+    let entries = match directory.entries() {
+        Ok(entries) => entries,
+        Err(_) => return vec![PlanEntryStatus::Conflict; proposed.len()],
+    };
+    let mut existing_names: HashMap<String, Vec<String>> = HashMap::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => return vec![PlanEntryStatus::Conflict; proposed.len()],
+        };
+        let Some(name) = entry.file_name().into_string().ok() else {
+            continue;
+        };
+        existing_names
+            .entry(crate::ward::portable_surface_key(&name))
+            .or_default()
+            .push(name);
+    }
+
+    proposed
+        .iter()
+        .map(|entry| {
+            let key = crate::ward::portable_surface_key(&entry.target_name);
+            let Some(matches) = existing_names.get(&key) else {
+                return PlanEntryStatus::Create;
+            };
+            if matches.len() != 1 || matches[0] != entry.target_name {
+                return PlanEntryStatus::Conflict;
+            }
+            inspect_existing_target(directory, entry)
+        })
+        .collect()
+}
+
+fn inspect_existing_target(directory: &Dir, proposed: &ProposedEntry<'_>) -> PlanEntryStatus {
+    let metadata = match directory.symlink_metadata(&proposed.target_name) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return PlanEntryStatus::Create,
+        Err(_) => return PlanEntryStatus::Conflict,
+    };
+    if !metadata.is_file()
+        || metadata_is_windows_reparse_point(&metadata)
+        || metadata.len() > crate::cockpit_sources::MEMORY_CONTENT_MAX_BYTES
+    {
+        return PlanEntryStatus::Conflict;
+    }
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .follow(FollowSymlinks::No)
+        .maybe_dir(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK);
+    let mut file = match directory.open_with(&proposed.target_name, &options) {
+        Ok(file) => file,
+        Err(_) => return PlanEntryStatus::Conflict,
+    };
+    let Some(digest) = digest_stable_opened_file(&mut file) else {
+        return PlanEntryStatus::Conflict;
+    };
+    if digest == proposed.digest {
+        PlanEntryStatus::Unchanged
+    } else {
+        PlanEntryStatus::Conflict
+    }
+}
+
+fn digest_stable_opened_file(file: &mut cap_std::fs::File) -> Option<String> {
+    let before = file.metadata().ok()?;
+    if !before.is_file()
+        || metadata_is_windows_reparse_point(&before)
+        || before.len() > crate::cockpit_sources::MEMORY_CONTENT_MAX_BYTES
+    {
+        return None;
+    }
+
+    let digest = digest_exact_length_stream(file, before.len())?;
+    let after = file.metadata().ok()?;
+    if !after.is_file()
+        || metadata_is_windows_reparse_point(&after)
+        || after.len() != before.len()
+        || !opened_metadata_stable(&before, &after)
+    {
+        return None;
+    }
+    Some(digest)
+}
+
+fn digest_exact_length_stream<R: Read>(reader: &mut R, expected_len: u64) -> Option<String> {
+    if expected_len > crate::cockpit_sources::MEMORY_CONTENT_MAX_BYTES {
+        return None;
+    }
+    let mut hasher = blake3::Hasher::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        total = total.checked_add(read as u64)?;
+        if total > expected_len || total > crate::cockpit_sources::MEMORY_CONTENT_MAX_BYTES {
+            return None;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if total != expected_len {
+        return None;
+    }
+    Some(format!("blake3:{}", hasher.finalize().to_hex()))
+}
+
+#[cfg(unix)]
+fn opened_metadata_stable(before: &cap_std::fs::Metadata, after: &cap_std::fs::Metadata) -> bool {
+    before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.size() == after.size()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
+}
+
+#[cfg(windows)]
+fn opened_metadata_stable(before: &cap_std::fs::Metadata, after: &cap_std::fs::Metadata) -> bool {
+    before.creation_time() == after.creation_time()
+        && before.last_write_time() == after.last_write_time()
+        && before.file_size() == after.file_size()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn opened_metadata_stable(before: &cap_std::fs::Metadata, after: &cap_std::fs::Metadata) -> bool {
+    before.len() == after.len() && before.modified().ok() == after.modified().ok()
 }
 
 pub(crate) fn run_import(
@@ -558,30 +1050,33 @@ pub(crate) fn run_import(
             openclaw_root,
         },
     )?;
-    let report = DiscoveryReport {
-        familiar_id: familiar,
-        source_kind: source,
-        status: "discovered",
-        file_count: discovered.len(),
-        entries: discovered
-            .iter()
-            .map(|source| DiscoveryReportEntry {
-                source_label: &source.source_label,
-            })
-            .collect(),
-    };
+    let plan = build_import_plan(&coven_home, familiar, source, &discovered)?;
 
     if json {
-        println!("{}", serde_json::to_string(&report)?);
+        println!("{}", serde_json::to_string(&plan)?);
     } else {
         println!(
-            "Discovered {} source file(s) for familiar `{familiar}`.",
-            report.file_count
+            "Preview for familiar `{familiar}`: {} file(s), {} create, {} unchanged, {} conflict.",
+            plan.file_count, plan.create_count, plan.unchanged_count, plan.conflict_count
         );
-        for entry in &report.entries {
-            println!("- {}", entry.source_label);
+        println!("Bundle: {}", plan.bundle_id);
+        for entry in &plan.entries {
+            println!(
+                "- {} -> {} [{}]",
+                entry.logical_label,
+                entry.target_name,
+                match entry.status {
+                    PlanEntryStatus::Create => "create",
+                    PlanEntryStatus::Unchanged => "unchanged",
+                    PlanEntryStatus::Conflict => "conflict",
+                }
+            );
         }
-        println!("Discovery only; import planning and filesystem changes are not implemented.");
+        if plan.apply_eligible {
+            println!("Plan is apply-eligible; no files or directories were created.");
+        } else {
+            println!("Plan is not apply-eligible; no files or directories were created.");
+        }
     }
     Ok(())
 }
@@ -603,22 +1098,22 @@ mod tests {
     const EXPECTED_MAX_VISITED_DIRECTORIES: usize = 256;
 
     #[test]
-    fn memory_import_report_json_is_stable_and_redacted() {
-        let report = MemoryImportReport {
+    fn import_plan_json_is_stable_and_redacted() {
+        let report = ImportPlan {
             familiar_id: "sage".to_owned(),
             source_kind: MemoryImportSourceKind::Openclaw,
-            bundle_id: Some("bundle-1".to_owned()),
-            status: MemoryImportStatus::Preview,
+            bundle_id: "blake3:bundle-1".to_owned(),
+            status: ImportPlanStatus::Preview,
+            apply_eligible: true,
             file_count: 1,
-            created_count: 0,
+            create_count: 1,
             unchanged_count: 0,
-            restored_count: 0,
             conflict_count: 0,
-            entries: vec![MemoryImportEntry {
-                source_label: "memory/notes.md".to_owned(),
+            entries: vec![PlanEntry {
+                logical_label: "memory/notes.md".to_owned(),
                 target_name: "openclaw-notes.md".to_owned(),
                 digest: "blake3:abc123".to_owned(),
-                status: MemoryImportEntryStatus::Planned,
+                status: PlanEntryStatus::Create,
             }],
         };
 
@@ -626,32 +1121,31 @@ mod tests {
         assert_eq!(value["familiar_id"], "sage");
         assert_eq!(value["source_kind"], "openclaw");
         assert_eq!(value["status"], "preview");
-        assert_eq!(value["entries"][0]["status"], "planned");
+        assert_eq!(value["entries"][0]["status"], "create");
 
         let json = serde_json::to_string(&report).expect("report must serialize");
-        for forbidden in ["content", "source_path", "absolute_path"] {
+        for forbidden in ["content", "source_path", "absolute_path", "bytes"] {
             assert!(
                 !json.contains(forbidden),
                 "serialized report leaked forbidden value {forbidden:?}: {json}"
             );
         }
 
-        let decoded: MemoryImportReport =
-            serde_json::from_str(&json).expect("report must deserialize");
+        let decoded: ImportPlan = serde_json::from_str(&json).expect("report must deserialize");
         assert_eq!(decoded, report);
     }
 
     #[test]
-    fn memory_import_report_json_omits_absent_bundle_id_without_path_fields() {
-        let report = MemoryImportReport {
+    fn empty_import_plan_has_a_bound_bundle_without_path_fields() {
+        let report = ImportPlan {
             familiar_id: "sage".to_owned(),
             source_kind: MemoryImportSourceKind::Native,
-            bundle_id: None,
-            status: MemoryImportStatus::Preview,
+            bundle_id: "blake3:empty".to_owned(),
+            status: ImportPlanStatus::Preview,
+            apply_eligible: true,
             file_count: 0,
-            created_count: 0,
+            create_count: 0,
             unchanged_count: 0,
-            restored_count: 0,
             conflict_count: 0,
             entries: Vec::new(),
         };
@@ -660,7 +1154,7 @@ mod tests {
         let object = value
             .as_object()
             .expect("report must serialize as an object");
-        assert!(!object.contains_key("bundle_id"));
+        assert_eq!(object["bundle_id"], "blake3:empty");
         assert!(!object.contains_key("content"));
         assert!(!object.contains_key("source_path"));
         assert!(!object.contains_key("openclaw_root"));
@@ -1136,6 +1630,601 @@ mod tests {
         assert!(!format!("{error:#}").contains("depth overflow secret"));
         assert!(!format!("{error:#}").contains(&temp.path().to_string_lossy().into_owned()));
         Ok(())
+    }
+
+    #[test]
+    fn plans_use_canonical_flat_targets_and_exact_blake3_digests_without_mutation() -> Result<()> {
+        let temp = trusted_tempdir()?;
+        let workspace = temp.path().join("workspace");
+        write_registered_familiars(temp.path(), &[("sage", &workspace)])?;
+        write_file(&temp.path().join("memory.md"), b"wrong location")?;
+        write_file(
+            &temp.path().join("memory/other/memory-notes.md"),
+            b"wrong familiar",
+        )?;
+        let sources = vec![
+            DiscoveredSource {
+                source_label: "memory/notes.md".to_owned(),
+                bytes: b"nested".to_vec(),
+            },
+            DiscoveredSource {
+                source_label: "MEMORY.md".to_owned(),
+                bytes: b"abc".to_vec(),
+            },
+        ];
+
+        let plan = build_import_plan(
+            temp.path(),
+            "sage",
+            MemoryImportSourceKind::Native,
+            &sources,
+        )?;
+
+        assert_eq!(plan.status, ImportPlanStatus::Preview);
+        assert!(plan.apply_eligible);
+        assert_eq!(plan.create_count, 2);
+        assert_eq!(plan.unchanged_count, 0);
+        assert_eq!(plan.conflict_count, 0);
+        assert_eq!(
+            plan.entries
+                .iter()
+                .map(|entry| (
+                    entry.logical_label.as_str(),
+                    entry.target_name.as_str(),
+                    entry.status
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("MEMORY.md", "memory.md", PlanEntryStatus::Create),
+                (
+                    "memory/notes.md",
+                    "memory-notes.md",
+                    PlanEntryStatus::Create
+                )
+            ]
+        );
+        assert_eq!(
+            plan.entries[0].digest,
+            "blake3:6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
+        );
+        assert!(!temp.path().join("memory/sage").exists());
+        assert!(!temp.path().join("memory-import").exists());
+        assert!(!temp.path().join("journal").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn plans_flatten_collisions_and_reserved_names_with_stable_digest_suffixes() -> Result<()> {
+        let temp = trusted_tempdir()?;
+        let workspace = temp.path().join("workspace");
+        write_registered_familiars(temp.path(), &[("sage", &workspace)])?;
+        let sources = vec![
+            DiscoveredSource {
+                source_label: "memory/a-b.md".to_owned(),
+                bytes: b"one".to_vec(),
+            },
+            DiscoveredSource {
+                source_label: "memory/a/b.md".to_owned(),
+                bytes: b"two".to_vec(),
+            },
+            DiscoveredSource {
+                source_label: "CON.md".to_owned(),
+                bytes: b"three".to_vec(),
+            },
+            DiscoveredSource {
+                source_label: "notes/Caf\u{e9}.md".to_owned(),
+                bytes: b"four".to_vec(),
+            },
+        ];
+
+        let plan = build_import_plan(
+            temp.path(),
+            "sage",
+            MemoryImportSourceKind::Native,
+            &sources,
+        )?;
+        let names = plan
+            .entries
+            .iter()
+            .map(|entry| entry.target_name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names.len(), 4);
+        assert!(names[0].starts_with("con-") && names[0].ends_with(".md"));
+        assert!(names[1].starts_with("memory-a-b-") && names[1].ends_with(".md"));
+        assert!(names[2].starts_with("memory-a-b-") && names[2].ends_with(".md"));
+        assert_ne!(names[1], names[2]);
+        assert_eq!(names[3], "notes-cafe.md");
+        for name in names {
+            assert_portable_target_name(name);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn plans_are_independent_of_input_and_filesystem_enumeration_order() -> Result<()> {
+        let first = trusted_tempdir()?;
+        let second = trusted_tempdir()?;
+        for home in [first.path(), second.path()] {
+            let workspace = home.join("workspace");
+            write_registered_familiars(home, &[("sage", &workspace)])?;
+            fs::create_dir_all(home.join("memory/sage"))?;
+        }
+        write_file(&first.path().join("memory/sage/z.md"), b"unrelated")?;
+        write_file(&first.path().join("memory/sage/memory.md"), b"root")?;
+        write_file(&second.path().join("memory/sage/memory.md"), b"root")?;
+        write_file(&second.path().join("memory/sage/z.md"), b"unrelated")?;
+
+        let sources = vec![
+            DiscoveredSource {
+                source_label: "notes/z.md".to_owned(),
+                bytes: b"z".to_vec(),
+            },
+            DiscoveredSource {
+                source_label: "MEMORY.md".to_owned(),
+                bytes: b"root".to_vec(),
+            },
+            DiscoveredSource {
+                source_label: "memory/a.md".to_owned(),
+                bytes: b"a".to_vec(),
+            },
+        ];
+        let reversed = sources.iter().cloned().rev().collect::<Vec<_>>();
+
+        let first_plan = build_import_plan(
+            first.path(),
+            "sage",
+            MemoryImportSourceKind::Native,
+            &sources,
+        )?;
+        let second_plan = build_import_plan(
+            second.path(),
+            "sage",
+            MemoryImportSourceKind::Native,
+            &reversed,
+        )?;
+
+        assert_eq!(first_plan, second_plan);
+        assert_eq!(
+            first_plan
+                .entries
+                .iter()
+                .map(|entry| entry.status)
+                .collect::<Vec<_>>(),
+            vec![
+                PlanEntryStatus::Unchanged,
+                PlanEntryStatus::Create,
+                PlanEntryStatus::Create
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn plans_bundle_id_binds_familiar_source_labels_targets_and_exact_bytes() -> Result<()> {
+        let temp = trusted_tempdir()?;
+        let workspace = temp.path().join("workspace");
+        write_registered_familiars(temp.path(), &[("sage", &workspace), ("cody", &workspace)])?;
+        let base = vec![DiscoveredSource {
+            source_label: "MEMORY.md".to_owned(),
+            bytes: b"same".to_vec(),
+        }];
+        let same = build_import_plan(temp.path(), "sage", MemoryImportSourceKind::Native, &base)?;
+        let same_again =
+            build_import_plan(temp.path(), "sage", MemoryImportSourceKind::Native, &base)?;
+        assert_eq!(same.bundle_id, same_again.bundle_id);
+        assert!(same.bundle_id.starts_with("blake3:"));
+        let alternate_target = bundle_id(
+            "sage",
+            MemoryImportSourceKind::Native,
+            &[ProposedEntry {
+                source: &base[0],
+                target_name: "alternate.md".to_owned(),
+                digest: blake3_digest(&base[0].bytes),
+            }],
+        );
+        assert_ne!(alternate_target, same.bundle_id);
+
+        let changed_bytes = vec![DiscoveredSource {
+            source_label: "MEMORY.md".to_owned(),
+            bytes: b"changed".to_vec(),
+        }];
+        let changed_label = vec![DiscoveredSource {
+            source_label: "notes/MEMORY.md".to_owned(),
+            bytes: b"same".to_vec(),
+        }];
+        let variants = [
+            build_import_plan(
+                temp.path(),
+                "sage",
+                MemoryImportSourceKind::Native,
+                &changed_bytes,
+            )?,
+            build_import_plan(
+                temp.path(),
+                "sage",
+                MemoryImportSourceKind::Native,
+                &changed_label,
+            )?,
+            build_import_plan(temp.path(), "cody", MemoryImportSourceKind::Native, &base)?,
+            build_import_plan(temp.path(), "sage", MemoryImportSourceKind::Openclaw, &base)?,
+        ];
+        assert!(variants
+            .iter()
+            .all(|variant| variant.bundle_id != same.bundle_id));
+        Ok(())
+    }
+
+    #[test]
+    fn plans_classify_exact_files_and_make_any_conflict_whole_plan_conflict() -> Result<()> {
+        let temp = trusted_tempdir()?;
+        let workspace = temp.path().join("workspace");
+        write_registered_familiars(temp.path(), &[("sage", &workspace)])?;
+        write_file(&temp.path().join("memory/sage/memory.md"), b"same")?;
+        write_file(&temp.path().join("memory/sage/memory-divergent.md"), b"old")?;
+        let sources = vec![
+            DiscoveredSource {
+                source_label: "MEMORY.md".to_owned(),
+                bytes: b"same".to_vec(),
+            },
+            DiscoveredSource {
+                source_label: "memory/divergent.md".to_owned(),
+                bytes: b"new".to_vec(),
+            },
+            DiscoveredSource {
+                source_label: "notes/new.md".to_owned(),
+                bytes: b"create".to_vec(),
+            },
+        ];
+
+        let plan = build_import_plan(
+            temp.path(),
+            "sage",
+            MemoryImportSourceKind::Native,
+            &sources,
+        )?;
+
+        assert_eq!(plan.status, ImportPlanStatus::Conflict);
+        assert!(!plan.apply_eligible);
+        assert_eq!(plan.create_count, 1);
+        assert_eq!(plan.unchanged_count, 1);
+        assert_eq!(plan.conflict_count, 1);
+        assert_eq!(
+            plan.entries
+                .iter()
+                .map(|entry| entry.status)
+                .collect::<Vec<_>>(),
+            vec![
+                PlanEntryStatus::Unchanged,
+                PlanEntryStatus::Conflict,
+                PlanEntryStatus::Create
+            ]
+        );
+        assert!(!temp.path().join("memory/sage/notes-new.md").exists());
+        assert!(!temp.path().join("memory-import").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plans_treat_symlink_nonregular_and_case_colliding_targets_as_conflicts() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+
+        let temp = trusted_tempdir()?;
+        let workspace = temp.path().join("workspace");
+        write_registered_familiars(temp.path(), &[("sage", &workspace)])?;
+        fs::create_dir_all(temp.path().join("memory/sage"))?;
+        write_file(&temp.path().join("outside.md"), b"same")?;
+        symlink(
+            temp.path().join("outside.md"),
+            temp.path().join("memory/sage/memory-link.md"),
+        )?;
+        let socket = UnixListener::bind(temp.path().join("memory/sage/memory-socket.md"))?;
+        write_file(&temp.path().join("memory/sage/Notes-Case.md"), b"same")?;
+        let sources = vec![
+            DiscoveredSource {
+                source_label: "memory/link.md".to_owned(),
+                bytes: b"same".to_vec(),
+            },
+            DiscoveredSource {
+                source_label: "memory/socket.md".to_owned(),
+                bytes: b"same".to_vec(),
+            },
+            DiscoveredSource {
+                source_label: "notes/case.md".to_owned(),
+                bytes: b"same".to_vec(),
+            },
+        ];
+
+        let plan = build_import_plan(
+            temp.path(),
+            "sage",
+            MemoryImportSourceKind::Native,
+            &sources,
+        )?;
+        drop(socket);
+
+        assert_eq!(plan.status, ImportPlanStatus::Conflict);
+        assert_eq!(plan.conflict_count, 3);
+        assert!(plan
+            .entries
+            .iter()
+            .all(|entry| entry.status == PlanEntryStatus::Conflict));
+        Ok(())
+    }
+
+    #[test]
+    fn plans_reject_duplicate_normalized_labels_and_unsafe_familiars_before_inspection(
+    ) -> Result<()> {
+        let temp = trusted_tempdir()?;
+        let workspace = temp.path().join("workspace");
+        write_registered_familiars(
+            temp.path(),
+            &[("sage", &workspace), ("../sage", &workspace)],
+        )?;
+        let duplicate = vec![
+            DiscoveredSource {
+                source_label: "notes/Caf\u{e9}.md".to_owned(),
+                bytes: b"one".to_vec(),
+            },
+            DiscoveredSource {
+                source_label: "notes/CAFE\u{301}.md".to_owned(),
+                bytes: b"two".to_vec(),
+            },
+        ];
+
+        let duplicate_error = build_import_plan(
+            temp.path(),
+            "sage",
+            MemoryImportSourceKind::Native,
+            &duplicate,
+        )
+        .expect_err("Unicode normalization and case-fold collisions must fail");
+        assert!(
+            duplicate_error
+                .to_string()
+                .contains("logical label collision"),
+            "{duplicate_error:#}"
+        );
+
+        let exact_duplicate = vec![
+            DiscoveredSource {
+                source_label: "MEMORY.md".to_owned(),
+                bytes: b"one".to_vec(),
+            },
+            DiscoveredSource {
+                source_label: "MEMORY.md".to_owned(),
+                bytes: b"two".to_vec(),
+            },
+        ];
+        assert!(build_import_plan(
+            temp.path(),
+            "sage",
+            MemoryImportSourceKind::Native,
+            &exact_duplicate,
+        )
+        .expect_err("duplicate labels must fail")
+        .to_string()
+        .contains("logical label collision"));
+
+        let unsafe_error =
+            build_import_plan(temp.path(), "../sage", MemoryImportSourceKind::Native, &[])
+                .expect_err("unsafe registered familiar IDs must be rejected");
+        assert!(unsafe_error.to_string().contains("safe single component"));
+        assert!(!temp.path().join("memory").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn plans_reject_unregistered_internal_familiar_inputs() -> Result<()> {
+        let temp = trusted_tempdir()?;
+        let workspace = temp.path().join("workspace");
+        write_registered_familiars(temp.path(), &[("sage", &workspace)])?;
+
+        let error = build_import_plan(temp.path(), "unknown", MemoryImportSourceKind::Native, &[])
+            .expect_err("planner must independently verify registration");
+
+        assert_eq!(error.to_string(), "unknown familiar `unknown`");
+        assert!(!temp.path().join("memory").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn plans_existing_digest_rejects_streams_that_grow_or_shrink_from_opened_length() {
+        let mut exact = io::Cursor::new(b"abc");
+        assert_eq!(
+            digest_exact_length_stream(&mut exact, 3),
+            Some(
+                "blake3:6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
+                    .to_owned()
+            )
+        );
+
+        let mut grew = io::Cursor::new(b"abcd");
+        assert_eq!(digest_exact_length_stream(&mut grew, 3), None);
+
+        let mut shrank = io::Cursor::new(b"ab");
+        assert_eq!(digest_exact_length_stream(&mut shrank, 3), None);
+    }
+
+    #[test]
+    fn plans_target_name_validation_rejects_portable_collisions_and_unsafe_names() {
+        for names in [
+            vec!["notes.md".to_owned(), "NOTES.md".to_owned()],
+            vec!["caf\u{e9}.md".to_owned(), "CAFE\u{301}.md".to_owned()],
+        ] {
+            let error = validate_unique_target_names(&names)
+                .expect_err("case-folded target names must collide");
+            assert!(error.to_string().contains("target-name collision"));
+        }
+
+        for unsafe_name in [
+            ".",
+            "..",
+            "nested/name.md",
+            "nested\\name.md",
+            "CON.md",
+            "name.md ",
+            "name.\n.md",
+            "name.txt",
+        ] {
+            assert!(
+                validate_target_name(unsafe_name).is_err(),
+                "unsafe target name was accepted: {unsafe_name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plans_normalize_unusual_labels_to_ascii_safe_flat_names_or_fail_closed() -> Result<()> {
+        let temp = trusted_tempdir()?;
+        let workspace = temp.path().join("workspace");
+        write_registered_familiars(temp.path(), &[("sage", &workspace)])?;
+        let sources = vec![
+            DiscoveredSource {
+                source_label: "...md".to_owned(),
+                bytes: b"dots".to_vec(),
+            },
+            DiscoveredSource {
+                source_label: "NUL.md".to_owned(),
+                bytes: b"device".to_vec(),
+            },
+            DiscoveredSource {
+                source_label: "notes/\u{4e2d}\u{56fd}.md".to_owned(),
+                bytes: b"unicode".to_vec(),
+            },
+            DiscoveredSource {
+                source_label: "notes/trailing. .md".to_owned(),
+                bytes: b"portable".to_vec(),
+            },
+        ];
+        let plan = build_import_plan(
+            temp.path(),
+            "sage",
+            MemoryImportSourceKind::Native,
+            &sources,
+        )?;
+        assert_eq!(plan.entries.len(), 4);
+        for entry in &plan.entries {
+            assert_portable_target_name(&entry.target_name);
+        }
+        assert!(plan
+            .entries
+            .iter()
+            .any(|entry| entry.target_name.starts_with("nul-")));
+        assert!(plan
+            .entries
+            .iter()
+            .any(|entry| entry.target_name.starts_with("notes-") && entry.target_name.len() > 20));
+
+        for invalid_label in [
+            "../escape.md",
+            "notes/../escape.md",
+            "notes\\escape.md",
+            "notes//empty.md",
+            "notes/control\n.md",
+            "/absolute.md",
+        ] {
+            let invalid = vec![DiscoveredSource {
+                source_label: invalid_label.to_owned(),
+                bytes: b"secret".to_vec(),
+            }];
+            assert!(
+                build_import_plan(
+                    temp.path(),
+                    "sage",
+                    MemoryImportSourceKind::Native,
+                    &invalid,
+                )
+                .is_err(),
+                "invalid logical label was accepted: {invalid_label:?}"
+            );
+        }
+        assert!(!temp.path().join("memory").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plans_unsafe_target_roots_mark_every_entry_conflict_without_creation() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        for unsafe_kind in ["memory-symlink", "familiar-symlink", "memory-file"] {
+            let temp = trusted_tempdir()?;
+            let workspace = temp.path().join("workspace");
+            write_registered_familiars(temp.path(), &[("sage", &workspace)])?;
+            let outside = temp.path().join("outside");
+            fs::create_dir_all(&outside)?;
+            match unsafe_kind {
+                "memory-symlink" => symlink(&outside, temp.path().join("memory"))?,
+                "familiar-symlink" => {
+                    fs::create_dir_all(temp.path().join("memory"))?;
+                    symlink(&outside, temp.path().join("memory/sage"))?;
+                }
+                "memory-file" => write_file(&temp.path().join("memory"), b"not a directory")?,
+                _ => unreachable!(),
+            }
+            let sources = vec![DiscoveredSource {
+                source_label: "MEMORY.md".to_owned(),
+                bytes: b"secret".to_vec(),
+            }];
+
+            let plan = build_import_plan(
+                temp.path(),
+                "sage",
+                MemoryImportSourceKind::Native,
+                &sources,
+            )?;
+
+            assert_eq!(plan.status, ImportPlanStatus::Conflict);
+            assert!(!plan.apply_eligible);
+            assert_eq!(plan.conflict_count, 1);
+            assert_eq!(plan.entries[0].status, PlanEntryStatus::Conflict);
+            assert!(!outside.join("memory.md").exists());
+            assert!(!temp.path().join("memory-import").exists());
+        }
+        Ok(())
+    }
+
+    fn assert_portable_target_name(name: &str) {
+        assert!(name.is_ascii());
+        assert_eq!(Path::new(name).components().count(), 1);
+        assert_ne!(name, ".");
+        assert_ne!(name, "..");
+        assert!(name.ends_with(".md"));
+        assert!(!name.ends_with(['.', ' ']));
+        assert!(!name.chars().any(char::is_control));
+        assert!(!name.contains(['/', '\\', ':']));
+        let stem = name.trim_end_matches(".md").to_ascii_uppercase();
+        assert!(
+            !matches!(
+                stem.as_str(),
+                "CON"
+                    | "PRN"
+                    | "AUX"
+                    | "NUL"
+                    | "COM1"
+                    | "COM2"
+                    | "COM3"
+                    | "COM4"
+                    | "COM5"
+                    | "COM6"
+                    | "COM7"
+                    | "COM8"
+                    | "COM9"
+                    | "LPT1"
+                    | "LPT2"
+                    | "LPT3"
+                    | "LPT4"
+                    | "LPT5"
+                    | "LPT6"
+                    | "LPT7"
+                    | "LPT8"
+                    | "LPT9"
+            ),
+            "Windows device name leaked into target: {name}"
+        );
     }
 
     fn labels(sources: &[DiscoveredSource]) -> Vec<&str> {
