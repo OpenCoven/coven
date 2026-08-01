@@ -576,12 +576,24 @@ Then run:
 ```bash
 COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
+RECOVERY_WORKTREE="$REPO/.worktrees/coven-recovery-541-$ISSUE_NUMBER-$BRANCH_SLUG"
+if test -e "$RECOVERY_WORKTREE"; then
+  printf 'Recovery worktree path already exists: %s\n' "$RECOVERY_WORKTREE" >&2
+  exit 1
+fi
+if git -C "$REPO" worktree list --porcelain | awk -v path="$RECOVERY_WORKTREE" '
+    $1 == "worktree" && $2 == path { found = 1 }
+    END { exit found ? 0 : 1 }
+  '; then
+  printf 'Recovery worktree is already registered by Git: %s\n' "$RECOVERY_WORKTREE" >&2
+  exit 1
+fi
 git -C "$REPO" fetch origin main
 git -C "$REPO" worktree add \
   -b "issue-$ISSUE_NUMBER-$BRANCH_SLUG" \
-  "/tmp/coven-issue-$ISSUE_NUMBER" \
+  "$RECOVERY_WORKTREE" \
   origin/main
-cd "/tmp/coven-issue-$ISSUE_NUMBER"
+cd "$RECOVERY_WORKTREE"
 coven claim acquire "issue-$ISSUE_NUMBER"
 ```
 
