@@ -1,8 +1,7 @@
 use std::ffi::OsString;
 use std::fmt;
-use std::fs;
 use std::io::{self, Read};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{anyhow, bail, Result};
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
@@ -13,8 +12,15 @@ use cap_std::fs::MetadataExt;
 use cap_std::fs::OpenOptionsExt;
 use cap_std::fs::{Dir, OpenOptions};
 use serde::{Deserialize, Serialize};
-#[cfg(windows)]
-use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+const MAX_SOURCE_FILES: usize = 256;
+const MAX_AGGREGATE_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_SOURCE_TRAVERSAL_DEPTH: usize = 32;
+#[cfg(any(windows, test))]
+const WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+const SOURCE_FILE_LIMIT_ERROR: &str = "source discovery exceeds maximum file count";
+const SOURCE_BYTE_LIMIT_ERROR: &str = "source discovery exceeds maximum aggregate bytes";
+const SOURCE_DEPTH_LIMIT_ERROR: &str = "source discovery exceeds maximum traversal depth";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -136,14 +142,41 @@ struct SourceRoot {
     dir: Dir,
 }
 
+#[derive(Default)]
+struct DiscoveryBudget {
+    source_files: usize,
+    aggregate_bytes: u64,
+}
+
+impl DiscoveryBudget {
+    fn claim_file(&mut self) -> Result<()> {
+        if self.source_files >= MAX_SOURCE_FILES {
+            bail!(SOURCE_FILE_LIMIT_ERROR);
+        }
+        self.source_files += 1;
+        Ok(())
+    }
+
+    fn ensure_bytes_available(&self, bytes: u64) -> Result<()> {
+        if self
+            .aggregate_bytes
+            .checked_add(bytes)
+            .is_none_or(|total| total > MAX_AGGREGATE_SOURCE_BYTES)
+        {
+            bail!(SOURCE_BYTE_LIMIT_ERROR);
+        }
+        Ok(())
+    }
+
+    fn charge_bytes(&mut self, bytes: u64) -> Result<()> {
+        self.ensure_bytes_available(bytes)?;
+        self.aggregate_bytes += bytes;
+        Ok(())
+    }
+}
+
 impl SourceRoot {
     fn open(path: &Path) -> Result<Self> {
-        let path_metadata =
-            fs::symlink_metadata(path).map_err(|_| anyhow!("source root is unavailable"))?;
-        if !path_metadata.is_dir() || std_metadata_is_windows_reparse_point(&path_metadata) {
-            bail!("source root must be a real directory");
-        }
-
         let dir = open_dir_path_nofollow(path)?;
         let metadata = dir
             .dir_metadata()
@@ -160,8 +193,9 @@ impl SourceRoot {
         allowed_directories: &[&str],
     ) -> Result<Vec<DiscoveredSource>> {
         let mut discovered = Vec::new();
+        let mut budget = DiscoveryBudget::default();
         for root_file in root_files {
-            if let Some(source) = read_allowed_file(&self.dir, root_file, root_file)? {
+            if let Some(source) = read_allowed_file(&self.dir, root_file, root_file, &mut budget)? {
                 discovered.push(source);
             }
         }
@@ -169,7 +203,7 @@ impl SourceRoot {
             let Some(directory) = open_optional_real_directory(&self.dir, directory_name)? else {
                 continue;
             };
-            discover_markdown_tree(&directory, directory_name, &mut discovered)?;
+            discover_markdown_tree(&directory, directory_name, 0, &mut discovered, &mut budget)?;
         }
         discovered.sort_by(|left, right| left.source_label.cmp(&right.source_label));
         Ok(discovered)
@@ -210,23 +244,73 @@ pub(crate) fn discover_sources(
 }
 
 fn open_dir_path_nofollow(path: &Path) -> Result<Dir> {
-    let Some(name) = path.file_name() else {
-        let dir = Dir::open_ambient_dir(path, ambient_authority())
-            .map_err(|_| anyhow!("source root is unavailable"))?;
-        return Ok(dir);
-    };
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let parent_dir = Dir::open_ambient_dir(parent, ambient_authority())
+    let (anchor, components) = split_source_root_from_trusted_anchor(path)?;
+    let mut directory = Dir::open_ambient_dir(anchor, ambient_authority())
         .map_err(|_| anyhow!("source root is unavailable"))?;
-    let parent_metadata = parent_dir
+    let anchor_metadata = directory
         .dir_metadata()
         .map_err(|_| anyhow!("source root is unavailable"))?;
-    if !parent_metadata.is_dir() || metadata_is_windows_reparse_point(&parent_metadata) {
+    if !anchor_metadata.is_dir() || metadata_is_windows_reparse_point(&anchor_metadata) {
         bail!("source root must be a real directory");
     }
-    parent_dir
-        .open_dir_nofollow(name)
-        .map_err(|_| anyhow!("source root must be a real directory"))
+
+    for component in components {
+        let metadata = directory
+            .symlink_metadata(&component)
+            .map_err(|_| anyhow!("source root is unavailable"))?;
+        if !metadata.is_dir() || metadata_is_windows_reparse_point(&metadata) {
+            bail!("source root must be a real directory");
+        }
+        directory = directory
+            .open_dir_nofollow(&component)
+            .map_err(|_| anyhow!("source root must be a real directory"))?;
+        let opened_metadata = directory
+            .dir_metadata()
+            .map_err(|_| anyhow!("source root is unavailable"))?;
+        if !opened_metadata.is_dir() || metadata_is_windows_reparse_point(&opened_metadata) {
+            bail!("source root must be a real directory");
+        }
+    }
+    Ok(directory)
+}
+
+fn split_source_root_from_trusted_anchor(path: &Path) -> Result<(PathBuf, Vec<OsString>)> {
+    if path.as_os_str().is_empty() {
+        bail!("source root is unavailable");
+    }
+    if path.is_absolute() {
+        let mut anchor = PathBuf::new();
+        let mut components = Vec::new();
+        let mut found_root = false;
+        for component in path.components() {
+            match component {
+                Component::Prefix(prefix) if !found_root => anchor.push(prefix.as_os_str()),
+                Component::RootDir if !found_root => {
+                    anchor.push(component.as_os_str());
+                    found_root = true;
+                }
+                Component::Normal(name) if found_root => components.push(name.to_os_string()),
+                Component::CurDir => {}
+                _ => bail!("source root must be a real directory"),
+            }
+        }
+        if !found_root {
+            bail!("source root is unavailable");
+        }
+        return Ok((anchor, components));
+    }
+
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(name) => components.push(name.to_os_string()),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!("source root must be a real directory");
+            }
+        }
+    }
+    Ok((PathBuf::from("."), components))
 }
 
 fn open_optional_real_directory(parent: &Dir, name: &str) -> Result<Option<Dir>> {
@@ -253,7 +337,9 @@ fn open_optional_real_directory(parent: &Dir, name: &str) -> Result<Option<Dir>>
 fn discover_markdown_tree(
     directory: &Dir,
     logical_directory: &str,
+    depth: usize,
     discovered: &mut Vec<DiscoveredSource>,
+    budget: &mut DiscoveryBudget,
 ) -> Result<()> {
     let entries = directory
         .entries()
@@ -274,10 +360,14 @@ fn discover_markdown_tree(
 
         let source_label = format!("{logical_directory}/{name}");
         if metadata.is_dir() {
+            let child_depth = depth + 1;
+            if child_depth > MAX_SOURCE_TRAVERSAL_DEPTH {
+                bail!(SOURCE_DEPTH_LIMIT_ERROR);
+            }
             let Some(child) = open_optional_real_directory(directory, &name)? else {
                 continue;
             };
-            discover_markdown_tree(&child, &source_label, discovered)?;
+            discover_markdown_tree(&child, &source_label, child_depth, discovered, budget)?;
             continue;
         }
         if Path::new(&name)
@@ -287,7 +377,7 @@ fn discover_markdown_tree(
         {
             continue;
         }
-        if let Some(source) = read_allowed_file(directory, &name, &source_label)? {
+        if let Some(source) = read_allowed_file(directory, &name, &source_label, budget)? {
             discovered.push(source);
         }
     }
@@ -304,16 +394,18 @@ fn read_allowed_file(
     directory: &Dir,
     name: &str,
     source_label: &str,
+    budget: &mut DiscoveryBudget,
 ) -> Result<Option<DiscoveredSource>> {
     let metadata = match directory.symlink_metadata(name) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(_) => bail!("unable to inspect source `{source_label}`"),
     };
-    if !metadata.is_file()
-        || metadata_is_windows_reparse_point(&metadata)
-        || metadata.len() > crate::cockpit_sources::MEMORY_CONTENT_MAX_BYTES
-    {
+    if !metadata.is_file() || metadata_is_windows_reparse_point(&metadata) {
+        return Ok(None);
+    }
+    budget.claim_file()?;
+    if metadata.len() > crate::cockpit_sources::MEMORY_CONTENT_MAX_BYTES {
         return Ok(None);
     }
 
@@ -338,21 +430,45 @@ fn read_allowed_file(
     {
         return Ok(None);
     }
+    budget.ensure_bytes_available(opened_metadata.len())?;
 
-    let mut bytes = Vec::with_capacity(opened_metadata.len() as usize);
-    file.by_ref()
-        .take(crate::cockpit_sources::MEMORY_CONTENT_MAX_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| anyhow!("unable to read source `{source_label}`"))?;
-    if bytes.len() as u64 > crate::cockpit_sources::MEMORY_CONTENT_MAX_BYTES
-        || std::str::from_utf8(&bytes).is_err()
-    {
+    let Some(bytes) = read_source_bytes_with_budget(&mut file, budget, source_label)? else {
         return Ok(None);
-    }
+    };
     Ok(Some(DiscoveredSource {
         source_label: source_label.to_owned(),
         bytes,
     }))
+}
+
+fn read_source_bytes_with_budget<R: Read>(
+    reader: &mut R,
+    budget: &mut DiscoveryBudget,
+    source_label: &str,
+) -> Result<Option<Vec<u8>>> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|_| anyhow!("unable to read source `{source_label}`"))?;
+        if read == 0 {
+            break;
+        }
+        if bytes
+            .len()
+            .checked_add(read)
+            .is_none_or(|total| total > crate::cockpit_sources::MEMORY_CONTENT_MAX_BYTES as usize)
+        {
+            return Ok(None);
+        }
+        budget.charge_bytes(read as u64)?;
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    if std::str::from_utf8(&bytes).is_err() {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
 }
 
 #[cfg(unix)]
@@ -372,7 +488,7 @@ fn path_open_error_is_symlink(_error: &io::Error) -> bool {
 
 #[cfg(windows)]
 fn metadata_is_windows_reparse_point(metadata: &cap_std::fs::Metadata) -> bool {
-    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    windows_attributes_are_reparse_point(metadata.file_attributes())
 }
 
 #[cfg(not(windows))]
@@ -380,16 +496,9 @@ fn metadata_is_windows_reparse_point(_metadata: &cap_std::fs::Metadata) -> bool 
     false
 }
 
-#[cfg(windows)]
-fn std_metadata_is_windows_reparse_point(metadata: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-
-    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-#[cfg(not(windows))]
-fn std_metadata_is_windows_reparse_point(_metadata: &fs::Metadata) -> bool {
-    false
+#[cfg(any(windows, test))]
+fn windows_attributes_are_reparse_point(attributes: u32) -> bool {
+    attributes & WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 #[derive(Serialize)]
@@ -462,6 +571,10 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::Path;
+
+    const EXPECTED_MAX_SOURCE_FILES: usize = 256;
+    const EXPECTED_MAX_AGGREGATE_BYTES: u64 = 16 * 1024 * 1024;
+    const EXPECTED_MAX_TRAVERSAL_DEPTH: usize = 32;
 
     #[test]
     fn memory_import_report_json_is_stable_and_redacted() {
@@ -557,7 +670,7 @@ mod tests {
 
     #[test]
     fn discovers_native_allowlist_for_exact_registered_familiar_in_stable_order() -> Result<()> {
-        let temp = tempfile::tempdir()?;
+        let temp = trusted_tempdir()?;
         let sage = temp.path().join("sage-workspace");
         let cody = temp.path().join("cody-workspace");
         write_registered_familiars(temp.path(), &[("sage", &sage), ("cody", &cody)])?;
@@ -610,7 +723,7 @@ mod tests {
 
     #[test]
     fn discovers_openclaw_allowlist_into_explicit_registered_familiar() -> Result<()> {
-        let temp = tempfile::tempdir()?;
+        let temp = trusted_tempdir()?;
         let sage = temp.path().join("native-sage");
         let openclaw = temp.path().join("explicit-openclaw");
         write_registered_familiars(temp.path(), &[("sage", &sage)])?;
@@ -650,7 +763,7 @@ mod tests {
 
     #[test]
     fn discovers_unknown_familiar_before_touching_source_root() -> Result<()> {
-        let temp = tempfile::tempdir()?;
+        let temp = trusted_tempdir()?;
         let sage = temp.path().join("sage");
         write_registered_familiars(temp.path(), &[("sage", &sage)])?;
         let must_not_touch = temp.path().join("missing-source-root");
@@ -674,7 +787,7 @@ mod tests {
 
     #[test]
     fn discovers_registry_errors_without_revealing_absolute_paths() -> Result<()> {
-        let temp = tempfile::tempdir()?;
+        let temp = trusted_tempdir()?;
         fs::write(temp.path().join("familiars.toml"), "not valid toml = [")?;
 
         let error = discover_sources(
@@ -698,7 +811,7 @@ mod tests {
 
     #[test]
     fn discovers_openclaw_requires_a_real_explicit_root() -> Result<()> {
-        let temp = tempfile::tempdir()?;
+        let temp = trusted_tempdir()?;
         let sage = temp.path().join("sage");
         write_registered_familiars(temp.path(), &[("sage", &sage)])?;
 
@@ -743,7 +856,7 @@ mod tests {
     fn discovers_without_traversing_source_or_allowed_directory_symlinks() -> Result<()> {
         use std::os::unix::fs::symlink;
 
-        let temp = tempfile::tempdir()?;
+        let temp = trusted_tempdir()?;
         let sage = temp.path().join("sage");
         let openclaw = temp.path().join("openclaw");
         let outside = temp.path().join("outside");
@@ -810,11 +923,158 @@ mod tests {
         assert_eq!(visible_utf8_name(OsString::from("line\nbreak.md")), None);
     }
 
+    #[test]
+    fn windows_reparse_attribute_classification_is_platform_independent() {
+        assert!(!windows_attributes_are_reparse_point(0));
+        assert!(!windows_attributes_are_reparse_point(0x20));
+        assert!(windows_attributes_are_reparse_point(0x400));
+        assert!(windows_attributes_are_reparse_point(0x420));
+    }
+
+    #[test]
+    fn source_root_rejects_an_empty_relative_path() {
+        let error = SourceRoot::open(Path::new(""))
+            .err()
+            .expect("an empty source root must not resolve to the current directory");
+        assert_eq!(error.to_string(), "source root is unavailable");
+    }
+
+    #[test]
+    fn aggregate_limit_is_checked_before_read_bytes_are_retained() {
+        let mut budget = DiscoveryBudget {
+            source_files: 0,
+            aggregate_bytes: MAX_AGGREGATE_SOURCE_BYTES - 1,
+        };
+        let mut reader = io::Cursor::new(b"ab");
+
+        let error = read_source_bytes_with_budget(&mut reader, &mut budget, "overflow-secret.md")
+            .expect_err("a chunk larger than the remaining aggregate budget must fail");
+
+        assert_eq!(error.to_string(), SOURCE_BYTE_LIMIT_ERROR);
+        assert!(!format!("{error:#}").contains("overflow-secret"));
+        assert_eq!(budget.aggregate_bytes, MAX_AGGREGATE_SOURCE_BYTES - 1);
+    }
+
+    #[test]
+    fn discovery_accepts_exact_file_limit_and_rejects_one_more_without_leaking() -> Result<()> {
+        let temp = trusted_tempdir()?;
+        let memory = temp.path().join("memory");
+        for index in 0..EXPECTED_MAX_SOURCE_FILES {
+            write_file(&memory.join(format!("{index:04}.md")), b"x")?;
+        }
+        let root = SourceRoot::open(temp.path())?;
+        let exact = root.discover(&[], &["memory"])?;
+        assert_eq!(exact.len(), EXPECTED_MAX_SOURCE_FILES);
+
+        write_file(&memory.join("overflow-secret.md"), b"count overflow secret")?;
+        let error = root
+            .discover(&[], &["memory"])
+            .expect_err("one source beyond the file limit must fail");
+        assert_eq!(
+            error.to_string(),
+            "source discovery exceeds maximum file count"
+        );
+        assert!(!format!("{error:#}").contains("overflow-secret"));
+        assert!(!format!("{error:#}").contains("count overflow secret"));
+        assert!(!format!("{error:#}").contains(&temp.path().to_string_lossy().into_owned()));
+        Ok(())
+    }
+
+    #[test]
+    fn discovery_accepts_exact_byte_limit_and_rejects_one_more_without_leaking() -> Result<()> {
+        let temp = trusted_tempdir()?;
+        let memory = temp.path().join("memory");
+        let mut remaining = EXPECTED_MAX_AGGREGATE_BYTES;
+        let mut index = 0;
+        while remaining > 0 {
+            let chunk = remaining.min(crate::cockpit_sources::MEMORY_CONTENT_MAX_BYTES);
+            write_file(
+                &memory.join(format!("{index:04}.md")),
+                &vec![b'x'; chunk as usize],
+            )?;
+            remaining -= chunk;
+            index += 1;
+        }
+        let root = SourceRoot::open(temp.path())?;
+        let exact = root.discover(&[], &["memory"])?;
+        assert_eq!(
+            exact
+                .iter()
+                .map(|source| source.bytes.len() as u64)
+                .sum::<u64>(),
+            EXPECTED_MAX_AGGREGATE_BYTES
+        );
+
+        write_file(&memory.join("overflow-secret.md"), b"b")?;
+        let error = root
+            .discover(&[], &["memory"])
+            .expect_err("one byte beyond the aggregate limit must fail");
+        assert_eq!(
+            error.to_string(),
+            "source discovery exceeds maximum aggregate bytes"
+        );
+        assert!(!format!("{error:#}").contains("overflow-secret"));
+        assert!(!format!("{error:#}").contains(&temp.path().to_string_lossy().into_owned()));
+        Ok(())
+    }
+
+    #[test]
+    fn discovery_accepts_exact_depth_limit_and_rejects_one_more_without_leaking() -> Result<()> {
+        let temp = trusted_tempdir()?;
+        let mut deepest = temp.path().join("memory");
+        for index in 0..EXPECTED_MAX_TRAVERSAL_DEPTH {
+            deepest.push(format!("level-{index:02}"));
+        }
+        write_file(&deepest.join("exact.md"), b"exact")?;
+        let root = SourceRoot::open(temp.path())?;
+        let exact = root.discover(&[], &["memory"])?;
+        assert_eq!(
+            labels(&exact),
+            vec![format!(
+                "memory/{}/exact.md",
+                (0..EXPECTED_MAX_TRAVERSAL_DEPTH)
+                    .map(|index| format!("level-{index:02}"))
+                    .collect::<Vec<_>>()
+                    .join("/")
+            )]
+        );
+
+        let overflow = deepest.join("overflow-secret");
+        write_file(&overflow.join("hidden.md"), b"depth overflow secret")?;
+        let error = root
+            .discover(&[], &["memory"])
+            .expect_err("one directory beyond the depth limit must fail");
+        assert_eq!(
+            error.to_string(),
+            "source discovery exceeds maximum traversal depth"
+        );
+        assert!(!format!("{error:#}").contains("overflow-secret"));
+        assert!(!format!("{error:#}").contains("depth overflow secret"));
+        assert!(!format!("{error:#}").contains(&temp.path().to_string_lossy().into_owned()));
+        Ok(())
+    }
+
     fn labels(sources: &[DiscoveredSource]) -> Vec<&str> {
         sources
             .iter()
             .map(|source| source.source_label.as_str())
             .collect()
+    }
+
+    fn trusted_tempdir() -> Result<tempfile::TempDir> {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let worktree = manifest_dir
+            .parent()
+            .and_then(Path::parent)
+            .expect("coven-cli manifest must be inside the repository");
+        let repository = worktree
+            .parent()
+            .filter(|parent| parent.file_name() == Some(std::ffi::OsStr::new(".worktrees")))
+            .and_then(Path::parent)
+            .unwrap_or(worktree);
+        let test_root = repository.join("target/m");
+        fs::create_dir_all(&test_root)?;
+        Ok(tempfile::Builder::new().prefix("m").tempdir_in(test_root)?)
     }
 
     fn write_registered_familiars(coven_home: &Path, familiars: &[(&str, &Path)]) -> Result<()> {

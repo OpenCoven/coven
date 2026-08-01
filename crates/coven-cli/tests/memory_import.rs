@@ -7,7 +7,7 @@ use serde_json::Value;
 
 #[test]
 fn source_boundaries_native_preview_reports_only_sorted_logical_labels() -> Result<()> {
-    let temp = tempfile::tempdir()?;
+    let temp = trusted_tempdir()?;
     let workspace = temp.path().join("native-workspace");
     write_familiar(temp.path(), "sage", &workspace)?;
     write_file(&workspace.join("notes/z.md"), b"z")?;
@@ -54,7 +54,7 @@ fn source_boundaries_native_preview_reports_only_sorted_logical_labels() -> Resu
 
 #[test]
 fn source_boundaries_openclaw_preview_uses_explicit_root_and_target() -> Result<()> {
-    let temp = tempfile::tempdir()?;
+    let temp = trusted_tempdir()?;
     let workspace = temp.path().join("native-workspace");
     let openclaw = temp.path().join("openclaw-workspace");
     write_familiar(temp.path(), "sage", &workspace)?;
@@ -109,7 +109,7 @@ fn source_boundaries_openclaw_preview_uses_explicit_root_and_target() -> Result<
 
 #[test]
 fn source_boundaries_unknown_familiar_fails_before_source_root_access() -> Result<()> {
-    let temp = tempfile::tempdir()?;
+    let temp = trusted_tempdir()?;
     let workspace = temp.path().join("native-workspace");
     write_familiar(temp.path(), "sage", &workspace)?;
     let missing_root = temp.path().join("must-not-be-touched");
@@ -141,7 +141,7 @@ fn source_boundaries_unknown_familiar_fails_before_source_root_access() -> Resul
 
 #[test]
 fn source_boundaries_openclaw_cli_requires_explicit_root_and_target() -> Result<()> {
-    let temp = tempfile::tempdir()?;
+    let temp = trusted_tempdir()?;
     for args in [
         vec![
             "memory",
@@ -171,7 +171,7 @@ fn source_boundaries_openclaw_cli_requires_explicit_root_and_target() -> Result<
 fn source_boundaries_openclaw_symlink_root_fails_closed() -> Result<()> {
     use std::os::unix::fs::symlink;
 
-    let temp = tempfile::tempdir()?;
+    let temp = trusted_tempdir()?;
     let workspace = temp.path().join("native-workspace");
     let openclaw = temp.path().join("openclaw");
     let linked = temp.path().join("linked-openclaw");
@@ -200,6 +200,72 @@ fn source_boundaries_openclaw_symlink_root_fails_closed() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn source_boundaries_openclaw_symlinked_intermediate_fails_closed() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let temp = trusted_tempdir()?;
+    let workspace = temp.path().join("native-workspace");
+    let actual_parent = temp.path().join("actual-parent");
+    let linked_parent = temp.path().join("linked-parent");
+    let openclaw = actual_parent.join("openclaw");
+    write_familiar(temp.path(), "sage", &workspace)?;
+    write_file(&openclaw.join("MEMORY.md"), b"ancestor secret")?;
+    symlink(&actual_parent, &linked_parent)?;
+
+    let linked_root = linked_parent.join("openclaw");
+    let output = run_coven(
+        temp.path(),
+        &[
+            "memory",
+            "import",
+            "--familiar",
+            "sage",
+            "--source",
+            "openclaw",
+            "--openclaw-root",
+            linked_root.to_str().expect("fixture path is UTF-8"),
+        ],
+    )?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("real directory"), "{stderr}");
+    assert!(!stderr.contains(linked_root.to_str().expect("fixture path is UTF-8")));
+    assert!(!stderr.contains("ancestor secret"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn source_boundaries_native_relative_workspace_symlinked_intermediate_fails_closed() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let temp = trusted_tempdir()?;
+    let actual_parent = temp.path().join("actual-parent");
+    let linked_parent = temp.path().join("linked-parent");
+    let workspace = actual_parent.join("native-workspace");
+    write_file(&workspace.join("MEMORY.md"), b"relative ancestor secret")?;
+    symlink(&actual_parent, &linked_parent)?;
+    write_familiar(
+        temp.path(),
+        "sage",
+        Path::new("linked-parent/native-workspace"),
+    )?;
+
+    let output = run_coven_at(
+        temp.path(),
+        temp.path(),
+        &["memory", "import", "--familiar", "sage"],
+    )?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("real directory"), "{stderr}");
+    assert!(!stderr.contains("linked-parent"));
+    assert!(!stderr.contains("relative ancestor secret"));
+    Ok(())
+}
+
 fn coven_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_coven"))
 }
@@ -211,6 +277,14 @@ fn run_coven(coven_home: &Path, args: &[&str]) -> Result<Output> {
         .output()?)
 }
 
+fn run_coven_at(coven_home: &Path, current_dir: &Path, args: &[&str]) -> Result<Output> {
+    Ok(Command::new(coven_bin())
+        .args(args)
+        .env("COVEN_HOME", coven_home)
+        .current_dir(current_dir)
+        .output()?)
+}
+
 fn assert_success(output: &Output) {
     assert!(
         output.status.success(),
@@ -218,6 +292,22 @@ fn assert_success(output: &Output) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn trusted_tempdir() -> Result<tempfile::TempDir> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let worktree = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("coven-cli manifest must be inside the repository");
+    let repository = worktree
+        .parent()
+        .filter(|parent| parent.file_name() == Some(std::ffi::OsStr::new(".worktrees")))
+        .and_then(Path::parent)
+        .unwrap_or(worktree);
+    let test_root = repository.join("target/m");
+    fs::create_dir_all(&test_root)?;
+    Ok(tempfile::Builder::new().prefix("m").tempdir_in(test_root)?)
 }
 
 fn write_familiar(coven_home: &Path, id: &str, workspace: &Path) -> Result<()> {
