@@ -4401,6 +4401,14 @@ do
       "classification row could not be parsed safely before any live-state checks"
     continue
   fi
+  evidence='Narrative evidence: this PR was merged into main after review.'
+  case "$evidence" in
+    *"merged into main"*) ;;
+    *)
+      printf '%s\n' "merged-into-main pattern must match ordinary narrative evidence" >&2
+      exit 1
+      ;;
+  esac
   CLASSIFICATION_LABEL="${CLASSIFICATION_ROW[0]}"
   MAIN_PR_EVIDENCE="${CLASSIFICATION_ROW[1]}"
   PRESERVED_SOURCE="${CLASSIFICATION_ROW[2]}"
@@ -4408,7 +4416,7 @@ do
   case "$CLASSIFICATION_LABEL" in
     already-shipped)
       case "$MAIN_PR_EVIDENCE" in
-        *merged*main*|*main*merged*|"*merged into main*")
+        *merged*main*|*main*merged*|*"merged into main"*)
           ;;
         *)
           block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
@@ -5718,7 +5726,19 @@ if [ "$CURRENT_BRANCH" = "main" ]; then
     block_restore \
       "Blocked: primary checkout could not fast-forward main to origin/main; leave it untouched."
   fi
-elif printf '%s\n%s\n' "$CURRENT_BRANCH" "$UPSTREAM_REF" | grep -Eq '(^|[-/])issue-541($|[-/])|(^|[-/])541($|[-/])'; then
+elif case "$CURRENT_BRANCH" in
+  docs/541-incomplete-work-recovery-design|issue-541-*)
+    ;;
+  *)
+    case "$UPSTREAM_REF" in
+      origin/docs/541-incomplete-work-recovery-design|origin/issue-541-*)
+        ;;
+      *)
+        false
+        ;;
+    esac
+    ;;
+esac; then
   if [ -z "$UPSTREAM_REMOTE" ] || [ -z "$UPSTREAM_MERGE_REF" ]; then
     block_restore \
       "Blocked: recovery-owned branch has no configured upstream remote/branch; leave it untouched."
