@@ -16,6 +16,10 @@ coven doctor
 The command is read-only. It prints local setup state and a next step without
 starting a session.
 
+The prose report uses `[OK]` for passing checks, `[--]` for advisory warnings,
+and `[!!]` only for blocking failures. It is line-oriented plain text and does
+not emit ANSI escape sequences, including when global color is forced.
+
 ## Machine-readable output
 
 `coven doctor --json` emits one JSON document for scripts and CI gates, with
@@ -26,13 +30,13 @@ found):
 {
   "ok": true,
   "blocking": false,
-  "store": "/home/alex/.coven",
-  "project": "/home/alex/src/app",
+  "store": "<COVEN_HOME>",
+  "project": "/path/to/project",
   "checks": [
-    { "id": "daemon", "status": "pass", "message": "running (pid 12345, socket /home/alex/.coven/coven.sock)" },
+    { "id": "daemon", "status": "pass", "message": "running (pid 12345, socket <COVEN_HOME>/coven.sock)" },
     { "id": "harness:codex", "status": "pass", "message": "`codex` is ready (built-in)" },
     { "id": "harnesses", "status": "pass", "message": "1 of 3 configured harnesses available" },
-    { "id": "engine", "status": "pass", "message": "/home/alex/.coven/engine/bin/coven-code (managed install), version 0.6.1 (pin 0.6.1)" }
+    { "id": "engine", "status": "pass", "message": "<COVEN_HOME>/engine/bin/coven-code (managed install), version 0.6.1 (pin 0.6.1)" }
   ],
   "nextSteps": ["coven run codex \"explain this repo in 5 bullets\"", "coven sessions"]
 }
@@ -110,7 +114,7 @@ coven daemon status --json
 Typical human output from `coven daemon status`:
 
 ```text
-Coven daemon: running (pid 12345, socket /home/alex/.coven/coven.sock)
+Coven daemon: running (pid 12345, socket <COVEN_HOME>/coven.sock)
 ```
 
 `not running` means no background daemon is running yet. Start it with:

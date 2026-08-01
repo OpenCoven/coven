@@ -1774,14 +1774,18 @@ fn print_doctor_prose(report: &DoctorReport) {
     println!("\nDaemon:");
     match &report.daemon {
         Some(daemon::DaemonStatusState::Running(status)) => {
-            // `ok` is always true for a live daemon, so the prose "Running"
-            // already conveys it; the `--json` path keeps the field.
-            println!("  Running (pid {}, socket {})", status.pid, status.socket);
+            println!(
+                "  [OK] Running (pid {}, socket {})",
+                status.pid, status.socket
+            );
         }
         Some(daemon::DaemonStatusState::Stale(status)) => {
-            println!("  Stale (pid {}, socket {})", status.pid, status.socket);
+            println!(
+                "  [!!] Stale (pid {}, socket {}) — run: coven daemon restart",
+                status.pid, status.socket
+            );
         }
-        None => println!("  Not running"),
+        None => println!("  [--] Not running — run: coven daemon start"),
     }
 
     if !report.repos.is_empty() {
@@ -1789,6 +1793,12 @@ fn print_doctor_prose(report: &DoctorReport) {
         for repo in &report.repos {
             let marker = if repo.ok { "OK" } else { "!!" };
             println!("  [{marker}] {:<16} {}", repo.name, repo.path.display());
+            if !repo.ok {
+                println!(
+                    "       fix the path in {}",
+                    report.repos_config_path.display()
+                );
+            }
         }
     }
 
@@ -1799,7 +1809,9 @@ fn print_doctor_prose(report: &DoctorReport) {
         } else {
             "missing"
         };
-        let marker = if harness.available { "OK" } else { "!!" };
+        // A single missing harness is advisory while another harness is
+        // available. The aggregate row below is the blocking condition.
+        let marker = if harness.available { "OK" } else { "--" };
         println!(
             "  [{marker}] {:<18} `{}` is {status} ({})",
             harness.label,
@@ -1809,6 +1821,9 @@ fn print_doctor_prose(report: &DoctorReport) {
         if !harness.available {
             println!("       {}", harness.install_hint);
         }
+    }
+    if !report.harnesses.iter().any(|harness| harness.available) {
+        println!("  [!!] No supported harness is available");
     }
 
     println!("\nEngine:");
@@ -1827,7 +1842,7 @@ fn print_doctor_prose(report: &DoctorReport) {
                         );
                     }
                 }
-                None => println!("       version: unknown (could not run the engine)"),
+                None => println!("  [--] version: unknown (could not run the engine)"),
             }
             println!("       pin: {}", engine::pinned_version());
         }
@@ -2824,7 +2839,7 @@ fn credentials_lines(
         }
         Some(Some(false)) => {
             lines.push(
-                "  [!!] Coven Code (engine) — not logged in; set ANTHROPIC_API_KEY, use Claude Code, or configure OAuth".to_string(),
+                "  [--] Coven Code (engine) — not logged in; set ANTHROPIC_API_KEY, use Claude Code, or configure OAuth".to_string(),
             );
         }
         Some(None) => {
@@ -6144,7 +6159,12 @@ mod tests {
         assert!(lines[0].contains("not logged in"), "got: {}", lines[0]);
         assert!(lines[0].contains("ANTHROPIC_API_KEY"), "got: {}", lines[0]);
         assert!(lines[0].contains("Claude Code"), "got: {}", lines[0]);
-        assert!(lines[0].contains("[!!]"), "got: {}", lines[0]);
+        assert!(lines[0].contains("[--]"), "got: {}", lines[0]);
+        assert!(
+            !lines[0].contains("[!!]"),
+            "non-blocking auth guidance must not look like a blocking failure: {}",
+            lines[0]
+        );
     }
 
     #[test]

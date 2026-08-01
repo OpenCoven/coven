@@ -492,6 +492,43 @@ fn doctor_json_passes_with_fake_harness_and_engine() -> anyhow::Result<()> {
 }
 
 #[test]
+fn doctor_prose_distinguishes_warnings_from_blocking_failures() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    fs::create_dir_all(&coven_home)?;
+    let fake_bin = temp_dir.path().join("bin");
+    fs::create_dir_all(&fake_bin)?;
+    write_fake_codex(&fake_bin)?;
+    write_fake_coven_code(&fake_bin)?;
+    let path = prepend_path(&fake_bin);
+    let coven = coven_bin();
+
+    let output = run_coven(&coven, &coven_home, &path, &["--color=always", "doctor"])?;
+
+    assert_success("doctor prose with advisory checks", &output);
+    assert_stdout_contains(
+        "doctor prose with advisory checks",
+        &output,
+        "[--] Not running — run: coven daemon start",
+    );
+    assert_stdout_contains(
+        "doctor prose with advisory checks",
+        &output,
+        "[--] Claude Code",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("\u{1b}["),
+        "doctor's line-oriented report must remain ANSI-free even when color is forced: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("[!!]"),
+        "a healthy report must not label advisory checks as blocking failures: {stdout}"
+    );
+    Ok(())
+}
+
+#[test]
 fn adapter_doctor_json_reports_each_adapter() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let coven_home = temp_dir.path().join("coven-home");
