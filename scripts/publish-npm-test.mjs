@@ -713,6 +713,10 @@ test('release workflow publishes only missing packages during recovery', () => {
     import.meta.url
   );
   const workflow = readFileSync(workflowPath, 'utf8');
+  const dryRun = workflow.slice(
+    workflow.indexOf('  npm-dry-run:'),
+    workflow.indexOf('  npm-publish:')
+  );
   const publish = workflow.slice(workflow.indexOf('  npm-publish:'));
 
   assert.match(workflow, /npm-dry-run:[\s\S]*?needs: \[build-platform, verify-tag\]/);
@@ -730,6 +734,21 @@ test('release workflow publishes only missing packages during recovery', () => {
     publish,
     /Could not prove \$package_name@\$NPM_VERSION is absent/,
     'registry errors other than E404 must fail closed'
+  );
+  assert.match(
+    dryRun,
+    /--target=linux-x64 --skip-build --dry-run --skip-wrapper\s*\n\s*if: needs\.verify-tag\.outputs\.release_mode == 'normal'/,
+    'Linux dry-run must skip an already-published version during recovery'
+  );
+  assert.match(
+    dryRun,
+    /--target=windows --skip-build --dry-run --skip-wrapper\s*\n\s*if: needs\.verify-tag\.outputs\.release_mode == 'normal'/,
+    'Windows dry-run must skip an already-published version during recovery'
+  );
+  assert.match(
+    dryRun,
+    /--target=macos --skip-build --dry-run\s*\n\s*env:/,
+    'macOS plus wrapper dry-run must run in normal and recovery modes'
   );
   assert.match(
     publish,

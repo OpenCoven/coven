@@ -232,9 +232,11 @@ jobs:
         env:
           COVEN_NPM_VERSION: ${{ needs.verify-tag.outputs.npm_version }}
       - run: node scripts/publish-npm.mjs --target=linux-x64 --skip-build --dry-run --skip-wrapper
+        if: needs.verify-tag.outputs.release_mode == 'normal'
         env:
           COVEN_NPM_VERSION: ${{ needs.verify-tag.outputs.npm_version }}
       - run: node scripts/publish-npm.mjs --target=windows --skip-build --dry-run --skip-wrapper
+        if: needs.verify-tag.outputs.release_mode == 'normal'
         env:
           COVEN_NPM_VERSION: ${{ needs.verify-tag.outputs.npm_version }}
 
