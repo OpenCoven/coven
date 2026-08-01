@@ -261,7 +261,7 @@ fn assert_only_local_engine_probes(invocations: &[Invocation]) {
     );
 }
 
-fn parse_json<'a>(label: &str, output: &'a Output) -> Result<Value> {
+fn parse_json(label: &str, output: &Output) -> Result<Value> {
     serde_json::from_slice(&output.stdout).with_context(|| {
         format!(
             "{label} did not emit one JSON document\nstdout:\n{}\nstderr:\n{}",
