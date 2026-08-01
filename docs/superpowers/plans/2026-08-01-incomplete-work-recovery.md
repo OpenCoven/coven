@@ -4408,7 +4408,7 @@ do
   case "$CLASSIFICATION_LABEL" in
     already-shipped)
       case "$MAIN_PR_EVIDENCE" in
-        *merged*main*|*main*merged*|*merged into main*)
+        *merged*main*|*main*merged*|"*merged into main*")
           ;;
         *)
           block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
@@ -5881,6 +5881,15 @@ Expected: the primary checkout is clean on `main`; every remaining
 recovery-owned worktree, claim, and open PR is documented; and unrelated active
 worktrees, claims, and PRs remain allowed when they are explicitly marked
 out-of-scope rather than removed or treated as audit failures.
+
+- [ ] **Step 6: Self-review all operational bash fences**
+
+Extract every fenced `bash` block in this plan into repo-local temporary files
+under the recovery archive, then run the repository's existing bash-syntax
+validation script if one already exists; otherwise run `/bin/bash -n` against
+each extracted file. Do not add new tooling solely for this check. Fix any
+syntax error before proceeding, and re-run the validation until every
+operational fence parses cleanly.
 
 - [ ] **Step 5: Reject unsanitized local paths before posting the ledger**
 
