@@ -889,11 +889,9 @@ pub(crate) fn spawn_strict_child_process_tree(
         command.creation_flags(CREATE_SUSPENDED);
     }
 
-    let mut child = command.spawn()?;
-    match StrictChildProcessTree::attach(&child) {
-        Some(tree) => Ok((child, tree)),
         None => {
             let _ = child.kill();
+            let _ = child.wait();
             Err(std::io::Error::other(
                 "failed to establish strict child-process containment",
             ))
