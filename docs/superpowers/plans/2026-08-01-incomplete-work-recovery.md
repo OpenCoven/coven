@@ -260,6 +260,7 @@ parent claim alive from the discovered controller worktree by re-resolving it
 instead of assuming shell variables persist:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -353,6 +354,7 @@ issue-541`.
 Run:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -447,6 +449,7 @@ file, and the privacy guard reports one staged plan file.
 Run:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -546,6 +549,7 @@ trailer. Human contributor co-author trailers remain conditional under
 Run:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -635,6 +639,7 @@ Expected: the remote branch is created successfully.
 Run:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -856,6 +861,7 @@ again before classification.
 Run:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -992,6 +998,7 @@ post-commit state.
 Run:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -1104,9 +1111,6 @@ raw = Path(sys.argv[1]).read_bytes()
 entries = [] if not raw else raw.rstrip(b"\0").split(b"\0")
 print(json.dumps([entry.decode("utf-8", "surrogateescape") for entry in entries], indent=2))
 PY
-```
-
-```bash
 printf 'memory-promote\tdirty-worktree\t%s\t%s\t%s\t%s\n' \
   "$SOURCE" \
   "$(cat "$DEST/head.txt")" \
@@ -1127,6 +1131,7 @@ captured only in `.ignored.zlist` and `ignored.json`.
 Run:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -1239,9 +1244,6 @@ raw = Path(sys.argv[1]).read_bytes()
 entries = [] if not raw else raw.rstrip(b"\0").split(b"\0")
 print(json.dumps([entry.decode("utf-8", "surrogateescape") for entry in entries], indent=2))
 PY
-```
-
-```bash
 printf 'mobile-memory-gateway\tdirty-worktree\t%s\t%s\t%s\t%s\n' \
   "$SOURCE" \
   "$(cat "$DEST/head.txt")" \
@@ -1261,6 +1263,7 @@ while ignored paths remain inventory-only.
 Run:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -1373,9 +1376,6 @@ raw = Path(sys.argv[1]).read_bytes()
 entries = [] if not raw else raw.rstrip(b"\0").split(b"\0")
 print(json.dumps([entry.decode("utf-8", "surrogateescape") for entry in entries], indent=2))
 PY
-```
-
-```bash
 printf 'pr-476-review\tdirty-worktree\t%s\t%s\t%s\t%s\n' \
   "$SOURCE" \
   "$(cat "$DEST/head.txt")" \
@@ -1394,6 +1394,7 @@ paths remain captured only in `.ignored.zlist` and `ignored.json`.
 Run:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -1579,6 +1580,7 @@ archive.
 Run:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -1681,6 +1683,7 @@ Expected: three bundle files and three metadata directories are created.
 Run:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -1773,6 +1776,7 @@ Expected: Git reports each bundle is okay and lists its branch ref.
 Run:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -1985,6 +1989,7 @@ flow.
 Run:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -2297,11 +2302,6 @@ if ! {
   exit 0
 fi
 PR_COUNT="$(jq 'length' "$OPEN_PR_EVIDENCE")"
-```
-
-Then branch on the exact-source-branch result:
-
-```bash
 case "$PR_COUNT" in
   1)
     printf 'Same-repo exact-head open PR count: 1\n' >> "$BRANCH_FETCH_EVIDENCE"
@@ -2551,6 +2551,7 @@ Set `WORKSTREAM_ID` to the viable row's exact workstream ID, then use the
 matching exact issue title:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -2695,6 +2696,7 @@ ISSUE_BLOCKER_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-issue-blocker.txt"
 ISSUE_LEDGER_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-issues.json"
 ISSUE_LEDGER_STAGE="$PRIVATE_RECOVERY/issue-ledger-refresh/$WORKSTREAM_ID-issues.stage.json"
 ISSUE_POSTCONDITION_STAGE="$PRIVATE_RECOVERY/issue-ledger-refresh/$WORKSTREAM_ID-issue-postcondition.stage.json"
+ISSUE_CREATED_BY_RUN=false
 rm -f "$ISSUE_LEDGER_STAGE"
 if ! gh api --paginate --slurp \
   "repos/OpenCoven/coven/issues?state=all&per_page=100" \
@@ -2765,33 +2767,26 @@ jq --arg title "$ISSUE_TITLE" \
   '[.[] | .[] | select(.pull_request? | not) | select(.title == $title and .state == "open") | {number, title, url, state}]' \
   "$ISSUE_LEDGER_EVIDENCE" > "$ISSUE_SEARCH_EVIDENCE"
 ISSUE_COUNT="$(jq 'length' "$ISSUE_SEARCH_EVIDENCE")"
-```
-
-Immediately before every exact-title reuse/create decision, refresh the fully
-paginated shared `issue-541/issues.json` ledger into
-`private/issue-ledger-refresh/$WORKSTREAM_ID-issues.stage.json`. If `gh api`
-fails, preserve the existing `issue-541/issues.json`, remove the staging file,
-persist blocker evidence, and stop that row. Only a non-empty JSON value that
-passes `jq -e 'type == "array" and length > 0 and all(.[]; type == "array")'` may replace the
-shared ledger, and that replacement must happen atomically with `mv`. Only
-after the verified shared ledger is in place may the plan copy it to
-`viable/$WORKSTREAM_ID-issues.json`, filter exact-title non-PR `open` matches,
-and count them. Each workstream's `viable/$WORKSTREAM_ID-issue-search.json`
-stores only the filtered matches from that verified persisted ledger, so
-default-limited `gh issue list` output never drives reuse, and a refresh
-failure never truncates the last known-good shared ledger. A sole unrelated or
-closed result in the refreshed ledger leaves `ISSUE_COUNT=0` and must not be
-reused.
-
-If exactly one exact-title open issue already exists, reuse it without creating
-a duplicate:
-
-```bash
 case "$ISSUE_COUNT" in
   1)
     ISSUE_NUMBER="$(jq -r '.[0].number' "$ISSUE_SEARCH_EVIDENCE")"
-    gh issue view --repo OpenCoven/coven "$ISSUE_NUMBER" \
+    if ! gh issue view --repo OpenCoven/coven "$ISSUE_NUMBER" \
       --json number,state,title,url > "$ISSUE_VIEW_EVIDENCE"
+    then
+      {
+        printf 'Blocked %s: exact-title candidate issue #%s could not be read for verification.\n' \
+          "$WORKSTREAM_ID" "$ISSUE_NUMBER"
+        printf 'Task 4 paginated issue evidence: issue-541/issues.json\n'
+        printf 'Persisted live issue ledger: viable/%s-issues.json\n' "$WORKSTREAM_ID"
+        printf 'Filtered issue evidence: viable/%s-issue-search.json\n' "$WORKSTREAM_ID"
+        printf 'Issue view evidence: viable/%s-issue-view.json\n' "$WORKSTREAM_ID"
+      } > "$ISSUE_BLOCKER_EVIDENCE"
+      update_classification_row \
+        "blocked" \
+        "Issue verification read failed; see issue-541/issues.json, viable/$WORKSTREAM_ID-issues.json, viable/$WORKSTREAM_ID-issue-search.json, viable/$WORKSTREAM_ID-issue-view.json, and viable/$WORKSTREAM_ID-issue-blocker.txt." \
+        "Blocked: candidate issue could not be read before exact-title verification."
+      exit 0
+    fi
     if ! jq -e --arg title "$ISSUE_TITLE" \
       '.title == $title and .state == "OPEN"' \
       "$ISSUE_VIEW_EVIDENCE" > /dev/null
@@ -2812,25 +2807,6 @@ case "$ISSUE_COUNT" in
     fi
     ;;
 esac
-```
-
-If zero issues match, create one and verify it immediately:
-
-```markdown
-## Recovered source
-
-- Source issue: #541
-- Source artifacts: issue-541 recovery archive and classification ledger.
-
-## Acceptance criteria
-
-- Preserve the still-valid intent identified in the classification evidence.
-- Rebuild against current `origin/main`; do not blindly replay obsolete code.
-- Add or retain regression coverage for the recovered behavior.
-- Pass all repository-required gates.
-```
-
-```bash
 case "$ISSUE_COUNT" in
   0)
     ISSUE_BODY="$(cat <<'EOF'
@@ -2847,10 +2823,39 @@ case "$ISSUE_COUNT" in
 - Pass all repository-required gates.
 EOF
 )"
-    ISSUE_URL="$(gh issue create --repo OpenCoven/coven --title "$ISSUE_TITLE" --body "$ISSUE_BODY")"
+    if ! ISSUE_URL="$(gh issue create --repo OpenCoven/coven --title "$ISSUE_TITLE" --body "$ISSUE_BODY")"; then
+      {
+        printf 'Blocked %s: gh issue create failed for exact title %s.\n' \
+          "$WORKSTREAM_ID" "$ISSUE_TITLE"
+        printf 'Task 4 paginated issue evidence: issue-541/issues.json\n'
+        printf 'Persisted live issue ledger: viable/%s-issues.json\n' "$WORKSTREAM_ID"
+        printf 'Filtered issue evidence: viable/%s-issue-search.json\n' "$WORKSTREAM_ID"
+      } > "$ISSUE_BLOCKER_EVIDENCE"
+      update_classification_row \
+        "blocked" \
+        "Issue creation failed; see issue-541/issues.json, viable/$WORKSTREAM_ID-issues.json, viable/$WORKSTREAM_ID-issue-search.json, and viable/$WORKSTREAM_ID-issue-blocker.txt." \
+        "Blocked: gh issue create failed during exact-title recovery issue creation."
+      exit 0
+    fi
     ISSUE_NUMBER="${ISSUE_URL##*/}"
-    gh issue view --repo OpenCoven/coven "$ISSUE_NUMBER" \
+    ISSUE_CREATED_BY_RUN=true
+    if ! gh issue view --repo OpenCoven/coven "$ISSUE_NUMBER" \
       --json number,state,title,url > "$ISSUE_VIEW_EVIDENCE"
+    then
+      {
+        printf 'Blocked %s: created issue #%s could not be read for verification.\n' \
+          "$WORKSTREAM_ID" "$ISSUE_NUMBER"
+        printf 'Task 4 paginated issue evidence: issue-541/issues.json\n'
+        printf 'Persisted live issue ledger: viable/%s-issues.json\n' "$WORKSTREAM_ID"
+        printf 'Filtered issue evidence: viable/%s-issue-search.json\n' "$WORKSTREAM_ID"
+        printf 'Issue view evidence: viable/%s-issue-view.json\n' "$WORKSTREAM_ID"
+      } > "$ISSUE_BLOCKER_EVIDENCE"
+      update_classification_row \
+        "blocked" \
+        "Created issue verification read failed; see issue-541/issues.json, viable/$WORKSTREAM_ID-issues.json, viable/$WORKSTREAM_ID-issue-search.json, viable/$WORKSTREAM_ID-issue-view.json, and viable/$WORKSTREAM_ID-issue-blocker.txt." \
+        "Blocked: created issue could not be read before exact-title verification."
+      exit 0
+    fi
     if ! jq -e --arg title "$ISSUE_TITLE" \
       '.title == $title and .state == "OPEN"' \
       "$ISSUE_VIEW_EVIDENCE" > /dev/null
@@ -2949,10 +2954,57 @@ then
     printf 'Postcondition paginated issue evidence: viable/%s-issue-postcondition.json\n' "$WORKSTREAM_ID"
     printf 'Postcondition filtered issue evidence: viable/%s-issue-postcondition-search.json\n' "$WORKSTREAM_ID"
     printf 'Postcondition issue view evidence: viable/%s-issue-postcondition-view.json\n' "$WORKSTREAM_ID"
+    printf 'Issue created by this run: %s\n' "$ISSUE_CREATED_BY_RUN"
   } > "$ISSUE_BLOCKER_EVIDENCE"
+  if [ "$ISSUE_CREATED_BY_RUN" = true ]; then
+    RACE_CLOSE_COMMENT='Closing as superseded after race-detected exact-title duplicate during issue-541 recovery reconciliation.'
+    printf 'Race cleanup required: this run created issue #%s.\n' "$ISSUE_NUMBER" >> "$ISSUE_BLOCKER_EVIDENCE"
+    printf 'Race cleanup comment: %s\n' "$RACE_CLOSE_COMMENT" >> "$ISSUE_BLOCKER_EVIDENCE"
+    if ! gh issue close --repo OpenCoven/coven "$ISSUE_NUMBER" --comment "$RACE_CLOSE_COMMENT" \
+      >> "$ISSUE_BLOCKER_EVIDENCE" 2>&1
+    then
+      printf 'Race cleanup blocked: gh issue close failed for created issue #%s.\n' "$ISSUE_NUMBER" \
+        >> "$ISSUE_BLOCKER_EVIDENCE"
+      update_classification_row \
+        "blocked" \
+        "Issue postcondition mismatch and created-issue cleanup failed; see issue-541/issues.json, viable/$WORKSTREAM_ID-issue-postcondition.json, viable/$WORKSTREAM_ID-issue-postcondition-search.json, viable/$WORKSTREAM_ID-issue-postcondition-view.json, and viable/$WORKSTREAM_ID-issue-blocker.txt." \
+        "Blocked: race-detected duplicate issue cleanup failed after exact-title creation."
+      exit 0
+    fi
+    if ! gh issue view --repo OpenCoven/coven "$ISSUE_NUMBER" \
+      --json number,state,title,url > "$ISSUE_POSTCONDITION_VIEW_EVIDENCE" 2>> "$ISSUE_BLOCKER_EVIDENCE"
+    then
+      printf 'Race cleanup blocked: could not verify CLOSED state for created issue #%s.\n' "$ISSUE_NUMBER" \
+        >> "$ISSUE_BLOCKER_EVIDENCE"
+      update_classification_row \
+        "blocked" \
+        "Issue postcondition mismatch and created-issue closure could not be verified; see issue-541/issues.json, viable/$WORKSTREAM_ID-issue-postcondition.json, viable/$WORKSTREAM_ID-issue-postcondition-search.json, viable/$WORKSTREAM_ID-issue-postcondition-view.json, and viable/$WORKSTREAM_ID-issue-blocker.txt." \
+        "Blocked: race-detected duplicate issue closure could not be verified as CLOSED."
+      exit 0
+    fi
+    if ! jq -e '.state == "CLOSED"' "$ISSUE_POSTCONDITION_VIEW_EVIDENCE" > /dev/null
+    then
+      printf 'Race cleanup blocked: created issue #%s did not verify CLOSED after gh issue close.\n' "$ISSUE_NUMBER" \
+        >> "$ISSUE_BLOCKER_EVIDENCE"
+      update_classification_row \
+        "blocked" \
+        "Issue postcondition mismatch and created issue remained open after cleanup attempt; see issue-541/issues.json, viable/$WORKSTREAM_ID-issue-postcondition.json, viable/$WORKSTREAM_ID-issue-postcondition-search.json, viable/$WORKSTREAM_ID-issue-postcondition-view.json, and viable/$WORKSTREAM_ID-issue-blocker.txt." \
+        "Blocked: race-detected duplicate issue did not verify CLOSED after cleanup."
+      exit 0
+    fi
+    printf 'Race cleanup outcome: created issue #%s verified CLOSED after superseded/race-detected closure.\n' \
+      "$ISSUE_NUMBER" >> "$ISSUE_BLOCKER_EVIDENCE"
+    update_classification_row \
+      "blocked" \
+      "Issue postcondition mismatch; created issue #$ISSUE_NUMBER was closed as superseded after race detection. See issue-541/issues.json, viable/$WORKSTREAM_ID-issue-postcondition.json, viable/$WORKSTREAM_ID-issue-postcondition-search.json, viable/$WORKSTREAM_ID-issue-postcondition-view.json, and viable/$WORKSTREAM_ID-issue-blocker.txt." \
+      "Blocked: race-detected duplicate issue was closed; rerun exact-title reconciliation before continuing."
+    exit 0
+  fi
+  printf 'Race cleanup skipped: reused pre-existing issue #%s was not created by this run.\n' "$ISSUE_NUMBER" \
+    >> "$ISSUE_BLOCKER_EVIDENCE"
   update_classification_row \
     "blocked" \
-    "Issue postcondition mismatch; see issue-541/issues.json, viable/$WORKSTREAM_ID-issue-postcondition-search.json, viable/$WORKSTREAM_ID-issue-blocker.txt, and the postcondition ledger." \
+    "Issue postcondition mismatch; reused issue #$ISSUE_NUMBER was preserved because it predates this run. See issue-541/issues.json, viable/$WORKSTREAM_ID-issue-postcondition.json, viable/$WORKSTREAM_ID-issue-postcondition-search.json, viable/$WORKSTREAM_ID-issue-postcondition-view.json, and viable/$WORKSTREAM_ID-issue-blocker.txt." \
     "Blocked: postcondition exact-title issue verification failed after reuse/create."
   exit 0
 fi
@@ -2963,12 +3015,34 @@ update_classification_row \
   "Recover via issue #$ISSUE_NUMBER ($ISSUE_URL)."
 ```
 
+When `ISSUE_COUNT=0`, the self-contained block above creates and verifies an
+issue with this exact body:
+
+```markdown
+## Recovered source
+
+- Source issue: #541
+- Source artifacts: issue-541 recovery archive and classification ledger.
+
+## Acceptance criteria
+
+- Preserve the still-valid intent identified in the classification evidence.
+- Rebuild against current `origin/main`; do not blindly replay obsolete code.
+- Add or retain regression coverage for the recovered behavior.
+- Pass all repository-required gates.
+```
+
+
 If `ISSUE_COUNT>1`, write `viable/$WORKSTREAM_ID-issue-blocker.txt`, update
 the row to `blocked`, and stop that row rather than choosing one arbitrarily.
 
 Expected: every viable row without an adopted PR has exactly one verified issue
 number, and every reuse, create, or block decision cites the saved paginated
-issue ledger, per-workstream filtered search evidence, and verification files.
+issue ledger, per-workstream filtered search evidence, and verification files. If
+the postcondition detects a race after this run created a duplicate issue, close
+that newly created issue as superseded with an explicit `--repo OpenCoven/coven`
+comment, verify it is `CLOSED`, leave any reused pre-existing issue untouched,
+and keep the row blocked until a rerun revalidates uniqueness.
 
 - [ ] **Step 3: Create one approved design per viable issue**
 
@@ -3028,6 +3102,7 @@ the commit message and adding any conditional human contributor trailers as
 separate extra `--trailer` arguments:
 
 ```bash
+set -euo pipefail
 COPILOT_GH_ID=223556219
 COPILOT_GH_USER=Copilot
 COPILOT_NOREPLY_DOMAIN=users.noreply.github.com
@@ -3058,6 +3133,7 @@ pr-476-review -> runtime-parity-plan-recovery
 Then run:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -3226,7 +3302,18 @@ For long child recovery sessions, keep the child claim alive from that child
 worktree:
 
 ```bash
-cd "$RECOVERY_WORKTREE"
+set -euo pipefail
+CURRENT_BRANCH="$(git branch --show-current)"
+case "$CURRENT_BRANCH" in
+  issue-[0-9]*-*)
+    ISSUE_NUMBER="${CURRENT_BRANCH#issue-}"
+    ISSUE_NUMBER="${ISSUE_NUMBER%%-*}"
+    ;;
+  *)
+    printf 'Blocked: current branch %s does not match issue-<number>-<slug>.\n' "$CURRENT_BRANCH" >&2
+    exit 1
+    ;;
+esac
 coven claim heartbeat "issue-$ISSUE_NUMBER"
 ```
 
@@ -3235,7 +3322,18 @@ responses, or final verification continue in the same session. Release it only
 when that pull request merges or the owning recovery session stops:
 
 ```bash
-cd "$RECOVERY_WORKTREE"
+set -euo pipefail
+CURRENT_BRANCH="$(git branch --show-current)"
+case "$CURRENT_BRANCH" in
+  issue-[0-9]*-*)
+    ISSUE_NUMBER="${CURRENT_BRANCH#issue-}"
+    ISSUE_NUMBER="${ISSUE_NUMBER%%-*}"
+    ;;
+  *)
+    printf 'Blocked: current branch %s does not match issue-<number>-<slug>.\n' "$CURRENT_BRANCH" >&2
+    exit 1
+    ;;
+esac
 coven claim release "issue-$ISSUE_NUMBER"
 ```
 
@@ -3254,6 +3352,7 @@ Immediately after any non-adopted recovery branch opens its PR, capture and
 verify that PR before Task 7 cleanup or Task 9 audit continues:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -3494,6 +3593,7 @@ resume condition to recover the delta later from current `main`.
 Run:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -3585,6 +3685,7 @@ Expected: every active recovery claim and open PR is understood before cleanup.
 Run:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -3673,6 +3774,7 @@ issue-541 archive or corresponds to a merged/detached review with no unique
 work. Then run:
 
 ```bash
+set -euo pipefail
 git worktree prune --verbose
 ```
 
@@ -3683,6 +3785,7 @@ Expected: only registrations whose directories no longer exist are removed.
 Check each known linked worktree:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -3779,6 +3882,7 @@ Then prove each branch's PR merged or its tip is represented by current main,
 and remove the five clean worktrees:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -3892,6 +3996,7 @@ resume condition. Unrelated or unsnapshotted worktrees must never use force.
 Run:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -4004,6 +4109,7 @@ row. Only unchanged rows with an empty preserved ignored inventory may use the
 exact-path force-removal exception:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -4233,6 +4339,7 @@ recovered source branches:
 Run this immediately before `branch -d`:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -4380,13 +4487,18 @@ recheck_branch_ref_tip() {
   fi
   return 0
 }
-recheck_branch_ref_tip pre-delete-d
-CHECK_STATUS=$?
-if [ "$CHECK_STATUS" -eq 2 ]; then
-  exit 0
-fi
-if [ "$CHECK_STATUS" -ne 0 ]; then
-  exit "$CHECK_STATUS"
+if recheck_branch_ref_tip pre-delete-d; then
+  :
+else
+  CHECK_STATUS=$?
+  case "$CHECK_STATUS" in
+    2)
+      exit 0
+      ;;
+    *)
+      exit "$CHECK_STATUS"
+      ;;
+  esac
 fi
 git -C "$REPO" branch -d "$BRANCH_TO_DELETE"
 ```
@@ -4397,6 +4509,7 @@ pushed replacement branch still proves the committed history, then rerun the
 same branch-ref proof immediately before `branch -D`:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -4544,13 +4657,18 @@ recheck_branch_ref_tip() {
   fi
   return 0
 }
-recheck_branch_ref_tip pre-delete-D
-CHECK_STATUS=$?
-if [ "$CHECK_STATUS" -eq 2 ]; then
-  exit 0
-fi
-if [ "$CHECK_STATUS" -ne 0 ]; then
-  exit "$CHECK_STATUS"
+if recheck_branch_ref_tip pre-delete-D; then
+  :
+else
+  CHECK_STATUS=$?
+  case "$CHECK_STATUS" in
+    2)
+      exit 0
+      ;;
+    *)
+      exit "$CHECK_STATUS"
+      ;;
+  esac
 fi
 git -C "$REPO" branch -D "$BRANCH_TO_DELETE"
 ```
@@ -4566,7 +4684,18 @@ For any child recovery workstream whose PR has merged or whose owning recovery
 session has stopped, release its claim from that child worktree:
 
 ```bash
-cd "$RECOVERY_WORKTREE"
+set -euo pipefail
+CURRENT_BRANCH="$(git branch --show-current)"
+case "$CURRENT_BRANCH" in
+  issue-[0-9]*-*)
+    ISSUE_NUMBER="${CURRENT_BRANCH#issue-}"
+    ISSUE_NUMBER="${ISSUE_NUMBER%%-*}"
+    ;;
+  *)
+    printf 'Blocked: current branch %s does not match issue-<number>-<slug>.\n' "$CURRENT_BRANCH" >&2
+    exit 1
+    ;;
+esac
 coven claim release "issue-$ISSUE_NUMBER"
 ```
 
@@ -4574,7 +4703,18 @@ Keep child claims active while follow-up work for an open PR continues. During
 long-running follow-up from that worktree, use:
 
 ```bash
-cd "$RECOVERY_WORKTREE"
+set -euo pipefail
+CURRENT_BRANCH="$(git branch --show-current)"
+case "$CURRENT_BRANCH" in
+  issue-[0-9]*-*)
+    ISSUE_NUMBER="${CURRENT_BRANCH#issue-}"
+    ISSUE_NUMBER="${ISSUE_NUMBER%%-*}"
+    ;;
+  *)
+    printf 'Blocked: current branch %s does not match issue-<number>-<slug>.\n' "$CURRENT_BRANCH" >&2
+    exit 1
+    ;;
+esac
 coven claim heartbeat "issue-$ISSUE_NUMBER"
 ```
 
@@ -4582,6 +4722,7 @@ Release the parent `issue-541` claim only when the issue #541 recovery session
 stops or the full issue #541 recovery effort is complete:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -4678,6 +4819,7 @@ allowed only for still-running recovery sessions and open follow-up work.
 Run:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -4800,6 +4942,7 @@ next external-PR sweep. Remove the duplicated stale `next` line.
 Run:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -4898,6 +5041,7 @@ Expected: each active goal has one `next` field, completed goals are under
 Run:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -4999,6 +5143,7 @@ Expected: all seven workstreams match exactly one terminal classification.
 For every `viable` row, set `PR_URL` to the recorded pull-request URL and run:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -5091,6 +5236,7 @@ the URL matches the ledger.
 Run:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -5286,6 +5432,7 @@ a safe fast-forward-only path.
 Run:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -5386,6 +5533,7 @@ out-of-scope rather than removed or treated as audit failures.
 Run:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -5491,6 +5639,7 @@ links, non-viable evidence, and remaining human blockers. Do not post
 `manifest.tsv` or raw snapshot files:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
@@ -5584,6 +5733,7 @@ Close only after every viable concern has an open PR and all local residue has
 been safely preserved or cleaned:
 
 ```bash
+set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local start_common_dir repo target_path path branch_ref live_path stale_path
