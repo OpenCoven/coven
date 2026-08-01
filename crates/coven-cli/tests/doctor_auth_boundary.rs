@@ -64,6 +64,7 @@ impl ProbeFixture {
         let home = self.root.join(format!("home-{label}"));
         let config = self.root.join(format!("config-{label}"));
         let log = self.root.join(format!("invocations-{label}.log"));
+        let descendant_pid_file = self.root.join(format!("descendant-{label}.pid"));
         fs::create_dir_all(&home)?;
         fs::create_dir_all(&config)?;
 
@@ -74,6 +75,7 @@ impl ProbeFixture {
             .env("COVEN_ENGINE_BIN", &self.engine)
             .env("COVEN_DOCTOR_PROBE_LOG", &log)
             .env("COVEN_DOCTOR_PROBE_MODE", mode)
+            .env("COVEN_DOCTOR_DESCENDANT_PID_FILE", &descendant_pid_file)
             .env("PATH", path_containing_only(&self.bin_dir)?)
             .env("HOME", &home)
             .env("USERPROFILE", &home)
@@ -93,10 +95,14 @@ impl ProbeFixture {
             .context("run coven doctor with auth probe")?;
         let elapsed = started.elapsed();
         let invocations = read_invocations(&log)?;
+        let descendant_pid = fs::read_to_string(&descendant_pid_file)
+            .ok()
+            .and_then(|value| value.trim().parse().ok());
         Ok(ProbeRun {
             output,
             elapsed,
             invocations,
+            descendant_pid,
         })
     }
 }
@@ -105,6 +111,7 @@ struct ProbeRun {
     output: Output,
     elapsed: Duration,
     invocations: Vec<Invocation>,
+    descendant_pid: Option<u32>,
 }
 
 #[test]
@@ -176,10 +183,29 @@ fn doctor_auth_boundary_is_offline_hermetic_and_failure_bounded() -> Result<()> 
         .find(|invocation| invocation.args == ["auth", "status", "--json"])
         .expect("timed-out auth invocation")
         .pid;
-    assert!(
-        !process_is_running(timeout_pid),
-        "Doctor returned without killing and reaping timed-out auth probe pid {timeout_pid}"
+    assert_process_stopped(timeout_pid, "timed-out auth probe");
+
+    let descendant = fixture.run("descendant", "descendant", true)?;
+    assert_success("stdout-holding descendant", &descendant.output);
+    anyhow::ensure!(
+        descendant.elapsed < Duration::from_secs(12),
+        "a descendant-held stdout pipe escaped Doctor's bound: {:?}",
+        descendant.elapsed
     );
+    let descendant_json = parse_json("stdout-holding descendant", &descendant.output)?;
+    assert_eq!(credential_status(&descendant_json, "engine"), "warn");
+    assert_only_local_engine_probes(&descendant.invocations);
+    let descendant_parent_pid = descendant
+        .invocations
+        .iter()
+        .find(|invocation| invocation.args == ["auth", "status", "--json"])
+        .expect("descendant-mode auth invocation")
+        .pid;
+    let descendant_pid = descendant
+        .descendant_pid
+        .context("probe did not record stdout-holding descendant pid")?;
+    assert_process_stopped(descendant_parent_pid, "descendant-mode engine parent");
+    assert_process_stopped(descendant_pid, "stdout-holding engine descendant");
 
     Ok(())
 }
@@ -319,4 +345,15 @@ fn process_is_running(pid: u32) -> bool {
     let mut system = System::new();
     system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
     system.process(pid).is_some()
+}
+
+fn assert_process_stopped(pid: u32, label: &str) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while process_is_running(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !process_is_running(pid),
+        "Doctor returned without stopping {label} pid {pid}"
+    );
 }

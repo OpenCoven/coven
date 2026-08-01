@@ -2804,41 +2804,94 @@ fn engine_source_label(source: &engine::EngineSource) -> &'static str {
 /// not proof that a provider turn succeeds.
 fn engine_auth_summary(binary: &Path) -> Option<bool> {
     use std::io::Read;
-    use std::process::Stdio;
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc::{self, TryRecvError};
     use std::time::{Duration, Instant};
 
-    let mut child = std::process::Command::new(binary)
+    const TIMEOUT: Duration = Duration::from_secs(5);
+    const OUTPUT_LIMIT: usize = 1024 * 1024;
+
+    let mut command = Command::new(binary);
+    command
         .args(["auth", "status", "--json"])
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::null());
+    pty_runner::configure_child_process_tree_command(&mut command);
+    let mut child = command.spawn().ok()?;
+    let mut process_tree = pty_runner::ChildProcessTree::attach(&child);
+    if !process_tree.is_strictly_contained() {
+        // Doctor cannot promise a bounded local-only probe without ownership
+        // of descendants, so fail closed instead of running uncontained.
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    }
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            process_tree.terminate(&mut child);
+            let _ = child.wait();
+            return None;
+        }
+    };
+    let (sender, receiver) = mpsc::channel::<std::io::Result<Vec<u8>>>();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout
+            .take((OUTPUT_LIMIT + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        let _ = sender.send(result);
+    });
+
+    let deadline = Instant::now() + TIMEOUT;
+    let mut status = None;
+    let mut output = None;
+    loop {
+        if output.is_none() {
+            match receiver.try_recv() {
+                Ok(Ok(bytes)) if bytes.len() <= OUTPUT_LIMIT => output = Some(bytes),
+                Ok(Ok(_)) | Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
+                    process_tree.terminate(&mut child);
                     let _ = child.wait();
                     return None;
                 }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
+                Err(TryRecvError::Empty) => {}
             }
         }
-    };
 
-    // `auth status --json` output is a few hundred bytes — far under the pipe
-    // buffer — so reading after exit cannot deadlock.
-    let mut buf = String::new();
-    child.stdout.take()?.read_to_string(&mut buf).ok()?;
-    parse_engine_auth_summary(status.code(), &buf)
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(exit_status)) => {
+                    status = Some(exit_status);
+                    // The direct engine has exited. Terminate anything it left
+                    // behind before waiting for pipe EOF; a descendant that
+                    // inherited stdout must not extend Doctor's deadline.
+                    process_tree.terminate(&mut child);
+                    let _ = child.wait();
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    process_tree.terminate(&mut child);
+                    let _ = child.wait();
+                    return None;
+                }
+            }
+        }
+
+        if let (Some(status), Some(bytes)) = (status.as_ref(), output.as_ref()) {
+            let stdout = std::str::from_utf8(bytes).ok()?;
+            return parse_engine_auth_summary(status.code(), stdout);
+        }
+
+        if Instant::now() >= deadline {
+            process_tree.terminate(&mut child);
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// Parse only the engine's boolean auth summary and reject contradictory

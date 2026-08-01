@@ -597,21 +597,21 @@ struct CodexJsonState {
     emitted_assistant: bool,
 }
 
-/// Owns the direct Codex child and all of its descendants while a one-shot
-/// JSON turn is running. A Node/npm wrapper can outlive or outspawn the direct
-/// launcher, so a plain `Child::kill()` is not enough to guarantee pipe EOF.
-struct CodexProcessTree {
+/// Own a one-shot child process tree. A wrapper can outlive or outspawn the
+/// direct launcher, so a plain `Child::kill()` is not enough to guarantee pipe
+/// EOF or descendant cleanup.
+pub(crate) struct ChildProcessTree {
     pid: u32,
     terminated: bool,
     #[cfg(windows)]
     job_handle: Option<windows_sys::Win32::Foundation::HANDLE>,
 }
 
-impl CodexProcessTree {
-    fn attach(child: &std::process::Child) -> Self {
+impl ChildProcessTree {
+    pub(crate) fn attach(child: &std::process::Child) -> Self {
         let pid = child.id();
         #[cfg(windows)]
-        let job_handle = codex_job_object_for_process(child);
+        let job_handle = child_job_object_for_process(child);
         Self {
             pid,
             terminated: false,
@@ -620,14 +620,29 @@ impl CodexProcessTree {
         }
     }
 
-    fn terminate(&mut self, child: &mut std::process::Child) {
+    pub(crate) fn is_strictly_contained(&self) -> bool {
+        #[cfg(unix)]
+        {
+            true
+        }
+        #[cfg(windows)]
+        {
+            self.job_handle.is_some()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            false
+        }
+    }
+
+    pub(crate) fn terminate(&mut self, child: &mut std::process::Child) {
         if self.terminated {
             return;
         }
         self.terminated = true;
         #[cfg(unix)]
         {
-            terminate_codex_unix_process_group(self.pid);
+            terminate_unix_process_group(self.pid);
         }
         #[cfg(windows)]
         {
@@ -662,26 +677,26 @@ impl CodexProcessTree {
 }
 
 #[cfg(unix)]
-fn terminate_codex_unix_process_group(pid: u32) {
+fn terminate_unix_process_group(pid: u32) {
     // The launch config puts the child at the head of a new session, so the
     // negative pid reaches its wrapper and every descendant.
     let _ = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
 }
 
 #[cfg(unix)]
-impl Drop for CodexProcessTree {
+impl Drop for ChildProcessTree {
     fn drop(&mut self) {
         if !self.terminated {
             // A wrapper can exit after detaching a descendant that has already
             // closed stdout/stderr. There is then no pipe timeout to trigger
             // terminate(), but this one-shot runner still owns that group.
-            terminate_codex_unix_process_group(self.pid);
+            terminate_unix_process_group(self.pid);
         }
     }
 }
 
 #[cfg(windows)]
-impl Drop for CodexProcessTree {
+impl Drop for ChildProcessTree {
     fn drop(&mut self) {
         if let Some(job) = self.job_handle.take() {
             // The job is configured with KILL_ON_JOB_CLOSE, so an abrupt
@@ -720,7 +735,7 @@ fn trusted_windows_taskkill_path() -> Option<PathBuf> {
 }
 
 #[cfg(windows)]
-fn codex_job_object_for_process(
+fn child_job_object_for_process(
     child: &std::process::Child,
 ) -> Option<windows_sys::Win32::Foundation::HANDLE> {
     use std::mem::size_of;
@@ -759,7 +774,7 @@ fn codex_job_object_for_process(
     }
 }
 
-fn configure_codex_json_command(_command: &mut std::process::Command) {
+pub(crate) fn configure_child_process_tree_command(_command: &mut std::process::Command) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -848,7 +863,7 @@ where
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    configure_codex_json_command(&mut child_command);
+    configure_child_process_tree_command(&mut child_command);
     let cancellation = CodexCancellationGuard::install()?;
     if let Some(error) = codex_cancellation_error(&cancellation) {
         anyhow::bail!(error);
@@ -859,7 +874,7 @@ where
             command.program()
         )
     })?;
-    let mut process_tree = CodexProcessTree::attach(&child);
+    let mut process_tree = ChildProcessTree::attach(&child);
     cancellation.arm(process_tree.pid);
 
     let stdout = match child.stdout.take() {

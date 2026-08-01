@@ -1,6 +1,6 @@
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::process;
+use std::process::{self, Command};
 use std::thread;
 use std::time::Duration;
 
@@ -12,6 +12,10 @@ fn main() {
         .expect("probe executable name")
         .to_ascii_lowercase();
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args == ["--hold-stdout"] {
+        thread::sleep(Duration::from_secs(60));
+        return;
+    }
     record_invocation(&invoked_as, &args);
 
     if invoked_as != "coven-code" {
@@ -42,10 +46,24 @@ fn main() {
                 record_timeout_completion();
                 println!(r#"{{"loggedIn":true}}"#);
             }
+            "descendant" => {
+                let descendant = Command::new(&executable)
+                    .arg("--hold-stdout")
+                    .spawn()
+                    .expect("spawn stdout-holding descendant");
+                record_descendant_pid(descendant.id());
+                println!(r#"{{"loggedIn":true}}"#);
+            }
             other => panic!("unknown probe mode: {other}"),
         },
         _ => process::exit(92),
     }
+}
+
+fn record_descendant_pid(pid: u32) {
+    let path = std::env::var_os("COVEN_DOCTOR_DESCENDANT_PID_FILE")
+        .expect("descendant pid file path");
+    std::fs::write(path, pid.to_string()).expect("record descendant pid");
 }
 
 fn record_invocation(invoked_as: &str, args: &[String]) {

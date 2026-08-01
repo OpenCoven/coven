@@ -131,9 +131,10 @@ coven daemon start
 
 ## Exit behavior
 
-`coven doctor` exits `0` when the environment can run Coven end to end, so
-scripts can gate on it (`coven doctor && …`). It exits `1` when it finds a
-blocking problem:
+`coven doctor` exits `0` when local structural prerequisites are ready, so
+scripts can gate on them (`coven doctor && …`). Provider access is deliberately
+outside that claim and still requires an explicitly authorized test turn. The
+command exits `1` when it finds a blocking local problem:
 
 - no supported harness is available on `PATH`
 - the daemon is stale (`running` and `stopped` are both healthy states)
