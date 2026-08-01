@@ -27,9 +27,9 @@
   - `.git/agent-recovery/issue-541/viable/<workstream-id>-issue-view.json`
   - `.git/agent-recovery/issue-541/viable/<workstream-id>-pr-blocker.txt`
   - `.git/agent-recovery/issue-541/viable/<workstream-id>-issue-blocker.txt`
-  - Exact-head open-PR evidence, per-workstream exact-title open issue-match
-    evidence derived from paginated `issues.json`, and blocker evidence for
-    each viable workstream.
+  - Exact-head open-PR evidence, verified replacement-PR view evidence,
+    per-workstream exact-title open issue-match evidence derived from paginated
+    `issues.json`, and blocker evidence for each viable workstream.
 - Create only when Task 9 runs:
   - `.git/agent-recovery/issue-541/final-audit-primary-checkout.txt`
   - Primary-checkout restore and blocker evidence for the final audit.
@@ -766,9 +766,24 @@ Then branch on the exact-head result:
 case "$PR_COUNT" in
   1)
     PR_NUMBER="$(jq -r '.[0].number' "$OPEN_PR_EVIDENCE")"
-    gh pr view --repo OpenCoven/coven "$PR_NUMBER" \
+    if ! gh pr view --repo OpenCoven/coven "$PR_NUMBER" \
       --json number,title,url,state,headRefOid,headRefName,headRepositoryOwner,isCrossRepository,baseRefName \
-      > "$PR_VIEW_EVIDENCE"
+      > "$PR_VIEW_EVIDENCE" 2> "$PR_BLOCKER_EVIDENCE"; then
+      PR_VIEW_ERROR="$(cat "$PR_BLOCKER_EVIDENCE")"
+      {
+        printf 'Blocked %s: candidate PR #%s disappeared or could not be read between gh pr list and gh pr view.\n' \
+          "$WORKSTREAM_ID" "$PR_NUMBER"
+        printf 'Expected source branch: %s\n' "$SOURCE_BRANCH"
+        printf 'Expected source head: %s\n' "$(tr -d '\n' < "$SOURCE_HEAD_FILE")"
+        printf 'Open PR evidence: viable/%s-open-prs.json\n' "$WORKSTREAM_ID"
+        printf 'gh pr view failure follows:\n%s\n' "$PR_VIEW_ERROR"
+      } > "$PR_BLOCKER_EVIDENCE"
+      update_classification_row \
+        "blocked" \
+        "PR view failed after candidate discovery; see viable/$WORKSTREAM_ID-open-prs.json and viable/$WORKSTREAM_ID-pr-blocker.txt." \
+        "Blocked: candidate PR disappeared or could not be read before identity verification."
+      exit 0
+    fi
     EXPECTED_HEAD="$(tr -d '\n' < "$SOURCE_HEAD_FILE")"
     ACTUAL_STATE="$(jq -r '.state' "$PR_VIEW_EVIDENCE")"
     ACTUAL_HEAD="$(jq -r '.headRefOid' "$PR_VIEW_EVIDENCE")"
@@ -834,10 +849,11 @@ If `PR_COUNT=1`, verify the candidate PR before adopting it: `.state` must be
 `headRefName` must equal `$SOURCE_BRANCH`,
 `headRepositoryOwner.login` must equal `OpenCoven`, `isCrossRepository` must
 be `false`, and `baseRefName` must equal `main`. Record `continue existing PR`
-only after all of those checks pass. If the PR closes or merges between
-`gh pr list` and `gh pr view`, or if any other identity check fails, write
-`viable/$WORKSTREAM_ID-pr-blocker.txt`, update the classification row to
-`blocked`, and stop that row without creating or adopting anything. This
+only after all of those checks pass. If `gh pr view` fails because the
+candidate disappears or cannot be read after `gh pr list`, or if any other
+identity check fails, write `viable/$WORKSTREAM_ID-pr-blocker.txt`, update the
+classification row to `blocked`, and stop that row only after the blocker
+evidence is persisted. This
 deterministically avoids duplicating possibly delivered work; a later rerun
 must reclassify against current main and GitHub history before deciding whether
 any replacement issue or PR is still needed. Continue to Step 2 only when
@@ -1144,9 +1160,116 @@ coven claim release "issue-$ISSUE_NUMBER"
 Execute that issue's plan, run its full gates, commit each child change with
 the Task 5 Step 4 trailer pattern, add human contributor co-author trailers
 only when `AGENTS.md` requires them, push, and open its scoped pull request.
+Immediately after any non-adopted recovery branch opens its PR, capture and
+verify that PR before Task 7 cleanup or Task 9 audit continues:
+
+```bash
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
+RECOVERY="$COMMON_DIR/agent-recovery/issue-541/viable"
+CLASSIFICATION="$COMMON_DIR/agent-recovery/issue-541/classification.md"
+ISSUE_VIEW_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-issue-view.json"
+PR_VIEW_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-pr-view.json"
+PR_BLOCKER_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-pr-blocker.txt"
+RECOVERY_BRANCH="issue-$ISSUE_NUMBER-$BRANCH_SLUG"
+mkdir -p "$RECOVERY"
+update_classification_row() {
+  python3 - "$CLASSIFICATION" "$WORKSTREAM_ID" "$1" "$2" "$3" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+workstream, classification, evidence, action = sys.argv[2:6]
+needle = f"| {workstream} |"
+lines = path.read_text().splitlines()
+for idx, line in enumerate(lines):
+    if line.startswith(needle):
+        parts = [part.strip() for part in line.strip().strip("|").split("|")]
+        if len(parts) != 5:
+            raise SystemExit(f"Unexpected classification row: {line}")
+        parts[1] = classification
+        parts[2] = evidence
+        parts[4] = action
+        lines[idx] = "| " + " | ".join(parts) + " |"
+        path.write_text("\n".join(lines) + "\n")
+        break
+else:
+    raise SystemExit(f"Missing classification row for {workstream}")
+PY
+}
+test -s "$ISSUE_VIEW_EVIDENCE"
+ISSUE_URL="$(jq -r '.url' "$ISSUE_VIEW_EVIDENCE")"
+if [ -z "${RECOVERY_PR_URL:-}" ]; then
+  if ! RECOVERY_PR_URL="$(gh pr view --repo OpenCoven/coven "$RECOVERY_BRANCH" \
+    --json url --jq '.url' 2> "$PR_BLOCKER_EVIDENCE")"; then
+    PR_VIEW_ERROR="$(cat "$PR_BLOCKER_EVIDENCE")"
+    {
+      printf 'Blocked %s: no recovery PR URL was captured from gh pr create, and gh pr view could not recover it.\n' \
+        "$WORKSTREAM_ID"
+      printf 'Expected recovery branch: %s\n' "$RECOVERY_BRANCH"
+      printf 'Issue evidence: viable/%s-issue-view.json\n' "$WORKSTREAM_ID"
+      printf 'gh pr view failure follows:\n%s\n' "$PR_VIEW_ERROR"
+    } > "$PR_BLOCKER_EVIDENCE"
+    update_classification_row \
+      "blocked" \
+      "Recovery PR URL capture failed; see viable/$WORKSTREAM_ID-issue-view.json and viable/$WORKSTREAM_ID-pr-blocker.txt." \
+      "Blocked: recovery PR URL could not be recovered for $RECOVERY_BRANCH."
+    exit 0
+  fi
+fi
+if ! gh pr view "$RECOVERY_PR_URL" --repo OpenCoven/coven \
+  --json number,url,state,headRefName,baseRefName \
+  > "$PR_VIEW_EVIDENCE" 2> "$PR_BLOCKER_EVIDENCE"; then
+  PR_VIEW_ERROR="$(cat "$PR_BLOCKER_EVIDENCE")"
+  {
+    printf 'Blocked %s: recovery PR URL %s could not be verified.\n' \
+      "$WORKSTREAM_ID" "$RECOVERY_PR_URL"
+    printf 'Expected recovery branch: %s\n' "$RECOVERY_BRANCH"
+    printf 'Issue evidence: viable/%s-issue-view.json\n' "$WORKSTREAM_ID"
+    printf 'gh pr view failure follows:\n%s\n' "$PR_VIEW_ERROR"
+  } > "$PR_BLOCKER_EVIDENCE"
+  update_classification_row \
+    "blocked" \
+    "Recovery PR verification failed; see viable/$WORKSTREAM_ID-pr-view.json and viable/$WORKSTREAM_ID-pr-blocker.txt." \
+    "Blocked: recovery PR URL could not be verified for $RECOVERY_BRANCH."
+  exit 0
+fi
+RECOVERY_PR_NUMBER="$(jq -r '.number' "$PR_VIEW_EVIDENCE")"
+ACTUAL_PR_URL="$(jq -r '.url' "$PR_VIEW_EVIDENCE")"
+ACTUAL_STATE="$(jq -r '.state' "$PR_VIEW_EVIDENCE")"
+ACTUAL_BRANCH="$(jq -r '.headRefName' "$PR_VIEW_EVIDENCE")"
+ACTUAL_BASE="$(jq -r '.baseRefName' "$PR_VIEW_EVIDENCE")"
+if [ "$ACTUAL_STATE" != "OPEN" ] || \
+   [ "$ACTUAL_BRANCH" != "$RECOVERY_BRANCH" ] || \
+   [ "$ACTUAL_BASE" != "main" ]; then
+  {
+    printf 'Blocked %s: recovery PR verification failed.\n' "$WORKSTREAM_ID"
+    printf 'Expected PR URL: %s\n' "$RECOVERY_PR_URL"
+    printf 'Expected recovery branch: %s\n' "$RECOVERY_BRANCH"
+    printf 'Expected base branch: main\n'
+    printf 'Expected state: OPEN\n'
+    printf 'Actual PR URL: %s\n' "$ACTUAL_PR_URL"
+    printf 'Actual state: %s\n' "$ACTUAL_STATE"
+    printf 'Actual branch: %s\n' "$ACTUAL_BRANCH"
+    printf 'Actual base branch: %s\n' "$ACTUAL_BASE"
+    printf 'PR view evidence: viable/%s-pr-view.json\n' "$WORKSTREAM_ID"
+  } > "$PR_BLOCKER_EVIDENCE"
+  update_classification_row \
+    "blocked" \
+    "Recovery PR verification mismatch; see viable/$WORKSTREAM_ID-pr-view.json and viable/$WORKSTREAM_ID-pr-blocker.txt." \
+    "Blocked: recovery PR was not OPEN on $RECOVERY_BRANCH targeting main."
+  exit 0
+fi
+update_classification_row \
+  "viable" \
+  "Issue verified via issue-541/issues.json, viable/$WORKSTREAM_ID-issue-search.json, and viable/$WORKSTREAM_ID-issue-view.json; recovery PR verified via viable/$WORKSTREAM_ID-pr-view.json." \
+  "Recover via issue #$ISSUE_NUMBER ($ISSUE_URL) with open PR #$RECOVERY_PR_NUMBER ($ACTUAL_PR_URL)."
+```
 
 Expected: every viable row either continues one adopted exact-head open pull
-request or links to one open pull request from a current-main recovery branch.
+request or rewrites its ledger row to stay `viable` with one verified OPEN
+recovery PR URL from the expected current-main recovery branch before Task 7
+cleanup or Task 9 audit begins.
 
 ### Task 6: Record Non-Viable Outcomes
 
@@ -1498,13 +1621,20 @@ AUDIT_EVIDENCE="$COMMON_DIR/agent-recovery/issue-541/final-audit-primary-checkou
 cd "$REPO"
 CURRENT_BRANCH="$(git branch --show-current)"
 UPSTREAM_REF="$(git rev-parse --abbrev-ref --symbolic-full-name @{upstream} 2>/dev/null || true)"
+UPSTREAM_REMOTE="$(git config --get "branch.$CURRENT_BRANCH.remote" 2>/dev/null || true)"
+UPSTREAM_MERGE_REF="$(git config --get "branch.$CURRENT_BRANCH.merge" 2>/dev/null || true)"
 STATUS="$(git status --porcelain=v1 --untracked-files=all)"
 record_state() {
-  local current_branch current_upstream
+  local current_branch current_upstream current_remote current_merge
   current_branch="$(git branch --show-current)"
   current_upstream="$(git rev-parse --abbrev-ref --symbolic-full-name @{upstream} 2>/dev/null || true)"
+  current_remote="$(git config --get "branch.$current_branch.remote" 2>/dev/null || true)"
+  current_merge="$(git config --get "branch.$current_branch.merge" 2>/dev/null || true)"
   printf 'Current branch: %s\n' "$current_branch"
+  printf 'Current HEAD: %s\n' "$(git rev-parse HEAD)"
   printf 'Configured upstream: %s\n' "${current_upstream:-<none>}"
+  printf 'Configured upstream remote: %s\n' "${current_remote:-<none>}"
+  printf 'Configured upstream merge ref: %s\n' "${current_merge:-<none>}"
   git status --short --branch --untracked-files=all
 }
 block_restore() {
@@ -1530,13 +1660,26 @@ fi
 if [ "$CURRENT_BRANCH" = "main" ]; then
   git merge --ff-only origin/main
 elif printf '%s\n%s\n' "$CURRENT_BRANCH" "$UPSTREAM_REF" | grep -Eq '(^|[-/])issue-541($|[-/])|(^|[-/])541($|[-/])'; then
-  if [ -z "$UPSTREAM_REF" ]; then
+  if [ -z "$UPSTREAM_REMOTE" ] || [ -z "$UPSTREAM_MERGE_REF" ]; then
     block_restore \
-      "Blocked: recovery-owned branch has no configured upstream; leave it untouched."
+      "Blocked: recovery-owned branch has no configured upstream remote/branch; leave it untouched."
   fi
-  if ! git merge-base --is-ancestor HEAD "$UPSTREAM_REF"; then
+  if ! git remote get-url "$UPSTREAM_REMOTE" > /dev/null 2>&1; then
     block_restore \
-      "Blocked: recovery-owned branch HEAD is not fully pushed to its configured upstream; leave it untouched."
+      "Blocked: recovery-owned branch upstream remote cannot be resolved; leave it untouched."
+  fi
+  if ! git fetch "$UPSTREAM_REMOTE" "$UPSTREAM_MERGE_REF"; then
+    block_restore \
+      "Blocked: recovery-owned branch upstream could not be fetched; leave it untouched."
+  fi
+  FETCHED_UPSTREAM="$(git rev-parse --verify FETCH_HEAD^{commit} 2>/dev/null || true)"
+  if [ -z "$FETCHED_UPSTREAM" ]; then
+    block_restore \
+      "Blocked: recovery-owned branch upstream fetch produced no commit tip; leave it untouched."
+  fi
+  if ! git merge-base --is-ancestor HEAD "$FETCHED_UPSTREAM"; then
+    block_restore \
+      "Blocked: recovery-owned branch HEAD is not fully pushed to its freshly fetched configured upstream; leave it untouched."
   fi
   git switch main
   git merge --ff-only origin/main
@@ -1554,7 +1697,10 @@ cat "$AUDIT_EVIDENCE"
 This step is mandatory before any final-audit branch-sensitive command. It
 must stay non-interactive: do not use `git reset`, `git checkout --force`, or
 any other destructive switch. If this step exits non-zero, stop Task 9 and
-leave the primary checkout exactly as it was.
+leave the primary checkout exactly as it was. For recovery-owned branches, the
+safety check must parse `branch.<name>.remote` and `branch.<name>.merge`,
+fetch that exact upstream into `FETCH_HEAD`, and compare `HEAD` with the fresh
+upstream tip rather than relying on a stale remote-tracking ref.
 
 Expected: the primary checkout either remains untouched with blocker evidence
 in `final-audit-primary-checkout.txt`, or it is restored cleanly to `main` by
