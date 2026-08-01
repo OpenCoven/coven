@@ -70,6 +70,15 @@
     verification artifacts, followed by byte-for-byte pre-removal proof
     artifacts regenerated from the live source worktree before any forced
     removal.
+- Create only when Task 7 Step 3 runs:
+  - `.git/agent-recovery/issue-541/private-merged-worktree-proof/<worktree-id>/tracked-index.porcelain`
+  - `.git/agent-recovery/issue-541/private-merged-worktree-proof/<worktree-id>/untracked.zlist`
+  - `.git/agent-recovery/issue-541/private-merged-worktree-proof/<worktree-id>/untracked.json`
+  - `.git/agent-recovery/issue-541/private-merged-worktree-proof/<worktree-id>/ignored.zlist`
+  - `.git/agent-recovery/issue-541/private-merged-worktree-proof/<worktree-id>/ignored.json`
+  - `.git/agent-recovery/issue-541/private-merged-worktree-proof/<worktree-id>/head.txt`
+  - `.git/agent-recovery/issue-541/private-merged-worktree-proof/<worktree-id>/origin-main.txt`
+  - Private evidence proving the tracked/index state is empty, the NUL-delimited nonignored untracked inventory is empty, the NUL-delimited ignored inventory is empty, and the worktree tip is already represented by fetched `origin/main` before any removal.
 - Create only when Task 4 Step 2 runs:
   - `.git/agent-recovery/issue-541/<workstream-id>-commits.txt`
   - `.git/agent-recovery/issue-541/<workstream-id>-stat.txt`
@@ -4079,9 +4088,9 @@ cd "$REPO"
 git worktree prune --dry-run --verbose
 ```
 
-Verify every listed `/private/tmp` path either has a bundle/snapshot in the
-issue-541 archive or corresponds to a merged/detached review with no unique
-work. Then run:
+Verify every path reported by `git worktree prune --dry-run --verbose` either
+has a bundle/snapshot in the issue-541 archive or corresponds to a
+merged/detached review with no unique work. Then run:
 
 ```bash
 set -euo pipefail
@@ -4092,7 +4101,11 @@ Expected: only registrations whose directories no longer exist are removed.
 
 - [ ] **Step 3: Remove clean merged worktrees**
 
-Check each known linked worktree:
+Check each known linked worktree. Persist private evidence for the tracked/index
+status, the nonignored untracked inventory, the ignored inventory, and the tip
+vs. `origin/main` proof before any removal. Any non-empty tracked/index status,
+nonignored untracked inventory, or ignored inventory blocks removal and leaves
+the worktree untouched:
 
 ```bash
 set -euo pipefail
@@ -4272,6 +4285,14 @@ EOF
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
+RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
+MERGED_RETIRE_ROOT="$RECOVERY/private-merged-worktree-proof"
+mkdir -p "$MERGED_RETIRE_ROOT"
+if ! git -C "$REPO" fetch origin main; then
+  printf 'Blocked: could not refresh origin/main before merged-worktree retirement proof.\n' >&2
+  exit 1
+fi
+ORIGIN_MAIN_COMMIT="$(git -C "$REPO" rev-parse "refs/remotes/origin/main^{commit}")"
 for path in \
   "$REPO/.worktrees/docs-cli-core-guides" \
   "$REPO/.worktrees/memory-summary-source" \
@@ -4279,11 +4300,71 @@ for path in \
   "$REPO/.worktrees/fix-coven-hq8-privacy-lockfile" \
   "$REPO/.worktrees/memory-api-review"
 do
+  worktree_id="$(basename "$path")"
+  PROOF_DIR="$MERGED_RETIRE_ROOT/$worktree_id"
+  BLOCKER="$RECOVERY/$worktree_id-merged-retire-blocker.txt"
+  mkdir -p "$PROOF_DIR"
+  if ! test -d "$path"; then
+    printf 'Blocked %s: worktree is missing; leave it untouched.\n' "$path" > "$BLOCKER"
+    continue
+  fi
+  if ! git -C "$path" status --porcelain=v1 --untracked-files=no > "$PROOF_DIR/tracked-index.porcelain"; then
+    printf 'Blocked %s: could not capture tracked/index status; leave the worktree untouched.\n' "$path" > "$BLOCKER"
+    continue
+  fi
+  if ! git -C "$path" ls-files --others --exclude-standard -z > "$PROOF_DIR/untracked.zlist"; then
+    printf 'Blocked %s: could not capture untracked inventory; leave the worktree untouched.\n' "$path" > "$BLOCKER"
+    continue
+  fi
+  python3 - "$PROOF_DIR/untracked.zlist" > "$PROOF_DIR/untracked.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+raw = Path(sys.argv[1]).read_bytes()
+entries = [] if not raw else raw.rstrip(b"\0").split(b"\0")
+print(json.dumps([entry.decode("utf-8", "surrogateescape") for entry in entries], indent=2))
+PY
+  if ! git -C "$path" ls-files --others --ignored --exclude-standard -z > "$PROOF_DIR/ignored.zlist"; then
+    printf 'Blocked %s: could not capture ignored inventory; leave the worktree untouched.\n' "$path" > "$BLOCKER"
+    continue
+  fi
+  python3 - "$PROOF_DIR/ignored.zlist" > "$PROOF_DIR/ignored.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+raw = Path(sys.argv[1]).read_bytes()
+entries = [] if not raw else raw.rstrip(b"\0").split(b"\0")
+print(json.dumps([entry.decode("utf-8", "surrogateescape") for entry in entries], indent=2))
+PY
+  if ! git -C "$path" rev-parse HEAD > "$PROOF_DIR/head.txt"; then
+    printf 'Blocked %s: could not capture worktree tip; leave the worktree untouched.\n' "$path" > "$BLOCKER"
+    continue
+  fi
+  printf '%s\n' "$ORIGIN_MAIN_COMMIT" > "$PROOF_DIR/origin-main.txt"
+  if test -s "$PROOF_DIR/tracked-index.porcelain"; then
+    printf 'Blocked %s: tracked/index status is non-empty; leave the worktree untouched.\n' "$path" > "$BLOCKER"
+    continue
+  fi
+  if test -s "$PROOF_DIR/untracked.zlist"; then
+    printf 'Blocked %s: nonignored untracked paths are present; leave the worktree untouched.\n' "$path" > "$BLOCKER"
+    continue
+  fi
+  if test -s "$PROOF_DIR/ignored.zlist"; then
+    printf 'Blocked %s: ignored paths are present; leave the worktree untouched.\n' "$path" > "$BLOCKER"
+    continue
+  fi
+  if ! git -C "$REPO" merge-base --is-ancestor "$(cat "$PROOF_DIR/head.txt")" "$ORIGIN_MAIN_COMMIT"; then
+    printf 'Blocked %s: worktree tip is not represented by fetched origin/main; leave the worktree untouched.\n' "$path" > "$BLOCKER"
+    continue
+  fi
   git -C "$REPO" worktree remove "$path"
 done
 ```
 
-Do not use `--force`. Any non-empty status blocks removal.
+Do not use `--force`. Any non-empty tracked/index status, nonignored untracked
+inventory, or ignored inventory blocks removal.
 
 - [ ] **Step 4: Retire the original dirty source worktrees only after proof checks**
 
