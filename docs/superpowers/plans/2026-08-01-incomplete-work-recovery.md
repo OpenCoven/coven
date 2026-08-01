@@ -81,14 +81,14 @@ Run:
 
 ```bash
 cd /tmp/coven-issue-541
-git diff --check
-python scripts/check-secrets.py
 git add docs/superpowers/plans/2026-08-01-incomplete-work-recovery.md
+git diff --cached --check
+python scripts/check-secrets.py
 python3 scripts/check-coven-privacy.py --staged
 ```
 
-Expected: every command exits zero and the privacy guard reports one staged
-plan file.
+Expected: every command exits zero, the staged diff check inspects the new plan
+file, and the privacy guard reports one staged plan file.
 
 - [ ] **Step 3: Commit the implementation plan**
 
@@ -96,13 +96,19 @@ Run:
 
 ```bash
 cd /tmp/coven-issue-541
-git commit -s -m "docs: plan incomplete work recovery"
+COPILOT_GH_ID=223556219
+COPILOT_GH_USER=Copilot
+COPILOT_NOREPLY_DOMAIN=users.noreply.github.com
+COPILOT_TRAILER="Co-authored-by: $COPILOT_GH_USER <${COPILOT_GH_ID}+${COPILOT_GH_USER}@${COPILOT_NOREPLY_DOMAIN}>"
+git commit -s --trailer "$COPILOT_TRAILER" \
+  -m "docs: plan incomplete work recovery"
 ```
 
 Expected: a commit containing only the implementation plan and the
 repository-required DCO sign-off plus the session-required Copilot co-author
 trailer. Human contributor co-author trailers remain conditional under
-`AGENTS.md` and are separate from the required Copilot trailer.
+`AGENTS.md` and, when required, are added separately with additional
+`--trailer` arguments rather than replacing the required Copilot trailer.
 
 - [ ] **Step 4: Push the design branch**
 
@@ -438,6 +444,7 @@ RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
 git -C "$REPO" fetch origin main
 git -C "$REPO" --no-pager branch -vv > "$RECOVERY/branches.txt"
 git -C "$REPO" worktree list --porcelain > "$RECOVERY/worktrees.txt"
+cd "$REPO"
 coven claim status > "$RECOVERY/claims.txt"
 gh api --paginate --slurp \
   "repos/OpenCoven/coven/pulls?state=all&per_page=100" \
@@ -661,6 +668,18 @@ Copilot co-author trailer on child commits, push, and PR creation. Human
 contributor `Co-authored-by:` trailers remain conditional under `AGENTS.md`
 and are separate from the required Copilot trailer.
 
+Every child plan must reuse this exact child-commit pattern, replacing only
+the commit message and adding any conditional human contributor trailers as
+separate extra `--trailer` arguments:
+
+```bash
+COPILOT_GH_ID=223556219
+COPILOT_GH_USER=Copilot
+COPILOT_NOREPLY_DOMAIN=users.noreply.github.com
+COPILOT_TRAILER="Co-authored-by: $COPILOT_GH_USER <${COPILOT_GH_ID}+${COPILOT_GH_USER}@${COPILOT_NOREPLY_DOMAIN}>"
+git commit -s --trailer "$COPILOT_TRAILER" -m "<child commit message>"
+```
+
 Expected: independent plans exist for mobile pairing, Intel macOS packaging,
 Ward confinement, memory promotion, Psyche specifications, universal runtime
 design, or runtime parity only when their ledger row is `viable`.
@@ -706,10 +725,9 @@ cd "$RECOVERY_WORKTREE"
 coven claim acquire "issue-$ISSUE_NUMBER"
 ```
 
-Execute that issue's plan, run its full gates, commit with `git commit -s`,
-include the session-required Copilot co-author trailer on each child commit,
-add human contributor co-author trailers only when `AGENTS.md` requires them,
-push, and open its scoped pull request.
+Execute that issue's plan, run its full gates, commit each child change with
+the Task 5 Step 3 trailer pattern, add human contributor co-author trailers
+only when `AGENTS.md` requires them, push, and open its scoped pull request.
 
 Expected: every viable row links to one open pull request from a current-main
 branch.
@@ -1027,7 +1045,11 @@ Expected: all seven workstreams match exactly one terminal classification.
 For every `viable` row, set `PR_URL` to the recorded pull-request URL and run:
 
 ```bash
-gh pr view "$PR_URL" --json state,isDraft,mergeStateStatus,url
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
+cd "$REPO"
+gh pr view "$PR_URL" --repo OpenCoven/coven \
+  --json state,isDraft,mergeStateStatus,url
 ```
 
 Expected: state is `OPEN`; draft status may reflect repository readiness, and
@@ -1044,7 +1066,7 @@ cd "$REPO"
 git status --short --branch
 git worktree list
 coven claim status
-gh pr list --state open --limit 100
+gh pr list --repo OpenCoven/coven --state open --limit 100
 ```
 
 Document every remaining recovery-owned worktree, claim, and open PR from these
@@ -1090,7 +1112,9 @@ links, non-viable evidence, and remaining human blockers. Do not post
 
 ```bash
 COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
-gh issue comment 541 --body-file \
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
+cd "$REPO"
+gh issue comment 541 --repo OpenCoven/coven --body-file \
   "$COMMON_DIR/agent-recovery/issue-541/classification.md"
 ```
 
@@ -1103,7 +1127,10 @@ Close only after every viable concern has an open PR and all local residue has
 been safely preserved or cleaned:
 
 ```bash
-gh issue close 541 --comment \
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
+cd "$REPO"
+gh issue close 541 --repo OpenCoven/coven --comment \
   "Recovery inventory is complete. Every viable concern has a scoped open PR; non-viable work has evidence and durable snapshots; local goals and Git hygiene are reconciled."
 ```
 
