@@ -96,8 +96,9 @@ its exact current source branch, reads that workstream's snapshotted source
 head, and runs an exact-head open-pull-request query. If exactly one candidate
 open pull request exists, the recovery verifies that its `headRefOid` matches
 the snapshotted source head, its `headRefName` matches the expected branch, its
-`headRepositoryOwner` is `OpenCoven`, and `isCrossRepository` is false before
-adopting it. If no exact-head pull request exists, the concern follows the
+`headRepositoryOwner` is `OpenCoven`, `isCrossRepository` is false, and
+`baseRefName` is `main` before adopting it. If no exact-head pull request
+exists, the concern follows the
 normal issue-reuse-or-create flow. If more than one exact-head pull request
 exists, or if the candidate pull request fails any identity check, the row
 moves to `blocked` with saved evidence rather than guessing.
@@ -141,6 +142,15 @@ after one of these proofs exists:
 Cleanup includes stale `/tmp` worktree registrations, merged local branches,
 gone upstream references, and expired claims. Unrelated user changes are never
 discarded.
+
+Before the final audit, the primary checkout is restored non-destructively to a
+clean `main`. If it is already on `main`, the recovery fetches `origin/main`
+and fast-forwards only when that is safe. If it is on a recovery-owned
+issue-541 branch, the recovery first proves the branch head is fully pushed to
+its configured upstream, then switches to `main` and fast-forwards from
+`origin/main`. Any dirty tracked or untracked state, missing upstream,
+unpushed recovery commits, unrelated current branch, or non-fast-forward `main`
+state blocks the audit and leaves the checkout untouched.
 
 ### 5. Reconcile long-running goals
 
@@ -200,6 +210,8 @@ after staging the intended change so it evaluates the actual proposed commit.
 - More than one exact-head open pull request, any candidate PR identity
   mismatch, or more than one exact-open matching recovery issue blocks the row
   with evidence rather than choosing a duplicate target.
+- Any unsafe primary-checkout restore condition blocks the final audit rather
+  than forcing a branch switch or reset.
 - Ambiguous ownership, policy, or human approval moves the workstream to
   `blocked` with evidence rather than inventing authority.
 - Claims are heartbeated during long work and released when the pull request
@@ -212,7 +224,8 @@ after staging the intended change so it evaluates the actual proposed commit.
 - Every dirty, formerly dirty, or orphaned workstream has a durable snapshot
   and classification.
 - Every viable concern either adopts one accurate exact-head open pull request
-  or has its own validated, pushed branch and open pull request.
+  targeting `main` or has its own validated, pushed branch and open pull
+  request.
 - Already-shipped and superseded work has concrete GitHub or main-branch
   evidence.
 - No uncommitted work is deleted.

@@ -30,6 +30,9 @@
   - `.git/agent-recovery/issue-541/viable/<workstream-id>-issue-blocker.txt`
   - Exact-head open-PR evidence, exact-open issue-match evidence, and blocker
     evidence for each viable workstream.
+- Create only when Task 9 runs:
+  - `.git/agent-recovery/issue-541/final-audit-primary-checkout.txt`
+  - Primary-checkout restore and blocker evidence for the final audit.
 - Create: `.git/agent-recovery/issue-541/dirty/docs-psyche-specs/`
 - Create: `.git/agent-recovery/issue-541/dirty/memory-promote/`
 - Create: `.git/agent-recovery/issue-541/dirty/mobile-memory-gateway/`
@@ -770,27 +773,31 @@ case "$PR_COUNT" in
     ACTUAL_BRANCH="$(jq -r '.headRefName' "$PR_VIEW_EVIDENCE")"
     ACTUAL_OWNER="$(jq -r '.headRepositoryOwner.login' "$PR_VIEW_EVIDENCE")"
     ACTUAL_CROSS="$(jq -r '.isCrossRepository' "$PR_VIEW_EVIDENCE")"
+    ACTUAL_BASE="$(jq -r '.baseRefName' "$PR_VIEW_EVIDENCE")"
     if [ "$ACTUAL_HEAD" != "$EXPECTED_HEAD" ] || \
        [ "$ACTUAL_BRANCH" != "$SOURCE_BRANCH" ] || \
        [ "$ACTUAL_OWNER" != "OpenCoven" ] || \
-       [ "$ACTUAL_CROSS" != "false" ]; then
+       [ "$ACTUAL_CROSS" != "false" ] || \
+       [ "$ACTUAL_BASE" != "main" ]; then
       {
         printf 'Blocked %s: candidate PR #%s failed identity checks.\n' \
           "$WORKSTREAM_ID" "$PR_NUMBER"
         printf 'Expected source head: %s\n' "$EXPECTED_HEAD"
         printf 'Expected source branch: %s\n' "$SOURCE_BRANCH"
         printf 'Expected owner/cross-repo: OpenCoven / false\n'
+        printf 'Expected base branch: main\n'
         printf 'Actual head: %s\n' "$ACTUAL_HEAD"
         printf 'Actual branch: %s\n' "$ACTUAL_BRANCH"
         printf 'Actual owner: %s\n' "$ACTUAL_OWNER"
         printf 'Actual cross-repo: %s\n' "$ACTUAL_CROSS"
+        printf 'Actual base branch: %s\n' "$ACTUAL_BASE"
         printf 'Open PR evidence: viable/%s-open-prs.json\n' "$WORKSTREAM_ID"
         printf 'PR view evidence: viable/%s-pr-view.json\n' "$WORKSTREAM_ID"
       } > "$PR_BLOCKER_EVIDENCE"
       update_classification_row \
         "blocked" \
         "PR identity mismatch; see viable/$WORKSTREAM_ID-open-prs.json, viable/$WORKSTREAM_ID-pr-view.json, and viable/$WORKSTREAM_ID-pr-blocker.txt." \
-        "Blocked: candidate PR failed exact-head SHA/branch/owner/repository validation."
+        "Blocked: candidate PR failed exact-head SHA/branch/owner/non-cross-repo/base validation."
       exit 0
     fi
     PR_URL="$(jq -r '.url' "$PR_VIEW_EVIDENCE")"
@@ -820,17 +827,18 @@ esac
 If `PR_COUNT=1`, verify the candidate PR before adopting it: `headRefOid` must
 equal the snapshotted source `head.txt`, `headRefName` must equal
 `$SOURCE_BRANCH`, `headRepositoryOwner.login` must equal `OpenCoven`, and
-`isCrossRepository` must be `false`. Record `continue existing PR` only after
-those checks pass. If `PR_COUNT>1`, or if the single candidate fails any
+`isCrossRepository` must be `false`, and `baseRefName` must equal `main`.
+Record `continue existing PR` only after those checks pass. If `PR_COUNT>1`,
+or if the single candidate fails any
 identity check, write `viable/$WORKSTREAM_ID-pr-blocker.txt`, update the
 classification row to `blocked`, and stop that row without creating or
 adopting anything. Continue to Step 2 only when `PR_COUNT=0`.
 
-Expected: every viable row has an evidence-backed exact-head PR decision before
-issue reuse or creation begins. If `docs/psyche-specs` still has exactly one
-open PR from head `docs/psyche-specs` at execution time and its identity checks
-pass, this step adopts whichever exact-source PR GitHub returns then rather
-than hardcoding a PR number.
+Expected: every viable row has an evidence-backed exact-head, `main`-targeting
+PR decision before issue reuse or creation begins. If `docs/psyche-specs`
+still has exactly one open PR from head `docs/psyche-specs` at execution time
+and its identity checks pass, this step adopts whichever exact-source PR
+GitHub returns then rather than hardcoding a PR number.
 
 - [ ] **Step 2: Reuse or create one issue per viable row that does not already have an adopted PR**
 
@@ -1438,6 +1446,7 @@ Expected: each active goal has one `next` field, completed goals are under
 ### Task 9: Final Recovery Audit
 
 **Artifacts:**
+- Create or modify: `.git/agent-recovery/issue-541/final-audit-primary-checkout.txt`
 - Modify: `.git/agent-recovery/issue-541/classification.md`
 
 - [ ] **Step 1: Verify every manifest row has a terminal recovery state**
@@ -1478,7 +1487,80 @@ gh pr view "$PR_URL" --repo OpenCoven/coven \
 Expected: state is `OPEN`; draft status may reflect repository readiness, and
 the URL matches the ledger.
 
-- [ ] **Step 3: Verify the primary checkout**
+- [ ] **Step 3: Restore the primary checkout before the final audit**
+
+Run:
+
+```bash
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
+AUDIT_EVIDENCE="$COMMON_DIR/agent-recovery/issue-541/final-audit-primary-checkout.txt"
+cd "$REPO"
+CURRENT_BRANCH="$(git branch --show-current)"
+UPSTREAM_REF="$(git rev-parse --abbrev-ref --symbolic-full-name @{upstream} 2>/dev/null || true)"
+STATUS="$(git status --porcelain=v1 --untracked-files=all)"
+record_state() {
+  local current_branch current_upstream
+  current_branch="$(git branch --show-current)"
+  current_upstream="$(git rev-parse --abbrev-ref --symbolic-full-name @{upstream} 2>/dev/null || true)"
+  printf 'Current branch: %s\n' "$current_branch"
+  printf 'Configured upstream: %s\n' "${current_upstream:-<none>}"
+  git status --short --branch --untracked-files=all
+}
+block_restore() {
+  {
+    printf '%s\n' "$1"
+    record_state
+  } > "$AUDIT_EVIDENCE"
+  cat "$AUDIT_EVIDENCE"
+  exit 1
+}
+if [ -n "$STATUS" ]; then
+  block_restore \
+    "Blocked: primary checkout has tracked or untracked changes; leave it untouched."
+fi
+git fetch origin main
+if ! git show-ref --verify --quiet refs/heads/main; then
+  block_restore "Blocked: local main branch is missing; leave the checkout untouched."
+fi
+if ! git merge-base --is-ancestor main origin/main; then
+  block_restore \
+    "Blocked: local main cannot be fast-forwarded safely to origin/main; leave the checkout untouched."
+fi
+if [ "$CURRENT_BRANCH" = "main" ]; then
+  git merge --ff-only origin/main
+elif printf '%s\n%s\n' "$CURRENT_BRANCH" "$UPSTREAM_REF" | grep -Eq '(^|[-/])issue-541($|[-/])|(^|[-/])541($|[-/])'; then
+  if [ -z "$UPSTREAM_REF" ]; then
+    block_restore \
+      "Blocked: recovery-owned branch has no configured upstream; leave it untouched."
+  fi
+  if ! git merge-base --is-ancestor HEAD "$UPSTREAM_REF"; then
+    block_restore \
+      "Blocked: recovery-owned branch HEAD is not fully pushed to its configured upstream; leave it untouched."
+  fi
+  git switch main
+  git merge --ff-only origin/main
+else
+  block_restore \
+    "Blocked: primary checkout is on an unrelated branch; leave it untouched."
+fi
+{
+  printf 'Primary checkout restored for final audit.\n'
+  record_state
+} > "$AUDIT_EVIDENCE"
+cat "$AUDIT_EVIDENCE"
+```
+
+This step is mandatory before any final-audit branch-sensitive command. It
+must stay non-interactive: do not use `git reset`, `git checkout --force`, or
+any other destructive switch. If this step exits non-zero, stop Task 9 and
+leave the primary checkout exactly as it was.
+
+Expected: the primary checkout either remains untouched with blocker evidence
+in `final-audit-primary-checkout.txt`, or it is restored cleanly to `main` by
+a safe fast-forward-only path.
+
+- [ ] **Step 4: Verify the primary checkout**
 
 Run:
 
@@ -1501,7 +1583,7 @@ recovery-owned worktree, claim, and open PR is documented; and unrelated active
 worktrees, claims, and PRs remain allowed when they are explicitly marked
 out-of-scope rather than removed or treated as audit failures.
 
-- [ ] **Step 4: Reject unsanitized local paths before posting the ledger**
+- [ ] **Step 5: Reject unsanitized local paths before posting the ledger**
 
 Run:
 
@@ -1527,7 +1609,7 @@ PY
 Expected: the command exits zero only when `classification.md` contains
 sanitized archive IDs and no local absolute path prefixes.
 
-- [ ] **Step 5: Update issue #541**
+- [ ] **Step 6: Update issue #541**
 
 Post a comment containing the sanitized classification table, recovery PR
 links, non-viable evidence, and remaining human blockers. Do not post
@@ -1544,7 +1626,7 @@ gh issue comment 541 --repo OpenCoven/coven --body-file \
 Expected: issue #541 contains the durable GitHub-visible recovery ledger sourced
 from the sanitized `classification.md`.
 
-- [ ] **Step 6: Close issue #541 when all machine work is delivered**
+- [ ] **Step 7: Close issue #541 when all machine work is delivered**
 
 Close only after every viable concern has an open PR and all local residue has
 been safely preserved or cleaned:
