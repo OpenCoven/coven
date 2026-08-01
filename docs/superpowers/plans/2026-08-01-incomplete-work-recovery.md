@@ -930,18 +930,64 @@ esac
 ISSUE_SEARCH_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-issue-search.json"
 ISSUE_VIEW_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-issue-view.json"
 ISSUE_BLOCKER_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-issue-blocker.txt"
-test -s "$ALL_ISSUES_EVIDENCE"
+ISSUE_LEDGER_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-issues.json"
+if ! gh api --paginate --slurp \
+  "repos/OpenCoven/coven/issues?state=all&per_page=100" \
+  > "$ALL_ISSUES_EVIDENCE"
+then
+  {
+    printf 'Blocked %s: could not refresh the paginated issue ledger before reuse/create.\n' \
+      "$WORKSTREAM_ID"
+    printf 'Latest shared issue ledger: issue-541/issues.json\n'
+    printf 'Per-workstream issue ledger: viable/%s-issues.json\n' "$WORKSTREAM_ID"
+  } > "$ISSUE_BLOCKER_EVIDENCE"
+  update_classification_row \
+    "blocked" \
+    "Issue ledger refresh failed; see issue-541/issues.json, viable/$WORKSTREAM_ID-issues.json, and viable/$WORKSTREAM_ID-issue-blocker.txt." \
+    "Blocked: could not refresh live issue evidence before exact-title reuse/create."
+  exit 0
+fi
+if ! cp "$ALL_ISSUES_EVIDENCE" "$ISSUE_LEDGER_EVIDENCE"; then
+  {
+    printf 'Blocked %s: could not persist the refreshed issue ledger copy.\n' \
+      "$WORKSTREAM_ID"
+    printf 'Latest shared issue ledger: issue-541/issues.json\n'
+    printf 'Per-workstream issue ledger: viable/%s-issues.json\n' "$WORKSTREAM_ID"
+  } > "$ISSUE_BLOCKER_EVIDENCE"
+  update_classification_row \
+    "blocked" \
+    "Issue ledger persistence failed; see issue-541/issues.json, viable/$WORKSTREAM_ID-issues.json, and viable/$WORKSTREAM_ID-issue-blocker.txt." \
+    "Blocked: could not persist live issue evidence before exact-title reuse/create."
+  exit 0
+fi
+if ! test -s "$ALL_ISSUES_EVIDENCE" || ! test -s "$ISSUE_LEDGER_EVIDENCE"; then
+  {
+    printf 'Blocked %s: refreshed issue ledger evidence is empty.\n' \
+      "$WORKSTREAM_ID"
+    printf 'Latest shared issue ledger: issue-541/issues.json\n'
+    printf 'Per-workstream issue ledger: viable/%s-issues.json\n' "$WORKSTREAM_ID"
+  } > "$ISSUE_BLOCKER_EVIDENCE"
+  update_classification_row \
+    "blocked" \
+    "Issue ledger evidence was empty; see issue-541/issues.json, viable/$WORKSTREAM_ID-issues.json, and viable/$WORKSTREAM_ID-issue-blocker.txt." \
+    "Blocked: live issue evidence was empty before exact-title reuse/create."
+  exit 0
+fi
 jq --arg title "$ISSUE_TITLE" \
   '[.[] | .[] | select(.pull_request? | not) | select(.title == $title and .state == "open") | {number, title, url, state}]' \
-  "$ALL_ISSUES_EVIDENCE" > "$ISSUE_SEARCH_EVIDENCE"
+  "$ISSUE_LEDGER_EVIDENCE" > "$ISSUE_SEARCH_EVIDENCE"
 ISSUE_COUNT="$(jq 'length' "$ISSUE_SEARCH_EVIDENCE")"
 ```
 
-Task 4's paginated `issues.json` is the authoritative reuse source. Each
-workstream's `viable/$WORKSTREAM_ID-issue-search.json` stores only the filtered
-non-PR exact-title `open` matches from that full ledger, so default-limited
-`gh issue list` output never drives reuse. A sole unrelated or closed result in
-`issues.json` leaves `ISSUE_COUNT=0` and must not be reused.
+Immediately before every exact-title reuse/create decision, refresh the fully
+paginated shared `issue-541/issues.json` ledger with `gh api --paginate
+--slurp`, then persist that row's exact live capture to
+`viable/$WORKSTREAM_ID-issues.json`. Only after that refresh may the plan
+filter and count exact-title non-PR `open` matches. Each workstream's
+`viable/$WORKSTREAM_ID-issue-search.json` stores only the filtered matches from
+that persisted live ledger, so default-limited `gh issue list` output never
+drives reuse. A sole unrelated or closed result in the refreshed ledger leaves
+`ISSUE_COUNT=0` and must not be reused.
 
 If exactly one exact-title open issue already exists, reuse it without creating
 a duplicate:
@@ -960,12 +1006,13 @@ case "$ISSUE_COUNT" in
         printf 'Blocked %s: issue #%s did not verify as exact-title OPEN.\n' \
           "$WORKSTREAM_ID" "$ISSUE_NUMBER"
         printf 'Task 4 paginated issue evidence: issue-541/issues.json\n'
+        printf 'Persisted live issue ledger: viable/%s-issues.json\n' "$WORKSTREAM_ID"
         printf 'Filtered issue evidence: viable/%s-issue-search.json\n' "$WORKSTREAM_ID"
         printf 'Issue view evidence: viable/%s-issue-view.json\n' "$WORKSTREAM_ID"
       } > "$ISSUE_BLOCKER_EVIDENCE"
       update_classification_row \
         "blocked" \
-        "Issue verification mismatch; see issue-541/issues.json, viable/$WORKSTREAM_ID-issue-search.json, viable/$WORKSTREAM_ID-issue-view.json, and viable/$WORKSTREAM_ID-issue-blocker.txt." \
+        "Issue verification mismatch; see issue-541/issues.json, viable/$WORKSTREAM_ID-issues.json, viable/$WORKSTREAM_ID-issue-search.json, viable/$WORKSTREAM_ID-issue-view.json, and viable/$WORKSTREAM_ID-issue-blocker.txt." \
         "Blocked: candidate issue failed exact-title OPEN verification."
       exit 0
     fi
@@ -1018,12 +1065,13 @@ EOF
         printf 'Blocked %s: created issue #%s did not verify as exact-title OPEN.\n' \
           "$WORKSTREAM_ID" "$ISSUE_NUMBER"
         printf 'Task 4 paginated issue evidence: issue-541/issues.json\n'
+        printf 'Persisted live issue ledger: viable/%s-issues.json\n' "$WORKSTREAM_ID"
         printf 'Filtered issue evidence: viable/%s-issue-search.json\n' "$WORKSTREAM_ID"
         printf 'Issue view evidence: viable/%s-issue-view.json\n' "$WORKSTREAM_ID"
       } > "$ISSUE_BLOCKER_EVIDENCE"
       update_classification_row \
         "blocked" \
-        "Created issue verification mismatch; see issue-541/issues.json, viable/$WORKSTREAM_ID-issue-search.json, viable/$WORKSTREAM_ID-issue-view.json, and viable/$WORKSTREAM_ID-issue-blocker.txt." \
+        "Created issue verification mismatch; see issue-541/issues.json, viable/$WORKSTREAM_ID-issues.json, viable/$WORKSTREAM_ID-issue-search.json, viable/$WORKSTREAM_ID-issue-view.json, and viable/$WORKSTREAM_ID-issue-blocker.txt." \
         "Blocked: created issue did not verify as exact-title OPEN."
       exit 0
     fi
@@ -1035,11 +1083,12 @@ EOF
       printf 'Blocked %s: expected 0 or 1 exact-title open issues for %s, found %s.\n' \
         "$WORKSTREAM_ID" "$ISSUE_TITLE" "$ISSUE_COUNT"
       printf 'Task 4 paginated issue evidence: issue-541/issues.json\n'
+      printf 'Persisted live issue ledger: viable/%s-issues.json\n' "$WORKSTREAM_ID"
       printf 'Filtered issue evidence: viable/%s-issue-search.json\n' "$WORKSTREAM_ID"
     } > "$ISSUE_BLOCKER_EVIDENCE"
     update_classification_row \
       "blocked" \
-      "Issue ambiguity; see issue-541/issues.json, viable/$WORKSTREAM_ID-issue-search.json, and viable/$WORKSTREAM_ID-issue-blocker.txt." \
+      "Issue ambiguity; see issue-541/issues.json, viable/$WORKSTREAM_ID-issues.json, viable/$WORKSTREAM_ID-issue-search.json, and viable/$WORKSTREAM_ID-issue-blocker.txt." \
       "Blocked: multiple open issues exactly match $ISSUE_TITLE."
     exit 0
     ;;
@@ -1048,7 +1097,7 @@ ISSUE_NUMBER="$(jq -r '.number' "$ISSUE_VIEW_EVIDENCE")"
 ISSUE_URL="$(jq -r '.url' "$ISSUE_VIEW_EVIDENCE")"
 update_classification_row \
   "viable" \
-  "Issue verified via issue-541/issues.json, viable/$WORKSTREAM_ID-issue-search.json, and viable/$WORKSTREAM_ID-issue-view.json." \
+  "Issue verified via issue-541/issues.json, viable/$WORKSTREAM_ID-issues.json, viable/$WORKSTREAM_ID-issue-search.json, and viable/$WORKSTREAM_ID-issue-view.json." \
   "Recover via issue #$ISSUE_NUMBER ($ISSUE_URL)."
 ```
 
@@ -1101,8 +1150,9 @@ continuing an adopted exact-head PR.
 - [ ] **Step 5: Recover and publish each viable concern sequentially**
 
 Skip this step for any row whose Task 5 Step 1 action is `continue existing PR`.
-For each remaining viable row, set `ISSUE_NUMBER` to its created or reused
-issue number and set `BRANCH_SLUG` from this fixed mapping:
+For each remaining viable row, set `WORKSTREAM_ID` to its exact workstream ID,
+set `ISSUE_NUMBER` to its created or reused issue number, and set
+`BRANCH_SLUG` from this fixed mapping:
 
 ```text
 mobile-memory-gateway -> mobile-pairing-recovery
@@ -1119,6 +1169,35 @@ Then run:
 ```bash
 COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
+RECOVERY="$COMMON_DIR/agent-recovery/issue-541/viable"
+CLASSIFICATION="$COMMON_DIR/agent-recovery/issue-541/classification.md"
+CLAIM_BLOCKER_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-claim-blocker.txt"
+mkdir -p "$RECOVERY"
+update_classification_row() {
+  python3 - "$CLASSIFICATION" "$WORKSTREAM_ID" "$1" "$2" "$3" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+workstream, classification, evidence, action = sys.argv[2:6]
+needle = f"| {workstream} |"
+lines = path.read_text().splitlines()
+for idx, line in enumerate(lines):
+    if line.startswith(needle):
+        parts = [part.strip() for part in line.strip().strip("|").split("|")]
+        if len(parts) != 5:
+            raise SystemExit(f"Unexpected classification row: {line}")
+        parts[1] = classification
+        parts[2] = evidence
+        parts[4] = action
+        lines[idx] = "| " + " | ".join(parts) + " |"
+        path.write_text("\n".join(lines) + "\n")
+        break
+else:
+    raise SystemExit(f"Missing classification row for {workstream}")
+PY
+}
+RECOVERY_BRANCH="issue-$ISSUE_NUMBER-$BRANCH_SLUG"
 RECOVERY_WORKTREE="$REPO/.worktrees/coven-recovery-541-$ISSUE_NUMBER-$BRANCH_SLUG"
 if test -e "$RECOVERY_WORKTREE"; then
   printf 'Recovery worktree path already exists: %s\n' "$RECOVERY_WORKTREE" >&2
@@ -1131,13 +1210,48 @@ if git -C "$REPO" worktree list --porcelain | awk -v path="$RECOVERY_WORKTREE" '
   printf 'Recovery worktree is already registered by Git: %s\n' "$RECOVERY_WORKTREE" >&2
   exit 1
 fi
-git -C "$REPO" fetch origin main
-git -C "$REPO" worktree add \
+if ! git -C "$REPO" fetch origin main; then
+  printf 'Failed to fetch origin/main before creating %s.\n' "$RECOVERY_BRANCH" >&2
+  exit 1
+fi
+if ! git -C "$REPO" worktree add \
   -b "issue-$ISSUE_NUMBER-$BRANCH_SLUG" \
   "$RECOVERY_WORKTREE" \
   origin/main
+then
+  printf 'Failed to create recovery worktree %s.\n' "$RECOVERY_WORKTREE" >&2
+  exit 1
+fi
 cd "$RECOVERY_WORKTREE"
-coven claim acquire "issue-$ISSUE_NUMBER"
+if ! coven claim acquire "issue-$ISSUE_NUMBER"; then
+  {
+    printf 'Blocked %s: coven claim acquire issue-%s failed.\n' \
+      "$WORKSTREAM_ID" "$ISSUE_NUMBER"
+    printf 'Recovery worktree: %s\n' "$RECOVERY_WORKTREE"
+    printf 'Recovery branch: %s\n' "$RECOVERY_BRANCH"
+  } > "$CLAIM_BLOCKER_EVIDENCE"
+  update_classification_row \
+    "blocked" \
+    "Claim acquisition failed; see viable/$WORKSTREAM_ID-claim-blocker.txt." \
+    "Blocked: child claim issue-$ISSUE_NUMBER could not be acquired."
+  if [ -n "$(git -C "$RECOVERY_WORKTREE" status --porcelain --untracked-files=all)" ]; then
+    printf 'Cleanup blocked: child worktree is no longer clean; leave it in place for inspection.\n' \
+      >> "$CLAIM_BLOCKER_EVIDENCE"
+    exit 1
+  fi
+  cd "$REPO"
+  if ! git -C "$REPO" worktree remove "$RECOVERY_WORKTREE"; then
+    printf 'Cleanup blocked: could not remove clean child worktree %s without force.\n' \
+      "$RECOVERY_WORKTREE" >> "$CLAIM_BLOCKER_EVIDENCE"
+    exit 1
+  fi
+  if ! git -C "$REPO" branch -d "$RECOVERY_BRANCH"; then
+    printf 'Cleanup blocked: could not delete clean child branch %s without force.\n' \
+      "$RECOVERY_BRANCH" >> "$CLAIM_BLOCKER_EVIDENCE"
+    exit 1
+  fi
+  exit 0
+fi
 ```
 
 For long child recovery sessions, keep the child claim alive from that child
@@ -1156,6 +1270,14 @@ when that pull request merges or the owning recovery session stops:
 cd "$RECOVERY_WORKTREE"
 coven claim release "issue-$ISSUE_NUMBER"
 ```
+
+Continue into the child recovery plan only after `coven claim acquire`
+succeeds. If acquisition fails, persist
+`viable/$WORKSTREAM_ID-claim-blocker.txt`, rewrite the classification row to
+`blocked`, remove the newly created still-clean child worktree and its exact
+local branch without force, and stop that row. If either cleanup command
+fails, leave the residue in place, keep the row blocked, and treat that as an
+operator-visible blocker.
 
 Execute that issue's plan, run its full gates, commit each child change with
 the Task 5 Step 4 trailer pattern, add human contributor co-author trailers
@@ -1428,11 +1550,90 @@ done
 If a row is `viable`, confirm its classification row cites either the adopted
 exact-head PR URL or the open replacement PR URL before removal. Otherwise
 confirm the row already records its `already-shipped`, `superseded`, or
-`blocked` evidence. Then remove only the four original dirty source worktrees:
+`blocked` evidence. Before any `--force` removal, recompute live proof files
+under the private recovery archive and compare them byte-for-byte with the
+preserved snapshot. Any mismatch or missing file blocks removal and requires a
+fresh snapshot plus reclassification for that row. Only unchanged rows may use
+the exact-path force-removal exception:
 
 ```bash
 COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
+RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
+RETIRE_PROOF_ROOT="$RECOVERY/private-retire-proof"
+mkdir -p "$RETIRE_PROOF_ROOT"
+for id in \
+  docs-psyche-specs \
+  memory-promote \
+  mobile-memory-gateway \
+  pr-476-review
+do
+  SNAPSHOT="$RECOVERY/dirty/$id"
+  PROOF_DIR="$RETIRE_PROOF_ROOT/$id"
+  BLOCKER="$RECOVERY/$id-retire-blocker.txt"
+  mkdir -p "$PROOF_DIR"
+  case "$id" in
+    docs-psyche-specs)
+      SOURCE="$REPO/.worktrees/docs-psyche-specs"
+      ;;
+    memory-promote)
+      SOURCE="$REPO/.worktrees/feat-cmem-1ev-memory-promote"
+      ;;
+    mobile-memory-gateway)
+      SOURCE="$REPO/.worktrees/mobile-memory-gateway"
+      ;;
+    pr-476-review)
+      SOURCE="$REPO/.worktrees/pr-476-review"
+      ;;
+  esac
+  if ! test -d "$SOURCE"; then
+    printf 'Blocked %s: source worktree is missing before retirement proof; take a fresh snapshot and reclassify.\n' \
+      "$id" > "$BLOCKER"
+    exit 1
+  fi
+  git -C "$SOURCE" rev-parse HEAD > "$PROOF_DIR/live-head.txt"
+  if ! cmp -s "$PROOF_DIR/live-head.txt" "$SNAPSHOT/head.txt"; then
+    printf 'Blocked %s: HEAD drifted since snapshot; take a fresh snapshot and reclassify before removal.\n' \
+      "$id" > "$BLOCKER"
+    exit 1
+  fi
+  git -C "$SOURCE" diff --binary > "$PROOF_DIR/live-worktree.patch"
+  if ! cmp -s "$PROOF_DIR/live-worktree.patch" "$SNAPSHOT/worktree.patch"; then
+    printf 'Blocked %s: unstaged tracked changes drifted since snapshot; take a fresh snapshot and reclassify before removal.\n' \
+      "$id" > "$BLOCKER"
+    exit 1
+  fi
+  git -C "$SOURCE" diff --cached --binary > "$PROOF_DIR/live-index.patch"
+  if ! cmp -s "$PROOF_DIR/live-index.patch" "$SNAPSHOT/index.patch"; then
+    printf 'Blocked %s: staged changes drifted since snapshot; take a fresh snapshot and reclassify before removal.\n' \
+      "$id" > "$BLOCKER"
+    exit 1
+  fi
+  git -C "$SOURCE" ls-files --others --exclude-standard > "$PROOF_DIR/live-untracked-files.txt"
+  if ! cmp -s "$PROOF_DIR/live-untracked-files.txt" "$SNAPSHOT/untracked-files.txt"; then
+    printf 'Blocked %s: untracked path inventory drifted since snapshot; take a fresh snapshot and reclassify before removal.\n' \
+      "$id" > "$BLOCKER"
+    exit 1
+  fi
+  while IFS= read -r path; do
+    test -n "$path" || continue
+    if ! test -e "$SOURCE/$path"; then
+      printf 'Blocked %s: live untracked file is missing: %s. Take a fresh snapshot and reclassify before removal.\n' \
+        "$id" "$path" > "$BLOCKER"
+      exit 1
+    fi
+    if ! test -e "$SNAPSHOT/untracked/$path"; then
+      printf 'Blocked %s: snapshotted untracked file copy is missing: %s. Take a fresh snapshot and reclassify before removal.\n' \
+        "$id" "$path" > "$BLOCKER"
+      exit 1
+    fi
+    if ! cmp -s "$SOURCE/$path" "$SNAPSHOT/untracked/$path"; then
+      printf 'Blocked %s: untracked file content drifted for %s; take a fresh snapshot and reclassify before removal.\n' \
+        "$id" "$path" > "$BLOCKER"
+      exit 1
+    fi
+  done < "$SNAPSHOT/untracked-files.txt"
+done
 for path in \
   "$REPO/.worktrees/docs-psyche-specs" \
   "$REPO/.worktrees/feat-cmem-1ev-memory-promote" \
@@ -1445,10 +1646,12 @@ done
 
 Expected: only those four exact dirty source paths are force-removed, because
 their committed history, dirty state, and recovery disposition have already
-been proven elsewhere in the archive. Empty worktree, index, and untracked
-snapshot classes are still acceptable, but the retirement proof now requires
-non-empty evidence files populated either with captured change summaries or
-deterministic sentinel lines.
+been proven elsewhere in the archive and reconfirmed as unchanged against the
+preserved snapshot immediately before removal. Empty worktree, index, and
+untracked snapshot classes are still acceptable, but the retirement proof now
+requires non-empty evidence files populated either with captured change
+summaries or deterministic sentinel lines, plus matching live proof files under
+`private-retire-proof/`.
 
 - [ ] **Step 5: Delete only proven local branch residue after worktree retirement**
 
@@ -1649,7 +1852,10 @@ if [ -n "$STATUS" ]; then
   block_restore \
     "Blocked: primary checkout has tracked or untracked changes; leave it untouched."
 fi
-git fetch origin main
+if ! git fetch origin main; then
+  block_restore \
+    "Blocked: could not fetch origin/main for the primary checkout; leave it untouched."
+fi
 if ! git show-ref --verify --quiet refs/heads/main; then
   block_restore "Blocked: local main branch is missing; leave the checkout untouched."
 fi
@@ -1658,7 +1864,10 @@ if ! git merge-base --is-ancestor main origin/main; then
     "Blocked: local main cannot be fast-forwarded safely to origin/main; leave the checkout untouched."
 fi
 if [ "$CURRENT_BRANCH" = "main" ]; then
-  git merge --ff-only origin/main
+  if ! git merge --ff-only origin/main; then
+    block_restore \
+      "Blocked: primary checkout could not fast-forward main to origin/main; leave it untouched."
+  fi
 elif printf '%s\n%s\n' "$CURRENT_BRANCH" "$UPSTREAM_REF" | grep -Eq '(^|[-/])issue-541($|[-/])|(^|[-/])541($|[-/])'; then
   if [ -z "$UPSTREAM_REMOTE" ] || [ -z "$UPSTREAM_MERGE_REF" ]; then
     block_restore \
@@ -1681,11 +1890,27 @@ elif printf '%s\n%s\n' "$CURRENT_BRANCH" "$UPSTREAM_REF" | grep -Eq '(^|[-/])iss
     block_restore \
       "Blocked: recovery-owned branch HEAD is not fully pushed to its freshly fetched configured upstream; leave it untouched."
   fi
-  git switch main
-  git merge --ff-only origin/main
+  if ! git switch main; then
+    block_restore \
+      "Blocked: could not switch the primary checkout to main; leave it untouched."
+  fi
+  if ! git merge --ff-only origin/main; then
+    block_restore \
+      "Blocked: primary checkout could not fast-forward main to origin/main after switching; leave it untouched."
+  fi
 else
   block_restore \
     "Blocked: primary checkout is on an unrelated branch; leave it untouched."
+fi
+FINAL_BRANCH="$(git branch --show-current)"
+FINAL_STATUS="$(git status --porcelain --untracked-files=all)"
+if [ "$FINAL_BRANCH" != "main" ]; then
+  block_restore \
+    "Blocked: final primary checkout branch is not main after restore; leave it untouched."
+fi
+if [ -n "$FINAL_STATUS" ]; then
+  block_restore \
+    "Blocked: primary checkout is not clean after restore; leave it untouched."
 fi
 {
   printf 'Primary checkout restored for final audit.\n'
