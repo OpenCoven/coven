@@ -13,7 +13,7 @@ use std::sync::atomic::AtomicI32;
 use std::sync::MutexGuard;
 
 use anyhow::{Context, Result};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, window_size};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, PtySize, PtySystem};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2294,13 +2294,49 @@ impl Drop for RawModeGuard {
     }
 }
 
-fn terminal_size() -> PtySize {
-    PtySize {
-        rows: env_u16("LINES").unwrap_or(24),
-        cols: env_u16("COLUMNS").unwrap_or(80),
+const DEFAULT_PTY_ROWS: u16 = 24;
+const DEFAULT_PTY_COLS: u16 = 80;
+
+fn detected_terminal_size() -> Option<PtySize> {
+    if !io::stdout().is_terminal() {
+        return None;
+    }
+    let window = window_size().ok()?;
+    valid_pty_size(PtySize {
+        rows: window.rows,
+        cols: window.columns,
+        pixel_width: window.width,
+        pixel_height: window.height,
+    })
+}
+
+fn valid_pty_size(size: PtySize) -> Option<PtySize> {
+    (size.rows > 0 && size.cols > 0).then_some(size)
+}
+
+fn terminal_size_from_sources(
+    terminal: Option<PtySize>,
+    env_rows: Option<u16>,
+    env_cols: Option<u16>,
+) -> PtySize {
+    terminal.and_then(valid_pty_size).unwrap_or(PtySize {
+        rows: env_rows.unwrap_or(DEFAULT_PTY_ROWS),
+        cols: env_cols.unwrap_or(DEFAULT_PTY_COLS),
         pixel_width: 0,
         pixel_height: 0,
-    }
+    })
+}
+
+fn terminal_size() -> PtySize {
+    terminal_size_from_sources(None, env_u16("LINES"), env_u16("COLUMNS"))
+}
+
+fn attached_terminal_size() -> PtySize {
+    terminal_size_from_sources(
+        detected_terminal_size(),
+        env_u16("LINES"),
+        env_u16("COLUMNS"),
+    )
 }
 
 fn env_u16(name: &str) -> Option<u16> {
@@ -2314,6 +2350,55 @@ fn env_u16(name: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pty_size(rows: u16, cols: u16, pixel_width: u16, pixel_height: u16) -> PtySize {
+        PtySize {
+            rows,
+            cols,
+            pixel_width,
+            pixel_height,
+        }
+    }
+
+    #[test]
+    fn pty_geometry_prefers_live_terminal_size_and_pixels() {
+        let live = pty_size(52, 151, 1812, 936);
+
+        assert_eq!(
+            terminal_size_from_sources(Some(live), Some(24), Some(80)),
+            live,
+        );
+    }
+
+    #[test]
+    fn pty_geometry_rejects_zero_live_dimensions() {
+        let invalid = pty_size(0, 151, 1812, 936);
+
+        assert_eq!(
+            terminal_size_from_sources(Some(invalid), Some(41), Some(132)),
+            pty_size(41, 132, 0, 0),
+        );
+    }
+
+    #[test]
+    fn pty_geometry_uses_each_environment_fallback_independently() {
+        assert_eq!(
+            terminal_size_from_sources(None, Some(41), None),
+            pty_size(41, 80, 0, 0),
+        );
+        assert_eq!(
+            terminal_size_from_sources(None, None, Some(132)),
+            pty_size(24, 132, 0, 0),
+        );
+    }
+
+    #[test]
+    fn pty_geometry_defaults_when_every_source_is_unavailable() {
+        assert_eq!(
+            terminal_size_from_sources(None, None, None),
+            pty_size(24, 80, 0, 0),
+        );
+    }
 
     #[test]
     fn builds_codex_command_without_shell_interpolation() {
