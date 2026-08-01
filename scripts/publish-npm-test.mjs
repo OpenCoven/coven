@@ -18,11 +18,45 @@ import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { defaultTargetName, isMainModule, isOidcContext, packageVersionPublished, publishArgs, publishEnv, releaseVersion, targetPackageName, validatePublishToken, validatePublishVersion, wrapperPackageDirName, wrapperPackageNameList, wrapperTextForPackage } from './publish-npm.mjs';
+import { parseReleaseTag } from './release-npm-context.mjs';
 
 const OIDC_ENV = {
   ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'fake-oidc-token',
   ACTIONS_ID_TOKEN_REQUEST_URL: 'https://token.actions.githubusercontent.com/'
 };
+
+test('parseReleaseTag preserves stable releases', () => {
+  assert.deepEqual(parseReleaseTag('v0.2.3'), {
+    releaseMode: 'normal',
+    releaseTag: 'v0.2.3',
+    npmVersion: '0.2.3',
+    recoveryAttempt: null
+  });
+});
+
+test('parseReleaseTag derives the base version from signed recovery tags', () => {
+  assert.deepEqual(parseReleaseTag('v0.2.3-recovery.1'), {
+    releaseMode: 'recovery',
+    releaseTag: 'v0.2.3',
+    npmVersion: '0.2.3',
+    recoveryAttempt: 1
+  });
+});
+
+test('parseReleaseTag rejects malformed and unrelated prerelease tags', () => {
+  for (const tag of [
+    'v0.2',
+    'v0.2.3-rc.1',
+    'v0.2.3-recovery.0',
+    'v01.2.3',
+    'recovery-v0.2.3'
+  ]) {
+    assert.throws(
+      () => parseReleaseTag(tag),
+      /stable vX.Y.Z tag or vX.Y.Z-recovery.N/
+    );
+  }
+});
 
 const SIGNAL_TEST_PACKAGES = {
   'darwin-arm64': ['@opencoven/cli-macos', 'coven'],
