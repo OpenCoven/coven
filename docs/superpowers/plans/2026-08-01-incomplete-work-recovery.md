@@ -192,9 +192,11 @@ printf 'docs-psyche-specs\tdirty-worktree\t%s\t%s\t%s\t%s\n' \
 ```
 
 Expected: `branch.bundle` verifies against `docs/psyche-specs`, preserving its
-committed history before any later branch deletion; both patch files exist; and
-the copied untracked tree contains `specs/psyche/COVEN_PREREQUISITES.md`,
-`specs/psyche/PLAN.md`, and the Psyche reconciliation plan.
+committed history before any later branch deletion; both patch files exist;
+`index.patch` preserves the staged additions for
+`specs/psyche/COVEN_PREREQUISITES.md`, `specs/psyche/PLAN.md`, and the Psyche
+reconciliation plan; and any copied untracked files match only the paths listed
+in `untracked-files.txt`.
 
 - [ ] **Step 3: Snapshot `feat-cmem-1ev-memory-promote`**
 
@@ -501,18 +503,20 @@ classes are valid and remain as existing zero-byte files.
 
 Create `.git/agent-recovery/issue-541/classification.md` with a five-column
 table headed `Workstream`, `Classification`, `Main/PR evidence`,
-`Preserved source`, and `Recovery action`. Include exactly these seven rows:
+`Preserved source`, and `Recovery action`. Initialize it as:
 
 ```markdown
 # Issue 541 Recovery Classification
 
-docs-psyche-specs
-memory-promote
-mobile-memory-gateway
-pr-476-review
-docs-universal-runtime-capability-design
-feat-npm-macos-x64
-fix-521-ward-surface-confinement
+| Workstream | Classification | Main/PR evidence | Preserved source | Recovery action |
+| --- | --- | --- | --- | --- |
+| docs-psyche-specs | pending | Pending Task 4 Step 2 evidence review. | dirty/docs-psyche-specs | Pending Task 4 Step 4 classification. |
+| memory-promote | pending | Pending Task 4 Step 2 evidence review. | dirty/memory-promote | Pending Task 4 Step 4 classification. |
+| mobile-memory-gateway | pending | Pending Task 4 Step 2 evidence review. | dirty/mobile-memory-gateway | Pending Task 4 Step 4 classification. |
+| pr-476-review | pending | Pending Task 4 Step 2 evidence review. | dirty/pr-476-review | Pending Task 4 Step 4 classification. |
+| docs-universal-runtime-capability-design | pending | Pending Task 4 Step 2 evidence review. | branches/docs-universal-runtime-capability-design.bundle | Pending Task 4 Step 4 classification. |
+| feat-npm-macos-x64 | pending | Pending Task 4 Step 2 evidence review. | branches/feat-npm-macos-x64.bundle | Pending Task 4 Step 4 classification. |
+| fix-521-ward-surface-confinement | pending | Pending Task 4 Step 2 evidence review. | branches/fix-521-ward-surface-confinement.bundle | Pending Task 4 Step 4 classification. |
 ```
 
 Write the selected classification, concrete commit/PR/issue/path evidence,
@@ -548,7 +552,9 @@ blocked:
   or an unresolved contract choice that cannot be inferred safely.
 ```
 
-Expected: every row has exactly one classification and one next action.
+Expected: Task 4 Step 4 replaces every `pending` row with exactly one terminal
+classification (`already-shipped`, `superseded`, `viable`, or `blocked`) and
+one next action before Task 4 Step 5 and Task 9 Step 1 verification.
 
 - [ ] **Step 5: Review the ledger against the manifest**
 
@@ -1016,8 +1022,14 @@ coven claim status
 gh pr list --state open --limit 100
 ```
 
-Expected: the primary checkout is clean on `main`; all remaining worktrees,
-claims, and open PRs correspond to documented active recovery work.
+Document every remaining recovery-owned worktree, claim, and open PR from these
+outputs. If unrelated active worktrees, claims, or PRs also appear, identify
+them generically as out-of-scope ongoing work and leave them untouched.
+
+Expected: the primary checkout is clean on `main`; every remaining
+recovery-owned worktree, claim, and open PR is documented; and unrelated active
+worktrees, claims, and PRs remain allowed when they are explicitly marked
+out-of-scope rather than removed or treated as audit failures.
 
 - [ ] **Step 4: Reject unsanitized local paths before posting the ledger**
 
