@@ -170,11 +170,12 @@ git -C "$REPO" bundle create "$DEST/branch.bundle" "$BRANCH"
 git -C "$REPO" bundle verify "$DEST/branch.bundle"
 git -C "$SOURCE" diff --binary > "$DEST/worktree.patch"
 git -C "$SOURCE" diff --cached --binary > "$DEST/index.patch"
-git -C "$SOURCE" ls-files --others --exclude-standard -z |
-  while IFS= read -r -d '' path; do
-    mkdir -p "$DEST/untracked/$(dirname "$path")"
-    cp -p "$SOURCE/$path" "$DEST/untracked/$path"
-  done
+git -C "$SOURCE" ls-files --others --exclude-standard > "$DEST/untracked-files.txt"
+while IFS= read -r path; do
+  test -n "$path" || continue
+  mkdir -p "$DEST/untracked/$(dirname "$path")"
+  cp -p "$SOURCE/$path" "$DEST/untracked/$path"
+done < "$DEST/untracked-files.txt"
 printf 'docs-psyche-specs\tdirty-worktree\t%s\t%s\t%s\t%s\n' \
   "$SOURCE" \
   "$(cat "$DEST/head.txt")" \
@@ -206,11 +207,12 @@ git -C "$REPO" bundle create "$DEST/branch.bundle" "$BRANCH"
 git -C "$REPO" bundle verify "$DEST/branch.bundle"
 git -C "$SOURCE" diff --binary > "$DEST/worktree.patch"
 git -C "$SOURCE" diff --cached --binary > "$DEST/index.patch"
-git -C "$SOURCE" ls-files --others --exclude-standard -z |
-  while IFS= read -r -d '' path; do
-    mkdir -p "$DEST/untracked/$(dirname "$path")"
-    cp -p "$SOURCE/$path" "$DEST/untracked/$path"
-  done
+git -C "$SOURCE" ls-files --others --exclude-standard > "$DEST/untracked-files.txt"
+while IFS= read -r path; do
+  test -n "$path" || continue
+  mkdir -p "$DEST/untracked/$(dirname "$path")"
+  cp -p "$SOURCE/$path" "$DEST/untracked/$path"
+done < "$DEST/untracked-files.txt"
 ```
 
 ```bash
@@ -246,11 +248,12 @@ git -C "$REPO" bundle create "$DEST/branch.bundle" "$BRANCH"
 git -C "$REPO" bundle verify "$DEST/branch.bundle"
 git -C "$SOURCE" diff --binary > "$DEST/worktree.patch"
 git -C "$SOURCE" diff --cached --binary > "$DEST/index.patch"
-git -C "$SOURCE" ls-files --others --exclude-standard -z |
-  while IFS= read -r -d '' path; do
-    mkdir -p "$DEST/untracked/$(dirname "$path")"
-    cp -p "$SOURCE/$path" "$DEST/untracked/$path"
-  done
+git -C "$SOURCE" ls-files --others --exclude-standard > "$DEST/untracked-files.txt"
+while IFS= read -r path; do
+  test -n "$path" || continue
+  mkdir -p "$DEST/untracked/$(dirname "$path")"
+  cp -p "$SOURCE/$path" "$DEST/untracked/$path"
+done < "$DEST/untracked-files.txt"
 ```
 
 ```bash
@@ -285,11 +288,12 @@ git -C "$REPO" bundle create "$DEST/branch.bundle" "$BRANCH"
 git -C "$REPO" bundle verify "$DEST/branch.bundle"
 git -C "$SOURCE" diff --binary > "$DEST/worktree.patch"
 git -C "$SOURCE" diff --cached --binary > "$DEST/index.patch"
-git -C "$SOURCE" ls-files --others --exclude-standard -z |
-  while IFS= read -r -d '' path; do
-    mkdir -p "$DEST/untracked/$(dirname "$path")"
-    cp -p "$SOURCE/$path" "$DEST/untracked/$path"
-  done
+git -C "$SOURCE" ls-files --others --exclude-standard > "$DEST/untracked-files.txt"
+while IFS= read -r path; do
+  test -n "$path" || continue
+  mkdir -p "$DEST/untracked/$(dirname "$path")"
+  cp -p "$SOURCE/$path" "$DEST/untracked/$path"
+done < "$DEST/untracked-files.txt"
 ```
 
 ```bash
@@ -314,20 +318,26 @@ REPO="$(cd "$COMMON_DIR/.." && pwd)"
 RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
 test "$(wc -l < "$RECOVERY/manifest.tsv" | tr -d ' ')" = 5
 for id in docs-psyche-specs memory-promote mobile-memory-gateway pr-476-review; do
-  test -s "$RECOVERY/dirty/$id/status.txt"
-  test -s "$RECOVERY/dirty/$id/branch.txt"
-  test -s "$RECOVERY/dirty/$id/head.txt"
-  test -s "$RECOVERY/dirty/$id/merge-base.txt"
-  test -s "$RECOVERY/dirty/$id/branch.bundle"
-  test -s "$RECOVERY/dirty/$id/worktree.patch"
-  test -s "$RECOVERY/dirty/$id/index.patch"
-  git -C "$REPO" bundle verify "$RECOVERY/dirty/$id/branch.bundle" > /dev/null
+  SNAPSHOT="$RECOVERY/dirty/$id"
+  test -s "$SNAPSHOT/status.txt"
+  test -s "$SNAPSHOT/branch.txt"
+  test -s "$SNAPSHOT/head.txt"
+  test -s "$SNAPSHOT/merge-base.txt"
+  test -s "$SNAPSHOT/branch.bundle"
+  test -s "$SNAPSHOT/worktree.patch"
+  test -s "$SNAPSHOT/index.patch"
+  test -f "$SNAPSHOT/untracked-files.txt"
+  while IFS= read -r path; do
+    test -n "$path" || continue
+    test -e "$SNAPSHOT/untracked/$path"
+  done < "$SNAPSHOT/untracked-files.txt"
+  git -C "$REPO" bundle verify "$SNAPSHOT/branch.bundle" > /dev/null
 done
 ```
 
 Expected: every dirty snapshot includes status, branch, head, merge-base, both
-patches, and a verified `branch.bundle`, so committed branch history is
-preserved before any later branch deletion.
+patches, an explicit untracked inventory, and a verified `branch.bundle`, so
+committed branch history is preserved before any later branch deletion.
 
 ### Task 3: Archive Every Orphan Branch
 
@@ -435,6 +445,8 @@ RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
 for branch in \
   docs/psyche-specs \
   docs/universal-runtime-capability-design \
+  feat/cmem-1ev-memory-promote \
+  feat/mobile-memory-gateway \
   feat/npm-macos-x64 \
   fix/476-review-threads \
   fix/521-ward-surface-confinement
@@ -462,19 +474,15 @@ do
     > "$RECOVERY/$id-index-evidence.txt"
   test -s "$RECOVERY/$id-index-evidence.txt" || \
     printf '<no staged diff>\n' > "$RECOVERY/$id-index-evidence.txt"
-  (
-    cd "$SNAPSHOT/untracked" &&
-    find . -type f | sed 's#^\./##' | LC_ALL=C sort
-  ) > "$RECOVERY/$id-untracked-evidence.txt"
-  test -s "$RECOVERY/$id-untracked-evidence.txt" || \
-    printf '<no untracked files>\n' > "$RECOVERY/$id-untracked-evidence.txt"
+  cp "$SNAPSHOT/untracked-files.txt" "$RECOVERY/$id-untracked-evidence.txt"
 done
 ```
 
-Expected: the five historical branch comparisons still provide complementary
-commit, stat, and cherry evidence, and all four dirty snapshots now each have
-reviewable worktree, index, and untracked evidence files, so evidence exists
-for all seven workstreams.
+Expected: the seven historical branch comparisons still provide complementary
+commit, stat, and cherry evidence, and the four dirty snapshots now each have
+reviewable worktree, index, and inventory-backed untracked evidence files, so
+branch evidence covers all seven branch-backed workstreams and dirty evidence
+complements the four dirty rows.
 
 - [ ] **Step 3: Write the ledger with one evidence-backed row per workstream**
 
