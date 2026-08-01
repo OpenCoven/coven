@@ -2255,7 +2255,7 @@ impl PtyResizeWatcher {
         Self::spawn_with_source(
             master,
             initial,
-            detected_terminal_size,
+            attached_terminal_size_sample,
             PTY_RESIZE_POLL_INTERVAL,
         )
     }
@@ -2457,6 +2457,10 @@ fn attached_terminal_size() -> PtySize {
     )
 }
 
+fn attached_terminal_size_sample() -> Option<PtySize> {
+    Some(attached_terminal_size())
+}
+
 fn env_u16(name: &str) -> Option<u16> {
     std::env::var(name)
         .ok()?
@@ -2552,6 +2556,15 @@ mod tests {
         fn drop(&mut self) {
             self.kill();
         }
+    }
+
+    #[test]
+    fn pty_resize_production_source_always_returns_safe_fallback() {
+        let sample = attached_terminal_size_sample()
+            .expect("attached resize source always resolves safe geometry");
+
+        assert!(sample.rows > 0);
+        assert!(sample.cols > 0);
     }
 
     #[test]
