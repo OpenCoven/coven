@@ -52,6 +52,7 @@ pub(crate) enum PlanEntryStatus {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct PlanEntry {
+    #[serde(rename = "source_label")]
     pub(crate) logical_label: String,
     pub(crate) target_name: String,
     pub(crate) digest: String,
@@ -64,10 +65,13 @@ pub(crate) struct ImportPlan {
     pub(crate) source_kind: MemoryImportSourceKind,
     pub(crate) bundle_id: String,
     pub(crate) status: ImportPlanStatus,
+    #[serde(skip)]
     pub(crate) apply_eligible: bool,
     pub(crate) file_count: usize,
+    #[serde(rename = "created_count")]
     pub(crate) create_count: usize,
     pub(crate) unchanged_count: usize,
+    pub(crate) restored_count: usize,
     pub(crate) conflict_count: usize,
     pub(crate) entries: Vec<PlanEntry>,
 }
@@ -628,6 +632,7 @@ pub(crate) fn build_import_plan(
         file_count: entries.len(),
         create_count,
         unchanged_count,
+        restored_count: 0,
         conflict_count,
         entries,
     })
@@ -1108,6 +1113,7 @@ mod tests {
             file_count: 1,
             create_count: 1,
             unchanged_count: 0,
+            restored_count: 0,
             conflict_count: 0,
             entries: vec![PlanEntry {
                 logical_label: "memory/notes.md".to_owned(),
@@ -1118,10 +1124,32 @@ mod tests {
         };
 
         let value = serde_json::to_value(&report).expect("report must serialize");
+        assert_exact_object_keys(
+            &value,
+            &[
+                "familiar_id",
+                "source_kind",
+                "bundle_id",
+                "status",
+                "file_count",
+                "created_count",
+                "unchanged_count",
+                "restored_count",
+                "conflict_count",
+                "entries",
+            ],
+        );
+        assert_exact_object_keys(
+            &value["entries"][0],
+            &["source_label", "target_name", "digest", "status"],
+        );
         assert_eq!(value["familiar_id"], "sage");
         assert_eq!(value["source_kind"], "openclaw");
         assert_eq!(value["status"], "preview");
+        assert_eq!(value["created_count"], 1);
+        assert_eq!(value["restored_count"], 0);
         assert_eq!(value["entries"][0]["status"], "create");
+        assert_eq!(value["entries"][0]["source_label"], "memory/notes.md");
 
         let json = serde_json::to_string(&report).expect("report must serialize");
         for forbidden in ["content", "source_path", "absolute_path", "bytes"] {
@@ -1130,9 +1158,17 @@ mod tests {
                 "serialized report leaked forbidden value {forbidden:?}: {json}"
             );
         }
+    }
 
-        let decoded: ImportPlan = serde_json::from_str(&json).expect("report must deserialize");
-        assert_eq!(decoded, report);
+    fn assert_exact_object_keys(value: &serde_json::Value, expected: &[&str]) {
+        let object = value
+            .as_object()
+            .expect("value must serialize as an object");
+        let mut actual = object.keys().map(String::as_str).collect::<Vec<_>>();
+        actual.sort_unstable();
+        let mut expected = expected.to_vec();
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -1146,6 +1182,7 @@ mod tests {
             file_count: 0,
             create_count: 0,
             unchanged_count: 0,
+            restored_count: 0,
             conflict_count: 0,
             entries: Vec::new(),
         };

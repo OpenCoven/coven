@@ -28,10 +28,25 @@ fn preview_native_reports_a_sorted_redacted_plan_without_creating_targets() -> R
     assert_eq!(report["status"], "preview");
     assert_eq!(report["familiar_id"], "sage");
     assert_eq!(report["source_kind"], "native");
-    assert_eq!(report["apply_eligible"], true);
+    assert_exact_object_keys(
+        &report,
+        &[
+            "familiar_id",
+            "source_kind",
+            "bundle_id",
+            "status",
+            "file_count",
+            "created_count",
+            "unchanged_count",
+            "restored_count",
+            "conflict_count",
+            "entries",
+        ],
+    );
     assert_eq!(report["file_count"], 3);
-    assert_eq!(report["create_count"], 3);
+    assert_eq!(report["created_count"], 3);
     assert_eq!(report["unchanged_count"], 0);
+    assert_eq!(report["restored_count"], 0);
     assert_eq!(report["conflict_count"], 0);
     assert!(report["bundle_id"]
         .as_str()
@@ -40,25 +55,32 @@ fn preview_native_reports_a_sorted_redacted_plan_without_creating_targets() -> R
         report["entries"],
         serde_json::json!([
             {
-                "logical_label": "MEMORY.md",
+                "source_label": "MEMORY.md",
                 "target_name": "memory.md",
                 "digest": format!("blake3:{}", blake3::hash(b"root secret").to_hex()),
                 "status": "create"
             },
             {
-                "logical_label": "memory/a.md",
+                "source_label": "memory/a.md",
                 "target_name": "memory-a.md",
                 "digest": format!("blake3:{}", blake3::hash(b"a").to_hex()),
                 "status": "create"
             },
             {
-                "logical_label": "notes/z.md",
+                "source_label": "notes/z.md",
                 "target_name": "notes-z.md",
                 "digest": format!("blake3:{}", blake3::hash(b"z").to_hex()),
                 "status": "create"
             }
         ])
     );
+    for entry in report["entries"]
+        .as_array()
+        .expect("entries must be an array")
+    {
+        assert_exact_object_keys(entry, &["source_label", "target_name", "digest", "status"]);
+    }
+    assert_no_absolute_path_values(&report);
     let rendered = String::from_utf8(output.stdout)?;
     assert!(!rendered.contains("root secret"));
     assert!(!rendered.contains("excluded sentinel"));
@@ -111,14 +133,13 @@ fn preview_openclaw_uses_explicit_root_and_registered_target_without_leaks() -> 
     assert_eq!(report["status"], "preview");
     assert_eq!(report["familiar_id"], "sage");
     assert_eq!(report["source_kind"], "openclaw");
-    assert_eq!(report["apply_eligible"], true);
     assert_eq!(
         report["entries"]
             .as_array()
             .expect("entries must be an array")
             .iter()
             .map(|entry| (
-                entry["logical_label"].as_str().unwrap(),
+                entry["source_label"].as_str().unwrap(),
                 entry["target_name"].as_str().unwrap(),
                 entry["status"].as_str().unwrap()
             ))
@@ -183,8 +204,8 @@ fn preview_conflict_is_whole_plan_ineligible_and_creates_nothing() -> Result<()>
     let report: Value = serde_json::from_slice(&output.stdout)?;
 
     assert_eq!(report["status"], "conflict");
-    assert_eq!(report["apply_eligible"], false);
-    assert_eq!(report["create_count"], 1);
+    assert_eq!(report["created_count"], 1);
+    assert_eq!(report["restored_count"], 0);
     assert_eq!(report["conflict_count"], 1);
     assert_eq!(report["entries"][0]["status"], "conflict");
     assert_eq!(report["entries"][1]["status"], "create");
@@ -238,6 +259,37 @@ fn restore_remains_not_implemented() -> Result<()> {
     );
     assert!(!temp.path().join("memory").exists());
     Ok(())
+}
+
+fn assert_exact_object_keys(value: &Value, expected: &[&str]) {
+    let object = value.as_object().expect("value must be a JSON object");
+    let mut actual = object.keys().map(String::as_str).collect::<Vec<_>>();
+    actual.sort_unstable();
+    let mut expected = expected.to_vec();
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
+}
+
+fn assert_no_absolute_path_values(value: &Value) {
+    match value {
+        Value::String(value) => {
+            assert!(
+                !Path::new(value).is_absolute(),
+                "report contains an absolute path: {value}"
+            );
+        }
+        Value::Array(values) => {
+            for value in values {
+                assert_no_absolute_path_values(value);
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values() {
+                assert_no_absolute_path_values(value);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[test]
