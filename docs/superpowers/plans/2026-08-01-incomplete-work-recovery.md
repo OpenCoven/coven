@@ -116,7 +116,9 @@
     local ref.
 - Modify: `.copilot/goals.md`
   - Reconcile active goals after all classification and delivery outcomes are
-    known. Keep this as a local untracked file.
+    known in the authoritative ignored primary-checkout copy at
+    `$REPO/.copilot/goals.md`. Ignored per-worktree copies are not synchronized
+    and are not a source of truth.
 - Create only when the matching workstream is viable:
   - `docs/superpowers/specs/2026-08-01-mobile-pairing-recovery-design.md`
   - `docs/superpowers/plans/2026-08-01-mobile-pairing-recovery.md`
@@ -5173,7 +5175,9 @@ allowed only for still-running recovery sessions and open follow-up work.
 ### Task 8: Reconcile Repository Goals
 
 **Files:**
-- Modify: `.copilot/goals.md` in `CONTROL_WORKTREE` only
+- Modify: authoritative ignored `$REPO/.copilot/goals.md` in the primary
+  checkout only. Ignored per-worktree copies are not synchronized and are not
+  a source of truth.
 
 - [ ] **Step 1: Re-read goals and live issue state**
 
@@ -5260,19 +5264,30 @@ EOF
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
-cd "$CONTROL_WORKTREE"
-sed -n '1,260p' .copilot/goals.md
+GOALS_FILE="$REPO/.copilot/goals.md"
+cd "$REPO"
+if ! test -f "$GOALS_FILE"; then
+  printf 'Blocked: authoritative goals file is missing: %s\n' "$GOALS_FILE" >&2
+  ls -ld "$REPO" "$REPO/.copilot" "$GOALS_FILE" 2>&1 || true
+  exit 1
+fi
+sed -n '1,260p' "$GOALS_FILE"
 for issue in 401 414 521 541; do
   gh issue view "$issue" --json number,state,title,closedAt,url
 done
 ```
 
-Expected: #401, #414, and #521 are closed; #541 reflects the recovery PR state.
+Expected: the authoritative primary-checkout goals file is readable at
+`$GOALS_FILE`; #401, #414, and #521 are closed; #541 reflects the recovery PR
+state; and ignored per-worktree goals copies remain out of scope because they
+are not synchronized.
 
 - [ ] **Step 2: Close stale active goal content**
 
-Move `usability-core-consolidation` to `done` in `CONTROL_WORKTREE` because its named high-risk
-follow-up #401 is closed. Set:
+Move `usability-core-consolidation` to `done` in the authoritative ignored
+primary-checkout goals file at `$REPO/.copilot/goals.md` because ignored
+per-worktree copies are not synchronized and its named high-risk follow-up #401
+is closed. Set:
 
 ```markdown
 - completed: 2026-08-01
@@ -5286,7 +5301,9 @@ Remove obsolete `next` text that presents #401 as future work.
 
 - [ ] **Step 3: Reconcile contribution stewardship**
 
-Keep `contribution-stewardship` active in `CONTROL_WORKTREE` because it is an ongoing maintenance
+Keep `contribution-stewardship` active in the authoritative ignored
+primary-checkout goals file at `$REPO/.copilot/goals.md` because ignored
+per-worktree copies are not synchronized and it is an ongoing maintenance
 objective. Append a 2026-08-01 checkpoint that records:
 
 - #414 and #521 are closed;
@@ -5383,13 +5400,20 @@ EOF
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
-cd "$CONTROL_WORKTREE"
+GOALS_FILE="$REPO/.copilot/goals.md"
+cd "$REPO"
+if ! test -f "$GOALS_FILE"; then
+  printf 'Blocked: authoritative goals file is missing: %s\n' "$GOALS_FILE" >&2
+  ls -ld "$REPO" "$REPO/.copilot" "$GOALS_FILE" 2>&1 || true
+  exit 1
+fi
 grep -n '^## active\|^## paused\|^## done\|^### goal:\|^- next:' \
-  .copilot/goals.md
+  "$GOALS_FILE"
 ```
 
-Expected: each active goal has one `next` field, completed goals are under
-`## done`, and no active `next` references closed issues as future work.
+Expected: the authoritative primary-checkout goals file at `$GOALS_FILE`
+contains one `next` field per active goal, completed goals are under `## done`,
+and no active `next` references closed issues as future work.
 
 ### Task 9: Final Recovery Audit
 
@@ -5680,17 +5704,20 @@ COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 AUDIT_EVIDENCE="$COMMON_DIR/agent-recovery/issue-541/final-audit-primary-checkout.txt"
 cd "$REPO"
-CURRENT_BRANCH="$(git branch --show-current)"
+ORIGINAL_BRANCH="$(git branch --show-current)"
+CURRENT_BRANCH="$ORIGINAL_BRANCH"
 UPSTREAM_REF="$(git rev-parse --abbrev-ref --symbolic-full-name @{upstream} 2>/dev/null || true)"
 UPSTREAM_REMOTE="$(git config --get "branch.$CURRENT_BRANCH.remote" 2>/dev/null || true)"
 UPSTREAM_MERGE_REF="$(git config --get "branch.$CURRENT_BRANCH.merge" 2>/dev/null || true)"
 STATUS="$(git status --porcelain=v1 --untracked-files=all)"
+SWITCHED_TO_MAIN=0
 record_state() {
   local current_branch current_upstream current_remote current_merge
   current_branch="$(git branch --show-current)"
   current_upstream="$(git rev-parse --abbrev-ref --symbolic-full-name @{upstream} 2>/dev/null || true)"
   current_remote="$(git config --get "branch.$current_branch.remote" 2>/dev/null || true)"
   current_merge="$(git config --get "branch.$current_branch.merge" 2>/dev/null || true)"
+  printf 'Original branch: %s\n' "$ORIGINAL_BRANCH"
   printf 'Current branch: %s\n' "$current_branch"
   printf 'Current HEAD: %s\n' "$(git rev-parse HEAD)"
   printf 'Configured upstream: %s\n' "${current_upstream:-<none>}"
@@ -5701,6 +5728,52 @@ record_state() {
 block_restore() {
   {
     printf '%s\n' "$1"
+    record_state
+  } > "$AUDIT_EVIDENCE"
+  cat "$AUDIT_EVIDENCE"
+  exit 1
+}
+rollback_or_block() {
+  local message current_branch_after_rollback rollback_status
+  if [ "$SWITCHED_TO_MAIN" != "1" ]; then
+    block_restore "$message"
+  fi
+  if [ "$(git branch --show-current)" != "$ORIGINAL_BRANCH" ]; then
+    if ! git switch "$ORIGINAL_BRANCH"; then
+      {
+        printf 'Critical: rollback to the original branch failed after restore error.\n'
+        printf 'Original branch: %s\n' "$ORIGINAL_BRANCH"
+        printf '%s\n' "$message"
+        record_state
+      } > "$AUDIT_EVIDENCE"
+      cat "$AUDIT_EVIDENCE"
+      exit 1
+    fi
+  fi
+  current_branch_after_rollback="$(git branch --show-current)"
+  rollback_status="$(git status --porcelain --untracked-files=all)"
+  if [ "$current_branch_after_rollback" != "$ORIGINAL_BRANCH" ]; then
+    {
+      printf 'Critical: rollback did not restore the original branch after restore error.\n'
+      printf 'Expected branch: %s\n' "$ORIGINAL_BRANCH"
+      record_state
+    } > "$AUDIT_EVIDENCE"
+    cat "$AUDIT_EVIDENCE"
+    exit 1
+  fi
+  if [ -n "$rollback_status" ]; then
+    {
+      printf 'Critical: rollback restored the original branch but left the primary checkout dirty.\n'
+      printf 'Original branch: %s\n' "$ORIGINAL_BRANCH"
+      printf '%s\n' "$message"
+      record_state
+    } > "$AUDIT_EVIDENCE"
+    cat "$AUDIT_EVIDENCE"
+    exit 1
+  fi
+  {
+    printf '%s\n' "$message"
+    printf 'Rollback succeeded: restored the original branch %s with a clean checkout.\n' "$ORIGINAL_BRANCH"
     record_state
   } > "$AUDIT_EVIDENCE"
   cat "$AUDIT_EVIDENCE"
@@ -5764,9 +5837,10 @@ esac; then
     block_restore \
       "Blocked: could not switch the primary checkout to main; leave it untouched."
   fi
+  SWITCHED_TO_MAIN=1
   if ! git merge --ff-only origin/main; then
-    block_restore \
-      "Blocked: primary checkout could not fast-forward main to origin/main after switching; leave it untouched."
+    rollback_or_block \
+      "Blocked: primary checkout could not fast-forward main to origin/main after switching to main."
   fi
 else
   block_restore \
@@ -5775,12 +5849,12 @@ fi
 FINAL_BRANCH="$(git branch --show-current)"
 FINAL_STATUS="$(git status --porcelain --untracked-files=all)"
 if [ "$FINAL_BRANCH" != "main" ]; then
-  block_restore \
-    "Blocked: final primary checkout branch is not main after restore; leave it untouched."
+  rollback_or_block \
+    "Blocked: final primary checkout branch is not main after restore."
 fi
 if [ -n "$FINAL_STATUS" ]; then
-  block_restore \
-    "Blocked: primary checkout is not clean after restore; leave it untouched."
+  rollback_or_block \
+    "Blocked: primary checkout is not clean after restore."
 fi
 {
   printf 'Primary checkout restored for final audit.\n'
@@ -5791,15 +5865,24 @@ cat "$AUDIT_EVIDENCE"
 
 This step is mandatory before any final-audit branch-sensitive command. It
 must stay non-interactive: do not use `git reset`, `git checkout --force`, or
-any other destructive switch. If this step exits non-zero, stop Task 9 and
-leave the primary checkout exactly as it was. For recovery-owned branches, the
-safety check must parse `branch.<name>.remote` and `branch.<name>.merge`,
-fetch that exact upstream into `FETCH_HEAD`, and compare `HEAD` with the fresh
-upstream tip rather than relying on a stale remote-tracking ref.
+any other destructive switch. Save `ORIGINAL_BRANCH` before any branch switch
+and keep every possible validation, fetch, upstream, and fast-forward
+feasibility check ahead of `git switch main`. If this step exits non-zero
+before `git switch main` succeeds, stop Task 9 and leave the primary checkout
+as-is. If `git switch main` succeeds and any later merge or final verification
+fails, switch back to `ORIGINAL_BRANCH` before writing blocker evidence, verify
+that rollback restored the original clean state, and emit a distinct critical
+blocker if rollback itself fails. For recovery-owned branches, the safety check
+must parse `branch.<name>.remote` and `branch.<name>.merge`, fetch that exact
+upstream into `FETCH_HEAD`, and compare `HEAD` with the fresh upstream tip
+rather than relying on a stale remote-tracking ref. Do not claim the primary
+checkout remained untouched unless rollback restored the original branch and
+clean state.
 
-Expected: the primary checkout either remains untouched with blocker evidence
-in `final-audit-primary-checkout.txt`, or it is restored cleanly to `main` by
-a safe fast-forward-only path.
+Expected: the primary checkout either remains on its original clean branch with
+blocker evidence because no switch occurred or rollback succeeded, or it is
+restored cleanly to `main` by a safe fast-forward-only path. Any rollback
+failure is a distinct critical blocker in `final-audit-primary-checkout.txt`.
 
 - [ ] **Step 4: Verify the primary checkout**
 
