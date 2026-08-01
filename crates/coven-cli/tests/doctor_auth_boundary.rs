@@ -185,27 +185,39 @@ fn doctor_auth_boundary_is_offline_hermetic_and_failure_bounded() -> Result<()> 
         .pid;
     assert_process_stopped(timeout_pid, "timed-out auth probe");
 
-    let descendant = fixture.run("descendant", "descendant", true)?;
-    assert_success("stdout-holding descendant", &descendant.output);
-    anyhow::ensure!(
-        descendant.elapsed < Duration::from_secs(12),
-        "a descendant-held stdout pipe escaped Doctor's bound: {:?}",
-        descendant.elapsed
-    );
-    let descendant_json = parse_json("stdout-holding descendant", &descendant.output)?;
-    assert_eq!(credential_status(&descendant_json, "engine"), "warn");
-    assert_only_local_engine_probes(&descendant.invocations);
-    let descendant_parent_pid = descendant
-        .invocations
-        .iter()
-        .find(|invocation| invocation.args == ["auth", "status", "--json"])
-        .expect("descendant-mode auth invocation")
-        .pid;
-    let descendant_pid = descendant
-        .descendant_pid
-        .context("probe did not record stdout-holding descendant pid")?;
-    assert_process_stopped(descendant_parent_pid, "descendant-mode engine parent");
-    assert_process_stopped(descendant_pid, "stdout-holding engine descendant");
+    let assert_descendant = |label: &str| -> Result<()> {
+        let descendant = fixture.run(label, "descendant", true)?;
+        assert_success("stdout-holding descendant", &descendant.output);
+        anyhow::ensure!(
+            descendant.elapsed < Duration::from_secs(12),
+            "a descendant-held stdout pipe escaped Doctor's bound: {:?}",
+            descendant.elapsed
+        );
+        let descendant_json = parse_json("stdout-holding descendant", &descendant.output)?;
+        assert_eq!(credential_status(&descendant_json, "engine"), "warn");
+        assert_eq!(
+            credential_message(&descendant_json, "engine"),
+            "authentication configured; provider turn not verified"
+        );
+        assert_only_local_engine_probes(&descendant.invocations);
+        let descendant_parent_pid = descendant
+            .invocations
+            .iter()
+            .find(|invocation| invocation.args == ["auth", "status", "--json"])
+            .expect("descendant-mode auth invocation")
+            .pid;
+        let descendant_pid = descendant
+            .descendant_pid
+            .context("probe did not record stdout-holding descendant pid")?;
+        assert_process_stopped(descendant_parent_pid, "descendant-mode engine parent");
+        assert_process_stopped(descendant_pid, "stdout-holding engine descendant");
+        Ok(())
+    };
+    assert_descendant("descendant")?;
+    #[cfg(windows)]
+    for attempt in 0..3 {
+        assert_descendant(&format!("descendant-stress-{attempt}"))?;
+    }
 
     Ok(())
 }

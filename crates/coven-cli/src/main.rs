@@ -2809,29 +2809,38 @@ fn engine_auth_summary(binary: &Path) -> Option<bool> {
     use std::time::{Duration, Instant};
 
     const TIMEOUT: Duration = Duration::from_secs(5);
+    const CLEANUP_BUDGET: Duration = Duration::from_millis(500);
     const OUTPUT_LIMIT: usize = 1024 * 1024;
+    let total_deadline = Instant::now() + TIMEOUT;
+    let probe_deadline = total_deadline - CLEANUP_BUDGET;
 
     let mut command = Command::new(binary);
     command
         .args(["auth", "status", "--json"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    pty_runner::configure_child_process_tree_command(&mut command);
-    let mut child = command.spawn().ok()?;
-    let mut process_tree = pty_runner::ChildProcessTree::attach(&child);
-    if !process_tree.is_strictly_contained() {
-        // Doctor cannot promise a bounded local-only probe without ownership
-        // of descendants, so fail closed instead of running uncontained.
-        let _ = child.kill();
-        let _ = child.wait();
-        return None;
-    }
+    let (mut child, mut process_tree) =
+        pty_runner::spawn_strict_child_process_tree(&mut command).ok()?;
+    let terminate_and_reap = |process_tree: &mut pty_runner::StrictChildProcessTree,
+                              child: &mut std::process::Child| {
+        process_tree.terminate(child);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => {}
+            }
+            let remaining = total_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10).min(remaining));
+        }
+    };
 
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
-            process_tree.terminate(&mut child);
-            let _ = child.wait();
+            terminate_and_reap(&mut process_tree, &mut child);
             return None;
         }
     };
@@ -2845,7 +2854,6 @@ fn engine_auth_summary(binary: &Path) -> Option<bool> {
         let _ = sender.send(result);
     });
 
-    let deadline = Instant::now() + TIMEOUT;
     let mut status = None;
     let mut output = None;
     loop {
@@ -2853,8 +2861,7 @@ fn engine_auth_summary(binary: &Path) -> Option<bool> {
             match receiver.try_recv() {
                 Ok(Ok(bytes)) if bytes.len() <= OUTPUT_LIMIT => output = Some(bytes),
                 Ok(Ok(_)) | Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
-                    process_tree.terminate(&mut child);
-                    let _ = child.wait();
+                    terminate_and_reap(&mut process_tree, &mut child);
                     return None;
                 }
                 Err(TryRecvError::Empty) => {}
@@ -2868,13 +2875,11 @@ fn engine_auth_summary(binary: &Path) -> Option<bool> {
                     // The direct engine has exited. Terminate anything it left
                     // behind before waiting for pipe EOF; a descendant that
                     // inherited stdout must not extend Doctor's deadline.
-                    process_tree.terminate(&mut child);
-                    let _ = child.wait();
+                    terminate_and_reap(&mut process_tree, &mut child);
                 }
                 Ok(None) => {}
                 Err(_) => {
-                    process_tree.terminate(&mut child);
-                    let _ = child.wait();
+                    terminate_and_reap(&mut process_tree, &mut child);
                     return None;
                 }
             }
@@ -2885,9 +2890,8 @@ fn engine_auth_summary(binary: &Path) -> Option<bool> {
             return parse_engine_auth_summary(status.code(), stdout);
         }
 
-        if Instant::now() >= deadline {
-            process_tree.terminate(&mut child);
-            let _ = child.wait();
+        if Instant::now() >= probe_deadline {
+            terminate_and_reap(&mut process_tree, &mut child);
             return None;
         }
         std::thread::sleep(Duration::from_millis(10));

@@ -620,22 +620,11 @@ impl ChildProcessTree {
         }
     }
 
-    pub(crate) fn is_strictly_contained(&self) -> bool {
-        #[cfg(unix)]
-        {
-            true
-        }
-        #[cfg(windows)]
-        {
-            self.job_handle.is_some()
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            false
-        }
+    pub(crate) fn terminate(&mut self, child: &mut std::process::Child) {
+        self.terminate_impl(child, true);
     }
 
-    pub(crate) fn terminate(&mut self, child: &mut std::process::Child) {
+    fn terminate_impl(&mut self, child: &mut std::process::Child, _allow_taskkill_fallback: bool) {
         if self.terminated {
             return;
         }
@@ -657,7 +646,7 @@ impl ChildProcessTree {
                     succeeded
                 })
                 .unwrap_or(false);
-            if !terminated_by_job {
+            if !terminated_by_job && _allow_taskkill_fallback {
                 // A Job Object can be unavailable when a parent policy forbids
                 // assignment. Fall back to Windows' documented tree kill for
                 // npm's cmd.exe -> node.exe -> codex.exe chain.
@@ -673,6 +662,44 @@ impl ChildProcessTree {
             }
         }
         let _ = child.kill();
+    }
+}
+
+/// A process tree whose descendants were contained before its first
+/// instruction ran. Its termination path deliberately cannot select the
+/// legacy `taskkill` fallback used by the Codex runner.
+pub(crate) struct StrictChildProcessTree(ChildProcessTree);
+
+impl StrictChildProcessTree {
+    fn attach(child: &std::process::Child) -> Option<Self> {
+        #[cfg(unix)]
+        {
+            Some(Self(ChildProcessTree::attach(child)))
+        }
+        #[cfg(windows)]
+        {
+            let job_handle = child_job_object_for_process(child)?;
+            if !resume_suspended_child(child) {
+                // KILL_ON_JOB_CLOSE ensures a partially resumed child cannot
+                // escape when thread enumeration/resume fails.
+                unsafe { windows_sys::Win32::Foundation::CloseHandle(job_handle) };
+                return None;
+            }
+            Some(Self(ChildProcessTree {
+                pid: child.id(),
+                terminated: false,
+                job_handle: Some(job_handle),
+            }))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = child;
+            None
+        }
+    }
+
+    pub(crate) fn terminate(&mut self, child: &mut std::process::Child) {
+        self.0.terminate_impl(child, false);
     }
 }
 
@@ -774,7 +801,54 @@ fn child_job_object_for_process(
     }
 }
 
-pub(crate) fn configure_child_process_tree_command(_command: &mut std::process::Command) {
+#[cfg(windows)]
+fn resume_suspended_child(child: &std::process::Child) -> bool {
+    use std::mem::size_of;
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+        System::{
+            Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD,
+                THREADENTRY32,
+            },
+            Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME},
+        },
+    };
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return false;
+    }
+
+    let mut entry = THREADENTRY32 {
+        dwSize: size_of::<THREADENTRY32>() as u32,
+        ..Default::default()
+    };
+    let mut thread_ids = Vec::new();
+    let mut has_entry = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+    while has_entry {
+        if entry.th32OwnerProcessID == child.id() {
+            thread_ids.push(entry.th32ThreadID);
+        }
+        has_entry = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+    }
+    unsafe { CloseHandle(snapshot) };
+
+    // CREATE_SUSPENDED creates exactly one primary thread. Anything else is
+    // inconsistent with the promised before-first-instruction boundary.
+    let [thread_id] = thread_ids.as_slice() else {
+        return false;
+    };
+    let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, *thread_id) };
+    if thread.is_null() {
+        return false;
+    }
+    let previous_suspend_count = unsafe { ResumeThread(thread) };
+    unsafe { CloseHandle(thread) };
+    previous_suspend_count == 1
+}
+
+fn configure_child_process_tree_command(_command: &mut std::process::Command) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -787,6 +861,35 @@ pub(crate) fn configure_child_process_tree_command(_command: &mut std::process::
                 }
                 Ok(())
             });
+        }
+    }
+}
+
+/// Spawn a process tree that cannot execute before Coven owns its descendants.
+/// Unix uses a fresh session created in the child before exec. Windows creates
+/// the process suspended, assigns it to a kill-on-close Job Object, and only
+/// then resumes its initial thread.
+pub(crate) fn spawn_strict_child_process_tree(
+    command: &mut std::process::Command,
+) -> std::io::Result<(std::process::Child, StrictChildProcessTree)> {
+    #[cfg(unix)]
+    configure_child_process_tree_command(command);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+
+        command.creation_flags(CREATE_SUSPENDED);
+    }
+
+    let mut child = command.spawn()?;
+    match StrictChildProcessTree::attach(&child) {
+        Some(tree) => Ok((child, tree)),
+        None => {
+            let _ = child.kill();
+            Err(std::io::Error::other(
+                "failed to establish strict child-process containment",
+            ))
         }
     }
 }
