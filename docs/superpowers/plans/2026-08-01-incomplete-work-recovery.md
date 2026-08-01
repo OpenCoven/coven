@@ -20,6 +20,12 @@
   - Sanitized evidence ledger assigning each workstream `already-shipped`,
     `superseded`, `viable`, or `blocked`. GitHub-visible `Preserved source`
     values use archive IDs only, never local absolute paths.
+- Create only when a row reaches Task 5:
+  - `.git/agent-recovery/issue-541/viable/<workstream-id>-open-prs.json`
+  - `.git/agent-recovery/issue-541/viable/<workstream-id>-pr-view.json`
+  - `.git/agent-recovery/issue-541/viable/<workstream-id>-issue-search.json`
+  - `.git/agent-recovery/issue-541/viable/<workstream-id>-issue-view.json`
+  - Exact-head open-PR and issue-search evidence for each viable workstream.
 - Create: `.git/agent-recovery/issue-541/dirty/docs-psyche-specs/`
 - Create: `.git/agent-recovery/issue-541/dirty/memory-promote/`
 - Create: `.git/agent-recovery/issue-541/dirty/mobile-memory-gateway/`
@@ -29,9 +35,10 @@
 - Create: `.git/agent-recovery/issue-541/dirty/mobile-memory-gateway/branch.bundle`
 - Create: `.git/agent-recovery/issue-541/dirty/pr-476-review/branch.bundle`
   - Status, commit identifiers, exact branch-name marker, verified
-    `branch.bundle`, binary patches, and copied untracked files for each dirty
+    `branch.bundle`, binary patches, and copied untracked files for each source
     worktree, so committed branch history is preserved before any later source
-    branch deletion.
+    branch deletion. Empty patches remain valid evidence when a formerly dirty
+    worktree is now clean because its changes were committed to an active PR.
 - Create: `.git/agent-recovery/issue-541/branches/docs-universal-runtime-capability-design.bundle`
 - Create: `.git/agent-recovery/issue-541/branches/feat-npm-macos-x64.bundle`
 - Create: `.git/agent-recovery/issue-541/branches/fix-521-ward-surface-confinement.bundle`
@@ -153,7 +160,7 @@ gh pr create \
 Expected: GitHub returns the URL of one open pull request tracking issue #541
 without auto-closing it.
 
-### Task 2: Snapshot Every Dirty Worktree
+### Task 2: Snapshot Every Dirty or Formerly Dirty Source Worktree
 
 **Artifacts:**
 - Create: `.git/agent-recovery/issue-541/dirty/docs-psyche-specs/`
@@ -217,11 +224,12 @@ printf 'docs-psyche-specs\tdirty-worktree\t%s\t%s\t%s\t%s\n' \
 ```
 
 Expected: `branch.bundle` verifies against `docs/psyche-specs`, preserving its
-committed history before any later branch deletion; both patch files exist;
-`index.patch` preserves the staged additions for
-`specs/psyche/COVEN_PREREQUISITES.md`, `specs/psyche/PLAN.md`, and the Psyche
-reconciliation plan; and any copied untracked files match only the paths listed
-in `untracked-files.txt`.
+committed history before any later branch deletion; both patch files exist; and
+any copied untracked files match only the paths listed in
+`untracked-files.txt`. If the worktree is still dirty, the patch files capture
+those changes. If the worktree is now clean because the source branch already
+backs an active PR, the patch files may be empty and `status.txt` becomes the
+evidence of that clean post-commit state.
 
 - [ ] **Step 3: Snapshot `feat-cmem-1ev-memory-promote`**
 
@@ -605,7 +613,9 @@ blocked:
 
 Expected: Task 4 Step 4 replaces every `pending` row with exactly one terminal
 classification (`already-shipped`, `superseded`, `viable`, or `blocked`) and
-one next action before Task 4 Step 5 and Task 9 Step 1 verification.
+one next action before Task 4 Step 5 and Task 9 Step 1 verification. A viable
+row may later keep that classification while Task 5 updates its action to
+`continue existing PR` after verifying one exact-head open PR.
 
 - [ ] **Step 5: Review the ledger against the manifest**
 
@@ -636,62 +646,151 @@ Expected: every workstream appears in both files.
 - Create only for rows classified `viable`:
   - The exact design and plan paths listed in the File and Artifact Map.
 
-- [ ] **Step 1: Create or identify one issue per viable row**
+- [ ] **Step 1: Check for an exact-head open pull request before creating anything**
 
-Set `WORKSTREAM_ID` to the viable row's exact workstream ID, then use the
-matching exact query:
-
-```bash
-gh issue list --repo OpenCoven/coven --state all --search '"mobile pairing"' --limit 20
-gh issue list --repo OpenCoven/coven --state all --search '"Intel macOS" npm' --limit 20
-gh issue list --repo OpenCoven/coven --state all --search '"Ward surface confinement"' --limit 20
-gh issue list --repo OpenCoven/coven --state all --search '"memory promotion"' --limit 20
-gh issue list --repo OpenCoven/coven --state all --search '"Psyche" specs' --limit 20
-gh issue list --repo OpenCoven/coven --state all --search '"universal runtime" capability' --limit 20
-gh issue list --repo OpenCoven/coven --state all --search '"runtime model parity"' --limit 20
-```
-
-Then set the issue title from this fixed mapping:
+Set `WORKSTREAM_ID` to the viable row's exact workstream ID, then map it to its
+current source branch:
 
 ```bash
 case "$WORKSTREAM_ID" in
   mobile-memory-gateway)
-    ISSUE_TITLE="Recover mobile pairing workstream"
+    SOURCE_BRANCH="feat/mobile-memory-gateway"
     ;;
   feat-npm-macos-x64)
-    ISSUE_TITLE="Recover Intel macOS npm packaging workstream"
+    SOURCE_BRANCH="feat/npm-macos-x64"
     ;;
   fix-521-ward-surface-confinement)
-    ISSUE_TITLE="Recover Ward surface confinement workstream"
+    SOURCE_BRANCH="fix/521-ward-surface-confinement"
     ;;
   memory-promote)
-    ISSUE_TITLE="Recover memory promotion workstream"
+    SOURCE_BRANCH="feat/cmem-1ev-memory-promote"
     ;;
   docs-psyche-specs)
-    ISSUE_TITLE="Recover Psyche specification workstream"
+    SOURCE_BRANCH="docs/psyche-specs"
     ;;
   docs-universal-runtime-capability-design)
-    ISSUE_TITLE="Recover universal runtime capability design workstream"
+    SOURCE_BRANCH="docs/universal-runtime-capability-design"
     ;;
   pr-476-review)
-    ISSUE_TITLE="Recover runtime model parity plan workstream"
+    SOURCE_BRANCH="fix/476-review-threads"
     ;;
   *)
     printf 'Unknown WORKSTREAM_ID: %s\n' "$WORKSTREAM_ID" >&2
     exit 1
     ;;
 esac
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+RECOVERY="$COMMON_DIR/agent-recovery/issue-541/viable"
+mkdir -p "$RECOVERY"
+OPEN_PR_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-open-prs.json"
+PR_VIEW_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-pr-view.json"
+gh pr list \
+  --repo OpenCoven/coven \
+  --state open \
+  --head "$SOURCE_BRANCH" \
+  --json number,title,url,headRefName > "$OPEN_PR_EVIDENCE"
+PR_COUNT="$(jq 'length' "$OPEN_PR_EVIDENCE")"
 ```
 
-If an accurate issue already exists, reuse it without creating a duplicate:
+Then branch on the exact-head result:
 
 ```bash
-ISSUE_NUMBER=<existing issue number>
-gh issue view --repo OpenCoven/coven "$ISSUE_NUMBER" \
-  --json number,state,title,url
+case "$PR_COUNT" in
+  1)
+    PR_NUMBER="$(jq -r '.[0].number' "$OPEN_PR_EVIDENCE")"
+    gh pr view --repo OpenCoven/coven "$PR_NUMBER" \
+      --json number,title,url,state,headRefName,baseRefName > "$PR_VIEW_EVIDENCE"
+    ;;
+  0)
+    ;;
+  *)
+    printf 'Blocked %s: expected 0 or 1 open PRs for head %s, found %s. Evidence: %s\n' \
+      "$WORKSTREAM_ID" "$SOURCE_BRANCH" "$PR_COUNT" "$OPEN_PR_EVIDENCE" >&2
+    exit 1
+    ;;
+esac
 ```
 
-If no issue accurately owns the concern, create one and verify it immediately:
+If `PR_COUNT=1`, verify the PR accurately owns the workstream, record its
+number and URL in the classification row's `Recovery action` as
+`continue existing PR`, and skip child issue, branch, worktree, claim, and PR
+creation for that row. If `PR_COUNT>1`, change that row to `blocked`, cite
+`$OPEN_PR_EVIDENCE`, and stop rather than guessing. If `PR_COUNT=0`, continue
+to Step 2.
+
+Expected: every viable row has an evidence-backed exact-head PR decision before
+issue reuse or creation begins. If `docs/psyche-specs` still has exactly one
+open PR from head `docs/psyche-specs` at execution time, this step adopts that
+live PR (currently #546) dynamically via the query result rather than
+hardcoding the number.
+
+- [ ] **Step 2: Reuse or create one issue per viable row that does not already have an adopted PR**
+
+Set `WORKSTREAM_ID` to the viable row's exact workstream ID, then use the
+matching exact issue title and search query:
+
+```bash
+case "$WORKSTREAM_ID" in
+  mobile-memory-gateway)
+    ISSUE_TITLE="Recover mobile pairing workstream"
+    ISSUE_SEARCH='"mobile pairing"'
+    ;;
+  feat-npm-macos-x64)
+    ISSUE_TITLE="Recover Intel macOS npm packaging workstream"
+    ISSUE_SEARCH='"Intel macOS" npm'
+    ;;
+  fix-521-ward-surface-confinement)
+    ISSUE_TITLE="Recover Ward surface confinement workstream"
+    ISSUE_SEARCH='"Ward surface confinement"'
+    ;;
+  memory-promote)
+    ISSUE_TITLE="Recover memory promotion workstream"
+    ISSUE_SEARCH='"memory promotion"'
+    ;;
+  docs-psyche-specs)
+    ISSUE_TITLE="Recover Psyche specification workstream"
+    ISSUE_SEARCH='"Psyche" specs'
+    ;;
+  docs-universal-runtime-capability-design)
+    ISSUE_TITLE="Recover universal runtime capability design workstream"
+    ISSUE_SEARCH='"universal runtime" capability'
+    ;;
+  pr-476-review)
+    ISSUE_TITLE="Recover runtime model parity plan workstream"
+    ISSUE_SEARCH='"runtime model parity"'
+    ;;
+  *)
+    printf 'Unknown WORKSTREAM_ID: %s\n' "$WORKSTREAM_ID" >&2
+    exit 1
+    ;;
+esac
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+RECOVERY="$COMMON_DIR/agent-recovery/issue-541/viable"
+mkdir -p "$RECOVERY"
+ISSUE_SEARCH_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-issue-search.json"
+ISSUE_VIEW_EVIDENCE="$RECOVERY/$WORKSTREAM_ID-issue-view.json"
+gh issue list \
+  --repo OpenCoven/coven \
+  --state all \
+  --search "$ISSUE_SEARCH" \
+  --json number,title,url,state > "$ISSUE_SEARCH_EVIDENCE"
+ISSUE_COUNT="$(jq 'length' "$ISSUE_SEARCH_EVIDENCE")"
+```
+
+If exactly one accurate issue already exists, reuse it without creating a
+duplicate:
+
+```bash
+case "$ISSUE_COUNT" in
+  1)
+    ISSUE_NUMBER="$(jq -r '.[0].number' "$ISSUE_SEARCH_EVIDENCE")"
+    gh issue view --repo OpenCoven/coven "$ISSUE_NUMBER" \
+      --json number,state,title,url > "$ISSUE_VIEW_EVIDENCE"
+    ;;
+esac
+```
+
+If zero issues match, create one and verify it immediately:
 
 ```markdown
 ## Recovered source
@@ -708,7 +807,9 @@ If no issue accurately owns the concern, create one and verify it immediately:
 ```
 
 ```bash
-ISSUE_BODY="$(cat <<'EOF'
+case "$ISSUE_COUNT" in
+  0)
+    ISSUE_BODY="$(cat <<'EOF'
 ## Recovered source
 
 - Source issue: #541
@@ -722,17 +823,24 @@ ISSUE_BODY="$(cat <<'EOF'
 - Pass all repository-required gates.
 EOF
 )"
-ISSUE_URL="$(gh issue create --repo OpenCoven/coven --title "$ISSUE_TITLE" --body "$ISSUE_BODY")"
-ISSUE_NUMBER="${ISSUE_URL##*/}"
-gh issue view --repo OpenCoven/coven "$ISSUE_NUMBER" \
-  --json number,state,title,url
+    ISSUE_URL="$(gh issue create --repo OpenCoven/coven --title "$ISSUE_TITLE" --body "$ISSUE_BODY")"
+    ISSUE_NUMBER="${ISSUE_URL##*/}"
+    gh issue view --repo OpenCoven/coven "$ISSUE_NUMBER" \
+      --json number,state,title,url > "$ISSUE_VIEW_EVIDENCE"
+    ;;
+esac
 ```
 
-Expected: every viable row has exactly one issue number.
+If more than one issue matches, change that row to `blocked`, cite
+`$ISSUE_SEARCH_EVIDENCE`, and stop rather than choosing one arbitrarily.
 
-- [ ] **Step 2: Create one approved design per viable issue**
+Expected: every viable row without an adopted PR has exactly one verified issue
+number, and every reuse or block decision cites a saved JSON evidence file.
 
-Use the brainstorming workflow separately for each issue. The design must name:
+- [ ] **Step 3: Create one approved design per viable issue**
+
+Use the brainstorming workflow separately for each issue that reached Step 2
+without being blocked. The design must name:
 
 - the current-main files and contracts involved;
 - the exact portion of the preserved source that remains valid;
@@ -740,16 +848,18 @@ Use the brainstorming workflow separately for each issue. The design must name:
 - test and migration behavior;
 - one-concern pull-request boundaries.
 
-Expected: each viable concern has an approved and committed design document.
+Expected: each viable concern that is not already continuing an adopted PR has
+an approved and committed design document.
 
-- [ ] **Step 3: Create one implementation plan per approved design**
+- [ ] **Step 4: Create one implementation plan per approved design**
 
-Use the writing-plans workflow separately for each approved design. Each plan
-must include exact paths, failing tests, targeted commands, full repository
-gates, commit boundaries, explicit `git commit -s` usage, the session-required
-Copilot co-author trailer on child commits, push, and PR creation. Human
-contributor `Co-authored-by:` trailers remain conditional under `AGENTS.md`
-and are separate from the required Copilot trailer.
+Use the writing-plans workflow separately for each approved design that reached
+Step 3 without being blocked. Each plan must include exact paths, failing
+tests, targeted commands, full repository gates, commit boundaries, explicit
+`git commit -s` usage, the session-required Copilot co-author trailer on child
+commits, push, and PR creation. Human contributor `Co-authored-by:` trailers
+remain conditional under `AGENTS.md` and are separate from the required
+Copilot trailer.
 
 Every child plan must reuse this exact child-commit pattern, replacing only
 the commit message and adding any conditional human contributor trailers as
@@ -763,14 +873,14 @@ COPILOT_TRAILER="Co-authored-by: $COPILOT_GH_USER <${COPILOT_GH_ID}+${COPILOT_GH
 git commit -s --trailer "$COPILOT_TRAILER" -m "<child commit message>"
 ```
 
-Expected: independent plans exist for mobile pairing, Intel macOS packaging,
-Ward confinement, memory promotion, Psyche specifications, universal runtime
-design, or runtime parity only when their ledger row is `viable`.
+Expected: independent plans exist only for viable rows that are not already
+continuing an adopted exact-head PR.
 
-- [ ] **Step 4: Recover and publish each viable concern sequentially**
+- [ ] **Step 5: Recover and publish each viable concern sequentially**
 
-For each viable row, set `ISSUE_NUMBER` to its created or reused issue number
-and set `BRANCH_SLUG` from this fixed mapping:
+Skip this step for any row whose Task 5 Step 1 action is `continue existing PR`.
+For each remaining viable row, set `ISSUE_NUMBER` to its created or reused
+issue number and set `BRANCH_SLUG` from this fixed mapping:
 
 ```text
 mobile-memory-gateway -> mobile-pairing-recovery
@@ -826,11 +936,11 @@ coven claim release "issue-$ISSUE_NUMBER"
 ```
 
 Execute that issue's plan, run its full gates, commit each child change with
-the Task 5 Step 3 trailer pattern, add human contributor co-author trailers
+the Task 5 Step 4 trailer pattern, add human contributor co-author trailers
 only when `AGENTS.md` requires them, push, and open its scoped pull request.
 
-Expected: every viable row links to one open pull request from a current-main
-branch.
+Expected: every viable row either continues one adopted exact-head open pull
+request or links to one open pull request from a current-main recovery branch.
 
 ### Task 6: Record Non-Viable Outcomes
 
@@ -955,12 +1065,15 @@ Do not use `--force`. Any non-empty status blocks removal.
 
 - [ ] **Step 4: Retire the original dirty source worktrees only after proof checks**
 
-These four source worktrees remain intentionally dirty until their proof is
-complete. `git worktree remove --force` is allowed only in this step, only for
-these four exact paths, and only after the worktree and index patch evidence,
-verified branch bundle, untracked inventory, terminal ledger classification,
-and either an open replacement PR or recorded non-viable/blocker evidence are
-all present. Unrelated or unsnapshotted worktrees must never use force.
+These four source worktrees remain intentionally present until their proof is
+complete. Their runtime dirtiness may change after snapshotting—for example, a
+formerly dirty tree may now be clean because its changes were committed to an
+accurate active PR. `git worktree remove --force` is allowed only in this
+step, only for these four exact paths, and only after the worktree and index
+patch evidence, verified branch bundle, untracked inventory, terminal ledger
+classification, and either an adopted exact-head open PR, an open replacement
+PR, or recorded non-viable/blocker evidence are all present. Unrelated or
+unsnapshotted worktrees must never use force.
 
 Run:
 
@@ -983,10 +1096,10 @@ do
 done
 ```
 
-If a row is `viable`, confirm its classification row cites the open replacement
-PR URL before removal. Otherwise confirm the row already records its
-`already-shipped`, `superseded`, or `blocked` evidence. Then remove only the
-four original dirty source worktrees:
+If a row is `viable`, confirm its classification row cites either the adopted
+exact-head PR URL or the open replacement PR URL before removal. Otherwise
+confirm the row already records its `already-shipped`, `superseded`, or
+`blocked` evidence. Then remove only the four original dirty source worktrees:
 
 ```bash
 COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"

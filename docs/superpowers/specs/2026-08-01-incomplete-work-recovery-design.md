@@ -5,8 +5,8 @@
 ## Objective
 
 Preserve, classify, recover, and deliver viable work from stale local branches
-and dirty worktrees without losing data, duplicating shipped behavior, or
-mixing unrelated concerns in one pull request.
+and dirty or formerly dirty worktrees without losing data, duplicating shipped
+behavior, or mixing unrelated concerns in one pull request.
 
 The recovery ends when every discovered workstream is in exactly one of these
 states:
@@ -20,10 +20,13 @@ removed.
 
 ## Current Inventory
 
-The primary checkout is clean and matches `origin/main`. There are no open pull
-requests, active claims, stashes, or session todos predating this recovery.
+The primary checkout is clean and matches `origin/main`. This inventory is a
+point-in-time baseline rather than a promise about later execution state:
+claims, open pull requests, and source-worktree dirtiness can change while the
+recovery is being published or executed, so the plan must re-query GitHub and
+snapshot the current state before each recovery action.
 
-Dirty worktrees:
+Source worktrees with preserved or in-flight local work at inventory time:
 
 - `docs/psyche-specs` (`.worktrees/docs-psyche-specs`): Psyche product,
   technical, parity, threat-model, prerequisites, and plan documents.
@@ -46,12 +49,19 @@ pull requests or missing temporary directories. They are hygiene candidates,
 not feature inputs, but will not be removed until their tips are verified
 against GitHub history.
 
+A formerly dirty source worktree may later appear clean because its changes
+were committed and pushed to an accurate open pull request. That is expected:
+the recovery still snapshots the worktree's current status, preserves its
+branch history, records empty patch evidence when applicable, and then decides
+whether to continue the existing pull request or create a new recovery track.
+
 ## Recovery Architecture
 
 ### 1. Preserve before mutation
 
 Create a durable recovery directory outside the repository worktrees. For each
-dirty worktree, store:
+source worktree, store its current state even if it is now clean because its
+changes were already committed to an active pull request:
 
 - `git status --short --branch`
 - the base and head commit identifiers
@@ -67,7 +77,8 @@ branch is pushed, or until the work is explicitly recorded as blocked.
 ### 2. Classify against current authority
 
 Compare each workstream with current `origin/main`, merged pull requests, closed
-issues, and current contracts. Assign one classification:
+issues, current open pull requests from the exact source branch, and current
+contracts. Assign one classification:
 
 - **Already shipped:** main contains equivalent behavior or documentation.
 - **Superseded:** a later implementation intentionally replaced the work.
@@ -80,7 +91,16 @@ squash merges make many merged branches appear unmerged.
 
 ### 3. Recover viable concerns in isolation
 
-Each viable concern receives:
+Before creating a child issue, branch, or worktree, each viable concern maps to
+its exact current source branch and runs an exact-head open-pull-request query.
+If exactly one accurate open pull request already exists, the recovery adopts
+and records that pull request and keeps the row classified `viable` with
+recovery action `continue existing PR`. If no exact-head pull request exists,
+the concern follows the normal issue-reuse-or-create flow. If more than one
+exact-head pull request exists, the row moves to `blocked` with evidence rather
+than guessing.
+
+Each viable concern without an adopted exact-head open pull request receives:
 
 1. A dedicated GitHub issue, unless an existing issue accurately owns it.
 2. A fresh branch and worktree based on current `origin/main`.
@@ -88,6 +108,11 @@ Each viable concern receives:
 4. A minimal transplant of only the still-relevant changes.
 5. Targeted tests followed by all repository-required gates.
 6. A conventional commit, push, and scoped pull request.
+
+For example, if the source branch `docs/psyche-specs` still has exactly one
+open pull request when the query runs, the recovery adopts that live pull
+request (today this is PR #546) instead of creating a duplicate issue, branch,
+worktree, claim, or pull request.
 
 Old commits are not blindly rebased or cherry-picked when current contracts
 have changed. The recovered implementation is rebuilt around current code and
@@ -161,6 +186,8 @@ after staging the intended change so it evaluates the actual proposed commit.
 - Rebase or transplant conflicts are resolved from current contracts; old code
   never wins automatically.
 - A failing required gate blocks push and pull-request creation.
+- More than one exact-head open pull request or more than one matching recovery
+  issue blocks the row with evidence rather than choosing a duplicate target.
 - Ambiguous ownership, policy, or human approval moves the workstream to
   `blocked` with evidence rather than inventing authority.
 - Claims are heartbeated during long work and released when the pull request
@@ -170,9 +197,10 @@ after staging the intended change so it evaluates the actual proposed commit.
 
 ## Success Criteria
 
-- Every dirty or orphaned workstream has a durable snapshot and classification.
-- Every viable concern has its own validated, pushed branch and open pull
-  request.
+- Every dirty, formerly dirty, or orphaned workstream has a durable snapshot
+  and classification.
+- Every viable concern either adopts one accurate exact-head open pull request
+  or has its own validated, pushed branch and open pull request.
 - Already-shipped and superseded work has concrete GitHub or main-branch
   evidence.
 - No uncommitted work is deleted.
