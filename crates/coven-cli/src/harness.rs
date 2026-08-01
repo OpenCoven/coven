@@ -3736,8 +3736,9 @@ mod tests {
     fn quarantined_explicit_manifest_path_keeps_built_ins_available() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let manifest = temp_dir.path().join("copilot.json");
-        let quarantined =
-            PathBuf::from(format!("{}{}", manifest.display(), ".shadowed-by-builtin"));
+        let mut quarantined = manifest.as_os_str().to_os_string();
+        quarantined.push(SHADOWED_BUILTIN_MANIFEST_SUFFIX);
+        let quarantined = PathBuf::from(quarantined);
         fs::write(
             quarantined,
             r#"{
