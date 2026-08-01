@@ -29,7 +29,7 @@ No dependency, command-builder, daemon, store, or harness-adapter files should c
 - Modify: `crates/coven-cli/src/pty_runner.rs:2297-2310`
 - Test: `crates/coven-cli/src/pty_runner.rs` inline `tests` module
 
-- [ ] **Step 1: Write failing geometry-precedence tests**
+- [x] **Step 1: Write failing geometry-precedence tests**
 
 Add these helpers and tests near the start of the existing `tests` module:
 
@@ -84,7 +84,7 @@ fn pty_geometry_defaults_when_every_source_is_unavailable() {
 }
 ```
 
-- [ ] **Step 2: Run the tests and confirm the intended RED failure**
+- [x] **Step 2: Run the tests and confirm the intended RED failure**
 
 Run:
 
@@ -94,7 +94,7 @@ cargo test -p coven-cli pty_runner::tests::pty_geometry_ -- --nocapture
 
 Expected: compilation fails because `terminal_size_from_sources` does not exist. A pass is not acceptable at this step.
 
-- [ ] **Step 3: Implement live geometry detection and fallback resolution**
+- [x] **Step 3: Implement live geometry detection and fallback resolution**
 
 Extend the crossterm import and replace the current environment-only resolver with:
 
@@ -155,7 +155,7 @@ Keep `env_u16` unchanged so malformed, zero, and missing values remain filtered.
 Keep the existing captured and detached `openpty(terminal_size())` calls unchanged;
 only the interactive attached runner will call `attached_terminal_size()`.
 
-- [ ] **Step 4: Run focused tests and formatting**
+- [x] **Step 4: Run focused tests and formatting**
 
 Run:
 
@@ -167,7 +167,7 @@ git diff --check
 
 Expected: four geometry tests pass; formatting and diff checks exit zero.
 
-- [ ] **Step 5: Stage, run privacy/secret verification, and commit**
+- [x] **Step 5: Stage, run privacy/secret verification, and commit**
 
 Run:
 
@@ -188,7 +188,7 @@ Expected: both guards pass and the commit contains only the resolver and its tes
 - Modify: `crates/coven-cli/src/pty_runner.rs` immediately before `run_attached_with_pty_system`
 - Test: `crates/coven-cli/src/pty_runner.rs` inline `tests` module
 
-- [ ] **Step 1: Write failing resize-decision tests**
+- [x] **Step 1: Write failing resize-decision tests**
 
 Add a focused test target and these tests:
 
@@ -268,7 +268,7 @@ fn pty_resize_failure_stops_relay_without_advancing_geometry() {
 }
 ```
 
-- [ ] **Step 2: Run the tests and confirm the intended RED failure**
+- [x] **Step 2: Run the tests and confirm the intended RED failure**
 
 Run:
 
@@ -278,7 +278,7 @@ cargo test -p coven-cli pty_runner::tests::pty_resize_ -- --nocapture
 
 Expected: compilation fails because `PtyResizeTarget` and `apply_pty_resize` do not exist.
 
-- [ ] **Step 3: Add the private resize target boundary and decision helper**
+- [x] **Step 3: Add the private resize target boundary and decision helper**
 
 Import `MasterPty` and add:
 
@@ -318,7 +318,7 @@ fn apply_pty_resize(
 
 The boolean means “continue watching”; resize errors remain quiet so they cannot corrupt native TUI output.
 
-- [ ] **Step 4: Run focused tests and formatting**
+- [x] **Step 4: Run focused tests and formatting**
 
 Run:
 
@@ -330,7 +330,7 @@ git diff --check
 
 Expected: three resize-decision tests pass and checks exit zero.
 
-- [ ] **Step 5: Stage, verify, and commit**
+- [x] **Step 5: Stage, verify, and commit**
 
 Run:
 
@@ -351,7 +351,7 @@ Expected: verified commit containing only the private resize boundary/helper and
 - Modify: `crates/coven-cli/src/pty_runner.rs:2216-2273`
 - Test: `crates/coven-cli/src/pty_runner.rs` inline `tests` module
 
-- [ ] **Step 1: Write failing watcher lifecycle tests**
+- [x] **Step 1: Write failing watcher lifecycle tests**
 
 Add imports inside the test module as needed and add:
 
@@ -457,7 +457,7 @@ fn pty_resize_watcher_exits_and_drops_target_after_resize_failure() {
 }
 ```
 
-- [ ] **Step 2: Write the failing Unix real-PTY resize regression**
+- [x] **Step 2: Write the failing Unix real-PTY resize regression**
 
 Add:
 
@@ -499,7 +499,7 @@ fn pty_resize_watcher_updates_real_child_geometry() -> anyhow::Result<()> {
 }
 ```
 
-- [ ] **Step 3: Run the tests and confirm the intended RED failure**
+- [x] **Step 3: Run the tests and confirm the intended RED failure**
 
 Run:
 
@@ -509,7 +509,7 @@ cargo test -p coven-cli pty_runner::tests::pty_resize_watcher_ -- --nocapture
 
 Expected: compilation fails because `PtyResizeWatcher` does not exist.
 
-- [ ] **Step 4: Implement the scoped polling watcher**
+- [x] **Step 4: Implement the scoped polling watcher**
 
 Add this before `run_attached_with_pty_system`:
 
@@ -577,7 +577,7 @@ impl Drop for PtyResizeWatcher {
 }
 ```
 
-- [ ] **Step 5: Integrate watcher ownership into the attached runner**
+- [x] **Step 5: Integrate watcher ownership into the attached runner**
 
 Update `run_attached_with_pty_system` so the startup size is retained and the master is either watched or held locally:
 
@@ -650,7 +650,7 @@ fn run_attached_with_pty_system(
 
 Do not alter stdin/stdout copying, raw-mode behavior, command args, captured output, detached sessions, or stream-JSON routing.
 
-- [ ] **Step 6: Run focused and surrounding PTY tests**
+- [x] **Step 6: Run focused and surrounding PTY tests**
 
 Run:
 
@@ -663,7 +663,7 @@ git diff --check
 
 Expected: all new geometry/watcher tests and the existing Codex command test pass; formatting and diff checks exit zero.
 
-- [ ] **Step 7: Stage, verify, and commit**
+- [x] **Step 7: Stage, verify, and commit**
 
 Run:
 
@@ -684,7 +684,7 @@ Expected: verified commit containing watcher lifecycle, attached-runner integrat
 - Verify: `docs/superpowers/specs/2026-08-01-coven-run-pty-terminal-fidelity-design.md`
 - Verify: `docs/superpowers/plans/2026-08-01-coven-run-pty-terminal-fidelity.md`
 
-- [ ] **Step 1: Run focused regression proof without concurrent Cargo jobs**
+- [x] **Step 1: Run focused regression proof without concurrent Cargo jobs**
 
 Run:
 
@@ -694,7 +694,7 @@ cargo test -p coven-cli pty_runner::tests::pty_ -- --nocapture
 
 Expected: all new tests pass, including the Unix child transition from `24 80` to `40 120`.
 
-- [ ] **Step 2: Run the required Rust gates**
+- [x] **Step 2: Run the required Rust gates**
 
 Run serially:
 
@@ -710,7 +710,7 @@ three-second deadline under unrelated machine load, record the full output, allo
 all competing Cargo jobs to finish, and rerun that exact test once from the already
 built test binary. Do not change its timeout in this PR.
 
-- [ ] **Step 3: Run secret, privacy, and diff gates**
+- [x] **Step 3: Run secret, privacy, and diff gates**
 
 Run:
 
@@ -723,7 +723,7 @@ git diff --cached --check
 
 Expected: all checks pass. If there are no uncommitted implementation changes, the staged privacy scan should still cover the plan update only.
 
-- [ ] **Step 4: Perform a wide-terminal manual smoke**
+- [x] **Step 4: Perform a wide-terminal manual smoke**
 
 From a real terminal pane wider than 120 columns, run:
 
@@ -741,26 +741,49 @@ While the native Codex composer remains open:
 
 Expected: full-width native layout, correct wrapping, no stale duplicate composer, and a healthy terminal after exit.
 
-- [ ] **Step 5: Audit the exact acceptance criteria**
+- [x] **Step 5: Audit the exact acceptance criteria**
 
 Record evidence for every approved requirement:
 
 ```text
-[ ] startup columns/rows come from the connected terminal
-[ ] startup pixel geometry is preserved when available
-[ ] environment/default fallbacks remain valid
-[ ] live resizes reach the child PTY
-[ ] identical samples do not redraw the child
-[ ] watcher exits on shutdown and resize failure
-[ ] native input/output and raw-mode restoration are unchanged
-[ ] detached/captured/stream-json paths have no diff
-[ ] focused tests, broad gates, secret scan, and privacy scan pass
-[ ] wide-terminal Codex smoke shows one aligned composer
+[x] startup columns/rows come from the connected terminal
+[x] startup pixel geometry is preserved when available
+[x] environment/default fallbacks remain valid
+[x] live resizes reach the child PTY
+[x] identical samples do not redraw the child
+[x] watcher exits on shutdown and resize failure
+[x] native input/output and raw-mode restoration are unchanged
+[x] detached/captured/stream-json paths have no diff
+[x] focused tests, broad gates, secret scan, and privacy scan pass
+[x] wide-terminal Codex smoke shows one aligned composer
 ```
 
 Expected: every box has direct command, diff, or visual evidence. Any unchecked item keeps issue #540 incomplete.
 
-- [ ] **Step 6: Commit any final plan-only checkbox updates after verification**
+#### Verification record (2026-08-01)
+
+- `cargo test -p coven-cli pty_runner::tests::pty_ -- --nocapture` passed all
+  13 focused tests, including the Unix child transition from `24 80` to `40 120`.
+- `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+  and `cargo test --workspace --locked` exited zero. The main `coven-cli` suite
+  reported 1,558 passed, zero failed, and two ignored; the known fixed-deadline
+  SIGTERM regression also passed in the normal workspace run.
+- Geometry tests cover live cell and pixel precedence, cell-only terminal fallback,
+  invalid terminal samples, independent environment dimensions, and 24-by-80
+  defaults. Resize tests cover deduplication, transient missing samples, resize
+  failure without advancing geometry, prompt shutdown, target lifetime, and the
+  real child PTY resize.
+- The cumulative diff changes the attached runner plus its inline tests only;
+  detached and captured `openpty(terminal_size())` call sites and stream-JSON
+  routing have no functional diff. The native stdin/stdout byte copies and
+  `RawModeGuard` remain in place.
+- A real macOS PTY started at 40 rows by 140 columns, ran
+  `target/debug/coven run codex "Reply with exactly PTY_OK."`, and returned
+  `PTY_OK`. Changing the same device to 28-by-72 produced a coherent narrow
+  reflow; restoring 40-by-140 restored the wide layout with one composer. The
+  command exited zero, and `stty -g` was byte-identical before and after.
+
+- [x] **Step 6: Commit any final plan-only checkbox updates after verification**
 
 If execution checkboxes were updated after the implementation commits, run:
 
