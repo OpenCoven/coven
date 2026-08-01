@@ -206,7 +206,7 @@ jobs:
   npm-dry-run:
     name: npm publish dry-run
     runs-on: ubuntu-latest
-    needs: build-platform
+    needs: [build-platform, verify-tag]
     permissions:
       contents: read
     steps:
@@ -230,18 +230,18 @@ jobs:
           path: target/x86_64-pc-windows-msvc/release
       - run: node scripts/publish-npm.mjs --target=macos --skip-build --dry-run
         env:
-          COVEN_NPM_VERSION: ${{ github.ref_name }}
+          COVEN_NPM_VERSION: ${{ needs.verify-tag.outputs.npm_version }}
       - run: node scripts/publish-npm.mjs --target=linux-x64 --skip-build --dry-run --skip-wrapper
         env:
-          COVEN_NPM_VERSION: ${{ github.ref_name }}
+          COVEN_NPM_VERSION: ${{ needs.verify-tag.outputs.npm_version }}
       - run: node scripts/publish-npm.mjs --target=windows --skip-build --dry-run --skip-wrapper
         env:
-          COVEN_NPM_VERSION: ${{ github.ref_name }}
+          COVEN_NPM_VERSION: ${{ needs.verify-tag.outputs.npm_version }}
 
   npm-publish:
     name: npm publish
     runs-on: ubuntu-latest
-    needs: [build-platform, npm-dry-run]
+    needs: [build-platform, npm-dry-run, verify-tag]
     # OIDC trusted publishing: id-token:write lets the job mint a short-lived OIDC token
     # that `npm publish --provenance` exchanges with the npm registry for a one-shot
     # publish credential. No NPM_TOKEN secret is read or written.
@@ -269,19 +269,54 @@ jobs:
           name: coven-windows
           path: target/x86_64-pc-windows-msvc/release
       - name: Refuse placeholder version
+        env:
+          NPM_VERSION: ${{ needs.verify-tag.outputs.npm_version }}
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"
-          if [ "$TAG" = "v0.0.0" ]; then
-            echo "::error::Refusing to publish placeholder version $TAG"
+          if [ "$NPM_VERSION" = "0.0.0" ]; then
+            echo "::error::Refusing to publish placeholder version $NPM_VERSION"
             exit 1
           fi
+      - name: Confirm expected partial npm state
+        if: needs.verify-tag.outputs.release_mode == 'recovery'
+        env:
+          NPM_VERSION: ${{ needs.verify-tag.outputs.npm_version }}
+        run: |
+          set -euo pipefail
+          expect_published() {
+            local package_name="$1"
+            local actual
+            actual=$(npm view "$package_name@$NPM_VERSION" version --json | jq -r '.')
+            if [ "$actual" != "$NPM_VERSION" ]; then
+              echo "::error::Expected $package_name@$NPM_VERSION to be published; found ${actual:-missing}."
+              exit 1
+            fi
+          }
+          expect_missing() {
+            local package_name="$1"
+            local output
+            if output=$(npm view "$package_name@$NPM_VERSION" version 2>&1); then
+              echo "::error::Expected $package_name@$NPM_VERSION to be absent before recovery."
+              exit 1
+            fi
+            if ! grep -q 'E404' <<<"$output"; then
+              printf '%s\n' "$output"
+              echo "::error::Could not prove $package_name@$NPM_VERSION is absent."
+              exit 1
+            fi
+          }
+          expect_published @opencoven/cli-linux-x64
+          expect_published @opencoven/cli-windows
+          expect_missing @opencoven/cli-macos
+          expect_missing @opencoven/cli
       - run: node scripts/publish-npm.mjs --target=linux-x64 --skip-build --publish --skip-wrapper
+        if: needs.verify-tag.outputs.release_mode == 'normal'
         env:
-          COVEN_NPM_VERSION: ${{ github.ref_name }}
+          COVEN_NPM_VERSION: ${{ needs.verify-tag.outputs.npm_version }}
       - run: node scripts/publish-npm.mjs --target=windows --skip-build --publish --skip-wrapper
+        if: needs.verify-tag.outputs.release_mode == 'normal'
         env:
-          COVEN_NPM_VERSION: ${{ github.ref_name }}
+          COVEN_NPM_VERSION: ${{ needs.verify-tag.outputs.npm_version }}
       - run: node scripts/publish-npm.mjs --target=macos --skip-build --publish
         env:
-          COVEN_NPM_VERSION: ${{ github.ref_name }}
+          COVEN_NPM_VERSION: ${{ needs.verify-tag.outputs.npm_version }}

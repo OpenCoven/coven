@@ -707,6 +707,56 @@ test('release workflow fail-closes signed recovery tags', () => {
   );
 });
 
+test('release workflow publishes only missing packages during recovery', () => {
+  const workflowPath = new URL(
+    ['..', '.github', 'workflows', 'release-npm.yml'].join('/'),
+    import.meta.url
+  );
+  const workflow = readFileSync(workflowPath, 'utf8');
+  const publish = workflow.slice(workflow.indexOf('  npm-publish:'));
+
+  assert.match(workflow, /npm-dry-run:[\s\S]*?needs: \[build-platform, verify-tag\]/);
+  assert.match(
+    publish,
+    /needs: \[build-platform, npm-dry-run, verify-tag\]/,
+    'publish job must consume verified release context'
+  );
+  assert.match(
+    publish,
+    /name: Confirm expected partial npm state[\s\S]*@opencoven\/cli-linux-x64[\s\S]*@opencoven\/cli-windows[\s\S]*@opencoven\/cli-macos[\s\S]*@opencoven\/cli/,
+    'recovery must prove the exact two-published, two-missing package state'
+  );
+  assert.match(
+    publish,
+    /Could not prove \$package_name@\$NPM_VERSION is absent/,
+    'registry errors other than E404 must fail closed'
+  );
+  assert.match(
+    publish,
+    /--target=linux-x64 --skip-build --publish --skip-wrapper\s*\n\s*if: needs\.verify-tag\.outputs\.release_mode == 'normal'/,
+    'Linux publication must run only for normal releases'
+  );
+  assert.match(
+    publish,
+    /--target=windows --skip-build --publish --skip-wrapper\s*\n\s*if: needs\.verify-tag\.outputs\.release_mode == 'normal'/,
+    'Windows publication must run only for normal releases'
+  );
+  assert.match(
+    publish,
+    /--target=macos --skip-build --publish\s*\n\s*env:/,
+    'macOS plus wrapper publication must run in normal and recovery modes'
+  );
+  assert.doesNotMatch(
+    workflow,
+    /COVEN_NPM_VERSION: \$\{\{ github\.ref_name \}\}/,
+    'publication must use the base npm version derived from verified tag context'
+  );
+  assert.match(
+    workflow,
+    /COVEN_NPM_VERSION: \$\{\{ needs\.verify-tag\.outputs\.npm_version \}\}/
+  );
+});
+
 test('release workflow triggers only on signed v* tag pushes (no workflow_dispatch fallback)', () => {
   const workflowPath = new URL(
     ['..', '.github', 'workflows', 'release-npm.yml'].join('/'),
