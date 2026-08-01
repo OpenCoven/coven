@@ -4193,6 +4193,47 @@ RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
 RETIRE_PROOF_ROOT="$RECOVERY/private-retire-proof"
 CLASSIFICATION="$RECOVERY/classification.md"
 mkdir -p "$RETIRE_PROOF_ROOT"
+parse_classification_row() {
+  python3 - "$CLASSIFICATION" "$1" <<'PY'
+import sys
+from pathlib import Path
+
+classification_path = Path(sys.argv[1])
+workstream = sys.argv[2]
+for raw in classification_path.read_text(encoding="utf-8").splitlines():
+    line = raw.strip()
+    if not line.startswith("|") or not line.endswith("|"):
+        continue
+    cells = [cell.strip() for cell in line.strip("|").split("|")]
+    if len(cells) != 5 or cells[0] == "Workstream":
+        continue
+    if cells[0] != workstream:
+        continue
+    print(cells[1])
+    print(cells[2])
+    print(cells[3])
+    print(cells[4])
+    break
+else:
+    raise SystemExit(f"Missing classification row for {workstream}")
+PY
+}
+block_retirement() {
+  local id="$1"
+  local blocker="$2"
+  local classification="$3"
+  local evidence="$4"
+  local preserved_source="$5"
+  local recovery_action="$6"
+  local reason="$7"
+  {
+    printf 'Blocked %s: %s\n' "$id" "$reason"
+    printf 'Classification: %s\n' "$classification"
+    printf 'Main/PR evidence: %s\n' "$evidence"
+    printf 'Preserved source: %s\n' "$preserved_source"
+    printf 'Recovery action: %s\n' "$recovery_action"
+  } > "$blocker"
+}
 for id in \
   docs-psyche-specs \
   memory-promote \
@@ -4217,35 +4258,113 @@ do
       SOURCE="$REPO/.worktrees/pr-476-review"
       ;;
   esac
-  if grep -F "| $id | blocked |" "$CLASSIFICATION" | \
-    grep -Fq 'Leave source worktree and branch untouched.'
-  then
-    printf 'Skip forced retirement for %s: classification is blocked because preserved dirty delta remains behind an existing PR. Leave the original source worktree and branch untouched.\n' \
-      "$id" > "$BLOCKER"
+  if ! CLASSIFICATION_FIELDS="$(parse_classification_row "$id")"; then
+    block_retirement "$id" "$BLOCKER" "unparsed" "missing exact row" "$SOURCE" "unparsed" \
+      "classification row could not be parsed safely before any live-state checks"
     continue
   fi
+  mapfile -t CLASSIFICATION_ROW <<<"$CLASSIFICATION_FIELDS"
+  if test "${#CLASSIFICATION_ROW[@]}" -ne 4; then
+    block_retirement "$id" "$BLOCKER" "unparsed" "unexpected column count" "$SOURCE" "unparsed" \
+      "classification row could not be parsed safely before any live-state checks"
+    continue
+  fi
+  CLASSIFICATION_LABEL="${CLASSIFICATION_ROW[0]}"
+  MAIN_PR_EVIDENCE="${CLASSIFICATION_ROW[1]}"
+  PRESERVED_SOURCE="${CLASSIFICATION_ROW[2]}"
+  RECOVERY_ACTION="${CLASSIFICATION_ROW[3]}"
+  case "$CLASSIFICATION_LABEL" in
+    already-shipped)
+      case "$MAIN_PR_EVIDENCE" in
+        *merged*main*|*main*merged*|*merged into main*)
+          ;;
+        *)
+          block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+            "already-shipped rows require concrete merged/main evidence"
+          continue
+          ;;
+      esac
+      ;;
+    superseded)
+      case "$MAIN_PR_EVIDENCE" in
+        *supersed*|*replac*)
+          ;;
+        *)
+          block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+            "superseded rows require concrete superseding evidence"
+          continue
+          ;;
+      esac
+      ;;
+    viable)
+      PR_URL="$MAIN_PR_EVIDENCE"
+      case "$PR_URL" in
+        https://github.com/OpenCoven/coven/pull/*)
+          ;;
+        *)
+          block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+            "viable rows must record a GitHub PR URL for OpenCoven/coven"
+          continue
+          ;;
+      esac
+      PR_VIEW_EVIDENCE="$PROOF_DIR/live-pr-view.json"
+      PR_BLOCKER_EVIDENCE="$PROOF_DIR/live-pr-view.err"
+      if ! gh pr view --repo OpenCoven/coven "$PR_URL" \
+        --json number,title,url,state,headRepositoryOwner,isCrossRepository,baseRefName \
+        > "$PR_VIEW_EVIDENCE" 2> "$PR_BLOCKER_EVIDENCE"; then
+        block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+          "recorded viable PR could not be freshly verified against OpenCoven/coven"
+        cat "$PR_BLOCKER_EVIDENCE" >> "$BLOCKER"
+        continue
+      fi
+      ACTUAL_URL="$(jq -r '.url' "$PR_VIEW_EVIDENCE")"
+      ACTUAL_STATE="$(jq -r '.state' "$PR_VIEW_EVIDENCE")"
+      ACTUAL_OWNER="$(jq -r '.headRepositoryOwner.login' "$PR_VIEW_EVIDENCE")"
+      ACTUAL_CROSS="$(jq -r '.isCrossRepository' "$PR_VIEW_EVIDENCE")"
+      ACTUAL_BASE="$(jq -r '.baseRefName' "$PR_VIEW_EVIDENCE")"
+      if [ "$ACTUAL_URL" != "$PR_URL" ] || \
+         [ "$ACTUAL_STATE" != "OPEN" ] || \
+         [ "$ACTUAL_OWNER" != "OpenCoven" ] || \
+         [ "$ACTUAL_CROSS" != "false" ] || \
+         [ "$ACTUAL_BASE" != "main" ]; then
+        block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+          "viable PR did not freshly verify as OPEN on base main in OpenCoven/coven"
+        continue
+      fi
+      ;;
+    pending|blocked)
+      block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+        "pending and blocked rows are never eligible for forced retirement"
+      continue
+      ;;
+    *)
+      block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+        "classification is not eligible for forced retirement"
+      continue
+      ;;
+  esac
   if ! test -d "$SOURCE"; then
-    printf 'Blocked %s: source worktree is missing before retirement proof; take a fresh snapshot and reclassify.\n' \
-      "$id" > "$BLOCKER"
-    exit 1
+    block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+      "source worktree is missing before retirement proof; take a fresh snapshot and reclassify"
+    continue
   fi
   git -C "$SOURCE" rev-parse HEAD > "$PROOF_DIR/live-head.txt"
   if ! cmp -s "$PROOF_DIR/live-head.txt" "$SNAPSHOT/head.txt"; then
-    printf 'Blocked %s: HEAD drifted since snapshot; take a fresh snapshot and reclassify before removal.\n' \
-      "$id" > "$BLOCKER"
-    exit 1
+    block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+      "HEAD drifted since snapshot; take a fresh snapshot and reclassify before removal"
+    continue
   fi
   git -C "$SOURCE" diff --binary > "$PROOF_DIR/live-worktree.patch"
   if ! cmp -s "$PROOF_DIR/live-worktree.patch" "$SNAPSHOT/worktree.patch"; then
-    printf 'Blocked %s: unstaged tracked changes drifted since snapshot; take a fresh snapshot and reclassify before removal.\n' \
-      "$id" > "$BLOCKER"
-    exit 1
+    block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+      "unstaged tracked changes drifted since snapshot; take a fresh snapshot and reclassify before removal"
+    continue
   fi
   git -C "$SOURCE" diff --cached --binary > "$PROOF_DIR/live-index.patch"
   if ! cmp -s "$PROOF_DIR/live-index.patch" "$SNAPSHOT/index.patch"; then
-    printf 'Blocked %s: staged changes drifted since snapshot; take a fresh snapshot and reclassify before removal.\n' \
-      "$id" > "$BLOCKER"
-    exit 1
+    block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+      "staged changes drifted since snapshot; take a fresh snapshot and reclassify before removal"
+    continue
   fi
   git -C "$SOURCE" ls-files --others --exclude-standard -z > "$PROOF_DIR/live-untracked.zlist"
   python3 - "$PROOF_DIR/live-untracked.zlist" > "$PROOF_DIR/live-untracked.json" <<'PY'
@@ -4259,19 +4378,19 @@ print(json.dumps([entry.decode("utf-8", "surrogateescape") for entry in entries]
 PY
   tar -C "$SOURCE" --null -T "$PROOF_DIR/live-untracked.zlist" -cf "$PROOF_DIR/live-untracked.tar"
   if ! cmp -s "$PROOF_DIR/live-untracked.zlist" "$SNAPSHOT/.untracked.zlist"; then
-    printf 'Blocked %s: untracked path inventory drifted since snapshot; take a fresh snapshot and reclassify before removal.\n' \
-      "$id" > "$BLOCKER"
-    exit 1
+    block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+      "untracked path inventory drifted since snapshot; take a fresh snapshot and reclassify before removal"
+    continue
   fi
   if ! cmp -s "$PROOF_DIR/live-untracked.json" "$SNAPSHOT/untracked.json"; then
-    printf 'Blocked %s: readable untracked inventory evidence drifted since snapshot; take a fresh snapshot and reclassify before removal.\n' \
-      "$id" > "$BLOCKER"
-    exit 1
+    block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+      "readable untracked inventory evidence drifted since snapshot; take a fresh snapshot and reclassify before removal"
+    continue
   fi
   if ! cmp -s "$PROOF_DIR/live-untracked.tar" "$SNAPSHOT/untracked.tar"; then
-    printf 'Blocked %s: untracked tar archive drifted since snapshot; take a fresh snapshot and reclassify before removal.\n' \
-      "$id" > "$BLOCKER"
-    exit 1
+    block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+      "untracked tar archive drifted since snapshot; take a fresh snapshot and reclassify before removal"
+    continue
   fi
   git -C "$SOURCE" ls-files --others --ignored --exclude-standard -z > "$PROOF_DIR/live-ignored.zlist"
   python3 - "$PROOF_DIR/live-ignored.zlist" > "$PROOF_DIR/live-ignored.json" <<'PY'
@@ -4284,35 +4403,32 @@ entries = [] if not raw else raw.rstrip(b"\0").split(b"\0")
 print(json.dumps([entry.decode("utf-8", "surrogateescape") for entry in entries], indent=2))
 PY
   if ! cmp -s "$PROOF_DIR/live-ignored.zlist" "$SNAPSHOT/.ignored.zlist"; then
-    printf 'Blocked %s: ignored path inventory drifted since snapshot; leave the source worktree untouched, take a fresh snapshot, and reclassify before removal.\n' \
-      "$id" > "$BLOCKER"
+    block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+      "ignored path inventory drifted since snapshot; leave the source worktree untouched, take a fresh snapshot, and reclassify before removal"
     continue
   fi
   if ! cmp -s "$PROOF_DIR/live-ignored.json" "$SNAPSHOT/ignored.json"; then
-    printf 'Blocked %s: readable ignored inventory evidence drifted since snapshot; leave the source worktree untouched, take a fresh snapshot, and reclassify before removal.\n' \
-      "$id" > "$BLOCKER"
+    block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+      "readable ignored inventory evidence drifted since snapshot; leave the source worktree untouched, take a fresh snapshot, and reclassify before removal"
     continue
   fi
   if test -s "$SNAPSHOT/.ignored.zlist"; then
-    printf 'Blocked %s: preserved ignored-path inventory is non-empty, so forced source-worktree removal is prohibited. Resume only after that ignored content is intentionally handled outside this recovery, a fresh snapshot records an empty ignored inventory, and the row is reclassified.\n' \
-      "$id" > "$BLOCKER"
+    block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+      "preserved ignored-path inventory is non-empty, so forced source-worktree removal is prohibited"
     continue
   fi
   git -C "$REPO" worktree remove --force "$SOURCE"
 done
 ```
 
-Expected: only those four exact dirty source paths are force-removed, because
-their committed history, dirty state, and recovery disposition have already
-been proven elsewhere in the archive and reconfirmed as unchanged against the
-preserved snapshot immediately before removal. Empty worktree and index patches
-are still acceptable, and empty untracked or ignored inventories remain valid
-when the regenerated `.zlist`, JSON, and tar artifacts match byte-for-byte.
-Rows with non-empty preserved or live ignored inventories never use force:
-they write blocker evidence plus a resume condition and leave the original
-source worktree in place. Any row blocked because preserved dirty delta remains
-behind an active PR likewise writes a skip blocker and leaves its original
-source worktree untouched.
+Expected: a row may retire only when its exact classification row says
+`already-shipped` with concrete merged/main evidence, `superseded` with concrete
+superseding evidence, or `viable` with a recorded GitHub PR URL that freshly
+verifies `OPEN`, `baseRefName=main`, and `OpenCoven/coven`. `pending` and
+`blocked` rows never retire. Any unverifiable viable PR writes cleanup blocker
+evidence and leaves the original source worktree and branch untouched. After
+that gate, the existing snapshot, live-drift, and ignored-content comparisons
+still run before removal.
 
 - [ ] **Step 5: Delete only proven local branch residue after worktree retirement**
 
