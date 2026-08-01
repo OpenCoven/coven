@@ -13,7 +13,9 @@ use std::sync::atomic::AtomicI32;
 use std::sync::MutexGuard;
 
 use anyhow::{Context, Result};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, window_size};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, size as terminal_cell_size, window_size,
+};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, PtySize, PtySystem};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2297,16 +2299,34 @@ impl Drop for RawModeGuard {
 const DEFAULT_PTY_ROWS: u16 = 24;
 const DEFAULT_PTY_COLS: u16 = 80;
 
+// Task 3 wires live attached sizing and removes this temporary allowance.
+#[allow(dead_code)]
 fn detected_terminal_size() -> Option<PtySize> {
     if !io::stdout().is_terminal() {
         return None;
     }
-    let window = window_size().ok()?;
-    valid_pty_size(PtySize {
+    let window = window_size().ok().map(|window| PtySize {
         rows: window.rows,
         cols: window.columns,
         pixel_width: window.width,
         pixel_height: window.height,
+    });
+    detected_terminal_size_from_sources(window, terminal_cell_size().ok())
+}
+
+fn detected_terminal_size_from_sources(
+    window: Option<PtySize>,
+    cells: Option<(u16, u16)>,
+) -> Option<PtySize> {
+    window.and_then(valid_pty_size).or_else(|| {
+        cells.and_then(|(cols, rows)| {
+            valid_pty_size(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+        })
     })
 }
 
@@ -2331,6 +2351,8 @@ fn terminal_size() -> PtySize {
     terminal_size_from_sources(None, env_u16("LINES"), env_u16("COLUMNS"))
 }
 
+// Task 3 wires live attached sizing and removes this temporary allowance.
+#[allow(dead_code)]
 fn attached_terminal_size() -> PtySize {
     terminal_size_from_sources(
         detected_terminal_size(),
@@ -2367,6 +2389,38 @@ mod tests {
         assert_eq!(
             terminal_size_from_sources(Some(live), Some(24), Some(80)),
             live,
+        );
+    }
+
+    #[test]
+    fn pty_geometry_falls_back_to_cell_size_when_pixels_are_unavailable() {
+        let live = pty_size(52, 151, 1812, 936);
+
+        assert_eq!(
+            detected_terminal_size_from_sources(None, Some((151, 52))),
+            Some(pty_size(52, 151, 0, 0)),
+        );
+        assert_eq!(
+            detected_terminal_size_from_sources(Some(live), Some((80, 24))),
+            Some(live),
+        );
+    }
+
+    #[test]
+    fn pty_geometry_rejects_zero_detected_sources() {
+        let invalid_window = pty_size(0, 151, 1812, 936);
+
+        assert_eq!(
+            detected_terminal_size_from_sources(Some(invalid_window), Some((132, 41))),
+            Some(pty_size(41, 132, 0, 0)),
+        );
+        assert_eq!(
+            detected_terminal_size_from_sources(None, Some((132, 0))),
+            None,
+        );
+        assert_eq!(
+            detected_terminal_size_from_sources(None, Some((0, 41))),
+            None,
         );
     }
 
