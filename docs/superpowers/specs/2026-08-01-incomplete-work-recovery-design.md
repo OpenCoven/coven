@@ -64,9 +64,16 @@ current-run path remains `agent-recovery/issue-541`, but reruns must never
 reuse it in place: if that path already exists, move the entire prior run into
 an immutable private archive directory under the shared recovery archive, record
 its former location and archival time, then create a fresh current root at the
-same fixed path before writing any new manifest or snapshot. For each source
-worktree, store its current state even if it is now clean because its changes
-were already committed to an active pull request:
+same fixed path before writing any new manifest or snapshot. Publication and
+execution are driven from a controller worktree for
+`docs/541-incomplete-work-recovery-design` that is discovered with `git worktree
+list --porcelain` from any `OpenCoven/coven` worktree or, when absent, created
+under the repo-local `.worktrees/issue-541-recovery` convention after verifying
+`.worktrees/` is ignored. Every operational command block re-derives
+`CONTROL_WORKTREE`, `COMMON_DIR`, and `REPO` instead of assuming a fixed local
+path or persistent shell variables. For each source worktree, store its current
+state even if it is now clean because its changes were already committed to an
+active pull request:
 
 - `git status --short --branch`
 - the base and head commit identifiers
@@ -190,7 +197,7 @@ after one of these proofs exists:
 - its behavior is identified in a merged pull request or current main;
 - its snapshot and blocker record preserve all remaining value.
 
-Cleanup includes stale `/tmp` worktree registrations, merged local branches,
+Cleanup includes stale worktree registrations, merged local branches,
 gone upstream references, and expired claims. Rows blocked because an existing
 PR already covers the preserved head while additional dirty snapshot state
 remains do not qualify for source-worktree or source-branch cleanup; those

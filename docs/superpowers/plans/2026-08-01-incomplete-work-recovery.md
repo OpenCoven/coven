@@ -4,7 +4,7 @@
 
 **Goal:** Preserve and classify every discovered local workstream, recover each viable concern through its own issue and implementation plan, and safely remove only proven stale residue.
 
-**Architecture:** Use the repository's shared Git common directory as a non-worktree recovery archive with a fixed current-run root at `agent-recovery/issue-541` and immutable private rerun archives for older runs. Run a preservation and classification phase before any cleanup, then hand each viable subsystem to an isolated issue/spec/plan/PR flow based on current `origin/main`.
+**Architecture:** Use the repository's shared Git common directory as a non-worktree recovery archive with a fixed current-run root at `agent-recovery/issue-541` and immutable private rerun archives for older runs. Discover or create the controller worktree for `docs/541-incomplete-work-recovery-design` through repo-local worktree conventions rather than a fixed machine path, then run a preservation and classification phase before any cleanup and hand each viable subsystem to an isolated issue/spec/plan/PR flow based on current `origin/main`.
 
 **Tech Stack:** Git worktrees and bundles, GitHub CLI, Coven claims, Markdown recovery ledger, Rust/Cargo, npm, repository secret and privacy guards.
 
@@ -132,42 +132,139 @@ No production file is modified during preservation or classification.
 - Existing: `docs/superpowers/specs/2026-08-01-incomplete-work-recovery-design.md`
 - Create: `docs/superpowers/plans/2026-08-01-incomplete-work-recovery.md`
 
-- [ ] **Step 1: Check claim state, check open pull requests, acquire `issue-541`, and confirm the design worktree state**
+- [ ] **Step 1: Discover or create the controller worktree for `docs/541-incomplete-work-recovery-design`, then acquire `issue-541`**
 
 Run:
 
 ```bash
-cd /tmp/coven-issue-541
+set -euo pipefail
+CONTROL_BRANCH="docs/541-incomplete-work-recovery-design"
+START_COMMON_DIR="$(git rev-parse --git-common-dir)"
+REPO="$(cd "$START_COMMON_DIR/.." && pwd)"
 coven claim status
 gh pr list --repo OpenCoven/coven --state open --limit 100
-coven claim acquire issue-541
-git status --short --branch
+CONTROL_WORKTREE="$(
+  git -C "$REPO" worktree list --porcelain | awk -v branch="refs/heads/$CONTROL_BRANCH" '
+    $1 == "worktree" { path = $2 }
+    $1 == "branch" && $2 == branch { print path; exit }
+  '
+)"
+if test -z "$CONTROL_WORKTREE"; then
+  if ! git -C "$REPO" check-ignore -q .worktrees/; then
+    printf 'Repository-local .worktrees/ is not ignored.\n' >&2
+    exit 1
+  fi
+  if ! git -C "$REPO" check-ignore -q .worktrees/issue-541-recovery; then
+    printf 'Repository-local control worktree path is not ignored: %s\n' \
+      '.worktrees/issue-541-recovery' >&2
+    exit 1
+  fi
+  mkdir -p "$REPO/.worktrees"
+  CONTROL_WORKTREE="$REPO/.worktrees/issue-541-recovery"
+  if test -e "$CONTROL_WORKTREE"; then
+    printf 'Control worktree path already exists without a branch registration: %s\n' \
+      "$CONTROL_WORKTREE" >&2
+    exit 1
+  fi
+  if ! git -C "$REPO" show-ref --verify --quiet "refs/heads/$CONTROL_BRANCH"; then
+    git -C "$REPO" fetch origin "$CONTROL_BRANCH:$CONTROL_BRANCH"
+  fi
+  git -C "$REPO" worktree add "$CONTROL_WORKTREE" "$CONTROL_BRANCH"
+fi
+if ! test -d "$CONTROL_WORKTREE"; then
+  printf 'Control worktree path is not present: %s\n' "$CONTROL_WORKTREE" >&2
+  exit 1
+fi
+ACTUAL_BRANCH="$(git -C "$CONTROL_WORKTREE" branch --show-current)"
+if test "$ACTUAL_BRANCH" != "$CONTROL_BRANCH"; then
+  printf 'Control worktree branch mismatch: expected %s, got %s\n' \
+    "$CONTROL_BRANCH" "$ACTUAL_BRANCH" >&2
+  exit 1
+fi
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
+(
+  cd "$CONTROL_WORKTREE"
+  coven claim acquire issue-541
+)
+git -C "$CONTROL_WORKTREE" status --short --branch
+printf 'CONTROL_WORKTREE=%s\nCOMMON_DIR=%s\nREPO=%s\n' \
+  "$CONTROL_WORKTREE" "$COMMON_DIR" "$REPO"
 ```
 
-Expected: the shared claim registry and open PR set are reviewed before any
-publication or recovery action; `issue-541` is actively claimed from
-`/tmp/coven-issue-541`; and branch
-`docs/541-incomplete-work-recovery-design` shows only the plan file untracked
-before it is staged.
+Expected: from any `OpenCoven/coven` worktree, the shared claim registry and
+open PR set are reviewed first; `git worktree list --porcelain` discovers an
+existing linked controller for branch `docs/541-incomplete-work-recovery-design`
+or, if none exists, the operator verifies `.worktrees/` is ignored and creates
+a deterministic repo-local controller worktree at
+`.worktrees/issue-541-recovery` from the existing or freshly fetched branch
+without creating a duplicate branch. `CONTROL_WORKTREE`, `COMMON_DIR`, and
+`REPO` are printed explicitly, `CONTROL_WORKTREE` is verified to be on
+`docs/541-incomplete-work-recovery-design`, `issue-541` is acquired from that
+controller worktree, and `git status --short --branch` there shows only the
+plan file untracked before it is staged.
 
 If this publication session or the later recovery session runs long, keep the
-parent claim alive from `/tmp/coven-issue-541`:
+parent claim alive from the discovered controller worktree by re-resolving it
+instead of assuming shell variables persist:
 
 ```bash
-cd /tmp/coven-issue-541
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
+cd "$CONTROL_WORKTREE"
 coven claim heartbeat issue-541
 ```
 
 Do not release `issue-541` after PR creation. Keep it active until this
 recovery session stops or the full issue #541 recovery effort is complete, then
-release it from `/tmp/coven-issue-541` with `coven claim release issue-541`.
+release it from the discovered controller worktree with `coven claim release
+issue-541`.
 
 - [ ] **Step 2: Run document safety checks**
 
 Run:
 
 ```bash
-cd /tmp/coven-issue-541
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
+cd "$CONTROL_WORKTREE"
 git add docs/superpowers/plans/2026-08-01-incomplete-work-recovery.md
 git diff --cached --check
 python scripts/check-secrets.py
@@ -182,7 +279,28 @@ file, and the privacy guard reports one staged plan file.
 Run:
 
 ```bash
-cd /tmp/coven-issue-541
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
+cd "$CONTROL_WORKTREE"
 COPILOT_GH_ID=223556219
 COPILOT_GH_USER=Copilot
 COPILOT_NOREPLY_DOMAIN=users.noreply.github.com
@@ -202,7 +320,28 @@ trailer. Human contributor co-author trailers remain conditional under
 Run:
 
 ```bash
-git -C /tmp/coven-issue-541 push -u origin docs/541-incomplete-work-recovery-design
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
+git -C "$CONTROL_WORKTREE" push -u origin docs/541-incomplete-work-recovery-design
 ```
 
 Expected: the remote branch is created successfully.
@@ -212,7 +351,28 @@ Expected: the remote branch is created successfully.
 Run:
 
 ```bash
-cd /tmp/coven-issue-541
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
+cd "$CONTROL_WORKTREE"
 gh pr create \
   --title "docs: design incomplete work recovery" \
   --body $'Tracks #541\n\nDefines a preservation-first process for recovering dirty worktrees and orphan branches without losing data or duplicating shipped work.\n\nThe implementation is deliberately split into one issue/spec/plan/PR per viable subsystem after snapshot and classification.'
@@ -240,7 +400,26 @@ Run:
 
 ```bash
 set -euo pipefail
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 git -C "$REPO" fetch origin main
 RECOVERY_PARENT="$COMMON_DIR/agent-recovery"
@@ -277,7 +456,26 @@ again before classification.
 Run:
 
 ```bash
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 SOURCE="$REPO/.worktrees/docs-psyche-specs"
 DEST="$COMMON_DIR/agent-recovery/issue-541/dirty/docs-psyche-specs"
@@ -336,7 +534,26 @@ post-commit state.
 Run:
 
 ```bash
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 SOURCE="$REPO/.worktrees/feat-cmem-1ev-memory-promote"
 DEST="$COMMON_DIR/agent-recovery/issue-541/dirty/memory-promote"
@@ -394,7 +611,26 @@ captured only in `.ignored.zlist` and `ignored.json`.
 Run:
 
 ```bash
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 SOURCE="$REPO/.worktrees/mobile-memory-gateway"
 DEST="$COMMON_DIR/agent-recovery/issue-541/dirty/mobile-memory-gateway"
@@ -451,7 +687,26 @@ while ignored paths remain inventory-only.
 Run:
 
 ```bash
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 SOURCE="$REPO/.worktrees/pr-476-review"
 DEST="$COMMON_DIR/agent-recovery/issue-541/dirty/pr-476-review"
@@ -507,7 +762,26 @@ paths remain captured only in `.ignored.zlist` and `ignored.json`.
 Run:
 
 ```bash
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
 test "$(wc -l < "$RECOVERY/manifest.tsv" | tr -d ' ')" = 5
@@ -615,7 +889,26 @@ archive.
 Run:
 
 ```bash
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
 mkdir -p \
@@ -640,7 +933,26 @@ Expected: three bundle files and three metadata directories are created.
 Run:
 
 ```bash
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
 git -C "$REPO" bundle verify "$RECOVERY/branches/docs-universal-runtime-capability-design.bundle"
@@ -655,7 +967,26 @@ Expected: Git reports each bundle is okay and lists its branch ref.
 Run:
 
 ```bash
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
 for entry in \
@@ -695,7 +1026,26 @@ Step 1.
 Run:
 
 ```bash
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
 git -C "$REPO" fetch origin main
@@ -723,7 +1073,26 @@ authoritative fully paginated source for later exact-title issue-reuse filters.
 Run:
 
 ```bash
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
 for branch in \
@@ -852,7 +1221,27 @@ flow.
 Run:
 
 ```bash
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
 RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
 for id in \
   docs-psyche-specs \
@@ -883,7 +1272,26 @@ current source branch:
 
 ```bash
 set -euo pipefail
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 RECOVERY="$COMMON_DIR/agent-recovery/issue-541/viable"
 CLASSIFICATION="$COMMON_DIR/agent-recovery/issue-541/classification.md"
@@ -1263,7 +1671,27 @@ Set `WORKSTREAM_ID` to the viable row's exact workstream ID, then use the
 matching exact issue title:
 
 ```bash
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
 RECOVERY="$COMMON_DIR/agent-recovery/issue-541/viable"
 PRIVATE_RECOVERY="$COMMON_DIR/agent-recovery/issue-541/private"
 CLASSIFICATION="$COMMON_DIR/agent-recovery/issue-541/classification.md"
@@ -1591,7 +2019,26 @@ pr-476-review -> runtime-parity-plan-recovery
 Then run:
 
 ```bash
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 RECOVERY="$COMMON_DIR/agent-recovery/issue-541/viable"
 CLASSIFICATION="$COMMON_DIR/agent-recovery/issue-541/classification.md"
@@ -1710,7 +2157,26 @@ Immediately after any non-adopted recovery branch opens its PR, capture and
 verify that PR before Task 7 cleanup or Task 9 audit continues:
 
 ```bash
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 RECOVERY="$COMMON_DIR/agent-recovery/issue-541/viable"
 CLASSIFICATION="$COMMON_DIR/agent-recovery/issue-541/classification.md"
@@ -1873,7 +2339,26 @@ resume condition to recover the delta later from current `main`.
 Run:
 
 ```bash
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 cd "$REPO"
 coven claim status
@@ -1887,7 +2372,26 @@ Expected: every active recovery claim and open PR is understood before cleanup.
 Run:
 
 ```bash
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 cd "$REPO"
 git worktree prune --dry-run --verbose
@@ -1908,7 +2412,26 @@ Expected: only registrations whose directories no longer exist are removed.
 Check each known linked worktree:
 
 ```bash
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 for path in \
   "$REPO/.worktrees/docs-cli-core-guides" \
@@ -1927,7 +2450,26 @@ Then prove each branch's PR merged or its tip is represented by current main,
 and remove the five clean worktrees:
 
 ```bash
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 for path in \
   "$REPO/.worktrees/docs-cli-core-guides" \
@@ -1963,7 +2505,26 @@ resume condition. Unrelated or unsnapshotted worktrees must never use force.
 Run:
 
 ```bash
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
 for id in \
@@ -1998,7 +2559,26 @@ row. Only unchanged rows with an empty preserved ignored inventory may use the
 exact-path force-removal exception:
 
 ```bash
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
 RETIRE_PROOF_ROOT="$RECOVERY/private-retire-proof"
@@ -2150,7 +2730,26 @@ recovered source branches:
 Run this immediately before `branch -d`:
 
 ```bash
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 BRANCH_DELETE_PROOF_ROOT="$COMMON_DIR/agent-recovery/issue-541/private/branch-delete-proof"
 mkdir -p "$BRANCH_DELETE_PROOF_ROOT"
@@ -2237,7 +2836,26 @@ pushed replacement branch still proves the committed history, then rerun the
 same branch-ref proof immediately before `branch -D`:
 
 ```bash
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 BRANCH_DELETE_PROOF_ROOT="$COMMON_DIR/agent-recovery/issue-541/private/branch-delete-proof"
 mkdir -p "$BRANCH_DELETE_PROOF_ROOT"
@@ -2345,7 +2963,28 @@ Release the parent `issue-541` claim only when the issue #541 recovery session
 stops or the full issue #541 recovery effort is complete:
 
 ```bash
-cd /tmp/coven-issue-541
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
+cd "$CONTROL_WORKTREE"
 coven claim release issue-541
 ```
 
@@ -2355,16 +2994,35 @@ allowed only for still-running recovery sessions and open follow-up work.
 ### Task 8: Reconcile Repository Goals
 
 **Files:**
-- Modify: `.copilot/goals.md`
+- Modify: `.copilot/goals.md` in `CONTROL_WORKTREE` only
 
 - [ ] **Step 1: Re-read goals and live issue state**
 
 Run:
 
 ```bash
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
-cd "$REPO"
+cd "$CONTROL_WORKTREE"
 sed -n '1,260p' .copilot/goals.md
 for issue in 401 414 521 541; do
   gh issue view "$issue" --json number,state,title,closedAt,url
@@ -2375,7 +3033,7 @@ Expected: #401, #414, and #521 are closed; #541 reflects the recovery PR state.
 
 - [ ] **Step 2: Close stale active goal content**
 
-Move `usability-core-consolidation` to `done` because its named high-risk
+Move `usability-core-consolidation` to `done` in `CONTROL_WORKTREE` because its named high-risk
 follow-up #401 is closed. Set:
 
 ```markdown
@@ -2390,7 +3048,7 @@ Remove obsolete `next` text that presents #401 as future work.
 
 - [ ] **Step 3: Reconcile contribution stewardship**
 
-Keep `contribution-stewardship` active because it is an ongoing maintenance
+Keep `contribution-stewardship` active in `CONTROL_WORKTREE` because it is an ongoing maintenance
 objective. Append a 2026-08-01 checkpoint that records:
 
 - #414 and #521 are closed;
@@ -2407,9 +3065,28 @@ next external-PR sweep. Remove the duplicated stale `next` line.
 Run:
 
 ```bash
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
-cd "$REPO"
+cd "$CONTROL_WORKTREE"
 grep -n '^## active\|^## paused\|^## done\|^### goal:\|^- next:' \
   .copilot/goals.md
 ```
@@ -2428,7 +3105,27 @@ Expected: each active goal has one `next` field, completed goals are under
 Run:
 
 ```bash
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
 RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
 for id in \
   docs-psyche-specs \
@@ -2451,7 +3148,26 @@ Expected: all seven workstreams match exactly one terminal classification.
 For every `viable` row, set `PR_URL` to the recorded pull-request URL and run:
 
 ```bash
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 cd "$REPO"
 gh pr view "$PR_URL" --repo OpenCoven/coven \
@@ -2466,7 +3182,26 @@ the URL matches the ledger.
 Run:
 
 ```bash
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 AUDIT_EVIDENCE="$COMMON_DIR/agent-recovery/issue-541/final-audit-primary-checkout.txt"
 cd "$REPO"
@@ -2584,7 +3319,26 @@ a safe fast-forward-only path.
 Run:
 
 ```bash
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 cd "$REPO"
 git status --short --branch
@@ -2607,7 +3361,26 @@ out-of-scope rather than removed or treated as audit failures.
 Run:
 
 ```bash
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 CLASSIFICATION="$COMMON_DIR/agent-recovery/issue-541/classification.md"
 python3 - "$CLASSIFICATION" "$REPO" "$COMMON_DIR" <<'PY'
@@ -2635,7 +3408,26 @@ links, non-viable evidence, and remaining human blockers. Do not post
 `manifest.tsv` or raw snapshot files:
 
 ```bash
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 cd "$REPO"
 gh issue comment 541 --repo OpenCoven/coven --body-file \
@@ -2651,7 +3443,26 @@ Close only after every viable concern has an open PR and all local residue has
 been safely preserved or cleaned:
 
 ```bash
-COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+resolve_control_worktree() {
+  local control_branch="docs/541-incomplete-work-recovery-design"
+  local start_common_dir repo control_worktree
+  start_common_dir="$(git rev-parse --git-common-dir)"
+  repo="$(cd "$start_common_dir/.." && pwd)"
+  control_worktree="$(
+    git -C "$repo" worktree list --porcelain | awk -v branch="refs/heads/$control_branch" '
+      $1 == "worktree" { path = $2 }
+      $1 == "branch" && $2 == branch { print path; exit }
+    '
+  )"
+  if test -z "$control_worktree"; then
+    printf 'Missing controller worktree for %s. Re-run Task 1 Step 1.\n' \
+      "$control_branch" >&2
+    exit 1
+  fi
+  printf '%s\n' "$control_worktree"
+}
+CONTROL_WORKTREE="$(resolve_control_worktree)"
+COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 cd "$REPO"
 gh issue close 541 --repo OpenCoven/coven --comment \
