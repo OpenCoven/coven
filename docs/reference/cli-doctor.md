@@ -118,7 +118,7 @@ coven daemon status --json
 Typical human output from `coven daemon status`:
 
 ```text
-Coven daemon: running (pid 12345, socket <coven-home>/coven.sock)
+Coven daemon: running (pid 12345, socket /path/to/coven-home/coven.sock)
 ```
 
 `not running` means no background daemon is running yet. Start it with:

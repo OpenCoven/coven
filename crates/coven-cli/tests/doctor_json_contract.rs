@@ -24,6 +24,7 @@ fn isolated_doctor_command(
         .env("COVEN_HOME", coven_home)
         .env("HOME", &fake_home)
         .env("USERPROFILE", &fake_home)
+        .env("XDG_CONFIG_HOME", root.join("xdg-config"))
         .env("PATH", OsString::new())
         .env("COVEN_ENGINE_BIN", root.join("missing-engine"))
         .env_remove("COVEN_HARNESS_ADAPTER_MANIFEST")
@@ -59,6 +60,7 @@ fn doctor_json_is_stable_redacted_and_stdout_pure() -> anyhow::Result<()> {
     fs::create_dir_all(project.join(".git"))?;
     fs::create_dir_all(&coven_home)?;
     fs::create_dir_all(temp.path().join("user-home"))?;
+    fs::create_dir_all(temp.path().join("xdg-config"))?;
     let shared_repo = temp.path().join("private-shared-repo");
     let missing_repo = temp.path().join("private-missing-repo");
     fs::create_dir_all(shared_repo.join(".git"))?;

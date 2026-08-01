@@ -1981,8 +1981,15 @@ impl DoctorJsonPathRedactor {
             })
     }
 
-    fn path(&self, value: &Path) -> String {
-        self.text(value.display().to_string())
+    /// Render a value that is itself a known path role. Exact absolute roles
+    /// can always become their semantic token, including filesystem roots;
+    /// unlike `text`, this never performs a broad root substring replacement.
+    fn role_path(&self, value: &Path, token: &str) -> String {
+        if value.is_absolute() {
+            token.to_string()
+        } else {
+            self.text(value.display().to_string())
+        }
     }
 }
 
@@ -2000,7 +2007,7 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
             format!(
                 "running (pid {}, socket {})",
                 status.pid,
-                paths.text(&status.socket)
+                paths.role_path(Path::new(&status.socket), "<daemon-socket>")
             ),
         ),
         Some(daemon::DaemonStatusState::Stale(status)) => DoctorCheck::fail(
@@ -2008,7 +2015,7 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
             format!(
                 "stale daemon record (pid {}, socket {})",
                 status.pid,
-                paths.text(&status.socket)
+                paths.role_path(Path::new(&status.socket), "<daemon-socket>")
             ),
             Some("run: coven daemon restart".to_string()),
         ),
@@ -2021,17 +2028,20 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
 
     for repo in &report.repos {
         checks.push(if repo.ok {
-            DoctorCheck::pass(format!("repo:{}", repo.name), paths.path(&repo.path))
+            DoctorCheck::pass(
+                format!("repo:{}", repo.name),
+                paths.role_path(&repo.path, "<repo>"),
+            )
         } else {
             DoctorCheck::fail(
                 format!("repo:{}", repo.name),
                 format!(
                     "{} is missing or not a git repository",
-                    paths.path(&repo.path)
+                    paths.role_path(&repo.path, "<repo>")
                 ),
                 Some(format!(
                     "fix the path in {}",
-                    paths.path(&report.repos_config_path)
+                    paths.role_path(&report.repos_config_path, "<repos-config>")
                 )),
             )
         });
@@ -2079,7 +2089,11 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
             Some("run: coven engine install".to_string()),
         ),
         Some(engine) => {
-            let located = format!("{} ({})", paths.path(&engine.path), engine.source_label);
+            let located = format!(
+                "{} ({})",
+                paths.role_path(&engine.path, "<engine>"),
+                engine.source_label
+            );
             match engine.version {
                 None => DoctorCheck::warn(
                     "engine",
@@ -2113,7 +2127,7 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
             "familiars",
             format!(
                 "could not read {}: {error}",
-                paths.path(&report.familiars_manifest),
+                paths.role_path(&report.familiars_manifest, "<familiars-manifest>"),
                 error = paths.text(error)
             ),
             None,
@@ -2122,7 +2136,7 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
             "familiars",
             format!(
                 "none configured ({})",
-                paths.path(&report.familiars_manifest)
+                paths.role_path(&report.familiars_manifest, "<familiars-manifest>")
             ),
         ),
         Ok(familiars) => DoctorCheck::pass("familiars", format!("{} configured", familiars.len())),
@@ -6298,6 +6312,11 @@ mod tests {
     fn doctor_json_redactor_rejects_unix_root_replacements() {
         let mut report = make_doctor_report();
         report.home = PathBuf::from("/");
+        report.repos.push(DoctorRepoReport {
+            name: "root".to_string(),
+            path: PathBuf::from("/"),
+            ok: true,
+        });
 
         let redactor = DoctorJsonPathRedactor::new(&report);
         assert!(
@@ -6305,6 +6324,11 @@ mod tests {
             "the Unix filesystem root must never become a global replacement"
         );
         assert_eq!(redactor.text("/var/lib/coven"), "/var/lib/coven");
+        let root_check = doctor_checks(&report)
+            .into_iter()
+            .find(|check| check.id == "repo:root")
+            .expect("root repository check");
+        assert_eq!(root_check.message, "<repo>");
     }
 
     #[cfg(windows)]
@@ -6312,6 +6336,11 @@ mod tests {
     fn doctor_json_redactor_rejects_windows_drive_and_unc_roots() {
         let mut drive_report = make_doctor_report();
         drive_report.home = PathBuf::from(r"C:\");
+        drive_report.repos.push(DoctorRepoReport {
+            name: "drive-root".to_string(),
+            path: PathBuf::from(r"C:\"),
+            ok: true,
+        });
         let drive_redactor = DoctorJsonPathRedactor::new(&drive_report);
         assert!(
             drive_redactor
@@ -6324,9 +6353,19 @@ mod tests {
             drive_redactor.text(r"C:\Users\example\project"),
             r"C:\Users\example\project"
         );
+        let drive_check = doctor_checks(&drive_report)
+            .into_iter()
+            .find(|check| check.id == "repo:drive-root")
+            .expect("drive-root repository check");
+        assert_eq!(drive_check.message, "<repo>");
 
         let mut unc_report = make_doctor_report();
         unc_report.home = PathBuf::from(r"\\server\share\");
+        unc_report.repos.push(DoctorRepoReport {
+            name: "unc-root".to_string(),
+            path: PathBuf::from(r"\\server\share\"),
+            ok: true,
+        });
         let unc_redactor = DoctorJsonPathRedactor::new(&unc_report);
         assert!(
             unc_redactor
@@ -6339,6 +6378,11 @@ mod tests {
             unc_redactor.text(r"\\server\share\project"),
             r"\\server\share\project"
         );
+        let unc_check = doctor_checks(&unc_report)
+            .into_iter()
+            .find(|check| check.id == "repo:unc-root")
+            .expect("UNC-root repository check");
+        assert_eq!(unc_check.message, "<repo>");
     }
 
     fn make_doctor_report() -> DoctorReport {
