@@ -4383,12 +4383,19 @@ do
       SOURCE="$REPO/.worktrees/pr-476-review"
       ;;
   esac
-  if ! CLASSIFICATION_FIELDS="$(parse_classification_row "$id")"; then
+  CLASSIFICATION_FIELDS_FILE="$RECOVERY/.classification-fields.$$"
+  if ! parse_classification_row "$id" >"$CLASSIFICATION_FIELDS_FILE"; then
+    rm -f "$CLASSIFICATION_FIELDS_FILE"
     block_retirement "$id" "$BLOCKER" "unparsed" "missing exact row" "$SOURCE" "unparsed" \
       "classification row could not be parsed safely before any live-state checks"
     continue
   fi
-  mapfile -t CLASSIFICATION_ROW <<<"$CLASSIFICATION_FIELDS"
+  CLASSIFICATION_ROW=()
+  CLASSIFICATION_FIELD=
+  while IFS= read -r CLASSIFICATION_FIELD || [ -n "$CLASSIFICATION_FIELD" ]; do
+    CLASSIFICATION_ROW+=("$CLASSIFICATION_FIELD")
+  done < "$CLASSIFICATION_FIELDS_FILE"
+  rm -f "$CLASSIFICATION_FIELDS_FILE"
   if test "${#CLASSIFICATION_ROW[@]}" -ne 4; then
     block_retirement "$id" "$BLOCKER" "unparsed" "unexpected column count" "$SOURCE" "unparsed" \
       "classification row could not be parsed safely before any live-state checks"
@@ -4432,12 +4439,19 @@ do
           continue
           ;;
       esac
-      if ! RECOVERY_ACTION_FIELDS="$(parse_recovery_action "$RECOVERY_ACTION")"; then
+      RECOVERY_ACTION_FIELDS_FILE="$RECOVERY/.recovery-action-fields.$$"
+      if ! parse_recovery_action "$RECOVERY_ACTION" >"$RECOVERY_ACTION_FIELDS_FILE"; then
+        rm -f "$RECOVERY_ACTION_FIELDS_FILE"
         block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
           "viable rows must encode a deterministic recovery action payload"
         continue
       fi
-      mapfile -t ACTION_ROW <<<"$RECOVERY_ACTION_FIELDS"
+      ACTION_ROW=()
+      ACTION_FIELD=
+      while IFS= read -r ACTION_FIELD || [ -n "$ACTION_FIELD" ]; do
+        ACTION_ROW+=("$ACTION_FIELD")
+      done < "$RECOVERY_ACTION_FIELDS_FILE"
+      rm -f "$RECOVERY_ACTION_FIELDS_FILE"
       if test "${#ACTION_ROW[@]}" -ne 6; then
         block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
           "recovery action parsing returned an unexpected field count"
