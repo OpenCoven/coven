@@ -324,8 +324,8 @@ for id in docs-psyche-specs memory-promote mobile-memory-gateway pr-476-review; 
   test -s "$SNAPSHOT/head.txt"
   test -s "$SNAPSHOT/merge-base.txt"
   test -s "$SNAPSHOT/branch.bundle"
-  test -s "$SNAPSHOT/worktree.patch"
-  test -s "$SNAPSHOT/index.patch"
+  test -f "$SNAPSHOT/worktree.patch"
+  test -f "$SNAPSHOT/index.patch"
   test -f "$SNAPSHOT/untracked-files.txt"
   while IFS= read -r path; do
     test -n "$path" || continue
@@ -337,7 +337,10 @@ done
 
 Expected: every dirty snapshot includes status, branch, head, merge-base, both
 patches, an explicit untracked inventory, and a verified `branch.bundle`, so
-committed branch history is preserved before any later branch deletion.
+committed branch history is preserved before any later branch deletion. Empty
+worktree, index, and untracked artifact classes are valid and appear as
+existing zero-byte files; non-empty untracked inventories still verify every
+copied path, and an empty inventory passes.
 
 ### Task 3: Archive Every Orphan Branch
 
@@ -468,13 +471,12 @@ do
   SNAPSHOT="$RECOVERY/dirty/$id"
   git apply --stat --summary "$SNAPSHOT/worktree.patch" \
     > "$RECOVERY/$id-worktree-evidence.txt"
-  test -s "$RECOVERY/$id-worktree-evidence.txt" || \
-    printf '<no unstaged diff>\n' > "$RECOVERY/$id-worktree-evidence.txt"
+  test -f "$RECOVERY/$id-worktree-evidence.txt"
   git apply --stat --summary "$SNAPSHOT/index.patch" \
     > "$RECOVERY/$id-index-evidence.txt"
-  test -s "$RECOVERY/$id-index-evidence.txt" || \
-    printf '<no staged diff>\n' > "$RECOVERY/$id-index-evidence.txt"
+  test -f "$RECOVERY/$id-index-evidence.txt"
   cp "$SNAPSHOT/untracked-files.txt" "$RECOVERY/$id-untracked-evidence.txt"
+  test -f "$RECOVERY/$id-untracked-evidence.txt"
 done
 ```
 
@@ -482,7 +484,8 @@ Expected: the seven historical branch comparisons still provide complementary
 commit, stat, and cherry evidence, and the four dirty snapshots now each have
 reviewable worktree, index, and inventory-backed untracked evidence files, so
 branch evidence covers all seven branch-backed workstreams and dirty evidence
-complements the four dirty rows.
+complements the four dirty rows. Empty worktree, index, and untracked evidence
+classes are valid and remain as existing zero-byte files.
 
 - [ ] **Step 3: Write the ledger with one evidence-backed row per workstream**
 
@@ -803,9 +806,9 @@ for id in \
   mobile-memory-gateway \
   pr-476-review
 do
-  test -s "$RECOVERY/$id-worktree-evidence.txt"
-  test -s "$RECOVERY/$id-index-evidence.txt"
-  test -s "$RECOVERY/$id-untracked-evidence.txt"
+  test -f "$RECOVERY/$id-worktree-evidence.txt"
+  test -f "$RECOVERY/$id-index-evidence.txt"
+  test -f "$RECOVERY/$id-untracked-evidence.txt"
   git -C "$REPO" bundle verify "$RECOVERY/dirty/$id/branch.bundle" > /dev/null
   grep -E "^\| $id \| (already-shipped|superseded|viable|blocked) \|" \
     "$RECOVERY/classification.md"
@@ -832,7 +835,9 @@ done
 
 Expected: only those four exact dirty source paths are force-removed, because
 their committed history, dirty state, and recovery disposition have already
-been proven elsewhere in the archive.
+been proven elsewhere in the archive. Empty worktree, index, and untracked
+evidence classes are valid and remain as existing zero-byte files, and these
+proof checks use the same file-existence semantics as Task 2.
 
 - [ ] **Step 5: Delete only proven local branch residue after worktree retirement**
 
