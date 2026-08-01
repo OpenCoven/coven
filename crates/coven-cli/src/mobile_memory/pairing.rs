@@ -400,6 +400,7 @@ mod tests {
     use super::*;
     use chrono::Duration;
     use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use rand::random;
     use std::collections::HashSet;
 
     struct PairingHarness {
@@ -407,6 +408,7 @@ mod tests {
         manager: PairingManager,
         pairing_id: Uuid,
         now: DateTime<Utc>,
+        pairing_nonce: [u8; 32],
         request: MobilePairingRequest,
     }
 
@@ -417,8 +419,9 @@ mod tests {
             let manager = PairingManager::new(registry);
             let pairing_id = Uuid::from_u128(1);
             let now = DateTime::from_timestamp(1_785_326_400, 0).unwrap();
+            let pairing_nonce = random::<[u8; 32]>();
             manager
-                .begin_pairing_with_id(pairing_id, [7; 32], now + Duration::minutes(5))
+                .begin_pairing_with_id(pairing_id, pairing_nonce, now + Duration::minutes(5))
                 .unwrap();
             let signing_key = p256::SecretKey::from_slice(&[1; 32]).unwrap();
             let public_key = signing_key.public_key().to_encoded_point(false);
@@ -427,9 +430,10 @@ mod tests {
                 manager,
                 pairing_id,
                 now,
+                pairing_nonce,
                 request: MobilePairingRequest {
                     protocol_version: MOBILE_PROTOCOL_VERSION,
-                    pairing_nonce: URL_SAFE_NO_PAD.encode([7; 32]),
+                    pairing_nonce: URL_SAFE_NO_PAD.encode(pairing_nonce),
                     device_name: "Synthetic phone".to_owned(),
                     device_public_key: URL_SAFE_NO_PAD.encode(public_key.as_bytes()),
                     app_version: "1.0.0".to_owned(),
@@ -442,7 +446,7 @@ mod tests {
         }
 
         fn enroll(&self) -> EnrolledPairing {
-            self.enroll_with_nonce([7; 32]).unwrap()
+            self.enroll_with_nonce(self.pairing_nonce).unwrap()
         }
 
         fn enroll_with_nonce(&self, nonce: [u8; 32]) -> Result<EnrolledPairing, PairingError> {
@@ -458,7 +462,7 @@ mod tests {
         fn enroll_after_expiry(&self) -> Result<EnrolledPairing, PairingError> {
             self.manager.enroll(
                 self.pairing_id,
-                [7; 32],
+                self.pairing_nonce,
                 self.request.clone(),
                 [3; 32],
                 self.now + Duration::minutes(6),
