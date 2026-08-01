@@ -92,19 +92,27 @@ squash merges make many merged branches appear unmerged.
 ### 3. Recover viable concerns in isolation
 
 Before creating a child issue, branch, or worktree, each viable concern maps to
-its exact current source branch, reads that workstream's snapshotted source
-head, and runs an exact-head open-pull-request query. If exactly one candidate
-open pull request exists, the recovery verifies that its `state` is `OPEN`,
-its `headRefOid` matches the snapshotted source head, its `headRefName`
-matches the expected branch, its `headRepositoryOwner` is `OpenCoven`,
-`isCrossRepository` is false, and `baseRefName` is `main` before adopting it.
-If no exact-head pull request exists, the concern follows the normal
-issue-reuse-or-create flow. If more than one exact-head pull request exists, or
-if the candidate pull request fails any identity check, including closing or
-merging between list and view, the row moves to `blocked` with saved evidence
-rather than guessing or falling through to duplicate-recovery work.
+its exact current source branch, reads that workstream's preserved local
+`head.txt`, fetches that exact branch from `origin`, records the freshly
+fetched authoritative remote tip, and runs an exact-source-branch
+open-pull-request query. If exactly one candidate open pull request exists, the
+recovery verifies that its `state` is `OPEN`, its `headRefName` matches the
+expected branch, its `headRepositoryOwner` is `OpenCoven`,
+`isCrossRepository` is false, its `baseRefName` is `main`, and its
+`headRefOid` exactly equals the freshly fetched authoritative source-branch
+tip. It then verifies via ancestry that the preserved local `head.txt` equals
+or is an ancestor of that PR head, so a clean local worktree that is behind its
+open PR by commits can still be adopted safely. If no exact-source-branch pull
+request exists, the concern follows the normal issue-reuse-or-create flow. If
+more than one exact-source-branch pull request exists, if the PR head differs
+from the fetched branch tip, if the preserved local head is not an ancestor of
+the PR head, or if the candidate pull request fails any other identity check
+including closing or merging between list and view, the row moves to `blocked`
+with saved evidence rather than guessing or falling through to
+duplicate-recovery work.
 
-Each viable concern without an adopted exact-head open pull request receives:
+Each viable concern without an adopted exact-source-branch open pull request
+receives:
 
 1. A dedicated GitHub issue, unless Task 4's paginated issue ledger contains
    exactly one non-PR open issue whose title exactly equals that concern's
@@ -127,10 +135,11 @@ unrelated or closed result remains preserved in `issues.json` but does not get
 reused.
 
 For example, if the source branch `docs/psyche-specs` still has exactly one
-open pull request from that exact source when the query runs and its identity
-checks pass, the recovery adopts whichever PR GitHub returns at execution time
-instead of creating a duplicate issue, branch, worktree, claim, or pull
-request.
+open pull request from that exact source when the query runs, its
+`headRefOid` matches the freshly fetched `origin/docs/psyche-specs` tip, and
+the preserved local `head.txt` is equal to or an ancestor of that PR head, the
+recovery adopts whichever PR GitHub returns at execution time instead of
+creating a duplicate issue, branch, worktree, claim, or pull request.
 
 Old commits are not blindly rebased or cherry-picked when current contracts
 have changed. The recovered implementation is rebuilt around current code and
@@ -213,9 +222,12 @@ after staging the intended change so it evaluates the actual proposed commit.
 - Rebase or transplant conflicts are resolved from current contracts; old code
   never wins automatically.
 - A failing required gate blocks push and pull-request creation.
-- More than one exact-head open pull request, any candidate PR state or
-  identity mismatch, or more than one exact-title open matching recovery issue
-  blocks the row with evidence rather than choosing a duplicate target.
+- More than one exact-source-branch open pull request, any candidate PR state,
+  branch, owner, base, or cross-repo mismatch, any PR head that differs from
+  the freshly fetched authoritative branch tip, any preserved local head that
+  is not an ancestor of the PR head, or more than one exact-title open
+  matching recovery issue blocks the row with evidence rather than choosing a
+  duplicate target.
 - Any unsafe primary-checkout restore condition blocks the final audit rather
   than forcing a branch switch or reset.
 - Ambiguous ownership, policy, or human approval moves the workstream to
@@ -229,9 +241,10 @@ after staging the intended change so it evaluates the actual proposed commit.
 
 - Every dirty, formerly dirty, or orphaned workstream has a durable snapshot
   and classification.
-- Every viable concern either adopts one accurate exact-head open pull request
-  targeting `main` or has its own validated, pushed branch and open pull
-  request.
+- Every viable concern either adopts one accurate exact-source-branch open pull
+  request whose head matches the freshly fetched authoritative branch tip and
+  still descends from the preserved local snapshot, or has its own validated,
+  pushed branch and open pull request.
 - Already-shipped and superseded work has concrete GitHub or main-branch
   evidence.
 - No uncommitted work is deleted.
