@@ -86,10 +86,13 @@ The PTY runner will resolve startup geometry in this order:
 1. When the attached path has a real terminal, read
    `crossterm::terminal::window_size()`. Accept the result only when both rows and
    columns are nonzero. Preserve its cell dimensions and pixel width and height.
-2. If terminal inspection is unavailable or invalid, read positive `LINES` and
+2. If pixel-aware window inspection is unavailable or invalid, read
+   `crossterm::terminal::size()`. Accept positive cell dimensions and set pixel
+   width and height to zero.
+3. If terminal inspection is unavailable or invalid, read positive `LINES` and
    `COLUMNS` values from the environment. A missing or invalid dimension uses its
    conventional default rather than invalidating the other dimension.
-3. Use 24 rows by 80 columns with zero pixel dimensions as the final fallback.
+4. Use 24 rows by 80 columns with zero pixel dimensions as the final fallback.
 
 The resolver will be a small pure helper around explicit terminal and environment
 inputs so precedence and invalid-value behavior can be tested without depending on

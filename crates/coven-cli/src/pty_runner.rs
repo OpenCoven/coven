@@ -2283,6 +2283,9 @@ impl PtyResizeWatcher {
                     break;
                 }
             }
+            // Retain the PTY master in the completed join result until `stop`
+            // joins and drops it after child teardown. Dropping it in this worker
+            // can close an otherwise-active Windows ConPTY on resize failure.
             target
         });
         Self {
