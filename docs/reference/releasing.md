@@ -14,7 +14,18 @@ Source package versions stay `0.0.0` in the repo. The published version comes fr
 
 ## One-time setup (per package, per fresh npm publisher)
 
-Before the first OIDC release, configure trusted publishing for every package on npmjs.com. This is a manual web-only step — there is no npm CLI for it today.
+Before the first OIDC release, configure trusted publishing for every package. With npm 11.16 or newer, an authenticated publisher can configure it from the CLI:
+
+```sh
+npm trust github @opencoven/cli --repository OpenCoven/coven --file release-npm.yml --allow-publish --yes
+npm trust github @opencoven/cli-macos --repository OpenCoven/coven --file release-npm.yml --allow-publish --yes
+npm trust github @opencoven/cli-linux-x64 --repository OpenCoven/coven --file release-npm.yml --allow-publish --yes
+npm trust github @opencoven/cli-windows --repository OpenCoven/coven --file release-npm.yml --allow-publish --yes
+```
+
+Leave the environment unset. Verify the result with `npm trust list <package>`.
+
+The npm website exposes the same configuration:
 
 For each of `@opencoven/cli`, `@opencoven/cli-macos`, `@opencoven/cli-linux-x64`, `@opencoven/cli-windows`:
 
@@ -93,7 +104,28 @@ Create or update the matching GitHub Release from the successful workflow artifa
 
 The release body should include the npm install command, published package list, action run URL, tagged commit, and compare link. This GitHub Release is the public binary/checksum surface; npm provenance remains the package-integrity surface.
 
-If any package did not publish, do not re-tag with the same version (npm forbids overwrite). Inspect the failed job, fix the underlying cause, then push a new patch-bumped signed tag.
+If publishing stopped after Linux and Windows succeeded but before macOS and the wrapper published, use the narrowly-scoped recovery procedure below. For every other partial state, inspect the failure, fix the cause, and push a new patch-bumped signed tag.
+
+### Recover a partial npm publication
+
+The recovery path exists for one exact registry state:
+
+- `@opencoven/cli-linux-x64@X.Y.Z` and `@opencoven/cli-windows@X.Y.Z` already exist.
+- `@opencoven/cli-macos@X.Y.Z` and `@opencoven/cli@X.Y.Z` do not exist.
+
+Fix the trusted-publisher configuration and land the release-only workflow repair on `main`. Then create a **new signed recovery tag** whose commit descends from the original release. The workflow requires that the original release tag is an ancestor and that every intervening changed path is on its release-only allowlist.
+
+```sh
+git fetch origin main --tags
+git checkout main
+git pull --ff-only origin main
+git tag -s vX.Y.Z-recovery.N -m "Recover partial vX.Y.Z npm publication"
+git push origin vX.Y.Z-recovery.N
+```
+
+Never move or reuse the original release tag or a recovery tag. Increment `N` if a later, separately-reviewed recovery attempt is required.
+
+Before publishing, the recovery workflow verifies both signed tags, ancestry, the changed-path allowlist, and the exact npm registry state above. It then skips the already-published Linux and Windows packages and publishes macOS followed by the wrapper through OIDC with provenance.
 
 ## Recovering from a refused release
 

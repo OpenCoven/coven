@@ -801,6 +801,21 @@ test('release workflow concurrency keeps overlapping releases from interleaving'
   assert.match(workflow, /cancel-in-progress:\s*false/);
 });
 
+test('releasing guide documents signed partial-publish recovery', () => {
+  const guide = readFileSync(
+    new URL(['..', 'docs', 'reference', 'releasing.md'].join('/'), import.meta.url),
+    'utf8'
+  );
+
+  assert.match(guide, /vX\.Y\.Z-recovery\.N/);
+  assert.match(guide, /new signed recovery tag/i);
+  assert.match(guide, /original release tag is an ancestor/i);
+  assert.match(guide, /never move or reuse/i);
+  assert.match(guide, /@opencoven\/cli-linux-x64[\s\S]*@opencoven\/cli-windows/);
+  assert.match(guide, /@opencoven\/cli-macos[\s\S]*@opencoven\/cli/);
+  assert.match(guide, /npm trust github/);
+});
+
 test('secret guard unit tests run in local and tag-driven release gates', () => {
   const prepublish = readFileSync(
     new URL('test-cli-prepublish.mjs', import.meta.url),
