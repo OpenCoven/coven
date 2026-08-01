@@ -2658,7 +2658,7 @@ case "$WORKSTREAM_ID" in
     ISSUE_TITLE="Recover mobile pairing workstream"
     ;;
   feat-npm-macos-x64)
-    ISSUE_TITLE="Recover Intel macOS npm packaging workstream"
+    ISSUE_TITLE="Recover or block Intel macOS npm packaging workstream"
     ;;
   fix-521-ward-surface-confinement)
     ISSUE_TITLE="Recover Ward surface confinement workstream"
@@ -2929,9 +2929,15 @@ section must use these repository-native commands:
   it with the matching release build plus the repository cargo gates. The
   supported matrix is `macos`/`aarch64-apple-darwin`,
   `linux-x64`/`x86_64-unknown-linux-gnu`, and
-  `windows`/`x86_64-pc-windows-msvc`. For the Intel macOS recovery row, keep
-  using `--target=macos` unless the child design intentionally introduces a new
-  target contract.
+  `windows`/`x86_64-pc-windows-msvc`. Current main cannot validate Intel x64,
+  and `--target=macos` must never be used as a proxy for Intel recovery. If the
+  child design/plan has not first restored the concrete
+  `macos-x64`/`@opencoven/cli-macos-x64` contract in current code with tests
+  proving default darwin x64 mapping and package metadata, classify the
+  Intel workstream as blocked. Once that contract exists, the exact Intel
+  validation command is
+  `node scripts/test-cli-prepublish.mjs --target=macos-x64 --with-cargo-gates`,
+  plus any targeted Node tests documented by the child plan.
 - `packages/openclaw-coven`: `npm install` and `npm exec vitest run` in
   `packages/openclaw-coven`; do not claim nonexistent package-local build or
   test scripts there.

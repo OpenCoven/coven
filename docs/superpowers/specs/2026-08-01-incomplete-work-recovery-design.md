@@ -245,7 +245,7 @@ Recovery proceeds sequentially to avoid overlapping claims and file changes:
 1. Snapshot every dirty and orphaned workstream.
 2. Perform the supersession and merged-history pass.
 3. Recover the mobile pairing patch.
-4. Recover Intel macOS npm packaging.
+4. Recover or block Intel macOS npm packaging.
 5. Reconcile Ward surface confinement.
 6. Recover memory promotion and privacy tooling.
 7. Recover Psyche specifications.
@@ -280,9 +280,14 @@ Use repository-native npm and Node validation based on the touched paths:
   affected target and pair it with the matching release build plus the cargo
   gates above. The current supported matrix is
   `macos`/`aarch64-apple-darwin`, `linux-x64`/`x86_64-unknown-linux-gnu`, and
-  `windows`/`x86_64-pc-windows-msvc`. For the Intel macOS recovery row, keep
-  using `--target=macos` unless the child design intentionally introduces a new
-  target contract.
+  `windows`/`x86_64-pc-windows-msvc`. Current main cannot validate Intel x64,
+  and `--target=macos` must never be used as a proxy for Intel recovery. A
+  viable child design/plan must first restore the concrete
+  `macos-x64`/`@opencoven/cli-macos-x64` contract in current code, with tests
+  proving default darwin x64 mapping and package metadata. After that contract
+  exists, the exact Intel validation command is
+  `node scripts/test-cli-prepublish.mjs --target=macos-x64 --with-cargo-gates`,
+  plus any targeted Node tests documented by the child plan.
 - If `packages/openclaw-coven` is touched, run `npm install` and
   `npm exec vitest run` with `working-directory=packages/openclaw-coven`.
   Do not claim nonexistent package-local build or test scripts there.
