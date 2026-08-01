@@ -1,0 +1,880 @@
+# Incomplete Work Recovery Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Preserve and classify every discovered local workstream, recover each viable concern through its own issue and implementation plan, and safely remove only proven stale residue.
+
+**Architecture:** Use the repository's shared Git common directory as a non-worktree recovery archive. Run a preservation and classification phase before any cleanup, then hand each viable subsystem to an isolated issue/spec/plan/PR flow based on current `origin/main`.
+
+**Tech Stack:** Git worktrees and bundles, GitHub CLI, Coven claims, Markdown recovery ledger, Rust/Cargo, npm, repository secret and privacy guards.
+
+---
+
+## File and Artifact Map
+
+- Create: `.git/agent-recovery/issue-541/manifest.tsv`
+  - Immutable inventory of source worktrees, branches, heads, bases, and snapshot paths.
+- Create: `.git/agent-recovery/issue-541/classification.md`
+  - Evidence ledger assigning each workstream `already-shipped`, `superseded`,
+    `viable`, or `blocked`.
+- Create: `.git/agent-recovery/issue-541/dirty/docs-psyche-specs/`
+- Create: `.git/agent-recovery/issue-541/dirty/memory-promote/`
+- Create: `.git/agent-recovery/issue-541/dirty/mobile-memory-gateway/`
+- Create: `.git/agent-recovery/issue-541/dirty/pr-476-review/`
+  - Status, commit identifiers, binary patches, and copied untracked files for
+    each dirty worktree.
+- Create: `.git/agent-recovery/issue-541/branches/docs-universal-runtime-capability-design.bundle`
+- Create: `.git/agent-recovery/issue-541/branches/feat-npm-macos-x64.bundle`
+- Create: `.git/agent-recovery/issue-541/branches/fix-521-ward-surface-confinement.bundle`
+  - Ref-preserving archive for each orphan branch.
+- Modify: `.copilot/goals.md`
+  - Reconcile active goals after all classification and delivery outcomes are
+    known. This file is intentionally git-excluded.
+- Create only when the matching workstream is viable:
+  - `docs/superpowers/specs/2026-08-01-mobile-pairing-recovery-design.md`
+  - `docs/superpowers/plans/2026-08-01-mobile-pairing-recovery.md`
+  - `docs/superpowers/specs/2026-08-01-npm-macos-x64-recovery-design.md`
+  - `docs/superpowers/plans/2026-08-01-npm-macos-x64-recovery.md`
+  - `docs/superpowers/specs/2026-08-01-ward-surface-confinement-recovery-design.md`
+  - `docs/superpowers/plans/2026-08-01-ward-surface-confinement-recovery.md`
+  - `docs/superpowers/specs/2026-08-01-memory-promotion-recovery-design.md`
+  - `docs/superpowers/plans/2026-08-01-memory-promotion-recovery.md`
+  - `docs/superpowers/specs/2026-08-01-psyche-spec-recovery-design.md`
+  - `docs/superpowers/plans/2026-08-01-psyche-spec-recovery.md`
+  - `docs/superpowers/specs/2026-08-01-universal-runtime-capability-recovery-design.md`
+  - `docs/superpowers/plans/2026-08-01-universal-runtime-capability-recovery.md`
+  - `docs/superpowers/specs/2026-08-01-runtime-parity-plan-recovery-design.md`
+  - `docs/superpowers/plans/2026-08-01-runtime-parity-plan-recovery.md`
+  - One issue-keyed branch, claim, commit series, and pull request.
+
+No production file is modified during preservation or classification.
+
+### Task 1: Publish the Approved Recovery Design and Plan
+
+**Files:**
+- Existing: `docs/superpowers/specs/2026-08-01-incomplete-work-recovery-design.md`
+- Create: `docs/superpowers/plans/2026-08-01-incomplete-work-recovery.md`
+
+- [ ] **Step 1: Confirm the design worktree is clean except for the plan**
+
+Run:
+
+```bash
+git -C /tmp/coven-issue-541 status --short --branch
+```
+
+Expected: branch `docs/541-incomplete-work-recovery-design`, with only the plan
+file untracked before it is staged.
+
+- [ ] **Step 2: Run document safety checks**
+
+Run:
+
+```bash
+cd /tmp/coven-issue-541
+git diff --check
+python scripts/check-secrets.py
+git add docs/superpowers/plans/2026-08-01-incomplete-work-recovery.md
+python3 scripts/check-coven-privacy.py --staged
+```
+
+Expected: every command exits zero and the privacy guard reports one staged
+plan file.
+
+- [ ] **Step 3: Commit the implementation plan**
+
+Run:
+
+```bash
+cd /tmp/coven-issue-541
+git commit -m "docs: plan incomplete work recovery"
+```
+
+Expected: a commit containing only the implementation plan and the
+session-required Copilot co-author trailer.
+
+- [ ] **Step 4: Push the design branch**
+
+Run:
+
+```bash
+git -C /tmp/coven-issue-541 push -u origin docs/541-incomplete-work-recovery-design
+```
+
+Expected: the remote branch is created successfully.
+
+- [ ] **Step 5: Open the design pull request**
+
+Run:
+
+```bash
+cd /tmp/coven-issue-541
+gh pr create \
+  --title "docs: design incomplete work recovery" \
+  --body $'Closes #541\n\nDefines a preservation-first process for recovering dirty worktrees and orphan branches without losing data or duplicating shipped work.\n\nThe implementation is deliberately split into one issue/spec/plan/PR per viable subsystem after snapshot and classification.'
+```
+
+Expected: GitHub returns the URL of one open pull request linked to issue #541.
+
+### Task 2: Snapshot Every Dirty Worktree
+
+**Artifacts:**
+- Create: `.git/agent-recovery/issue-541/dirty/docs-psyche-specs/`
+- Create: `.git/agent-recovery/issue-541/dirty/memory-promote/`
+- Create: `.git/agent-recovery/issue-541/dirty/mobile-memory-gateway/`
+- Create: `.git/agent-recovery/issue-541/dirty/pr-476-review/`
+- Create: `.git/agent-recovery/issue-541/manifest.tsv`
+
+- [ ] **Step 1: Create the recovery archive root**
+
+Run:
+
+```bash
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
+RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
+mkdir -p "$RECOVERY/dirty" "$RECOVERY/branches"
+printf 'id\ttype\tsource\thead\tmerge_base\tsnapshot\n' > "$RECOVERY/manifest.tsv"
+```
+
+Expected: the recovery root exists under
+`$COMMON_DIR/agent-recovery/issue-541`.
+
+- [ ] **Step 2: Snapshot `docs-psyche-specs`**
+
+Run:
+
+```bash
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
+SOURCE="$REPO/.worktrees/docs-psyche-specs"
+DEST="$COMMON_DIR/agent-recovery/issue-541/dirty/docs-psyche-specs"
+mkdir -p "$DEST/untracked"
+git -C "$SOURCE" status --short --branch > "$DEST/status.txt"
+git -C "$SOURCE" rev-parse HEAD > "$DEST/head.txt"
+git -C "$SOURCE" merge-base HEAD origin/main > "$DEST/merge-base.txt"
+git -C "$SOURCE" diff --binary > "$DEST/worktree.patch"
+git -C "$SOURCE" diff --cached --binary > "$DEST/index.patch"
+git -C "$SOURCE" ls-files --others --exclude-standard -z |
+  while IFS= read -r -d '' path; do
+    mkdir -p "$DEST/untracked/$(dirname "$path")"
+    cp -p "$SOURCE/$path" "$DEST/untracked/$path"
+  done
+printf 'docs-psyche-specs\tdirty-worktree\t%s\t%s\t%s\t%s\n' \
+  "$SOURCE" \
+  "$(cat "$DEST/head.txt")" \
+  "$(cat "$DEST/merge-base.txt")" \
+  "$DEST" >> "$COMMON_DIR/agent-recovery/issue-541/manifest.tsv"
+```
+
+Expected: both patch files exist and the copied untracked tree contains
+`specs/psyche/COVEN_PREREQUISITES.md`, `specs/psyche/PLAN.md`, and the Psyche
+reconciliation plan.
+
+- [ ] **Step 3: Snapshot `feat-cmem-1ev-memory-promote`**
+
+Run:
+
+```bash
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
+SOURCE="$REPO/.worktrees/feat-cmem-1ev-memory-promote"
+DEST="$COMMON_DIR/agent-recovery/issue-541/dirty/memory-promote"
+mkdir -p "$DEST/untracked"
+git -C "$SOURCE" status --short --branch > "$DEST/status.txt"
+git -C "$SOURCE" rev-parse HEAD > "$DEST/head.txt"
+git -C "$SOURCE" merge-base HEAD origin/main > "$DEST/merge-base.txt"
+git -C "$SOURCE" diff --binary > "$DEST/worktree.patch"
+git -C "$SOURCE" diff --cached --binary > "$DEST/index.patch"
+git -C "$SOURCE" ls-files --others --exclude-standard -z |
+  while IFS= read -r -d '' path; do
+    mkdir -p "$DEST/untracked/$(dirname "$path")"
+    cp -p "$SOURCE/$path" "$DEST/untracked/$path"
+  done
+```
+
+```bash
+printf 'memory-promote\tdirty-worktree\t%s\t%s\t%s\t%s\n' \
+  "$SOURCE" \
+  "$(cat "$DEST/head.txt")" \
+  "$(cat "$DEST/merge-base.txt")" \
+  "$DEST" >> "$COMMON_DIR/agent-recovery/issue-541/manifest.tsv"
+```
+
+Expected: the untracked tree includes `crates/coven-memory/src/promotion.rs`,
+`scripts/check-coven-privacy.py`, and `scripts/check-coven-privacy-test.py`.
+
+- [ ] **Step 4: Snapshot `feat/mobile-memory-gateway`**
+
+Run:
+
+```bash
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
+SOURCE="$REPO/.worktrees/mobile-memory-gateway"
+DEST="$COMMON_DIR/agent-recovery/issue-541/dirty/mobile-memory-gateway"
+mkdir -p "$DEST/untracked"
+git -C "$SOURCE" status --short --branch > "$DEST/status.txt"
+git -C "$SOURCE" rev-parse HEAD > "$DEST/head.txt"
+git -C "$SOURCE" merge-base HEAD origin/main > "$DEST/merge-base.txt"
+git -C "$SOURCE" diff --binary > "$DEST/worktree.patch"
+git -C "$SOURCE" diff --cached --binary > "$DEST/index.patch"
+git -C "$SOURCE" ls-files --others --exclude-standard -z |
+  while IFS= read -r -d '' path; do
+    mkdir -p "$DEST/untracked/$(dirname "$path")"
+    cp -p "$SOURCE/$path" "$DEST/untracked/$path"
+  done
+```
+
+```bash
+printf 'mobile-memory-gateway\tdirty-worktree\t%s\t%s\t%s\t%s\n' \
+  "$SOURCE" \
+  "$(cat "$DEST/head.txt")" \
+  "$(cat "$DEST/merge-base.txt")" \
+  "$DEST" >> "$COMMON_DIR/agent-recovery/issue-541/manifest.tsv"
+```
+
+Expected: `worktree.patch` contains the changes to
+`crates/coven-cli/src/mobile_memory/pairing.rs`.
+
+- [ ] **Step 5: Snapshot `fix/476-review-threads`**
+
+Run:
+
+```bash
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
+SOURCE="$REPO/.worktrees/pr-476-review"
+DEST="$COMMON_DIR/agent-recovery/issue-541/dirty/pr-476-review"
+mkdir -p "$DEST/untracked"
+git -C "$SOURCE" status --short --branch > "$DEST/status.txt"
+git -C "$SOURCE" rev-parse HEAD > "$DEST/head.txt"
+git -C "$SOURCE" merge-base HEAD origin/main > "$DEST/merge-base.txt"
+git -C "$SOURCE" diff --binary > "$DEST/worktree.patch"
+git -C "$SOURCE" diff --cached --binary > "$DEST/index.patch"
+git -C "$SOURCE" ls-files --others --exclude-standard -z |
+  while IFS= read -r -d '' path; do
+    mkdir -p "$DEST/untracked/$(dirname "$path")"
+    cp -p "$SOURCE/$path" "$DEST/untracked/$path"
+  done
+```
+
+```bash
+printf 'pr-476-review\tdirty-worktree\t%s\t%s\t%s\t%s\n' \
+  "$SOURCE" \
+  "$(cat "$DEST/head.txt")" \
+  "$(cat "$DEST/merge-base.txt")" \
+  "$DEST" >> "$COMMON_DIR/agent-recovery/issue-541/manifest.tsv"
+```
+
+Expected: the untracked tree contains all three runtime parity plan files.
+
+- [ ] **Step 6: Verify snapshot completeness**
+
+Run:
+
+```bash
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
+test "$(wc -l < "$RECOVERY/manifest.tsv" | tr -d ' ')" = 5
+for id in docs-psyche-specs memory-promote mobile-memory-gateway pr-476-review; do
+  test -s "$RECOVERY/dirty/$id/status.txt"
+  test -s "$RECOVERY/dirty/$id/head.txt"
+  test -s "$RECOVERY/dirty/$id/merge-base.txt"
+  test -f "$RECOVERY/dirty/$id/worktree.patch"
+  test -f "$RECOVERY/dirty/$id/index.patch"
+done
+```
+
+Expected: every assertion exits zero.
+
+### Task 3: Archive Every Orphan Branch
+
+**Artifacts:**
+- Create: `.git/agent-recovery/issue-541/branches/docs-universal-runtime-capability-design.bundle`
+- Create: `.git/agent-recovery/issue-541/branches/feat-npm-macos-x64.bundle`
+- Create: `.git/agent-recovery/issue-541/branches/fix-521-ward-surface-confinement.bundle`
+
+- [ ] **Step 1: Create ref-preserving bundles**
+
+Run:
+
+```bash
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
+RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
+git -C "$REPO" bundle create \
+  "$RECOVERY/branches/docs-universal-runtime-capability-design.bundle" \
+  docs/universal-runtime-capability-design
+git -C "$REPO" bundle create \
+  "$RECOVERY/branches/feat-npm-macos-x64.bundle" \
+  feat/npm-macos-x64
+git -C "$REPO" bundle create \
+  "$RECOVERY/branches/fix-521-ward-surface-confinement.bundle" \
+  fix/521-ward-surface-confinement
+```
+
+Expected: three bundle files are created.
+
+- [ ] **Step 2: Verify each bundle**
+
+Run:
+
+```bash
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
+git bundle verify "$RECOVERY/branches/docs-universal-runtime-capability-design.bundle"
+git bundle verify "$RECOVERY/branches/feat-npm-macos-x64.bundle"
+git bundle verify "$RECOVERY/branches/fix-521-ward-surface-confinement.bundle"
+```
+
+Expected: Git reports each bundle is okay and lists its branch ref.
+
+- [ ] **Step 3: Record the archived branches**
+
+Run:
+
+```bash
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
+RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
+for entry in \
+  'docs-universal-runtime-capability-design|docs/universal-runtime-capability-design' \
+  'feat-npm-macos-x64|feat/npm-macos-x64' \
+  'fix-521-ward-surface-confinement|fix/521-ward-surface-confinement'
+do
+  id=${entry%%|*}
+  branch=${entry#*|}
+  printf '%s\torphan-branch\t%s\t%s\t%s\t%s\n' \
+    "$id" \
+    "$branch" \
+    "$(git -C "$REPO" rev-parse "$branch")" \
+    "$(git -C "$REPO" merge-base "$branch" origin/main)" \
+    "$RECOVERY/branches/$id.bundle" >> "$RECOVERY/manifest.tsv"
+done
+```
+
+Expected: `manifest.tsv` has seven data rows plus its header.
+
+### Task 4: Build the Classification Ledger
+
+**Artifacts:**
+- Create: `.git/agent-recovery/issue-541/classification.md`
+
+- [ ] **Step 1: Capture branch and GitHub evidence**
+
+Run:
+
+```bash
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
+RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
+git -C "$REPO" fetch origin main
+git -C "$REPO" --no-pager branch -vv > "$RECOVERY/branches.txt"
+git -C "$REPO" worktree list --porcelain > "$RECOVERY/worktrees.txt"
+coven claim status > "$RECOVERY/claims.txt"
+gh pr list --repo OpenCoven/coven --state all --limit 200 \
+  --json number,state,title,headRefName,baseRefName,mergedAt,url \
+  > "$RECOVERY/pulls.json"
+gh issue list --repo OpenCoven/coven --state all --limit 200 \
+  --json number,state,title,closedAt,url \
+  > "$RECOVERY/issues.json"
+```
+
+Expected: all five evidence files exist and are non-empty.
+
+- [ ] **Step 2: Compare each source with current main**
+
+Run:
+
+```bash
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
+RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
+for branch in \
+  docs/psyche-specs \
+  docs/universal-runtime-capability-design \
+  feat/npm-macos-x64 \
+  fix/476-review-threads \
+  fix/521-ward-surface-confinement
+do
+  id=$(printf '%s' "$branch" | tr '/' '-')
+  git -C "$REPO" --no-pager log --oneline --reverse \
+    "origin/main..$branch" > "$RECOVERY/$id-commits.txt"
+  git -C "$REPO" --no-pager diff --stat \
+    "origin/main...$branch" > "$RECOVERY/$id-stat.txt"
+  git -C "$REPO" cherry -v origin/main "$branch" \
+    > "$RECOVERY/$id-cherry.txt"
+done
+```
+
+Expected: each branch has commit, stat, and patch-equivalence evidence.
+
+- [ ] **Step 3: Write the ledger with one evidence-backed row per workstream**
+
+Create `.git/agent-recovery/issue-541/classification.md` with a five-column
+table headed `Workstream`, `Classification`, `Main/PR evidence`,
+`Preserved source`, and `Recovery action`. Include exactly these seven rows:
+
+```markdown
+# Issue 541 Recovery Classification
+
+docs-psyche-specs
+memory-promote
+mobile-memory-gateway
+pr-476-review
+docs-universal-runtime-capability-design
+feat-npm-macos-x64
+fix-521-ward-surface-confinement
+```
+
+Write the selected classification, concrete commit/PR/issue/path evidence,
+preserved source path, and deterministic recovery action directly into each
+row. A row is not complete until another engineer can reproduce its
+classification from the cited source.
+
+- [ ] **Step 4: Apply the classification rules**
+
+Use these deterministic rules:
+
+```text
+already-shipped:
+  Current main contains equivalent behavior or documentation, with a merged PR
+  or direct file/commit evidence.
+
+superseded:
+  A later merged change intentionally replaces the same contract, and applying
+  the old work would regress or duplicate it.
+
+viable:
+  The work's user-visible or authority-preserving intent is absent from current
+  main, remains consistent with current policy, and has a testable acceptance
+  boundary.
+
+blocked:
+  The work requires a maintainer decision, external authority, missing source,
+  or an unresolved contract choice that cannot be inferred safely.
+```
+
+Expected: every row has exactly one classification and one next action.
+
+- [ ] **Step 5: Review the ledger against the manifest**
+
+Run:
+
+```bash
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
+for id in \
+  docs-psyche-specs \
+  memory-promote \
+  mobile-memory-gateway \
+  pr-476-review \
+  docs-universal-runtime-capability-design \
+  feat-npm-macos-x64 \
+  fix-521-ward-surface-confinement
+do
+  grep -F "| $id |" "$RECOVERY/classification.md"
+  grep -F "$id" "$RECOVERY/manifest.tsv"
+done
+```
+
+Expected: every workstream appears in both files.
+
+### Task 5: Create One Recovery Track per Viable Workstream
+
+**Files:**
+- Create only for rows classified `viable`:
+  - The exact design and plan paths listed in the File and Artifact Map.
+
+- [ ] **Step 1: Create or identify one issue per viable row**
+
+Use the matching exact query for each viable row:
+
+```bash
+gh issue list --repo OpenCoven/coven --state all --search '"mobile pairing"' --limit 20
+gh issue list --repo OpenCoven/coven --state all --search '"Intel macOS" npm' --limit 20
+gh issue list --repo OpenCoven/coven --state all --search '"Ward surface confinement"' --limit 20
+gh issue list --repo OpenCoven/coven --state all --search '"memory promotion"' --limit 20
+gh issue list --repo OpenCoven/coven --state all --search '"Psyche" specs' --limit 20
+gh issue list --repo OpenCoven/coven --state all --search '"universal runtime" capability' --limit 20
+gh issue list --repo OpenCoven/coven --state all --search '"runtime model parity"' --limit 20
+```
+
+If no issue accurately owns the concern, create one whose body includes:
+
+```markdown
+## Recovered source
+
+Issue #541 recovery archive and classification ledger.
+
+## Acceptance criteria
+
+- Preserve the still-valid intent identified in the classification evidence.
+- Rebuild against current `origin/main`; do not blindly replay obsolete code.
+- Add or retain regression coverage for the recovered behavior.
+- Pass all repository-required gates.
+```
+
+Expected: every viable row has exactly one issue number.
+
+- [ ] **Step 2: Create one approved design per viable issue**
+
+Use the brainstorming workflow separately for each issue. The design must name:
+
+- the current-main files and contracts involved;
+- the exact portion of the preserved source that remains valid;
+- intentionally omitted obsolete portions;
+- test and migration behavior;
+- one-concern pull-request boundaries.
+
+Expected: each viable concern has an approved and committed design document.
+
+- [ ] **Step 3: Create one implementation plan per approved design**
+
+Use the writing-plans workflow separately for each approved design. Each plan
+must include exact paths, failing tests, targeted commands, full repository
+gates, commit boundaries, push, and PR creation.
+
+Expected: independent plans exist for mobile pairing, Intel macOS packaging,
+Ward confinement, memory promotion, Psyche specifications, universal runtime
+design, or runtime parity only when their ledger row is `viable`.
+
+- [ ] **Step 4: Recover and publish each viable concern sequentially**
+
+For each viable row, set `ISSUE_NUMBER` to its created or reused issue number
+and set `BRANCH_SLUG` from this fixed mapping:
+
+```text
+mobile-memory-gateway -> mobile-pairing-recovery
+feat-npm-macos-x64 -> npm-macos-x64-recovery
+fix-521-ward-surface-confinement -> ward-surface-confinement-recovery
+memory-promote -> memory-promotion-recovery
+docs-psyche-specs -> psyche-spec-recovery
+docs-universal-runtime-capability-design -> universal-runtime-capability-recovery
+pr-476-review -> runtime-parity-plan-recovery
+```
+
+Then run:
+
+```bash
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
+git -C "$REPO" fetch origin main
+git -C "$REPO" worktree add \
+  -b "issue-$ISSUE_NUMBER-$BRANCH_SLUG" \
+  "/tmp/coven-issue-$ISSUE_NUMBER" \
+  origin/main
+cd "/tmp/coven-issue-$ISSUE_NUMBER"
+coven claim acquire "issue-$ISSUE_NUMBER"
+```
+
+Execute that issue's plan, run its full gates, commit with the required Copilot
+co-author trailer, push, and open its scoped pull request.
+
+Expected: every viable row links to one open pull request from a current-main
+branch.
+
+### Task 6: Record Non-Viable Outcomes
+
+**Artifacts:**
+- Modify: `.git/agent-recovery/issue-541/classification.md`
+
+- [ ] **Step 1: Record already-shipped evidence**
+
+For each `already-shipped` row, add:
+
+```markdown
+- Equivalent current file or behavior:
+- Merged pull request or commit:
+- Why replay would duplicate rather than extend main:
+```
+
+Fill every field with a path and commit or pull-request URL.
+
+- [ ] **Step 2: Record supersession evidence**
+
+For each `superseded` row, add:
+
+```markdown
+- Superseding contract:
+- Superseding pull request or commit:
+- Regression or duplication caused by replay:
+```
+
+Fill every field with concrete evidence.
+
+- [ ] **Step 3: Record blockers**
+
+For each `blocked` row, add:
+
+```markdown
+- Missing authority or decision:
+- Evidence that the agent cannot infer it:
+- Preserved snapshot:
+- Safe resume condition:
+```
+
+Expected: no non-viable row relies on branch age or lack of a PR as its sole
+reason.
+
+### Task 7: Clean Verified Git Residue
+
+**Files:** None. This task changes only local Git worktree and branch metadata.
+
+- [ ] **Step 1: Recheck claims and open pull requests**
+
+Run:
+
+```bash
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
+cd "$REPO"
+coven claim status
+gh pr list --state open --limit 100
+```
+
+Expected: every active recovery claim and open PR is understood before cleanup.
+
+- [ ] **Step 2: Remove prunable registrations only after snapshot verification**
+
+Run:
+
+```bash
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
+cd "$REPO"
+git worktree prune --dry-run --verbose
+```
+
+Verify every listed `/private/tmp` path either has a bundle/snapshot in the
+issue-541 archive or corresponds to a merged/detached review with no unique
+work. Then run:
+
+```bash
+git worktree prune --verbose
+```
+
+Expected: only registrations whose directories no longer exist are removed.
+
+- [ ] **Step 3: Remove clean merged worktrees**
+
+Check each known linked worktree:
+
+```bash
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
+for path in \
+  "$REPO/.worktrees/docs-cli-core-guides" \
+  "$REPO/.worktrees/memory-summary-source" \
+  "$REPO/.worktrees/memory-open" \
+  "$REPO/.worktrees/fix-coven-hq8-privacy-lockfile" \
+  "$REPO/.worktrees/memory-api-review"
+do
+  git -C "$path" status --porcelain
+done
+```
+
+Expected: empty output.
+
+Then prove each branch's PR merged or its tip is represented by current main,
+and remove the five clean worktrees:
+
+```bash
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
+for path in \
+  "$REPO/.worktrees/docs-cli-core-guides" \
+  "$REPO/.worktrees/memory-summary-source" \
+  "$REPO/.worktrees/memory-open" \
+  "$REPO/.worktrees/fix-coven-hq8-privacy-lockfile" \
+  "$REPO/.worktrees/memory-api-review"
+do
+  git -C "$REPO" worktree remove "$path"
+done
+```
+
+Do not use `--force`. Any non-empty status blocks removal.
+
+- [ ] **Step 4: Delete only proven local branch residue**
+
+For each branch in the ledger with merged or superseded evidence, set
+`BRANCH_TO_DELETE` to its exact local branch name and run:
+
+```bash
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
+git -C "$REPO" branch -d "$BRANCH_TO_DELETE"
+```
+
+If squash history makes `-d` refuse, recheck the ledger evidence and use:
+
+```bash
+git -C "$REPO" branch -D "$BRANCH_TO_DELETE"
+```
+
+only after confirming its snapshot or pushed replacement branch exists.
+
+- [ ] **Step 5: Release stopped recovery claims**
+
+After each child pull request is opened, release its claim from that worktree:
+
+```bash
+coven claim release "issue-$ISSUE_NUMBER"
+```
+
+Release the design claim when issue #541 work stops:
+
+```bash
+cd /tmp/coven-issue-541
+coven claim release issue-541
+```
+
+Expected: `coven claim status` has no abandoned active claim.
+
+### Task 8: Reconcile Repository Goals
+
+**Files:**
+- Modify: `.copilot/goals.md`
+
+- [ ] **Step 1: Re-read goals and live issue state**
+
+Run:
+
+```bash
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
+cd "$REPO"
+sed -n '1,260p' .copilot/goals.md
+for issue in 401 414 521 541; do
+  gh issue view "$issue" --json number,state,title,closedAt,url
+done
+```
+
+Expected: #401, #414, and #521 are closed; #541 reflects the recovery PR state.
+
+- [ ] **Step 2: Close stale active goal content**
+
+Move `usability-core-consolidation` to `done` because its named high-risk
+follow-up #401 is closed. Set:
+
+```markdown
+- completed: 2026-08-01
+- outcome: |
+    The five top gaps and the session-launch consolidation tracked by #401 are
+    closed. Remaining translation drift is not part of this completed
+    consolidation goal and requires a separately claimed issue if resumed.
+```
+
+Remove obsolete `next` text that presents #401 as future work.
+
+- [ ] **Step 3: Reconcile contribution stewardship**
+
+Keep `contribution-stewardship` active because it is an ongoing maintenance
+objective. Append a 2026-08-01 checkpoint that records:
+
+- #414 and #521 are closed;
+- there were no open PRs at recovery start;
+- issue #541 owns local recovery;
+- viable workstream PR URLs from the classification ledger;
+- already-shipped, superseded, and blocked outcomes.
+
+Set its single `next` action to review the open recovery PRs and perform the
+next external-PR sweep. Remove the duplicated stale `next` line.
+
+- [ ] **Step 4: Verify goals structure**
+
+Run:
+
+```bash
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
+cd "$REPO"
+grep -n '^## active\|^## paused\|^## done\|^### goal:\|^- next:' \
+  .copilot/goals.md
+```
+
+Expected: each active goal has one `next` field, completed goals are under
+`## done`, and no active `next` references closed issues as future work.
+
+### Task 9: Final Recovery Audit
+
+**Artifacts:**
+- Modify: `.git/agent-recovery/issue-541/classification.md`
+
+- [ ] **Step 1: Verify every manifest row has a terminal recovery state**
+
+Run:
+
+```bash
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
+for id in \
+  docs-psyche-specs \
+  memory-promote \
+  mobile-memory-gateway \
+  pr-476-review \
+  docs-universal-runtime-capability-design \
+  feat-npm-macos-x64 \
+  fix-521-ward-surface-confinement
+do
+  grep -E "^\| $id \| (already-shipped|superseded|viable|blocked) \|" \
+    "$RECOVERY/classification.md"
+done
+```
+
+Expected: all seven workstreams match exactly one terminal classification.
+
+- [ ] **Step 2: Verify all viable rows have open pull requests**
+
+For every `viable` row, set `PR_URL` to the recorded pull-request URL and run:
+
+```bash
+gh pr view "$PR_URL" --json state,isDraft,mergeStateStatus,url
+```
+
+Expected: state is `OPEN`; draft status may reflect repository readiness, and
+the URL matches the ledger.
+
+- [ ] **Step 3: Verify the primary checkout**
+
+Run:
+
+```bash
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
+cd "$REPO"
+git status --short --branch
+git worktree list
+coven claim status
+gh pr list --state open --limit 100
+```
+
+Expected: the primary checkout is clean on `main`; all remaining worktrees,
+claims, and open PRs correspond to documented active recovery work.
+
+- [ ] **Step 4: Update issue #541**
+
+Post a comment containing the classification table, recovery PR links,
+non-viable evidence, and remaining human blockers:
+
+```bash
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+gh issue comment 541 --body-file \
+  "$COMMON_DIR/agent-recovery/issue-541/classification.md"
+```
+
+Expected: issue #541 contains the durable GitHub-visible recovery ledger.
+
+- [ ] **Step 5: Close issue #541 when all machine work is delivered**
+
+Close only after every viable concern has an open PR and all local residue has
+been safely preserved or cleaned:
+
+```bash
+gh issue close 541 --comment \
+  "Recovery inventory is complete. Every viable concern has a scoped open PR; non-viable work has evidence and durable snapshots; local goals and Git hygiene are reconciled."
+```
+
+Expected: #541 is closed while child implementation PRs continue through normal
+review and merge.
