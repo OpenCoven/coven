@@ -13,10 +13,13 @@
 ## File and Artifact Map
 
 - Create: `.git/agent-recovery/issue-541/manifest.tsv`
-  - Immutable inventory of source worktrees, branches, heads, bases, and snapshot paths.
+  - Private immutable inventory of source worktrees, branches, heads, bases,
+    and snapshot paths. Local absolute paths stay here and in private snapshot
+    artifacts only.
 - Create: `.git/agent-recovery/issue-541/classification.md`
-  - Evidence ledger assigning each workstream `already-shipped`, `superseded`,
-    `viable`, or `blocked`.
+  - Sanitized evidence ledger assigning each workstream `already-shipped`,
+    `superseded`, `viable`, or `blocked`. GitHub-visible `Preserved source`
+    values use archive IDs only, never local absolute paths.
 - Create: `.git/agent-recovery/issue-541/dirty/docs-psyche-specs/`
 - Create: `.git/agent-recovery/issue-541/dirty/memory-promote/`
 - Create: `.git/agent-recovery/issue-541/dirty/mobile-memory-gateway/`
@@ -96,7 +99,10 @@ cd /tmp/coven-issue-541
 git commit -s -m "docs: plan incomplete work recovery"
 ```
 
-Expected: a commit containing only the implementation plan.
+Expected: a commit containing only the implementation plan and the
+repository-required DCO sign-off plus the session-required Copilot co-author
+trailer. Human contributor co-author trailers remain conditional under
+`AGENTS.md` and are separate from the required Copilot trailer.
 
 - [ ] **Step 4: Push the design branch**
 
@@ -149,7 +155,9 @@ printf 'id\ttype\tsource\thead\tmerge_base\tsnapshot\n' > "$RECOVERY/manifest.ts
 ```
 
 Expected: the recovery root exists under
-`$COMMON_DIR/agent-recovery/issue-541`.
+`$COMMON_DIR/agent-recovery/issue-541`, and that fetched `origin/main`
+becomes the baseline for every Task 2 and Task 3 `merge_base` record. Task 4
+may fetch `origin/main` again before classification.
 
 - [ ] **Step 2: Snapshot `docs-psyche-specs`**
 
@@ -409,6 +417,8 @@ done
 ```
 
 Expected: `manifest.tsv` has seven data rows plus its header.
+Every Task 3 `merge_base` value still uses the `origin/main` fetched in Task 2
+Step 1.
 
 ### Task 4: Build the Classification Ledger
 
@@ -506,9 +516,14 @@ fix-521-ward-surface-confinement
 ```
 
 Write the selected classification, concrete commit/PR/issue/path evidence,
-preserved source path, and deterministic recovery action directly into each
-row. A row is not complete until another engineer can reproduce its
-classification from the cited source.
+sanitized preserved-source archive ID, and deterministic recovery action
+directly into each row. Use `Preserved source` values such as
+`dirty/docs-psyche-specs`, `dirty/memory-promote`, or
+`branches/feat-npm-macos-x64.bundle`; never write expanded `$REPO`,
+`$COMMON_DIR`, `/tmp`, `/private`, `/Users`, or `/home` paths into
+`classification.md`. Local absolute paths belong only in `manifest.tsv` and
+private snapshot artifacts. A row is not complete until another engineer can
+reproduce its classification from the cited source.
 
 - [ ] **Step 4: Apply the classification rules**
 
@@ -611,7 +626,10 @@ Expected: each viable concern has an approved and committed design document.
 
 Use the writing-plans workflow separately for each approved design. Each plan
 must include exact paths, failing tests, targeted commands, full repository
-gates, commit boundaries, push, and PR creation.
+gates, commit boundaries, explicit `git commit -s` usage, the session-required
+Copilot co-author trailer on child commits, push, and PR creation. Human
+contributor `Co-authored-by:` trailers remain conditional under `AGENTS.md`
+and are separate from the required Copilot trailer.
 
 Expected: independent plans exist for mobile pairing, Intel macOS packaging,
 Ward confinement, memory promotion, Psyche specifications, universal runtime
@@ -658,8 +676,10 @@ cd "$RECOVERY_WORKTREE"
 coven claim acquire "issue-$ISSUE_NUMBER"
 ```
 
-Execute that issue's plan, run its full gates, commit with the required Copilot
-co-author trailer, push, and open its scoped pull request.
+Execute that issue's plan, run its full gates, commit with `git commit -s`,
+include the session-required Copilot co-author trailer on each child commit,
+add human contributor co-author trailers only when `AGENTS.md` requires them,
+push, and open its scoped pull request.
 
 Expected: every viable row links to one open pull request from a current-main
 branch.
@@ -999,10 +1019,37 @@ gh pr list --state open --limit 100
 Expected: the primary checkout is clean on `main`; all remaining worktrees,
 claims, and open PRs correspond to documented active recovery work.
 
-- [ ] **Step 4: Update issue #541**
+- [ ] **Step 4: Reject unsanitized local paths before posting the ledger**
 
-Post a comment containing the classification table, recovery PR links,
-non-viable evidence, and remaining human blockers:
+Run:
+
+```bash
+COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
+REPO="$(cd "$COMMON_DIR/.." && pwd)"
+CLASSIFICATION="$COMMON_DIR/agent-recovery/issue-541/classification.md"
+python3 - "$CLASSIFICATION" "$REPO" "$COMMON_DIR" <<'PY'
+from pathlib import Path
+import sys
+
+classification = Path(sys.argv[1]).read_text()
+blocked_prefixes = [sys.argv[2], sys.argv[3], "/tmp", "/private", "/Users", "/home"]
+hits = [prefix for prefix in blocked_prefixes if prefix and prefix in classification]
+if hits:
+    raise SystemExit(
+        "classification.md contains unsanitized local path prefix(es): "
+        + ", ".join(hits)
+    )
+PY
+```
+
+Expected: the command exits zero only when `classification.md` contains
+sanitized archive IDs and no local absolute path prefixes.
+
+- [ ] **Step 5: Update issue #541**
+
+Post a comment containing the sanitized classification table, recovery PR
+links, non-viable evidence, and remaining human blockers. Do not post
+`manifest.tsv` or raw snapshot files:
 
 ```bash
 COMMON_DIR="$(git -C /tmp/coven-issue-541 rev-parse --git-common-dir)"
@@ -1010,9 +1057,10 @@ gh issue comment 541 --body-file \
   "$COMMON_DIR/agent-recovery/issue-541/classification.md"
 ```
 
-Expected: issue #541 contains the durable GitHub-visible recovery ledger.
+Expected: issue #541 contains the durable GitHub-visible recovery ledger sourced
+from the sanitized `classification.md`.
 
-- [ ] **Step 5: Close issue #541 when all machine work is delivered**
+- [ ] **Step 6: Close issue #541 when all machine work is delivered**
 
 Close only after every viable concern has an open PR and all local residue has
 been safely preserved or cleaned:
