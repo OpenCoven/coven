@@ -676,10 +676,10 @@ git commit -s --trailer "$COPILOT_TRAILER" \
 ```
 
 Expected: a commit containing only the implementation plan and the
-repository-required DCO sign-off plus the session-required Copilot co-author
-trailer. Human contributor co-author trailers remain conditional under
-`AGENTS.md` and, when required, are added separately with additional
-`--trailer` arguments rather than replacing the required Copilot trailer.
+repository-required DCO sign-off. If this session is using a Copilot co-author
+trailer, include it in the commit; human contributor co-author trailers remain
+conditional under `AGENTS.md` and, when required, are added separately with
+additional `--trailer` arguments.
 
 - [ ] **Step 4: Push the design branch**
 
@@ -3670,10 +3670,9 @@ Use the writing-plans workflow separately for each approved design that reached
 Step 3 without being blocked. Each plan must include exact paths, failing
 tests, targeted commands, the applicable repository-native npm/package commands
 below instead of root-level placeholders, full repository gates, commit
-boundaries, explicit `git commit -s` usage, the session-required Copilot
-co-author trailer on child commits, push, and PR creation. Human contributor
-`Co-authored-by:` trailers remain conditional under `AGENTS.md` and are
-separate from the required Copilot trailer.
+boundaries, explicit `git commit -s` usage, optional Copilot co-author trailer
+usage when present in the session, push, and PR creation. Human contributor
+`Co-authored-by:` trailers remain conditional under `AGENTS.md`.
 
 When a child recovery plan touches npm or Node-delivered surfaces, its gate
 section must use these repository-native commands:
