@@ -3789,7 +3789,7 @@ test -s "$ISSUE_VIEW_EVIDENCE"
 ISSUE_URL="$(jq -r '.url' "$ISSUE_VIEW_EVIDENCE")"
 if [ -z "${RECOVERY_PR_URL:-}" ]; then
   if ! RECOVERY_PR_URL="$(gh pr view --repo OpenCoven/coven "$RECOVERY_BRANCH" \
-    --json url --jq '.url' 2> "$PR_BLOCKER_EVIDENCE")"; then
+    --json number,title,url,state,headRefName,headRepositoryOwner,isCrossRepository,baseRefName --jq '.url' 2> "$PR_BLOCKER_EVIDENCE")"; then
     PR_VIEW_ERROR="$(cat "$PR_BLOCKER_EVIDENCE")"
     {
       printf 'Blocked %s: no recovery PR URL was captured from gh pr create, and gh pr view could not recover it.\n' \
@@ -3806,7 +3806,7 @@ if [ -z "${RECOVERY_PR_URL:-}" ]; then
   fi
 fi
 if ! gh pr view "$RECOVERY_PR_URL" --repo OpenCoven/coven \
-  --json number,url,state,headRefName,baseRefName \
+  --json number,url,state,headRefName,headRepositoryOwner,isCrossRepository,baseRefName \
   > "$PR_VIEW_EVIDENCE" 2> "$PR_BLOCKER_EVIDENCE"; then
   PR_VIEW_ERROR="$(cat "$PR_BLOCKER_EVIDENCE")"
   {
@@ -3826,19 +3826,26 @@ RECOVERY_PR_NUMBER="$(jq -r '.number' "$PR_VIEW_EVIDENCE")"
 ACTUAL_PR_URL="$(jq -r '.url' "$PR_VIEW_EVIDENCE")"
 ACTUAL_STATE="$(jq -r '.state' "$PR_VIEW_EVIDENCE")"
 ACTUAL_BRANCH="$(jq -r '.headRefName' "$PR_VIEW_EVIDENCE")"
+ACTUAL_OWNER="$(jq -r '.headRepositoryOwner.login' "$PR_VIEW_EVIDENCE")"
+ACTUAL_CROSS="$(jq -r '.isCrossRepository' "$PR_VIEW_EVIDENCE")"
 ACTUAL_BASE="$(jq -r '.baseRefName' "$PR_VIEW_EVIDENCE")"
 if [ "$ACTUAL_STATE" != "OPEN" ] || \
    [ "$ACTUAL_BRANCH" != "$RECOVERY_BRANCH" ] || \
+   [ "$ACTUAL_OWNER" != "OpenCoven" ] || \
+   [ "$ACTUAL_CROSS" != "false" ] || \
    [ "$ACTUAL_BASE" != "main" ]; then
   {
     printf 'Blocked %s: recovery PR verification failed.\n' "$WORKSTREAM_ID"
     printf 'Expected PR URL: %s\n' "$RECOVERY_PR_URL"
     printf 'Expected recovery branch: %s\n' "$RECOVERY_BRANCH"
     printf 'Expected base branch: main\n'
+    printf 'Expected owner/cross-repo: OpenCoven / false\n'
     printf 'Expected state: OPEN\n'
     printf 'Actual PR URL: %s\n' "$ACTUAL_PR_URL"
     printf 'Actual state: %s\n' "$ACTUAL_STATE"
     printf 'Actual branch: %s\n' "$ACTUAL_BRANCH"
+    printf 'Actual owner: %s\n' "$ACTUAL_OWNER"
+    printf 'Actual cross-repo: %s\n' "$ACTUAL_CROSS"
     printf 'Actual base branch: %s\n' "$ACTUAL_BASE"
     printf 'PR view evidence: viable/%s-pr-view.json\n' "$WORKSTREAM_ID"
   } > "$PR_BLOCKER_EVIDENCE"
