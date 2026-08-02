@@ -1653,7 +1653,6 @@ struct DoctorReport {
     home: PathBuf,
     project_root: Option<PathBuf>,
     daemon: Option<daemon::DaemonStatusState>,
-    repos_config_path: PathBuf,
     repos: Vec<DoctorRepoReport>,
     harnesses: Vec<harness::HarnessSummary>,
     engine: Option<DoctorEngineReport>,
@@ -1667,6 +1666,7 @@ struct DoctorReport {
 struct DoctorRepoReport {
     name: String,
     path: PathBuf,
+    config_path: PathBuf,
     ok: bool,
 }
 
@@ -1694,20 +1694,42 @@ impl DoctorReport {
     }
 }
 
+fn doctor_repo_config_path(
+    name: &str,
+    legacy_path: &Path,
+    settings_path: Option<&Path>,
+    loaded_settings: Option<&settings::Settings>,
+) -> PathBuf {
+    if loaded_settings.is_some_and(|value| value.coven_cli.repos.contains_key(name)) {
+        settings_path.unwrap_or(legacy_path).to_path_buf()
+    } else {
+        legacy_path.to_path_buf()
+    }
+}
+
 fn gather_doctor_report() -> Result<DoctorReport> {
     let home = coven_home_dir()?;
     let project_root = std::env::current_dir()
         .ok()
         .and_then(|cwd| project::canonical_project_root(&cwd).ok());
     let daemon = daemon::background_server_status(&home)?;
+    let legacy_repos_config_path = repos_config::config_path(&home);
+    let settings_config_path = settings::user_settings_path();
     let repos_config = repos_config::load_with_settings(&home, settings::cached())?;
     let repos = repos_config
         .entries()
         .map(|(name, path)| {
             let ok = path.is_dir() && path.join(".git").exists();
+            let config_path = doctor_repo_config_path(
+                name,
+                &legacy_repos_config_path,
+                settings_config_path.as_deref(),
+                settings::cached(),
+            );
             DoctorRepoReport {
                 name: name.to_string(),
                 path,
+                config_path,
                 ok,
             }
         })
@@ -1730,7 +1752,6 @@ fn gather_doctor_report() -> Result<DoctorReport> {
     let familiars = cockpit_sources::read_familiars(&home).map_err(|err| format!("{err:#}"));
     Ok(DoctorReport {
         familiars_manifest: home.join("familiars.toml"),
-        repos_config_path: repos_config::config_path(&home),
         home,
         project_root,
         daemon,
@@ -1763,32 +1784,68 @@ fn run_doctor(json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Keep Doctor's line-oriented prose safe even when a user-controlled config
+/// value contains terminal controls. Static line breaks are emitted by
+/// `println!`; embedded control characters are rendered visibly instead of
+/// being passed through to the terminal.
+fn doctor_prose_line(value: impl AsRef<str>) -> String {
+    let mut output = String::with_capacity(value.as_ref().len());
+    for character in value.as_ref().chars() {
+        if character.is_control() {
+            use std::fmt::Write as _;
+            write!(&mut output, "\\u{{{:x}}}", character as u32)
+                .expect("writing to a String cannot fail");
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
+fn print_doctor_line(value: impl AsRef<str>) {
+    println!("{}", doctor_prose_line(value));
+}
+
 fn print_doctor_prose(report: &DoctorReport) {
     println!("Coven doctor");
-    println!("Store: {}", report.home.display());
+    print_doctor_line(format!("Store: {}", report.home.display()));
     match &report.project_root {
-        Some(root) => println!("Project: {}", root.display()),
+        Some(root) => print_doctor_line(format!("Project: {}", root.display())),
         None => println!("Project: not inside a git/project root yet"),
     }
 
     println!("\nDaemon:");
     match &report.daemon {
         Some(daemon::DaemonStatusState::Running(status)) => {
-            // `ok` is always true for a live daemon, so the prose "Running"
-            // already conveys it; the `--json` path keeps the field.
-            println!("  Running (pid {}, socket {})", status.pid, status.socket);
+            print_doctor_line(format!(
+                "  [OK] Running (pid {}, socket {})",
+                status.pid, status.socket
+            ));
         }
         Some(daemon::DaemonStatusState::Stale(status)) => {
-            println!("  Stale (pid {}, socket {})", status.pid, status.socket);
+            print_doctor_line(format!(
+                "  [!!] Stale (pid {}, socket {}) — run: coven daemon restart",
+                status.pid, status.socket
+            ));
         }
-        None => println!("  Not running"),
+        None => println!("  [--] Not running — run: coven daemon start"),
     }
 
     if !report.repos.is_empty() {
-        println!("\nRepos ({}):", report.repos_config_path.display());
+        println!("\nRepos:");
         for repo in &report.repos {
             let marker = if repo.ok { "OK" } else { "!!" };
-            println!("  [{marker}] {:<16} {}", repo.name, repo.path.display());
+            print_doctor_line(format!(
+                "  [{marker}] {:<16} {}",
+                repo.name,
+                repo.path.display()
+            ));
+            if !repo.ok {
+                print_doctor_line(format!(
+                    "       fix the path in {}",
+                    repo.config_path.display()
+                ));
+            }
         }
     }
 
@@ -1797,21 +1854,19 @@ fn print_doctor_prose(report: &DoctorReport) {
         // Individual missing harnesses are advisory. The aggregate condition
         // below is the blocking failure when every supported harness is absent.
         let marker = if harness.available { "OK" } else { "--" };
-        if harness.available {
-            println!(
-                "  [{marker}] {:<18} `{}` executable is available ({})",
-                harness.label,
-                harness.executable,
-                adapter_source_label(&harness.source)
-            );
+        let availability = if harness.available {
+            "executable is available"
         } else {
-            println!(
-                "  [{marker}] {:<18} `{}` is missing ({})",
-                harness.label,
-                harness.executable,
-                adapter_source_label(&harness.source)
-            );
-            println!("       {}", harness.install_hint);
+            "is missing"
+        };
+        print_doctor_line(format!(
+            "  [{marker}] {:<18} `{}` {availability} ({})",
+            harness.label,
+            harness.executable,
+            adapter_source_label(&harness.source)
+        ));
+        if !harness.available {
+            print_doctor_line(format!("       {}", harness.install_hint));
         }
     }
     if !report.harnesses.iter().any(|harness| harness.available) {
@@ -1821,7 +1876,11 @@ fn print_doctor_prose(report: &DoctorReport) {
     println!("\nEngine:");
     match &report.engine {
         Some(engine) => {
-            println!("  [OK] {} ({})", engine.path.display(), engine.source_label);
+            print_doctor_line(format!(
+                "  [OK] {} ({})",
+                engine.path.display(),
+                engine.source_label
+            ));
             match engine.version {
                 Some(version) => {
                     let (a, b, c) = version;
@@ -1834,7 +1893,7 @@ fn print_doctor_prose(report: &DoctorReport) {
                         );
                     }
                 }
-                None => println!("       version: unknown (could not run the engine)"),
+                None => println!("  [--] version: unknown (could not run the engine)"),
             }
             println!("       pin: {}", engine::pinned_version());
         }
@@ -1850,12 +1909,12 @@ fn print_doctor_prose(report: &DoctorReport) {
 
     println!("\nCredentials:");
     for line in credentials_lines(report.engine_auth, &report.harnesses) {
-        println!("{line}");
+        print_doctor_line(line);
     }
 
     println!("\nNext steps:");
     for line in doctor_next_steps(report.default_harness.as_deref()) {
-        println!("  {line}");
+        print_doctor_line(format!("  {line}"));
     }
 }
 
@@ -1955,7 +2014,6 @@ impl DoctorJsonPathRedactor {
             &report.familiars_manifest,
             "<familiars-manifest>".to_string(),
         );
-        add_path(&report.repos_config_path, "<repos-config>".to_string());
         if let Some(engine) = &report.engine {
             add_path(&engine.path, "<engine>".to_string());
         }
@@ -1964,6 +2022,7 @@ impl DoctorJsonPathRedactor {
             // path-scoped and neutral so insertion order cannot assign one
             // alias's identity to another alias's check.
             add_path(&repo.path, "<repo>".to_string());
+            add_path(&repo.config_path, "<repos-config>".to_string());
         }
         if let Some(project_root) = &report.project_root {
             add_path(project_root, "<project>".to_string());
@@ -2059,7 +2118,7 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
                 ),
                 Some(format!(
                     "fix the path in {}",
-                    paths.role_path(&report.repos_config_path, "<repos-config>")
+                    paths.role_path(&repo.config_path, "<repos-config>")
                 )),
             )
         });
@@ -2151,7 +2210,10 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
                 paths.role_path(&report.familiars_manifest, "<familiars-manifest>"),
                 error = paths.text(error)
             ),
-            None,
+            Some(format!(
+                "fix access to or contents of {}, then rerun coven doctor",
+                paths.role_path(&report.familiars_manifest, "<familiars-manifest>")
+            )),
         ),
         Ok(familiars) if familiars.is_empty() => DoctorCheck::pass(
             "familiars",
@@ -2252,14 +2314,21 @@ fn print_familiars_section(
         Ok(familiars) => familiars,
         Err(err) => {
             println!("\nFamiliars:");
-            println!("  !! could not read {}: {err}", manifest.display());
+            print_doctor_line(format!(
+                "  [--] could not read {}: {err}",
+                manifest.display()
+            ));
+            print_doctor_line(format!(
+                "       fix access to or contents of {}, then rerun coven doctor",
+                manifest.display()
+            ));
             return;
         }
     };
 
     if familiars.is_empty() {
         println!("\nFamiliars:");
-        println!("  none configured ({})", manifest.display());
+        print_doctor_line(format!("  none configured ({})", manifest.display()));
         println!(
             "  Declare [[familiar]] entries there, then run with \
              `coven run <harness> --familiar <id> \"...\"`."
@@ -2267,7 +2336,8 @@ fn print_familiars_section(
         return;
     }
 
-    println!("\nFamiliars ({}):", manifest.display());
+    println!();
+    print_doctor_line(format!("Familiars ({}):", manifest.display()));
     let id_width = familiars
         .iter()
         .map(|familiar| familiar.id.len())
@@ -2279,10 +2349,10 @@ fn print_familiars_section(
         } else {
             format!(" — {}", familiar.role)
         };
-        println!(
+        print_doctor_line(format!(
             "  {:<id_width$} {}{}  (memory: {})",
             familiar.id, familiar.display_name, role, familiar.memory_freshness
-        );
+        ));
     }
 }
 
@@ -6389,7 +6459,7 @@ mod tests {
         assert!(lines[0].contains("[--]"), "got: {}", lines[0]);
         assert!(
             !lines[0].contains("[!!]"),
-            "non-blocking auth guidance must not look blocking: {}",
+            "non-blocking auth guidance must not look like a blocking failure: {}",
             lines[0]
         );
     }
@@ -6510,6 +6580,14 @@ mod tests {
 
     // --- doctor report/check unit tests ---
 
+    #[test]
+    fn doctor_prose_line_escapes_controls_and_preserves_printable_unicode() {
+        assert_eq!(
+            doctor_prose_line("safe\t\n\r\u{1b}\u{009b} —"),
+            r"safe\u{9}\u{a}\u{d}\u{1b}\u{9b} —"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn doctor_json_redactor_rejects_unix_root_replacements() {
@@ -6518,6 +6596,7 @@ mod tests {
         report.repos.push(DoctorRepoReport {
             name: "root".to_string(),
             path: PathBuf::from("/"),
+            config_path: PathBuf::from("/tmp/repos.toml"),
             ok: true,
         });
 
@@ -6542,6 +6621,7 @@ mod tests {
         drive_report.repos.push(DoctorRepoReport {
             name: "drive-root".to_string(),
             path: PathBuf::from(r"C:\"),
+            config_path: PathBuf::from(r"C:\repos.toml"),
             ok: true,
         });
         let drive_redactor = DoctorJsonPathRedactor::new(&drive_report);
@@ -6567,6 +6647,7 @@ mod tests {
         unc_report.repos.push(DoctorRepoReport {
             name: "unc-root".to_string(),
             path: PathBuf::from(r"\\server\share\"),
+            config_path: PathBuf::from(r"\\server\share\repos.toml"),
             ok: true,
         });
         let unc_redactor = DoctorJsonPathRedactor::new(&unc_report);
@@ -6631,7 +6712,6 @@ mod tests {
                 started_at: "2026-01-01T00:00:00Z".to_string(),
                 socket: "/tmp/coven-home/coven.sock".to_string(),
             })),
-            repos_config_path: PathBuf::from("/tmp/coven-home/repos.toml"),
             repos: vec![],
             harnesses: vec![make_harness_with_hint("codex", true, "npm i -g codex")],
             engine: Some(DoctorEngineReport {
@@ -6664,6 +6744,7 @@ mod tests {
         bad_repo.repos.push(DoctorRepoReport {
             name: "openclaw".to_string(),
             path: PathBuf::from("/does/not/exist"),
+            config_path: PathBuf::from("/tmp/settings.json"),
             ok: false,
         });
 
@@ -6697,6 +6778,49 @@ mod tests {
                 "{label}: check statuses disagree with healthy()"
             );
         }
+    }
+
+    #[test]
+    fn doctor_bad_repo_hint_redacts_the_entrys_actual_config_source() {
+        let mut report = make_doctor_report();
+        report.repos.push(DoctorRepoReport {
+            name: "openclaw".to_string(),
+            path: PathBuf::from("/does/not/exist"),
+            config_path: PathBuf::from("/tmp/settings.json"),
+            ok: false,
+        });
+
+        let check = doctor_checks(&report)
+            .into_iter()
+            .find(|check| check.id == "repo:openclaw")
+            .expect("repo check");
+        assert_eq!(check.status, "fail");
+        assert_eq!(
+            check.hint.as_deref(),
+            Some("fix the path in <repos-config>")
+        );
+    }
+
+    #[test]
+    fn doctor_repo_config_path_tracks_settings_overrides() {
+        let legacy = Path::new("/tmp/repos.toml");
+        let settings_path = Path::new("/tmp/settings.json");
+        let mut loaded = settings::Settings::default();
+        loaded.coven_cli.repos.insert(
+            "settings-repo".to_string(),
+            settings::RepoSettings {
+                path: PathBuf::from("/tmp/repo"),
+            },
+        );
+
+        assert_eq!(
+            doctor_repo_config_path("settings-repo", legacy, Some(settings_path), Some(&loaded)),
+            settings_path
+        );
+        assert_eq!(
+            doctor_repo_config_path("legacy-repo", legacy, Some(settings_path), Some(&loaded)),
+            legacy
+        );
     }
 
     #[test]

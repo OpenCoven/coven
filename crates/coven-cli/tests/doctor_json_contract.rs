@@ -155,6 +155,15 @@ fn doctor_json_is_stable_redacted_and_stdout_pure() -> anyhow::Result<()> {
         "<repo> is missing or not a git repository"
     );
     assert_eq!(missing["hint"], "fix the path in <repos-config>");
+    let familiars = checks
+        .iter()
+        .find(|check| check["id"] == "familiars")
+        .expect("familiars check");
+    assert_eq!(familiars["status"], "pass");
+    assert_eq!(
+        familiars["message"],
+        "none configured (<familiars-manifest>)"
+    );
     assert!(first_json["nextSteps"]
         .as_array()
         .is_some_and(|steps| !steps.is_empty() && steps.iter().all(Value::is_string)));

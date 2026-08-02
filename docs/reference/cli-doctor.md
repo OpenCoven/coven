@@ -16,6 +16,11 @@ coven doctor
 The command is read-only. It prints local setup state and a next step without
 starting a session.
 
+The prose report uses `[OK]` for passing checks, `[--]` for advisory warnings,
+and `[!!]` only for blocking failures. It is line-oriented plain text and does
+not emit or pass through ANSI escape sequences, including when global color is
+forced or configuration text contains terminal controls.
+
 ## Machine-readable output
 
 `coven doctor --json` emits one JSON document for scripts and CI gates, with
@@ -31,7 +36,7 @@ found):
   "checks": [
     { "id": "daemon", "status": "pass", "message": "running (pid 12345, socket <daemon-socket>)" },
     { "id": "harness:codex", "status": "pass", "message": "`codex` executable is available (built-in)" },
-    { "id": "harnesses", "status": "pass", "message": "1 of 3 configured harness executables available" },
+    { "id": "harnesses", "status": "pass", "message": "2 of 4 configured harness executables available" },
     { "id": "engine", "status": "pass", "message": "<engine> (managed install), version 0.6.1 (pin 0.6.1)" },
     { "id": "credentials:engine", "status": "warn", "message": "authentication configured; provider turn not verified", "hint": "run an explicitly authorized test turn to verify provider access" },
     { "id": "credentials:codex", "status": "warn", "message": "executable available; authentication not verified", "hint": "authenticate or inspect local setup with: codex login; verify provider access with an explicitly authorized test turn" }
@@ -69,8 +74,9 @@ availability, where any missing adapter is a `fail`.
 | `Daemon` | Whether the background daemon is stopped, running, or stale. |
 | `Repos` | Configured repositories from Coven repo settings, if present. |
 | `Harnesses` | Supported harness executables that are visible on this shell's `PATH`. |
-| `Credentials` | Advisory local engine auth configuration and explicit `authentication not verified` rows for external harnesses. Doctor calls only the engine's contractually offline `auth status --json`; it never launches a provider harness, starts a provider turn, contacts a provider, or reads harness credentials. |
+| `Engine` | Whether the Coven engine is installed and meets the minimum supported version. |
 | `Familiars` | Configured familiar identities from `familiars.toml`, if present. |
+| `Credentials` | Advisory local engine auth configuration and explicit `authentication not verified` rows for external harnesses. Doctor calls only the engine's contractually offline `auth status --json`; it never launches a provider harness, starts a provider turn, contacts a provider, or reads harness credentials. |
 | `Next steps` | The safest next command based on the detected state. |
 
 ## Expected first-run loop
@@ -149,6 +155,7 @@ command exits `1` when it finds a blocking local problem:
 - the daemon is stale (`running` and `stopped` are both healthy states)
 - a registered repo entry points at a missing or non-git path
 - `coven-code` is missing
+- the installed `coven-code` version is older than the supported minimum
 
 Each missing harness prints an advisory `[--]` line with an install hint. When
 none is available, Doctor adds a blocking `[!!] No supported harness is

@@ -696,6 +696,12 @@ fn doctor_missing_harness_prints_cross_platform_setup_loop() -> anyhow::Result<(
     assert_stdout_contains("doctor without harnesses", &output, "Harnesses:");
     assert_stdout_contains("doctor without harnesses", &output, "`codex` is missing");
     assert_stdout_contains("doctor without harnesses", &output, "`claude` is missing");
+    assert_stdout_contains("doctor without harnesses", &output, "[--] Codex");
+    assert_stdout_contains(
+        "doctor without harnesses",
+        &output,
+        "[!!] No supported harness is available",
+    );
     assert_stdout_contains(
         "doctor without harnesses",
         &output,
