@@ -7,7 +7,9 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use qrcode::render::unicode::Dense1x2;
 use qrcode::QrCode;
+#[cfg(test)]
 use rand::rngs::OsRng;
+#[cfg(test)]
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use url::Url;
