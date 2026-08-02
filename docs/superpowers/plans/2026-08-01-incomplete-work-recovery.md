@@ -187,8 +187,10 @@ coven claim status
 gh pr list --repo OpenCoven/coven --state open --limit 100
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -197,13 +199,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -212,14 +214,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -228,6 +245,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -242,10 +266,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -296,8 +322,10 @@ instead of assuming shell variables persist:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -306,13 +334,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -321,14 +349,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -337,6 +380,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -351,10 +401,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -390,8 +442,10 @@ Run:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -400,13 +454,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -415,14 +469,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -431,6 +500,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -445,10 +521,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -485,8 +563,10 @@ Run:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -495,13 +575,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -510,14 +590,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -526,6 +621,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -540,10 +642,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -585,8 +689,10 @@ Run:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -595,13 +701,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -610,14 +716,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -626,6 +747,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -640,10 +768,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -675,8 +805,10 @@ Run:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -685,13 +817,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -700,14 +832,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -716,6 +863,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -730,10 +884,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -782,8 +938,10 @@ Run:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -792,13 +950,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -807,14 +965,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -823,6 +996,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -837,10 +1017,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -915,8 +1097,10 @@ Run:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -925,13 +1109,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -940,14 +1124,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -956,6 +1155,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -970,10 +1176,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -1052,8 +1260,10 @@ Run:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -1062,13 +1272,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -1077,14 +1287,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -1093,6 +1318,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -1107,10 +1339,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -1185,8 +1419,10 @@ Run:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -1195,13 +1431,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -1210,14 +1446,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -1226,6 +1477,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -1240,10 +1498,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -1317,8 +1577,10 @@ Run:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -1327,13 +1589,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -1342,14 +1604,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -1358,6 +1635,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -1372,10 +1656,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -1448,8 +1734,10 @@ Run:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -1458,13 +1746,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -1473,14 +1761,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -1489,6 +1792,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -1503,10 +1813,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -1634,8 +1946,10 @@ Run:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -1644,13 +1958,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -1659,14 +1973,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -1675,6 +2004,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -1689,10 +2025,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -1737,8 +2075,10 @@ Run:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -1747,13 +2087,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -1762,14 +2102,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -1778,6 +2133,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -1792,10 +2154,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -1830,8 +2194,10 @@ Run:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -1840,13 +2206,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -1855,14 +2221,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -1871,6 +2252,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -1885,10 +2273,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -2101,8 +2491,10 @@ Run:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -2111,13 +2503,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -2126,14 +2518,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -2142,6 +2549,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -2156,10 +2570,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -2210,8 +2626,10 @@ current source branch:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -2220,13 +2638,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -2235,14 +2653,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -2251,6 +2684,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -2265,10 +2705,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -2673,8 +3115,10 @@ matching exact issue title:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -2683,13 +3127,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -2698,14 +3142,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -2714,6 +3173,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -2728,10 +3194,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -3276,8 +3744,10 @@ Then run:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -3286,13 +3756,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -3301,14 +3771,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -3317,6 +3802,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -3331,10 +3823,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -3706,8 +4200,10 @@ or Task 9 audit continues:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -3716,13 +4212,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -3731,14 +4227,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -3747,6 +4258,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -3761,10 +4279,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -4021,8 +4541,10 @@ Run:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -4031,13 +4553,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -4046,14 +4568,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -4062,6 +4599,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -4076,10 +4620,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -4113,8 +4659,10 @@ Run:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -4123,13 +4671,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -4138,14 +4686,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -4154,6 +4717,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -4168,10 +4738,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -4217,8 +4789,10 @@ the worktree untouched:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -4227,13 +4801,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -4242,14 +4816,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -4258,6 +4847,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -4272,10 +4868,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -4315,8 +4913,10 @@ for that worktree branch, and remove the five clean worktrees:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -4325,13 +4925,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -4340,14 +4940,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -4356,6 +4971,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -4370,10 +4992,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -4577,8 +5201,10 @@ Run:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -4587,13 +5213,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -4602,14 +5228,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -4618,6 +5259,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -4632,10 +5280,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -4690,8 +5340,10 @@ exact-path force-removal exception:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -4700,13 +5352,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -4715,14 +5367,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -4731,6 +5398,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -4745,10 +5419,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -5417,8 +6093,10 @@ Run this immediately before `branch -d`:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -5427,13 +6105,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -5442,14 +6120,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -5458,6 +6151,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -5472,10 +6172,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -5587,8 +6289,10 @@ same branch-ref proof immediately before `branch -D`:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -5597,13 +6301,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -5612,14 +6316,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -5628,6 +6347,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -5642,10 +6368,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -5800,8 +6528,10 @@ stops or the full issue #541 recovery effort is complete:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -5810,13 +6540,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -5825,14 +6555,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -5841,6 +6586,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -5855,10 +6607,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -5899,8 +6653,10 @@ Run:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -5909,13 +6665,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -5924,14 +6680,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -5940,6 +6711,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -5954,10 +6732,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -6035,8 +6815,10 @@ Run:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -6045,13 +6827,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -6060,14 +6842,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -6076,6 +6873,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -6090,10 +6894,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -6141,8 +6947,10 @@ Run:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -6151,13 +6959,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -6166,14 +6974,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -6182,6 +7005,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -6196,10 +7026,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -6244,8 +7076,10 @@ recorded in `Main/PR evidence` and run:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -6254,13 +7088,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -6269,14 +7103,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -6285,6 +7134,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -6299,10 +7155,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -6337,8 +7195,10 @@ Run:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -6347,13 +7207,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -6362,14 +7222,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -6378,6 +7253,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -6392,10 +7274,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -6612,8 +7496,10 @@ Run:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -6622,13 +7508,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -6637,14 +7523,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -6653,6 +7554,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -6667,10 +7575,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -6722,8 +7632,10 @@ Run:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -6732,13 +7644,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -6747,14 +7659,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -6763,6 +7690,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -6777,10 +7711,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -6828,8 +7764,10 @@ links, non-viable evidence, and remaining human blockers. Do not post
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -6838,13 +7776,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -6853,14 +7791,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -6869,6 +7822,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -6883,10 +7843,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
@@ -6922,8 +7884,10 @@ been safely preserved or cleaned:
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
-  local start_common_dir repo target_path path branch_ref live_path stale_path
-  local target_registration_branch actual_branch
+  local expected_branch="refs/heads/$control_branch"
+  local start_common_dir repo target_path path branch_ref actual_branch
+  local target_registration_branch live_count stale_count live_path stale_path
+  local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
@@ -6932,13 +7896,13 @@ resolve_control_worktree() {
     if test "$path" = "$target_path"; then
       target_registration_branch="$branch_ref"
     fi
-    if test "$branch_ref" != "refs/heads/$control_branch"; then
+    if test "$branch_ref" != "$expected_branch"; then
       continue
     fi
     if test -d "$path"; then
-      live_path="$path"
+      live_paths+=("$path")
     else
-      stale_path="$path"
+      stale_paths+=("$path")
     fi
   done <<EOF
 $(git -C "$repo" worktree list --porcelain | awk '
@@ -6947,14 +7911,29 @@ $(git -C "$repo" worktree list --porcelain | awk '
   END { if (path != "") print path "\t" branch }
 ')
 EOF
-  if test -n "$target_registration_branch" && test "$target_registration_branch" != "refs/heads/$control_branch"; then
+  live_count="${#live_paths[@]}"
+  stale_count="${#stale_paths[@]}"
+  if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
     printf 'Blocked: %s is registered to %s, not %s.\n' "$target_path" "$target_registration_branch" "$control_branch" >&2
     exit 1
   fi
-  if test -n "$live_path"; then
-    if test -n "$stale_path" && test "$live_path" != "$target_path"; then
-      printf 'Blocked: %s has a stale controller registration and a different live worktree (%s); do not override it.\n' "$control_branch" "$live_path" >&2
-      exit 1
+  if test "$live_count" -gt 1; then
+    printf 'Blocked: %s has %s live controller worktree registrations; refusing to choose arbitrarily.\n' "$control_branch" "$live_count" >&2
+    for live_path in "${live_paths[@]}"; do
+      printf '  live: %s\n' "$live_path" >&2
+    done
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
+  fi
+  if test "$live_count" -eq 1; then
+    live_path="${live_paths[0]}"
+    if test "$stale_count" -gt 0; then
+      printf 'Warning: ignoring %s stale controller registration(s) for %s while using the one live worktree.\n' "$stale_count" "$control_branch" >&2
+      for stale_path in "${stale_paths[@]}"; do
+        printf '  stale: %s\n' "$stale_path" >&2
+      done
     fi
     actual_branch="$(git -C "$live_path" branch --show-current)"
     if test "$actual_branch" != "$control_branch"; then
@@ -6963,6 +7942,13 @@ EOF
     fi
     printf '%s\n' "$live_path"
     return 0
+  fi
+  if test "$stale_count" -gt 1; then
+    printf 'Blocked: %s has %s stale controller registrations and no live worktree; refusing to choose arbitrarily.\n' "$control_branch" "$stale_count" >&2
+    for stale_path in "${stale_paths[@]}"; do
+      printf '  stale: %s\n' "$stale_path" >&2
+    done
+    exit 1
   fi
   if ! git -C "$repo" check-ignore -q .worktrees/; then
     printf 'Repository-local .worktrees/ is not ignored.\n' >&2
@@ -6977,10 +7963,12 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$control_branch"; then
+  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
     git -C "$repo" fetch origin "$control_branch:$control_branch"
   fi
-  if test -n "$stale_path"; then
+  if test "$stale_count" -eq 1; then
+    stale_path="${stale_paths[0]}"
+    printf 'Recreating %s at %s from the one stale controller registration:\n  stale: %s\n' "$control_branch" "$target_path" "$stale_path" >&2
     git -C "$repo" worktree add --force "$target_path" "$control_branch"
   else
     git -C "$repo" worktree add "$target_path" "$control_branch"
