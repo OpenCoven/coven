@@ -70,15 +70,25 @@
     verification artifacts, followed by byte-for-byte pre-removal proof
     artifacts regenerated from the live source worktree before any forced
     removal.
+
 - Create only when Task 7 Step 3 runs:
+  - `.git/agent-recovery/issue-541/private-merged-worktree-proof/closed-prs.json`
   - `.git/agent-recovery/issue-541/private-merged-worktree-proof/<worktree-id>/tracked-index.porcelain`
   - `.git/agent-recovery/issue-541/private-merged-worktree-proof/<worktree-id>/untracked.zlist`
   - `.git/agent-recovery/issue-541/private-merged-worktree-proof/<worktree-id>/untracked.json`
   - `.git/agent-recovery/issue-541/private-merged-worktree-proof/<worktree-id>/ignored.zlist`
   - `.git/agent-recovery/issue-541/private-merged-worktree-proof/<worktree-id>/ignored.json`
+  - `.git/agent-recovery/issue-541/private-merged-worktree-proof/<worktree-id>/branch.txt`
   - `.git/agent-recovery/issue-541/private-merged-worktree-proof/<worktree-id>/head.txt`
   - `.git/agent-recovery/issue-541/private-merged-worktree-proof/<worktree-id>/origin-main.txt`
-  - Private evidence proving the tracked/index state is empty, the NUL-delimited nonignored untracked inventory is empty, the NUL-delimited ignored inventory is empty, and the worktree tip is already represented by fetched `origin/main` before any removal.
+  - `.git/agent-recovery/issue-541/private-merged-worktree-proof/<worktree-id>/proof-mode.txt`
+  - `.git/agent-recovery/issue-541/private-merged-worktree-proof/<worktree-id>/merged-pr-matches.json`
+  - `.git/agent-recovery/issue-541/private-merged-worktree-proof/<worktree-id>/merged-pr.json`
+  - `.git/agent-recovery/issue-541/private-merged-worktree-proof/<worktree-id>/merged-pr-number.txt`
+  - `.git/agent-recovery/issue-541/private-merged-worktree-proof/<worktree-id>/merged-pr-url.txt`
+  - `.git/agent-recovery/issue-541/private-merged-worktree-proof/<worktree-id>/branch-recheck.txt`
+  - `.git/agent-recovery/issue-541/private-merged-worktree-proof/<worktree-id>/head-recheck.txt`
+  - Private evidence proving the tracked/index state is empty, the NUL-delimited nonignored untracked inventory is empty, the NUL-delimited ignored inventory is empty, the exact branch and head stayed stable immediately before removal, and either fetched `origin/main` ancestry or exactly one same-repository merged-PR fallback represents the worktree tip before any removal.
 - Create only when Task 4 Step 2 runs:
   - `.git/agent-recovery/issue-541/<workstream-id>-commits.txt`
   - `.git/agent-recovery/issue-541/<workstream-id>-stat.txt`
@@ -4286,35 +4296,68 @@ EOF
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
+
 RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
 MERGED_RETIRE_ROOT="$RECOVERY/private-merged-worktree-proof"
+CLOSED_PRS_STAGE="$MERGED_RETIRE_ROOT/closed-prs.stage.json"
+CLOSED_PRS_EVIDENCE="$MERGED_RETIRE_ROOT/closed-prs.json"
 mkdir -p "$MERGED_RETIRE_ROOT"
+rm -f "$CLOSED_PRS_STAGE"
 if ! git -C "$REPO" fetch origin main; then
-  printf 'Blocked: could not refresh origin/main before merged-worktree retirement proof.\n' >&2
+  echo "Blocked: could not refresh origin/main before merged-worktree retirement proof." >&2
+  exit 1
+fi
+if ! gh api --paginate --slurp "repos/OpenCoven/coven/pulls?state=closed&per_page=100" > "$CLOSED_PRS_STAGE"; then
+  rm -f "$CLOSED_PRS_STAGE"
+  echo "Blocked: could not capture paginated closed PR evidence for OpenCoven/coven before merged-worktree retirement proof." >&2
+  exit 1
+fi
+if ! test -s "$CLOSED_PRS_STAGE" || ! jq -e 'type == "array" and length > 0 and all(.[]; type == "array") and ([ .[] | length ] | add) > 0' "$CLOSED_PRS_STAGE" > /dev/null; then
+  rm -f "$CLOSED_PRS_STAGE"
+  echo "Blocked: closed PR evidence was empty or not a valid paginated slurped JSON array before merged-worktree retirement proof." >&2
+  exit 1
+fi
+if ! mv "$CLOSED_PRS_STAGE" "$CLOSED_PRS_EVIDENCE"; then
+  rm -f "$CLOSED_PRS_STAGE"
+  echo "Blocked: could not atomically store closed PR evidence under $MERGED_RETIRE_ROOT." >&2
   exit 1
 fi
 ORIGIN_MAIN_COMMIT="$(git -C "$REPO" rev-parse "refs/remotes/origin/main^{commit}")"
-for path in \
-  "$REPO/.worktrees/docs-cli-core-guides" \
-  "$REPO/.worktrees/memory-summary-source" \
-  "$REPO/.worktrees/memory-open" \
-  "$REPO/.worktrees/fix-coven-hq8-privacy-lockfile" \
-  "$REPO/.worktrees/memory-api-review"
-do
+for path in "$REPO/.worktrees/docs-cli-core-guides" "$REPO/.worktrees/memory-summary-source" "$REPO/.worktrees/memory-open" "$REPO/.worktrees/fix-coven-hq8-privacy-lockfile" "$REPO/.worktrees/memory-api-review"; do
   worktree_id="$(basename "$path")"
   PROOF_DIR="$MERGED_RETIRE_ROOT/$worktree_id"
   BLOCKER="$RECOVERY/$worktree_id-merged-retire-blocker.txt"
+  MATCHES_FILE="$PROOF_DIR/merged-pr-matches.json"
+  MERGED_PR_JSON="$PROOF_DIR/merged-pr.json"
+  MERGED_PR_NUMBER_FILE="$PROOF_DIR/merged-pr-number.txt"
+  MERGED_PR_URL_FILE="$PROOF_DIR/merged-pr-url.txt"
+  PROOF_MODE_FILE="$PROOF_DIR/proof-mode.txt"
+  BRANCH_RECHECK_FILE="$PROOF_DIR/branch-recheck.txt"
+  HEAD_RECHECK_FILE="$PROOF_DIR/head-recheck.txt"
   mkdir -p "$PROOF_DIR"
+  rm -f "$BLOCKER" "$MATCHES_FILE" "$MERGED_PR_JSON" "$MERGED_PR_NUMBER_FILE" "$MERGED_PR_URL_FILE" "$PROOF_MODE_FILE" "$BRANCH_RECHECK_FILE" "$HEAD_RECHECK_FILE"
   if ! test -d "$path"; then
-    printf 'Blocked %s: worktree is missing; leave it untouched.\n' "$path" > "$BLOCKER"
+    echo "Blocked $path: worktree is missing; leave it untouched." > "$BLOCKER"
     continue
   fi
+  if ! CURRENT_BRANCH="$(git -C "$path" branch --show-current)" || test -z "$CURRENT_BRANCH"; then
+    echo "Blocked $path: could not capture a non-empty current branch name; leave the worktree untouched." > "$BLOCKER"
+    continue
+  fi
+  echo "$CURRENT_BRANCH" > "$PROOF_DIR/branch.txt"
+  if ! CURRENT_HEAD="$(git -C "$path" rev-parse "HEAD^{commit}")"; then
+    echo "Blocked $path: could not capture worktree tip; leave the worktree untouched." > "$BLOCKER"
+    continue
+  fi
+  echo "$CURRENT_HEAD" > "$PROOF_DIR/head.txt"
+  CAPTURED_BRANCH="$CURRENT_BRANCH"
+  CAPTURED_HEAD="$CURRENT_HEAD"
   if ! git -C "$path" status --porcelain=v1 --untracked-files=no > "$PROOF_DIR/tracked-index.porcelain"; then
-    printf 'Blocked %s: could not capture tracked/index status; leave the worktree untouched.\n' "$path" > "$BLOCKER"
+    echo "Blocked $path: could not capture tracked/index status; leave the worktree untouched." > "$BLOCKER"
     continue
   fi
   if ! git -C "$path" ls-files --others --exclude-standard -z > "$PROOF_DIR/untracked.zlist"; then
-    printf 'Blocked %s: could not capture untracked inventory; leave the worktree untouched.\n' "$path" > "$BLOCKER"
+    echo "Blocked $path: could not capture untracked inventory; leave the worktree untouched." > "$BLOCKER"
     continue
   fi
   python3 - "$PROOF_DIR/untracked.zlist" > "$PROOF_DIR/untracked.json" <<'PY'
@@ -4323,11 +4366,12 @@ import sys
 from pathlib import Path
 
 raw = Path(sys.argv[1]).read_bytes()
-entries = [] if not raw else raw.rstrip(b"\0").split(b"\0")
+nul = bytes([0])
+entries = [] if not raw else raw.rstrip(nul).split(nul)
 print(json.dumps([entry.decode("utf-8", "surrogateescape") for entry in entries], indent=2))
 PY
   if ! git -C "$path" ls-files --others --ignored --exclude-standard -z > "$PROOF_DIR/ignored.zlist"; then
-    printf 'Blocked %s: could not capture ignored inventory; leave the worktree untouched.\n' "$path" > "$BLOCKER"
+    echo "Blocked $path: could not capture ignored inventory; leave the worktree untouched." > "$BLOCKER"
     continue
   fi
   python3 - "$PROOF_DIR/ignored.zlist" > "$PROOF_DIR/ignored.json" <<'PY'
@@ -4336,28 +4380,70 @@ import sys
 from pathlib import Path
 
 raw = Path(sys.argv[1]).read_bytes()
-entries = [] if not raw else raw.rstrip(b"\0").split(b"\0")
+nul = bytes([0])
+entries = [] if not raw else raw.rstrip(nul).split(nul)
 print(json.dumps([entry.decode("utf-8", "surrogateescape") for entry in entries], indent=2))
 PY
-  if ! git -C "$path" rev-parse HEAD > "$PROOF_DIR/head.txt"; then
-    printf 'Blocked %s: could not capture worktree tip; leave the worktree untouched.\n' "$path" > "$BLOCKER"
-    continue
-  fi
-  printf '%s\n' "$ORIGIN_MAIN_COMMIT" > "$PROOF_DIR/origin-main.txt"
+  echo "$ORIGIN_MAIN_COMMIT" > "$PROOF_DIR/origin-main.txt"
   if test -s "$PROOF_DIR/tracked-index.porcelain"; then
-    printf 'Blocked %s: tracked/index status is non-empty; leave the worktree untouched.\n' "$path" > "$BLOCKER"
+    echo "Blocked $path: tracked/index status is non-empty; leave the worktree untouched." > "$BLOCKER"
     continue
   fi
   if test -s "$PROOF_DIR/untracked.zlist"; then
-    printf 'Blocked %s: nonignored untracked paths are present; leave the worktree untouched.\n' "$path" > "$BLOCKER"
+    echo "Blocked $path: nonignored untracked paths are present; leave the worktree untouched." > "$BLOCKER"
     continue
   fi
   if test -s "$PROOF_DIR/ignored.zlist"; then
-    printf 'Blocked %s: ignored paths are present; leave the worktree untouched.\n' "$path" > "$BLOCKER"
+    echo "Blocked $path: ignored paths are present; leave the worktree untouched." > "$BLOCKER"
     continue
   fi
-  if ! git -C "$REPO" merge-base --is-ancestor "$(cat "$PROOF_DIR/head.txt")" "$ORIGIN_MAIN_COMMIT"; then
-    printf 'Blocked %s: worktree tip is not represented by fetched origin/main; leave the worktree untouched.\n' "$path" > "$BLOCKER"
+  if git -C "$REPO" merge-base --is-ancestor "$CAPTURED_HEAD" "$ORIGIN_MAIN_COMMIT"; then
+    echo ancestor > "$PROOF_MODE_FILE"
+  else
+    if ! jq --arg REPO_NAME "OpenCoven/coven" --arg CAPTURED_BRANCH "$CAPTURED_BRANCH" --arg CAPTURED_HEAD "$CAPTURED_HEAD" '[ .[] | .[] | select(.head.repo != null and .head.repo.full_name == $REPO_NAME) | select(.base.repo != null and .base.repo.full_name == $REPO_NAME) | select(.head.ref == $CAPTURED_BRANCH) | select(.head.sha == $CAPTURED_HEAD) | select(.base.ref == "main") | select(.merged_at != null) | { number, url: .html_url, merged_at, head: { ref: .head.ref, sha: .head.sha, repo: .head.repo.full_name }, base: { ref: .base.ref, repo: .base.repo.full_name } } ]' "$CLOSED_PRS_EVIDENCE" > "$MATCHES_FILE"; then
+      echo "Blocked $path: could not filter closed PR evidence for branch $CAPTURED_BRANCH at head $CAPTURED_HEAD; leave the worktree untouched." > "$BLOCKER"
+      continue
+    fi
+    MATCH_COUNT="$(jq -r 'length' "$MATCHES_FILE")"
+    if [ "$MATCH_COUNT" != "1" ]; then
+      {
+        echo "Blocked $path: closed-PR fallback found $MATCH_COUNT same-repository merged main PR matches for branch $CAPTURED_BRANCH at head $CAPTURED_HEAD; leave the worktree untouched."
+        echo "Evidence: $MATCHES_FILE"
+      } > "$BLOCKER"
+      continue
+    fi
+    if ! jq '.[0]' "$MATCHES_FILE" > "$MERGED_PR_JSON"; then
+      echo "Blocked $path: could not save the unique merged-PR fallback evidence; leave the worktree untouched." > "$BLOCKER"
+      continue
+    fi
+    MATCH_PR_NUMBER="$(jq -r '.[0].number // empty' "$MATCHES_FILE")"
+    MATCH_PR_URL="$(jq -r '.[0].url // empty' "$MATCHES_FILE")"
+    if test -z "$MATCH_PR_NUMBER" || test -z "$MATCH_PR_URL"; then
+      echo "Blocked $path: unique merged-PR fallback evidence was missing a PR number or URL; leave the worktree untouched." > "$BLOCKER"
+      continue
+    fi
+    echo "$MATCH_PR_NUMBER" > "$MERGED_PR_NUMBER_FILE"
+    echo "$MATCH_PR_URL" > "$MERGED_PR_URL_FILE"
+    echo merged-pr > "$PROOF_MODE_FILE"
+  fi
+  if ! RECHECK_BRANCH="$(git -C "$path" branch --show-current)" || test -z "$RECHECK_BRANCH"; then
+    echo "Blocked $path: could not revalidate a non-empty branch name immediately before removal; leave the worktree untouched." > "$BLOCKER"
+    continue
+  fi
+  echo "$RECHECK_BRANCH" > "$BRANCH_RECHECK_FILE"
+  if ! RECHECK_HEAD="$(git -C "$path" rev-parse "HEAD^{commit}")"; then
+    echo "Blocked $path: could not revalidate the worktree tip immediately before removal; leave the worktree untouched." > "$BLOCKER"
+    continue
+  fi
+  echo "$RECHECK_HEAD" > "$HEAD_RECHECK_FILE"
+  if [ "$RECHECK_BRANCH" != "$CAPTURED_BRANCH" ] || [ "$RECHECK_HEAD" != "$CAPTURED_HEAD" ]; then
+    {
+      echo "Blocked $path: worktree branch/head drifted after proof capture and before removal; leave the worktree untouched."
+      echo "Captured branch: $CAPTURED_BRANCH"
+      echo "Rechecked branch: $RECHECK_BRANCH"
+      echo "Captured head: $CAPTURED_HEAD"
+      echo "Rechecked head: $RECHECK_HEAD"
+    } > "$BLOCKER"
     continue
   fi
   git -C "$REPO" worktree remove "$path"
