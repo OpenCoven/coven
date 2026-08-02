@@ -40,6 +40,14 @@ fn check_status<'a>(json: &'a Value, id: &str) -> Option<&'a str> {
         .as_str()
 }
 
+fn check_hint<'a>(json: &'a Value, id: &str) -> Option<&'a str> {
+    json["checks"]
+        .as_array()?
+        .iter()
+        .find(|check| check["id"] == id)?["hint"]
+        .as_str()
+}
+
 fn assert_blocking_exit(output: &Output) {
     assert_eq!(output.status.code(), Some(1));
     assert!(
@@ -89,6 +97,10 @@ fn doctor_prose_markers_match_json_severity_and_are_ansi_free() -> anyhow::Resul
     assert_eq!(check_status(&json, "harnesses"), Some("fail"));
     assert_eq!(check_status(&json, "engine"), Some("fail"));
     assert_eq!(check_status(&json, "familiars"), Some("warn"));
+    assert_eq!(
+        check_hint(&json, "familiars"),
+        Some("fix access to or contents of <familiars-manifest>, then rerun coven doctor")
+    );
 
     let repeated = isolated_doctor_command(
         temp.path(),

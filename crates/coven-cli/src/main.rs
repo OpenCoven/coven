@@ -1976,23 +1976,122 @@ impl DoctorCheck {
     }
 }
 
+/// Replace paths in the machine-readable doctor report with stable role
+/// tokens. Doctor JSON is commonly attached to CI logs and bug reports; raw
+/// absolute paths make otherwise identical reports host-specific and can leak
+/// account or project directory names. The prose report intentionally keeps
+/// the concrete paths for local troubleshooting.
+struct DoctorJsonPathRedactor {
+    role_replacements: Vec<(String, String)>,
+    replacements: Vec<(String, String)>,
+}
+
+impl DoctorJsonPathRedactor {
+    fn new(report: &DoctorReport) -> Self {
+        let mut role_replacements = Vec::new();
+        let mut replacements = Vec::new();
+        let mut add_path = |path: &Path, token: String| {
+            let rendered = path.display().to_string();
+            role_replacements.push((rendered.clone(), token.clone()));
+
+            // Only redact rooted paths with a normal component below the root.
+            // Checking components rather than their count rejects Unix `/`,
+            // Windows drive roots, and UNC share roots; prefix/root components
+            // alone would otherwise create an unsafe broad substring
+            // replacement. Root-relative Windows paths are still safe because
+            // the normal component keeps the replacement narrow.
+            if path.has_root()
+                && path
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::Normal(_)))
+            {
+                replacements.push((rendered, token));
+            }
+        };
+
+        add_path(
+            &report.familiars_manifest,
+            "<familiars-manifest>".to_string(),
+        );
+        if let Some(engine) = &report.engine {
+            add_path(&engine.path, "<engine>".to_string());
+        }
+        for repo in &report.repos {
+            // A path may be registered under multiple aliases. Keep the token
+            // path-scoped and neutral so insertion order cannot assign one
+            // alias's identity to another alias's check.
+            add_path(&repo.path, "<repo>".to_string());
+            add_path(&repo.config_path, "<repos-config>".to_string());
+        }
+        if let Some(project_root) = &report.project_root {
+            add_path(project_root, "<project>".to_string());
+        }
+        add_path(&report.home, "<coven-home>".to_string());
+
+        if let Some(status) = report.daemon.as_ref().map(|state| match state {
+            daemon::DaemonStatusState::Running(status)
+            | daemon::DaemonStatusState::Stale(status) => status,
+        }) {
+            let socket = Path::new(&status.socket);
+            add_path(socket, "<daemon-socket>".to_string());
+        }
+
+        // Replace children before parents, for example the manifest before
+        // COVEN_HOME. `sort_by` is stable, so equally long exact paths retain
+        // the role-specific insertion order above.
+        replacements.sort_by_key(|entry| std::cmp::Reverse(entry.0.len()));
+        Self {
+            role_replacements,
+            replacements,
+        }
+    }
+
+    fn text(&self, value: impl AsRef<str>) -> String {
+        self.replacements
+            .iter()
+            .fold(value.as_ref().to_string(), |redacted, (path, token)| {
+                redacted.replace(path, token)
+            })
+    }
+
+    /// Render a value that is itself a known path role. Exact roles can always
+    /// become their semantic token, including relative paths and filesystem
+    /// roots; unlike `text`, this never performs a broad substring replacement
+    /// with those otherwise unsafe values.
+    fn role_path(&self, value: &Path, token: &str) -> String {
+        let rendered = value.display().to_string();
+        self.role_replacements
+            .iter()
+            .find(|(path, registered_token)| {
+                path == &rendered && registered_token.as_str() == token
+            })
+            .map_or_else(|| self.text(rendered), |(_, token)| token.clone())
+    }
+}
+
 /// Derive the machine-readable check list from a gathered report. Statuses
 /// mirror the prose markers: `fail` is exactly the set of conditions that
 /// flip [`DoctorReport::healthy`], so `ok`/exit-code semantics stay identical
 /// across both output modes.
 fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
     let mut checks = Vec::new();
+    let paths = DoctorJsonPathRedactor::new(report);
 
     checks.push(match &report.daemon {
         Some(daemon::DaemonStatusState::Running(status)) => DoctorCheck::pass(
             "daemon",
-            format!("running (pid {}, socket {})", status.pid, status.socket),
+            format!(
+                "running (pid {}, socket {})",
+                status.pid,
+                paths.role_path(Path::new(&status.socket), "<daemon-socket>")
+            ),
         ),
         Some(daemon::DaemonStatusState::Stale(status)) => DoctorCheck::fail(
             "daemon",
             format!(
                 "stale daemon record (pid {}, socket {})",
-                status.pid, status.socket
+                status.pid,
+                paths.role_path(Path::new(&status.socket), "<daemon-socket>")
             ),
             Some("run: coven daemon restart".to_string()),
         ),
@@ -2007,13 +2106,19 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
         checks.push(if repo.ok {
             DoctorCheck::pass(
                 format!("repo:{}", repo.name),
-                repo.path.display().to_string(),
+                paths.role_path(&repo.path, "<repo>"),
             )
         } else {
             DoctorCheck::fail(
                 format!("repo:{}", repo.name),
-                format!("{} is missing or not a git repository", repo.path.display()),
-                Some(format!("fix the path in {}", repo.config_path.display())),
+                format!(
+                    "{} is missing or not a git repository",
+                    paths.role_path(&repo.path, "<repo>")
+                ),
+                Some(format!(
+                    "fix the path in {}",
+                    paths.role_path(&repo.config_path, "<repos-config>")
+                )),
             )
         });
     }
@@ -2060,7 +2165,11 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
             Some("run: coven engine install".to_string()),
         ),
         Some(engine) => {
-            let located = format!("{} ({})", engine.path.display(), engine.source_label);
+            let located = format!(
+                "{} ({})",
+                paths.role_path(&engine.path, "<engine>"),
+                engine.source_label
+            );
             match engine.version {
                 None => DoctorCheck::warn(
                     "engine",
@@ -2094,16 +2203,20 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
             "familiars",
             format!(
                 "could not read {}: {error}",
-                report.familiars_manifest.display()
+                paths.role_path(&report.familiars_manifest, "<familiars-manifest>"),
+                error = paths.text(error)
             ),
             Some(format!(
                 "fix access to or contents of {}, then rerun coven doctor",
-                report.familiars_manifest.display()
+                paths.role_path(&report.familiars_manifest, "<familiars-manifest>")
             )),
         ),
         Ok(familiars) if familiars.is_empty() => DoctorCheck::pass(
             "familiars",
-            format!("none configured ({})", report.familiars_manifest.display()),
+            format!(
+                "none configured ({})",
+                paths.role_path(&report.familiars_manifest, "<familiars-manifest>")
+            ),
         ),
         Ok(familiars) => DoctorCheck::pass("familiars", format!("{} configured", familiars.len())),
     });
@@ -2137,11 +2250,8 @@ fn doctor_json_body(report: &DoctorReport) -> serde_json::Value {
     serde_json::json!({
         "ok": ok,
         "blocking": !ok,
-        "store": report.home.display().to_string(),
-        "project": report
-            .project_root
-            .as_ref()
-            .map(|root| root.display().to_string()),
+        "store": "<coven-home>",
+        "project": report.project_root.as_ref().map(|_| "<project>"),
         "checks": checks,
         "nextSteps": doctor_next_steps(report.default_harness.as_deref()),
     })
@@ -6297,6 +6407,121 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn doctor_json_redactor_rejects_unix_root_replacements() {
+        let mut report = make_doctor_report();
+        report.home = PathBuf::from("/");
+        report.repos.push(DoctorRepoReport {
+            name: "root".to_string(),
+            path: PathBuf::from("/"),
+            config_path: PathBuf::from("/tmp/repos.toml"),
+            ok: true,
+        });
+
+        let redactor = DoctorJsonPathRedactor::new(&report);
+        assert!(
+            redactor.replacements.iter().all(|(path, _)| path != "/"),
+            "the Unix filesystem root must never become a global replacement"
+        );
+        assert_eq!(redactor.text("/var/lib/coven"), "/var/lib/coven");
+        let root_check = doctor_checks(&report)
+            .into_iter()
+            .find(|check| check.id == "repo:root")
+            .expect("root repository check");
+        assert_eq!(root_check.message, "<repo>");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn doctor_json_redactor_rejects_windows_drive_and_unc_roots() {
+        let mut drive_report = make_doctor_report();
+        drive_report.home = PathBuf::from(r"C:\");
+        drive_report.repos.push(DoctorRepoReport {
+            name: "drive-root".to_string(),
+            path: PathBuf::from(r"C:\"),
+            config_path: PathBuf::from(r"C:\repos.toml"),
+            ok: true,
+        });
+        let drive_redactor = DoctorJsonPathRedactor::new(&drive_report);
+        assert!(
+            drive_redactor
+                .replacements
+                .iter()
+                .all(|(path, _)| path != r"C:\"),
+            "a Windows drive root must never become a global replacement"
+        );
+        assert_eq!(
+            drive_redactor.text(r"C:\Users\example\project"),
+            r"C:\Users\example\project"
+        );
+        let drive_check = doctor_checks(&drive_report)
+            .into_iter()
+            .find(|check| check.id == "repo:drive-root")
+            .expect("drive-root repository check");
+        assert_eq!(drive_check.message, "<repo>");
+
+        let mut unc_report = make_doctor_report();
+        unc_report.home = PathBuf::from(r"\\server\share\");
+        unc_report.repos.push(DoctorRepoReport {
+            name: "unc-root".to_string(),
+            path: PathBuf::from(r"\\server\share\"),
+            config_path: PathBuf::from(r"\\server\share\repos.toml"),
+            ok: true,
+        });
+        let unc_redactor = DoctorJsonPathRedactor::new(&unc_report);
+        assert!(
+            unc_redactor
+                .replacements
+                .iter()
+                .all(|(path, _)| path != r"\\server\share\"),
+            "a UNC share root must never become a global replacement"
+        );
+        assert_eq!(
+            unc_redactor.text(r"\\server\share\project"),
+            r"\\server\share\project"
+        );
+        let unc_check = doctor_checks(&unc_report)
+            .into_iter()
+            .find(|check| check.id == "repo:unc-root")
+            .expect("UNC-root repository check");
+        assert_eq!(unc_check.message, "<repo>");
+    }
+
+    #[test]
+    fn doctor_json_redacts_relative_daemon_socket_without_broad_replacement() {
+        let mut report = make_doctor_report();
+        let private_hash = "0123456789abcdef0123456789abcdef";
+        let socket = format!("coven-daemon-{private_hash}.sock");
+        report.daemon = Some(daemon::DaemonStatusState::Running(daemon::DaemonStatus {
+            pid: 42,
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            socket: socket.clone(),
+        }));
+
+        let redactor = DoctorJsonPathRedactor::new(&report);
+        assert_eq!(
+            redactor.text(format!("socket={socket}")),
+            format!("socket={socket}"),
+            "relative paths must not become broad substring replacements"
+        );
+
+        let body = doctor_json_body(&report);
+        let daemon = body["checks"]
+            .as_array()
+            .expect("checks array")
+            .iter()
+            .find(|check| check["id"] == "daemon")
+            .expect("daemon check");
+        assert_eq!(
+            daemon["message"],
+            "running (pid 42, socket <daemon-socket>)"
+        );
+        let serialized = body.to_string();
+        assert!(!serialized.contains(private_hash));
+        assert!(!serialized.contains(&socket));
+    }
+
     fn make_doctor_report() -> DoctorReport {
         DoctorReport {
             home: PathBuf::from("/tmp/coven-home"),
@@ -6375,7 +6600,7 @@ mod tests {
     }
 
     #[test]
-    fn doctor_bad_repo_hint_names_the_entrys_actual_config_source() {
+    fn doctor_bad_repo_hint_redacts_the_entrys_actual_config_source() {
         let mut report = make_doctor_report();
         report.repos.push(DoctorRepoReport {
             name: "openclaw".to_string(),
@@ -6391,7 +6616,7 @@ mod tests {
         assert_eq!(check.status, "fail");
         assert_eq!(
             check.hint.as_deref(),
-            Some("fix the path in /tmp/settings.json")
+            Some("fix the path in <repos-config>")
         );
     }
 
@@ -6428,8 +6653,8 @@ mod tests {
         let body = doctor_json_body(&report);
         assert_eq!(body["ok"], serde_json::json!(false));
         assert_eq!(body["blocking"], serde_json::json!(true));
-        assert_eq!(body["store"], serde_json::json!("/tmp/coven-home"));
-        assert_eq!(body["project"], serde_json::json!("/tmp/project"));
+        assert_eq!(body["store"], serde_json::json!("<coven-home>"));
+        assert_eq!(body["project"], serde_json::json!("<project>"));
         let checks = body["checks"].as_array().expect("checks array");
         let harness_check = checks
             .iter()
@@ -6448,6 +6673,18 @@ mod tests {
             .expect("engine check");
         assert_eq!(engine["status"], "fail");
         assert_eq!(engine["hint"], "run: coven engine install");
+        let familiars = checks
+            .iter()
+            .find(|check| check["id"] == "familiars")
+            .expect("familiars check");
+        assert_eq!(
+            familiars["message"],
+            "none configured (<familiars-manifest>)"
+        );
+        assert!(
+            !body.to_string().contains("/tmp/"),
+            "doctor JSON must not expose host-specific fixture paths: {body}"
+        );
         assert!(
             checks
                 .iter()
@@ -6478,8 +6715,18 @@ mod tests {
             daemon["message"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("pid 42"),
+                .contains("pid 42, socket <daemon-socket>"),
             "daemon message should carry the pid: {daemon}"
+        );
+        let engine = checks
+            .iter()
+            .find(|check| check["id"] == "engine")
+            .expect("engine check");
+        assert!(
+            engine["message"]
+                .as_str()
+                .is_some_and(|message| message.starts_with("<engine>")),
+            "engine path should be role-redacted: {engine}"
         );
         let credentials = checks
             .iter()
