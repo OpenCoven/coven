@@ -121,6 +121,9 @@ fn doctor_json_is_stable_redacted_and_stdout_pure() -> anyhow::Result<()> {
             "harnesses",
             "engine",
             "familiars",
+            "credentials:codex",
+            "credentials:claude",
+            "credentials:copilot",
         ],
         "Doctor check ordering is part of the JSON compatibility contract"
     );
