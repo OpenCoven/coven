@@ -725,6 +725,7 @@ dependencies = [
  "crossterm",
  "dirs-next",
  "flate2",
+ "fs2",
  "globset",
  "interprocess",
  "json5",
@@ -737,6 +738,7 @@ dependencies = [
  "rcgen",
  "regex",
  "rusqlite",
+ "rustix",
  "rustls",
  "rustls-pki-types",
  "serde",
@@ -1596,6 +1598,16 @@ dependencies = [
  "io-lifetimes 2.0.4",
  "rustix",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
 ]
 
 [[package]]

@@ -247,6 +247,12 @@ verified -> restoring -> restored
 
 Create directories and files with private permissions, `create_new`, no-follow checks, sibling staging, `sync_all`, and parent directory syncs. Journal every target as `prepared`, `published`, or `verified`. On failure, remove only targets created by the current bundle whose digest still matches.
 
+Apply is supported only where the implementation can guarantee private files,
+atomic no-replace publication, and durable parent-directory synchronization.
+On Windows, preview remains available but apply must fail before creating the
+migration or canonical memory directories until equivalent durability
+primitives are implemented.
+
 - [ ] **Step 4: Verify and commit**
 
 Run:
@@ -369,4 +375,3 @@ Compare source bytes before/after, canonical target hashes after apply, and targ
 ```bash
 git commit -s -m "docs(memory): document familiar import recovery"
 ```
-

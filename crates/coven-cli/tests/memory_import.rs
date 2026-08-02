@@ -216,6 +216,7 @@ fn preview_conflict_is_whole_plan_ineligible_and_creates_nothing() -> Result<()>
 }
 
 #[test]
+#[cfg(not(windows))]
 fn apply_publishes_a_private_redacted_bundle_and_leaves_sources_unchanged() -> Result<()> {
     let temp = trusted_tempdir()?;
     let workspace = temp.path().join("native-workspace");
@@ -254,6 +255,7 @@ fn apply_publishes_a_private_redacted_bundle_and_leaves_sources_unchanged() -> R
 }
 
 #[test]
+#[cfg(not(windows))]
 fn apply_conflict_creates_no_bundle_or_additional_target() -> Result<()> {
     let temp = trusted_tempdir()?;
     let workspace = temp.path().join("native-workspace");
@@ -285,6 +287,7 @@ fn apply_conflict_creates_no_bundle_or_additional_target() -> Result<()> {
 }
 
 #[test]
+#[cfg(not(windows))]
 fn apply_rerun_is_idempotent_and_isolated_to_one_familiar() -> Result<()> {
     let temp = trusted_tempdir()?;
     let sage_workspace = temp.path().join("sage-workspace");
@@ -344,6 +347,7 @@ fn apply_rerun_is_idempotent_and_isolated_to_one_familiar() -> Result<()> {
 }
 
 #[test]
+#[cfg(not(windows))]
 fn apply_preserves_an_existing_exact_target_and_human_output_is_redacted() -> Result<()> {
     let temp = trusted_tempdir()?;
     let workspace = temp.path().join("native-workspace");
@@ -380,6 +384,34 @@ fn apply_preserves_an_existing_exact_target_and_human_output_is_redacted() -> Re
     #[cfg(not(unix))]
     let _ = (before, after);
     assert_eq!(fs::read(target)?, b"same bytes");
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn apply_fails_closed_before_mutation_when_directory_durability_is_unavailable() -> Result<()> {
+    let temp = trusted_tempdir()?;
+    let workspace = temp.path().join("native-workspace");
+    write_familiar(temp.path(), "sage", &workspace)?;
+    write_file(&workspace.join("MEMORY.md"), b"same bytes")?;
+
+    let output = run_coven(
+        temp.path(),
+        &[
+            "memory",
+            "import",
+            "--familiar",
+            "sage",
+            "--apply",
+            "--json",
+        ],
+    )?;
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("durable directory publication"), "{stderr}");
+    assert!(!temp.path().join("memory").exists());
+    assert!(!temp.path().join("memory-migrations").exists());
     Ok(())
 }
 
