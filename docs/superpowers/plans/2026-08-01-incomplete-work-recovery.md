@@ -4201,8 +4201,9 @@ done
 
 Expected: empty output.
 
-Then prove each branch's PR merged or its tip is represented by current main,
-and remove the five clean worktrees:
+Then prove each branch's tip is reachable from freshly fetched `origin/main`
+or, if ancestry fails, from exactly one freshly discovered same-repo merged PR
+for that worktree branch, and remove the five clean worktrees:
 
 ```bash
 set -euo pipefail
