@@ -4559,13 +4559,17 @@ step, only for these four exact paths, and only after the worktree and index
 patch evidence, verified branch bundle, lossless untracked inventory plus tar
 evidence, ignored-path inventory evidence, terminal ledger classification, and
 either an adopted exact-source-branch open PR, an open replacement PR, or
-recorded non-viable/blocker evidence are all present.
+recorded non-viable/blocker evidence are all present. For each source tree,
+re-read the preserved `dirty/<id>/branch.txt` identity, require the live
+`git branch --show-current` to match it before any live-state comparisons, and
+recheck that branch identity immediately before `git worktree remove --force`.
 Rows blocked because an existing PR already covers the preserved head while
 `worktree.patch`, `index.patch`, or `.untracked.zlist` remains non-empty are
 explicitly excluded from forced source cleanup and leave their original
 worktree and branch untouched. Any non-empty preserved `.ignored.zlist` also
 prohibits forced source cleanup and must instead emit blocker evidence with a
-resume condition. Unrelated or unsnapshotted worktrees must never use force.
+resume condition. Detached, repurposed, or unrelated worktrees must never use
+force and must remain untouched.
 
 Run:
 
@@ -5112,9 +5116,28 @@ do
       esac
       PR_VIEW_EVIDENCE="$PROOF_DIR/live-pr-view.json"
       PR_BLOCKER_EVIDENCE="$PROOF_DIR/live-pr-view.err"
+      SOURCE_BRANCH_FETCH_EVIDENCE="$PROOF_DIR/live-source-branch-fetch.txt"
       RECOVERY_BRANCH_FETCH_EVIDENCE="$PROOF_DIR/live-recovery-branch-fetch.txt"
       ACTION_FETCHED_HEAD=''
       case "$ACTION_MODE/$ACTION_PR_KIND" in
+        continue-existing-pr/adopted)
+          {
+            printf 'Expected source branch: %s\n' "$ACTION_EXPECTED_BRANCH"
+            printf 'Expected preserved head from action: %s\n' "$ACTION_PRESERVED_HEAD"
+            printf 'Fetching origin/%s for retirement verification.\n' "$ACTION_EXPECTED_BRANCH"
+          } > "$SOURCE_BRANCH_FETCH_EVIDENCE"
+          if ! git -C "$REPO" fetch --no-tags origin \
+            "refs/heads/$ACTION_EXPECTED_BRANCH:refs/remotes/origin/$ACTION_EXPECTED_BRANCH" \
+            >> "$SOURCE_BRANCH_FETCH_EVIDENCE" 2>&1; then
+            block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+              "could not refetch the expected adopted source branch immediately before retirement verification"
+            cat "$SOURCE_BRANCH_FETCH_EVIDENCE" >> "$BLOCKER"
+            continue
+          fi
+          ACTION_FETCHED_HEAD="$(git -C "$REPO" rev-parse "refs/remotes/origin/$ACTION_EXPECTED_BRANCH")"
+          printf 'Fresh fetched origin/%s tip: %s\n' \
+            "$ACTION_EXPECTED_BRANCH" "$ACTION_FETCHED_HEAD" >> "$SOURCE_BRANCH_FETCH_EVIDENCE"
+          ;;
         continue-existing-pr/recovered|recovery-pr-open/recovered)
           {
             printf 'Expected recovery branch: %s\n' "$ACTION_EXPECTED_BRANCH"
@@ -5165,14 +5188,16 @@ do
               SNAPSHOT_HEAD="$(tr -d '\n' < "$SNAPSHOT/head.txt")"
               if [ "$ACTION_EXPECTED_BRANCH" != "$ACTUAL_BRANCH" ] || \
                  [ "$ACTION_PRESERVED_HEAD" != "$SNAPSHOT_HEAD" ] || \
+                 [ "$ACTION_FETCHED_HEAD" != "$ACTUAL_HEAD" ] || \
                  ! git -C "$REPO" merge-base --is-ancestor "$ACTION_PRESERVED_HEAD" "$ACTUAL_HEAD"; then
                 block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
-                  "adopted PR no longer matches the expected source branch and preserved-head ancestry"
+                  "adopted PR no longer matches the expected source branch, fetched tip, and preserved-head ancestry"
                 {
                   printf 'Expected branch from recovery action: %s\n' "$ACTION_EXPECTED_BRANCH"
                   printf 'Actual branch from PR: %s\n' "$ACTUAL_BRANCH"
                   printf 'Preserved head from recovery action: %s\n' "$ACTION_PRESERVED_HEAD"
                   printf 'Preserved head from snapshot: %s\n' "$SNAPSHOT_HEAD"
+                  printf 'Fresh fetched origin/%s tip: %s\n' "$ACTION_EXPECTED_BRANCH" "$ACTION_FETCHED_HEAD"
                   printf 'Current PR head: %s\n' "$ACTUAL_HEAD"
                 } >> "$BLOCKER"
                 continue
@@ -5228,6 +5253,26 @@ do
   if ! test -d "$SOURCE"; then
     block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
       "source worktree is missing before retirement proof; take a fresh snapshot and reclassify"
+    continue
+  fi
+  if ! test -s "$SNAPSHOT/branch.txt"; then
+    block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+      "preserved branch identity snapshot is missing; take a fresh snapshot and reclassify before removal"
+    continue
+  fi
+  PRESERVED_BRANCH="$(tr -d '\n' < "$SNAPSHOT/branch.txt")"
+  if ! CURRENT_BRANCH="$(git -C "$SOURCE" branch --show-current)" || test -z "$CURRENT_BRANCH"; then
+    block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+      "source worktree is detached or branchless before retirement proof; leave the worktree untouched"
+    continue
+  fi
+  if [ "$CURRENT_BRANCH" != "$PRESERVED_BRANCH" ]; then
+    block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+      "source worktree branch drifted before live-state comparisons; leave the worktree untouched"
+    {
+      printf 'Preserved branch: %s\n' "$PRESERVED_BRANCH"
+      printf 'Current branch: %s\n' "$CURRENT_BRANCH"
+    } >> "$BLOCKER"
     continue
   fi
   git -C "$SOURCE" rev-parse HEAD > "$PROOF_DIR/live-head.txt"
@@ -5299,6 +5344,20 @@ PY
       "preserved ignored-path inventory is non-empty, so forced source-worktree removal is prohibited"
     continue
   fi
+  if ! REMOVE_BRANCH="$(git -C "$SOURCE" branch --show-current)" || test -z "$REMOVE_BRANCH"; then
+    block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+      "source worktree became detached or branchless immediately before forced removal; leave the worktree untouched"
+    continue
+  fi
+  if [ "$REMOVE_BRANCH" != "$PRESERVED_BRANCH" ]; then
+    block_retirement "$id" "$BLOCKER" "$CLASSIFICATION_LABEL" "$MAIN_PR_EVIDENCE" "$PRESERVED_SOURCE" "$RECOVERY_ACTION" \
+      "source worktree branch drifted immediately before forced removal; leave the worktree untouched"
+    {
+      printf 'Preserved branch: %s\n' "$PRESERVED_BRANCH"
+      printf 'Current branch: %s\n' "$REMOVE_BRANCH"
+    } >> "$BLOCKER"
+    continue
+  fi
   git -C "$REPO" worktree remove --force "$SOURCE"
 done
 ```
@@ -5314,7 +5373,9 @@ every viable PR still has to freshly verify `OPEN`, `baseRefName=main`, and
 `OpenCoven/coven`. Adopted source-branch rows additionally require their
 parsed expected source branch to equal the current `headRefName`, and their
 parsed preserved head to remain equal to or an ancestor of the current
-`headRefOid`; a force-push or divergence blocks retirement with evidence.
+`headRefOid`; they also require a freshly fetched authoritative `origin/<branch>`
+tip to equal the current `headRefOid`; a force-push or divergence blocks
+retirement with evidence.
 Adopted or newly opened recovery-branch rows additionally require the parsed
 expected recovery branch to equal the current `headRefName`, a fresh exact
 `origin/<branch>` refetch immediately before verification to resolve the
@@ -5324,8 +5385,9 @@ blocks retirement with evidence. These recovered-row checks do not require
 ancestry to the old preserved local snapshot head because that work may have
 been rebuilt on current `main`. Any unverifiable viable PR or non-viable proof
 writes cleanup blocker evidence and leaves the original source worktree and
-branch untouched. After that gate, the existing snapshot, live-drift, and
-ignored-content comparisons still run before removal.
+branch untouched. After that gate, the preserved branch identity must still
+match immediately before forced removal, and the existing snapshot, live-drift,
+and ignored-content comparisons still run before removal.
 
 - [ ] **Step 5: Delete only proven local branch residue after worktree retirement**
 
