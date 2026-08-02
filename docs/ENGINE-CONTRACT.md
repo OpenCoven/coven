@@ -41,9 +41,14 @@ version.
    validation
 8. `coven-code --permission-mode {default|accept-edits|bypass-permissions|plan}` —
    accepted and honored; coven passes the value through unvalidated
-9. `coven-code auth status --json` — machine-readable auth state; coven reads only
-   the `loggedIn` boolean; additional fields may be present and are ignored;
-   exit 0 = logged in, 1 = not
+9. `coven-code auth status --json` — machine-readable, local auth-configuration
+   state. This command MUST be an offline read of engine-owned local state: it
+   MUST NOT contact a provider or other network service, refresh credentials,
+   launch an external harness, or start a provider turn. Coven reads only the
+   `loggedIn` boolean; additional fields may be present and are ignored. Exit
+   0 with `loggedIn: true` means authentication is locally configured; exit 1
+   with `loggedIn: false` means it is not. Any other exit/output combination is
+   unavailable advisory evidence, never proof of provider access.
 
    Minimal example:
    ```json

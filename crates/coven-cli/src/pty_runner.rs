@@ -597,21 +597,21 @@ struct CodexJsonState {
     emitted_assistant: bool,
 }
 
-/// Owns the direct Codex child and all of its descendants while a one-shot
-/// JSON turn is running. A Node/npm wrapper can outlive or outspawn the direct
-/// launcher, so a plain `Child::kill()` is not enough to guarantee pipe EOF.
-struct CodexProcessTree {
+/// Own a one-shot child process tree. A wrapper can outlive or outspawn the
+/// direct launcher, so a plain `Child::kill()` is not enough to guarantee pipe
+/// EOF or descendant cleanup.
+pub(crate) struct ChildProcessTree {
     pid: u32,
     terminated: bool,
     #[cfg(windows)]
     job_handle: Option<windows_sys::Win32::Foundation::HANDLE>,
 }
 
-impl CodexProcessTree {
-    fn attach(child: &std::process::Child) -> Self {
+impl ChildProcessTree {
+    pub(crate) fn attach(child: &std::process::Child) -> Self {
         let pid = child.id();
         #[cfg(windows)]
-        let job_handle = codex_job_object_for_process(child);
+        let job_handle = child_job_object_for_process(child);
         Self {
             pid,
             terminated: false,
@@ -620,14 +620,18 @@ impl CodexProcessTree {
         }
     }
 
-    fn terminate(&mut self, child: &mut std::process::Child) {
+    pub(crate) fn terminate(&mut self, child: &mut std::process::Child) {
+        self.terminate_impl(child, true);
+    }
+
+    fn terminate_impl(&mut self, child: &mut std::process::Child, _allow_taskkill_fallback: bool) {
         if self.terminated {
             return;
         }
         self.terminated = true;
         #[cfg(unix)]
         {
-            terminate_codex_unix_process_group(self.pid);
+            terminate_unix_process_group(self.pid);
         }
         #[cfg(windows)]
         {
@@ -642,7 +646,7 @@ impl CodexProcessTree {
                     succeeded
                 })
                 .unwrap_or(false);
-            if !terminated_by_job {
+            if !terminated_by_job && _allow_taskkill_fallback {
                 // A Job Object can be unavailable when a parent policy forbids
                 // assignment. Fall back to Windows' documented tree kill for
                 // npm's cmd.exe -> node.exe -> codex.exe chain.
@@ -661,27 +665,65 @@ impl CodexProcessTree {
     }
 }
 
+/// A process tree whose descendants were contained before its first
+/// instruction ran. Its termination path deliberately cannot select the
+/// legacy `taskkill` fallback used by the Codex runner.
+pub(crate) struct StrictChildProcessTree(ChildProcessTree);
+
+impl StrictChildProcessTree {
+    fn attach(child: &std::process::Child) -> Option<Self> {
+        #[cfg(unix)]
+        {
+            Some(Self(ChildProcessTree::attach(child)))
+        }
+        #[cfg(windows)]
+        {
+            let job_handle = child_job_object_for_process(child)?;
+            if !resume_suspended_child(child) {
+                // KILL_ON_JOB_CLOSE ensures a partially resumed child cannot
+                // escape when thread enumeration/resume fails.
+                unsafe { windows_sys::Win32::Foundation::CloseHandle(job_handle) };
+                return None;
+            }
+            Some(Self(ChildProcessTree {
+                pid: child.id(),
+                terminated: false,
+                job_handle: Some(job_handle),
+            }))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = child;
+            None
+        }
+    }
+
+    pub(crate) fn terminate(&mut self, child: &mut std::process::Child) {
+        self.0.terminate_impl(child, false);
+    }
+}
+
 #[cfg(unix)]
-fn terminate_codex_unix_process_group(pid: u32) {
+fn terminate_unix_process_group(pid: u32) {
     // The launch config puts the child at the head of a new session, so the
     // negative pid reaches its wrapper and every descendant.
     let _ = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
 }
 
 #[cfg(unix)]
-impl Drop for CodexProcessTree {
+impl Drop for ChildProcessTree {
     fn drop(&mut self) {
         if !self.terminated {
             // A wrapper can exit after detaching a descendant that has already
             // closed stdout/stderr. There is then no pipe timeout to trigger
             // terminate(), but this one-shot runner still owns that group.
-            terminate_codex_unix_process_group(self.pid);
+            terminate_unix_process_group(self.pid);
         }
     }
 }
 
 #[cfg(windows)]
-impl Drop for CodexProcessTree {
+impl Drop for ChildProcessTree {
     fn drop(&mut self) {
         if let Some(job) = self.job_handle.take() {
             // The job is configured with KILL_ON_JOB_CLOSE, so an abrupt
@@ -720,7 +762,7 @@ fn trusted_windows_taskkill_path() -> Option<PathBuf> {
 }
 
 #[cfg(windows)]
-fn codex_job_object_for_process(
+fn child_job_object_for_process(
     child: &std::process::Child,
 ) -> Option<windows_sys::Win32::Foundation::HANDLE> {
     use std::mem::size_of;
@@ -759,7 +801,61 @@ fn codex_job_object_for_process(
     }
 }
 
-fn configure_codex_json_command(_command: &mut std::process::Command) {
+#[cfg(windows)]
+fn resume_suspended_child(child: &std::process::Child) -> bool {
+    use std::mem::size_of;
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, GetLastError, ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE},
+        System::{
+            Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD,
+                THREADENTRY32,
+            },
+            Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME},
+        },
+    };
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return false;
+    }
+
+    let mut entry = THREADENTRY32 {
+        dwSize: size_of::<THREADENTRY32>() as u32,
+        ..Default::default()
+    };
+    let mut thread_ids = Vec::new();
+    let mut has_entry = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+    let mut enumeration_complete = false;
+    while has_entry {
+        if entry.th32OwnerProcessID == child.id() {
+            thread_ids.push(entry.th32ThreadID);
+        }
+        has_entry = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+        if !has_entry {
+            enumeration_complete = unsafe { GetLastError() } == ERROR_NO_MORE_FILES;
+        }
+    }
+    unsafe { CloseHandle(snapshot) };
+
+    if !enumeration_complete {
+        return false;
+    }
+    // CREATE_SUSPENDED creates exactly one primary thread. Anything else is
+    // inconsistent with the promised before-first-instruction boundary.
+    let [thread_id] = thread_ids.as_slice() else {
+        return false;
+    };
+    let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, *thread_id) };
+    if thread.is_null() {
+        return false;
+    }
+    let previous_suspend_count = unsafe { ResumeThread(thread) };
+    unsafe { CloseHandle(thread) };
+    previous_suspend_count == 1
+}
+
+fn configure_child_process_tree_command(_command: &mut std::process::Command) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -772,6 +868,36 @@ fn configure_codex_json_command(_command: &mut std::process::Command) {
                 }
                 Ok(())
             });
+        }
+    }
+}
+
+/// Spawn a process tree that cannot execute before Coven owns its descendants.
+/// Unix uses a fresh session created in the child before exec. Windows creates
+/// the process suspended, assigns it to a kill-on-close Job Object, and only
+/// then resumes its initial thread.
+pub(crate) fn spawn_strict_child_process_tree(
+    command: &mut std::process::Command,
+) -> std::io::Result<(std::process::Child, StrictChildProcessTree)> {
+    #[cfg(unix)]
+    configure_child_process_tree_command(command);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+
+        command.creation_flags(CREATE_SUSPENDED);
+    }
+
+    let mut child = command.spawn()?;
+    match StrictChildProcessTree::attach(&child) {
+        Some(tree) => Ok((child, tree)),
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(std::io::Error::other(
+                "failed to establish strict child-process containment",
+            ))
         }
     }
 }
@@ -848,7 +974,7 @@ where
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    configure_codex_json_command(&mut child_command);
+    configure_child_process_tree_command(&mut child_command);
     let cancellation = CodexCancellationGuard::install()?;
     if let Some(error) = codex_cancellation_error(&cancellation) {
         anyhow::bail!(error);
@@ -859,7 +985,7 @@ where
             command.program()
         )
     })?;
-    let mut process_tree = CodexProcessTree::attach(&child);
+    let mut process_tree = ChildProcessTree::attach(&child);
     cancellation.arm(process_tree.pid);
 
     let stdout = match child.stdout.take() {

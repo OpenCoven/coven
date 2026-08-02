@@ -16,9 +16,10 @@ Start with:
 coven doctor
 ```
 
-In the `Harnesses` section, `ready` means Coven can find the executable. `missing`
-means the binary is not visible from this shell, even if another terminal or app
-can run it.
+In the `Harnesses` section, `executable is available` means Coven can find the
+binary. It does not mean provider authentication was verified. `missing` means
+the binary is not visible from this shell, even if another terminal or app can
+run it.
 
 ## Install a supported harness
 
@@ -92,21 +93,25 @@ coven doctor
 
 ## Authentication failures
 
-If `coven doctor` says the harness is ready but `coven run` exits immediately,
-the binary is visible but the provider CLI is not authenticated. Run the provider
-setup command directly:
+If `coven doctor` says the harness executable is available but `coven run` exits
+immediately, the binary is visible but the provider CLI may not be authenticated.
+Run the provider setup or local-status command directly:
 
 ```sh
 codex login
 claude doctor
 ```
 
-Then verify again:
+Then, when a provider call is explicitly authorized, verify access with a test
+turn:
 
 ```sh
-coven doctor
 coven run codex "say hello"
 ```
+
+Running `coven doctor` again can confirm executable discovery and local engine
+state, but it deliberately does not call a provider or prove the external
+harness is authenticated.
 
 ## Still failing
 

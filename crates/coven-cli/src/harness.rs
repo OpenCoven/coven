@@ -11,6 +11,7 @@ pub const EXTERNAL_ADAPTER_MANIFEST_ENV: &str = "COVEN_HARNESS_ADAPTER_MANIFEST"
 pub const EXTERNAL_ADAPTER_DIRS_ENV: &str = "COVEN_HARNESS_ADAPTER_DIRS";
 pub const CLAUDE_BYPASS_PERMISSIONS_ENV: &str = "COVEN_CLAUDE_BYPASS_PERMISSIONS";
 pub const TRUSTED_ADAPTERS_DIR_NAME: &str = "adapters";
+const SHADOWED_BUILTIN_MANIFEST_SUFFIX: &str = ".shadowed-by-builtin";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HarnessSummary {
@@ -980,7 +981,9 @@ fn external_adapter_manifest_sources(adapter_env: &AdapterEnv) -> Vec<AdapterMan
     }
 
     if let Some(manifest_path) = adapter_env.manifest_path.as_deref() {
-        sources.push(AdapterManifestSource::Path(PathBuf::from(manifest_path)));
+        sources.push(explicit_adapter_manifest_source(PathBuf::from(
+            manifest_path,
+        )));
     }
 
     if let Some(dir_list) = adapter_env.adapter_dirs.as_deref() {
@@ -998,6 +1001,24 @@ fn external_adapter_manifest_sources(adapter_env: &AdapterEnv) -> Vec<AdapterMan
         .into_iter()
         .filter(|source| seen.insert(source.path().to_path_buf()))
         .collect()
+}
+
+fn explicit_adapter_manifest_source(path: PathBuf) -> AdapterManifestSource {
+    if fs::symlink_metadata(&path).is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound) {
+        let mut marker = path.as_os_str().to_os_string();
+        marker.push(SHADOWED_BUILTIN_MANIFEST_SUFFIX);
+        let marker = PathBuf::from(marker);
+        if fs::symlink_metadata(&marker).is_ok_and(|metadata| metadata.file_type().is_file()) {
+            eprintln!(
+                "warning: harness adapter manifest {} was quarantined after its adapter became \
+                 built-in; loading {} instead",
+                path.display(),
+                marker.display()
+            );
+            return AdapterManifestSource::Path(marker);
+        }
+    }
+    AdapterManifestSource::Path(path)
 }
 
 pub fn trusted_adapter_dir(coven_home: &Path) -> PathBuf {
@@ -3704,6 +3725,83 @@ mod tests {
         let (program, args) = launch?;
         assert_eq!(program, "codex");
         assert!(!args.is_empty());
+        Ok(())
+    }
+
+    /// Cave quarantines manifests that shadow a newly built-in harness by
+    /// renaming them off the `.json` suffix. A daemon service may retain the
+    /// original explicit manifest path until it is restarted or reinstalled;
+    /// resolve that exact marker instead of bricking every daemon launch.
+    #[test]
+    fn quarantined_explicit_manifest_path_keeps_built_ins_available() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let manifest = temp_dir.path().join("copilot.json");
+        let mut quarantined = manifest.as_os_str().to_os_string();
+        quarantined.push(SHADOWED_BUILTIN_MANIFEST_SUFFIX);
+        let quarantined = PathBuf::from(quarantined);
+        fs::write(
+            quarantined,
+            r#"{
+              "adapters": [
+                {
+                  "id": "copilot",
+                  "label": "Copilot (stale scaffold)",
+                  "executable": "copilot",
+                  "interactive_prompt_prefix_args": [],
+                  "non_interactive_prompt_prefix_args": ["--prompt"],
+                  "install_hint": "Install copilot."
+                },
+                {
+                  "id": "sidecar",
+                  "label": "Sidecar",
+                  "executable": "sidecar",
+                  "interactive_prompt_prefix_args": [],
+                  "non_interactive_prompt_prefix_args": ["run"],
+                  "install_hint": "Install sidecar."
+                }
+              ]
+            }"#,
+        )?;
+
+        let specs = configured_harness_specs_from(&AdapterEnv {
+            manifest_path: Some(manifest.into()),
+            ..Default::default()
+        })?;
+
+        let copilot = specs
+            .iter()
+            .find(|spec| spec.id == "copilot")
+            .expect("built-in copilot spec present");
+        assert_eq!(copilot.source, "bundled");
+        let sidecar = specs
+            .iter()
+            .find(|spec| spec.id == "sidecar")
+            .expect("non-shadowed sibling adapter remains available");
+        assert!(sidecar
+            .manifest_path
+            .as_deref()
+            .is_some_and(|path| path.ends_with("copilot.json.shadowed-by-builtin")));
+        Ok(())
+    }
+
+    #[test]
+    fn genuinely_missing_explicit_manifest_path_remains_fatal() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let manifest = temp_dir.path().join("missing.json");
+
+        let err = configured_harness_specs_from(&AdapterEnv {
+            manifest_path: Some(manifest.clone().into()),
+            ..Default::default()
+        })
+        .expect_err("missing explicit manifest must remain an operator error");
+
+        assert!(
+            err.to_string().contains(&format!(
+                "failed to read harness adapter manifest {}",
+                manifest.display()
+            )),
+            "unexpected error: {err:#}"
+        );
         Ok(())
     }
 

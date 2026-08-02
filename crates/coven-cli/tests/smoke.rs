@@ -427,6 +427,7 @@ fn doctor_json_reports_blocking_failure_when_no_harness_is_available() -> anyhow
     let output = Command::new(&coven)
         .args(["doctor", "--json"])
         .env("COVEN_HOME", &coven_home)
+        .env_remove("COVEN_ENGINE_BIN")
         .env("PATH", &empty_path)
         .env("HOME", &fake_home)
         .output()?;
@@ -470,7 +471,13 @@ fn doctor_json_passes_with_fake_harness_and_engine() -> anyhow::Result<()> {
     let path = prepend_path(&fake_bin);
     let coven = coven_bin();
 
-    let output = run_coven(&coven, &coven_home, &path, &["doctor", "--json"])?;
+    let output = run_coven_with_engine(
+        &coven,
+        &coven_home,
+        &path,
+        &fake_bin.join("coven-code"),
+        &["doctor", "--json"],
+    )?;
 
     assert_success("doctor --json with fakes", &output);
     let value = parse_stdout_json("doctor --json with fakes", &output)?;
@@ -488,6 +495,34 @@ fn doctor_json_passes_with_fake_harness_and_engine() -> anyhow::Result<()> {
         .find(|check| check["id"] == "harness:codex")
         .expect("doctor JSON should report harness:codex");
     assert_eq!(codex["status"], "pass");
+    assert!(
+        codex["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("executable is available")),
+        "harness discovery must describe executable availability only: {codex}"
+    );
+    let codex_auth = checks
+        .iter()
+        .find(|check| check["id"] == "credentials:codex")
+        .expect("doctor JSON should report the unverified Codex auth boundary");
+    assert_eq!(codex_auth["status"], "warn");
+    assert_eq!(
+        codex_auth["message"],
+        "executable available; authentication not verified"
+    );
+    let engine_auth = checks
+        .iter()
+        .find(|check| check["id"] == "credentials:engine")
+        .expect("doctor JSON should report the engine's local auth state");
+    assert_eq!(engine_auth["status"], "warn");
+    assert_eq!(
+        engine_auth["message"],
+        "authentication configured; provider turn not verified"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("logged in"),
+        "doctor must not turn local configuration evidence into a live-auth claim"
+    );
     Ok(())
 }
 
@@ -565,7 +600,13 @@ description = "Keeps the coven sociable."
     let path = prepend_path(&fake_bin);
     let coven = coven_bin();
 
-    let output = run_coven(&coven, &coven_home, &path, &["doctor"])?;
+    let output = run_coven_with_engine(
+        &coven,
+        &coven_home,
+        &path,
+        &fake_bin.join("coven-code"),
+        &["doctor"],
+    )?;
 
     assert_success("doctor with familiars", &output);
     assert_stdout_contains("doctor with familiars", &output, "Familiars (");
@@ -590,11 +631,36 @@ fn doctor_reports_no_familiars_when_manifest_absent() -> anyhow::Result<()> {
     let path = prepend_path(&fake_bin);
     let coven = coven_bin();
 
-    let output = run_coven(&coven, &coven_home, &path, &["doctor"])?;
+    let output = run_coven_with_engine(
+        &coven,
+        &coven_home,
+        &path,
+        &fake_bin.join("coven-code"),
+        &["doctor"],
+    )?;
 
     assert_success("doctor without familiars", &output);
     assert_stdout_contains("doctor without familiars", &output, "none configured");
     assert_stdout_contains("doctor without familiars", &output, "familiars.toml");
+    assert_stdout_contains(
+        "doctor without familiars",
+        &output,
+        "`codex` executable is available",
+    );
+    assert_stdout_contains(
+        "doctor without familiars",
+        &output,
+        "authentication not verified",
+    );
+    assert_stdout_contains(
+        "doctor without familiars",
+        &output,
+        "provider turn not verified",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("logged in"),
+        "doctor must not turn local configuration evidence into a live-auth claim"
+    );
     Ok(())
 }
 
@@ -614,6 +680,7 @@ fn doctor_missing_harness_prints_cross_platform_setup_loop() -> anyhow::Result<(
     let output = Command::new(&coven)
         .args(["doctor"])
         .env("COVEN_HOME", &coven_home)
+        .env_remove("COVEN_ENGINE_BIN")
         .env("PATH", &empty_path)
         .env("HOME", &fake_home)
         .output()?;
@@ -629,6 +696,12 @@ fn doctor_missing_harness_prints_cross_platform_setup_loop() -> anyhow::Result<(
     assert_stdout_contains("doctor without harnesses", &output, "Harnesses:");
     assert_stdout_contains("doctor without harnesses", &output, "`codex` is missing");
     assert_stdout_contains("doctor without harnesses", &output, "`claude` is missing");
+    assert_stdout_contains("doctor without harnesses", &output, "[--] Codex");
+    assert_stdout_contains(
+        "doctor without harnesses",
+        &output,
+        "[!!] No supported harness is available",
+    );
     assert_stdout_contains(
         "doctor without harnesses",
         &output,
@@ -673,7 +746,13 @@ fn doctor_reports_live_daemon_socket_status() -> anyhow::Result<()> {
     assert_success("daemon start", &start);
     wait_for_daemon_health(&coven_home)?;
 
-    let output = run_coven(&coven, &coven_home, &path, &["doctor"])?;
+    let output = run_coven_with_engine(
+        &coven,
+        &coven_home,
+        &path,
+        &fake_bin.join("coven-code"),
+        &["doctor"],
+    )?;
 
     assert_success("doctor with live daemon", &output);
     assert_stdout_contains("doctor with live daemon", &output, "Daemon:");
@@ -1234,6 +1313,22 @@ fn run_coven(
         .map_err(Into::into)
 }
 
+fn run_coven_with_engine(
+    coven: &Path,
+    coven_home: &Path,
+    path: &OsString,
+    engine: &Path,
+    args: &[&str],
+) -> anyhow::Result<Output> {
+    Command::new(coven)
+        .args(args)
+        .env("COVEN_HOME", coven_home)
+        .env("COVEN_ENGINE_BIN", engine)
+        .env("PATH", path)
+        .output()
+        .map_err(Into::into)
+}
+
 /// Like `run_coven`, but runs from `cwd` with extra env vars — for commands
 /// that discover a git repository from the working directory.
 fn run_coven_in(
@@ -1394,7 +1489,17 @@ printf 'fake grok reply\n'
 /// healthy environment plant a fake alongside the fake harness.
 fn write_fake_coven_code(fake_bin: &Path) -> anyhow::Result<()> {
     let coven_code = fake_bin.join("coven-code");
-    fs::write(&coven_code, "#!/bin/sh\nexit 0\n")?;
+    fs::write(
+        &coven_code,
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf 'coven-code 0.6.1\n'
+elif [ "$1" = "auth" ] && [ "$2" = "status" ] && [ "$3" = "--json" ]; then
+  printf '{"loggedIn":true}\n'
+fi
+exit 0
+"#,
+    )?;
     let mut permissions = fs::metadata(&coven_code)?.permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&coven_code, permissions)?;

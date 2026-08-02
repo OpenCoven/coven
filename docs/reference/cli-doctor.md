@@ -16,6 +16,11 @@ coven doctor
 The command is read-only. It prints local setup state and a next step without
 starting a session.
 
+The prose report uses `[OK]` for passing checks, `[--]` for advisory warnings,
+and `[!!]` only for blocking failures. It is line-oriented plain text and does
+not emit or pass through ANSI escape sequences, including when global color is
+forced or configuration text contains terminal controls.
+
 ## Machine-readable output
 
 `coven doctor --json` emits one JSON document for scripts and CI gates, with
@@ -26,17 +31,27 @@ found):
 {
   "ok": true,
   "blocking": false,
-  "store": "/home/alex/.coven",
-  "project": "/home/alex/src/app",
+  "store": "<coven-home>",
+  "project": "<project>",
   "checks": [
-    { "id": "daemon", "status": "pass", "message": "running (pid 12345, socket /home/alex/.coven/coven.sock)" },
-    { "id": "harness:codex", "status": "pass", "message": "`codex` is ready (built-in)" },
-    { "id": "harnesses", "status": "pass", "message": "1 of 3 configured harnesses available" },
-    { "id": "engine", "status": "pass", "message": "/home/alex/.coven/engine/bin/coven-code (managed install), version 0.6.1 (pin 0.6.1)" }
+    { "id": "daemon", "status": "pass", "message": "running (pid 12345, socket <daemon-socket>)" },
+    { "id": "harness:codex", "status": "pass", "message": "`codex` executable is available (built-in)" },
+    { "id": "harnesses", "status": "pass", "message": "2 of 4 configured harness executables available" },
+    { "id": "engine", "status": "pass", "message": "<engine> (managed install), version 0.6.1 (pin 0.6.1)" },
+    { "id": "credentials:engine", "status": "warn", "message": "authentication configured; provider turn not verified", "hint": "run an explicitly authorized test turn to verify provider access" },
+    { "id": "credentials:codex", "status": "warn", "message": "executable available; authentication not verified", "hint": "authenticate or inspect local setup with: codex login; verify provider access with an explicitly authorized test turn" }
   ],
   "nextSteps": ["coven run codex \"explain this repo in 5 bullets\"", "coven sessions"]
 }
 ```
+
+Known Doctor-owned absolute path roles are replaced with stable tokens such as
+`<coven-home>`, `<project>`, `<engine>`, `<daemon-socket>`, `<repo>`, and
+`<repos-config>`. This keeps repeated output comparable across machines and
+safer to attach to CI logs or bug reports without implying that arbitrary
+user-authored hint text is sanitized. Run the prose form locally when you need
+the concrete paths. `project` is `null` when the command runs outside a project
+root.
 
 Check `status` is `pass`, `warn`, or `fail`. Every `fail` is blocking — `ok`
 is false and the command exits 1 — while `warn` needs attention but does not
@@ -59,7 +74,9 @@ availability, where any missing adapter is a `fail`.
 | `Daemon` | Whether the background daemon is stopped, running, or stale. |
 | `Repos` | Configured repositories from Coven repo settings, if present. |
 | `Harnesses` | Supported harness executables that are visible on this shell's `PATH`. |
+| `Engine` | Whether the Coven engine is installed and meets the minimum supported version. |
 | `Familiars` | Configured familiar identities from `familiars.toml`, if present. |
+| `Credentials` | Advisory local engine auth configuration and explicit `authentication not verified` rows for external harnesses. Doctor calls only the engine's contractually offline `auth status --json`; it never launches a provider harness, starts a provider turn, contacts a provider, or reads harness credentials. |
 | `Next steps` | The safest next command based on the detected state. |
 
 ## Expected first-run loop
@@ -110,7 +127,7 @@ coven daemon status --json
 Typical human output from `coven daemon status`:
 
 ```text
-Coven daemon: running (pid 12345, socket /home/alex/.coven/coven.sock)
+Coven daemon: running (pid 12345, socket /path/to/coven-home/coven.sock)
 ```
 
 `not running` means no background daemon is running yet. Start it with:
@@ -129,18 +146,23 @@ coven daemon start
 
 ## Exit behavior
 
-`coven doctor` exits `0` when the environment can run Coven end to end, so
-scripts can gate on it (`coven doctor && …`). It exits `1` when it finds a
-blocking problem:
+`coven doctor` exits `0` when local structural prerequisites are ready, so
+scripts can gate on them (`coven doctor && …`). Provider access is deliberately
+outside that claim and still requires an explicitly authorized test turn. The
+command exits `1` when it finds a blocking local problem:
 
 - no supported harness is available on `PATH`
 - the daemon is stale (`running` and `stopped` are both healthy states)
 - a registered repo entry points at a missing or non-git path
 - `coven-code` is missing
+- the installed `coven-code` version is older than the supported minimum
 
-A missing harness prints a `[!!]` line with an install hint but does not fail
-the check while another harness is available — one working harness makes Coven
-usable.
+Each missing harness prints an advisory `[--]` line with an install hint. When
+none is available, Doctor adds a blocking `[!!] No supported harness is
+available` line and exits 1; one working harness keeps the aggregate usable.
+Executable discovery does not prove provider authentication. A harness's own
+login/status command can configure or inspect local authentication, while only
+an explicitly authorized test turn verifies provider access.
 
 `coven adapter doctor` is stricter about its own subject: it exits `1` if any
 listed adapter is unavailable. `coven wt --doctor` exits `1` when managed hooks

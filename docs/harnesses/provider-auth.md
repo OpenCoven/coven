@@ -14,8 +14,8 @@ Coven supervises harness PTYs. It never reads, proxies, persists, or mints provi
 
 - Provider tokens live wherever the harness already puts them — typically `~/.codex/`, `~/.config/anthropic/`, `~/.copilot/`, or a system keychain managed by that CLI.
 - The Coven daemon never reads them, never stores them in SQLite, never forwards them over the socket API, and never logs them into the event ledger.
-- `coven doctor` reports the Coven Code engine's login state, but only checks whether each external harness binary exists; it does **not** test provider credentials for those harnesses. Each harness already ships its own `login` / `doctor` for that.
-- Treat Coven as having **zero** knowledge of provider auth state. The boundary is intentional.
+- `coven doctor` reports the Coven Code engine's local auth configuration as advisory evidence, but only checks whether each external harness binary exists. The engine status command is contractually local and offline; Doctor does **not** launch an external harness, contact a provider, run a provider turn, or test provider credentials.
+- Treat Coven as having **zero** knowledge of external-harness provider auth state and no proof that any provider is reachable. The engine's boolean is local configuration evidence only. The boundary is intentional.
 
 ## Why Coven refuses to own credentials
 
@@ -62,8 +62,11 @@ Without that OAuth configuration, use one of the supported alternatives:
 - Authenticate the official Claude Code CLI and use `coven run claude <prompt>`.
 - Run `coven code codex login` for ChatGPT/Codex authentication.
 
-`coven doctor` reports the engine's login state and points to these alternatives
-instead of suggesting an OAuth login that cannot succeed.
+`coven doctor` reports the engine's local auth configuration, explicitly notes
+that no provider turn was verified, and points to these alternatives instead of
+suggesting an OAuth login that cannot succeed. Its engine probe is the
+contractually offline `coven-code auth status --json`; Doctor does not contact
+Anthropic, OpenAI, or another provider while gathering this report.
 
 ### Daemon API
 

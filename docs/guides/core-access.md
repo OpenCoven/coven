@@ -31,7 +31,7 @@ For scripts, gate on the JSON envelope instead of scraping prose:
 coven doctor --json | jq -e '.ok'
 ```
 
-`doctor` checks the active `COVEN_HOME`, harness visibility in this shell, and daemon condition. You need at least one usable harness. Follow the per-harness hint it prints; provider authentication happens in the harness's own CLI, not in Coven.
+`doctor` checks the active `COVEN_HOME`, harness executable visibility in this shell, and daemon condition. You need at least one visible harness executable. A per-harness login/status hint configures or inspects local authentication; it does not verify provider access. Doctor reports provider access as unverified until you run an explicitly authorized provider turn.
 
 ## 3. Start or verify the local daemon
 
@@ -69,7 +69,7 @@ cd /path/to/project
 coven run codex "summarize this repository in five bullets" --permission read-only
 ```
 
-Replace `codex` with a harness that `coven doctor` reports as ready. `--permission read-only` is a useful first-run posture when your selected harness supports it. After the run starts, inspect it with:
+Replace `codex` with a harness whose executable `coven doctor` reports as available. `--permission read-only` is a useful first-run posture when your selected harness supports it. After the run starts, inspect it with:
 
 ```sh
 coven sessions
@@ -77,7 +77,7 @@ coven sessions
 
 ## What success means
 
-You have core access when `doctor --json` reports `ok: true`, `daemon status --json` reports a reachable state, `sessions --json` returns a document, and a selected harness can create a project-scoped session. A missing optional adapter does not prevent core use when another supported harness is ready.
+You have core access when `doctor --json` reports `ok: true`, `daemon status --json` reports a reachable state, `sessions --json` returns a document, and a selected harness completes a project-scoped provider turn. A missing optional adapter does not prevent core use when another supported harness executable is available.
 
 ## Related
 

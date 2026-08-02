@@ -1644,16 +1644,15 @@ fn interactive_shell_route(
 
 /// Exits 1 when a blocking problem is found (stale daemon, broken registered
 /// repo, no harness available, missing coven-code) so scripts can gate on
-/// `coven doctor && …`. Individual missing harnesses print `[!!]` but don't
-/// fail the check while another harness is available — one working harness
-/// makes coven usable.
+/// `coven doctor && …`. Individual missing harnesses print advisory `[--]`
+/// rows; when none is available, one aggregate `[!!]` row marks the blocking
+/// failure. One working harness makes coven usable.
 /// Everything `coven doctor` inspects, gathered before rendering so the
 /// prose and `--json` surfaces read the same probe results and cannot drift.
 struct DoctorReport {
     home: PathBuf,
     project_root: Option<PathBuf>,
     daemon: Option<daemon::DaemonStatusState>,
-    repos_config_path: PathBuf,
     repos: Vec<DoctorRepoReport>,
     harnesses: Vec<harness::HarnessSummary>,
     engine: Option<DoctorEngineReport>,
@@ -1667,6 +1666,7 @@ struct DoctorReport {
 struct DoctorRepoReport {
     name: String,
     path: PathBuf,
+    config_path: PathBuf,
     ok: bool,
 }
 
@@ -1694,20 +1694,42 @@ impl DoctorReport {
     }
 }
 
+fn doctor_repo_config_path(
+    name: &str,
+    legacy_path: &Path,
+    settings_path: Option<&Path>,
+    loaded_settings: Option<&settings::Settings>,
+) -> PathBuf {
+    if loaded_settings.is_some_and(|value| value.coven_cli.repos.contains_key(name)) {
+        settings_path.unwrap_or(legacy_path).to_path_buf()
+    } else {
+        legacy_path.to_path_buf()
+    }
+}
+
 fn gather_doctor_report() -> Result<DoctorReport> {
     let home = coven_home_dir()?;
     let project_root = std::env::current_dir()
         .ok()
         .and_then(|cwd| project::canonical_project_root(&cwd).ok());
     let daemon = daemon::background_server_status(&home)?;
+    let legacy_repos_config_path = repos_config::config_path(&home);
+    let settings_config_path = settings::user_settings_path();
     let repos_config = repos_config::load_with_settings(&home, settings::cached())?;
     let repos = repos_config
         .entries()
         .map(|(name, path)| {
             let ok = path.is_dir() && path.join(".git").exists();
+            let config_path = doctor_repo_config_path(
+                name,
+                &legacy_repos_config_path,
+                settings_config_path.as_deref(),
+                settings::cached(),
+            );
             DoctorRepoReport {
                 name: name.to_string(),
                 path,
+                config_path,
                 ok,
             }
         })
@@ -1730,7 +1752,6 @@ fn gather_doctor_report() -> Result<DoctorReport> {
     let familiars = cockpit_sources::read_familiars(&home).map_err(|err| format!("{err:#}"));
     Ok(DoctorReport {
         familiars_manifest: home.join("familiars.toml"),
-        repos_config_path: repos_config::config_path(&home),
         home,
         project_root,
         daemon,
@@ -1763,58 +1784,103 @@ fn run_doctor(json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Keep Doctor's line-oriented prose safe even when a user-controlled config
+/// value contains terminal controls. Static line breaks are emitted by
+/// `println!`; embedded control characters are rendered visibly instead of
+/// being passed through to the terminal.
+fn doctor_prose_line(value: impl AsRef<str>) -> String {
+    let mut output = String::with_capacity(value.as_ref().len());
+    for character in value.as_ref().chars() {
+        if character.is_control() {
+            use std::fmt::Write as _;
+            write!(&mut output, "\\u{{{:x}}}", character as u32)
+                .expect("writing to a String cannot fail");
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
+fn print_doctor_line(value: impl AsRef<str>) {
+    println!("{}", doctor_prose_line(value));
+}
+
 fn print_doctor_prose(report: &DoctorReport) {
     println!("Coven doctor");
-    println!("Store: {}", report.home.display());
+    print_doctor_line(format!("Store: {}", report.home.display()));
     match &report.project_root {
-        Some(root) => println!("Project: {}", root.display()),
+        Some(root) => print_doctor_line(format!("Project: {}", root.display())),
         None => println!("Project: not inside a git/project root yet"),
     }
 
     println!("\nDaemon:");
     match &report.daemon {
         Some(daemon::DaemonStatusState::Running(status)) => {
-            // `ok` is always true for a live daemon, so the prose "Running"
-            // already conveys it; the `--json` path keeps the field.
-            println!("  Running (pid {}, socket {})", status.pid, status.socket);
+            print_doctor_line(format!(
+                "  [OK] Running (pid {}, socket {})",
+                status.pid, status.socket
+            ));
         }
         Some(daemon::DaemonStatusState::Stale(status)) => {
-            println!("  Stale (pid {}, socket {})", status.pid, status.socket);
+            print_doctor_line(format!(
+                "  [!!] Stale (pid {}, socket {}) — run: coven daemon restart",
+                status.pid, status.socket
+            ));
         }
-        None => println!("  Not running"),
+        None => println!("  [--] Not running — run: coven daemon start"),
     }
 
     if !report.repos.is_empty() {
-        println!("\nRepos ({}):", report.repos_config_path.display());
+        println!("\nRepos:");
         for repo in &report.repos {
             let marker = if repo.ok { "OK" } else { "!!" };
-            println!("  [{marker}] {:<16} {}", repo.name, repo.path.display());
+            print_doctor_line(format!(
+                "  [{marker}] {:<16} {}",
+                repo.name,
+                repo.path.display()
+            ));
+            if !repo.ok {
+                print_doctor_line(format!(
+                    "       fix the path in {}",
+                    repo.config_path.display()
+                ));
+            }
         }
     }
 
     println!("\nHarnesses:");
     for harness in &report.harnesses {
-        let status = if harness.available {
-            "ready"
+        // Individual missing harnesses are advisory. The aggregate condition
+        // below is the blocking failure when every supported harness is absent.
+        let marker = if harness.available { "OK" } else { "--" };
+        let availability = if harness.available {
+            "executable is available"
         } else {
-            "missing"
+            "is missing"
         };
-        let marker = if harness.available { "OK" } else { "!!" };
-        println!(
-            "  [{marker}] {:<18} `{}` is {status} ({})",
+        print_doctor_line(format!(
+            "  [{marker}] {:<18} `{}` {availability} ({})",
             harness.label,
             harness.executable,
             adapter_source_label(&harness.source)
-        );
+        ));
         if !harness.available {
-            println!("       {}", harness.install_hint);
+            print_doctor_line(format!("       {}", harness.install_hint));
         }
+    }
+    if !report.harnesses.iter().any(|harness| harness.available) {
+        println!("  [!!] No supported harness is available");
     }
 
     println!("\nEngine:");
     match &report.engine {
         Some(engine) => {
-            println!("  [OK] {} ({})", engine.path.display(), engine.source_label);
+            print_doctor_line(format!(
+                "  [OK] {} ({})",
+                engine.path.display(),
+                engine.source_label
+            ));
             match engine.version {
                 Some(version) => {
                     let (a, b, c) = version;
@@ -1827,7 +1893,7 @@ fn print_doctor_prose(report: &DoctorReport) {
                         );
                     }
                 }
-                None => println!("       version: unknown (could not run the engine)"),
+                None => println!("  [--] version: unknown (could not run the engine)"),
             }
             println!("       pin: {}", engine::pinned_version());
         }
@@ -1843,12 +1909,12 @@ fn print_doctor_prose(report: &DoctorReport) {
 
     println!("\nCredentials:");
     for line in credentials_lines(report.engine_auth, &report.harnesses) {
-        println!("{line}");
+        print_doctor_line(line);
     }
 
     println!("\nNext steps:");
     for line in doctor_next_steps(report.default_harness.as_deref()) {
-        println!("  {line}");
+        print_doctor_line(format!("  {line}"));
     }
 }
 
@@ -1911,23 +1977,122 @@ impl DoctorCheck {
     }
 }
 
+/// Replace paths in the machine-readable doctor report with stable role
+/// tokens. Doctor JSON is commonly attached to CI logs and bug reports; raw
+/// absolute paths make otherwise identical reports host-specific and can leak
+/// account or project directory names. The prose report intentionally keeps
+/// the concrete paths for local troubleshooting.
+struct DoctorJsonPathRedactor {
+    role_replacements: Vec<(String, String)>,
+    replacements: Vec<(String, String)>,
+}
+
+impl DoctorJsonPathRedactor {
+    fn new(report: &DoctorReport) -> Self {
+        let mut role_replacements = Vec::new();
+        let mut replacements = Vec::new();
+        let mut add_path = |path: &Path, token: String| {
+            let rendered = path.display().to_string();
+            role_replacements.push((rendered.clone(), token.clone()));
+
+            // Only redact rooted paths with a normal component below the root.
+            // Checking components rather than their count rejects Unix `/`,
+            // Windows drive roots, and UNC share roots; prefix/root components
+            // alone would otherwise create an unsafe broad substring
+            // replacement. Root-relative Windows paths are still safe because
+            // the normal component keeps the replacement narrow.
+            if path.has_root()
+                && path
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::Normal(_)))
+            {
+                replacements.push((rendered, token));
+            }
+        };
+
+        add_path(
+            &report.familiars_manifest,
+            "<familiars-manifest>".to_string(),
+        );
+        if let Some(engine) = &report.engine {
+            add_path(&engine.path, "<engine>".to_string());
+        }
+        for repo in &report.repos {
+            // A path may be registered under multiple aliases. Keep the token
+            // path-scoped and neutral so insertion order cannot assign one
+            // alias's identity to another alias's check.
+            add_path(&repo.path, "<repo>".to_string());
+            add_path(&repo.config_path, "<repos-config>".to_string());
+        }
+        if let Some(project_root) = &report.project_root {
+            add_path(project_root, "<project>".to_string());
+        }
+        add_path(&report.home, "<coven-home>".to_string());
+
+        if let Some(status) = report.daemon.as_ref().map(|state| match state {
+            daemon::DaemonStatusState::Running(status)
+            | daemon::DaemonStatusState::Stale(status) => status,
+        }) {
+            let socket = Path::new(&status.socket);
+            add_path(socket, "<daemon-socket>".to_string());
+        }
+
+        // Replace children before parents, for example the manifest before
+        // COVEN_HOME. `sort_by` is stable, so equally long exact paths retain
+        // the role-specific insertion order above.
+        replacements.sort_by_key(|entry| std::cmp::Reverse(entry.0.len()));
+        Self {
+            role_replacements,
+            replacements,
+        }
+    }
+
+    fn text(&self, value: impl AsRef<str>) -> String {
+        self.replacements
+            .iter()
+            .fold(value.as_ref().to_string(), |redacted, (path, token)| {
+                redacted.replace(path, token)
+            })
+    }
+
+    /// Render a value that is itself a known path role. Exact roles can always
+    /// become their semantic token, including relative paths and filesystem
+    /// roots; unlike `text`, this never performs a broad substring replacement
+    /// with those otherwise unsafe values.
+    fn role_path(&self, value: &Path, token: &str) -> String {
+        let rendered = value.display().to_string();
+        self.role_replacements
+            .iter()
+            .find(|(path, registered_token)| {
+                path == &rendered && registered_token.as_str() == token
+            })
+            .map_or_else(|| self.text(rendered), |(_, token)| token.clone())
+    }
+}
+
 /// Derive the machine-readable check list from a gathered report. Statuses
 /// mirror the prose markers: `fail` is exactly the set of conditions that
 /// flip [`DoctorReport::healthy`], so `ok`/exit-code semantics stay identical
 /// across both output modes.
 fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
     let mut checks = Vec::new();
+    let paths = DoctorJsonPathRedactor::new(report);
 
     checks.push(match &report.daemon {
         Some(daemon::DaemonStatusState::Running(status)) => DoctorCheck::pass(
             "daemon",
-            format!("running (pid {}, socket {})", status.pid, status.socket),
+            format!(
+                "running (pid {}, socket {})",
+                status.pid,
+                paths.role_path(Path::new(&status.socket), "<daemon-socket>")
+            ),
         ),
         Some(daemon::DaemonStatusState::Stale(status)) => DoctorCheck::fail(
             "daemon",
             format!(
                 "stale daemon record (pid {}, socket {})",
-                status.pid, status.socket
+                status.pid,
+                paths.role_path(Path::new(&status.socket), "<daemon-socket>")
             ),
             Some("run: coven daemon restart".to_string()),
         ),
@@ -1942,15 +2107,18 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
         checks.push(if repo.ok {
             DoctorCheck::pass(
                 format!("repo:{}", repo.name),
-                repo.path.display().to_string(),
+                paths.role_path(&repo.path, "<repo>"),
             )
         } else {
             DoctorCheck::fail(
                 format!("repo:{}", repo.name),
-                format!("{} is missing or not a git repository", repo.path.display()),
+                format!(
+                    "{} is missing or not a git repository",
+                    paths.role_path(&repo.path, "<repo>")
+                ),
                 Some(format!(
                     "fix the path in {}",
-                    report.repos_config_path.display()
+                    paths.role_path(&repo.config_path, "<repos-config>")
                 )),
             )
         });
@@ -1960,7 +2128,10 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
         checks.push(if harness.available {
             DoctorCheck::pass(
                 format!("harness:{}", harness.id),
-                format!("`{}` is ready ({})", harness.executable, harness.source),
+                format!(
+                    "`{}` executable is available ({})",
+                    harness.executable, harness.source
+                ),
             )
         } else {
             DoctorCheck::warn(
@@ -1979,7 +2150,7 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
         DoctorCheck::pass(
             "harnesses",
             format!(
-                "{available} of {} configured harnesses available",
+                "{available} of {} configured harness executables available",
                 report.harnesses.len()
             ),
         )
@@ -1998,7 +2169,11 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
             Some("run: coven engine install".to_string()),
         ),
         Some(engine) => {
-            let located = format!("{} ({})", engine.path.display(), engine.source_label);
+            let located = format!(
+                "{} ({})",
+                paths.role_path(&engine.path, "<engine>"),
+                engine.source_label
+            );
             match engine.version {
                 None => DoctorCheck::warn(
                     "engine",
@@ -2032,29 +2207,67 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
             "familiars",
             format!(
                 "could not read {}: {error}",
-                report.familiars_manifest.display()
+                paths.role_path(&report.familiars_manifest, "<familiars-manifest>"),
+                error = paths.text(error)
             ),
-            None,
+            Some(format!(
+                "fix access to or contents of {}, then rerun coven doctor",
+                paths.role_path(&report.familiars_manifest, "<familiars-manifest>")
+            )),
         ),
         Ok(familiars) if familiars.is_empty() => DoctorCheck::pass(
             "familiars",
-            format!("none configured ({})", report.familiars_manifest.display()),
+            format!(
+                "none configured ({})",
+                paths.role_path(&report.familiars_manifest, "<familiars-manifest>")
+            ),
         ),
         Ok(familiars) => DoctorCheck::pass("familiars", format!("{} configured", familiars.len())),
     });
 
     if let Some(auth) = report.engine_auth {
         checks.push(match auth {
-            Some(true) => DoctorCheck::pass("credentials:engine", "logged in"),
+            Some(true) => DoctorCheck::warn(
+                "credentials:engine",
+                "authentication configured; provider turn not verified",
+                Some("run an explicitly authorized test turn to verify provider access".to_string()),
+            ),
             Some(false) => DoctorCheck::warn(
                 "credentials:engine",
-                "not logged in",
+                "authentication not configured",
                 Some(
                     "set ANTHROPIC_API_KEY, authenticate Claude Code, or configure OAuth then run: coven auth login"
                         .to_string(),
                 ),
             ),
-            None => DoctorCheck::warn("credentials:engine", "auth check skipped", None),
+            None => DoctorCheck::warn(
+                "credentials:engine",
+                "authentication status unavailable; provider turn not verified",
+                None,
+            ),
+        });
+    }
+
+    for harness in report
+        .harnesses
+        .iter()
+        .filter(|harness| harness.id != engine::ENGINE_HARNESS_ID)
+    {
+        checks.push(if harness.available {
+            DoctorCheck::warn(
+                format!("credentials:{}", harness.id),
+                "executable available; authentication not verified",
+                Some(format!(
+                    "authenticate or inspect local setup with: {}; verify provider access with an explicitly authorized test turn",
+                    auth_setup_hint_for_harness(&harness.id)
+                )),
+            )
+        } else {
+            DoctorCheck::warn(
+                format!("credentials:{}", harness.id),
+                "authentication not checked because the executable is missing",
+                Some(harness.install_hint.trim().to_string()),
+            )
         });
     }
 
@@ -2072,11 +2285,8 @@ fn doctor_json_body(report: &DoctorReport) -> serde_json::Value {
     serde_json::json!({
         "ok": ok,
         "blocking": !ok,
-        "store": report.home.display().to_string(),
-        "project": report
-            .project_root
-            .as_ref()
-            .map(|root| root.display().to_string()),
+        "store": "<coven-home>",
+        "project": report.project_root.as_ref().map(|_| "<project>"),
         "checks": checks,
         "nextSteps": doctor_next_steps(report.default_harness.as_deref()),
     })
@@ -2104,14 +2314,21 @@ fn print_familiars_section(
         Ok(familiars) => familiars,
         Err(err) => {
             println!("\nFamiliars:");
-            println!("  !! could not read {}: {err}", manifest.display());
+            print_doctor_line(format!(
+                "  [--] could not read {}: {err}",
+                manifest.display()
+            ));
+            print_doctor_line(format!(
+                "       fix access to or contents of {}, then rerun coven doctor",
+                manifest.display()
+            ));
             return;
         }
     };
 
     if familiars.is_empty() {
         println!("\nFamiliars:");
-        println!("  none configured ({})", manifest.display());
+        print_doctor_line(format!("  none configured ({})", manifest.display()));
         println!(
             "  Declare [[familiar]] entries there, then run with \
              `coven run <harness> --familiar <id> \"...\"`."
@@ -2119,7 +2336,8 @@ fn print_familiars_section(
         return;
     }
 
-    println!("\nFamiliars ({}):", manifest.display());
+    println!();
+    print_doctor_line(format!("Familiars ({}):", manifest.display()));
     let id_width = familiars
         .iter()
         .map(|familiar| familiar.id.len())
@@ -2131,10 +2349,10 @@ fn print_familiars_section(
         } else {
             format!(" — {}", familiar.role)
         };
-        println!(
+        print_doctor_line(format!(
             "  {:<id_width$} {}{}  (memory: {})",
             familiar.id, familiar.display_name, role, familiar.memory_freshness
-        );
+        ));
     }
 }
 
@@ -2756,53 +2974,126 @@ fn engine_source_label(source: &engine::EngineSource) -> &'static str {
     }
 }
 
-/// Query the engine's auth state via `auth status --json`, bounded to ~5s so a
-/// hung engine never hangs `coven doctor`. Returns `Some(logged_in)` on a clean
-/// parse, or `None` if the check couldn't be completed (spawn/timeout/parse
-/// failure) — the caller treats `None` as a skipped, non-blocking check.
+/// Query the engine's local auth state via `auth status --json`, bounded to ~5s
+/// so a hung engine never hangs `coven doctor`. Returns `Some(configured)` only
+/// when the JSON value agrees with the engine contract's exit status (0 for
+/// configured, 1 for not configured). This is local configuration evidence,
+/// not proof that a provider turn succeeds.
 fn engine_auth_summary(binary: &Path) -> Option<bool> {
     use std::io::Read;
-    use std::process::Stdio;
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc::{self, TryRecvError};
     use std::time::{Duration, Instant};
 
-    let mut child = std::process::Command::new(binary)
+    const TIMEOUT: Duration = Duration::from_secs(5);
+    const CLEANUP_BUDGET: Duration = Duration::from_millis(500);
+    const OUTPUT_LIMIT: usize = 1024 * 1024;
+    let total_deadline = Instant::now() + TIMEOUT;
+    let probe_deadline = total_deadline - CLEANUP_BUDGET;
+
+    let mut command = Command::new(binary);
+    command
         .args(["auth", "status", "--json"])
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::null());
+    let (mut child, mut process_tree) =
+        pty_runner::spawn_strict_child_process_tree(&mut command).ok()?;
+    let terminate_and_reap = |process_tree: &mut pty_runner::StrictChildProcessTree,
+                              child: &mut std::process::Child| {
+        process_tree.terminate(child);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => {}
+            }
+            let remaining = total_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10).min(remaining));
+        }
+    };
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            terminate_and_reap(&mut process_tree, &mut child);
+            return None;
+        }
+    };
+    let (sender, receiver) = mpsc::channel::<std::io::Result<Vec<u8>>>();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout
+            .take((OUTPUT_LIMIT + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        let _ = sender.send(result);
+    });
+
+    let mut status = None;
+    let mut output = None;
     loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+        if output.is_none() {
+            match receiver.try_recv() {
+                Ok(Ok(bytes)) if bytes.len() <= OUTPUT_LIMIT => output = Some(bytes),
+                Ok(Ok(_)) | Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
+                    terminate_and_reap(&mut process_tree, &mut child);
                     return None;
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                Err(TryRecvError::Empty) => {}
             }
-            Err(_) => return None,
         }
-    }
 
-    // `auth status --json` output is a few hundred bytes — far under the pipe
-    // buffer — so reading after exit cannot deadlock.
-    let mut buf = String::new();
-    child.stdout.take()?.read_to_string(&mut buf).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&buf).ok()?;
-    json.get("loggedIn")?.as_bool()
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(exit_status)) => {
+                    status = Some(exit_status);
+                    // The direct engine has exited. Terminate anything it left
+                    // behind before waiting for pipe EOF; a descendant that
+                    // inherited stdout must not extend Doctor's deadline.
+                    terminate_and_reap(&mut process_tree, &mut child);
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    terminate_and_reap(&mut process_tree, &mut child);
+                    return None;
+                }
+            }
+        }
+
+        if let (Some(status), Some(bytes)) = (status.as_ref(), output.as_ref()) {
+            let stdout = std::str::from_utf8(bytes).ok()?;
+            return parse_engine_auth_summary(status.code(), stdout);
+        }
+
+        if Instant::now() >= probe_deadline {
+            terminate_and_reap(&mut process_tree, &mut child);
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Parse only the engine's boolean auth summary and reject contradictory
+/// status/output pairs. Additional fields are deliberately ignored so Doctor
+/// never forwards provider metadata or credential material.
+fn parse_engine_auth_summary(exit_code: Option<i32>, stdout: &str) -> Option<bool> {
+    let json: serde_json::Value = serde_json::from_str(stdout).ok()?;
+    let configured = json.get("loggedIn")?.as_bool()?;
+    match (exit_code, configured) {
+        (Some(0), true) | (Some(1), false) => Some(configured),
+        _ => None,
+    }
 }
 
 /// Pure formatter for the "Credentials:" section of `coven doctor`.
 ///
 /// `engine_auth` is:
 /// - `None`          — engine binary is missing; skip engine auth row entirely
-/// - `Some(None)`    — engine present but auth probe returned no result (skipped)
-/// - `Some(Some(true))`  — engine present and logged in
-/// - `Some(Some(false))` — engine present but not logged in
+/// - `Some(None)`    — engine present but local auth status is unavailable
+/// - `Some(Some(true))`  — engine reports local authentication configured
+/// - `Some(Some(false))` — engine reports local authentication not configured
 ///
 /// Harnesses with `id == "coven-code"` are skipped (that is the engine, shown above).
 ///
@@ -2820,15 +3111,21 @@ fn credentials_lines(
                 .push("  [!!] Coven Code (engine) — missing; see Engine section above".to_string());
         }
         Some(Some(true)) => {
-            lines.push("  [OK] Coven Code (engine) — logged in".to_string());
+            lines.push(
+                "  [--] Coven Code (engine) — authentication configured; provider turn not verified"
+                    .to_string(),
+            );
         }
         Some(Some(false)) => {
             lines.push(
-                "  [!!] Coven Code (engine) — not logged in; set ANTHROPIC_API_KEY, use Claude Code, or configure OAuth".to_string(),
+                "  [--] Coven Code (engine) — authentication not configured; set ANTHROPIC_API_KEY, use Claude Code, or configure OAuth".to_string(),
             );
         }
         Some(None) => {
-            lines.push("  [--] Coven Code (engine) — auth check skipped".to_string());
+            lines.push(
+                "  [--] Coven Code (engine) — authentication status unavailable; provider turn not verified"
+                    .to_string(),
+            );
         }
     }
 
@@ -2838,10 +3135,10 @@ fn credentials_lines(
             continue;
         }
         if h.available {
-            let login_hint = login_hint_for_harness(&h.id);
+            let setup_hint = auth_setup_hint_for_harness(&h.id);
             lines.push(format!(
-                "  [OK] {} — available; authenticate with `{}`",
-                h.label, login_hint
+                "  [--] {} — executable available; authentication not verified; authenticate or inspect local setup with `{}`; verify provider access with an explicitly authorized test turn",
+                h.label, setup_hint
             ));
         } else {
             lines.push(format!(
@@ -2855,8 +3152,9 @@ fn credentials_lines(
     lines
 }
 
-/// Return the canonical "how to log in" command for a harness by id.
-fn login_hint_for_harness(harness_id: &str) -> &'static str {
+/// Return the canonical authentication or local-status command for a harness.
+/// Running this command is not proof that a provider turn will succeed.
+fn auth_setup_hint_for_harness(harness_id: &str) -> &'static str {
     match harness_id {
         "codex" => "codex login",
         "claude" => "claude doctor",
@@ -6130,21 +6428,40 @@ mod tests {
     }
 
     #[test]
-    fn credentials_lines_engine_logged_in() {
+    fn credentials_lines_engine_configured_does_not_claim_a_provider_turn() {
         let lines = credentials_lines(Some(Some(true)), &[]);
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("logged in"), "got: {}", lines[0]);
-        assert!(lines[0].contains("[OK]"), "got: {}", lines[0]);
+        assert!(
+            lines[0].contains("authentication configured"),
+            "got: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("provider turn not verified"),
+            "got: {}",
+            lines[0]
+        );
+        assert!(lines[0].contains("[--]"), "got: {}", lines[0]);
+        assert!(!lines[0].contains("logged in"), "got: {}", lines[0]);
     }
 
     #[test]
-    fn credentials_lines_engine_not_logged_in() {
+    fn credentials_lines_engine_not_configured() {
         let lines = credentials_lines(Some(Some(false)), &[]);
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("not logged in"), "got: {}", lines[0]);
+        assert!(
+            lines[0].contains("authentication not configured"),
+            "got: {}",
+            lines[0]
+        );
         assert!(lines[0].contains("ANTHROPIC_API_KEY"), "got: {}", lines[0]);
         assert!(lines[0].contains("Claude Code"), "got: {}", lines[0]);
-        assert!(lines[0].contains("[!!]"), "got: {}", lines[0]);
+        assert!(lines[0].contains("[--]"), "got: {}", lines[0]);
+        assert!(
+            !lines[0].contains("[!!]"),
+            "non-blocking auth guidance must not look like a blocking failure: {}",
+            lines[0]
+        );
     }
 
     #[test]
@@ -6194,11 +6511,63 @@ mod tests {
     }
 
     #[test]
-    fn credentials_lines_engine_auth_skipped() {
+    fn credentials_lines_engine_auth_unavailable() {
         let lines = credentials_lines(Some(None), &[]);
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("skipped"), "got: {}", lines[0]);
+        assert!(lines[0].contains("status unavailable"), "got: {}", lines[0]);
+        assert!(
+            lines[0].contains("provider turn not verified"),
+            "got: {}",
+            lines[0]
+        );
         assert!(lines[0].contains("[--]"), "got: {}", lines[0]);
+    }
+
+    #[test]
+    fn engine_auth_summary_requires_consistent_contract_output() {
+        let configured =
+            parse_engine_auth_summary(Some(0), r#"{"loggedIn":true,"account":"private-sentinel"}"#);
+        assert_eq!(configured, Some(true));
+        assert!(
+            credentials_lines(Some(configured), &[])
+                .iter()
+                .all(|line| !line.contains("private-sentinel")),
+            "Doctor must reduce engine output to the boolean boundary"
+        );
+        assert_eq!(
+            parse_engine_auth_summary(Some(1), r#"{"loggedIn":false}"#),
+            Some(false)
+        );
+        assert_eq!(
+            parse_engine_auth_summary(Some(1), r#"{"loggedIn":true}"#),
+            None,
+            "a contradictory exit status must not be presented as authenticated"
+        );
+        assert_eq!(
+            parse_engine_auth_summary(Some(0), r#"{"loggedIn":"yes"}"#),
+            None
+        );
+        assert_eq!(parse_engine_auth_summary(Some(0), "not-json"), None);
+        assert_eq!(
+            parse_engine_auth_summary(Some(2), r#"{"loggedIn":false}"#),
+            None,
+            "non-contract exit codes must report auth status as unavailable"
+        );
+        assert_eq!(
+            parse_engine_auth_summary(None, r#"{"loggedIn":true}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn engine_auth_summary_returns_unavailable_when_spawn_fails() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let missing = temp_dir.path().join(if cfg!(windows) {
+            "missing-coven-code.exe"
+        } else {
+            "missing-coven-code"
+        });
+        assert_eq!(engine_auth_summary(&missing), None);
     }
 
     #[test]
@@ -6211,6 +6580,129 @@ mod tests {
 
     // --- doctor report/check unit tests ---
 
+    #[test]
+    fn doctor_prose_line_escapes_controls_and_preserves_printable_unicode() {
+        assert_eq!(
+            doctor_prose_line("safe\t\n\r\u{1b}\u{009b} —"),
+            r"safe\u{9}\u{a}\u{d}\u{1b}\u{9b} —"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_json_redactor_rejects_unix_root_replacements() {
+        let mut report = make_doctor_report();
+        report.home = PathBuf::from("/");
+        report.repos.push(DoctorRepoReport {
+            name: "root".to_string(),
+            path: PathBuf::from("/"),
+            config_path: PathBuf::from("/tmp/repos.toml"),
+            ok: true,
+        });
+
+        let redactor = DoctorJsonPathRedactor::new(&report);
+        assert!(
+            redactor.replacements.iter().all(|(path, _)| path != "/"),
+            "the Unix filesystem root must never become a global replacement"
+        );
+        assert_eq!(redactor.text("/var/lib/coven"), "/var/lib/coven");
+        let root_check = doctor_checks(&report)
+            .into_iter()
+            .find(|check| check.id == "repo:root")
+            .expect("root repository check");
+        assert_eq!(root_check.message, "<repo>");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn doctor_json_redactor_rejects_windows_drive_and_unc_roots() {
+        let mut drive_report = make_doctor_report();
+        drive_report.home = PathBuf::from(r"C:\");
+        drive_report.repos.push(DoctorRepoReport {
+            name: "drive-root".to_string(),
+            path: PathBuf::from(r"C:\"),
+            config_path: PathBuf::from(r"C:\repos.toml"),
+            ok: true,
+        });
+        let drive_redactor = DoctorJsonPathRedactor::new(&drive_report);
+        assert!(
+            drive_redactor
+                .replacements
+                .iter()
+                .all(|(path, _)| path != r"C:\"),
+            "a Windows drive root must never become a global replacement"
+        );
+        assert_eq!(
+            drive_redactor.text(r"C:\Users\example\project"),
+            r"C:\Users\example\project"
+        );
+        let drive_check = doctor_checks(&drive_report)
+            .into_iter()
+            .find(|check| check.id == "repo:drive-root")
+            .expect("drive-root repository check");
+        assert_eq!(drive_check.message, "<repo>");
+
+        let mut unc_report = make_doctor_report();
+        unc_report.home = PathBuf::from(r"\\server\share\");
+        unc_report.repos.push(DoctorRepoReport {
+            name: "unc-root".to_string(),
+            path: PathBuf::from(r"\\server\share\"),
+            config_path: PathBuf::from(r"\\server\share\repos.toml"),
+            ok: true,
+        });
+        let unc_redactor = DoctorJsonPathRedactor::new(&unc_report);
+        assert!(
+            unc_redactor
+                .replacements
+                .iter()
+                .all(|(path, _)| path != r"\\server\share\"),
+            "a UNC share root must never become a global replacement"
+        );
+        assert_eq!(
+            unc_redactor.text(r"\\server\share\project"),
+            r"\\server\share\project"
+        );
+        let unc_check = doctor_checks(&unc_report)
+            .into_iter()
+            .find(|check| check.id == "repo:unc-root")
+            .expect("UNC-root repository check");
+        assert_eq!(unc_check.message, "<repo>");
+    }
+
+    #[test]
+    fn doctor_json_redacts_relative_daemon_socket_without_broad_replacement() {
+        let mut report = make_doctor_report();
+        let private_hash = "0123456789abcdef0123456789abcdef";
+        let socket = format!("coven-daemon-{private_hash}.sock");
+        report.daemon = Some(daemon::DaemonStatusState::Running(daemon::DaemonStatus {
+            pid: 42,
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            socket: socket.clone(),
+        }));
+
+        let redactor = DoctorJsonPathRedactor::new(&report);
+        assert_eq!(
+            redactor.text(format!("socket={socket}")),
+            format!("socket={socket}"),
+            "relative paths must not become broad substring replacements"
+        );
+
+        let body = doctor_json_body(&report);
+        let daemon = body["checks"]
+            .as_array()
+            .expect("checks array")
+            .iter()
+            .find(|check| check["id"] == "daemon")
+            .expect("daemon check");
+        assert_eq!(
+            daemon["message"],
+            "running (pid 42, socket <daemon-socket>)"
+        );
+        let serialized = body.to_string();
+        assert!(!serialized.contains(private_hash));
+        assert!(!serialized.contains(&socket));
+    }
+
     fn make_doctor_report() -> DoctorReport {
         DoctorReport {
             home: PathBuf::from("/tmp/coven-home"),
@@ -6220,7 +6712,6 @@ mod tests {
                 started_at: "2026-01-01T00:00:00Z".to_string(),
                 socket: "/tmp/coven-home/coven.sock".to_string(),
             })),
-            repos_config_path: PathBuf::from("/tmp/coven-home/repos.toml"),
             repos: vec![],
             harnesses: vec![make_harness_with_hint("codex", true, "npm i -g codex")],
             engine: Some(DoctorEngineReport {
@@ -6253,6 +6744,7 @@ mod tests {
         bad_repo.repos.push(DoctorRepoReport {
             name: "openclaw".to_string(),
             path: PathBuf::from("/does/not/exist"),
+            config_path: PathBuf::from("/tmp/settings.json"),
             ok: false,
         });
 
@@ -6289,6 +6781,49 @@ mod tests {
     }
 
     #[test]
+    fn doctor_bad_repo_hint_redacts_the_entrys_actual_config_source() {
+        let mut report = make_doctor_report();
+        report.repos.push(DoctorRepoReport {
+            name: "openclaw".to_string(),
+            path: PathBuf::from("/does/not/exist"),
+            config_path: PathBuf::from("/tmp/settings.json"),
+            ok: false,
+        });
+
+        let check = doctor_checks(&report)
+            .into_iter()
+            .find(|check| check.id == "repo:openclaw")
+            .expect("repo check");
+        assert_eq!(check.status, "fail");
+        assert_eq!(
+            check.hint.as_deref(),
+            Some("fix the path in <repos-config>")
+        );
+    }
+
+    #[test]
+    fn doctor_repo_config_path_tracks_settings_overrides() {
+        let legacy = Path::new("/tmp/repos.toml");
+        let settings_path = Path::new("/tmp/settings.json");
+        let mut loaded = settings::Settings::default();
+        loaded.coven_cli.repos.insert(
+            "settings-repo".to_string(),
+            settings::RepoSettings {
+                path: PathBuf::from("/tmp/repo"),
+            },
+        );
+
+        assert_eq!(
+            doctor_repo_config_path("settings-repo", legacy, Some(settings_path), Some(&loaded)),
+            settings_path
+        );
+        assert_eq!(
+            doctor_repo_config_path("legacy-repo", legacy, Some(settings_path), Some(&loaded)),
+            legacy
+        );
+    }
+
+    #[test]
     fn doctor_json_body_shapes_the_scriptable_envelope() {
         let mut report = make_doctor_report();
         report.harnesses = vec![make_harness_with_hint("codex", false, "npm i -g codex\n")];
@@ -6299,8 +6834,8 @@ mod tests {
         let body = doctor_json_body(&report);
         assert_eq!(body["ok"], serde_json::json!(false));
         assert_eq!(body["blocking"], serde_json::json!(true));
-        assert_eq!(body["store"], serde_json::json!("/tmp/coven-home"));
-        assert_eq!(body["project"], serde_json::json!("/tmp/project"));
+        assert_eq!(body["store"], serde_json::json!("<coven-home>"));
+        assert_eq!(body["project"], serde_json::json!("<project>"));
         let checks = body["checks"].as_array().expect("checks array");
         let harness_check = checks
             .iter()
@@ -6319,6 +6854,18 @@ mod tests {
             .expect("engine check");
         assert_eq!(engine["status"], "fail");
         assert_eq!(engine["hint"], "run: coven engine install");
+        let familiars = checks
+            .iter()
+            .find(|check| check["id"] == "familiars")
+            .expect("familiars check");
+        assert_eq!(
+            familiars["message"],
+            "none configured (<familiars-manifest>)"
+        );
+        assert!(
+            !body.to_string().contains("/tmp/"),
+            "doctor JSON must not expose host-specific fixture paths: {body}"
+        );
         assert!(
             checks
                 .iter()
@@ -6335,7 +6882,7 @@ mod tests {
     }
 
     #[test]
-    fn doctor_passing_report_keeps_daemon_and_credentials_checks() {
+    fn doctor_passing_report_keeps_authentication_checks_non_blocking_and_unverified() {
         let body = doctor_json_body(&make_doctor_report());
         assert_eq!(body["ok"], serde_json::json!(true));
         assert_eq!(body["blocking"], serde_json::json!(false));
@@ -6349,14 +6896,37 @@ mod tests {
             daemon["message"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("pid 42"),
+                .contains("pid 42, socket <daemon-socket>"),
             "daemon message should carry the pid: {daemon}"
+        );
+        let engine = checks
+            .iter()
+            .find(|check| check["id"] == "engine")
+            .expect("engine check");
+        assert!(
+            engine["message"]
+                .as_str()
+                .is_some_and(|message| message.starts_with("<engine>")),
+            "engine path should be role-redacted: {engine}"
         );
         let credentials = checks
             .iter()
             .find(|check| check["id"] == "credentials:engine")
             .expect("credentials:engine check");
-        assert_eq!(credentials["status"], "pass");
+        assert_eq!(credentials["status"], "warn");
+        assert_eq!(
+            credentials["message"],
+            "authentication configured; provider turn not verified"
+        );
+        let codex_credentials = checks
+            .iter()
+            .find(|check| check["id"] == "credentials:codex")
+            .expect("credentials:codex check");
+        assert_eq!(codex_credentials["status"], "warn");
+        assert_eq!(
+            codex_credentials["message"],
+            "executable available; authentication not verified"
+        );
         assert!(
             checks.iter().all(|check| check["status"] != "fail"),
             "healthy report must not contain fail checks"
@@ -6372,7 +6942,7 @@ mod tests {
     }
 
     #[test]
-    fn credentials_lines_available_harness_shows_login_hint() {
+    fn credentials_lines_available_harness_separates_setup_from_turn_verification() {
         let harnesses = vec![
             make_harness_with_hint("codex", true, "npm install -g @openai/codex"),
             make_harness_with_hint("claude", true, "npm install -g @anthropic-ai/claude-code"),
@@ -6381,11 +6951,27 @@ mod tests {
         // engine row + 2 harness rows
         assert_eq!(lines.len(), 3);
         let codex_line = &lines[1];
-        assert!(codex_line.contains("[OK]"), "got: {codex_line}");
+        assert!(codex_line.contains("[--]"), "got: {codex_line}");
+        assert!(
+            codex_line.contains("authentication not verified"),
+            "got: {codex_line}"
+        );
         assert!(codex_line.contains("codex login"), "got: {codex_line}");
+        assert!(
+            codex_line.contains("explicitly authorized test turn"),
+            "got: {codex_line}"
+        );
         let claude_line = &lines[2];
-        assert!(claude_line.contains("[OK]"), "got: {claude_line}");
+        assert!(claude_line.contains("[--]"), "got: {claude_line}");
+        assert!(
+            claude_line.contains("authentication not verified"),
+            "got: {claude_line}"
+        );
         assert!(claude_line.contains("claude doctor"), "got: {claude_line}");
+        assert!(
+            claude_line.contains("explicitly authorized test turn"),
+            "got: {claude_line}"
+        );
     }
 
     #[test]
