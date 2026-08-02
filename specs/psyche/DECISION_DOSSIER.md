@@ -804,9 +804,9 @@ needs the following independently testable workstreams.
 
 | ID | Workstream | Depends on | Exit result |
 |---|---|---|---|
-| W0 | Canonical specification reconciliation | Dossier approval | Every companion document describes the same product and ownership model. |
-| W1 | Current Coven contract audit | Dossier approval | Every prerequisite is classified with evidence and owner. |
-| W2 | Rust foundation and canonical schemas | W0 | Buildable workspace, schemas, store, fake services, and contract tests. |
+| W0 | Canonical specification reconciliation | G0 | Every companion document describes the same product and ownership model. |
+| W1 | Current Coven contract audit | W0, G1 | Every prerequisite is classified with evidence and owner. |
+| W2 | Rust foundation and canonical schemas | W0, W1, G3 | Buildable workspace, schemas, store, fake services, and contract tests. |
 | W3 | Identity and intent | W2 | Surface-neutral identity snapshots and immutable intent replay pass. |
 | W4 | Graph store and simulation | W2, W3 | Graph/node/attempt state, dependencies, budgets, cancellation, and restart recovery work without real harnesses. |
 | W5 | Single-node Coven execution | W1, W2, W3 | One node dispatches, adopts, follows, cancels, and recovers against real Coven. |
@@ -820,20 +820,22 @@ needs the following independently testable workstreams.
 ### 13.1 Critical path
 
 ```text
-Dossier approval
-  -> W0 specification reconciliation
-  -> W2 foundation and schemas
+G0 decision approval
+  -> W0 / G1 specification coherence
+  -> standalone repository creation
+  -> W1 / G3 current Coven audit
+  -> W2 / G2 foundation and schemas
   -> W3 identity and intent
-  -> W5 single-node real Coven execution
+  -> W5 / G4 single-node real Coven execution
   -> W6 Telegram vertical slice
-  -> W10 Telegram parity
-  -> W11 canary and release
+  -> W10 / G8-G9 Telegram evidence
+  -> W11 / G10-G12 operations, canary, and release
 ```
 
-W1 runs in parallel with W0-W3. W4 may proceed against fakes after schemas
-freeze. W7 and W9 can proceed after their boundaries stabilize. W8 is never on
-the first Telegram release critical path unless Val explicitly makes
-production multi-agent execution a launch requirement.
+W1 begins after G1 and gates W2. W4 may proceed against fakes after W2/W3. W7
+and W9 may progress when their contracts stabilize. W8 is never on the first
+Telegram release critical path unless Val explicitly makes production
+multi-agent execution a launch requirement.
 
 ### 13.2 Recommended first release
 
@@ -867,7 +869,7 @@ release slice of that architecture.
 | G7 - Trusted add-ons | Approval, allowlisting, digest pinning, provenance, revocation, per-invocation audit, protocol denial, crash, and security evidence pass. | Trusted add-on activation. |
 | G8 - Adapter reliability | Fake surface, crash, security, ambiguity, and parity evidence pass repeatedly. | Live Telegram. |
 | G9 - Live Telegram | Required live rows pass twice on dedicated non-production accounts and two client families. | Canary. |
-| G10 - Operations | Doctor, retention, privacy, export/restore, incident response, and rollback drills pass. | Production cutover. |
+| G10 - Operations | Doctor, retention, privacy, export/restore, incident response, migration, token rotation, and rollback drills pass; a release security review finds no open critical or high-severity issue. | Production cutover. |
 | G11 - Canary | Core and Telegram adapter service objectives hold for the operator-approved observation window and update volume with zero unauthorized dispatch. The prior seven-day and 1,000-update values remain provisional until operators approve the canary. | General release. |
 | G12 - Distribution | Signed/checksummed artifacts, SBOM, provenance, clean-host install, and rollback under threshold pass. | Publication. |
 

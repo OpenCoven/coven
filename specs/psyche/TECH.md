@@ -114,7 +114,9 @@ snapshot, intent, graph node, execution request, evidence policy, and effect.
 
 The root config declares `schema_version = "psyche.config.v1"`. Unknown fields
 are errors except under an explicitly versioned `extensions` table. Raw token
-values are not valid configuration.
+values are not valid configuration. The Coven API version below illustrates a
+candidate configuration shape; W1 must replace it with the verified public
+version before implementation.
 
 ```toml
 schema_version = "psyche.config.v1"
@@ -1058,7 +1060,7 @@ CLI, admin socket, and internal boundary errors use `psyche.error.v1`:
     "retryable": false,
     "correlation_id": "corr_01J...",
     "details": {
-      "capability": "coven.approvals.v1"
+      "capability": "required-capability-id"
     }
   }
 }
@@ -1070,15 +1072,19 @@ the local CLI explicitly requests a privileged diagnostic view.
 
 ## Coven capability profile
 
-At startup Psyche calls `GET /api/v1/health`, requires
-`apiVersion == "coven.daemon.v1"`, then calls `GET /api/v1/capabilities`.
-Psyche never assumes an endpoint is authorized merely because it exists.
+W1 must identify Coven's current public, versioned health and capability
+discovery contracts. The names `GET /api/v1/health`,
+`coven.daemon.v1`, and `GET /api/v1/capabilities` are candidate references,
+not W0 requirements. If W1 confirms them, Psyche may use that profile;
+otherwise the audited public names govern. Psyche never assumes an endpoint is
+authorized merely because it exists.
 
 W0 freezes behavior requirements, not speculative Coven names. W1 must classify
 each requirement as `current`, `current_but_undocumented`, `planned`,
 `optional`, or `rejected`, with a code/test citation and owner. Only `current`
-or `current_but_undocumented` behavior with executable conformance can satisfy
-G4.
+behavior with executable conformance can satisfy G4.
+`current_but_undocumented` behavior must become a public, versioned contract
+before it is reclassified as `current` and used for G4.
 
 The single-node execution profile requires:
 
@@ -1144,7 +1150,8 @@ resources. Coven does not authorize Telegram or another surface effect.
 
 Psyche uses daemon-managed sessions, not external sessions, because Coven owns
 the admitted process lifecycle. Exact endpoint, capability, and error names are
-W1 outputs and remain absent from this W0 protocol.
+W1 outputs. Any names shown in W0 are explicitly non-normative candidate
+examples.
 
 ### Adoption-unknown operator recovery
 
@@ -1511,10 +1518,11 @@ project/familiar-snapshot/graph/attempt/source binding, request ID, and expiry.
 Coven
 recomputes the metadata digest and streamed-byte hash. Repeating the same
 client-scoped `artifact_request_id` and request digest returns the original
-artifact; any field or byte change returns `409 intent_conflict`. Psyche
-verifies every echoed response field before use. Coven expiry may shorten but
-never extend Psyche's requested lifetime. Without the capability, no media
-bytes or path enter Coven and the media parity release gate cannot pass.
+artifact; any field or byte change returns the W1-confirmed public
+intent-conflict response. Psyche verifies every echoed response field before
+use. Coven expiry may shorten but never extend Psyche's requested lifetime.
+Without the capability, no media bytes or path enter Coven and the media parity
+release gate cannot pass.
 
 1. Persist Telegram file identifiers and declared metadata.
 2. Ask Telegram for the file path using the account client.
@@ -1730,9 +1738,9 @@ is a deterministic rendering of the same object:
       "correlation_id": "corr_01J..."
     },
     {
-      "check_id": "capability.coven.memory.read",
+      "check_id": "capability.required-memory-read",
       "component": "coven",
-      "scope": { "type": "capability", "id": "coven.memory.read" },
+      "scope": { "type": "capability", "id": "required-memory-read" },
       "status": "degraded",
       "reason_code": "optional_capability_missing",
       "blocking": false,

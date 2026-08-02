@@ -266,7 +266,7 @@ pass. No calendar date overrides evidence.
 | G7 - Trusted add-ons | Allowlist, digest/provenance, revocation, audit, protocol denial, crash/security evidence. | Add-on activation. |
 | G8 - Adapter reliability | Fake surface, crash, security, ambiguity, and parity evidence. | Live Telegram. |
 | G9 - Live Telegram | Required live rows pass twice on dedicated accounts and two client families. | Canary. |
-| G10 - Operations | Doctor, retention, privacy, export/restore, incident response, rollback. | Production cutover. |
+| G10 - Operations | Doctor, retention, privacy, export/restore, incident response, migration, token rotation, rollback, and a release security review with no open critical or high-severity issue. | Production cutover. |
 | G11 - Canary | Approved core and Telegram objectives hold for the operator-approved window/volume with zero unauthorized dispatch. | General release. |
 | G12 - Distribution | Signed/checksummed artifacts, SBOM, provenance, clean-host install, rollback under threshold. | Publication. |
 

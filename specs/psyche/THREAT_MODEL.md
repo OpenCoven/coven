@@ -385,19 +385,29 @@ Response:
 
 ## Security acceptance
 
-G1 cannot pass, and Psyche cannot release, until:
+G1 cannot pass until:
 
 - all six companion documents share the surface-neutral product and authority
   model;
-- all invariants have automated negative tests;
-- crash tests prove durable acknowledgement;
-- webhook, media, callback, identity, and Coven-boundary fuzz targets run in
-  CI;
-- a security review finds no open critical or high-severity issue;
-- release artifacts pass secret scanning and provenance verification;
-- minimum export/restore and ambiguous-recovery drills pass on a clean host
-  profile;
-- migration and token-rotation drills pass on a dedicated account;
-- W1 classifies Coven requirements before any implementation assignment; and
-- repository creation and W1 remain blocked until G1; implementation planning,
-  issues, and production code remain blocked until G3.
+- their trust boundaries, invariants, abuse cases, recovery rules, and
+  acceptance-gate allocations are internally consistent; and
+- repository creation and W1 remain blocked until G1.
+
+Executable security evidence belongs to the later gate that owns the affected
+behavior:
+
+- G2 requires automated negative, state-machine, property, migration, and
+  unknown-version tests for the contract foundation;
+- G3 requires W1 to classify Coven requirements before implementation
+  assignments, issues, or production code;
+- G4 requires denial, restart, cancellation, binding, and ambiguity evidence
+  against a pinned real Coven build;
+- G8-G9 require adapter crash, fuzz, security, ambiguity, parity, and dedicated
+  live-account evidence;
+- G10 requires privacy, export/restore, incident-response, migration,
+  token-rotation, and rollback drills plus a release security review with no
+  open critical or high-severity issue; and
+- G12 requires clean-host, secret-scan, signed/checksummed artifact, SBOM,
+  provenance, and distribution rollback evidence.
+
+Passing G1 does not substitute for any of this executable evidence.

@@ -617,7 +617,7 @@ G11.
 | G7 - Trusted add-ons | Approval, allowlisting, digest pinning, provenance, revocation, invocation audit, protocol denial, crash, and security evidence pass. | Trusted add-on activation. |
 | G8 - Adapter reliability | Fake-surface, crash, security, ambiguity, and parity evidence pass repeatedly. | Live Telegram. |
 | G9 - Live Telegram | Every required live parity row passes twice on dedicated non-production accounts and two client families. | Canary. |
-| G10 - Operations | Doctor, retention, privacy, export/restore, incident response, and rollback drills pass. | Production cutover. |
+| G10 - Operations | Doctor, retention, privacy, export/restore, incident response, migration, token rotation, and rollback drills pass; a release security review finds no open critical or high-severity issue. | Production cutover. |
 | G11 - Canary | Approved core and Telegram service objectives hold for the approved window and volume with zero unauthorized dispatch. | General release. |
 | G12 - Distribution | Signed/checksummed artifacts, SBOM, provenance, clean-host install, and rollback under threshold pass. | Publication. |
 

@@ -53,7 +53,7 @@ permissive fallback would create risk.
 | Canonical reply/action authorization | `psyche.surface_effect.v1` plus `psyche.telegram_effect.v1` | G8 |
 | Logical/physical send durability and ambiguity | `psyche.delivery.v1`, `psyche.recovery.v1` | G8 |
 | Live Bot API behavior | Required rows marked `L` | G9 |
-| Doctor, retention, export/restore, migration, rollback | Psyche operations contracts | G10 |
+| Doctor, retention, export/restore, migration, token rotation, rollback, release security review | Psyche operations contracts | G10 |
 | Production observation window and service objectives | Approved canary report | G11 |
 
 G6 controls production child-session dispatch and is not implied by any
