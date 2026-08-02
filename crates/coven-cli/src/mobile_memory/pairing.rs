@@ -7,10 +7,6 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use qrcode::render::unicode::Dense1x2;
 use qrcode::QrCode;
-#[cfg(test)]
-use rand::rngs::OsRng;
-#[cfg(test)]
-use rand::TryRngCore;
 use sha2::{Digest, Sha256};
 use url::Url;
 use uuid::Uuid;
@@ -464,8 +460,7 @@ mod tests {
         }
 
         fn enroll_after_expiry(&self) -> Result<EnrolledPairing, PairingError> {
-            let mut nonce = [0u8; 32];
-            OsRng.try_fill_bytes(&mut nonce).expect("OS RNG failed");
+            let nonce = random::<[u8; 32]>();
             self.manager.enroll(
                 self.pairing_id,
                 nonce,
