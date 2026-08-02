@@ -26,18 +26,27 @@ found):
 {
   "ok": true,
   "blocking": false,
-  "store": "/path/to/coven-home",
-  "project": "/path/to/project",
+  "store": "<coven-home>",
+  "project": "<project>",
   "checks": [
-    { "id": "daemon", "status": "pass", "message": "running (pid 12345, socket /path/to/coven-home/coven.sock)" },
+    { "id": "daemon", "status": "pass", "message": "running (pid 12345, socket <daemon-socket>)" },
     { "id": "harness:codex", "status": "pass", "message": "`codex` executable is available (built-in)" },
     { "id": "harnesses", "status": "pass", "message": "1 of 3 configured harness executables available" },
-    { "id": "engine", "status": "pass", "message": "/path/to/coven-home/engine/bin/coven-code (managed install), version 0.6.1 (pin 0.6.1)" },
+    { "id": "engine", "status": "pass", "message": "<engine> (managed install), version 0.6.1 (pin 0.6.1)" },
+    { "id": "credentials:engine", "status": "warn", "message": "authentication configured; provider turn not verified", "hint": "run an explicitly authorized test turn to verify provider access" },
     { "id": "credentials:codex", "status": "warn", "message": "executable available; authentication not verified", "hint": "authenticate or inspect local setup with: codex login; verify provider access with an explicitly authorized test turn" }
   ],
   "nextSteps": ["coven run codex \"explain this repo in 5 bullets\"", "coven sessions"]
 }
 ```
+
+Known Doctor-owned absolute path roles are replaced with stable tokens such as
+`<coven-home>`, `<project>`, `<engine>`, `<daemon-socket>`, `<repo>`, and
+`<repos-config>`. This keeps repeated output comparable across machines and
+safer to attach to CI logs or bug reports without implying that arbitrary
+user-authored hint text is sanitized. Run the prose form locally when you need
+the concrete paths. `project` is `null` when the command runs outside a project
+root.
 
 Check `status` is `pass`, `warn`, or `fail`. Every `fail` is blocking — `ok`
 is false and the command exits 1 — while `warn` needs attention but does not
