@@ -427,6 +427,7 @@ fn doctor_json_reports_blocking_failure_when_no_harness_is_available() -> anyhow
     let output = Command::new(&coven)
         .args(["doctor", "--json"])
         .env("COVEN_HOME", &coven_home)
+        .env_remove("COVEN_ENGINE_BIN")
         .env("PATH", &empty_path)
         .env("HOME", &fake_home)
         .output()?;
@@ -470,7 +471,13 @@ fn doctor_json_passes_with_fake_harness_and_engine() -> anyhow::Result<()> {
     let path = prepend_path(&fake_bin);
     let coven = coven_bin();
 
-    let output = run_coven(&coven, &coven_home, &path, &["doctor", "--json"])?;
+    let output = run_coven_with_engine(
+        &coven,
+        &coven_home,
+        &path,
+        &fake_bin.join("coven-code"),
+        &["doctor", "--json"],
+    )?;
 
     assert_success("doctor --json with fakes", &output);
     let value = parse_stdout_json("doctor --json with fakes", &output)?;
@@ -593,7 +600,13 @@ description = "Keeps the coven sociable."
     let path = prepend_path(&fake_bin);
     let coven = coven_bin();
 
-    let output = run_coven(&coven, &coven_home, &path, &["doctor"])?;
+    let output = run_coven_with_engine(
+        &coven,
+        &coven_home,
+        &path,
+        &fake_bin.join("coven-code"),
+        &["doctor"],
+    )?;
 
     assert_success("doctor with familiars", &output);
     assert_stdout_contains("doctor with familiars", &output, "Familiars (");
@@ -618,7 +631,13 @@ fn doctor_reports_no_familiars_when_manifest_absent() -> anyhow::Result<()> {
     let path = prepend_path(&fake_bin);
     let coven = coven_bin();
 
-    let output = run_coven(&coven, &coven_home, &path, &["doctor"])?;
+    let output = run_coven_with_engine(
+        &coven,
+        &coven_home,
+        &path,
+        &fake_bin.join("coven-code"),
+        &["doctor"],
+    )?;
 
     assert_success("doctor without familiars", &output);
     assert_stdout_contains("doctor without familiars", &output, "none configured");
@@ -661,6 +680,7 @@ fn doctor_missing_harness_prints_cross_platform_setup_loop() -> anyhow::Result<(
     let output = Command::new(&coven)
         .args(["doctor"])
         .env("COVEN_HOME", &coven_home)
+        .env_remove("COVEN_ENGINE_BIN")
         .env("PATH", &empty_path)
         .env("HOME", &fake_home)
         .output()?;
@@ -720,7 +740,13 @@ fn doctor_reports_live_daemon_socket_status() -> anyhow::Result<()> {
     assert_success("daemon start", &start);
     wait_for_daemon_health(&coven_home)?;
 
-    let output = run_coven(&coven, &coven_home, &path, &["doctor"])?;
+    let output = run_coven_with_engine(
+        &coven,
+        &coven_home,
+        &path,
+        &fake_bin.join("coven-code"),
+        &["doctor"],
+    )?;
 
     assert_success("doctor with live daemon", &output);
     assert_stdout_contains("doctor with live daemon", &output, "Daemon:");
@@ -1276,6 +1302,22 @@ fn run_coven(
     Command::new(coven)
         .args(args)
         .env("COVEN_HOME", coven_home)
+        .env("PATH", path)
+        .output()
+        .map_err(Into::into)
+}
+
+fn run_coven_with_engine(
+    coven: &Path,
+    coven_home: &Path,
+    path: &OsString,
+    engine: &Path,
+    args: &[&str],
+) -> anyhow::Result<Output> {
+    Command::new(coven)
+        .args(args)
+        .env("COVEN_HOME", coven_home)
+        .env("COVEN_ENGINE_BIN", engine)
         .env("PATH", path)
         .output()
         .map_err(Into::into)
