@@ -74,10 +74,18 @@ whose directory no longer exists is treated as stale/absent rather than as an
 immediate hard failure; the recovery may use the minimal documented
 `git worktree add --force` exception only when that missing registration is
 proven stale and the controller branch is not present in any live worktree.
-Every operational command block re-derives `CONTROL_WORKTREE`, `COMMON_DIR`,
-and `REPO` instead of assuming a fixed local path or persistent shell
-variables, and every recreated controller path is re-verified on the exact
-branch before the plan continues. For each source worktree, store its current
+Before any live controller is used or any replacement controller is created,
+the recovery first fetches `origin/docs/541-incomplete-work-recovery-design`
+into its remote-tracking ref. One live controller is acceptable only when its
+worktree is clean and can fast-forward-only to that freshly fetched remote tip;
+local ahead state, divergence, or dirtiness blocks. With zero live controllers,
+the local controller branch may be created from the fetched remote tip or
+fast-forwarded to it, but any force-rewrite requirement blocks. Every
+operational command block re-derives `CONTROL_WORKTREE`, `COMMON_DIR`, and
+`REPO` instead of assuming a fixed local path or persistent shell variables,
+and every resolved or recreated controller path is re-verified on the exact
+branch with `HEAD` equal to that freshly fetched remote tip before the plan
+continues. For each source worktree, store its current
 state even if it is now clean because its changes were already committed to an
 active pull request:
 
@@ -220,7 +228,12 @@ with the same lossless method used for the snapshot and compares them
 byte-for-byte to the preserved artifacts. Any ignored content or inventory
 drift blocks removal, records blocker evidence with a resume condition, and
 leaves the source worktree untouched. Unrelated user changes are never
-discarded.
+discarded. Exact preserved-head equality remains the default local branch
+deletion proof. The only allowed exception is a viable adopted source-branch
+row whose exact expected branch matches the branch being deleted, whose live
+local tip equals a freshly fetched `origin/<branch>` tip, whose current PR is
+still the OPEN same-repo `main` PR at that exact branch/tip, and whose
+preserved snapshot head is an ancestor of the advanced live tip.
 
 Before the final audit, the primary checkout is restored non-destructively to a
 clean `main`. If it is already on `main`, the recovery fetches `origin/main`
@@ -230,6 +243,11 @@ its configured upstream, then switches to `main` and fast-forwards from
 `origin/main`. Any dirty tracked or untracked state, missing upstream,
 unpushed recovery commits, unrelated current branch, or non-fast-forward `main`
 state blocks the audit and leaves the checkout untouched.
+The final audit parses exact classification rows rather than label-only grep.
+Viable rows are terminal only when `Main/PR evidence` is the raw
+`OpenCoven/coven` PR URL and `Recovery action` is already in a terminal
+PR-backed mode (`continue-existing-pr` or `recovery-pr-open`) with the
+required metadata; `mode=awaiting-recovery-pr` fails the terminal audit.
 
 ### 5. Reconcile long-running goals
 

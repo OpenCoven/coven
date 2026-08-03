@@ -188,12 +188,22 @@ gh pr list --repo OpenCoven/coven --state open --limit 100
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -207,13 +217,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -243,6 +253,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -266,8 +302,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -283,6 +343,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -300,19 +365,24 @@ printf 'CONTROL_WORKTREE=%s\nCOMMON_DIR=%s\nREPO=%s\n' \
 ```
 
 Expected: from any `OpenCoven/coven` worktree, the shared claim registry and
-open PR set are reviewed first; `git worktree list --porcelain` discovers an
-existing linked controller for branch
-`docs/541-incomplete-work-recovery-design`; if the discovered registration
-points at a missing directory, the helper treats it as stale/absent instead of
-failing immediately. The deterministic repo-local controller
-`.worktrees/issue-541-recovery` is recreated only for the exact existing branch
-and only with the minimal `git worktree add --force` exception when that stale
-registration is proven missing and no live worktree still has the branch;
-otherwise the step blocks. `CONTROL_WORKTREE`, `COMMON_DIR`, and `REPO` are
-printed explicitly, the resolved or recreated controller path is verified on
-`docs/541-incomplete-work-recovery-design`, `issue-541` is acquired from that
-controller worktree, and `git status --short --branch` there shows only the
-plan file untracked before it is staged.
+open PR set are reviewed first, then `origin/docs/541-incomplete-work-recovery-design`
+is fetched into its remote-tracking ref before the helper chooses any existing
+controller or recreates the deterministic repo-local controller at
+`.worktrees/issue-541-recovery`. A single live controller is acceptable only
+when its worktree is clean and can fast-forward-only to the freshly fetched
+remote tip; local dirtiness, ahead state, or divergence blocks. With zero live
+controllers, the local branch may be created from that fetched remote tip or
+fast-forwarded to it, but divergence or any force-rewrite requirement blocks.
+If the discovered registration points at a missing directory, the helper treats
+it as stale/absent instead of failing immediately and uses the minimal
+documented `git worktree add --force` exception only for that one stale
+registration after the branch has been proven safe to reuse. `CONTROL_WORKTREE`,
+`COMMON_DIR`, and `REPO` are printed explicitly, the resolved or recreated
+controller path is verified on
+`docs/541-incomplete-work-recovery-design`, its `HEAD` is verified equal to the
+freshly fetched remote tip, `issue-541` is acquired from that controller
+worktree, and `git status --short --branch` there shows only the plan file
+untracked before it is staged.
 
 If this publication session or the later recovery session runs long, keep the
 parent claim alive from the discovered controller worktree by re-resolving it
@@ -323,12 +393,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -342,13 +422,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -378,6 +458,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -401,8 +507,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -418,6 +548,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -443,12 +578,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -462,13 +607,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -498,6 +643,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -521,8 +692,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -538,6 +733,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -564,12 +764,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -583,13 +793,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -619,6 +829,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -642,8 +878,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -659,6 +919,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -690,12 +955,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -709,13 +984,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -745,6 +1020,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -768,8 +1069,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -785,6 +1110,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -806,12 +1136,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -825,13 +1165,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -861,6 +1201,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -884,8 +1250,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -901,6 +1291,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -939,12 +1334,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -958,13 +1363,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -994,6 +1399,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -1017,8 +1448,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -1034,6 +1489,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -1098,12 +1558,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -1117,13 +1587,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -1153,6 +1623,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -1176,8 +1672,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -1193,6 +1713,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -1261,12 +1786,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -1280,13 +1815,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -1316,6 +1851,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -1339,8 +1900,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -1356,6 +1941,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -1420,12 +2010,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -1439,13 +2039,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -1475,6 +2075,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -1498,8 +2124,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -1515,6 +2165,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -1578,12 +2233,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -1597,13 +2262,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -1633,6 +2298,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -1656,8 +2347,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -1673,6 +2388,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -1735,12 +2455,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -1754,13 +2484,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -1790,6 +2520,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -1813,8 +2569,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -1830,6 +2610,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -1947,12 +2732,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -1966,13 +2761,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -2002,6 +2797,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -2025,8 +2846,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -2042,6 +2887,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -2076,12 +2926,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -2095,13 +2955,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -2131,6 +2991,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -2154,8 +3040,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -2171,6 +3081,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -2195,12 +3110,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -2214,13 +3139,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -2250,6 +3175,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -2273,8 +3224,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -2290,6 +3265,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -2492,12 +3472,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -2511,13 +3501,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -2547,6 +3537,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -2570,8 +3586,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -2587,6 +3627,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -2627,12 +3672,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -2646,13 +3701,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -2682,6 +3737,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -2705,8 +3786,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -2722,6 +3827,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -3116,12 +4226,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -3135,13 +4255,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -3171,6 +4291,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -3194,8 +4340,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -3211,6 +4381,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -3744,12 +4919,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -3763,13 +4948,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -3799,6 +4984,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -3822,8 +5033,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -3839,6 +5074,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -4200,12 +5440,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -4219,13 +5469,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -4255,6 +5505,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -4278,8 +5554,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -4295,6 +5595,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -4541,12 +5846,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -4560,13 +5875,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -4596,6 +5911,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -4619,8 +5960,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -4636,6 +6001,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -4659,12 +6029,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -4678,13 +6058,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -4714,6 +6094,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -4737,8 +6143,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -4754,6 +6184,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -4789,12 +6224,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -4808,13 +6253,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -4844,6 +6289,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -4867,8 +6338,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -4884,6 +6379,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -4913,12 +6413,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -4932,13 +6442,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -4968,6 +6478,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -4991,8 +6527,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -5008,6 +6568,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -5201,12 +6766,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -5220,13 +6795,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -5256,6 +6831,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -5279,8 +6880,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -5296,6 +6921,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -5340,12 +6970,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -5359,13 +6999,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -5395,6 +7035,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -5418,8 +7084,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -5435,6 +7125,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -6050,7 +7745,14 @@ parsed expected source branch to equal the current `headRefName`, and their
 parsed preserved head to remain equal to or an ancestor of the current
 `headRefOid`; they also require a freshly fetched authoritative `origin/<branch>`
 tip to equal the current `headRefOid`; a force-push or divergence blocks
-retirement with evidence.
+retirement with evidence. In later branch cleanup, exact preserved-head
+equality remains the default deletion proof; the only allowed exception is a
+viable adopted source-branch row whose exact expected branch matches the branch
+being deleted, whose live local tip equals a freshly fetched `origin/<branch>`
+tip, whose current PR is still the OPEN same-repo `main` PR at that exact
+branch/tip, and whose preserved snapshot head is an ancestor of the advanced
+live tip. Without that fresh proof, advanced local source-branch tips still
+block deletion.
 Adopted or newly opened recovery-branch rows additionally require the parsed
 expected recovery branch to equal the current `headRefName`, a fresh exact
 `origin/<branch>` refetch immediately before verification to resolve the
@@ -6093,12 +7795,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -6112,13 +7824,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -6148,6 +7860,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -6171,8 +7909,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -6190,6 +7952,11 @@ EOF
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
     exit 1
   fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
+    exit 1
+  fi
   printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
@@ -6197,29 +7964,114 @@ COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 BRANCH_DELETE_PROOF_ROOT="$COMMON_DIR/agent-recovery/issue-541/private/branch-delete-proof"
 mkdir -p "$BRANCH_DELETE_PROOF_ROOT"
+CLASSIFICATION="$COMMON_DIR/agent-recovery/issue-541/classification.md"
+parse_classification_row() {
+  python3 - "$CLASSIFICATION" "$1" <<'PY'
+import sys
+from pathlib import Path
+
+classification_path = Path(sys.argv[1])
+workstream = sys.argv[2]
+for raw in classification_path.read_text(encoding="utf-8").splitlines():
+    line = raw.strip()
+    if not line.startswith("|") or not line.endswith("|"):
+        continue
+    cells = [cell.strip() for cell in line.strip("|").split("|")]
+    if len(cells) != 5 or cells[0] == "Workstream":
+        continue
+    if cells[0] != workstream:
+        continue
+    print(cells[1])
+    print(cells[2])
+    print(cells[3])
+    print(cells[4])
+    break
+else:
+    raise SystemExit(f"Missing classification row for {workstream}")
+PY
+}
+parse_recovery_action() {
+  python3 - "$1" <<'PY'
+import sys
+
+action = sys.argv[1].strip()
+fields = {}
+for raw_part in action.split(";"):
+    part = raw_part.strip()
+    if not part:
+        continue
+    if "=" not in part:
+        raise SystemExit(f"Recovery action segment is not key=value: {part}")
+    key, value = part.split("=", 1)
+    key = key.strip()
+    value = value.strip()
+    if not key or not value:
+        raise SystemExit(f"Recovery action segment has an empty key or value: {part}")
+    if key in fields:
+        raise SystemExit(f"Recovery action repeats key {key}")
+    fields[key] = value
+
+mode = fields.get("mode")
+pr_kind = fields.get("pr_kind")
+required = ["mode", "pr_kind", "issue_url", "archive_id", "expected_branch"]
+if mode == "continue-existing-pr":
+    if pr_kind == "adopted":
+        required.append("preserved_head")
+    elif pr_kind == "recovered":
+        required.append("expected_head")
+    else:
+        raise SystemExit(f"Unsupported continue-existing-pr kind: {pr_kind}")
+elif mode in {"awaiting-recovery-pr", "recovery-pr-open"}:
+    if pr_kind != "recovered":
+        raise SystemExit(f"{mode} must declare pr_kind=recovered, got {pr_kind}")
+    if mode == "recovery-pr-open":
+        required.append("expected_head")
+else:
+    raise SystemExit(f"Unsupported recovery action mode: {mode}")
+
+for key in required:
+    if key not in fields:
+        raise SystemExit(f"Recovery action is missing {key}")
+
+print(fields["mode"])
+print(fields["pr_kind"])
+print(fields["issue_url"])
+print(fields["archive_id"])
+print(fields["expected_branch"])
+print(fields.get("expected_head", ""))
+print(fields.get("preserved_head", ""))
+PY
+}
 recheck_branch_ref_tip() {
   MODE="$1"
   BRANCH_PROOF_ID="$(printf '%s' "$BRANCH_TO_DELETE" | tr '/' '_')"
   case "$BRANCH_TO_DELETE" in
     docs/psyche-specs)
+      WORKSTREAM_ID="docs-psyche-specs"
       PRESERVED_HEAD_SOURCE="dirty/docs-psyche-specs/head.txt"
       ;;
     docs/universal-runtime-capability-design)
+      WORKSTREAM_ID="docs-universal-runtime-capability-design"
       PRESERVED_HEAD_SOURCE="branches/docs-universal-runtime-capability-design/head.txt"
       ;;
     feat/cmem-1ev-memory-promote)
+      WORKSTREAM_ID="memory-promote"
       PRESERVED_HEAD_SOURCE="dirty/memory-promote/head.txt"
       ;;
     feat/mobile-memory-gateway)
+      WORKSTREAM_ID="mobile-memory-gateway"
       PRESERVED_HEAD_SOURCE="dirty/mobile-memory-gateway/head.txt"
       ;;
     feat/npm-macos-x64)
+      WORKSTREAM_ID="feat-npm-macos-x64"
       PRESERVED_HEAD_SOURCE="branches/feat-npm-macos-x64/head.txt"
       ;;
     fix/476-review-threads)
+      WORKSTREAM_ID="pr-476-review"
       PRESERVED_HEAD_SOURCE="dirty/pr-476-review/head.txt"
       ;;
     fix/521-ward-surface-confinement)
+      WORKSTREAM_ID="fix-521-ward-surface-confinement"
       PRESERVED_HEAD_SOURCE="branches/fix-521-ward-surface-confinement/head.txt"
       ;;
     *)
@@ -6242,6 +8094,7 @@ recheck_branch_ref_tip() {
   then
     {
       printf 'Branch: %s\n' "$BRANCH_TO_DELETE"
+      printf 'Workstream: %s\n' "$WORKSTREAM_ID"
       printf 'Preserved head source: %s\n' "$PRESERVED_HEAD_SOURCE"
       printf 'Outcome: local branch ref is already missing immediately before %s; no deletion command ran.\n' "$MODE"
     } > "$PROOF_FILE"
@@ -6252,15 +8105,151 @@ recheck_branch_ref_tip() {
   LIVE_HEAD="$(tr -d '\n' < "$LIVE_HEAD_FILE")"
   {
     printf 'Branch: %s\n' "$BRANCH_TO_DELETE"
+    printf 'Workstream: %s\n' "$WORKSTREAM_ID"
     printf 'Preserved head source: %s\n' "$PRESERVED_HEAD_SOURCE"
     printf 'Preserved head: %s\n' "$PRESERVED_HEAD"
     printf 'Live branch ref tip: %s\n' "$LIVE_HEAD"
   } > "$PROOF_FILE"
-  if [ "$LIVE_HEAD" != "$PRESERVED_HEAD" ]; then
-    printf 'Blocked: live branch ref tip differs from the preserved head; newer commits are unpreserved.\n' \
+  if [ "$LIVE_HEAD" = "$PRESERVED_HEAD" ]; then
+    return 0
+  fi
+  CLASSIFICATION_FIELDS_FILE="$BRANCH_DELETE_PROOF_ROOT/$BRANCH_PROOF_ID-$MODE-classification.txt"
+  ACTION_FIELDS_FILE="$BRANCH_DELETE_PROOF_ROOT/$BRANCH_PROOF_ID-$MODE-action.txt"
+  FETCH_EVIDENCE="$BRANCH_DELETE_PROOF_ROOT/$BRANCH_PROOF_ID-$MODE-fetch.txt"
+  PR_VIEW_EVIDENCE="$BRANCH_DELETE_PROOF_ROOT/$BRANCH_PROOF_ID-$MODE-pr-view.json"
+  PR_VIEW_ERR="$BRANCH_DELETE_PROOF_ROOT/$BRANCH_PROOF_ID-$MODE-pr-view.err"
+  if ! parse_classification_row "$WORKSTREAM_ID" > "$CLASSIFICATION_FIELDS_FILE"; then
+    printf 'Blocked: live branch ref tip differs from the preserved head, and the classification row could not be parsed for fresh adopted-PR proof.\n' \
       >> "$PROOF_FILE"
+    rm -f "$CLASSIFICATION_FIELDS_FILE" "$ACTION_FIELDS_FILE" "$FETCH_EVIDENCE" "$PR_VIEW_EVIDENCE" "$PR_VIEW_ERR"
     return 1
   fi
+  CLASSIFICATION_ROW=()
+  CLASSIFICATION_FIELD=
+  while IFS= read -r CLASSIFICATION_FIELD || [ -n "$CLASSIFICATION_FIELD" ]; do
+    CLASSIFICATION_ROW+=("$CLASSIFICATION_FIELD")
+  done < "$CLASSIFICATION_FIELDS_FILE"
+  rm -f "$CLASSIFICATION_FIELDS_FILE"
+  if test "${#CLASSIFICATION_ROW[@]}" -ne 4; then
+    printf 'Blocked: classification row parsing returned an unexpected field count for adopted-PR proof.\n' >> "$PROOF_FILE"
+    rm -f "$ACTION_FIELDS_FILE" "$FETCH_EVIDENCE" "$PR_VIEW_EVIDENCE" "$PR_VIEW_ERR"
+    return 1
+  fi
+  CLASSIFICATION_LABEL="${CLASSIFICATION_ROW[0]}"
+  MAIN_PR_EVIDENCE="${CLASSIFICATION_ROW[1]}"
+  RECOVERY_ACTION="${CLASSIFICATION_ROW[3]}"
+  case "$MAIN_PR_EVIDENCE" in
+    https://github.com/OpenCoven/coven/pull/*)
+      ;;
+    *)
+      printf 'Blocked: live branch ref tip differs from the preserved head and the exact row does not record a raw OpenCoven/coven PR URL.\n' >> "$PROOF_FILE"
+      rm -f "$ACTION_FIELDS_FILE" "$FETCH_EVIDENCE" "$PR_VIEW_EVIDENCE" "$PR_VIEW_ERR"
+      return 1
+      ;;
+  esac
+  if [ "$CLASSIFICATION_LABEL" != "viable" ]; then
+    printf 'Blocked: live branch ref tip differs from the preserved head and only viable adopted source-branch rows may use the advanced remote proof.\n' >> "$PROOF_FILE"
+    rm -f "$ACTION_FIELDS_FILE" "$FETCH_EVIDENCE" "$PR_VIEW_EVIDENCE" "$PR_VIEW_ERR"
+    return 1
+  fi
+  if ! parse_recovery_action "$RECOVERY_ACTION" > "$ACTION_FIELDS_FILE"; then
+    printf 'Blocked: viable row recovery action could not be parsed for adopted source-branch proof.\n' >> "$PROOF_FILE"
+    rm -f "$ACTION_FIELDS_FILE" "$FETCH_EVIDENCE" "$PR_VIEW_EVIDENCE" "$PR_VIEW_ERR"
+    return 1
+  fi
+  ACTION_ROW=()
+  ACTION_FIELD=
+  while IFS= read -r ACTION_FIELD || [ -n "$ACTION_FIELD" ]; do
+    ACTION_ROW+=("$ACTION_FIELD")
+  done < "$ACTION_FIELDS_FILE"
+  rm -f "$ACTION_FIELDS_FILE"
+  if test "${#ACTION_ROW[@]}" -ne 7; then
+    printf 'Blocked: viable row recovery action parsing returned an unexpected field count.\n' >> "$PROOF_FILE"
+    rm -f "$FETCH_EVIDENCE" "$PR_VIEW_EVIDENCE" "$PR_VIEW_ERR"
+    return 1
+  fi
+  ACTION_MODE="${ACTION_ROW[0]}"
+  ACTION_PR_KIND="${ACTION_ROW[1]}"
+  ACTION_EXPECTED_BRANCH="${ACTION_ROW[4]}"
+  ACTION_PRESERVED_HEAD="${ACTION_ROW[6]}"
+  if [ "$ACTION_MODE" != "continue-existing-pr" ] || [ "$ACTION_PR_KIND" != "adopted" ]; then
+    printf 'Blocked: live branch ref tip differs from the preserved head and the row is not a viable adopted source-branch PR.\n' >> "$PROOF_FILE"
+    rm -f "$FETCH_EVIDENCE" "$PR_VIEW_EVIDENCE" "$PR_VIEW_ERR"
+    return 1
+  fi
+  if [ "$ACTION_EXPECTED_BRANCH" != "$BRANCH_TO_DELETE" ]; then
+    printf 'Blocked: adopted source-branch proof expected branch %s, not %s.\n' "$ACTION_EXPECTED_BRANCH" "$BRANCH_TO_DELETE" >> "$PROOF_FILE"
+    rm -f "$FETCH_EVIDENCE" "$PR_VIEW_EVIDENCE" "$PR_VIEW_ERR"
+    return 1
+  fi
+  if [ "$ACTION_PRESERVED_HEAD" != "$PRESERVED_HEAD" ]; then
+    printf 'Blocked: adopted source-branch proof preserved head %s does not match snapshot head %s.\n' "$ACTION_PRESERVED_HEAD" "$PRESERVED_HEAD" >> "$PROOF_FILE"
+    rm -f "$FETCH_EVIDENCE" "$PR_VIEW_EVIDENCE" "$PR_VIEW_ERR"
+    return 1
+  fi
+  {
+    printf 'Advanced adopted-source-branch proof for %s\n' "$BRANCH_TO_DELETE"
+    printf 'Fetching origin/%s immediately before deletion proof.\n' "$BRANCH_TO_DELETE"
+  } > "$FETCH_EVIDENCE"
+  if ! git -C "$REPO" fetch --no-tags origin \
+    "refs/heads/$BRANCH_TO_DELETE:refs/remotes/origin/$BRANCH_TO_DELETE" \
+    >> "$FETCH_EVIDENCE" 2>&1
+  then
+    printf 'Blocked: could not fetch origin/%s for advanced adopted-source-branch proof.\n' "$BRANCH_TO_DELETE" >> "$PROOF_FILE"
+    cat "$FETCH_EVIDENCE" >> "$PROOF_FILE"
+    rm -f "$PR_VIEW_EVIDENCE" "$PR_VIEW_ERR"
+    return 1
+  fi
+  REMOTE_HEAD="$(git -C "$REPO" rev-parse "refs/remotes/origin/$BRANCH_TO_DELETE")"
+  {
+    printf 'Fetched remote tip: %s\n' "$REMOTE_HEAD"
+    printf 'Live branch ref tip: %s\n' "$LIVE_HEAD"
+  } >> "$FETCH_EVIDENCE"
+  if [ "$LIVE_HEAD" != "$REMOTE_HEAD" ]; then
+    printf 'Blocked: live branch ref tip differs from freshly fetched origin/%s, so advanced commits are not yet proven remote-backed.\n' "$BRANCH_TO_DELETE" >> "$PROOF_FILE"
+    cat "$FETCH_EVIDENCE" >> "$PROOF_FILE"
+    rm -f "$PR_VIEW_EVIDENCE" "$PR_VIEW_ERR"
+    return 1
+  fi
+  if ! gh pr view --repo OpenCoven/coven "$MAIN_PR_EVIDENCE" \
+    --json url,state,headRefOid,headRefName,headRepositoryOwner,isCrossRepository,baseRefName \
+    > "$PR_VIEW_EVIDENCE" 2> "$PR_VIEW_ERR"
+  then
+    printf 'Blocked: adopted PR %s could not be freshly verified for advanced source-branch deletion proof.\n' "$MAIN_PR_EVIDENCE" >> "$PROOF_FILE"
+    cat "$PR_VIEW_ERR" >> "$PROOF_FILE"
+    return 1
+  fi
+  ACTUAL_URL="$(jq -r '.url' "$PR_VIEW_EVIDENCE")"
+  ACTUAL_STATE="$(jq -r '.state' "$PR_VIEW_EVIDENCE")"
+  ACTUAL_HEAD="$(jq -r '.headRefOid' "$PR_VIEW_EVIDENCE")"
+  ACTUAL_BRANCH="$(jq -r '.headRefName' "$PR_VIEW_EVIDENCE")"
+  ACTUAL_OWNER="$(jq -r '.headRepositoryOwner.login' "$PR_VIEW_EVIDENCE")"
+  ACTUAL_CROSS="$(jq -r '.isCrossRepository' "$PR_VIEW_EVIDENCE")"
+  ACTUAL_BASE="$(jq -r '.baseRefName' "$PR_VIEW_EVIDENCE")"
+  {
+    printf 'Verified PR URL: %s\n' "$ACTUAL_URL"
+    printf 'Verified PR state: %s\n' "$ACTUAL_STATE"
+    printf 'Verified PR head branch: %s\n' "$ACTUAL_BRANCH"
+    printf 'Verified PR head tip: %s\n' "$ACTUAL_HEAD"
+    printf 'Verified PR base: %s\n' "$ACTUAL_BASE"
+    printf 'Verified PR owner: %s\n' "$ACTUAL_OWNER"
+    printf 'Verified PR cross-repository: %s\n' "$ACTUAL_CROSS"
+  } >> "$PROOF_FILE"
+  if [ "$ACTUAL_URL" != "$MAIN_PR_EVIDENCE" ] || \
+     [ "$ACTUAL_STATE" != "OPEN" ] || \
+     [ "$ACTUAL_BASE" != "main" ] || \
+     [ "$ACTUAL_OWNER" != "OpenCoven" ] || \
+     [ "$ACTUAL_CROSS" != "false" ] || \
+     [ "$ACTUAL_BRANCH" != "$BRANCH_TO_DELETE" ] || \
+     [ "$ACTUAL_HEAD" != "$REMOTE_HEAD" ]; then
+    printf 'Blocked: adopted PR proof must verify one OPEN same-repo main PR whose head branch and headRefOid match the fetched live branch tip.\n' >> "$PROOF_FILE"
+    return 1
+  fi
+  if ! git -C "$REPO" merge-base --is-ancestor "$PRESERVED_HEAD" "$LIVE_HEAD"; then
+    printf 'Blocked: preserved snapshot head is not an ancestor of the live adopted branch tip.\n' >> "$PROOF_FILE"
+    return 1
+  fi
+  printf 'Advanced adopted-source-branch proof succeeded: newer commits are preserved remotely and in the OPEN PR.\n' >> "$PROOF_FILE"
   return 0
 }
 if recheck_branch_ref_tip pre-delete-d; then
@@ -6289,12 +8278,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -6308,13 +8307,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -6344,6 +8343,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -6367,8 +8392,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -6386,6 +8435,11 @@ EOF
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
     exit 1
   fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
+    exit 1
+  fi
   printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
@@ -6393,29 +8447,114 @@ COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 BRANCH_DELETE_PROOF_ROOT="$COMMON_DIR/agent-recovery/issue-541/private/branch-delete-proof"
 mkdir -p "$BRANCH_DELETE_PROOF_ROOT"
+CLASSIFICATION="$COMMON_DIR/agent-recovery/issue-541/classification.md"
+parse_classification_row() {
+  python3 - "$CLASSIFICATION" "$1" <<'PY'
+import sys
+from pathlib import Path
+
+classification_path = Path(sys.argv[1])
+workstream = sys.argv[2]
+for raw in classification_path.read_text(encoding="utf-8").splitlines():
+    line = raw.strip()
+    if not line.startswith("|") or not line.endswith("|"):
+        continue
+    cells = [cell.strip() for cell in line.strip("|").split("|")]
+    if len(cells) != 5 or cells[0] == "Workstream":
+        continue
+    if cells[0] != workstream:
+        continue
+    print(cells[1])
+    print(cells[2])
+    print(cells[3])
+    print(cells[4])
+    break
+else:
+    raise SystemExit(f"Missing classification row for {workstream}")
+PY
+}
+parse_recovery_action() {
+  python3 - "$1" <<'PY'
+import sys
+
+action = sys.argv[1].strip()
+fields = {}
+for raw_part in action.split(";"):
+    part = raw_part.strip()
+    if not part:
+        continue
+    if "=" not in part:
+        raise SystemExit(f"Recovery action segment is not key=value: {part}")
+    key, value = part.split("=", 1)
+    key = key.strip()
+    value = value.strip()
+    if not key or not value:
+        raise SystemExit(f"Recovery action segment has an empty key or value: {part}")
+    if key in fields:
+        raise SystemExit(f"Recovery action repeats key {key}")
+    fields[key] = value
+
+mode = fields.get("mode")
+pr_kind = fields.get("pr_kind")
+required = ["mode", "pr_kind", "issue_url", "archive_id", "expected_branch"]
+if mode == "continue-existing-pr":
+    if pr_kind == "adopted":
+        required.append("preserved_head")
+    elif pr_kind == "recovered":
+        required.append("expected_head")
+    else:
+        raise SystemExit(f"Unsupported continue-existing-pr kind: {pr_kind}")
+elif mode in {"awaiting-recovery-pr", "recovery-pr-open"}:
+    if pr_kind != "recovered":
+        raise SystemExit(f"{mode} must declare pr_kind=recovered, got {pr_kind}")
+    if mode == "recovery-pr-open":
+        required.append("expected_head")
+else:
+    raise SystemExit(f"Unsupported recovery action mode: {mode}")
+
+for key in required:
+    if key not in fields:
+        raise SystemExit(f"Recovery action is missing {key}")
+
+print(fields["mode"])
+print(fields["pr_kind"])
+print(fields["issue_url"])
+print(fields["archive_id"])
+print(fields["expected_branch"])
+print(fields.get("expected_head", ""))
+print(fields.get("preserved_head", ""))
+PY
+}
 recheck_branch_ref_tip() {
   MODE="$1"
   BRANCH_PROOF_ID="$(printf '%s' "$BRANCH_TO_DELETE" | tr '/' '_')"
   case "$BRANCH_TO_DELETE" in
     docs/psyche-specs)
+      WORKSTREAM_ID="docs-psyche-specs"
       PRESERVED_HEAD_SOURCE="dirty/docs-psyche-specs/head.txt"
       ;;
     docs/universal-runtime-capability-design)
+      WORKSTREAM_ID="docs-universal-runtime-capability-design"
       PRESERVED_HEAD_SOURCE="branches/docs-universal-runtime-capability-design/head.txt"
       ;;
     feat/cmem-1ev-memory-promote)
+      WORKSTREAM_ID="memory-promote"
       PRESERVED_HEAD_SOURCE="dirty/memory-promote/head.txt"
       ;;
     feat/mobile-memory-gateway)
+      WORKSTREAM_ID="mobile-memory-gateway"
       PRESERVED_HEAD_SOURCE="dirty/mobile-memory-gateway/head.txt"
       ;;
     feat/npm-macos-x64)
+      WORKSTREAM_ID="feat-npm-macos-x64"
       PRESERVED_HEAD_SOURCE="branches/feat-npm-macos-x64/head.txt"
       ;;
     fix/476-review-threads)
+      WORKSTREAM_ID="pr-476-review"
       PRESERVED_HEAD_SOURCE="dirty/pr-476-review/head.txt"
       ;;
     fix/521-ward-surface-confinement)
+      WORKSTREAM_ID="fix-521-ward-surface-confinement"
       PRESERVED_HEAD_SOURCE="branches/fix-521-ward-surface-confinement/head.txt"
       ;;
     *)
@@ -6438,6 +8577,7 @@ recheck_branch_ref_tip() {
   then
     {
       printf 'Branch: %s\n' "$BRANCH_TO_DELETE"
+      printf 'Workstream: %s\n' "$WORKSTREAM_ID"
       printf 'Preserved head source: %s\n' "$PRESERVED_HEAD_SOURCE"
       printf 'Outcome: local branch ref is already missing immediately before %s; no deletion command ran.\n' "$MODE"
     } > "$PROOF_FILE"
@@ -6448,15 +8588,151 @@ recheck_branch_ref_tip() {
   LIVE_HEAD="$(tr -d '\n' < "$LIVE_HEAD_FILE")"
   {
     printf 'Branch: %s\n' "$BRANCH_TO_DELETE"
+    printf 'Workstream: %s\n' "$WORKSTREAM_ID"
     printf 'Preserved head source: %s\n' "$PRESERVED_HEAD_SOURCE"
     printf 'Preserved head: %s\n' "$PRESERVED_HEAD"
     printf 'Live branch ref tip: %s\n' "$LIVE_HEAD"
   } > "$PROOF_FILE"
-  if [ "$LIVE_HEAD" != "$PRESERVED_HEAD" ]; then
-    printf 'Blocked: live branch ref tip differs from the preserved head; newer commits are unpreserved.\n' \
+  if [ "$LIVE_HEAD" = "$PRESERVED_HEAD" ]; then
+    return 0
+  fi
+  CLASSIFICATION_FIELDS_FILE="$BRANCH_DELETE_PROOF_ROOT/$BRANCH_PROOF_ID-$MODE-classification.txt"
+  ACTION_FIELDS_FILE="$BRANCH_DELETE_PROOF_ROOT/$BRANCH_PROOF_ID-$MODE-action.txt"
+  FETCH_EVIDENCE="$BRANCH_DELETE_PROOF_ROOT/$BRANCH_PROOF_ID-$MODE-fetch.txt"
+  PR_VIEW_EVIDENCE="$BRANCH_DELETE_PROOF_ROOT/$BRANCH_PROOF_ID-$MODE-pr-view.json"
+  PR_VIEW_ERR="$BRANCH_DELETE_PROOF_ROOT/$BRANCH_PROOF_ID-$MODE-pr-view.err"
+  if ! parse_classification_row "$WORKSTREAM_ID" > "$CLASSIFICATION_FIELDS_FILE"; then
+    printf 'Blocked: live branch ref tip differs from the preserved head, and the classification row could not be parsed for fresh adopted-PR proof.\n' \
       >> "$PROOF_FILE"
+    rm -f "$CLASSIFICATION_FIELDS_FILE" "$ACTION_FIELDS_FILE" "$FETCH_EVIDENCE" "$PR_VIEW_EVIDENCE" "$PR_VIEW_ERR"
     return 1
   fi
+  CLASSIFICATION_ROW=()
+  CLASSIFICATION_FIELD=
+  while IFS= read -r CLASSIFICATION_FIELD || [ -n "$CLASSIFICATION_FIELD" ]; do
+    CLASSIFICATION_ROW+=("$CLASSIFICATION_FIELD")
+  done < "$CLASSIFICATION_FIELDS_FILE"
+  rm -f "$CLASSIFICATION_FIELDS_FILE"
+  if test "${#CLASSIFICATION_ROW[@]}" -ne 4; then
+    printf 'Blocked: classification row parsing returned an unexpected field count for adopted-PR proof.\n' >> "$PROOF_FILE"
+    rm -f "$ACTION_FIELDS_FILE" "$FETCH_EVIDENCE" "$PR_VIEW_EVIDENCE" "$PR_VIEW_ERR"
+    return 1
+  fi
+  CLASSIFICATION_LABEL="${CLASSIFICATION_ROW[0]}"
+  MAIN_PR_EVIDENCE="${CLASSIFICATION_ROW[1]}"
+  RECOVERY_ACTION="${CLASSIFICATION_ROW[3]}"
+  case "$MAIN_PR_EVIDENCE" in
+    https://github.com/OpenCoven/coven/pull/*)
+      ;;
+    *)
+      printf 'Blocked: live branch ref tip differs from the preserved head and the exact row does not record a raw OpenCoven/coven PR URL.\n' >> "$PROOF_FILE"
+      rm -f "$ACTION_FIELDS_FILE" "$FETCH_EVIDENCE" "$PR_VIEW_EVIDENCE" "$PR_VIEW_ERR"
+      return 1
+      ;;
+  esac
+  if [ "$CLASSIFICATION_LABEL" != "viable" ]; then
+    printf 'Blocked: live branch ref tip differs from the preserved head and only viable adopted source-branch rows may use the advanced remote proof.\n' >> "$PROOF_FILE"
+    rm -f "$ACTION_FIELDS_FILE" "$FETCH_EVIDENCE" "$PR_VIEW_EVIDENCE" "$PR_VIEW_ERR"
+    return 1
+  fi
+  if ! parse_recovery_action "$RECOVERY_ACTION" > "$ACTION_FIELDS_FILE"; then
+    printf 'Blocked: viable row recovery action could not be parsed for adopted source-branch proof.\n' >> "$PROOF_FILE"
+    rm -f "$ACTION_FIELDS_FILE" "$FETCH_EVIDENCE" "$PR_VIEW_EVIDENCE" "$PR_VIEW_ERR"
+    return 1
+  fi
+  ACTION_ROW=()
+  ACTION_FIELD=
+  while IFS= read -r ACTION_FIELD || [ -n "$ACTION_FIELD" ]; do
+    ACTION_ROW+=("$ACTION_FIELD")
+  done < "$ACTION_FIELDS_FILE"
+  rm -f "$ACTION_FIELDS_FILE"
+  if test "${#ACTION_ROW[@]}" -ne 7; then
+    printf 'Blocked: viable row recovery action parsing returned an unexpected field count.\n' >> "$PROOF_FILE"
+    rm -f "$FETCH_EVIDENCE" "$PR_VIEW_EVIDENCE" "$PR_VIEW_ERR"
+    return 1
+  fi
+  ACTION_MODE="${ACTION_ROW[0]}"
+  ACTION_PR_KIND="${ACTION_ROW[1]}"
+  ACTION_EXPECTED_BRANCH="${ACTION_ROW[4]}"
+  ACTION_PRESERVED_HEAD="${ACTION_ROW[6]}"
+  if [ "$ACTION_MODE" != "continue-existing-pr" ] || [ "$ACTION_PR_KIND" != "adopted" ]; then
+    printf 'Blocked: live branch ref tip differs from the preserved head and the row is not a viable adopted source-branch PR.\n' >> "$PROOF_FILE"
+    rm -f "$FETCH_EVIDENCE" "$PR_VIEW_EVIDENCE" "$PR_VIEW_ERR"
+    return 1
+  fi
+  if [ "$ACTION_EXPECTED_BRANCH" != "$BRANCH_TO_DELETE" ]; then
+    printf 'Blocked: adopted source-branch proof expected branch %s, not %s.\n' "$ACTION_EXPECTED_BRANCH" "$BRANCH_TO_DELETE" >> "$PROOF_FILE"
+    rm -f "$FETCH_EVIDENCE" "$PR_VIEW_EVIDENCE" "$PR_VIEW_ERR"
+    return 1
+  fi
+  if [ "$ACTION_PRESERVED_HEAD" != "$PRESERVED_HEAD" ]; then
+    printf 'Blocked: adopted source-branch proof preserved head %s does not match snapshot head %s.\n' "$ACTION_PRESERVED_HEAD" "$PRESERVED_HEAD" >> "$PROOF_FILE"
+    rm -f "$FETCH_EVIDENCE" "$PR_VIEW_EVIDENCE" "$PR_VIEW_ERR"
+    return 1
+  fi
+  {
+    printf 'Advanced adopted-source-branch proof for %s\n' "$BRANCH_TO_DELETE"
+    printf 'Fetching origin/%s immediately before deletion proof.\n' "$BRANCH_TO_DELETE"
+  } > "$FETCH_EVIDENCE"
+  if ! git -C "$REPO" fetch --no-tags origin \
+    "refs/heads/$BRANCH_TO_DELETE:refs/remotes/origin/$BRANCH_TO_DELETE" \
+    >> "$FETCH_EVIDENCE" 2>&1
+  then
+    printf 'Blocked: could not fetch origin/%s for advanced adopted-source-branch proof.\n' "$BRANCH_TO_DELETE" >> "$PROOF_FILE"
+    cat "$FETCH_EVIDENCE" >> "$PROOF_FILE"
+    rm -f "$PR_VIEW_EVIDENCE" "$PR_VIEW_ERR"
+    return 1
+  fi
+  REMOTE_HEAD="$(git -C "$REPO" rev-parse "refs/remotes/origin/$BRANCH_TO_DELETE")"
+  {
+    printf 'Fetched remote tip: %s\n' "$REMOTE_HEAD"
+    printf 'Live branch ref tip: %s\n' "$LIVE_HEAD"
+  } >> "$FETCH_EVIDENCE"
+  if [ "$LIVE_HEAD" != "$REMOTE_HEAD" ]; then
+    printf 'Blocked: live branch ref tip differs from freshly fetched origin/%s, so advanced commits are not yet proven remote-backed.\n' "$BRANCH_TO_DELETE" >> "$PROOF_FILE"
+    cat "$FETCH_EVIDENCE" >> "$PROOF_FILE"
+    rm -f "$PR_VIEW_EVIDENCE" "$PR_VIEW_ERR"
+    return 1
+  fi
+  if ! gh pr view --repo OpenCoven/coven "$MAIN_PR_EVIDENCE" \
+    --json url,state,headRefOid,headRefName,headRepositoryOwner,isCrossRepository,baseRefName \
+    > "$PR_VIEW_EVIDENCE" 2> "$PR_VIEW_ERR"
+  then
+    printf 'Blocked: adopted PR %s could not be freshly verified for advanced source-branch deletion proof.\n' "$MAIN_PR_EVIDENCE" >> "$PROOF_FILE"
+    cat "$PR_VIEW_ERR" >> "$PROOF_FILE"
+    return 1
+  fi
+  ACTUAL_URL="$(jq -r '.url' "$PR_VIEW_EVIDENCE")"
+  ACTUAL_STATE="$(jq -r '.state' "$PR_VIEW_EVIDENCE")"
+  ACTUAL_HEAD="$(jq -r '.headRefOid' "$PR_VIEW_EVIDENCE")"
+  ACTUAL_BRANCH="$(jq -r '.headRefName' "$PR_VIEW_EVIDENCE")"
+  ACTUAL_OWNER="$(jq -r '.headRepositoryOwner.login' "$PR_VIEW_EVIDENCE")"
+  ACTUAL_CROSS="$(jq -r '.isCrossRepository' "$PR_VIEW_EVIDENCE")"
+  ACTUAL_BASE="$(jq -r '.baseRefName' "$PR_VIEW_EVIDENCE")"
+  {
+    printf 'Verified PR URL: %s\n' "$ACTUAL_URL"
+    printf 'Verified PR state: %s\n' "$ACTUAL_STATE"
+    printf 'Verified PR head branch: %s\n' "$ACTUAL_BRANCH"
+    printf 'Verified PR head tip: %s\n' "$ACTUAL_HEAD"
+    printf 'Verified PR base: %s\n' "$ACTUAL_BASE"
+    printf 'Verified PR owner: %s\n' "$ACTUAL_OWNER"
+    printf 'Verified PR cross-repository: %s\n' "$ACTUAL_CROSS"
+  } >> "$PROOF_FILE"
+  if [ "$ACTUAL_URL" != "$MAIN_PR_EVIDENCE" ] || \
+     [ "$ACTUAL_STATE" != "OPEN" ] || \
+     [ "$ACTUAL_BASE" != "main" ] || \
+     [ "$ACTUAL_OWNER" != "OpenCoven" ] || \
+     [ "$ACTUAL_CROSS" != "false" ] || \
+     [ "$ACTUAL_BRANCH" != "$BRANCH_TO_DELETE" ] || \
+     [ "$ACTUAL_HEAD" != "$REMOTE_HEAD" ]; then
+    printf 'Blocked: adopted PR proof must verify one OPEN same-repo main PR whose head branch and headRefOid match the fetched live branch tip.\n' >> "$PROOF_FILE"
+    return 1
+  fi
+  if ! git -C "$REPO" merge-base --is-ancestor "$PRESERVED_HEAD" "$LIVE_HEAD"; then
+    printf 'Blocked: preserved snapshot head is not an ancestor of the live adopted branch tip.\n' >> "$PROOF_FILE"
+    return 1
+  fi
+  printf 'Advanced adopted-source-branch proof succeeded: newer commits are preserved remotely and in the OPEN PR.\n' >> "$PROOF_FILE"
   return 0
 }
 if recheck_branch_ref_tip pre-delete-D; then
@@ -6476,9 +8752,15 @@ git -C "$REPO" branch -D "$BRANCH_TO_DELETE"
 ```
 
 If the local branch ref is already missing, record that outcome in the private
-proof file and succeed without failing the step. If the live branch ref tip
-exists but differs from the preserved head, stop and do not use `-D`; newer
-commits are unpreserved until a fresh archive captures them.
+proof file and succeed without failing the step. Exact preserved-head equality
+remains the default deletion proof. If the live branch ref tip differs from the
+preserved head, allow deletion only for a viable
+`mode=continue-existing-pr; pr_kind=adopted` source-branch row after fresh
+proof that the branch being deleted is the exact expected branch, the live
+local tip equals the freshly fetched `origin/<branch>` tip, the current PR is
+still the OPEN same-repo `main` PR at that branch/tip, and the preserved
+snapshot head is an ancestor of the live tip. Otherwise stop and do not use
+`-D`; newer commits are not yet proven preserved remotely.
 
 - [ ] **Step 6: Release only merged or stopped recovery claims**
 
@@ -6528,12 +8810,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -6547,13 +8839,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -6583,6 +8875,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -6606,8 +8924,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -6623,6 +8965,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -6653,12 +9000,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -6672,13 +9029,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -6708,6 +9065,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -6731,8 +9114,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -6748,6 +9155,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -6815,12 +9227,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -6834,13 +9256,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -6870,6 +9292,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -6893,8 +9341,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -6910,6 +9382,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -6947,12 +9424,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -6966,13 +9453,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -7002,6 +9489,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -7025,8 +9538,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -7042,6 +9579,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -7050,38 +9592,160 @@ CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
 RECOVERY="$COMMON_DIR/agent-recovery/issue-541"
-for id in \
-  docs-psyche-specs \
-  memory-promote \
-  mobile-memory-gateway \
-  pr-476-review \
-  docs-universal-runtime-capability-design \
-  feat-npm-macos-x64 \
-  fix-521-ward-surface-confinement
-do
-  grep -E "^\| $id \| (already-shipped|superseded|viable|blocked) \|" \
-    "$RECOVERY/classification.md"
-done
+CLASSIFICATION="$RECOVERY/classification.md"
+python3 - "$CLASSIFICATION" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+classification_path = Path(sys.argv[1])
+expected = [
+    "docs-psyche-specs",
+    "memory-promote",
+    "mobile-memory-gateway",
+    "pr-476-review",
+    "docs-universal-runtime-capability-design",
+    "feat-npm-macos-x64",
+    "fix-521-ward-surface-confinement",
+]
+terminal = {"already-shipped", "superseded", "viable", "blocked"}
+pr_re = re.compile(r"^https://github\.com/OpenCoven/coven/pull/\d+$")
+issue_re = re.compile(r"^https://github\.com/OpenCoven/coven/issues/\d+$")
+sha_re = re.compile(r"^[0-9a-f]{40}$")
+rows = {}
+
+def parse_action(action: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for raw_part in action.split(";"):
+        part = raw_part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise SystemExit(f"Recovery action segment is not key=value: {part}")
+        key, value = part.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key or not value:
+            raise SystemExit(f"Recovery action segment has an empty key or value: {part}")
+        if key in fields:
+            raise SystemExit(f"Recovery action repeats key {key}")
+        fields[key] = value
+    return fields
+
+for raw in classification_path.read_text(encoding="utf-8").splitlines():
+    line = raw.strip()
+    if not line.startswith("|") or not line.endswith("|"):
+        continue
+    cells = [cell.strip() for cell in line.strip("|").split("|")]
+    if len(cells) != 5 or cells[0] == "Workstream":
+        continue
+    workstream, classification, evidence, preserved_source, recovery_action = cells
+    if workstream not in expected:
+        raise SystemExit(f"Unexpected classification row: {line}")
+    if workstream in rows:
+        raise SystemExit(f"Duplicate classification row for {workstream}")
+    if classification not in terminal:
+        raise SystemExit(f"Non-terminal classification {classification} for {workstream}")
+    if classification in {"already-shipped", "superseded"}:
+        if not (pr_re.fullmatch(evidence) or sha_re.fullmatch(evidence)):
+            raise SystemExit(
+                f"{workstream} {classification} row must use a raw OpenCoven/coven PR URL or exact main commit SHA"
+            )
+        action_fields = parse_action(recovery_action)
+        if action_fields.get("mode") != "non-viable-proof":
+            raise SystemExit(f"{workstream} {classification} row must use mode=non-viable-proof")
+        if action_fields.get("classification") != classification:
+            raise SystemExit(
+                f"{workstream} {classification} row must repeat its classification in Recovery action"
+            )
+        evidence_kind = action_fields.get("evidence_kind")
+        if evidence_kind == "merged-pr":
+            if not pr_re.fullmatch(evidence):
+                raise SystemExit(f"{workstream} merged-pr proof must use a raw PR URL")
+        elif evidence_kind == "main-commit":
+            if not sha_re.fullmatch(evidence):
+                raise SystemExit(f"{workstream} main-commit proof must use an exact 40-character SHA")
+        else:
+            raise SystemExit(f"{workstream} has unsupported non-viable evidence_kind {evidence_kind}")
+    elif classification == "viable":
+        if not pr_re.fullmatch(evidence):
+            raise SystemExit(
+                f"{workstream} viable row is not terminal until Main/PR evidence is a raw OpenCoven/coven PR URL"
+            )
+        action_fields = parse_action(recovery_action)
+        mode = action_fields.get("mode")
+        pr_kind = action_fields.get("pr_kind")
+        if mode not in {"continue-existing-pr", "recovery-pr-open"}:
+            raise SystemExit(
+                f"{workstream} viable row is not terminal with mode={mode}; awaiting-recovery-pr fails final audit"
+            )
+        required = {"mode", "pr_kind", "issue_url", "archive_id", "expected_branch"}
+        if mode == "continue-existing-pr":
+            if pr_kind == "adopted":
+                required.add("preserved_head")
+            elif pr_kind == "recovered":
+                required.add("expected_head")
+            else:
+                raise SystemExit(f"{workstream} continue-existing-pr row has unsupported pr_kind {pr_kind}")
+        else:
+            if pr_kind != "recovered":
+                raise SystemExit(f"{workstream} recovery-pr-open row must declare pr_kind=recovered")
+            required.add("expected_head")
+        missing = sorted(key for key in required if key not in action_fields)
+        if missing:
+            raise SystemExit(f"{workstream} viable terminal row is missing metadata: {', '.join(missing)}")
+        if not issue_re.fullmatch(action_fields["issue_url"]):
+            raise SystemExit(f"{workstream} viable row must record a raw OpenCoven/coven issue URL")
+    else:
+        if not evidence or not recovery_action:
+            raise SystemExit(f"{workstream} blocked row must keep explicit evidence and recovery action text")
+    rows[workstream] = (classification, evidence, preserved_source, recovery_action)
+
+if len(rows) != len(expected):
+    missing = [workstream for workstream in expected if workstream not in rows]
+    raise SystemExit(f"Classification table is incomplete; missing rows: {', '.join(missing)}")
+
+for workstream in expected:
+    classification, evidence, _preserved_source, recovery_action = rows[workstream]
+    print(f"{workstream}\t{classification}\t{evidence}\t{recovery_action}")
+PY
 ```
 
-Expected: all seven workstreams match exactly one terminal classification.
+Expected: the final audit parses exact classification rows rather than
+label-only grep, confirms the table is complete for exactly these seven
+workstreams, and rejects any viable row whose `Main/PR evidence` is not the raw
+canonical `OpenCoven/coven` PR URL or whose `Recovery action` is still
+`mode=awaiting-recovery-pr` or otherwise lacks the terminal PR-backed metadata
+required by `continue-existing-pr` or `recovery-pr-open`. The existing
+terminal rules for `already-shipped`, `superseded`, and `blocked` rows remain
+in force.
 
-- [ ] **Step 2: Verify all viable rows have open pull requests**
+- [ ] **Step 2: Verify all viable rows still have open pull requests**
 
-For every `viable` row, set `PR_URL` to the raw canonical pull-request URL
-recorded in `Main/PR evidence` and run:
+For every workstream whose exact row from Step 1 says `viable`, set
+`WORKSTREAM_ID` to that row's ID and run:
 
 ```bash
 set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -7095,13 +9759,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -7131,6 +9795,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -7154,8 +9844,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -7173,18 +9887,125 @@ EOF
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
     exit 1
   fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
+    exit 1
+  fi
   printf '%s\n' "$target_path"
 }
 CONTROL_WORKTREE="$(resolve_control_worktree)"
 COMMON_DIR="$(git -C "$CONTROL_WORKTREE" rev-parse --git-common-dir)"
 REPO="$(cd "$COMMON_DIR/.." && pwd)"
+CLASSIFICATION="$COMMON_DIR/agent-recovery/issue-541/classification.md"
 cd "$REPO"
-gh pr view "$PR_URL" --repo OpenCoven/coven \
-  --json state,isDraft,mergeStateStatus,url
+mapfile -t VIABLE_ROW < <(python3 - "$CLASSIFICATION" "$WORKSTREAM_ID" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+classification_path = Path(sys.argv[1])
+workstream = sys.argv[2]
+pr_re = re.compile(r"^https://github\.com/OpenCoven/coven/pull/\d+$")
+issue_re = re.compile(r"^https://github\.com/OpenCoven/coven/issues/\d+$")
+
+for raw in classification_path.read_text(encoding="utf-8").splitlines():
+    line = raw.strip()
+    if not line.startswith("|") or not line.endswith("|"):
+        continue
+    cells = [cell.strip() for cell in line.strip("|").split("|")]
+    if len(cells) != 5 or cells[0] == "Workstream":
+        continue
+    if cells[0] != workstream:
+        continue
+    classification, evidence, _preserved_source, recovery_action = cells[1:]
+    if classification != "viable":
+        raise SystemExit(f"{workstream} is {classification}, not viable")
+    if not pr_re.fullmatch(evidence):
+        raise SystemExit(f"{workstream} viable row must record a raw OpenCoven/coven PR URL")
+    fields = {}
+    for raw_part in recovery_action.split(";"):
+        part = raw_part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise SystemExit(f"Recovery action segment is not key=value: {part}")
+        key, value = part.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key or not value:
+            raise SystemExit(f"Recovery action segment has an empty key or value: {part}")
+        if key in fields:
+            raise SystemExit(f"Recovery action repeats key {key}")
+        fields[key] = value
+    mode = fields.get("mode")
+    pr_kind = fields.get("pr_kind")
+    if mode not in {"continue-existing-pr", "recovery-pr-open"}:
+        raise SystemExit(f"{workstream} viable row is not terminal with mode={mode}")
+    required = {"mode", "pr_kind", "issue_url", "archive_id", "expected_branch"}
+    if mode == "continue-existing-pr":
+        if pr_kind == "adopted":
+            required.add("preserved_head")
+        elif pr_kind == "recovered":
+            required.add("expected_head")
+        else:
+            raise SystemExit(f"{workstream} continue-existing-pr row has unsupported pr_kind {pr_kind}")
+    else:
+        if pr_kind != "recovered":
+            raise SystemExit(f"{workstream} recovery-pr-open row must declare pr_kind=recovered")
+        required.add("expected_head")
+    missing = sorted(key for key in required if key not in fields)
+    if missing:
+        raise SystemExit(f"{workstream} viable row is missing metadata: {', '.join(missing)}")
+    if not issue_re.fullmatch(fields["issue_url"]):
+        raise SystemExit(f"{workstream} viable row must record a raw OpenCoven/coven issue URL")
+    print(evidence)
+    print(fields["expected_branch"])
+    print(mode)
+    print(pr_kind)
+    break
+else:
+    raise SystemExit(f"Missing classification row for {workstream}")
+PY
+)
+if test "${#VIABLE_ROW[@]}" -ne 4; then
+  printf 'Expected exactly four parsed fields for viable workstream %s, got %s.\n' \
+    "$WORKSTREAM_ID" "${#VIABLE_ROW[@]}" >&2
+  exit 1
+fi
+PR_URL="${VIABLE_ROW[0]}"
+EXPECTED_BRANCH="${VIABLE_ROW[1]}"
+ACTION_MODE="${VIABLE_ROW[2]}"
+ACTION_PR_KIND="${VIABLE_ROW[3]}"
+PR_VIEW_JSON="$(gh pr view "$PR_URL" --repo OpenCoven/coven \
+  --json state,isDraft,mergeStateStatus,url,headRefName,headRefOid,headRepositoryOwner,isCrossRepository,baseRefName)"
+ACTUAL_URL="$(printf '%s\n' "$PR_VIEW_JSON" | jq -r '.url')"
+ACTUAL_STATE="$(printf '%s\n' "$PR_VIEW_JSON" | jq -r '.state')"
+ACTUAL_BRANCH="$(printf '%s\n' "$PR_VIEW_JSON" | jq -r '.headRefName')"
+ACTUAL_OWNER="$(printf '%s\n' "$PR_VIEW_JSON" | jq -r '.headRepositoryOwner.login')"
+ACTUAL_CROSS="$(printf '%s\n' "$PR_VIEW_JSON" | jq -r '.isCrossRepository')"
+ACTUAL_BASE="$(printf '%s\n' "$PR_VIEW_JSON" | jq -r '.baseRefName')"
+if [ "$ACTUAL_URL" != "$PR_URL" ] || \
+   [ "$ACTUAL_STATE" != "OPEN" ] || \
+   [ "$ACTUAL_BRANCH" != "$EXPECTED_BRANCH" ] || \
+   [ "$ACTUAL_OWNER" != "OpenCoven" ] || \
+   [ "$ACTUAL_CROSS" != "false" ] || \
+   [ "$ACTUAL_BASE" != "main" ]; then
+  printf 'Viable row %s no longer matches its recorded OPEN same-repo main PR.\n' \
+    "$WORKSTREAM_ID" >&2
+  printf 'Expected URL: %s\nExpected branch: %s\nExpected mode/kind: %s/%s\n' \
+    "$PR_URL" "$EXPECTED_BRANCH" "$ACTION_MODE" "$ACTION_PR_KIND" >&2
+  printf 'Actual JSON:\n%s\n' "$PR_VIEW_JSON" >&2
+  exit 1
+fi
+printf '%s\n' "$PR_VIEW_JSON"
 ```
 
-Expected: state is `OPEN`; draft status may reflect repository readiness, and
-the URL matches the ledger.
+Expected: each viable row is re-derived from its exact classification row
+rather than from a copied label match, and its live PR still verifies as the
+OPEN same-repo `main` PR recorded there. Rows still stuck at
+`mode=awaiting-recovery-pr`, rows with non-canonical PR evidence, or rows whose
+expected branch no longer matches the PR head fail the final audit.
 
 - [ ] **Step 3: Restore the primary checkout before the final audit**
 
@@ -7195,12 +10016,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -7214,13 +10045,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -7250,6 +10081,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -7273,8 +10130,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -7290,6 +10171,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -7496,12 +10382,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -7515,13 +10411,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -7551,6 +10447,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -7574,8 +10496,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -7591,6 +10537,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -7632,12 +10583,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -7651,13 +10612,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -7687,6 +10648,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -7710,8 +10697,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -7727,6 +10738,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -7764,12 +10780,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -7783,13 +10809,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -7819,6 +10845,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -7842,8 +10894,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -7859,6 +10935,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
@@ -7884,12 +10965,22 @@ set -euo pipefail
 resolve_control_worktree() {
   local control_branch="docs/541-incomplete-work-recovery-design"
   local expected_branch="refs/heads/$control_branch"
+  local remote_branch_ref="refs/remotes/origin/$control_branch"
   local start_common_dir repo target_path path branch_ref actual_branch
   local target_registration_branch live_count stale_count live_path stale_path
+  local live_status live_head local_head remote_head
   local -a live_paths=() stale_paths=()
   start_common_dir="$(git rev-parse --git-common-dir)"
   repo="$(cd "$start_common_dir/.." && pwd)"
   target_path="$repo/.worktrees/issue-541-recovery"
+  if ! git -C "$repo" fetch --no-tags origin \
+    "refs/heads/$control_branch:$remote_branch_ref"
+  then
+    printf 'Blocked: could not fetch origin/%s into %s.\n' \
+      "$control_branch" "$remote_branch_ref" >&2
+    exit 1
+  fi
+  remote_head="$(git -C "$repo" rev-parse --verify "$remote_branch_ref^{commit}")"
   while IFS="$(printf "\t")" read -r path branch_ref; do
     test -n "$path" || continue
     if test "$path" = "$target_path"; then
@@ -7903,13 +10994,13 @@ resolve_control_worktree() {
     else
       stale_paths+=("$path")
     fi
-  done <<EOF
+  done <<EOF2
 $(git -C "$repo" worktree list --porcelain | awk '
   $1 == "worktree" { if (path != "") print path "\t" branch; path = substr($0, 10); branch = ""; next }
   $1 == "branch" { branch = $2; next }
   END { if (path != "") print path "\t" branch }
 ')
-EOF
+EOF2
   live_count="${#live_paths[@]}"
   stale_count="${#stale_paths[@]}"
   if test -n "$target_registration_branch" && test "$target_registration_branch" != "$expected_branch"; then
@@ -7939,6 +11030,32 @@ EOF
       printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
       exit 1
     fi
+    live_status="$(git -C "$live_path" status --porcelain=v1 --untracked-files=all)"
+    if test -n "$live_status"; then
+      printf 'Blocked: live controller worktree is dirty and cannot be refreshed safely: %s\n' "$live_path" >&2
+      git -C "$live_path" status --short --branch --untracked-files=all >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$live_head" "$remote_head"; then
+      if ! git -C "$live_path" merge --ff-only "$remote_branch_ref"; then
+        printf 'Blocked: live controller worktree could not fast-forward %s to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$live_head"; then
+      printf 'Blocked: live controller branch %s is ahead of fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: live controller branch %s diverged from fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+    live_head="$(git -C "$live_path" rev-parse HEAD)"
+    if test "$live_head" != "$remote_head"; then
+      printf 'Blocked: live controller HEAD %s does not match fetched origin tip %s.\n' "$live_head" "$remote_head" >&2
+      exit 1
+    fi
     printf '%s\n' "$live_path"
     return 0
   fi
@@ -7962,8 +11079,32 @@ EOF
     printf 'Control worktree path already exists without a matching live registration: %s\n' "$target_path" >&2
     exit 1
   fi
-  if ! git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
-    git -C "$repo" fetch origin "$control_branch:$control_branch"
+  if git -C "$repo" show-ref --verify --quiet "$expected_branch"; then
+    local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+    if test "$local_head" = "$remote_head"; then
+      :
+    elif git -C "$repo" merge-base --is-ancestor "$local_head" "$remote_head"; then
+      if ! git -C "$repo" update-ref "$expected_branch" "$remote_head" "$local_head"; then
+        printf 'Blocked: local controller branch %s could not be fast-forwarded to fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+        exit 1
+      fi
+    elif git -C "$repo" merge-base --is-ancestor "$remote_head" "$local_head"; then
+      printf 'Blocked: local controller branch %s is ahead of fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    else
+      printf 'Blocked: local controller branch %s diverged from fetched origin tip %s and cannot be rewritten safely.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  else
+    if ! git -C "$repo" update-ref "$expected_branch" "$remote_head"; then
+      printf 'Blocked: local controller branch %s could not be created at fetched origin tip %s.\n' "$control_branch" "$remote_head" >&2
+      exit 1
+    fi
+  fi
+  local_head="$(git -C "$repo" rev-parse --verify "$expected_branch^{commit}")"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: local controller branch %s resolved to %s instead of fetched origin tip %s.\n' "$control_branch" "$local_head" "$remote_head" >&2
+    exit 1
   fi
   if test "$stale_count" -eq 1; then
     stale_path="${stale_paths[0]}"
@@ -7979,6 +11120,11 @@ EOF
   actual_branch="$(git -C "$target_path" branch --show-current)"
   if test "$actual_branch" != "$control_branch"; then
     printf 'Control worktree branch mismatch: expected %s, got %s\n' "$control_branch" "$actual_branch" >&2
+    exit 1
+  fi
+  local_head="$(git -C "$target_path" rev-parse HEAD)"
+  if test "$local_head" != "$remote_head"; then
+    printf 'Blocked: resolved controller HEAD %s does not match fetched origin tip %s.\n' "$local_head" "$remote_head" >&2
     exit 1
   fi
   printf '%s\n' "$target_path"
