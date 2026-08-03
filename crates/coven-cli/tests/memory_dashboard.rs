@@ -17,11 +17,20 @@ mod unix {
             .output();
     }
 
+    struct DaemonGuard(PathBuf);
+
+    impl Drop for DaemonGuard {
+        fn drop(&mut self) {
+            stop_daemon(&self.0);
+        }
+    }
+
     #[test]
     fn memory_open_starts_daemon_before_dashboard() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let coven_home = temp.path().join("coven-home");
         fs::create_dir_all(&coven_home)?;
+        let _daemon_guard = DaemonGuard(coven_home.clone());
         let marker = coven_home.join("dashboard-launched");
         let dashboard = temp.path().join("fake-dashboard");
         fs::write(
@@ -38,7 +47,6 @@ mod unix {
             .env("COVEN_MEMORY_DASHBOARD_BIN", &dashboard)
             .env("COVEN_TEST_DASHBOARD_MARKER", &marker)
             .output()?;
-        stop_daemon(&coven_home);
 
         assert!(
             output.status.success(),
