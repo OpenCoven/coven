@@ -25,10 +25,10 @@ use crate::{
 };
 
 const MAX_EVENTS_LIMIT: i64 = 1_000;
-pub const COVEN_API_VERSION: &str = "v1";
+pub const COVEN_API_ROUTE_VERSION: &str = "v1";
 pub const COVEN_API_NAMED_VERSION: &str = "coven.daemon.v1";
 pub const COVEN_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const SUPPORTED_API_VERSIONS: [&str; 1] = [COVEN_API_VERSION];
+pub const SUPPORTED_API_ROUTE_VERSIONS: [&str; 1] = [COVEN_API_ROUTE_VERSION];
 
 fn proposal_decision_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -299,7 +299,7 @@ pub fn handle_request_with_runtime(
                 "Unsupported API version.",
                 Some(json!({
                     "apiVersion": version,
-                    "supportedApiVersions": SUPPORTED_API_VERSIONS,
+                    "supportedApiVersions": SUPPORTED_API_ROUTE_VERSIONS,
                 })),
             );
         }
@@ -311,8 +311,8 @@ pub fn handle_request_with_runtime(
         ("GET", "/api-version") => json_response(
             200,
             &json!({
-                "apiVersion": COVEN_API_VERSION,
-                "supportedApiVersions": SUPPORTED_API_VERSIONS,
+                "apiVersion": COVEN_API_ROUTE_VERSION,
+                "supportedApiVersions": SUPPORTED_API_ROUTE_VERSIONS,
             }),
         ),
         ("GET", "/health") => json_response(200, &health_response_with_hub(coven_home, daemon)),
@@ -712,7 +712,7 @@ fn normalize_api_route(route: &str) -> ApiRoute<'_> {
     let Some((version, suffix)) = rest.split_once('/') else {
         return ApiRoute::Malformed;
     };
-    if version != COVEN_API_VERSION {
+    if version != COVEN_API_ROUTE_VERSION {
         return ApiRoute::Unsupported(version.to_string());
     }
     if suffix.is_empty() {
@@ -6308,6 +6308,40 @@ mod tests {
         assert!(response.body.contains(r#""capabilities""#));
         assert!(response.body.contains(r#""eventCursor":"sequence""#));
         assert!(response.body.contains(r#""ok":true"#));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_api_version_route_remains_a_route_token_diagnostic() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let response = handle_request("GET", "/api/v1/api-version", temp_dir.path(), None)?;
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+
+        assert_eq!(response.status, 200);
+        assert_eq!(body["apiVersion"], COVEN_API_ROUTE_VERSION);
+        assert_eq!(body["apiVersion"], "v1");
+        assert_eq!(
+            body["supportedApiVersions"],
+            json!(SUPPORTED_API_ROUTE_VERSIONS)
+        );
+        assert_eq!(body["supportedApiVersions"], json!(["v1"]));
+        Ok(())
+    }
+
+    #[test]
+    fn health_is_the_named_contract_handshake() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let response = handle_request("GET", "/api/v1/health", temp_dir.path(), None)?;
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+
+        assert_eq!(response.status, 200);
+        assert_eq!(body["apiVersion"], COVEN_API_NAMED_VERSION);
+        assert_eq!(body["apiVersion"], "coven.daemon.v1");
+        assert!(body.get("supportedApiVersions").is_none());
+        assert_eq!(body["capabilities"]["sessions"], true);
+        assert_eq!(body["capabilities"]["events"], true);
+        assert_eq!(body["capabilities"]["eventCursor"], "sequence");
+        assert_eq!(body["capabilities"]["structuredErrors"], true);
         Ok(())
     }
 
