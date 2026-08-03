@@ -909,12 +909,12 @@ and not through `Display` either, which is the subtler half: an
 `#[error("...: {0}")]` that interpolates the TOML error renders the offending
 source line straight into the message.
 
-`ConfigError` therefore does **not** hold one and has no `#[from]` for it. The
-deserializer error is reduced to a fixed, payload-free variant at exactly one
-place, `reduce_toml_error`. Do not retain even `toml::de::Error::message()`:
-serde diagnostics may embed the rejected scalar. Task 3 made its rule greppable
-through a single `expose_reference` accessor; this is the same move, so review
-can grep one name instead of auditing every `?`.
+`ConfigError` therefore does **not** hold one and has no `#[from]` for it.
+Deserializer errors are reduced to message-only text at exactly one place,
+`detail_from`, which drops the source line and complete input. That message is
+not unconditionally value-free: serde diagnostics may embed a rejected scalar.
+Secret-bearing fields must therefore use `SecretRef`; review can grep the one
+reduction boundary instead of auditing every `?`.
 
 - [ ] **Step 0: Register the crate**
 
@@ -952,10 +952,10 @@ use serde::Deserialize;
 pub const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
 /// Wire representation. Private on purpose: it is the only thing that derives
-/// `Deserialize`, so the sole route to a `Config` is `load_str`/`load_path`,
-/// which run `ensure_schema_version`. A public `Deserialize` on `Config` would
-/// let a nested derive in a consumer crate produce an unvalidated `Config` with
-/// no compile error and no failing test.
+/// `Deserialize`, so deserialising a `Config` must go through
+/// `load_str`/`load_path`, which run `ensure_schema_version`. A public
+/// `Deserialize` on `Config` would let a nested derive in a consumer crate
+/// produce an unvalidated `Config` with no compile error and no failing test.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigRepr {
@@ -978,8 +978,9 @@ struct ConfigRepr {
 
 /// A validated `psyche.config.v1` document.
 ///
-/// Obtainable only through [`load_str`] or [`load_path`], both of which deny an
-/// unknown `schema_version` before any field is used.
+/// Deserialised only through [`load_str`] or [`load_path`], both of which deny
+/// an unknown `schema_version` before any field is used. The public fields also
+/// permit direct construction for callers that already own validated values.
 ///
 /// No `Eq`: [`Extensions`] wraps a `toml::Table` whose values include
 /// `Float(f64)`, so only `PartialEq` is available.
@@ -1084,18 +1085,14 @@ impl Extensions {
 /// `#[from]` for one. That type's `Display` renders the offending source line
 /// verbatim and its `Debug` carries `input: Some(<the entire file>)`, so holding
 /// one would leave every secret in the file a single `?err` away from a log. The
-/// deserializer error is reduced to its message string at exactly one place —
-/// [`detail_from`] — which is what review should grep for. (The message is not
-/// unconditionally value-free: serde diagnostics can embed offending scalar
-/// values; see the `detail` field docs.) [`reduce_toml_error`] wraps it for the
-/// file-loading path only, so it is not the exhaustive one.
+/// deserializer error is reduced to message-only text at exactly one place —
+/// [`detail_from`] — which is what review should grep for. [`reduce_toml_error`]
+/// wraps it for the file-loading path only, so it is not the exhaustive one.
 ///
-/// `Parse` has four construction sites: `Extensions::get` above (using
-/// [`detail_from`] directly), the two [`toml::from_str`] paths in `load_inner`
-/// below (via [`reduce_toml_error`]), and the unversioned-extension-key branch
-/// in `load_inner`. That last one is built from a key this crate validated
-/// itself, never from a `toml::de::Error`, so [`detail_from`] covering three of
-/// four is correct rather than an omission.
+/// All three deserializer paths — [`Extensions::get`] and the two
+/// `toml::from_str` calls in `load_inner` — pass through [`detail_from`]. The
+/// unversioned-extension-key branch constructs `Parse` directly from a key this
+/// crate validated itself, never from a `toml::de::Error`.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     /// The file is not valid TOML, or violates the strict schema.
@@ -1629,9 +1626,10 @@ field.
 Unknown fields are errors. The only exception is the `extensions` table, whose
 keys must themselves be versioned identifiers.
 
-Raw secret values are never valid configuration. Secrets are named by reference
-(for example `op://VAULT/ITEM/token`); a literal value is rejected at parse
-time.
+First-party secret-bearing fields accept references only (for example
+`op://VAULT/ITEM/token`) and reject literal values at parse time. Extension
+tables are untyped; extension owners must apply the same `SecretRef` contract to
+their secret-bearing fields. Config debug output redacts all extension values.
 
 ## Minimal example
 
