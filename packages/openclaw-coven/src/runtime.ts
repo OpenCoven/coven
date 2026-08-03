@@ -43,9 +43,11 @@ const MAX_RUNTIME_SESSION_NAME_BYTES = 2_048;
 const MAX_RUNTIME_AGENT_CHARS = 128;
 const MAX_RUNTIME_MODE_CHARS = 32;
 const MAX_STATUS_FIELD_CHARS = 256;
+const MAX_PUBLIC_API_VERSION_CHARS = 128;
 const MAX_SESSION_ID_CHARS = 128;
 const MAX_EVENT_ID_CHARS = 256;
 const SAFE_SESSION_ID_REGEX = /^[A-Za-z0-9._:-]+$/;
+const SAFE_PUBLIC_API_VERSION_REGEX = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 type CovenRuntimeSessionState = {
   agent: string;
@@ -282,9 +284,23 @@ function terminalStatusEvent(session: CovenSessionRecord): AcpRuntimeEvent {
   };
 }
 
+function describeObservedApiVersion(value: unknown): string {
+  if (value === undefined || value === "") {
+    return "missing";
+  }
+  if (
+    typeof value !== "string" ||
+    value.length > MAX_PUBLIC_API_VERSION_CHARS ||
+    !SAFE_PUBLIC_API_VERSION_REGEX.test(value)
+  ) {
+    return "invalid";
+  }
+  return value;
+}
+
 function healthCompatibilityError(health: CovenHealthResponse): HealthCompatibilityError | null {
   if (health.apiVersion !== SUPPORTED_COVEN_API_CONTRACT) {
-    const actual = typeof health.apiVersion === "string" ? health.apiVersion : "missing";
+    const actual = describeObservedApiVersion(health.apiVersion);
     return {
       code: "COVEN_UNSUPPORTED_API_VERSION",
       detail: `expected apiVersion ${SUPPORTED_COVEN_API_CONTRACT}, got ${actual}; upgrade Coven to a compatible version`,
@@ -320,6 +336,17 @@ function healthCompatibilityError(health: CovenHealthResponse): HealthCompatibil
   return null;
 }
 
+function normalizeCovenAvailabilityError(error: unknown): AcpRuntimeError {
+  if (error instanceof AcpRuntimeError) {
+    return error;
+  }
+  return new AcpRuntimeError(
+    "ACP_BACKEND_UNAVAILABLE",
+    `Coven health check failed: ${sanitizeErrorText(error)}`,
+    { cause: error },
+  );
+}
+
 export class CovenAcpRuntime implements AcpRuntime {
   private readonly config: ResolvedCovenPluginConfig;
   private readonly client: CovenClient;
@@ -347,11 +374,12 @@ export class CovenAcpRuntime implements AcpRuntime {
     try {
       await this.requireCovenCompatibility();
     } catch (error) {
+      const availabilityError = normalizeCovenAvailabilityError(error);
       if (!this.config.allowFallback) {
-        throw error;
+        throw availabilityError;
       }
       this.logger?.warn(
-        `coven compatibility check failed; falling back to ${this.config.fallbackBackend}: ${sanitizeErrorText(error)}`,
+        `coven compatibility check failed; falling back to ${this.config.fallbackBackend}: ${sanitizeErrorText(availabilityError)}`,
       );
       return await this.ensureFallbackSession(input);
     }
@@ -398,6 +426,9 @@ export class CovenAcpRuntime implements AcpRuntime {
         input.signal,
       );
     } catch (error) {
+      if (input.signal?.aborted) {
+        throw input.signal.reason ?? new Error("Coven turn aborted");
+      }
       const safeError = sanitizeErrorText(error);
       if (!this.config.allowFallback) {
         throw new AcpRuntimeError(
@@ -600,30 +631,26 @@ export class CovenAcpRuntime implements AcpRuntime {
   }
 
   private async requireCovenCompatibility(signal?: AbortSignal): Promise<void> {
-    if (signal) {
-      const health = await this.client.health(signal);
-      const compatibilityError = healthCompatibilityError(health);
-      if (compatibilityError) {
-        throw new AcpRuntimeError(
-          "ACP_BACKEND_UNAVAILABLE",
-          `Coven compatibility check failed: ${compatibilityError.detail}`,
-        );
-      }
-      if (health.ok !== true) {
-        throw new AcpRuntimeError(
-          "ACP_BACKEND_UNAVAILABLE",
-          "Coven daemon did not report healthy.",
-        );
-      }
-      return;
+    if (signal?.aborted) {
+      throw signal.reason ?? new Error("Coven turn aborted");
     }
     const controller = new AbortController();
+    const forwardCallerAbort = () => {
+      controller.abort(signal?.reason ?? new Error("Coven turn aborted"));
+    };
+    signal?.addEventListener("abort", forwardCallerAbort, { once: true });
     const timeout = setTimeout(
       () => controller.abort(new Error("Coven health check timed out")),
       HEALTH_CHECK_TIMEOUT_MS,
     );
     try {
       const health = await this.client.health(controller.signal);
+      if (signal?.aborted) {
+        throw signal.reason ?? new Error("Coven turn aborted");
+      }
+      if (controller.signal.aborted) {
+        throw controller.signal.reason;
+      }
       const compatibilityError = healthCompatibilityError(health);
       if (compatibilityError) {
         throw new AcpRuntimeError(
@@ -637,8 +664,17 @@ export class CovenAcpRuntime implements AcpRuntime {
           "Coven daemon did not report healthy.",
         );
       }
+    } catch (error) {
+      if (signal?.aborted) {
+        throw signal.reason ?? new Error("Coven turn aborted");
+      }
+      if (controller.signal.aborted) {
+        throw controller.signal.reason;
+      }
+      throw error;
     } finally {
       clearTimeout(timeout);
+      signal?.removeEventListener("abort", forwardCallerAbort);
     }
   }
 

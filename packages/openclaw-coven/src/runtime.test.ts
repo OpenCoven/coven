@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
+  AcpRuntimeError,
   registerAcpRuntimeBackend,
   unregisterAcpRuntimeBackend,
   type AcpRuntime,
@@ -143,23 +144,31 @@ afterEach(() => {
 
 describe("CovenAcpRuntime", () => {
   it("fails closed by default when Coven is unavailable", async () => {
+    const transportError = new Error("\u001b[31moffline\r\nnow");
     const runtime = new CovenAcpRuntime({
       config,
       client: fakeClient({
         health: vi.fn(async () => {
-          throw new Error("offline");
+          throw transportError;
         }),
       }),
     });
 
-    await expect(
-      runtime.ensureSession({
+    const error = await runtime
+      .ensureSession({
         sessionKey: "agent:codex:test",
         agent: "codex",
         mode: "oneshot",
         cwd: workspaceDir,
-      }),
-    ).rejects.toThrow(/offline/);
+      })
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(AcpRuntimeError);
+    expect(error).toMatchObject({
+      code: "ACP_BACKEND_UNAVAILABLE",
+      message: "Coven health check failed: Error: offline now",
+      cause: transportError,
+    });
   });
 
   it("falls back to the direct ACP backend when Coven is unavailable and fallback is enabled", async () => {
@@ -210,7 +219,7 @@ describe("CovenAcpRuntime", () => {
 
     expect(handle.backend).toBe("acpx");
     expect(logger.warn).toHaveBeenCalledWith(
-      "coven compatibility check failed; falling back to acpx: AcpRuntimeError: Coven compatibility check failed: expected apiVersion coven.daemon.v1, got coven.daemon.v2; upgrade Coven to a compatible version",
+      "coven compatibility check failed; falling back to acpx: AcpRuntimeError: Coven compatibility check failed: expected apiVersion coven.daemon.v1, got invalid; upgrade Coven to a compatible version",
     );
     expect(launchSession).not.toHaveBeenCalled();
   });
@@ -1029,6 +1038,31 @@ describe("CovenAcpRuntime", () => {
   });
 
   it.each([
+    ["absent", undefined, "missing"],
+    ["empty", "", "missing"],
+    ["non-string", 2, "invalid"],
+    ["ANSI", "\u001b[31mcoven.daemon.v2", "invalid"],
+    ["newline", "coven.daemon.v2\nspoof", "invalid"],
+    ["bidi", "coven.daemon.v2\u202espoof", "invalid"],
+    ["oversized", `coven.daemon.${"v".repeat(1_024)}`, "invalid"],
+  ])("bounds %s Coven API version diagnostics", async (_name, apiVersion, actual) => {
+    const runtime = new CovenAcpRuntime({
+      config,
+      client: fakeClient({
+        health: vi.fn(async () => compatibleHealth({ apiVersion })),
+      }),
+    });
+
+    await expect(runtime.doctor()).resolves.toMatchObject({
+      ok: false,
+      code: "COVEN_UNSUPPORTED_API_VERSION",
+      details: [
+        `expected apiVersion coven.daemon.v1, got ${actual}; upgrade Coven to a compatible version`,
+      ],
+    });
+  });
+
+  it.each([
     [
       "sessions",
       { sessions: false },
@@ -1158,6 +1192,157 @@ describe("CovenAcpRuntime", () => {
     );
     expect(health).toHaveBeenCalledTimes(2);
     expect(launchSession).not.toHaveBeenCalled();
+  });
+
+  it("falls back without launching when capabilities drift before launch", async () => {
+    const fallback = fallbackRuntime();
+    registerAcpRuntimeBackend({ id: "acpx", runtime: fallback });
+    const launchSession = vi.fn(async () => session());
+    const health = vi
+      .fn<CovenClient["health"]>()
+      .mockResolvedValueOnce(compatibleHealth())
+      .mockResolvedValueOnce(
+        compatibleHealth({
+          capabilities: { ...compatibleHealth().capabilities, sessions: false },
+        }),
+      );
+    const runtime = new CovenAcpRuntime({
+      config: { ...config, allowFallback: true },
+      client: fakeClient({ health, launchSession }),
+    });
+    const handle = await runtime.ensureSession({
+      sessionKey: "agent:codex:test",
+      agent: "codex",
+      mode: "oneshot",
+      cwd: workspaceDir,
+    });
+
+    const events = await collect(
+      runtime.runTurn({ handle, text: "Fix tests", mode: "prompt", requestId: "req-1" }),
+    );
+
+    expect(launchSession).not.toHaveBeenCalled();
+    expect(fallback.ensureSession).toHaveBeenCalledOnce();
+    expect(handle.backend).toBe("acpx");
+    expect(events).toEqual([
+      expect.objectContaining({ type: "text_delta", text: "direct fallback\n" }),
+      expect.objectContaining({ type: "done", stopReason: "complete" }),
+    ]);
+  });
+
+  it("propagates caller cancellation during the pre-launch health check without fallback", async () => {
+    const fallback = fallbackRuntime();
+    registerAcpRuntimeBackend({ id: "acpx", runtime: fallback });
+    const launchSession = vi.fn(async () => session());
+    let markSecondHealthStarted!: () => void;
+    const secondHealthStarted = new Promise<void>((resolve) => {
+      markSecondHealthStarted = resolve;
+    });
+    const health = vi
+      .fn<CovenClient["health"]>()
+      .mockResolvedValueOnce(compatibleHealth())
+      .mockImplementationOnce(
+        async (signal) =>
+          await new Promise<never>((_resolve, reject) => {
+            markSecondHealthStarted();
+            signal?.addEventListener(
+              "abort",
+              () => reject(signal.reason ?? new Error("aborted")),
+              { once: true },
+            );
+          }),
+      );
+    const client = fakeClient({ health, launchSession });
+    const runtime = new CovenAcpRuntime({
+      config: { ...config, allowFallback: true },
+      client,
+    });
+    const handle = await runtime.ensureSession({
+      sessionKey: "agent:codex:test",
+      agent: "codex",
+      mode: "oneshot",
+      cwd: workspaceDir,
+    });
+    const originalHandle = { ...handle };
+    const controller = new AbortController();
+    const removeAbortListener = vi.spyOn(controller.signal, "removeEventListener");
+    const cancellation = new Error("caller cancelled");
+    const pending = collect(
+      runtime.runTurn({
+        handle,
+        text: "Fix tests",
+        mode: "prompt",
+        requestId: "req-1",
+        signal: controller.signal,
+      }),
+    );
+    await secondHealthStarted;
+
+    controller.abort(cancellation);
+
+    await expect(pending).rejects.toBe(cancellation);
+    expect(launchSession).not.toHaveBeenCalled();
+    expect(fallback.ensureSession).not.toHaveBeenCalled();
+    expect(handle).toEqual(originalHandle);
+    expect(removeAbortListener).toHaveBeenCalledWith("abort", expect.any(Function));
+  });
+
+  it("keeps the pre-launch health deadline when a caller signal is present", async () => {
+    vi.useFakeTimers();
+    const launchSession = vi.fn(async () => session());
+    let observedSecondSignal: AbortSignal | undefined;
+    let markSecondHealthStarted!: () => void;
+    const secondHealthStarted = new Promise<void>((resolve) => {
+      markSecondHealthStarted = resolve;
+    });
+    const health = vi.fn<CovenClient["health"]>(async (signal) => {
+      if (health.mock.calls.length === 1) {
+        return compatibleHealth();
+      }
+      observedSecondSignal = signal;
+      markSecondHealthStarted();
+      return await new Promise<never>((_resolve, reject) => {
+        signal?.addEventListener(
+          "abort",
+          () => reject(signal.reason ?? new Error("aborted")),
+          { once: true },
+        );
+      });
+    });
+    const runtime = new CovenAcpRuntime({ config, client: fakeClient({ health, launchSession }) });
+    const handle = await runtime.ensureSession({
+      sessionKey: "agent:codex:test",
+      agent: "codex",
+      mode: "oneshot",
+      cwd: workspaceDir,
+    });
+    const controller = new AbortController();
+    const pending = collect(
+      runtime.runTurn({
+        handle,
+        text: "Fix tests",
+        mode: "prompt",
+        requestId: "req-1",
+        signal: controller.signal,
+      }),
+    );
+    const settled = pending.catch((error: unknown) => error);
+    await secondHealthStarted;
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    const abortedAtDeadline = observedSecondSignal?.aborted ?? false;
+    const reasonAtDeadline = observedSecondSignal?.reason;
+    if (!abortedAtDeadline) {
+      controller.abort(new Error("test cleanup"));
+    }
+    const deadlineError = await settled;
+
+    expect(abortedAtDeadline).toBe(true);
+    expect(reasonAtDeadline).toEqual(new Error("Coven health check timed out"));
+    expect(controller.signal.aborted).toBe(false);
+    expect(deadlineError).toMatchObject({ code: "ACP_TURN_FAILED" });
+    expect(launchSession).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("falls back when Coven reports an unsupported API version and fallback is enabled", async () => {

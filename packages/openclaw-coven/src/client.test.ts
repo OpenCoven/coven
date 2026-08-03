@@ -108,6 +108,39 @@ describe("createCovenClient", () => {
     );
   });
 
+  it.each([
+    ["array", []],
+    ["null", null],
+    ["string", "sessions"],
+  ])("does not treat a capabilities %s as a capability record", (_name, capabilities) => {
+    expect(
+      __testing.normalizeHealthResponse({
+        apiVersion: "coven.daemon.v1",
+        capabilities,
+        ok: true,
+      }).capabilities,
+    ).toBeUndefined();
+  });
+
+  it.each([
+    ["eventCursor", false, "event_cursor", "sequence", false],
+    ["structuredErrors", false, "structured_errors", true, false],
+    ["eventCursor", null, "event_cursor", "sequence", "sequence"],
+    ["structuredErrors", null, "structured_errors", true, true],
+  ])(
+    "uses nullish camel-case precedence for health capability %s",
+    (camelKey, camelValue, snakeKey, snakeValue, expected) => {
+      const health = __testing.normalizeHealthResponse({
+        capabilities: {
+          [camelKey]: camelValue,
+          [snakeKey]: snakeValue,
+        },
+      });
+
+      expect(health.capabilities?.[camelKey as "eventCursor" | "structuredErrors"]).toBe(expected);
+    },
+  );
+
   it("validates a real socket inside the configured socket root", async () => {
     await withServer(
       (_req, res) => {
