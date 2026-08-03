@@ -15,6 +15,8 @@ CONTRACT_DOCS = (
     "docs/daemon/socket-api.md",
     "docs/daemon/capabilities-handshake.md",
     "docs/ARCHITECTURE.md",
+    "packages/openclaw-coven/README.md",
+    "docs/OPERATIONAL-MODEL.md",
 )
 LIFECYCLE_DOCS = (
     "docs/API-CONTRACT.md",
@@ -57,6 +59,16 @@ CLAUSE_BOUNDARY = re.compile(
 )
 ROUTE_CONTINUATION = re.compile(
     r"^(?:it|its)\b|\b(?:this|the)\s+(?:route|endpoint|response)\b",
+    re.IGNORECASE,
+)
+SUPPORTED_API_VERSIONS = re.compile(r"\bsupportedApiVersions\b", re.IGNORECASE)
+HEALTH_REFERENCE = re.compile(
+    rf"{re.escape(HEALTH_ROUTE)}|\bhealth(?:\s+response)?\b",
+    re.IGNORECASE,
+)
+REMOVAL_GUIDANCE = re.compile(
+    r"\b(?:has|have|had|is|are|was|were)\s+(?:been\s+)?removed\b|"
+    r"\bremoved\s+from\b",
     re.IGNORECASE,
 )
 
@@ -111,6 +123,44 @@ def presents_legacy_route_as_named_contract(text: str) -> bool:
     return False
 
 
+def health_advertises_supported_api_versions(text: str) -> bool:
+    # Scope follows explicit health references plus one immediate route-pronoun
+    # continuation. Each field-bearing clause is then classified independently,
+    # so legacy-route examples and explicit removal guidance remain valid.
+    for paragraph in re.split(r"\n\s*\n", text):
+        if not SUPPORTED_API_VERSIONS.search(paragraph):
+            continue
+        paragraph = re.sub(r"\n(?=\s*(?:[-*]\s+|\|))", ". ", paragraph)
+        normalized = re.sub(r"\s+", " ", paragraph)
+        statements = re.split(r"(?<=[.!?;])\s+(?=[A-Z`|*\-])", normalized)
+        for index, statement in enumerate(statements):
+            if not SUPPORTED_API_VERSIONS.search(statement):
+                continue
+            health_scoped = bool(HEALTH_REFERENCE.search(statement))
+            if not health_scoped and index > 0:
+                health_scoped = bool(
+                    HEALTH_REFERENCE.search(statements[index - 1])
+                    and ROUTE_CONTINUATION.search(statement)
+                )
+            if not health_scoped:
+                continue
+            if LEGACY_ROUTE in statement and not HEALTH_REFERENCE.search(statement):
+                continue
+
+            for clause in CLAUSE_BOUNDARY.split(statement):
+                field = SUPPORTED_API_VERSIONS.search(clause)
+                if not field:
+                    continue
+                if LEGACY_ROUTE in clause and not HEALTH_REFERENCE.search(clause):
+                    continue
+                if NEGATION.search(clause[: field.start()]):
+                    continue
+                if REMOVAL_GUIDANCE.search(clause):
+                    continue
+                return True
+    return False
+
+
 def validate_documents(documents: dict[str, str]) -> list[str]:
     errors: list[str] = []
     for path in CONTRACT_DOCS:
@@ -126,6 +176,8 @@ def validate_documents(documents: dict[str, str]) -> list[str]:
             errors.append(f"{path}: legacy route explanation is missing")
         if presents_legacy_route_as_named_contract(text):
             errors.append(f"{path}: legacy route presented as named-contract handshake")
+        if health_advertises_supported_api_versions(text):
+            errors.append(f"{path}: health must not advertise supportedApiVersions")
 
     for path in LIFECYCLE_DOCS:
         text = documents[path]

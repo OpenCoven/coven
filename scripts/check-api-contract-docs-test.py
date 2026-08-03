@@ -17,6 +17,11 @@ SPEC.loader.exec_module(module)
 
 
 class ApiContractDocsTests(unittest.TestCase):
+    PUBLIC_CONTRACT_DOCS = (
+        "packages/openclaw-coven/README.md",
+        "docs/OPERATIONAL-MODEL.md",
+    )
+
     def canonical_documents(self) -> dict[str, str]:
         contract = """
 Clients negotiate compatibility with GET /api/v1/health and coven.daemon.v1.
@@ -49,6 +54,53 @@ Archive visibility is stored separately in `archived_at`.
 
     def test_accepts_canonical_handshake_and_lifecycle(self) -> None:
         self.assertEqual(module.validate_documents(self.canonical_documents()), [])
+
+    def test_guards_public_contract_guides(self) -> None:
+        for path in self.PUBLIC_CONTRACT_DOCS:
+            with self.subTest(path=path):
+                self.assertIn(path, module.CONTRACT_DOCS)
+
+    def test_rejects_supported_api_versions_in_health_guidance(self) -> None:
+        for path in self.PUBLIC_CONTRACT_DOCS:
+            with self.subTest(path=path):
+                documents = self.canonical_documents()
+                documents[path] = documents["docs/API.md"] + (
+                    "\n\nGET /api/v1/health returns coven.daemon.v1 and "
+                    "includes supportedApiVersions.\n"
+                )
+                errors = module.validate_documents(documents)
+                self.assertTrue(
+                    any(
+                        "health must not advertise supportedApiVersions" in error
+                        for error in errors
+                    ),
+                    errors,
+                )
+
+    def test_accepts_explicit_supported_api_versions_health_removal(self) -> None:
+        guidance = (
+            "GET /api/v1/health does not include supportedApiVersions.",
+            "GET /api/v1/health has removed supportedApiVersions.",
+        )
+        for path in self.PUBLIC_CONTRACT_DOCS:
+            for statement in guidance:
+                with self.subTest(path=path, statement=statement):
+                    documents = self.canonical_documents()
+                    documents[path] = documents["docs/API.md"] + (
+                        f"\n\n{statement}\n"
+                    )
+                    self.assertEqual(module.validate_documents(documents), [])
+
+    def test_accepts_supported_api_versions_on_legacy_route_only(self) -> None:
+        for path in self.PUBLIC_CONTRACT_DOCS:
+            with self.subTest(path=path):
+                documents = self.canonical_documents()
+                documents[path] = documents["docs/API.md"] + (
+                    "\n\nGET /api/v1/api-version is a legacy route-family "
+                    "diagnostic returning literal `v1` and "
+                    "supportedApiVersions: [`v1`].\n"
+                )
+                self.assertEqual(module.validate_documents(documents), [])
 
     def test_rejects_legacy_endpoint_as_named_handshake(self) -> None:
         documents = self.canonical_documents()
