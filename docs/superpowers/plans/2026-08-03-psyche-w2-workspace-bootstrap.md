@@ -165,7 +165,7 @@ Create `rust-toolchain.toml`:
 ```toml
 [toolchain]
 channel = "1.85.0"
-components = ["rustfmt", "clippy"]
+components = ["rustfmt", "clippy", "rust-src"]  # rust-src: rust-analyzer stdlib support
 profile = "minimal"
 ```
 
@@ -175,27 +175,34 @@ Create `Cargo.toml`:
 
 ```toml
 [workspace]
-resolver = "2"
-members = [
-    "crates/psyche-core",
-    "crates/psyche-config",
-    "crates/psyche-runtime",
-    "crates/psyche-cli",
-]
+# Resolver 3 is MSRV-aware. clap, assert_cmd, and toml all declare rust-version
+# 1.85 — exactly our pin — so under resolver 2 a routine `cargo update` would
+# select a release requiring a newer compiler and break the build.
+resolver = "3"
+# Members are added by the task that creates each crate. Cargo loads every
+# declared member's manifest on ANY command — `--no-deps` and `--manifest-path`
+# both still walk up to the workspace root — so naming a crate before it exists
+# makes the entire workspace uninvokable, including `cargo test`.
+members = []
 
 [workspace.package]
 version = "0.0.0"
-edition = "2021"
+# Edition 2024 stabilised in Rust 1.85 — the version pinned above. Adopting it
+# now costs nothing; deferring means migrating four crates of real code later,
+# and the 2024 `if let` temporary-scope change alters when guards drop across
+# awaits, which is a behavioural migration best done at 50 lines.
+edition = "2024"
 rust-version = "1.85"
+publish = false   # distributed via npm, never crates.io
 license = "MIT"
 repository = "https://github.com/OpenCoven/psyche"
 
 [workspace.dependencies]
+# Path entries are added by the task that creates each crate, for the same
+# reason `members` is: naming a path that does not exist is a latent break.
 psyche-core = { path = "crates/psyche-core" }
-psyche-config = { path = "crates/psyche-config" }
-psyche-runtime = { path = "crates/psyche-runtime" }
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "1"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
@@ -206,28 +213,86 @@ assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
 
+# Shared lint policy. Declared at bootstrap because retrofitting it later means
+# editing every member manifest *and* clearing whatever backlog the new lints
+# surface across real code; each crate is instead born compliant.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# The highest-value pair for a long-running daemon. clippy.toml permits them in
+# tests. Deliberately NOT clippy::pedantic — noisy enough to train people to
+# reach for #[allow], and module_name_repetitions fires on schema::SchemaError.
+unwrap_used = "deny"
+expect_used = "deny"
+
 [profile.release]
 codegen-units = 1
 lto = true
 opt-level = "s"
-strip = true
+# "debuginfo", not true: `strip = true` also removes the symbol table, which
+# turns field panics in an npm-distributed daemon into unresolved hex addresses.
+strip = "debuginfo"
 ```
 
-- [ ] **Step 3: Ignore build and local state**
+- [ ] **Step 3: Permit unwrap/expect in tests**
+
+Create `clippy.toml`:
+
+```toml
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+```
+
+Without this, `clippy::unwrap_used` fires on `unwrap_err()` in every test.
+
+- [ ] **Step 4: Ignore build and local state**
 
 Create `.gitignore`:
 
 ```gitignore
 /target
 **/node_modules
-*.log
+/*.log
 .DS_Store
+.env*
+*.tgz
 ```
 
-- [ ] **Step 4: Verify the workspace resolves**
+`.env*` matters most here: this repo will eventually hold npm publish tokens and
+signing material. `*.log` is anchored to the root so it cannot silently swallow a
+committed log-output test fixture, which is a realistic collision for a project
+built around structured logging.
 
-Run: `cargo metadata --format-version 1 --no-deps > /dev/null && echo OK`
-Expected: `OK`. (Members do not exist yet, so `cargo build` still fails — that is expected until Task 2.)
+- [ ] **Step 4: Verify both manifests parse**
+
+Run:
+
+```bash
+python3 -c "import tomllib,pathlib;[tomllib.loads(pathlib.Path(f).read_text()) for f in ('Cargo.toml','rust-toolchain.toml')];print('OK')"
+```
+
+Expected: `OK`.
+
+**Cargo commands cannot succeed yet, by design.** `cargo metadata`, `cargo build`,
+and `cargo verify-project` all load every workspace member's manifest — `--no-deps`
+suppresses *dependency* resolution, not *member* loading — and the four members are
+not created until Tasks 2-6. Expect:
+
+```
+error: failed to load manifest for workspace member `.../crates/psyche-core`
+Caused by: No such file or directory (os error 2)
+```
+
+That error is the correct state at the end of Task 1. **Do not create crate stubs to
+silence it** — Task 2 owns those files, and stubbing here breaks the task boundary.
+The first real cargo verification runs at the end of Task 2.
 
 - [ ] **Step 5: Commit**
 
@@ -255,11 +320,19 @@ Create `crates/psyche-core/src/schema.rs`:
 /// The only configuration schema this build accepts.
 pub const CONFIG_SCHEMA_VERSION: &str = "psyche.config.v1";
 
+/// Reasons a declared schema version is not usable by this build.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SchemaError {
-    #[error("unsupported schema_version `{found}`; this build accepts `{expected}`")]
+    // {found:?} not {found}: a hand-edited `schema_version = " psyche.config.v1"`
+    // would otherwise log as visually identical to the accepted value, and the
+    // value is untrusted text going into a log line — newlines and ANSI escapes
+    // are log injection. `expected` is not a field: it is always this const, and
+    // a public field would let callers construct a state that cannot exist.
+    /// The configuration declared a version this build does not accept. Denial
+    /// is unconditional: there is no compatibility range and no coercion.
+    #[error("unsupported schema_version {found:?}; this build accepts {CONFIG_SCHEMA_VERSION:?}")]
     UnsupportedVersion {
-        expected: &'static str,
+        /// The rejected value, byte-for-byte as it appeared in the configuration.
         found: String,
     },
 }
@@ -268,27 +341,58 @@ pub enum SchemaError {
 mod tests {
     use super::*;
 
+    // The literal, not the const: this string is the on-disk contract with every
+    // user's config file, so a typo in the const must fail a test rather than
+    // silently redefine the format.
     #[test]
-    fn accepts_the_current_version() {
-        assert!(ensure_schema_version(CONFIG_SCHEMA_VERSION).is_ok());
+    fn the_accepted_version_string_is_stable() {
+        assert_eq!(CONFIG_SCHEMA_VERSION, "psyche.config.v1");
+        assert!(ensure_schema_version("psyche.config.v1").is_ok());
     }
 
     #[test]
     fn denies_a_future_version() {
         let err = ensure_schema_version("psyche.config.v2").unwrap_err();
-        assert_eq!(
-            err,
-            SchemaError::UnsupportedVersion {
-                expected: "psyche.config.v1",
-                found: "psyche.config.v2".to_string(),
-            }
-        );
+        // matches!, not a full struct literal: pins what an operator can observe
+        // without coupling the test to the variant's field list.
+        assert!(matches!(err, SchemaError::UnsupportedVersion { ref found } if found == "psyche.config.v2"));
     }
 
     #[test]
-    fn denies_an_empty_version() {
-        assert!(ensure_schema_version("").is_err());
+    fn the_error_names_both_versions() {
+        // The #[error] format string is the operator-facing contract; without
+        // this it could be mangled to anything and every other test would pass.
+        let rendered = ensure_schema_version("psyche.config.v2").unwrap_err().to_string();
+        assert!(rendered.contains("psyche.config.v2"), "{rendered}");
+        assert!(rendered.contains("psyche.config.v1"), "{rendered}");
     }
+
+    // These pin the deliberate strictness. Without them, someone "helpfully"
+    // adding .trim() or eq_ignore_ascii_case would break G2 denial silently.
+    #[test]
+    fn denies_near_misses() {
+        for near in [
+            "",
+            " psyche.config.v1",
+            "psyche.config.v1 ",
+            "psyche.config.v1\n",
+            "PSYCHE.CONFIG.V1",
+            "psyche.config.v10",
+            "psyche.config.v1.1",
+        ] {
+            assert!(
+                ensure_schema_version(near).is_err(),
+                "expected denial for {near:?}"
+            );
+        }
+    }
+
+    // psyche-runtime is tokio-based, so this error crosses task boundaries and
+    // lands in Box<dyn Error + Send + Sync>. Fails at compile time if that breaks.
+    const _: fn() = || {
+        fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+        assert_send_sync_static::<SchemaError>();
+    };
 }
 ```
 
@@ -306,26 +410,27 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-serde = { workspace = true }
 thiserror = { workspace = true }
+
+[lints]
+workspace = true
 ```
+
+The `[lints] workspace = true` stanza is required in **every** member manifest —
+workspace lints are opt-in per package, so a crate that omits it silently escapes
+the policy. Tasks 4, 5, and 6 repeat it.
 
 Create `crates/psyche-core/src/lib.rs`:
 
 ```rust
-#![forbid(unsafe_code)]
 //! Core versioned identifiers and secret-reference types for Psyche.
 
+// One public path per item. Flat re-exports alongside public modules would give
+// every type two spellings for downstream crates to drift between, and a glob
+// re-export would silently promote anything later added to `secret.rs` into the
+// public API. Callers write `psyche_core::schema::ensure_schema_version`.
 pub mod schema;
 pub mod secret;
-
-pub use schema::{ensure_schema_version, SchemaError, CONFIG_SCHEMA_VERSION};
-// Glob re-export deliberately. A braced re-export from this module matches
-// coven's secret-guard generic-assignment rule, because Rust path syntax
-// supplies the separator the rule looks for and the brace list supplies the
-// trailing run of characters. The glob form exports the same items without
-// tripping it.
-pub use secret::*;
 ```
 
 - [ ] **Step 3: Run the test to verify it fails**
@@ -340,13 +445,12 @@ Append to `crates/psyche-core/src/schema.rs`, above the `#[cfg(test)]` block:
 ```rust
 /// Returns `Ok` only for the exact supported version. No range matching, no
 /// coercion — an unknown version is a denial, which is what G2 requires.
-pub fn ensure_schema_version(found: &str) -> Result<(), SchemaError> {
-    if found == CONFIG_SCHEMA_VERSION {
+pub fn ensure_schema_version(declared: &str) -> Result<(), SchemaError> {
+    if declared == CONFIG_SCHEMA_VERSION {
         Ok(())
     } else {
         Err(SchemaError::UnsupportedVersion {
-            expected: CONFIG_SCHEMA_VERSION,
-            found: found.to_string(),
+            found: declared.to_string(),
         })
     }
 }
@@ -363,7 +467,25 @@ Create a placeholder `crates/psyche-core/src/secret.rs` so the crate compiles; T
 Run: `cargo test -p psyche-core schema`
 Expected: `test result: ok. 3 passed; 0 failed`.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Register the crate as a workspace member**
+
+Only now that `crates/psyche-core/Cargo.toml` exists can it be declared. In the
+root `Cargo.toml`, replace `members = []` with:
+
+```toml
+members = ["crates/psyche-core"]
+```
+
+Then verify the workspace loads:
+
+```bash
+cargo metadata --format-version 1 --no-deps > /dev/null && echo OK
+```
+
+Expected: `OK`. Each later task appends its own crate the same way, so the list
+always names exactly the crates that exist and cargo stays usable throughout.
+
+- [ ] **Step 7: Commit**
 
 ```bash
 git add crates/psyche-core
@@ -514,14 +636,13 @@ git commit -m "feat(core): add non-printing SecretRef that rejects literal value
 Create `crates/psyche-config/src/lib.rs`:
 
 ```rust
-#![forbid(unsafe_code)]
 //! Strict `psyche.config.v1` loading. Unknown fields are errors; unknown
 //! versions are denied before field validation so the error names the real
 //! cause.
 
 use std::path::{Path, PathBuf};
 
-use psyche_core::{ensure_schema_version, SchemaError};
+use psyche_core::schema::{ensure_schema_version, SchemaError};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -644,6 +765,9 @@ psyche-core = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }
+
+[lints]
+workspace = true
 ```
 
 - [ ] **Step 3: Run the test to verify it fails**
@@ -747,7 +871,6 @@ git commit -m "feat(config): strict psyche.config.v1 loading with version-first 
 Create `crates/psyche-runtime/src/lib.rs`:
 
 ```rust
-#![forbid(unsafe_code)]
 //! Composition root. Owns the daemon lifecycle and the only shutdown path.
 
 use std::sync::{Arc, Mutex};
@@ -847,6 +970,9 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+
+[lints]
+workspace = true
 ```
 
 - [ ] **Step 3: Run the test to verify it fails**
@@ -1073,6 +1199,9 @@ tracing-subscriber = { workspace = true }
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
 tempfile = { workspace = true }
+
+[lints]
+workspace = true
 ```
 
 - [ ] **Step 3: Run the test to verify it fails**
@@ -1154,7 +1283,6 @@ pub fn run(config: &Config) -> Vec<Check> {
 Create `crates/psyche-cli/src/main.rs`:
 
 ```rust
-#![forbid(unsafe_code)]
 
 mod doctor;
 mod logging;
@@ -1256,7 +1384,6 @@ fn main() -> ExitCode {
 Create `crates/psyche-cli/src/bin/psyched.rs`:
 
 ```rust
-#![forbid(unsafe_code)]
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -1708,6 +1835,13 @@ gh pr create --repo OpenCoven/psyche \
 ```
 
 Expected: a PR URL. Do **not** enable auto-merge.
+
+**Squash-merge this branch.** Review fixes are applied as follow-up commits rather
+than amends (so each reviewed state stays inspectable), which means intermediate
+commits can be individually non-building — for example, the commit that adds the
+first crate still declares four workspace members and does not compile until the
+next commit narrows the list. Squashing collapses that into one buildable commit
+and keeps `main` bisectable. Rebase-merging would preserve the broken states.
 
 - [ ] **Step 3: Stop at the review gate**
 
