@@ -78,6 +78,8 @@ jobs:
           python-version: '3.x'
       - run: python scripts/check-coven-privacy-test.py
       - run: python scripts/check-secrets-test.py
+      - run: python3 scripts/check-api-contract-docs-test.py
+      - run: python3 scripts/check-api-contract-docs.py
       - run: python scripts/check-secrets.py
       - name: Coven privacy guard (pull request changes)
         if: github.event_name == 'pull_request'
