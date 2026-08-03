@@ -629,7 +629,10 @@ describe("CovenAcpRuntime", () => {
             payloadJson: JSON.stringify({ status: "completed", exitCode: 0 }),
           }),
         ]),
-      getSession: vi.fn(async () => session({ status: "running" })),
+      getSession: vi
+        .fn()
+        .mockResolvedValueOnce(session({ status: "running" }))
+        .mockResolvedValueOnce(session({ status: "completed", exitCode: 0 })),
     });
     const runtime = new CovenAcpRuntime({ config, client });
     const handle = await runtime.ensureSession({
@@ -639,7 +642,7 @@ describe("CovenAcpRuntime", () => {
       cwd: workspaceDir,
     });
 
-    await collect(
+    const events = await collect(
       runtime.runTurn({ handle, text: "Fix tests", mode: "prompt", requestId: "req-1" }),
     );
 
@@ -651,6 +654,10 @@ describe("CovenAcpRuntime", () => {
       },
       undefined,
     );
+    expect(events).not.toContainEqual(
+      expect.objectContaining({ type: "status", text: "coven session polling failed" }),
+    );
+    expect(client.killSession).not.toHaveBeenCalled();
   });
 
   it("does not treat conversational idle as one-shot completion", async () => {
