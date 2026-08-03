@@ -1667,6 +1667,14 @@ git commit -m "feat(config): strict psyche.config.v1 loading with version-first 
 - Create: `crates/psyche-runtime/Cargo.toml`
 - Create: `crates/psyche-runtime/src/lib.rs`
 
+- [ ] **Step 0: Register the crate**
+
+Per the rule from Task 2 — cargo loads every declared member on any command, so
+a member named before it exists breaks the workspace. Extend the root `members`
+to include `crates/psyche-runtime`, and add
+`psyche-runtime = { path = "crates/psyche-runtime" }` to
+`[workspace.dependencies]` beneath `psyche-config`.
+
 - [ ] **Step 1: Write the failing test**
 
 Create `crates/psyche-runtime/src/lib.rs`:
@@ -1682,23 +1690,45 @@ use psyche_config::Config;
 /// observable so `psyche status` can distinguish it from `Running`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleState {
+    /// Accepting work.
     Running,
+    /// Intake stopped; in-flight work finishing.
     Draining,
+    /// Fully stopped. Terminal.
     Stopped,
 }
 
+/// Failures from driving the runtime lifecycle.
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
+    /// [`Runtime::shutdown`] was called on an already-stopped runtime.
     #[error("runtime already stopped")]
     AlreadyStopped,
 }
 
+/// The daemon composition root.
+///
+/// Deriving `Debug` is safe here only because [`psyche_config::Config`] redacts
+/// its untyped `extensions` table, so `tracing::debug!(?runtime)` cannot print a
+/// secret placed there. That property belongs to `Config` — if this field is
+/// ever replaced with something that renders differently, this derive must be
+/// revisited.
+#[derive(Debug)]
 pub struct Runtime {
     state: Arc<Mutex<LifecycleState>>,
     transitions: Arc<Mutex<Vec<LifecycleState>>>,
-    #[allow(dead_code)]
+    /// Held for the store and lease work that attaches at the drain point in
+    /// the follow-on G2 plan; nothing in this slice reads it yet.
+    #[expect(dead_code, reason = "consumed by the store/lease work in the G2 follow-on")]
     config: Config,
 }
+
+// psyche-cli will hold this across tokio task boundaries.
+const _: fn() = || {
+    fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+    assert_send_sync_static::<Runtime>();
+    assert_send_sync_static::<RuntimeError>();
+};
 
 #[cfg(test)]
 mod tests {
@@ -1764,7 +1794,6 @@ repository.workspace = true
 
 [dependencies]
 psyche-config = { workspace = true }
-psyche-core = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
