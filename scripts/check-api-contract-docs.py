@@ -156,13 +156,21 @@ def presents_legacy_route_as_named_contract(text: str) -> bool:
 
 def health_advertises_supported_api_versions(text: str) -> bool:
     # Scope follows explicit health references, one immediate route-pronoun
-    # continuation, and contiguous Markdown field rows introduced by either.
-    # Each field-bearing clause is then classified independently, so legacy
-    # route examples and explicit removal guidance remain valid.
+    # continuation, and contiguous Markdown field rows introduced by either,
+    # including a field block in the immediately following paragraph. Each
+    # field-bearing clause is then classified independently, so legacy route
+    # examples and explicit removal guidance remain valid.
+    pending_health_field_block = False
     for paragraph in re.split(r"\n\s*\n", text):
-        if not SUPPORTED_API_VERSIONS.search(paragraph):
-            continue
         starts_with_row = bool(re.match(r"^\s*(?:[-*]\s+|\|)", paragraph))
+        inherited_paragraph_scope = pending_health_field_block and starts_with_row
+        pending_health_field_block = False
+        if not SUPPORTED_API_VERSIONS.search(paragraph):
+            if not starts_with_row:
+                pending_health_field_block = bool(
+                    HEALTH_REFERENCE.search(paragraph)
+                )
+            continue
         paragraph = re.sub(
             r"\n(?=\s*(?:[-*]\s+|\|))",
             f". {STRUCTURAL_ROW_MARKER} ",
@@ -172,7 +180,7 @@ def health_advertises_supported_api_versions(text: str) -> bool:
             paragraph = f"{STRUCTURAL_ROW_MARKER} {paragraph}"
         normalized = re.sub(r"\s+", " ", paragraph)
         statements = re.split(r"(?<=[.!?;])\s+(?=[A-Z`|*\-])", normalized)
-        structural_health_scope = False
+        structural_health_scope = inherited_paragraph_scope
         for index, statement in enumerate(statements):
             if not SUPPORTED_API_VERSIONS.search(statement):
                 if not statement.startswith(STRUCTURAL_ROW_MARKER):
@@ -215,6 +223,8 @@ def health_advertises_supported_api_versions(text: str) -> bool:
                 if LEGACY_ROUTE in clause and health_absence_is_explicit:
                     continue
                 return True
+        if not starts_with_row:
+            pending_health_field_block = bool(HEALTH_REFERENCE.search(paragraph))
     return False
 
 

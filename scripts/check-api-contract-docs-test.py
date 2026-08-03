@@ -229,6 +229,36 @@ Archive visibility is stored separately in `archived_at`.
                         errors,
                     )
 
+    def test_rejects_blank_line_health_field_blocks(self) -> None:
+        structures = (
+            (
+                "GET /api/v1/health returns these fields:\n\n"
+                "- supportedApiVersions\n"
+            ),
+            (
+                "GET /api/v1/health returns these fields:\n\n"
+                "* supportedApiVersions\n"
+            ),
+            (
+                "GET /api/v1/health returns these fields:\n\n"
+                "| Field | Type |\n"
+                "|---|---|\n"
+                "| supportedApiVersions | array |\n"
+            ),
+        )
+        for path in self.PUBLIC_CONTRACT_DOCS:
+            for structure in structures:
+                with self.subTest(path=path, structure=structure):
+                    documents = self.canonical_documents()
+                    documents[path] = documents["docs/API.md"] + (
+                        f"\n\n{structure}"
+                    )
+                    errors = module.validate_documents(documents)
+                    self.assertIn(
+                        f"{path}: health must not advertise supportedApiVersions",
+                        errors,
+                    )
+
     def test_rejects_legacy_source_inside_health_field_lists(self) -> None:
         structures = (
             (
@@ -258,33 +288,57 @@ Archive visibility is stored separately in `archived_at`.
                         errors,
                     )
 
-    def test_bounds_health_field_list_scope_to_one_paragraph(self) -> None:
-        documents = self.canonical_documents()
-        path = "packages/openclaw-coven/README.md"
-        documents[path] = documents["docs/API.md"] + (
-            "\n\nGET /api/v1/health returns documented fields.\n"
-            "\n- supportedApiVersions belongs to an unrelated example.\n"
-        )
-        self.assertEqual(module.validate_documents(documents), [])
+    def test_resets_health_field_scope_after_intervening_prose(self) -> None:
+        for path in self.PUBLIC_CONTRACT_DOCS:
+            with self.subTest(path=path):
+                documents = self.canonical_documents()
+                documents[path] = documents["docs/API.md"] + (
+                    "\n\nGET /api/v1/health returns documented fields.\n"
+                    "\nThis intervening prose is not a structural field block.\n"
+                    "\n- supportedApiVersions belongs to an unrelated example.\n"
+                )
+                self.assertEqual(module.validate_documents(documents), [])
 
     def test_accepts_supported_api_versions_in_legacy_field_lists(self) -> None:
-        documents = self.canonical_documents()
-        path = "packages/openclaw-coven/README.md"
-        documents[path] = documents["docs/API.md"] + (
-            "\n\nGET /api/v1/api-version is a legacy route-family diagnostic "
-            "returning literal `v1` with fields:\n"
-            "- supportedApiVersions\n"
+        field_blocks = (
+            "- supportedApiVersions\n",
+            (
+                "| Field | Type |\n"
+                "|---|---|\n"
+                "| supportedApiVersions | array |\n"
+            ),
         )
-        self.assertEqual(module.validate_documents(documents), [])
+        for path in self.PUBLIC_CONTRACT_DOCS:
+            for field_block in field_blocks:
+                with self.subTest(path=path, field_block=field_block):
+                    documents = self.canonical_documents()
+                    documents[path] = documents["docs/API.md"] + (
+                        "\n\nGET /api/v1/api-version is a legacy route-family "
+                        "diagnostic returning literal `v1` with fields:\n\n"
+                        f"{field_block}"
+                    )
+                    self.assertEqual(module.validate_documents(documents), [])
 
     def test_accepts_removed_supported_api_versions_health_field(self) -> None:
-        documents = self.canonical_documents()
-        path = "packages/openclaw-coven/README.md"
-        documents[path] = documents["docs/API.md"] + (
-            "\n\nGET /api/v1/health returns documented fields:\n"
-            "- supportedApiVersions has been removed\n"
+        field_blocks = (
+            "- supportedApiVersions has been removed\n",
+            "- GET /api/v1/health does not include supportedApiVersions\n",
+            (
+                "| Field | Disposition |\n"
+                "|---|---|\n"
+                "| supportedApiVersions | has been removed from "
+                "GET /api/v1/health |\n"
+            ),
         )
-        self.assertEqual(module.validate_documents(documents), [])
+        for path in self.PUBLIC_CONTRACT_DOCS:
+            for field_block in field_blocks:
+                with self.subTest(path=path, field_block=field_block):
+                    documents = self.canonical_documents()
+                    documents[path] = documents["docs/API.md"] + (
+                        "\n\nGET /api/v1/health returns documented fields:\n\n"
+                        f"{field_block}"
+                    )
+                    self.assertEqual(module.validate_documents(documents), [])
 
     def test_accepts_explicit_supported_api_versions_health_removal(self) -> None:
         guidance = (
