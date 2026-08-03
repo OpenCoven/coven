@@ -32,21 +32,31 @@ TERMINAL = {
     "orphaned": "Yes",
 }
 LEGACY_ROUTE = "/api/v1/api-version"
-LITERAL_V1 = re.compile(
-    r"(?<![-./A-Za-z0-9_])v1(?![-A-Za-z0-9_])",
-    re.IGNORECASE,
-)
+HEALTH_ROUTE = "/api/v1/health"
+LITERAL_V1 = re.compile(r'(?:"v1"|\'v1\'|`v1`)', re.IGNORECASE)
 NAMED_CONTRACT = re.compile(
     r"\bcoven\.daemon\.v1\b|\bnamed[-\s]+(?:compatibility[-\s]+)?contract\b",
     re.IGNORECASE,
 )
 CONTRACT_CLAIM = re.compile(
-    r"\b(?:compatib(?:ility|le)|handshake|proof|prov(?:e|es|ed|ing))\b",
+    r"\b(?:"
+    r"compatib(?:ility|le)|handshake|proof|prov(?:e|es|ed|ing)|"
+    r"support(?:s|ed|ing)?|negotiat(?:e|es|ed|ing)|verif(?:y|ies|ied|ying)"
+    r")\b",
     re.IGNORECASE,
 )
-NEGATION = re.compile(r"\b(?:never|no)\b|\bnot\b(?!\s+only\b)", re.IGNORECASE)
+NEGATION = re.compile(
+    r"\b(?:never|no|cannot)\b|\bnot\b(?!\s+only\b)|"
+    r"\bcan(?:not|['’]t)\b|\b(?:fails?|failed)\s+to\b|"
+    r"\bmust\s+not\b|\bdo(?:es|did)\s+not\b",
+    re.IGNORECASE,
+)
 CLAUSE_BOUNDARY = re.compile(
-    r"\s*(?:[;,]|\b(?:but|however|while|although|though|yet)\b)\s*",
+    r"\s*(?:[;,]|\b(?:and|but|however|while|although|though|yet)\b)\s*",
+    re.IGNORECASE,
+)
+ROUTE_CONTINUATION = re.compile(
+    r"^(?:it|its)\b|\b(?:this|the)\s+(?:route|endpoint|response)\b",
     re.IGNORECASE,
 )
 
@@ -65,21 +75,30 @@ def legacy_route_explained(text: str) -> bool:
 
 
 def presents_legacy_route_as_named_contract(text: str) -> bool:
-    # Blank-line-delimited Markdown paragraphs are the stable scope here: prose
-    # wrapping is not semantic, and a following sentence may refer to the route
-    # as "it". The explicit route opens that forward scope; earlier health prose
-    # in the same paragraph remains independent. Clause-local contract markers
-    # and negation prevent an unrelated "not proof" from blessing a neighboring
-    # positive assertion.
+    # This is deliberately bounded grammar, not general NLP. A sentence naming
+    # the legacy route is in scope, as is one immediate sentence that explicitly
+    # refers back with a pronoun or "this route". Later prose and explicit health
+    # sentences are independent. Coordinating clauses keep negation local.
     for paragraph in re.split(r"\n\s*\n", text):
         if LEGACY_ROUTE not in paragraph:
             continue
         normalized = re.sub(r"\s+", " ", paragraph)
-        statements = re.split(r"(?<=[.!?])\s+(?=[A-Z`])", normalized)
-        route_index = next(
-            index for index, statement in enumerate(statements) if LEGACY_ROUTE in statement
-        )
-        for statement in statements[route_index:]:
+        statements = re.split(r"(?<=[.!?])\s+(?=[A-Z`|])", normalized)
+        scoped_indexes: set[int] = set()
+        for index, statement in enumerate(statements):
+            if LEGACY_ROUTE not in statement or HEALTH_ROUTE in statement:
+                continue
+            scoped_indexes.add(index)
+            if index + 1 >= len(statements):
+                continue
+            continuation = statements[index + 1]
+            if HEALTH_ROUTE not in continuation and ROUTE_CONTINUATION.search(
+                continuation
+            ):
+                scoped_indexes.add(index + 1)
+
+        for index in sorted(scoped_indexes):
+            statement = statements[index]
             for clause in CLAUSE_BOUNDARY.split(statement):
                 if not NAMED_CONTRACT.search(clause):
                     continue

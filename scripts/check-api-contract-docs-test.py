@@ -73,7 +73,17 @@ Archive visibility is stored separately in `archived_at`.
         )
 
     def test_rejects_non_standalone_literal_v1_tokens(self) -> None:
-        for invalid in ("v1-beta", "pre-v1", "/api/v1", "coven.daemon.v1", "v10"):
+        invalid_tokens = (
+            "v1-beta",
+            "pre-v1",
+            "/api/v1",
+            "coven.daemon.v1",
+            "v10",
+            "v1.0",
+            "v1/beta",
+            "v1+meta",
+        )
+        for invalid in invalid_tokens:
             with self.subTest(invalid=invalid):
                 documents = self.canonical_documents()
                 documents["docs/reference/api-contract.md"] = documents[
@@ -123,16 +133,52 @@ Archive visibility is stored separately in `archived_at`.
         )
 
     def test_rejects_positive_named_contract_claim_variants(self) -> None:
-        claims = (
-            "GET /api/v1/api-version provides the coven.daemon.v1 compatibility handshake.",
-            "GET /api/v1/api-version proves coven.daemon.v1 compatibility.",
-            "Use GET /api/v1/api-version as proof of coven.daemon.v1 compatibility.",
-            "The coven.daemon.v1 compatibility handshake uses GET /api/v1/api-version.",
+        explanations = (
+            "GET /api/v1/api-version is a legacy route-family diagnostic returning "
+            "literal `v1` and provides the coven.daemon.v1 compatibility handshake.",
+            "GET /api/v1/api-version is a legacy route-family diagnostic returning "
+            "literal `v1` and proves coven.daemon.v1 compatibility.",
+            "Use GET /api/v1/api-version, a legacy route-family diagnostic returning "
+            "literal `v1`, as proof of coven.daemon.v1 compatibility.",
+            "The coven.daemon.v1 compatibility handshake uses GET /api/v1/api-version, "
+            "a legacy route-family diagnostic returning literal `v1`.",
         )
-        for claim in claims:
-            with self.subTest(claim=claim):
+        for explanation in explanations:
+            with self.subTest(explanation=explanation):
                 documents = self.canonical_documents()
-                documents["docs/reference/api-contract.md"] += f"\n{claim}"
+                self.replace_legacy_explanation(
+                    documents,
+                    "docs/reference/api-contract.md",
+                    explanation,
+                )
+                errors = module.validate_documents(documents)
+                self.assertTrue(
+                    any(
+                        "legacy route presented as named-contract handshake" in error
+                        for error in errors
+                    ),
+                    errors,
+                )
+
+    def test_rejects_clause_local_negation_bypasses(self) -> None:
+        explanations = (
+            "GET /api/v1/api-version is a legacy route-family diagnostic returning "
+            "literal `v1`, not deprecated and provides the coven.daemon.v1 "
+            "compatibility handshake.",
+            "GET /api/v1/api-version is a legacy route-family diagnostic returning "
+            "literal `v1`, not proof of authorization and proves coven.daemon.v1 "
+            "compatibility.",
+            "GET /api/v1/api-version is a legacy route-family diagnostic returning "
+            "literal `v1`. Clients negotiate coven.daemon.v1 through this route.",
+        )
+        for explanation in explanations:
+            with self.subTest(explanation=explanation):
+                documents = self.canonical_documents()
+                self.replace_legacy_explanation(
+                    documents,
+                    "docs/reference/api-contract.md",
+                    explanation,
+                )
                 errors = module.validate_documents(documents)
                 self.assertTrue(
                     any(
@@ -191,6 +237,56 @@ Archive visibility is stored separately in `archived_at`.
                 "GET /api/v1/api-version is a legacy route-family diagnostic "
                 "returning literal `v1` and is absolutely not proof of "
                 "coven.daemon.v1 compatibility."
+            ),
+        )
+        self.assertEqual(module.validate_documents(documents), [])
+
+    def test_accepts_cannot_and_fails_to_prove_negations(self) -> None:
+        explanations = (
+            "GET /api/v1/api-version is a legacy route-family diagnostic returning "
+            "literal `v1` and cannot prove coven.daemon.v1 compatibility.",
+            "GET /api/v1/api-version is a legacy route-family diagnostic returning "
+            "literal `v1` and fails to prove coven.daemon.v1 compatibility.",
+        )
+        for explanation in explanations:
+            with self.subTest(explanation=explanation):
+                documents = self.canonical_documents()
+                self.replace_legacy_explanation(
+                    documents,
+                    "docs/reference/api-contract.md",
+                    explanation,
+                )
+                self.assertEqual(module.validate_documents(documents), [])
+
+    def test_rejects_immediate_pronoun_verification_claim(self) -> None:
+        documents = self.canonical_documents()
+        self.replace_legacy_explanation(
+            documents,
+            "docs/reference/api-contract.md",
+            (
+                "GET /api/v1/api-version is a legacy route-family diagnostic "
+                "returning literal `v1`. It verifies support for coven.daemon.v1."
+            ),
+        )
+        errors = module.validate_documents(documents)
+        self.assertTrue(
+            any(
+                "legacy route presented as named-contract handshake" in error
+                for error in errors
+            ),
+            errors,
+        )
+
+    def test_ignores_later_health_scoped_compatibility_sentence(self) -> None:
+        documents = self.canonical_documents()
+        self.replace_legacy_explanation(
+            documents,
+            "docs/reference/api-contract.md",
+            (
+                "GET /api/v1/api-version is a legacy route-family diagnostic "
+                "returning literal `v1`. Separately, clients negotiate "
+                "coven.daemon.v1 compatibility through GET /api/v1/health.\n"
+                "| GET | `/api/v1/api-version` | legacy route-family literal `v1` |"
             ),
         )
         self.assertEqual(module.validate_documents(documents), [])
