@@ -200,7 +200,6 @@ repository = "https://github.com/OpenCoven/psyche"
 [workspace.dependencies]
 # Path entries are added by the task that creates each crate, for the same
 # reason `members` is: naming a path that does not exist is a latent break.
-psyche-core = { path = "crates/psyche-core" }
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 thiserror = "2"
@@ -270,31 +269,30 @@ signing material. `*.log` is anchored to the root so it cannot silently swallow 
 committed log-output test fixture, which is a realistic collision for a project
 built around structured logging.
 
-- [ ] **Step 4: Verify both manifests parse**
+- [ ] **Step 5: Verify the empty workspace and toolchain parse**
 
 Run:
 
 ```bash
-python3 -c "import tomllib,pathlib;[tomllib.loads(pathlib.Path(f).read_text()) for f in ('Cargo.toml','rust-toolchain.toml')];print('OK')"
+cargo metadata --format-version 1 --no-deps > /dev/null && echo OK
 ```
 
 Expected: `OK`.
 
-**Cargo commands cannot succeed yet, by design.** `cargo metadata`, `cargo build`,
-and `cargo verify-project` all load every workspace member's manifest — `--no-deps`
-suppresses *dependency* resolution, not *member* loading — and the four members are
-not created until Tasks 2-6. Expect:
+`cargo build` and `cargo test` cannot succeed yet, by design: this is a virtual
+manifest whose workspace has no members. Expect:
 
 ```
-error: failed to load manifest for workspace member `.../crates/psyche-core`
-Caused by: No such file or directory (os error 2)
+error: manifest path `.../psyche` contains no package: The manifest is virtual,
+and the workspace has no members.
 ```
 
-That error is the correct state at the end of Task 1. **Do not create crate stubs to
-silence it** — Task 2 owns those files, and stubbing here breaks the task boundary.
-The first real cargo verification runs at the end of Task 2.
+That build/test error is the correct state at the end of Task 1. **Do not create
+crate stubs to silence it** — Task 2 owns those files, and stubbing here breaks
+the task boundary. The first real build/test verification runs at the end of
+Task 2.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add Cargo.toml rust-toolchain.toml .gitignore
@@ -465,15 +463,19 @@ Create a placeholder `crates/psyche-core/src/secret.rs` so the crate compiles; T
 - [ ] **Step 5: Run the test to verify it passes**
 
 Run: `cargo test -p psyche-core schema`
-Expected: `test result: ok. 3 passed; 0 failed`.
+Expected: `test result: ok. 4 passed; 0 failed`.
 
 - [ ] **Step 6: Register the crate as a workspace member**
 
 Only now that `crates/psyche-core/Cargo.toml` exists can it be declared. In the
-root `Cargo.toml`, replace `members = []` with:
+root `Cargo.toml`, replace `members = []` and add the matching path dependency:
 
 ```toml
 members = ["crates/psyche-core"]
+
+[workspace.dependencies]
+psyche-core = { path = "crates/psyche-core" }
+# ...the registry dependencies declared in Task 1 remain below...
 ```
 
 Then verify the workspace loads:
@@ -902,13 +904,28 @@ line verbatim, and its `Debug` carries `input: Some(<the entire file>)`. A singl
 in the file, not just the value that failed — defeating `SecretRefError`'s
 payload-free design one layer up.
 
-So this loader must never let a `toml::de::Error` escape. `ConfigError::Parse`
-below holds one via `#[from]`, which means **`ConfigError` must not derive
-`Debug` naively and must not be logged with `?err`**. Task 3 made its rule
-greppable through a single `expose_reference` accessor; do the same here — the
-raw `toml::de::Error` should be consumed in one place that renders a
-payload-free message, so review can grep for the conversion rather than audit
-every call site.
+So this loader must never let a `toml::de::Error` escape — not through `Debug`,
+and not through `Display` either, which is the subtler half: an
+`#[error("...: {0}")]` that interpolates the TOML error renders the offending
+source line straight into the message.
+
+`ConfigError` therefore does **not** hold one and has no `#[from]` for it. The
+deserializer error is reduced to a fixed, payload-free variant at exactly one
+place, `reduce_toml_error`. Do not retain even `toml::de::Error::message()`:
+serde diagnostics may embed the rejected scalar. Task 3 made its rule greppable
+through a single `expose_reference` accessor; this is the same move, so review
+can grep one name instead of auditing every `?`.
+
+- [ ] **Step 0: Register the crate**
+
+Create `crates/psyche-config/` and add it to the workspace as the task that
+creates it, per the rule established in Task 2 — cargo loads every declared
+member on any command, so a member named before it exists breaks the workspace.
+
+In the root `Cargo.toml`, extend `members` to
+`["crates/psyche-core", "crates/psyche-config"]`, and add
+`psyche-config = { path = "crates/psyche-config" }` to `[workspace.dependencies]`
+beneath the `psyche-core` entry.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -919,16 +936,25 @@ Create `crates/psyche-config/src/lib.rs`:
 //! versions are denied before field validation so the error names the real
 //! cause.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use psyche_core::schema::{ensure_schema_version, SchemaError};
 use serde::Deserialize;
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// A parsed `psyche.config.v1` document.
+///
+/// No `Eq`: `extensions` is a `toml::Table` whose values include `Float(f64)`,
+/// so `toml::Value` derives only `PartialEq`. No derived `Debug` either — see
+/// the manual impl below.
+#[derive(Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Must be `psyche.config.v1`; any other value is denied.
     pub schema_version: String,
+    /// Directory owning local Psyche state.
     pub data_dir: PathBuf,
+    /// Coven daemon connection settings.
     pub coven: CovenConfig,
     /// The only place unknown keys are tolerated, and only under an explicitly
     /// versioned table.
@@ -936,25 +962,70 @@ pub struct Config {
     pub extensions: toml::Table,
 }
 
+/// Coven daemon connection settings.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CovenConfig {
+    /// Path to the Coven daemon socket.
     pub socket: PathBuf,
+    /// Named daemon contract required before any dependent action.
     pub required_api_version: String,
 }
 
+/// Errors from loading configuration.
+///
+/// `Parse` deliberately does **not** hold a [`toml::de::Error`], and there is no
+/// `#[from]` for one. That type's `Display` renders the offending source line
+/// verbatim and its `Debug` carries `input: Some(<the entire file>)`, so holding
+/// one would leave every secret in the file a single `?err` away from a log. The
+/// deserializer error is reduced to a payload-free form at exactly one place —
+/// [`reduce_toml_error`] — which is what review should grep for.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("configuration is not valid TOML: {0}")]
-    Parse(#[from] toml::de::Error),
+    /// The file is not valid TOML, or violates the strict schema.
+    #[error("configuration is not valid TOML or violates the strict schema")]
+    Parse,
+    /// The declared `schema_version` is not accepted by this build.
     #[error(transparent)]
     Schema(#[from] SchemaError),
+    /// The configuration file could not be read.
     #[error("cannot read configuration at {path}: {source}")]
     Read {
+        /// Path that could not be read.
         path: PathBuf,
+        /// Underlying I/O failure.
         #[source]
         source: std::io::Error,
     },
+}
+
+// Manual `Debug`, not derived. `extensions` holds arbitrary untyped
+// `toml::Value`, so a derived impl would print whatever is in it — including a
+// secret placed there by a future extension — on `tracing::debug!(?config)`
+// after a *successful* load. `reduce_toml_error` guards the failure path; this
+// guards the success path, which is the one more often logged.
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("schema_version", &self.schema_version)
+            .field("data_dir", &self.data_dir)
+            .field("coven", &self.coven)
+            .field(
+                "extensions",
+                &format_args!("<{} key(s) redacted>", self.extensions.len()),
+            )
+            .finish()
+    }
+}
+
+/// The single conversion from a deserializer error into a payload-free one.
+///
+/// Taking ownership and discarding the error is deliberate. Both the complete
+/// error and its message can carry input values. Keeping this in one function
+/// means a review can grep `reduce_toml_error` to find every place a TOML error
+/// crosses the boundary, rather than auditing every `?`.
+fn reduce_toml_error(_: toml::de::Error) -> ConfigError {
+    ConfigError::Parse
 }
 
 #[cfg(test)]
@@ -981,13 +1052,22 @@ required_api_version = "coven.daemon.v1"
 
     #[test]
     fn rejects_an_unknown_top_level_field() {
-        let raw = format!("{VALID}\ntelegram_token = \"nope\"\n");
+        let sentinel = "must-never-appear-in-an-error";
+        let raw = VALID.replacen(
+            "\n[coven]",
+            &format!("\ntelegram_token = \"{sentinel}\"\n\n[coven]"),
+            1,
+        );
         let err = load_str(&raw).unwrap_err();
         assert!(
-            matches!(err, ConfigError::Parse(_)),
+            matches!(err, ConfigError::Parse),
             "expected a parse error, got {err:?}"
         );
-        assert!(err.to_string().contains("telegram_token"));
+        assert_eq!(
+            err.to_string(),
+            "configuration is not valid TOML or violates the strict schema"
+        );
+        assert!(!format!("{err:?}").contains(sentinel));
     }
 
     #[test]
@@ -1016,6 +1096,19 @@ required_api_version = "coven.daemon.v1"
         let raw = format!("{VALID}\n[extensions.\"psyche.experiment.v1\"]\nenabled = true\n");
         let cfg = load_str(&raw).unwrap();
         assert!(cfg.extensions.contains_key("psyche.experiment.v1"));
+    }
+
+    #[test]
+    fn debug_does_not_print_extension_values() {
+        let sentinel = "must-never-appear-in-debug";
+        let raw = format!(
+            "{VALID}\n[extensions.\"psyche.experiment.v1\"]\nvalue = \"{sentinel}\"\n"
+        );
+        let cfg = load_str(&raw).unwrap();
+        let rendered = format!("{cfg:?}");
+        assert!(!rendered.contains("value"), "{rendered}");
+        assert!(!rendered.contains(sentinel), "{rendered}");
+        assert!(rendered.contains("1 key(s) redacted"), "{rendered}");
     }
 
     #[test]
@@ -1068,9 +1161,9 @@ struct VersionProbe {
 }
 
 pub fn load_str(raw: &str) -> Result<Config, ConfigError> {
-    let probe: VersionProbe = toml::from_str(raw)?;
+    let probe: VersionProbe = toml::from_str(raw).map_err(reduce_toml_error)?;
     ensure_schema_version(&probe.schema_version)?;
-    let config: Config = toml::from_str(raw)?;
+    let config: Config = toml::from_str(raw).map_err(reduce_toml_error)?;
     Ok(config)
 }
 
@@ -1086,7 +1179,7 @@ pub fn load_path(path: &Path) -> Result<Config, ConfigError> {
 - [ ] **Step 5: Run the test to verify it passes**
 
 Run: `cargo test -p psyche-config`
-Expected: `test result: ok. 5 passed; 0 failed`.
+Expected: `test result: ok. 6 passed; 0 failed`.
 
 - [ ] **Step 6: Document the shipped contract**
 
