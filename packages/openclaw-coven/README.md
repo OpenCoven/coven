@@ -91,17 +91,28 @@ The plugin is a client, not a trust root. The Rust daemon must still validate pr
 |---|---|---|
 | `@opencoven/coven@2026.4.28` | Coven 2026.4.x | Initial tested version pair. Fixture responses live in `src/fixtures/v2026.4/`. |
 
-The compatibility tests in `src/compat.test.ts` verify the plugin against the fixture files for the documented daemon API version. When the Rust daemon changes a response shape for `/api/v1/health`, `/api/v1/sessions`, or `/api/v1/events`, update the matching fixture and re-run the tests.
+The compatibility tests in `src/compat.test.ts` verify the plugin against
+minimal fixtures for the bridge-required field subset. They are not exhaustive
+copies of each current Rust response. When the daemon changes a bridge-consumed
+field from `/api/v1/health`, `/api/v1/sessions`, or `/api/v1/events`, update the
+matching fixture and re-run the tests.
 
-Fixture field names follow the Rust daemon's serialization rules:
-- `GET /api/v1/health` — camelCase: `ok`, named contract
-  `apiVersion: "coven.daemon.v1"`, `covenVersion`, nullable daemon metadata
-  (`daemon.pid`, `daemon.startedAt`, `daemon.socket`), and the exact current
-  capability fields `sessions`, `events`, `travel`, `scheduler`, `hub`,
-  `executorDispatch`, `eventCursor`, and `structuredErrors`. A store-backed
-  response may also include the optional `hub` summary.
+The minimal fixture field names follow the Rust daemon's serialization rules:
+- `GET /api/v1/health` — camelCase `ok`, named contract
+  `apiVersion: "coven.daemon.v1"`, `covenVersion`, and the bridge-required
+  capability subset `sessions`, `events`, `eventCursor`, and
+  `structuredErrors`. `daemon` is nullable; when present, its non-null fields
+  are `pid`, `startedAt`, and `socket`.
 - `GET /api/v1/sessions`, `POST /api/v1/sessions`, `GET /api/v1/sessions/:id` — snake_case (`project_root`, `exit_code`, `created_at`, `updated_at`)
 - `GET /api/v1/events` — snake_case (`session_id`, `payload_json`, `created_at`)
+
+The exact current Rust health DTO is documented separately in the
+[API contract](../../docs/API-CONTRACT.md#get-apiv1health). It contains `ok`,
+named `apiVersion: "coven.daemon.v1"`, `covenVersion`, nullable `daemon` whose
+present `pid`, `startedAt`, and `socket` fields are non-null, and the exact
+`capabilities` fields `sessions`, `events`, `travel`, `scheduler`, `hub`,
+`executorDispatch`, `eventCursor`, and `structuredErrors`. A store-backed
+response may also include the optional top-level `hub` summary.
 
 Separately, `GET /api/v1/api-version` is a legacy route-family diagnostic with
 literal `apiVersion: "v1"` and `supportedApiVersions: ["v1"]`; this is not
@@ -115,4 +126,4 @@ sending a dependent request. Capabilities advertise availability and never grant
 
 The source lives in the Coven repo so the bridge can mature with the Coven daemon/API. Do not add Coven or OpenCoven code back into OpenClaw core as part of normal plugin work.
 
-Because the plugin is externalized, the Coven socket API is a compatibility contract. The plugin uses the current `/api/v1` contract and verifies `GET /api/v1/health` before launching sessions. Plugin changes should be tested against representative daemon responses, and daemon changes that affect `/api/v1/health`, `/api/v1/sessions`, `/api/v1/events`, input, or kill behavior should update this package in the same repo.
+Because the plugin is externalized, the Coven socket API is a compatibility contract. The plugin uses the named `coven.daemon.v1` contract served under `/api/v1` and verifies `GET /api/v1/health` before launching sessions. Plugin changes should be tested against representative daemon responses, and daemon changes that affect `/api/v1/health`, `/api/v1/sessions`, `/api/v1/events`, input, or kill behavior should update this package in the same repo.

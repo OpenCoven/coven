@@ -124,18 +124,19 @@ Additional compatibility protections before broad distribution:
   `coven.daemon.v1` support;
 - keep legacy `GET /health` available as an early-MVP alias, but never
   recommend it as the compatibility handshake;
-- use structured error codes for API failures;
-- paginate `GET /api/v1/events` with a daemon-enforced limit;
+- retain structured error codes for API failures;
+- maintain daemon-bounded event pagination with the monotonic `afterSeq`
+  cursor and the `afterEventId` compatibility cursor;
 - keep unknown fields ignored where safe and unknown required behavior rejected;
-- add plugin tests against representative daemon responses;
+- maintain plugin tests against representative daemon responses;
 - document breaking API changes in the Coven repo before updating the plugin.
 
 ## Hardening priorities
 
 1. Enforce private `COVEN_HOME` ownership and permissions in Rust before creating, binding, or removing daemon state.
 2. Add daemon request limits for request line length, header bytes, `Content-Length`, body bytes, and read duration.
-3. Add API versioning and structured error codes.
-4. Add event pagination that honors `afterEventId` or a monotonic sequence cursor.
+3. Maintain named API versioning and structured error codes across new and changed routes.
+4. Maintain daemon-bounded event pagination with monotonic `afterSeq` and `afterEventId` compatibility.
 5. Enable SQLite durability defaults suitable for a local daemon, including WAL and a busy timeout.
 6. Add release gates for Rust dependency audit, npm/package dry runs, and plugin compatibility tests.
 7. Keep generic/custom command adapters out of v0 until policy and approval behavior are explicit.
