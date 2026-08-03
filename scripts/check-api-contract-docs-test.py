@@ -72,6 +72,22 @@ Archive visibility is stored separately in `archived_at`.
             errors,
         )
 
+    def test_rejects_non_standalone_literal_v1_tokens(self) -> None:
+        for invalid in ("v1-beta", "pre-v1", "/api/v1", "coven.daemon.v1", "v10"):
+            with self.subTest(invalid=invalid):
+                documents = self.canonical_documents()
+                documents["docs/reference/api-contract.md"] = documents[
+                    "docs/reference/api-contract.md"
+                ].replace("literal `v1`", f"literal `{invalid}`")
+                errors = module.validate_documents(documents)
+                self.assertTrue(
+                    any(
+                        "legacy route explanation is missing" in error
+                        for error in errors
+                    ),
+                    errors,
+                )
+
     def test_rejects_api_version_route_as_compatibility_handshake(self) -> None:
         documents = self.canonical_documents()
         self.replace_legacy_explanation(
@@ -105,6 +121,79 @@ Archive visibility is stored separately in `archived_at`.
             any("legacy route presented as named-contract handshake" in error for error in errors),
             errors,
         )
+
+    def test_rejects_positive_named_contract_claim_variants(self) -> None:
+        claims = (
+            "GET /api/v1/api-version provides the coven.daemon.v1 compatibility handshake.",
+            "GET /api/v1/api-version proves coven.daemon.v1 compatibility.",
+            "Use GET /api/v1/api-version as proof of coven.daemon.v1 compatibility.",
+            "The coven.daemon.v1 compatibility handshake uses GET /api/v1/api-version.",
+        )
+        for claim in claims:
+            with self.subTest(claim=claim):
+                documents = self.canonical_documents()
+                documents["docs/reference/api-contract.md"] += f"\n{claim}"
+                errors = module.validate_documents(documents)
+                self.assertTrue(
+                    any(
+                        "legacy route presented as named-contract handshake" in error
+                        for error in errors
+                    ),
+                    errors,
+                )
+
+    def test_rejects_positive_pronoun_continuation(self) -> None:
+        documents = self.canonical_documents()
+        self.replace_legacy_explanation(
+            documents,
+            "docs/reference/api-contract.md",
+            (
+                "GET /api/v1/api-version is a legacy route-family diagnostic "
+                "returning literal `v1`. It provides the coven.daemon.v1 "
+                "compatibility handshake."
+            ),
+        )
+        errors = module.validate_documents(documents)
+        self.assertTrue(
+            any(
+                "legacy route presented as named-contract handshake" in error
+                for error in errors
+            ),
+            errors,
+        )
+
+    def test_unrelated_negation_does_not_hide_positive_continuation(self) -> None:
+        documents = self.canonical_documents()
+        self.replace_legacy_explanation(
+            documents,
+            "docs/reference/api-contract.md",
+            (
+                "GET /api/v1/api-version is a legacy route-family diagnostic "
+                "returning literal `v1`. It is not proof of authorization, but "
+                "it provides the coven.daemon.v1 compatibility handshake."
+            ),
+        )
+        errors = module.validate_documents(documents)
+        self.assertTrue(
+            any(
+                "legacy route presented as named-contract handshake" in error
+                for error in errors
+            ),
+            errors,
+        )
+
+    def test_accepts_modified_legitimate_negation(self) -> None:
+        documents = self.canonical_documents()
+        self.replace_legacy_explanation(
+            documents,
+            "docs/reference/api-contract.md",
+            (
+                "GET /api/v1/api-version is a legacy route-family diagnostic "
+                "returning literal `v1` and is absolutely not proof of "
+                "coven.daemon.v1 compatibility."
+            ),
+        )
+        self.assertEqual(module.validate_documents(documents), [])
 
     def test_requires_health_handshake_in_every_contract_guide(self) -> None:
         documents = self.canonical_documents()
