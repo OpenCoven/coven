@@ -22,13 +22,13 @@ flowchart LR
   Root --> Hub["/hub"]
 ```
 
-All error responses use the structured envelope documented in the [API contract](/API-CONTRACT#structured-error-envelope): `{ "error": { "code", "message", "details" } }`. Unknown routes, action ids, and API versions fail closed. Capability groups (`sessions`, `events`, `travel`, `scheduler`, `hub`) are advertised in the `GET /api/v1/health` `capabilities` block — treat a group as unavailable unless health advertises it.
+All error responses use the structured envelope documented in the [API contract](/API-CONTRACT#structured-error-envelope): `{ "error": { "code", "message", "details" } }`. Unknown routes, action ids, and API versions fail closed. Clients negotiate the named `coven.daemon.v1` contract with `GET /api/v1/health`, then check every capability required by the operation. Capability groups (`sessions`, `events`, `travel`, `scheduler`, `hub`) are advertised in the health `capabilities` block — treat a group as unavailable unless health advertises it. Capabilities advertise availability and never grant permission.
 
 ## Contract and discovery
 
 | Method | Path | Purpose | Success |
 |---|---|---|---|
-| GET | `/api/v1/api-version` | Active API version + supported versions. | `{ apiVersion, supportedApiVersions }` |
+| GET | `/api/v1/api-version` | Read the legacy route-family token. | `{ apiVersion: "v1", supportedApiVersions: ["v1"] }` |
 | GET | `/api/v1/health` | Daemon reachability, version, capabilities, pid, hub summary. | `{ ok, apiVersion, covenVersion, capabilities, daemon, hub }` |
 | GET | `/api/v1/capabilities` | Control-plane capability catalog with policy hints and action ids. | `{ capabilities: [...] }` |
 | GET | `/api/v1/capabilities/harnesses` | Aggregate of harness-native capability manifests plus Coven skills (`?refresh=1` re-scans). | `{ coven_skills, harness_capabilities, scanned_at }` |

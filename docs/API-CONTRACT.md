@@ -15,6 +15,17 @@ The Coven daemon socket API is a public compatibility boundary for comux and ext
 
 ## Current stable version
 
+Clients negotiate compatibility with `GET /api/v1/health`. Its `apiVersion`
+field is the named contract `coven.daemon.v1`; clients must then check every
+capability required by the operation before sending a dependent request.
+Capabilities advertise availability and never grant permission.
+
+`GET /api/v1/api-version` is a legacy route-family diagnostic. Its existing
+`apiVersion: "v1"` and `supportedApiVersions: ["v1"]` values identify the
+`/api/v1/*` route namespace, not the named compatibility contract. Existing
+values remain wire-compatible, but new clients must not use this response as
+proof of `coven.daemon.v1` support.
+
 - `GET /api/v1/health` exposes `apiVersion: "coven.daemon.v1"`, `covenVersion`, and a machine-readable `capabilities` object.
 - Clients should read `/api/v1/health` before assuming any response shape from other endpoints.
 - Legacy unversioned routes such as `GET /health` remain early-MVP aliases; new clients should use `/api/v1`.
@@ -150,7 +161,7 @@ All API errors use the following stable envelope. Clients must branch on `error.
 
 ## Capability catalog shape (`v1`)
 
-`GET /api/v1/capabilities` returns the daemon/control-plane capability catalog. This is the intended intake-client handshake for deciding which actions to show or route through Coven.
+`GET /api/v1/capabilities` returns the daemon/control-plane capability catalog. This is the intended intake-client discovery surface for deciding which actions to show or route through Coven after compatibility negotiation.
 
 ```json
 {
@@ -440,6 +451,21 @@ Endpoints that return this shape:
 ```
 
 The `external` field is `true` for sessions registered via `POST /api/v1/sessions/external`; it is `false` for all daemon-launched sessions. The `transcript_path` field carries the absolute path to the external session's transcript file when provided at registration; it is `null` for daemon-launched sessions and for external sessions where no path was supplied.
+
+| Status | Terminal in the current ledger | Meaning |
+|---|---:|---|
+| `created` | No | Durable row exists; no live runtime has been established. Recovery moves a stale unowned row to `failed`. |
+| `running` | No | A daemon-owned or registered external runtime is live. |
+| `idle` | No | A conversational turn completed and the session remains reusable. |
+| `completed` | Yes | Runtime completion was successful. |
+| `failed` | Yes | Launch or runtime completion failed. |
+| `killed` | Yes | A kill request was accepted and persisted; this is not proof of acknowledged process termination. |
+| `orphaned` | Yes | Recovery cannot prove ownership of a row previously marked running. |
+
+Archive visibility is stored separately in `archived_at` and does not change
+the lifecycle status. Synthetic Cast quest-anchor rows may use `active`; that
+store value is not a harness-session state and must be classified by row kind
+before interpreting status.
 
 ## `POST /api/v1/sessions/external`
 

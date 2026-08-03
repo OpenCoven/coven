@@ -11,7 +11,11 @@ description: "Coven runtime topology: the Rust daemon, CLI, TUI, comux, and Open
 
 Coven is a local-first harness substrate. The Rust CLI/daemon is the authority layer; clients such as the CLI TUI, comux, and the optional OpenClaw plugin are presentation/integration layers.
 
-The versioned local socket API contract lives in [`docs/API-CONTRACT.md`](API-CONTRACT.md). Clients should use `GET /api/v1/health` and its `apiVersion` / `supportedApiVersions` fields as the handshake before depending on session or event response shapes.
+The versioned local socket API contract lives in [`docs/API-CONTRACT.md`](API-CONTRACT.md). Clients should use `GET /api/v1/health` and its named `apiVersion` plus the
+required `capabilities` fields before depending on session or event response
+shapes. Capabilities advertise availability and never grant permission. The
+legacy `GET /api/v1/api-version` route reports literal `v1` route-family values,
+not proof of `coven.daemon.v1` support.
 
 ## Runtime topology
 

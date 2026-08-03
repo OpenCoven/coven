@@ -26,8 +26,12 @@ GET /api/v1/health
   "capabilities": {
     "sessions": true,
     "events": true,
-    "actions": true,
-    "harnesses": ["codex", "claude"]
+    "travel": true,
+    "scheduler": true,
+    "hub": true,
+    "executorDispatch": true,
+    "eventCursor": "sequence",
+    "structuredErrors": true
   },
   "daemon": {
     "pid": 31415,
@@ -37,13 +41,17 @@ GET /api/v1/health
 }
 ```
 
-Negotiate against `apiVersion` and `capabilities` before depending on session or event response shapes.
+Negotiate the named `coven.daemon.v1` contract against this health
+`apiVersion`, then check every capability required by the operation before
+depending on a response shape. Capabilities advertise availability and never grant permission.
+`GET /api/v1/api-version` remains a legacy route-family
+diagnostic whose literal `v1` values are not proof of named-contract support.
 
 ## Endpoints
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /api/v1/api-version` | Read the active API version and supported versions. |
+| `GET /api/v1/api-version` | Read the legacy route-family token. |
 | `GET /api/v1/health` | Check daemon health and metadata. |
 | `GET /api/v1/capabilities` | Discover routable capabilities and owning adapters. |
 | `POST /api/v1/actions` | Send a known intent through the control plane. |
@@ -95,7 +103,7 @@ See [Error envelope](/daemon/error-envelope) for the full code list.
 
 ## Versioning
 
-The `apiVersion` field is the contract clients pin against. Coven follows additive compatibility: new fields and new capabilities are added under existing versions; breaking changes require a new version. See [API versioning](/daemon/api-versioning).
+The health response's `apiVersion` field is the named contract clients pin against. Coven follows additive compatibility: new fields and new capabilities are added under existing versions; breaking changes require a new version. See [API versioning](/daemon/api-versioning).
 
 ## Calling the socket
 

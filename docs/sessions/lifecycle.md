@@ -1,42 +1,50 @@
 ---
-summary: "Launch, run, attach, exit, archive, summon, sacrifice — every state a Coven session can be in."
+summary: "The seven harness-session statuses, their daemon transitions, and separate archive visibility."
 read_when:
   - Designing a client that follows session state
   - Debugging a stuck or orphaned session
 title: "Session lifecycle for client developers"
-description: "Coven session states for client developers: pending, running, exited, archived, sacrificed, with the daemon transitions and socket API calls that drive each."
+description: "Coven harness-session states for client developers, with daemon transitions and the separate archive visibility field."
 ---
 
-Every Coven session moves through the same states, regardless of which harness is driving it.
+Every Coven harness session uses the same status vocabulary, regardless of which harness is driving it.
 
 ```mermaid
 stateDiagram-v2
-  [*] --> Pending: POST /api/v1/sessions
-  Pending --> Running: daemon spawns PTY
-  Pending --> Failed: validation rejects (project root, cwd, harness)
+  [*] --> Created: POST /api/v1/sessions
+  Created --> Running: daemon spawns PTY
+  Created --> Failed: launch fails / stale unowned recovery
+  Running --> Idle: conversational turn completes; reusable
   Running --> Completed: harness exits 0
   Running --> Failed: harness exits non-zero
-  Running --> Killed: POST /api/v1/sessions/:id/kill
-  Completed --> Archived: coven archive
-  Failed --> Archived: coven archive
-  Killed --> Archived: coven archive
-  Archived --> Completed: coven summon (if originally completed)
-  Archived --> Failed: coven summon (if originally failed)
-  Archived --> Killed: coven summon (if originally killed)
-  Archived --> [*]: coven sacrifice --yes
+  Running --> Killed: kill request accepted and persisted
+  Running --> Orphaned: recovery cannot prove ownership
+  Completed --> Completed: archive sets / summon clears archived_at
+  Failed --> Failed: archive sets / summon clears archived_at
+  Killed --> Killed: archive sets / summon clears archived_at
+  Orphaned --> Orphaned: archive sets / summon clears archived_at
   Completed --> [*]: coven sacrifice --yes
+  Failed --> [*]: coven sacrifice --yes
+  Killed --> [*]: coven sacrifice --yes
+  Orphaned --> [*]: coven sacrifice --yes
 ```
 
 ## State definitions
 
-| State | Meaning |
-|---|---|
-| `pending` | Daemon accepted the request; PTY not yet spawned. |
-| `running` | PTY is live; output and input flow through Coven. |
-| `completed` | Harness exited with code 0. |
-| `failed` | Harness exited with a non-zero code. The exit code is recorded. |
-| `killed` | Operator or client called `kill`. |
-| `archived` | Session is hidden from the active list. Events preserved. |
+| Status | Terminal in the current ledger | Meaning |
+|---|---:|---|
+| `created` | No | Durable row exists; no live runtime has been established. Recovery moves a stale unowned row to `failed`. |
+| `running` | No | A daemon-owned or registered external runtime is live. |
+| `idle` | No | A conversational turn completed and the session remains reusable. |
+| `completed` | Yes | Runtime completion was successful. |
+| `failed` | Yes | Launch or runtime completion failed. |
+| `killed` | Yes | A kill request was accepted and persisted; this is not proof of acknowledged process termination. |
+| `orphaned` | Yes | Recovery cannot prove ownership of a row previously marked running. |
+
+Archive visibility is stored separately in `archived_at` and does not change
+the lifecycle status. Synthetic Cast quest-anchor rows may use `active`; that
+store value is not a harness-session state and must be classified by row kind
+before interpreting status.
 
 ## Launch
 
@@ -70,7 +78,8 @@ coven attach <session-id>
 
 ## Archive / summon / sacrifice
 
-These are the three rituals around finished sessions:
+These are the three rituals around non-running sessions. Archive and summon
+change `archived_at` without changing the lifecycle status:
 
 <Columns>
   <Card title="Archive" href="/rituals/archive" icon="archive">
@@ -86,11 +95,13 @@ These are the three rituals around finished sessions:
 
 ## Orphan recovery
 
-If the daemon restarts while a PTY is running, the session is marked **orphaned**. On the next start, the daemon:
+If the daemon restarts while a daemon-owned PTY was marked `running`, recovery
+marks the session `orphaned`. On startup, the daemon:
 
 1. Reads the session ledger.
-2. Marks orphaned sessions as `failed` with a recovery note in their event stream.
-3. Refuses to re-attach to a dead PTY.
+2. Marks previously `running` daemon-owned rows as `orphaned` when ownership cannot be proved.
+3. Marks stale unowned `created` rows as `failed`.
+4. Refuses to re-attach to a dead PTY.
 
 See [Orphan recovery](/daemon/orphan-recovery).
 
