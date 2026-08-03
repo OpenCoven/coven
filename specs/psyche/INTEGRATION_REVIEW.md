@@ -1138,7 +1138,7 @@ requirements remain independently binding.
 | G7 Trusted add-ons | Allowlist, pin/provenance, revocation, audit, protocol denial, crash/security evidence | Add-on activation |
 | G8 Adapter reliability | Fake surface, crash, security, ambiguity, and parity evidence | Live Telegram |
 | G9 Live Telegram | Required live rows pass twice on dedicated accounts and two client families | Canary |
-| G10 Operations | Doctor, retention, privacy, export/restore, incident response, migration, token rotation, rollback, release security review with no open critical/high issue | Production cutover |
+| G10 Operations | Doctor, retention, privacy, export/restore, incident response, migration, token rotation, rollback, release security review with no open critical or high-severity issue | Production cutover |
 | G11 Canary | Approved core/adapter objectives for approved window/volume; zero unauthorized dispatch | General release |
 | G12 Distribution | Signed/checksummed artifacts, SBOM, provenance, clean-host install, rollback threshold | Publication |
 
