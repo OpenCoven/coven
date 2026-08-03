@@ -63,8 +63,7 @@ and expect successful type checking.
 
 ```bash
 git add crates/coven-cli/src/memory_import.rs
-git commit -s -m "fix(memory): keep Windows tests on stable Rust" \
-  -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
+git commit -s -m "fix(memory): keep Windows tests on stable Rust"
 ```
 
 ### Task 2: Harden private directories through the pinned capability
@@ -139,8 +138,7 @@ regression.
 
 ```bash
 git add crates/coven-cli/src/memory_import.rs
-git commit -s -m "fix(memory): secure Linux import directories" \
-  -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
+git commit -s -m "fix(memory): secure Linux import directories"
 ```
 
 ### Task 3: Validate and publish the CI repair
@@ -181,8 +179,7 @@ unrelated mobile TLS `EAGAIN` test.
 git add \
   docs/superpowers/specs/2026-08-03-memory-import-ci-repair-design.md \
   docs/superpowers/plans/2026-08-03-memory-import-ci-repair.md
-git commit -s -m "docs(memory): plan CI repair" \
-  -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
+git commit -s -m "docs(memory): plan CI repair"
 ```
 
 - [ ] **Step 4: Push the existing PR branch**
