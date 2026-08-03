@@ -34,12 +34,13 @@ separate local-dashboard launcher described after the table.
 
 ## coven memory open
 
-`coven memory open` launches the optional
-`@opencoven/coven-memory-dashboard` companion on a validated loopback address.
-It does not accept `--json`; `coven memory` and `coven memory --json` retain the
-read-only list behavior above. The npm wrapper requires Node.js 24 or newer for
-the dashboard only, while other wrapped Coven commands continue to support
-Node.js 18 or newer.
+`coven memory open` starts or reuses the local Coven daemon, then launches the
+optional `@opencoven/coven-memory-dashboard` companion on a validated loopback
+address. It does not require the dashboard source repository or a separate
+`coven daemon start` step. It does not accept `--json`; `coven memory` and
+`coven memory --json` retain the read-only list behavior above. The npm wrapper
+requires Node.js 24 or newer for the dashboard only, while other wrapped Coven
+commands continue to support Node.js 18 or newer.
 
 ## coven status
 

@@ -154,6 +154,10 @@ coven doctor
 coven memory open
 ```
 
+`coven memory open` starts or reuses the installed local Coven daemon before
+launching the packaged dashboard. It does not require a checkout or running
+development server from the `coven-memory` repository.
+
 The core npm wrapper supports Node.js 18 or newer. The optional memory
 dashboard requires Node.js 24 or newer; on an older runtime, only
 `coven memory open` is blocked and prints an upgrade instruction.
@@ -301,13 +305,13 @@ and `GET /api/v1/memory/:id`. The daemon resolves and validates memory files;
 clients must not open the archival database, vector index, manifest, or memory
 paths directly.
 
-`coven memory open` delegates to the local
-`@opencoven/coven-memory-dashboard` executable. The npm wrapper supplies only
-the installed Node executable and dashboard entrypoint; memory data and daemon
-transport proofs are never passed through the environment. Direct native
-binary installs can place `coven-memory-dashboard` on `PATH` or install the
-package globally. The dashboard requires Node.js 24 or newer; the rest of the
-npm-wrapped CLI remains available on Node.js 18 or newer.
+`coven memory open` establishes local daemon readiness before delegating to the
+installed `@opencoven/coven-memory-dashboard` executable. The npm wrapper
+supplies only the installed Node executable and dashboard entrypoint; memory
+data and daemon transport proofs are never passed through the environment.
+Direct native binary installs can place `coven-memory-dashboard` on `PATH` or
+install the package globally. The dashboard requires Node.js 24 or newer; the
+rest of the npm-wrapped CLI remains available on Node.js 18 or newer.
 
 Treat the socket API as the product contract. Clients may validate for better UX, but the Rust daemon remains the authority boundary.
 
