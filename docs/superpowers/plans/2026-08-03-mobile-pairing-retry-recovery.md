@@ -25,7 +25,7 @@
 - Modify: `crates/coven-cli/src/mobile_memory/pairing.rs:400-567`
 - Test: `crates/coven-cli/src/mobile_memory/pairing.rs`
 
-- [ ] **Step 1: Add replay-oriented helper assertions and failing tests**
+- [x] **Step 1: Add replay-oriented helper assertions and failing tests**
 
 ```rust
 fn assert_complete(progress: PairingProgress, replayed: bool) -> MobilePairedDevice {
@@ -146,7 +146,7 @@ Also update `pairing_requires_host_and_device_confirmation` to assert against
 `PairingProgress::Complete { replayed: false, .. }` instead of the old tuple
 variant.
 
-- [ ] **Step 2: Run the pairing tests and confirm they fail first**
+- [x] **Step 2: Run the pairing tests and confirm they fail first**
 
 Run:
 
@@ -163,7 +163,7 @@ completed confirmations still remove the pairing entry.
 - Modify: `crates/coven-cli/src/mobile_memory/gateway.rs:1094-1230`
 - Test: `crates/coven-cli/src/mobile_memory/gateway.rs`
 
-- [ ] **Step 1: Add failing gateway tests for replay responses and audit dedupe**
+- [x] **Step 1: Add failing gateway tests for replay responses and audit dedupe**
 
 Add this helper and tests to the gateway test module:
 
@@ -217,10 +217,9 @@ fn device_confirmation_replay_returns_same_envelope_data() {
     );
 
     let path = format!("/api/v1/mobile/pairings/{}/confirm", invitation.id);
-    let body = serde_json::to_vec(&super::super::contract::MobilePairingConfirmation {
-        phrase: enrolled.phrase.to_vec(),
-    })
-    .unwrap();
+    let body = serde_json::json!({ "phrase": enrolled.phrase })
+        .to_string()
+        .into_bytes();
 
     let first = handle_pairing_confirmation(
         &state,
@@ -237,7 +236,7 @@ fn device_confirmation_replay_returns_same_envelope_data() {
         &path,
         MobileHttpRequest {
             method: "POST".to_owned(),
-            target: path,
+            target: path.clone(),
             headers: HashMap::new(),
             body,
         },
@@ -296,7 +295,7 @@ Add any missing test imports for `URL_SAFE_NO_PAD`, `Engine`, and
 body equality: `success_response` regenerates `request_id` for each response,
 so the stable contract is parsed envelope `data`.
 
-- [ ] **Step 2: Run the gateway tests and confirm the current behavior fails**
+- [x] **Step 2: Run the gateway tests and confirm the current behavior fails**
 
 Run:
 
@@ -316,7 +315,7 @@ completion.
 - Modify: `crates/coven-cli/src/mobile_memory/pairing.rs:20-30, 54-58, 104-119, 239-295, 400-567`
 - Modify: `crates/coven-cli/src/mobile_memory/gateway.rs:626-660, 858-885`
 
-- [ ] **Step 1: Extend the pending state and progress enum**
+- [x] **Step 1: Extend the pending state and progress enum**
 
 Update the data model near the top of `pairing.rs` to this shape:
 
@@ -346,7 +345,7 @@ pub enum PairingProgress {
 
 Initialize `completed: None` in `begin_pairing_with_id`.
 
-- [ ] **Step 2: Update `PairingManager::confirm` and both gateway callers in one edit set**
+- [x] **Step 2: Update `PairingManager::confirm` and both gateway callers in one edit set**
 
 In `PairingManager::confirm`, keep the existing expiry and transcript guards,
 then replace the phrase / completion block with:
@@ -459,7 +458,7 @@ named-field variant. Treat this as one atomic implementation task: do **not**
 stop after changing only `pairing.rs`, because the new enum shape and gateway
 match arms must compile together.
 
-- [ ] **Step 3: Re-run the focused mobile tests**
+- [x] **Step 3: Re-run the focused mobile tests**
 
 Run:
 
@@ -470,6 +469,14 @@ cargo test -p coven-cli mobile_memory --locked -- --nocapture
 Expected: PASS. Pairing and gateway tests now cover the full retry contract.
 
 - [ ] **Step 4: Run the repository gates exactly as the spec requires**
+
+Validation note: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`python scripts/check-secrets.py`, and `python3 scripts/check-coven-privacy.py --staged`
+passed. `cargo test --workspace --locked` currently fails in pre-existing
+`crates/coven-cli/tests/smoke.rs` doctor assertions unrelated to mobile pairing
+(`doctor_missing_harness_prints_cross_platform_setup_loop`,
+`doctor_json_passes_with_fake_harness_and_engine`,
+`doctor_reports_no_familiars_when_manifest_absent`).
 
 Run:
 
@@ -485,7 +492,7 @@ python3 scripts/check-coven-privacy.py --staged
 Expected: PASS. No formatting drift, no lint warnings, full locked tests clean,
 no secret findings, and no privacy-guard complaints on the staged patch.
 
-- [ ] **Step 5: Commit the replay-safe implementation**
+- [x] **Step 5: Commit the replay-safe implementation**
 
 ```bash
 git commit -s -m "fix(mobile): make pairing confirmation retries idempotent"

@@ -647,7 +647,9 @@ fn handle_pairing_confirmation(
         Ok(PairingProgress::Pending) => {
             error_response(409, MobileErrorCode::PairingConfirmationRequired)
         }
-        Ok(PairingProgress::Complete(device)) => success_response(201, device),
+        Ok(PairingProgress::Complete { device, replayed }) => {
+            success_response(if replayed { 200 } else { 201 }, device)
+        }
         Err(error) => {
             let _ = append_event(
                 &state.coven_home,
@@ -871,13 +873,15 @@ pub(crate) fn handle_local_control(
                     .pairing
                     .confirm_host(id, &confirmation.phrase, Utc::now())?
                 {
-                    PairingProgress::Complete(device) => {
-                        append_event(
-                            &state.coven_home,
-                            Utc::now(),
-                            MobileAuditEvent::PairingCompleted,
-                            Some(device.id),
-                        )?;
+                    PairingProgress::Complete { device, replayed } => {
+                        if !replayed {
+                            append_event(
+                                &state.coven_home,
+                                Utc::now(),
+                                MobileAuditEvent::PairingCompleted,
+                                Some(device.id),
+                            )?;
+                        }
                         crate::api::json_response(200, &device)
                     }
                     PairingProgress::Pending => crate::api::api_error(
@@ -1009,8 +1013,12 @@ fn reason(status: u16) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use p256::elliptic_curve::sec1::ToEncodedPoint;
     use rustls::pki_types::ServerName;
     use rustls::{ClientConfig, ClientConnection, RootCertStore};
+    use std::collections::HashMap;
     use std::net::{IpAddr, UdpSocket};
 
     static TEST_GATEWAY_LOCK: Mutex<()> = Mutex::new(());
@@ -1225,5 +1233,136 @@ mod tests {
             }
         }
         Ok(response)
+    }
+
+    fn sample_pairing_request(nonce: [u8; 32]) -> super::super::contract::MobilePairingRequest {
+        let signing_key = p256::SecretKey::from_slice(&[1; 32]).unwrap();
+        let public_key = signing_key.public_key().to_encoded_point(false);
+        super::super::contract::MobilePairingRequest {
+            protocol_version: super::super::MOBILE_PROTOCOL_VERSION,
+            pairing_nonce: URL_SAFE_NO_PAD.encode(nonce),
+            device_name: "Synthetic phone".to_owned(),
+            device_public_key: URL_SAFE_NO_PAD.encode(public_key.as_bytes()),
+            app_version: "1.0.0".to_owned(),
+            supported_protocol: super::super::contract::MobileProtocolRange {
+                minimum: 1,
+                maximum: 1,
+            },
+        }
+    }
+
+    fn envelope_data(body: &str) -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(body).unwrap()["data"].clone()
+    }
+
+    #[test]
+    fn device_confirmation_replay_returns_same_envelope_data() {
+        let _guard = TEST_GATEWAY_LOCK.lock().unwrap();
+        let Some((temp, config, _)) = test_listener_config() else {
+            return;
+        };
+        let _gateway = start_mobile_gateway_with_config(temp.path(), &config).unwrap();
+        let state = active_gateway().unwrap();
+        let now = Utc::now();
+        let invitation = state
+            .pairing
+            .begin_pairing([7; 32], now + PAIRING_LIFETIME)
+            .unwrap();
+        let enrolled = state
+            .pairing
+            .enroll(
+                invitation.id,
+                invitation.nonce,
+                sample_pairing_request(invitation.nonce),
+                state.host_fingerprint,
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            state
+                .pairing
+                .confirm_host(invitation.id, &enrolled.phrase, now)
+                .unwrap(),
+            PairingProgress::Pending
+        );
+
+        let path = format!("/api/v1/mobile/pairings/{}/confirm", invitation.id);
+        let body = serde_json::json!({ "phrase": enrolled.phrase })
+            .to_string()
+            .into_bytes();
+
+        let first = handle_pairing_confirmation(
+            &state,
+            &path,
+            MobileHttpRequest {
+                method: "POST".to_owned(),
+                target: path.clone(),
+                headers: HashMap::new(),
+                body: body.clone(),
+            },
+        );
+        let replay = handle_pairing_confirmation(
+            &state,
+            &path,
+            MobileHttpRequest {
+                method: "POST".to_owned(),
+                target: path.clone(),
+                headers: HashMap::new(),
+                body,
+            },
+        );
+
+        assert_eq!(first.status, 201);
+        assert_eq!(replay.status, 200);
+        assert_eq!(envelope_data(&replay.body), envelope_data(&first.body));
+    }
+
+    #[test]
+    fn local_control_replay_does_not_duplicate_pairing_completed_audit() {
+        let _guard = TEST_GATEWAY_LOCK.lock().unwrap();
+        let Some((temp, config, _)) = test_listener_config() else {
+            return;
+        };
+        let _gateway = start_mobile_gateway_with_config(temp.path(), &config).unwrap();
+        let state = active_gateway().unwrap();
+        let now = Utc::now();
+        let invitation = state
+            .pairing
+            .begin_pairing([9; 32], now + PAIRING_LIFETIME)
+            .unwrap();
+        let enrolled = state
+            .pairing
+            .enroll(
+                invitation.id,
+                invitation.nonce,
+                sample_pairing_request(invitation.nonce),
+                state.host_fingerprint,
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            state
+                .pairing
+                .confirm_device(invitation.id, &enrolled.phrase, now)
+                .unwrap(),
+            PairingProgress::Pending
+        );
+
+        let path = format!("/api/v1/internal/mobile/pairings/{}/confirm", invitation.id);
+        let body = serde_json::json!({ "phrase": enrolled.phrase }).to_string();
+
+        let first = handle_local_control("POST", &path, Some(&body))
+            .unwrap()
+            .unwrap();
+        let replay = handle_local_control("POST", &path, Some(&body))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(first.status, 200);
+        assert_eq!(replay.status, 200);
+        assert_eq!(replay.body, first.body);
+
+        let audit = std::fs::read_to_string(temp.path().join("mobile/audit.jsonl")).unwrap();
+        assert_eq!(audit.matches("\"event\":\"pairing_completed\"").count(), 1);
     }
 }
