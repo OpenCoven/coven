@@ -1,6 +1,6 @@
 # Psyche O1 Coven Contract Design
 
-**Status:** Written-spec and child-plan review passed; implementation pending
+**Status:** Written spec approved; corrected child implementation plan ready for maintainer review
 
 **Decision date:** 2026-08-02
 

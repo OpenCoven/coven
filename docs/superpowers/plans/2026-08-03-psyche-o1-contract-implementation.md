@@ -17,8 +17,8 @@
 - `packages/openclaw-coven/src/client.test.ts` - prove health parsing does not promote untrusted capability values into typed authority.
 - `packages/openclaw-coven/src/runtime.ts` - apply the OpenClaw bridge's fail-closed named-contract/capability policy and explicit lifecycle interpretation.
 - `packages/openclaw-coven/src/runtime.test.ts` - prove mismatches stop before launch and `idle`/unknown states are not inferred as completed work.
-- `packages/openclaw-coven/package.json` - provide reproducible test/typecheck scripts and an exact OpenClaw development dependency.
-- `packages/openclaw-coven/package-lock.json` - lock the package test environment.
+- `packages/openclaw-coven/package.json` - declare the existing pnpm toolchain, provide reproducible test/typecheck scripts, and add exact test-time dependencies.
+- `packages/openclaw-coven/pnpm-lock.yaml` - update the existing package lock without introducing a second package manager.
 - `.github/workflows/ci.yml` - run the OpenClaw bridge checks in CI.
 - `docs/API-CONTRACT.md` - canonical single-page handshake, legacy route diagnostic, and `SessionRecord.status` contract.
 - `docs/reference/api-contract.md` - condensed named-contract negotiation guidance.
@@ -36,7 +36,7 @@
 
 **Files:**
 - Modify: `packages/openclaw-coven/package.json`
-- Create: `packages/openclaw-coven/package-lock.json`
+- Modify: `packages/openclaw-coven/pnpm-lock.yaml`
 - Modify: `.github/workflows/ci.yml`
 
 - [ ] **Step 1: Add package scripts and exact development dependencies**
@@ -45,7 +45,9 @@ Update `packages/openclaw-coven/package.json` with:
 
 ```json
 {
+  "packageManager": "pnpm@10.11.1",
   "scripts": {
+    "build": "tsc --noEmit",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
@@ -59,20 +61,26 @@ Update `packages/openclaw-coven/package.json` with:
 ```
 
 Preserve every existing package metadata, peer dependency, and OpenClaw plugin
-field. The exact OpenClaw development version matches `openclaw.build.openclawVersion`;
-the published peer range remains unchanged.
+field. The exact OpenClaw development version matches
+`openclaw.build.openclawVersion`; the published peer range remains unchanged.
+The package already carries `pnpm-lock.yaml`, so keep pnpm as its sole lockfile
+and record the locally verified pnpm version instead of adding an npm lock.
 
-- [ ] **Step 2: Generate the lockfile with npm**
+- [ ] **Step 2: Update and prove the existing pnpm lockfile**
 
 Run:
 
 ```bash
-npm --prefix packages/openclaw-coven install --package-lock-only --ignore-scripts
-npm --prefix packages/openclaw-coven ci --ignore-scripts
+corepack enable
+corepack prepare pnpm@10.11.1 --activate
+pnpm --dir packages/openclaw-coven install --lockfile-only --ignore-scripts
+pnpm --dir packages/openclaw-coven install --frozen-lockfile --ignore-scripts
 ```
 
-Expected: `packages/openclaw-coven/package-lock.json` is created, dependencies
-install without peer auto-installation, and no package lifecycle script runs.
+Expected: `packages/openclaw-coven/pnpm-lock.yaml` is updated in place,
+dependencies install with the lockfile frozen, the existing
+`autoInstallPeers: false` setting remains intact, no npm lockfile appears, and
+no package lifecycle script runs.
 
 - [ ] **Step 3: Prove the baseline package tests execute**
 
@@ -80,7 +88,7 @@ Run:
 
 ```bash
 npm --prefix packages/openclaw-coven run typecheck
-npm --prefix packages/openclaw-coven test -- --run src/client.test.ts src/runtime.test.ts
+npm --prefix packages/openclaw-coven test -- src/client.test.ts src/runtime.test.ts
 ```
 
 Expected: the existing tests execute rather than failing module resolution. If
@@ -96,25 +104,30 @@ Add this job to `.github/workflows/ci.yml`:
     name: OpenClaw bridge
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7
         with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: packages/openclaw-coven/package-lock.json
-      - run: npm ci --ignore-scripts
+          node-version: 24
+      - name: Activate pinned pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.11.1 --activate
+      - run: pnpm install --frozen-lockfile --ignore-scripts
         working-directory: packages/openclaw-coven
-      - run: npm run typecheck
+      - run: pnpm run build
         working-directory: packages/openclaw-coven
-      - run: npm test
+      - run: pnpm test
         working-directory: packages/openclaw-coven
-      - run: python3 scripts/check-api-contract-docs.py
 ```
+
+Use the repository's current checkout/setup-node major versions and Node 24;
+do not copy older action versions into the workflow. Task 5 adds the docs guard
+to the existing Python-based secret-guard job after the guard exists.
 
 - [ ] **Step 5: Commit the package test workflow**
 
 ```bash
-git add packages/openclaw-coven/package.json packages/openclaw-coven/package-lock.json .github/workflows/ci.yml
+git add packages/openclaw-coven/package.json packages/openclaw-coven/pnpm-lock.yaml .github/workflows/ci.yml
 git commit -m "test(openclaw): add reproducible package checks"
 ```
 
@@ -488,7 +501,7 @@ it("rechecks compatibility immediately before dependent launch", async () => {
 Run:
 
 ```bash
-npm --prefix packages/openclaw-coven test -- --run src/client.test.ts src/runtime.test.ts
+npm --prefix packages/openclaw-coven test -- src/client.test.ts src/runtime.test.ts
 ```
 
 Expected: failures show the current client casts capabilities to trusted types,
@@ -531,6 +544,10 @@ function isJsonRecord(value: unknown): value is JsonRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 ```
+
+Remove the now-unused `COVEN_API_CONTRACT_VERSION` constant from `client.ts`.
+Compatibility policy belongs in the runtime; this normalization layer only
+preserves bounded wire values for that policy to validate.
 
 Update existing health assertions to use optional access, for example:
 
@@ -634,14 +651,29 @@ private async requireCovenCompatibility(signal?: AbortSignal): Promise<void> {
 }
 ```
 
-Call `requireCovenCompatibility()` from `ensureSession()`. Preserve fallback
-behavior, but when fallback is disabled rethrow the specific compatibility
-error instead of replacing it with the generic "Coven is unavailable" message.
-Call `requireCovenCompatibility(input.signal)` again inside `runTurn()`'s launch
-`try` block immediately before `client.launchSession(...)`; this closes the
-time-of-check/time-of-use gap and preserves the exact capability/remediation
-detail in the existing sanitized launch failure. Remove `isCovenAvailable()`.
-The healthy branch in `doctor()` must require `health.ok === true`.
+Replace `ensureSession()`'s boolean availability branch with:
+
+```typescript
+try {
+  await this.requireCovenCompatibility();
+} catch (error) {
+  if (!this.config.allowFallback) {
+    throw error;
+  }
+  this.logger?.warn(
+    `coven compatibility check failed; falling back to ${this.config.fallbackBackend}: ` +
+      sanitizeErrorText(error),
+  );
+  return await this.ensureFallbackSession(input);
+}
+```
+
+Call `await this.requireCovenCompatibility(input.signal)` again inside
+`runTurn()`'s launch `try` block, immediately before bounding the prompt and
+calling `client.launchSession(...)`. This closes the time-of-check/time-of-use
+gap and preserves the exact capability/remediation detail in the existing
+sanitized launch-failure path. Remove `isCovenAvailable()` entirely. The
+healthy branch in `doctor()` must require `health.ok === true`.
 
 - [ ] **Step 6: Run the focused TypeScript tests**
 
@@ -649,7 +681,7 @@ Run:
 
 ```bash
 npm --prefix packages/openclaw-coven run typecheck
-npm --prefix packages/openclaw-coven test -- --run src/client.test.ts src/runtime.test.ts
+npm --prefix packages/openclaw-coven test -- src/client.test.ts src/runtime.test.ts
 ```
 
 Expected: all client and runtime tests pass, including named-contract mismatch and every required-capability mismatch before launch.
@@ -679,7 +711,10 @@ it("does not treat conversational idle as one-shot completion", async () => {
     .mockResolvedValueOnce(session({ status: "completed", exitCode: 0 }));
   const runtime = new CovenAcpRuntime({
     config: { ...config, pollIntervalMs: 25 },
-    client: fakeClient({ getSession }),
+    client: fakeClient({
+      listEvents: vi.fn(async () => []),
+      getSession,
+    }),
     sleep: vi.fn(async () => undefined),
   });
   const handle = await runtime.ensureSession({
@@ -694,7 +729,7 @@ it("does not treat conversational idle as one-shot completion", async () => {
   );
 
   expect(getSession).toHaveBeenCalledTimes(2);
-  expect(events.at(-1)).toEqual({ type: "done", stopReason: "complete" });
+  expect(events.at(-1)).toEqual({ type: "done", stopReason: "completed" });
 });
 
 it.each(["future_state", "active"])(
@@ -702,7 +737,10 @@ it.each(["future_state", "active"])(
   async (status) => {
     const runtime = new CovenAcpRuntime({
       config,
-      client: fakeClient({ getSession: vi.fn(async () => session({ status })) }),
+      client: fakeClient({
+        listEvents: vi.fn(async () => []),
+        getSession: vi.fn(async () => session({ status })),
+      }),
     });
     const handle = await runtime.ensureSession({
       sessionKey: "agent:codex:test",
@@ -725,7 +763,7 @@ it.each(["future_state", "active"])(
 Run:
 
 ```bash
-npm --prefix packages/openclaw-coven test -- --run src/runtime.test.ts -t "idle|unsupported harness-session"
+npm --prefix packages/openclaw-coven test -- src/runtime.test.ts -t "idle|unsupported harness-session"
 ```
 
 Expected: `idle` is currently treated as terminal completion, and the unknown status is also inferred terminal.
@@ -767,7 +805,7 @@ Do not describe `killed` as process-exit acknowledgement. This helper classifies
 Run:
 
 ```bash
-npm --prefix packages/openclaw-coven test -- --run src/runtime.test.ts
+npm --prefix packages/openclaw-coven test -- src/runtime.test.ts
 ```
 
 Expected: all runtime tests pass; `idle` continues polling, unknown values end in the existing sanitized polling-error path, and current `killed` behavior is unchanged.
@@ -899,6 +937,7 @@ git commit -m "docs(api): clarify contract and session lifecycle"
 **Files:**
 - Create: `scripts/check-api-contract-docs.py`
 - Create: `scripts/check-api-contract-docs-test.py`
+- Modify: `.github/workflows/ci.yml`
 
 - [ ] **Step 1: Write failing guardrail tests**
 
@@ -1075,7 +1114,7 @@ def validate_documents(documents: dict[str, str]) -> list[str]:
     lowered_contract = contract.lower()
     if not all(term in lowered_contract for term in ("stale unowned", "recover", "`failed`")):
         errors.append("docs/API-CONTRACT.md: stale created recovery is missing")
-    if "not proof of acknowledged process termination" not in contract:
+    if "not proof of acknowledged process termination" not in lowered_contract:
         errors.append("docs/API-CONTRACT.md: killed acknowledgement boundary is missing")
     if not all(term in lowered_contract for term in ("synthetic", "`active`", "not a harness-session state")):
         errors.append("docs/API-CONTRACT.md: synthetic active distinction is missing")
@@ -1112,10 +1151,25 @@ python3 scripts/check-api-contract-docs.py
 
 Expected: both commands exit 0.
 
-- [ ] **Step 5: Commit the documentation guardrail**
+- [ ] **Step 5: Add the guardrail to the existing Python CI job**
+
+Add these steps after the current privacy/secret unit tests in the
+`secret-guard` job:
+
+```yaml
+      - run: python3 scripts/check-api-contract-docs-test.py
+      - run: python3 scripts/check-api-contract-docs.py
+```
+
+Keep the current `actions/checkout@v7.0.1` and `actions/setup-python@v7`
+versions unchanged. The guard belongs here because it is a Python repository
+policy check, while the `openclaw-bridge` job remains scoped to package build
+and tests.
+
+- [ ] **Step 6: Commit the documentation guardrail**
 
 ```bash
-git add scripts/check-api-contract-docs.py scripts/check-api-contract-docs-test.py
+git add scripts/check-api-contract-docs.py scripts/check-api-contract-docs-test.py .github/workflows/ci.yml
 git commit -m "test(docs): guard Coven contract vocabulary"
 ```
 
@@ -1134,8 +1188,9 @@ cargo test -p coven-cli api::tests::rejects_unknown_api_version_prefixes
 cargo test -p coven-cli api::tests::unknown_harness_capability_manifest_fails_closed_with_structured_error
 cargo test -p coven-cli daemon::tests::exit_event_does_not_overwrite_killed_session_status
 cargo test -p coven-cli daemon::tests::clean_exit_on_conversational_session_persists_as_idle
+npm --prefix packages/openclaw-coven run build
 npm --prefix packages/openclaw-coven run typecheck
-npm --prefix packages/openclaw-coven test -- --run src/client.test.ts src/runtime.test.ts
+npm --prefix packages/openclaw-coven test -- src/client.test.ts src/runtime.test.ts
 python3 scripts/check-api-contract-docs-test.py
 python3 scripts/check-api-contract-docs.py
 ```
@@ -1149,6 +1204,8 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
 python scripts/check-secrets.py
+npm --prefix packages/openclaw-coven run build
+npm --prefix packages/openclaw-coven test
 ```
 
 Expected: every command exits 0.
@@ -1158,7 +1215,7 @@ Expected: every command exits 0.
 Change the O1 design status to:
 
 ```markdown
-**Status:** Implementation verified; merge and issue evidence pending
+**Status:** Implementation verified; delivery evidence is tracked in issue #567 and Bead `coven-psy-o1`
 ```
 
 Add an O1 evidence line to `specs/psyche/PLAN.md`:
@@ -1178,7 +1235,7 @@ and G4/G6 remain blocked.
 git add crates/coven-cli/src/api.rs \
   .github/workflows/ci.yml \
   packages/openclaw-coven/package.json \
-  packages/openclaw-coven/package-lock.json \
+  packages/openclaw-coven/pnpm-lock.yaml \
   packages/openclaw-coven/src/client.ts \
   packages/openclaw-coven/src/client.test.ts \
   packages/openclaw-coven/src/runtime.ts \
@@ -1209,7 +1266,19 @@ routes, migrations, or behavior in the staged diff.
 git commit -m "docs(psyche): record O1 contract evidence"
 ```
 
-- [ ] **Step 6: Request final review before merge**
+- [ ] **Step 6: Run whole-branch pre-PR guards**
+
+```bash
+python3 scripts/check-coven-privacy.py --range origin/main...HEAD
+git diff --check origin/main...HEAD
+git status --short
+```
+
+Expected: the whole O1 branch passes the privacy and whitespace guards, and
+the worktree is clean. This range check covers earlier implementation commits;
+the staged check in Step 4 covers the final evidence commit before it is made.
+
+- [ ] **Step 7: Request final review before merge**
 
 Review the branch diff against the O1 design and confirm:
 
@@ -1222,18 +1291,16 @@ Review the branch diff against the O1 design and confirm:
 7. `active` is scoped to synthetic rows.
 8. no O2-O8 contract or production child-dispatch behavior was added.
 
-- [ ] **Step 7: Record completion only after the reviewed PR merges**
+- [ ] **Step 8: Record completion only after the reviewed PR merges**
 
 After merge, update GitHub issue #567 and Bead `coven-psy-o1` with:
 
 Record the observed merge commit SHA together with this exact evidence
 statement: focused Rust API/lifecycle tests, OpenClaw bridge typecheck/Vitest,
 documentation contract guardrail, full Rust workspace checks, secret scan, and
-staged privacy guard passed in the merged PR. Scope closed is C-S1 vocabulary
-and C-S8 documentation only. C-S3-C-S6, C-S9-C-S12, G4, G6, and production
-child dispatch remain blocked.
-
-Then change `specs/psyche/O1_CONTRACT_DESIGN.md` to `**Status:** Implemented
-and verified` in a follow-up evidence commit that cites the actual merge commit.
-Do not substitute a branch HEAD, proposed PR number, or expected commit for
-observed merge evidence.
+staged plus whole-branch privacy guards passed in the merged PR. Scope closed
+is C-S1 vocabulary and C-S8 documentation only. C-S3-C-S6, C-S9-C-S12, G4,
+G6, and production child dispatch remain blocked. Close issue #567 and mark
+Bead `coven-psy-o1` complete only after both trackers contain that observed
+merge evidence. Do not substitute a branch HEAD, proposed PR number, or
+expected commit for the merge commit reported by GitHub.
