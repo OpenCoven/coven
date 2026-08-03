@@ -40,8 +40,10 @@ mod prompt_refs;
 mod proposal_scheduler;
 mod pty_runner;
 mod repos_config;
+mod reset;
 mod session_launch;
 mod settings;
+mod state_lock;
 mod store;
 mod stream_json;
 mod theme;
@@ -301,6 +303,50 @@ enum Command {
     },
     #[command(about = "Repair and compact the local Coven session store")]
     Vacuum,
+    #[command(about = "Preview or recoverably reset selected local Coven state")]
+    #[command(
+        long_about = "Preview or recoverably reset selected categories of state beneath COVEN_HOME. A preview is the default. After the daemon and other active Coven commands are stopped, --apply moves only explicitly selected local state into COVEN_HOME/reset-backups/; it never deletes project directories, contacts GitHub, or revokes external credentials."
+    )]
+    #[command(after_help = "Examples:
+  coven reset --list-features
+  coven reset --feature familiars
+  coven reset --feature projects --feature github --apply
+  coven reset --all --apply")]
+    Reset {
+        #[arg(
+            long,
+            value_name = "NAME",
+            help = "Local state category to reset; repeat for multiple categories"
+        )]
+        feature: Vec<String>,
+        #[arg(
+            long,
+            help = "Reset every explicitly registered local state category; requires --apply"
+        )]
+        all: bool,
+        #[arg(
+            long,
+            help = "List reset categories, affected local state classes, sensitivity, and warnings"
+        )]
+        list_features: bool,
+        #[arg(
+            long,
+            conflicts_with = "dry_run",
+            help = "Move selected local state into a recoverable COVEN_HOME/reset-backups/ backup"
+        )]
+        apply: bool,
+        #[arg(
+            long,
+            conflicts_with = "apply",
+            help = "Explicitly request the default non-mutating preview"
+        )]
+        dry_run: bool,
+        #[arg(
+            long,
+            help = "Emit the reset plan or result as JSON without state contents"
+        )]
+        json: bool,
+    },
     #[command(
         about = "Create, list, diagnose, and prune Coven worktrees",
         alias = "worktree",
@@ -944,6 +990,11 @@ fn main() -> Result<()> {
         "never" => theme::ColorChoice::Never,
         _ => theme::ColorChoice::Auto,
     });
+    let _state_lock = if matches!(&cli.command, Some(Command::Reset { .. })) {
+        None
+    } else {
+        Some(state_lock::acquire_shared(&coven_home_dir()?)?)
+    };
     if let Err(error) = run_cli(cli) {
         // A user-initiated cancellation is a neutral outcome, not a failure:
         // print it in plain voice (no `Error:` prefix) but keep a nonzero
@@ -951,6 +1002,10 @@ fn main() -> Result<()> {
         if let Some(cancelled) = error.downcast_ref::<Cancelled>() {
             eprintln!("{}", cancelled.0);
             std::process::exit(1);
+        }
+        if let Some(reset_error) = error.downcast_ref::<reset::ResetError>() {
+            eprintln!("Error: {reset_error}");
+            std::process::exit(reset_error.exit_code());
         }
         eprintln!("Error: {error:#}");
         std::process::exit(1);
@@ -1107,6 +1162,22 @@ fn run_cli(cli: Cli) -> Result<()> {
         },
         Some(Command::Logs { command }) => run_logs_command(command),
         Some(Command::Vacuum) => run_vacuum_command(),
+        Some(Command::Reset {
+            feature,
+            all,
+            list_features,
+            apply,
+            dry_run: _,
+            json,
+        }) => reset::run(
+            reset::ResetRequest {
+                features: &feature,
+                all,
+                apply,
+                json,
+            },
+            list_features,
+        ),
         Some(Command::Wt {
             branch,
             list,
@@ -4581,6 +4652,42 @@ mod tests {
             Cli::parse_from(["coven", "doctor", "--json"]).command,
             Some(Command::Doctor { json: true })
         ));
+    }
+
+    #[test]
+    fn cli_parses_guarded_reset_commands() {
+        let parsed = Cli::parse_from([
+            "coven",
+            "reset",
+            "--feature",
+            "familiars",
+            "--feature",
+            "projects",
+            "--json",
+        ]);
+        match parsed.command {
+            Some(Command::Reset {
+                feature,
+                all,
+                list_features,
+                apply,
+                dry_run,
+                json,
+            }) => {
+                assert_eq!(feature, ["familiars", "projects"]);
+                assert!(!all && !list_features && !apply && !dry_run && json);
+            }
+            other => panic!("expected reset command, got {other:?}"),
+        }
+        assert!(matches!(
+            Cli::parse_from(["coven", "reset", "--all", "--apply"]).command,
+            Some(Command::Reset {
+                all: true,
+                apply: true,
+                ..
+            })
+        ));
+        assert!(Cli::try_parse_from(["coven", "reset", "--apply", "--dry-run"]).is_err());
     }
 
     #[test]

@@ -97,6 +97,36 @@ coven daemon restart
 
 If a client cannot connect, verify it is using the same `COVEN_HOME` as the CLI.
 
+## Local state needs a partial reset
+
+Do not delete `~/.coven` to debug one category of local state. Start with the
+allowlist and a non-mutating plan:
+
+```sh
+coven reset --list-features
+coven reset --feature familiars
+```
+
+Add `--apply` only after reviewing the feature’s local paths and warning. Coven
+moves the selected state to `COVEN_HOME/reset-backups/` for recovery. For
+example, `projects` resets only the local registry, not a project checkout;
+`github`, `claude`, `openclaw`, `hermes`, `opencode`, `grok-build`, and `gemini`
+reset only Coven-local adapter state. They make no provider request, do not
+change an external CLI's configuration or login, and do not expose secrets.
+The `sessions` category keeps the encrypted artifact key with the ledger it
+decrypts, while `mobile` handles local pairings and host credentials.
+
+Stop the daemon and finish or close active Coven commands before applying any
+reset so no local state can move mid-write:
+
+```sh
+coven daemon stop
+coven reset --feature projects --apply
+```
+
+See [`coven reset`](/reference/cli-reset) for all categories, JSON output, and
+documented exit codes.
+
 ## System health and pressure
 
 If sessions feel slow, the daemon is sluggish to start, or `coven doctor` succeeds but harness work stalls, the underlying machine may be under CPU, memory, or disk pressure.

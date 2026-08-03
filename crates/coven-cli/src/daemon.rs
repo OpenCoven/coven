@@ -11,6 +11,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 #[cfg(unix)]
@@ -21,7 +22,6 @@ use std::os::unix::{
     ffi::OsStrExt,
     fs::{FileTypeExt, MetadataExt, PermissionsExt},
     net::{UnixListener, UnixStream},
-    prelude::AsRawFd,
 };
 
 use crate::{
@@ -865,7 +865,7 @@ fn check_owned_by_current_user(path: &Path, owner_uid: u32, euid: u32) -> Result
 }
 
 #[cfg(unix)]
-fn ensure_private_coven_home(coven_home: &Path) -> Result<()> {
+pub(crate) fn ensure_private_coven_home(coven_home: &Path) -> Result<()> {
     // Fail closed if the home already exists as a symlink: following it would
     // let anyone able to plant the link redirect daemon state (socket, status,
     // SQLite ledger) outside the trusted directory. See docs/AUTH.md
@@ -895,7 +895,7 @@ fn ensure_private_coven_home(coven_home: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn ensure_private_coven_home(coven_home: &Path) -> Result<()> {
+pub(crate) fn ensure_private_coven_home(coven_home: &Path) -> Result<()> {
     std::fs::create_dir_all(coven_home)
         .with_context(|| format!("failed to create Coven home {}", coven_home.display()))?;
     Ok(())
@@ -1073,62 +1073,48 @@ fn process_coven_home_matches(environ: &[std::ffi::OsString], coven_home: &Path)
     })
 }
 
-#[cfg(unix)]
 struct DaemonLifecycleLock {
     file: std::fs::File,
 }
 
-#[cfg(unix)]
 impl Drop for DaemonLifecycleLock {
     fn drop(&mut self) {
-        unsafe {
-            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
-        }
+        let _ = FileExt::unlock(&self.file);
     }
 }
 
-#[cfg(unix)]
 fn acquire_daemon_lifecycle_lock(coven_home: &Path) -> Result<DaemonLifecycleLock> {
     ensure_private_coven_home(coven_home)?;
     let lock_path = daemon_lifecycle_lock_path(coven_home);
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
+    let file = crate::state_lock::open_lock_file(&lock_path).with_context(|| {
+        format!(
+            "failed to open daemon lifecycle lock {}",
+            lock_path.display()
+        )
+    })?;
+    file.lock_exclusive()
+        .with_context(|| format!("failed to lock daemon lifecycle {}", lock_path.display()))?;
+    Ok(DaemonLifecycleLock { file })
+}
+
+fn try_acquire_daemon_lifecycle_lock_in(
+    coven_home: &Path,
+    home_dir: &cap_std::fs::Dir,
+) -> Result<Option<DaemonLifecycleLock>> {
+    let lock_path = daemon_lifecycle_lock_path(coven_home);
+    let file = crate::state_lock::open_lock_file_in(home_dir, "daemon.lock", &lock_path)
         .with_context(|| {
             format!(
                 "failed to open daemon lifecycle lock {}",
                 lock_path.display()
             )
         })?;
-    std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600)).with_context(
-        || {
-            format!(
-                "failed to set daemon lifecycle lock permissions {}",
-                lock_path.display()
-            )
-        },
-    )?;
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    if rc != 0 {
-        anyhow::bail!(
-            "failed to lock daemon lifecycle {}: {}",
-            lock_path.display(),
-            std::io::Error::last_os_error()
-        );
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(DaemonLifecycleLock { file })),
+        Err(error) if crate::state_lock::is_lock_contended(&error) => Ok(None),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to lock daemon lifecycle {}", lock_path.display())),
     }
-    Ok(DaemonLifecycleLock { file })
-}
-
-#[cfg(not(unix))]
-struct DaemonLifecycleLock;
-
-#[cfg(not(unix))]
-fn acquire_daemon_lifecycle_lock(coven_home: &Path) -> Result<DaemonLifecycleLock> {
-    ensure_private_coven_home(coven_home)?;
-    Ok(DaemonLifecycleLock)
 }
 
 pub fn recover_orphaned_sessions(coven_home: &Path, updated_at: &str) -> Result<usize> {
@@ -1784,6 +1770,12 @@ fn daemon_status_from_health_socket(socket: &str) -> Result<Option<DaemonStatus>
         }
     };
     stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .context("failed to bound Coven health response time")?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .context("failed to bound Coven health request time")?;
+    stream
         .write_all(b"GET /health HTTP/1.1\r\nHost: coven\r\n\r\n")
         .context("failed to write Coven health request")?;
     stream
@@ -2140,7 +2132,6 @@ fn install_daemon_panic_hook(coven_home: &Path, socket_path: &Path, status_path:
 /// `daemon.lock` *lifecycle* lock that `ensure_background_server` holds only
 /// across a start/stop — this one is held by the `serve` process for its entire
 /// life, so it must be a separate file or the two would deadlock at startup.
-#[cfg(unix)]
 fn daemon_serve_lock_path(coven_home: &Path) -> PathBuf {
     coven_home.join("daemon-serve.lock")
 }
@@ -2156,35 +2147,145 @@ fn daemon_serve_lock_path(coven_home: &Path) -> PathBuf {
 /// two processes writing one SQLite store — the loser then fails the
 /// `events_fts` backfill with "database is locked". This OS lock is independent
 /// of socket health and of the start path: a live incumbent still holds it, so a
-/// duplicate fails fast with a clear message. `flock` releases automatically
-/// when the fd closes — normal exit, panic, or SIGKILL — so it never wedges shut.
-#[cfg(unix)]
-fn acquire_serve_lock(coven_home: &Path) -> Result<std::fs::File> {
-    std::fs::create_dir_all(coven_home)
-        .with_context(|| format!("failed to create Coven home {}", coven_home.display()))?;
+/// duplicate fails fast with a clear message. The OS releases the advisory lock
+/// when the file closes — normal exit, panic, or termination — so it never
+/// wedges shut.
+fn try_acquire_serve_lock(coven_home: &Path) -> Result<Option<std::fs::File>> {
+    ensure_private_coven_home(coven_home)?;
     let path = daemon_serve_lock_path(coven_home);
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&path)
+    let file = crate::state_lock::open_lock_file(&path)
         .with_context(|| format!("failed to open serve lock {}", path.display()))?;
-    // SAFETY: flock only operates on the provided fd; it cannot corrupt memory.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
-            anyhow::bail!(
-                "another Coven daemon is already serving this home (holds {}); refusing to \
-                 start a second daemon, which would contend for the SQLite store",
-                path.display()
-            );
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(file)),
+        Err(error) if crate::state_lock::is_lock_contended(&error) => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to acquire serve lock {}", path.display()))
         }
-        return Err(err)
-            .with_context(|| format!("failed to acquire serve lock {}", path.display()));
     }
-    Ok(file)
+}
+
+fn try_acquire_serve_lock_in(
+    coven_home: &Path,
+    home_dir: &cap_std::fs::Dir,
+) -> Result<Option<std::fs::File>> {
+    let path = daemon_serve_lock_path(coven_home);
+    let file = crate::state_lock::open_lock_file_in(home_dir, "daemon-serve.lock", &path)
+        .with_context(|| format!("failed to open serve lock {}", path.display()))?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(file)),
+        Err(error) if crate::state_lock::is_lock_contended(&error) => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to acquire serve lock {}", path.display()))
+        }
+    }
+}
+
+pub(crate) struct ResetDaemonGuard {
+    _lifecycle: DaemonLifecycleLock,
+    _serve: std::fs::File,
+    #[cfg(windows)]
+    _pipe: interprocess::local_socket::Listener,
+}
+
+/// Exclude daemon lifecycle changes for the duration of reset and detect a
+/// daemon started by an older CLI that does not hold the repository state lock.
+pub(crate) fn try_acquire_reset_guard(
+    coven_home: &Path,
+    home_dir: &cap_std::fs::Dir,
+) -> Result<Option<ResetDaemonGuard>> {
+    let Some(lifecycle) = try_acquire_daemon_lifecycle_lock_in(coven_home, home_dir)? else {
+        return Ok(None);
+    };
+    let Some(serve) = try_acquire_serve_lock_in(coven_home, home_dir)? else {
+        return Ok(None);
+    };
+    #[cfg(unix)]
+    if unix_daemon_transport_is_occupied(coven_home)? {
+        return Ok(None);
+    }
+    #[cfg(windows)]
+    let Some(pipe) = try_reserve_windows_daemon_pipe(coven_home)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ResetDaemonGuard {
+        _lifecycle: lifecycle,
+        _serve: serve,
+        #[cfg(windows)]
+        _pipe: pipe,
+    }))
+}
+
+#[cfg(unix)]
+fn unix_daemon_transport_is_occupied(coven_home: &Path) -> Result<bool> {
+    let socket_path = daemon_socket_path(coven_home);
+    if let Ok(metadata) = std::fs::symlink_metadata(&socket_path) {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid() only reads the effective uid and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        check_owned_by_current_user(&socket_path, metadata.uid(), euid)?;
+    }
+    match UnixStream::connect(&socket_path) {
+        Ok(_) => Ok(true),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to determine whether daemon socket {} is occupied",
+                socket_path.display()
+            )
+        }),
+    }
+}
+
+#[cfg(windows)]
+fn try_reserve_windows_daemon_pipe(
+    coven_home: &Path,
+) -> Result<Option<interprocess::local_socket::Listener>> {
+    use interprocess::{
+        local_socket::{prelude::*, GenericNamespaced, ListenerOptions},
+        os::windows::local_socket::ListenerOptionsExt,
+    };
+
+    let pipe_name = daemon_windows_pipe_name(coven_home);
+    let name = pipe_name
+        .to_ns_name::<GenericNamespaced>()
+        .context("failed to create reset pipe reservation name")?;
+    let security_descriptor = owner_only_pipe_security_descriptor()?;
+    match ListenerOptions::new()
+        .name(name)
+        .security_descriptor(security_descriptor)
+        .create_sync()
+    {
+        Ok(listener) => Ok(Some(listener)),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to reserve Windows daemon pipe {pipe_name}"))
+        }
+    }
+}
+
+pub(crate) fn acquire_serve_lock(coven_home: &Path) -> Result<std::fs::File> {
+    try_acquire_serve_lock(coven_home)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "another Coven daemon is already serving this home (holds {}); refusing to start a \
+             second daemon, which would contend for the SQLite store",
+            daemon_serve_lock_path(coven_home).display()
+        )
+    })
 }
 
 fn initialize_daemon_store(coven_home: &Path) -> Result<()> {
@@ -2748,6 +2849,7 @@ pub fn serve_forever(
     let _ = tcp_addr; // TCP not wired on Windows in this prototype
     let _ = allowed_hosts; // only meaningful on the (Unix) TCP transport
 
+    let _serve_lock = acquire_serve_lock(coven_home)?;
     let status = DaemonStatus {
         pid: std::process::id(),
         started_at: started_at.clone(),
@@ -2924,7 +3026,6 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
-    #[cfg(unix)]
     #[test]
     fn serve_lock_is_exclusive_and_reusable() -> Result<()> {
         let home = tempfile::tempdir()?;
@@ -2940,6 +3041,26 @@ mod tests {
         drop(first);
         let _second =
             acquire_serve_lock(home.path()).expect("lock should be reacquirable once released");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_locks_refuse_symlinks_without_mutating_the_target() -> Result<()> {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let home = tempfile::tempdir()?;
+        let outside = tempfile::NamedTempFile::new()?;
+        outside
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o640))?;
+        symlink(outside.path(), daemon_lifecycle_lock_path(home.path()))?;
+
+        assert!(acquire_daemon_lifecycle_lock(home.path()).is_err());
+        assert_eq!(
+            outside.as_file().metadata()?.permissions().mode() & 0o777,
+            0o640
+        );
         Ok(())
     }
 

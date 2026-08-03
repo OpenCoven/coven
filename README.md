@@ -444,6 +444,17 @@ Coven works with zero configuration. State lives under `COVEN_HOME` (default `~/
 
 Retention defaults (30 days for redacted event logs, 7 days for optional raw encrypted artifacts) and manual pruning via `coven logs prune` are covered in [`docs/reference/cli-logs.md`](docs/reference/cli-logs.md).
 
+For debugging local state without deleting an entire profile, use `coven reset`
+to preview or recoverably reset selected familiar, project, GitHub/Copilot, or
+runtime-adapter state, plus secret, cache, session, or metadata state. Runtime
+selectors cover Coven-local Claude, OpenClaw, Hermes, OpenCode, Grok Build, and
+Gemini records only; mobile gateway state has its own selector. After
+`coven daemon stop` and after other active Coven commands finish, `--apply`
+moves only the selected state into `COVEN_HOME/reset-backups/`. It never changes
+a provider CLI, login, or account, and project reset never deletes a checkout.
+Session reset keeps encrypted artifact records and their key together. See
+[`docs/reference/cli-reset.md`](docs/reference/cli-reset.md).
+
 Never commit runtime state: `.coven/`, `*.sqlite*`, `*.db`, `*.sock`, `.env*`, and `*.key` are covered by `.gitignore`. Before submitting any PR, run the secret scanner (`python scripts/check-secrets.py`) — see [Security](#security).
 
 ---
@@ -578,6 +589,7 @@ coven doctor
 | Sessions feel slow / daemon sluggish        | Run `coven pc status` to check system pressure; `coven pc top --n 10` for CPU culprits |
 | `coven attach` won't accept input           | The session is not live; attach replays logs for completed or archived sessions        |
 | Secret scan fails                           | Remove the secret from your working tree; rotate it if it entered git history          |
+| Local familiar/project/integration state is broken | Preview `coven reset --list-features`, then reset only the affected local category with `--apply` |
 | API version mismatch                        | Update Coven to match the client's expected contract, or update the client             |
 
 For the full diagnostic flowchart and detailed resolution steps, see [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md).

@@ -61,6 +61,7 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm",
 unicode-width = "0.2"
 textwrap = "0.16"
 unicode-casefold = "0.2.0"
+fs2 = "0.4.3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -4,7 +4,7 @@ read_when:
   - Looking up a Coven CLI flag
   - Scripting against the Coven CLI
 title: "Coven CLI reference"
-description: "Reference for the coven CLI commands: doctor, status, daemon, run, sessions, attach, archive, kill, summon, sacrifice, familiars, skills, memory, research, calls, hub, scheduler, travel, and TUI command flags."
+description: "Reference for the coven CLI commands: doctor, status, reset, daemon, run, sessions, attach, archive, kill, summon, sacrifice, familiars, skills, memory, research, calls, hub, scheduler, travel, and TUI command flags."
 ---
 
 
@@ -25,6 +25,7 @@ flowchart TB
   Root --> Patch["patch"]
   Root --> Logs["logs"]
   Root --> Vacuum["vacuum"]
+  Root --> Reset["reset"]
   Root --> Wt["wt"]
   Root --> Claim["claim"]
   Root --> Hooks["hooks"]
@@ -107,6 +108,7 @@ flowchart TB
 | `coven patch openclaw <prompt>` | Local OpenClaw rescue loop. Does not commit or push. |
 | `coven logs prune` | Prune expired encrypted raw artifacts and old redacted event logs; see [cli-logs](cli-logs.md). |
 | `coven vacuum` | Rebuild the session event FTS index, compact the SQLite store, and print integrity status; see [cli-vacuum](cli-vacuum.md). |
+| `coven reset` | Preview or recoverably reset explicit local `COVEN_HOME` categories. After the daemon and other active Coven commands stop, `--apply` moves selected state to `reset-backups/`; `--all` also requires `--apply`. See [cli-reset](cli-reset.md). |
 | `coven wt <branch>` | Create or enter a sibling `<repo>.wt/<branch-slug>` git worktree; see [cli-wt](cli-wt.md). |
 | `coven wt --list/--doctor/--prune-merged/--prune-stale DAYS` | Inspect and clean Coven protocol worktrees; see [cli-wt](cli-wt.md). |
 | `coven claim acquire/release/heartbeat/canary <branch>` | Manage TTL-bounded branch ownership for the current agent; see [cli-claim](cli-claim.md). |
@@ -136,6 +138,7 @@ flowchart TB
 | `coven scheduler decision/loop` | `<id>` positional, `--json` |
 | `coven travel state` | `--client <CLIENT_ID>` (required), `--profile <PROFILE_ID>`, `--json` |
 | `coven sacrifice` | `--yes` (required) |
+| `coven reset` | `--list-features`, `--feature <name>` (repeatable), `--all` (requires `--apply`), `--apply`, `--dry-run`, `--json` |
 | `coven logs prune` | `--dry-run`, `--raw-days <N>`, `--event-days <N>` |
 | `coven wt` | `--list`, `--json` (with `--list`), `--doctor`, `--prune-merged`, `--prune-stale <DAYS>` |
 | `coven claim status` | `--json` |
@@ -209,7 +212,9 @@ Coven Parallel Work Protocol for multi-agent repositories.
 
 ## Exit codes
 
-Current builds return `0` for success and a non-zero error for failed CLI execution. Structured, command-specific exit codes are reserved for a future release.
+Most commands return `0` for success and a non-zero error for failed CLI
+execution. `coven reset` reserves explicit local-recovery codes: see
+[cli-reset](cli-reset.md#output-and-exit-codes).
 
 ## Related
 

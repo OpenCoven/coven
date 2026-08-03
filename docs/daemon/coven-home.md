@@ -27,10 +27,15 @@ contain:
 | `coven.sqlite3` | Local session/event store. |
 | `coven.sock` | Local daemon socket on Unix-like hosts. |
 | `daemon.json` | Daemon pid/socket metadata. |
+| `state.lock` | Shared/exclusive coordination between normal commands and reset. |
+| `reset-transaction.json` | Durable marker used to roll back an interrupted reset before normal commands resume. |
 | `daemon-recovery.log` | Background start/recovery notes. |
 | `familiars.toml` | Optional familiar identity registry. |
 | `repos.toml` | Optional known repository registry. |
+| `keys/session-artifacts.key` | Key coupled to encrypted session artifact records. |
+| `mobile/` | Mobile gateway configuration, pairings, host identity, and audit state. |
 | `logs/` or artifacts directories | Redacted logs and retained session artifacts when enabled. |
+| `reset-backups/` | Timestamped, recoverable backups created by `coven reset --apply`. |
 
 Do not edit the SQLite store by hand. Use the CLI when possible:
 
@@ -38,7 +43,12 @@ Do not edit the SQLite store by hand. Use the CLI when possible:
 coven sessions
 coven daemon status
 coven logs prune --dry-run
+coven reset --list-features
 ```
+
+For partial debugging resets, use [`coven reset`](/reference/cli-reset) rather
+than deleting `COVEN_HOME`. It previews by default and backs up only selected
+registered local state after `--apply`.
 
 ## Defaults by platform
 
