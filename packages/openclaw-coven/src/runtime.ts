@@ -270,8 +270,22 @@ function eventToRuntimeEvents(event: CovenEventRecord): AcpRuntimeEvent[] {
   return [];
 }
 
-function sessionIsTerminal(session: CovenSessionRecord): boolean {
-  return session.status !== "running" && session.status !== "created";
+type SessionDisposition = "nonterminal" | "terminal";
+
+function sessionDisposition(status: string): SessionDisposition {
+  switch (status) {
+    case "created":
+    case "running":
+    case "idle":
+      return "nonterminal";
+    case "completed":
+    case "failed":
+    case "killed":
+    case "orphaned":
+      return "terminal";
+    default:
+      throw new Error(`Coven daemon returned unsupported session status: ${status}`);
+  }
 }
 
 function terminalStatusEvent(session: CovenSessionRecord): AcpRuntimeEvent {
@@ -516,7 +530,7 @@ export class CovenAcpRuntime implements AcpRuntime {
         }
 
         const latest = await this.client.getSession(sessionId, input.signal);
-        if (sessionIsTerminal(latest)) {
+        if (sessionDisposition(latest.status) === "terminal") {
           yield terminalStatusEvent(latest);
           yield { type: "done", stopReason: normalizeStopReason(latest.status) };
           this.activeSessionIdsBySessionKey.delete(input.handle.sessionKey);

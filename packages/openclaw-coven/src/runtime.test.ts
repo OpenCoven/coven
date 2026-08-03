@@ -653,6 +653,64 @@ describe("CovenAcpRuntime", () => {
     );
   });
 
+  it("does not treat conversational idle as one-shot completion", async () => {
+    const getSession = vi
+      .fn()
+      .mockResolvedValueOnce(session({ status: "idle" }))
+      .mockResolvedValueOnce(session({ status: "completed", exitCode: 0 }));
+    const runtime = new CovenAcpRuntime({
+      config: { ...config, pollIntervalMs: 25 },
+      client: fakeClient({
+        listEvents: vi.fn(async () => []),
+        getSession,
+      }),
+      sleep: vi.fn(async () => undefined),
+    });
+    const handle = await runtime.ensureSession({
+      sessionKey: "agent:codex:test",
+      agent: "codex",
+      mode: "oneshot",
+      cwd: workspaceDir,
+    });
+
+    const events = await collect(
+      runtime.runTurn({ handle, text: "Fix tests", mode: "prompt", requestId: "req-idle" }),
+    );
+
+    expect(getSession).toHaveBeenCalledTimes(2);
+    expect(events.at(-1)).toEqual({ type: "done", stopReason: "completed" });
+  });
+
+  it.each(["future_state", "active"])(
+    "fails closed on unsupported harness-session status %s",
+    async (status) => {
+      const runtime = new CovenAcpRuntime({
+        config,
+        client: fakeClient({
+          listEvents: vi.fn(async () => []),
+          getSession: vi.fn(async () => session({ status })),
+        }),
+      });
+      const handle = await runtime.ensureSession({
+        sessionKey: "agent:codex:test",
+        agent: "codex",
+        mode: "oneshot",
+        cwd: workspaceDir,
+      });
+
+      const events = await collect(
+        runtime.runTurn({
+          handle,
+          text: "Fix tests",
+          mode: "prompt",
+          requestId: "req-unknown",
+        }),
+      );
+
+      expect(events.at(-1)).toEqual({ type: "done", stopReason: "error" });
+    },
+  );
+
   it("fails and kills the Coven session when the daemon returns an unsafe event id", async () => {
     const client = fakeClient({
       listEvents: vi.fn(async () => [
