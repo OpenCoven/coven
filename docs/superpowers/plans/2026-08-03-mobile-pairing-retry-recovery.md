@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make completed mobile pairing confirmations idempotent for the rest of the existing pairing lifetime without duplicate device registration or weaker phrase checks.
+**Goal:** Make completed mobile pairing confirmations idempotent for the rest of the existing pairing lifetime without duplicate device registration or weaker phrase checks, while defining “same result” as identical completed device data even when response `request_id` values differ.
 
-**Architecture:** Keep the retry window inside `PairingManager` by caching the first completed `MobilePairedDevice` on the existing pending pairing entry until `expires_at`. Extend `PairingProgress` with replay metadata so `gateway.rs` can return stable HTTP responses and avoid duplicate host-side `PairingCompleted` audit lines while leaving `DeviceRegistry` unchanged.
+**Architecture:** Keep the retry window inside `PairingManager` by caching the first completed `MobilePairedDevice` on the existing pending pairing entry until `expires_at`. Extend `PairingProgress` with replay metadata so `gateway.rs` can return `201` for the first remote completion, `200` for a replayed remote completion, compare replay success via parsed envelope `data` instead of raw body equality, and avoid duplicate host-side `PairingCompleted` audit lines while leaving `DeviceRegistry` unchanged.
 
 **Tech Stack:** Rust, `chrono`, `uuid`, existing mobile gateway/pairing unit tests, Cargo, repository privacy and secret checks.
 
@@ -15,7 +15,7 @@
 - Modify: `crates/coven-cli/src/mobile_memory/pairing.rs:20-30, 54-58, 104-119, 239-295, 400-567`
   - Add completed pairing cache, replay-aware completion result, and focused unit tests.
 - Modify: `crates/coven-cli/src/mobile_memory/gateway.rs:626-660, 858-885, 1094-1130`
-  - Preserve first-completion HTTP/audit semantics while allowing replayed confirmations to return the same device cleanly.
+  - Preserve first-completion HTTP/audit semantics while allowing replayed confirmations to return the same completed device data cleanly.
 - No change expected: `crates/coven-cli/src/mobile_memory/registry.rs`
   - Registry uniqueness rules stay authoritative, but the new flow should never hit them on replay.
 
@@ -39,6 +39,30 @@ fn assert_complete(progress: PairingProgress, replayed: bool) -> MobilePairedDev
         }
         PairingProgress::Pending => panic!("expected pairing completion"),
     }
+}
+
+#[test]
+fn incomplete_pairing_mismatch_invalidates_the_retry_window() {
+    let harness = PairingHarness::new();
+    let pending = harness.enroll();
+    let mut wrong_phrase = pending.phrase.clone();
+    wrong_phrase[0] = "wrong".to_owned();
+
+    assert_eq!(
+        harness
+            .manager
+            .confirm_host(harness.pairing_id, &wrong_phrase, harness.now)
+            .unwrap_err(),
+        PairingError::PairingPhraseMismatch
+    );
+    assert_eq!(
+        harness
+            .manager
+            .confirm_host(harness.pairing_id, &pending.phrase, harness.now)
+            .unwrap_err(),
+        PairingError::PairingConsumed
+    );
+    assert!(harness.devices().is_empty());
 }
 
 #[test]
@@ -133,123 +157,10 @@ cargo test -p coven-cli mobile_memory::pairing::tests --locked -- --nocapture
 Expected: FAIL because `PairingProgress::Complete { .. }` does not exist yet and
 completed confirmations still remove the pairing entry.
 
-### Task 2: Cache the completed device inside `PairingManager`
+### Task 2: Lock down gateway replay semantics with failing tests
 
 **Files:**
-- Modify: `crates/coven-cli/src/mobile_memory/pairing.rs:20-30, 54-58, 104-119, 239-295`
-- Test: `crates/coven-cli/src/mobile_memory/pairing.rs`
-
-- [ ] **Step 1: Extend the pending state and progress enum**
-
-Update the data model near the top of `pairing.rs` to this shape:
-
-```rust
-#[derive(Debug, Clone)]
-pub struct PendingPairing {
-    pub id: Uuid,
-    pub nonce_hash: [u8; 32],
-    pub expires_at: DateTime<Utc>,
-    pub transcript_hash: Option<[u8; 32]>,
-    pub device: Option<PendingDevice>,
-    pub host_confirmed: bool,
-    pub device_confirmed: bool,
-    pub consumed: bool,
-    pub completed: Option<MobilePairedDevice>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PairingProgress {
-    Pending,
-    Complete {
-        device: MobilePairedDevice,
-        replayed: bool,
-    },
-}
-```
-
-Initialize `completed: None` in `begin_pairing_with_id`.
-
-- [ ] **Step 2: Replace the confirmation tail with replay-aware logic**
-
-In `PairingManager::confirm`, keep the existing expiry and transcript guards,
-then replace the phrase / completion block with:
-
-```rust
-let expected = phrase_for_hash(transcript_hash);
-if phrase != expected {
-    if pairing.completed.is_none() {
-        pending.remove(&pairing_id);
-    }
-    return Err(PairingError::PairingPhraseMismatch);
-}
-if let Some(device) = &pairing.completed {
-    return Ok(PairingProgress::Complete {
-        device: device.clone(),
-        replayed: true,
-    });
-}
-if host {
-    pairing.host_confirmed = true;
-} else {
-    pairing.device_confirmed = true;
-}
-if !pairing.host_confirmed || !pairing.device_confirmed {
-    return Ok(PairingProgress::Pending);
-}
-let device = pairing
-    .device
-    .clone()
-    .ok_or(PairingError::PairingConfirmationRequired)?;
-let record = DeviceRecord {
-    id: Uuid::new_v4(),
-    display_name: device.display_name,
-    public_key_x963: device.public_key_x963,
-    paired_at: now,
-    revoked_at: None,
-    scopes: vec![DeviceScope::MemoryRead],
-};
-self.registry
-    .register(record.clone())
-    .map_err(|_| PairingError::InvalidRequest)?;
-let completed = MobilePairedDevice {
-    id: record.id,
-    display_name: record.display_name,
-    paired_at: record.paired_at,
-    scopes: vec![MobileDeviceScope::MemoryRead],
-};
-pairing.device = None;
-pairing.completed = Some(completed.clone());
-Ok(PairingProgress::Complete {
-    device: completed,
-    replayed: false,
-})
-```
-
-Do **not** reintroduce `pending.remove(&pairing_id)` on first completion; the
-completed entry must survive until the existing expiry removes it.
-
-- [ ] **Step 3: Re-run the focused pairing suite**
-
-Run:
-
-```bash
-cargo test -p coven-cli mobile_memory::pairing::tests --locked -- --nocapture
-```
-
-Expected: PASS. The suite should now prove idempotent replays, no second device
-registration, preserved mismatch rejection, and expiry-bound retention.
-
-- [ ] **Step 4: Commit the pairing-manager boundary**
-
-```bash
-git add crates/coven-cli/src/mobile_memory/pairing.rs
-git commit -s -m "fix(mobile): cache completed pairing confirmations"
-```
-
-### Task 3: Preserve gateway HTTP and audit semantics on replay
-
-**Files:**
-- Modify: `crates/coven-cli/src/mobile_memory/gateway.rs:626-660, 858-885, 1094-1130`
+- Modify: `crates/coven-cli/src/mobile_memory/gateway.rs:1094-1230`
 - Test: `crates/coven-cli/src/mobile_memory/gateway.rs`
 
 - [ ] **Step 1: Add failing gateway tests for replay responses and audit dedupe**
@@ -273,8 +184,12 @@ fn sample_pairing_request(nonce: [u8; 32]) -> super::super::contract::MobilePair
     }
 }
 
+fn envelope_data(body: &str) -> serde_json::Value {
+    serde_json::from_str::<serde_json::Value>(body).unwrap()["data"].clone()
+}
+
 #[test]
-fn device_confirmation_replay_returns_ok_with_the_same_body() {
+fn device_confirmation_replay_returns_same_envelope_data() {
     let _guard = TEST_GATEWAY_LOCK.lock().unwrap();
     let Some((temp, config, _)) = test_listener_config() else {
         return;
@@ -330,7 +245,7 @@ fn device_confirmation_replay_returns_ok_with_the_same_body() {
 
     assert_eq!(first.status, 201);
     assert_eq!(replay.status, 200);
-    assert_eq!(replay.body, first.body);
+    assert_eq!(envelope_data(&replay.body), envelope_data(&first.body));
 }
 
 #[test]
@@ -377,7 +292,9 @@ fn local_control_replay_does_not_duplicate_pairing_completed_audit() {
 ```
 
 Add any missing test imports for `URL_SAFE_NO_PAD`, `Engine`, and
-`ToEncodedPoint` at the top of the test module.
+`ToEncodedPoint` at the top of the test module. Do **not** assert raw remote
+body equality: `success_response` regenerates `request_id` for each response,
+so the stable contract is parsed envelope `data`.
 
 - [ ] **Step 2: Run the gateway tests and confirm the current behavior fails**
 
@@ -387,12 +304,105 @@ Run:
 cargo test -p coven-cli mobile_memory::gateway::tests --locked -- --nocapture
 ```
 
-Expected: FAIL because the gateway still treats replayed completions as first
-completions.
+Expected: FAIL. At this point the replay-aware `PairingProgress` shape is still
+unimplemented, and once that compiles the current logic still evicts completed
+pairings, so the remote replay will not produce a `200` success envelope with
+matching `data`, and the host replay will still duplicate or reject the second
+completion.
 
-- [ ] **Step 3: Update both confirmation callers to consume `replayed`**
+### Task 3: Atomically implement replay-aware pairing and gateway behavior
 
-Change the remote confirmation route to:
+**Files:**
+- Modify: `crates/coven-cli/src/mobile_memory/pairing.rs:20-30, 54-58, 104-119, 239-295, 400-567`
+- Modify: `crates/coven-cli/src/mobile_memory/gateway.rs:626-660, 858-885`
+
+- [ ] **Step 1: Extend the pending state and progress enum**
+
+Update the data model near the top of `pairing.rs` to this shape:
+
+```rust
+#[derive(Debug, Clone)]
+pub struct PendingPairing {
+    pub id: Uuid,
+    pub nonce_hash: [u8; 32],
+    pub expires_at: DateTime<Utc>,
+    pub transcript_hash: Option<[u8; 32]>,
+    pub device: Option<PendingDevice>,
+    pub host_confirmed: bool,
+    pub device_confirmed: bool,
+    pub consumed: bool,
+    pub completed: Option<MobilePairedDevice>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PairingProgress {
+    Pending,
+    Complete {
+        device: MobilePairedDevice,
+        replayed: bool,
+    },
+}
+```
+
+Initialize `completed: None` in `begin_pairing_with_id`.
+
+- [ ] **Step 2: Update `PairingManager::confirm` and both gateway callers in one edit set**
+
+In `PairingManager::confirm`, keep the existing expiry and transcript guards,
+then replace the phrase / completion block with:
+
+```rust
+let expected = phrase_for_hash(transcript_hash);
+if phrase != expected {
+    if pairing.completed.is_none() {
+        pending.remove(&pairing_id);
+    }
+    return Err(PairingError::PairingPhraseMismatch);
+}
+if let Some(device) = &pairing.completed {
+    return Ok(PairingProgress::Complete {
+        device: device.clone(),
+        replayed: true,
+    });
+}
+if host {
+    pairing.host_confirmed = true;
+} else {
+    pairing.device_confirmed = true;
+}
+if !pairing.host_confirmed || !pairing.device_confirmed {
+    return Ok(PairingProgress::Pending);
+}
+let device = pairing
+    .device
+    .clone()
+    .ok_or(PairingError::PairingConfirmationRequired)?;
+let record = DeviceRecord {
+    id: Uuid::new_v4(),
+    display_name: device.display_name,
+    public_key_x963: device.public_key_x963,
+    paired_at: now,
+    revoked_at: None,
+    scopes: vec![DeviceScope::MemoryRead],
+};
+self.registry
+    .register(record.clone())
+    .map_err(|_| PairingError::InvalidRequest)?;
+let completed = MobilePairedDevice {
+    id: record.id,
+    display_name: record.display_name,
+    paired_at: record.paired_at,
+    scopes: vec![MobileDeviceScope::MemoryRead],
+};
+pairing.device = None;
+pairing.completed = Some(completed.clone());
+Ok(PairingProgress::Complete {
+    device: completed,
+    replayed: false,
+})
+```
+
+Then update the remote confirmation route to:
 
 ```rust
 match state
@@ -417,7 +427,7 @@ match state
 }
 ```
 
-Change the internal host confirmation route to:
+And change the internal host confirmation route to:
 
 ```rust
 match state
@@ -445,9 +455,11 @@ match state
 ```
 
 Update any remaining `PairingProgress::Complete` matches in the file to the new
-named-field variant.
+named-field variant. Treat this as one atomic implementation task: do **not**
+stop after changing only `pairing.rs`, because the new enum shape and gateway
+match arms must compile together.
 
-- [ ] **Step 4: Re-run the focused mobile tests**
+- [ ] **Step 3: Re-run the focused mobile tests**
 
 Run:
 
@@ -457,7 +469,7 @@ cargo test -p coven-cli mobile_memory --locked -- --nocapture
 
 Expected: PASS. Pairing and gateway tests now cover the full retry contract.
 
-- [ ] **Step 5: Run the repository gates exactly as the spec requires**
+- [ ] **Step 4: Run the repository gates exactly as the spec requires**
 
 Run:
 
@@ -473,7 +485,7 @@ python3 scripts/check-coven-privacy.py --staged
 Expected: PASS. No formatting drift, no lint warnings, full locked tests clean,
 no secret findings, and no privacy-guard complaints on the staged patch.
 
-- [ ] **Step 6: Commit the replay-safe implementation**
+- [ ] **Step 5: Commit the replay-safe implementation**
 
 ```bash
 git commit -s -m "fix(mobile): make pairing confirmation retries idempotent"

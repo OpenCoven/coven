@@ -7,8 +7,10 @@
 
 Make completed mobile pairing confirmations idempotent for the rest of the
 existing pairing window. A host or device that retries the final confirmation
-must receive the same paired device record instead of a duplicate registration
-attempt or a terminal `pairing_consumed` failure.
+must receive the same completed pairing result — the identical
+`MobilePairedDevice` data, even if transport-level `request_id` values differ —
+instead of a duplicate registration attempt or a terminal
+`pairing_consumed` failure.
 
 ## Scope
 
@@ -63,8 +65,9 @@ because it leaves two gaps:
 
 ## Requirements
 
-1. A completed retry with the correct phrase returns the same
-   `MobilePairedDevice` value that the first successful completion produced.
+1. A completed retry with the correct phrase returns the same completed result
+   as the first successful completion: identical `MobilePairedDevice` data,
+   while outer response metadata such as `request_id` may differ.
 2. The device registry is written exactly once per pairing, regardless of
    replayed confirmations.
 3. Phrase validation is not weakened: a wrong phrase still returns
@@ -190,13 +193,16 @@ short-circuiting before `DeviceRegistry::register` can run a second time.
 
 - `/api/v1/mobile/pairings/{id}/confirm`
   - first completion: return `201` with the device payload;
-  - replayed completion: return `200` with the same payload.
+  - replayed completion: return `200` with the same completed device payload.
 - `/api/v1/internal/mobile/pairings/{id}/confirm`
   - return `200` for both first completion and replay;
   - append `MobileAuditEvent::PairingCompleted` only when
     `replayed == false`.
 
-No other mobile routes change.
+No other mobile routes change. `success_response` continues to generate a fresh
+mobile envelope `request_id` on each response, so replay equivalence is defined
+as identical parsed completion data rather than byte-for-byte response-body
+equality.
 
 ### Retention and cleanup
 
@@ -217,6 +223,8 @@ This means:
 
 Add focused Rust tests in `pairing.rs` for:
 
+- incomplete-pairing mismatch invalidation still removing the pairing and
+  closing the retry window;
 - device replay after host-first completion;
 - host replay after device-first completion;
 - wrong phrase after completion still failing while leaving the good retry path
@@ -225,8 +233,9 @@ Add focused Rust tests in `pairing.rs` for:
 
 Add focused Rust tests in `gateway.rs` for:
 
-- replayed device confirmations returning `200` with the same JSON body as the
-  first completion;
+- replayed device confirmations returning `201` on first completion, `200` on
+  replay, and identical parsed success-envelope `data` even though `request_id`
+  may differ;
 - replayed host confirmations not appending a second `pairing_completed` audit
   record.
 
