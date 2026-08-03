@@ -251,6 +251,7 @@ The full command surface — every subcommand, flag, and JSON output shape — l
 | `coven adapter list/doctor/install` | Inspect harness adapters; opt into trusted adapter recipes (e.g. `coven adapter install grok`) | [`docs/HARNESS-ADAPTERS.md`](docs/HARNESS-ADAPTERS.md) |
 | `coven status` / `familiars` / `skills` / `research` / `calls` / `hub` | Read-only observability with `--json`, mirroring the daemon API routes | [`cli-observe.md`](docs/reference/cli-observe.md) |
 | `coven memory` / `coven memory --json` / `coven memory open` | Preserve the memory list output or launch the private loopback dashboard | [`cli-observe.md`](docs/reference/cli-observe.md) |
+| `coven memory import` / `coven memory restore` | Preview, apply, verify, and logically restore one familiar's memory migration | [`memory-import.md`](docs/help/memory-import.md) |
 | `coven wt` / `claim` / `hooks` | Parallel work protocol: worktrees, TTL-bounded claims, git hooks | [`cli-wt.md`](docs/reference/cli-wt.md), [`cli-claim.md`](docs/reference/cli-claim.md) |
 | `coven pc` | macOS-first system diagnostics; write operations require `--confirm` | [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) |
 | `coven patch openclaw` / `logs prune` / `vacuum` | OpenClaw rescue loop, log-retention pruning, store repair | [`cli-patch.md`](docs/reference/cli-patch.md), [`cli-logs.md`](docs/reference/cli-logs.md), [`cli-vacuum.md`](docs/reference/cli-vacuum.md) |
@@ -483,6 +484,7 @@ comux is a standalone terminal cockpit that proved the tmux-cockpit model for pa
 | ------------------------------------------------------- | --------------------------------------------------------------------- |
 | [CLI core functionality for developers](docs/development/cli-core-functionality.md) | Command ownership, core-access contract, source map, and maintainer verification loop |
 | [Workflow guides](docs/guides/index.md)                | Runnable examples for core access, session operations, JSON automation, worktrees, and troubleshooting |
+| [Familiar memory import](docs/help/memory-import.md)   | Preview-first migration, private bundles, logical restore, and recovery |
 | [Top-level `coven` command](docs/reference/cli-coven.md) | Interactive entry point, free-text task routing, global flags, and command discovery |
 | [Getting started](docs/GETTING-STARTED.md)              | Full install → first session walkthrough                              |
 | [Concepts](docs/CONCEPTS.md)                            | Definitions: harness, session, project, ritual, daemon, store, client |

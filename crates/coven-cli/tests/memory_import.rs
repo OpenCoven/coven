@@ -416,9 +416,30 @@ fn apply_fails_closed_before_mutation_when_directory_durability_is_unavailable()
 }
 
 #[test]
-fn restore_remains_not_implemented() -> Result<()> {
+#[cfg(not(windows))]
+fn restore_logically_hides_an_unchanged_imported_target() -> Result<()> {
     let temp = trusted_tempdir()?;
-    let output = run_coven(
+    let workspace = temp.path().join("native-workspace");
+    write_familiar(temp.path(), "sage", &workspace)?;
+    write_file(&workspace.join("MEMORY.md"), b"restore bytes")?;
+    let applied = run_coven(
+        temp.path(),
+        &[
+            "memory",
+            "import",
+            "--familiar",
+            "sage",
+            "--apply",
+            "--json",
+        ],
+    )?;
+    assert_success(&applied);
+    let applied_report: Value = serde_json::from_slice(&applied.stdout)?;
+    let bundle = applied_report["bundle_id"]
+        .as_str()
+        .expect("apply report has bundle ID");
+
+    let restored = run_coven(
         temp.path(),
         &[
             "memory",
@@ -426,17 +447,94 @@ fn restore_remains_not_implemented() -> Result<()> {
             "--familiar",
             "sage",
             "--bundle",
-            "blake3:example",
+            bundle,
+            "--json",
         ],
     )?;
 
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr)?;
-    assert!(
-        stderr.contains("restore is not implemented yet"),
-        "{stderr}"
+    assert_success(&restored);
+    let report: Value = serde_json::from_slice(&restored.stdout)?;
+    assert_eq!(report["status"], "restored");
+    assert_eq!(report["restored_count"], 1);
+    assert_eq!(
+        fs::read(temp.path().join("memory/sage/memory.md"))?,
+        b"restore bytes"
     );
-    assert!(!temp.path().join("memory").exists());
+
+    let human = run_coven(
+        temp.path(),
+        &[
+            "memory",
+            "restore",
+            "--familiar",
+            "sage",
+            "--bundle",
+            bundle,
+        ],
+    )?;
+    assert_success(&human);
+    let human = String::from_utf8(human.stdout)?;
+    assert!(
+        human.contains("Logical restore for familiar `sage`"),
+        "{human}"
+    );
+    assert!(human.contains("1 suppressed"), "{human}");
+    assert!(human.contains("hidden from Coven readers"), "{human}");
+    assert!(!human.contains("restore bytes"), "{human}");
+    Ok(())
+}
+
+#[test]
+#[cfg(not(windows))]
+fn restore_conflict_returns_nonzero_with_a_redacted_report() -> Result<()> {
+    let temp = trusted_tempdir()?;
+    let workspace = temp.path().join("native-workspace");
+    write_familiar(temp.path(), "sage", &workspace)?;
+    write_file(&workspace.join("MEMORY.md"), b"original secret")?;
+    let applied = run_coven(
+        temp.path(),
+        &[
+            "memory",
+            "import",
+            "--familiar",
+            "sage",
+            "--apply",
+            "--json",
+        ],
+    )?;
+    assert_success(&applied);
+    let applied_report: Value = serde_json::from_slice(&applied.stdout)?;
+    let bundle = applied_report["bundle_id"]
+        .as_str()
+        .expect("apply report has bundle ID");
+    write_file(&temp.path().join("memory/sage/memory.md"), b"edited secret")?;
+
+    let restored = run_coven(
+        temp.path(),
+        &[
+            "memory",
+            "restore",
+            "--familiar",
+            "sage",
+            "--bundle",
+            bundle,
+            "--json",
+        ],
+    )?;
+
+    assert!(!restored.status.success());
+    let report: Value = serde_json::from_slice(&restored.stdout)?;
+    assert_eq!(report["status"], "manual_recovery");
+    assert_eq!(report["conflict_count"], 1);
+    assert_eq!(report["entries"][0]["status"], "conflict");
+    let rendered = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&restored.stdout),
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    assert!(!rendered.contains("original secret"));
+    assert!(!rendered.contains("edited secret"));
+    assert!(!rendered.contains(&workspace.to_string_lossy().into_owned()));
     Ok(())
 }
 

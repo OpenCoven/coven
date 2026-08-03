@@ -281,7 +281,7 @@ git commit -s -m "feat(memory): apply recoverable familiar imports"
 Assert:
 
 - successful apply reopens every canonical target and verifies its digest;
-- restore removes only a target whose current bytes match the journal;
+- restore logically suppresses only a target whose current bytes and inode still match the journal and private candidate;
 - user-edited, replaced, symlinked, missing, or non-regular targets are retained and reported;
 - restore is idempotent;
 - restoring one familiar never inspects or mutates another familiar;
@@ -297,7 +297,9 @@ cargo test -p coven-cli memory_import::tests::restore --locked
 
 - [ ] **Step 3: Implement restore**
 
-Load the bundle by familiar and validated bundle ID. Revalidate the manifest and journal before mutation. For each recorded creation, open without following symlinks, compare BLAKE3, remove only an exact regular-file match, journal the result, and leave edited or unsafe targets untouched with a non-success status.
+Load the bundle by familiar and validated bundle ID. Revalidate the manifest and journal before mutation. For each recorded creation, open without following symlinks, compare BLAKE3 and inode identity with the private candidate, and set a versioned digest-bound restore marker through the verified file descriptor. Canonical readers suppress only markers whose familiar, bundle, target, manifest, terminal journal state, candidate identity, and current digest all validate. Physical bytes remain recoverable; edited, replaced, or unsafe targets stay visible and untouched with a non-success status. This logical suppression is required because POSIX has no atomic "unlink this name only if it still references this opened inode" operation.
+
+Reapplying the same unchanged source plan to a completely restored bundle uses a resumable `restoring -> restored -> reactivating -> verified` journal cycle. Reactivation changes only journal authority, leaves canonical pathnames and markers untouched, and allows the bundle to be restored repeatedly. Every initial or resumed reactivation revalidates canonical, marker, and candidate provenance; a mismatch transitions durably to `invalidated` manual recovery.
 
 - [ ] **Step 4: Verify and commit**
 
@@ -368,7 +370,7 @@ In an isolated temporary `COVEN_HOME`, prove:
 preview -> apply -> canonical readback -> identical rerun -> restore
 ```
 
-Compare source bytes before/after, canonical target hashes after apply, and target absence after restore. Repeat with a user edit after apply and verify restore refuses to remove it.
+Compare source bytes before/after, canonical target hashes after apply, canonical reader absence after restore, and retained physical recovery bytes. Repeat with a user edit after apply and verify restore leaves it visible and untouched.
 
 - [ ] **Step 6: Commit**
 

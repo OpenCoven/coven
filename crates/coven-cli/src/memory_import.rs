@@ -30,6 +30,10 @@ const SOURCE_BYTE_LIMIT_ERROR: &str = "source discovery exceeds maximum aggregat
 const SOURCE_DEPTH_LIMIT_ERROR: &str = "source discovery exceeds maximum traversal depth";
 const SOURCE_ENTRY_LIMIT_ERROR: &str = "source discovery exceeds maximum visited entry count";
 const SOURCE_DIRECTORY_LIMIT_ERROR: &str = "source discovery exceeds maximum directory count";
+#[cfg(target_vendor = "apple")]
+const RESTORED_XATTR: &str = "com.opencoven.memory-import-restored-v1";
+#[cfg(all(unix, not(target_vendor = "apple")))]
+const RESTORED_XATTR: &str = "user.coven.memory-import-restored-v1";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -44,6 +48,7 @@ pub(crate) enum ImportPlanStatus {
     Preview,
     Conflict,
     Verified,
+    Restored,
     RolledBack,
     ManualRecovery,
 }
@@ -53,6 +58,7 @@ pub(crate) enum ImportPlanStatus {
 pub(crate) enum PlanEntryStatus {
     Create,
     Unchanged,
+    Restored,
     Conflict,
 }
 
@@ -1068,6 +1074,15 @@ struct ManifestEntry {
     initial_status: ManifestInitialStatus,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct RestoredMarker {
+    protocol_version: u32,
+    familiar_id: String,
+    bundle_id: String,
+    target_name: String,
+    digest: String,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ManifestInitialStatus {
@@ -1088,6 +1103,10 @@ enum JournalState {
     Publishing,
     Published,
     Verified,
+    Restoring,
+    Restored,
+    Reactivating,
+    Invalidated,
     RollingBack,
     RolledBack,
 }
@@ -1099,6 +1118,7 @@ enum JournalOutcome {
     Unchanged,
     NotPublished,
     Removed,
+    Suppressed,
     ManualRecovery,
 }
 
@@ -1212,6 +1232,64 @@ trait ApplyHook {
     fn step(&mut self, step: &ApplyStep) -> Result<ApplyHookAction>;
 }
 
+#[derive(Clone, Debug)]
+enum RestoreStep {
+    BeforeMarker(String),
+    AfterMarkerBeforeVerify(String),
+    AfterVerifyBeforeJournal(String),
+}
+
+impl RestoreStep {
+    fn target_name(&self) -> &str {
+        match self {
+            Self::BeforeMarker(name)
+            | Self::AfterMarkerBeforeVerify(name)
+            | Self::AfterVerifyBeforeJournal(name) => name,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RestoreHookAction {
+    Continue,
+    #[cfg(test)]
+    Interrupt,
+}
+
+trait RestoreHook {
+    fn step(&mut self, step: &RestoreStep) -> Result<RestoreHookAction>;
+}
+
+struct NoopRestoreHook;
+
+impl RestoreHook for NoopRestoreHook {
+    fn step(&mut self, _step: &RestoreStep) -> Result<RestoreHookAction> {
+        Ok(RestoreHookAction::Continue)
+    }
+}
+
+#[cfg(test)]
+struct TestRestoreHook<F> {
+    callback: F,
+}
+
+#[cfg(test)]
+impl<F> TestRestoreHook<F> {
+    fn new(callback: F) -> Self {
+        Self { callback }
+    }
+}
+
+#[cfg(test)]
+impl<F> RestoreHook for TestRestoreHook<F>
+where
+    F: FnMut(&RestoreStep) -> Result<RestoreHookAction>,
+{
+    fn step(&mut self, step: &RestoreStep) -> Result<RestoreHookAction> {
+        (self.callback)(step)
+    }
+}
+
 struct NoopApplyHook;
 
 impl ApplyHook for NoopApplyHook {
@@ -1240,6 +1318,15 @@ fn run_apply_step(hook: &mut dyn ApplyHook, step: ApplyStep) -> Result<()> {
         ApplyHookAction::Continue => Ok(()),
         #[cfg(test)]
         ApplyHookAction::Interrupt => Err(anyhow!(ApplyInterrupted)),
+    }
+}
+
+fn run_restore_step(hook: &mut dyn RestoreHook, step: RestoreStep) -> Result<()> {
+    let _ = step.target_name();
+    match hook.step(&step)? {
+        RestoreHookAction::Continue => Ok(()),
+        #[cfg(test)]
+        RestoreHookAction::Interrupt => Err(anyhow!(ApplyInterrupted)),
     }
 }
 
@@ -1333,6 +1420,47 @@ fn apply_import_plan_with_hook(
         } else {
             anyhow!("memory import bundle was rolled back")
         });
+    }
+    if journal.bundle_state == Some(JournalState::Restoring) {
+        bail!("memory import bundle has an incomplete restore");
+    }
+    if journal.bundle_state == Some(JournalState::Restored) {
+        let restored_outcome = journal
+            .records
+            .iter()
+            .rev()
+            .find(|record| {
+                record.scope == JournalScope::Bundle && record.state == JournalState::Restored
+            })
+            .and_then(|record| record.outcome);
+        if restored_outcome == Some(JournalOutcome::ManualRecovery) {
+            bail!("memory import bundle restore requires manual recovery");
+        }
+        if refreshed_plan
+            .entries
+            .iter()
+            .any(|entry| entry.status != PlanEntryStatus::Unchanged)
+            || !restored_bundle_has_reactivation_provenance(coven_home, &manifest, &journal)?
+        {
+            append_journal(
+                &bundle,
+                &mut journal,
+                JournalScope::Bundle,
+                JournalState::Invalidated,
+                None,
+                Some(JournalOutcome::ManualRecovery),
+            )?;
+            bail!("memory import bundle restore requires manual recovery");
+        }
+        resume_reactivation(coven_home, &bundle, &manifest, &mut journal)?;
+        return verified_report(&refreshed_plan, &manifest, &bundle, coven_home, &journal);
+    }
+    if journal.bundle_state == Some(JournalState::Reactivating) {
+        resume_reactivation(coven_home, &bundle, &manifest, &mut journal)?;
+        return verified_report(&refreshed_plan, &manifest, &bundle, coven_home, &journal);
+    }
+    if journal.bundle_state == Some(JournalState::Invalidated) {
+        bail!("memory import bundle restore requires manual recovery");
     }
     if journal.bundle_state == Some(JournalState::RollingBack) {
         let manual = resume_rollback(
@@ -1546,18 +1674,20 @@ fn open_or_create_bundle(migration: &MigrationFamiliar, bundle_id: &str) -> Resu
 }
 
 fn open_existing_bundle(migration: &MigrationFamiliar, bundle_name: &str) -> Result<Bundle> {
+    open_existing_bundle_in(&migration.dir, bundle_name)
+}
+
+fn open_existing_bundle_in(migration: &Dir, bundle_name: &str) -> Result<Bundle> {
     if bundle_component(bundle_name)? != bundle_name {
         bail!("memory migration bundle name is invalid");
     }
     let metadata = migration
-        .dir
         .symlink_metadata(bundle_name)
         .map_err(|_| anyhow!("unable to inspect memory migration bundle"))?;
     if !metadata.is_dir() || metadata_is_windows_reparse_point(&metadata) {
         bail!("memory migration bundle is not a real directory");
     }
     let dir = migration
-        .dir
         .open_dir_nofollow(bundle_name)
         .map_err(|_| anyhow!("memory migration bundle is not a real directory"))?;
     validate_private_directory_handle(&dir)?;
@@ -1572,6 +1702,45 @@ fn open_existing_bundle(migration: &MigrationFamiliar, bundle_name: &str) -> Res
         .map_err(|_| anyhow!("memory migration staged path is not a real directory"))?;
     validate_private_directory_handle(&staged)?;
     Ok(Bundle { dir, staged })
+}
+
+fn open_existing_private_directory(parent: &Dir, name: &str) -> Result<Dir> {
+    let metadata = parent
+        .symlink_metadata(name)
+        .map_err(|_| anyhow!("private import directory is unavailable"))?;
+    if !metadata.is_dir() || metadata_is_windows_reparse_point(&metadata) {
+        bail!("private import directory is unsafe");
+    }
+    let directory = parent
+        .open_dir_nofollow(name)
+        .map_err(|_| anyhow!("private import directory is unavailable"))?;
+    validate_private_directory_handle(&directory)?;
+    Ok(directory)
+}
+
+fn open_existing_migration_familiar(coven_home: &Path, familiar: &str) -> Result<Dir> {
+    let home = open_dir_path_nofollow(coven_home)
+        .map_err(|_| anyhow!("COVEN_HOME must be a real directory"))?;
+    let migrations = open_existing_private_directory(&home, MIGRATIONS_DIRECTORY)?;
+    open_existing_private_directory(&migrations, familiar)
+}
+
+fn open_existing_target_context(
+    coven_home: &Path,
+    familiar: &str,
+    bundle_id: &str,
+) -> Result<TargetContext> {
+    let home = open_dir_path_nofollow(coven_home)
+        .map_err(|_| anyhow!("COVEN_HOME must be a real directory"))?;
+    let memory = home
+        .open_dir_nofollow("memory")
+        .map_err(|_| anyhow!("memory root is unavailable"))?;
+    let dir = memory
+        .open_dir_nofollow(familiar)
+        .map_err(|_| anyhow!("familiar memory is unavailable"))?;
+    let work_root = open_existing_private_directory(&dir, TARGET_WORK_DIRECTORY)?;
+    let work = open_existing_private_directory(&work_root, &bundle_component(bundle_id)?)?;
+    Ok(TargetContext { dir, work })
 }
 
 fn reconcile_other_incomplete_bundles(
@@ -1625,6 +1794,18 @@ fn reconcile_other_incomplete_bundles(
             Some(JournalState::Verified) => {
                 stage_manifest_is_complete(&bundle, &manifest)?;
                 continue;
+            }
+            Some(JournalState::Restored) => continue,
+            Some(JournalState::Reactivating) => {
+                resume_reactivation(coven_home, &bundle, &manifest, &mut journal)?;
+                stage_manifest_is_complete(&bundle, &manifest)?;
+                continue;
+            }
+            Some(JournalState::Invalidated) => {
+                bail!("an older memory import requires manual recovery")
+            }
+            Some(JournalState::Restoring) => {
+                bail!("an older memory import has an incomplete restore")
             }
             Some(JournalState::RolledBack) => {
                 if journal_requires_manual_recovery(&journal) {
@@ -2227,6 +2408,11 @@ fn parse_journal(bytes: &[u8]) -> Result<JournalSummary> {
     Ok(summary)
 }
 
+fn read_existing_journal(bundle: &Bundle) -> Result<JournalSummary> {
+    let bytes = read_private_regular_file(&bundle.dir, JOURNAL_FILE, 16 * 1024 * 1024)?;
+    parse_journal(&bytes)
+}
+
 fn validate_journal_against_manifest(
     journal: &JournalSummary,
     manifest: &ImportManifest,
@@ -2240,8 +2426,11 @@ fn validate_journal_against_manifest(
         match record.scope {
             JournalScope::Bundle => {
                 let valid_outcome = match record.state {
-                    JournalState::RolledBack => {
+                    JournalState::RolledBack | JournalState::Restored => {
                         matches!(record.outcome, None | Some(JournalOutcome::ManualRecovery))
+                    }
+                    JournalState::Invalidated => {
+                        record.outcome == Some(JournalOutcome::ManualRecovery)
                     }
                     _ => record.outcome.is_none(),
                 };
@@ -2277,6 +2466,24 @@ fn validate_journal_against_manifest(
                         record.outcome,
                         Some(JournalOutcome::Created | JournalOutcome::Unchanged)
                     ),
+                    JournalState::Restoring => matches!(
+                        record.outcome,
+                        Some(
+                            JournalOutcome::Created
+                                | JournalOutcome::Unchanged
+                                | JournalOutcome::ManualRecovery
+                        )
+                    ),
+                    JournalState::Restored => matches!(
+                        record.outcome,
+                        Some(
+                            JournalOutcome::Suppressed
+                                | JournalOutcome::Unchanged
+                                | JournalOutcome::ManualRecovery
+                        )
+                    ),
+                    JournalState::Reactivating => false,
+                    JournalState::Invalidated => false,
                     JournalState::RolledBack => matches!(
                         record.outcome,
                         Some(
@@ -2313,6 +2520,16 @@ fn validate_journal_against_manifest(
     {
         bail!("rolled-back import journal is incomplete for its manifest");
     }
+    if journal.bundle_state == Some(JournalState::Restored)
+        && manifest.entries.iter().any(|entry| {
+            journal
+                .entry_states
+                .get(&entry.target_name)
+                .is_none_or(|record| record.state != JournalState::Restored)
+        })
+    {
+        bail!("restored import journal is incomplete for its manifest");
+    }
     Ok(())
 }
 
@@ -2341,6 +2558,12 @@ fn validate_journal_transition(summary: &JournalSummary, record: &JournalRecord)
                         JournalState::RollingBack
                     )
                     | (Some(JournalState::Publishing), JournalState::Verified)
+                    | (Some(JournalState::Verified), JournalState::Restoring)
+                    | (Some(JournalState::Restoring), JournalState::Restored)
+                    | (Some(JournalState::Restored), JournalState::Reactivating)
+                    | (Some(JournalState::Restored), JournalState::Invalidated)
+                    | (Some(JournalState::Reactivating), JournalState::Verified)
+                    | (Some(JournalState::Reactivating), JournalState::Invalidated)
                     | (Some(JournalState::RollingBack), JournalState::RolledBack)
             );
             if !valid {
@@ -2357,13 +2580,22 @@ fn validate_journal_transition(summary: &JournalSummary, record: &JournalRecord)
                 bail!("import journal entry record is invalid");
             }
             let bundle_allows_entry = match record.state {
-                JournalState::Prepared | JournalState::Published | JournalState::Verified => {
+                JournalState::Prepared | JournalState::Published => {
                     summary.bundle_state == Some(JournalState::Publishing)
+                }
+                JournalState::Verified => matches!(
+                    summary.bundle_state,
+                    Some(JournalState::Publishing | JournalState::Reactivating)
+                ),
+                JournalState::Restoring | JournalState::Restored => {
+                    summary.bundle_state == Some(JournalState::Restoring)
                 }
                 JournalState::RollingBack | JournalState::RolledBack => {
                     summary.bundle_state == Some(JournalState::RollingBack)
                 }
-                JournalState::Publishing => false,
+                JournalState::Publishing
+                | JournalState::Reactivating
+                | JournalState::Invalidated => false,
             };
             if !bundle_allows_entry {
                 bail!("import journal entry appears outside its bundle phase");
@@ -2406,6 +2638,9 @@ fn validate_journal_transition(summary: &JournalSummary, record: &JournalRecord)
                             Some(JournalState::Prepared | JournalState::Published),
                             JournalState::Verified
                         )
+                        | (Some(JournalState::Verified), JournalState::Restoring)
+                        | (Some(JournalState::Restoring), JournalState::Restored)
+                        | (Some(JournalState::Restored), JournalState::Verified)
                         | (
                             Some(
                                 JournalState::Prepared
@@ -3199,7 +3434,7 @@ fn verified_report(
                 report.unchanged_count += 1;
                 PlanEntryStatus::Unchanged
             }
-            PlanEntryStatus::Conflict => {
+            PlanEntryStatus::Restored | PlanEntryStatus::Conflict => {
                 bail!("verified import target is unsafe or divergent")
             }
         };
@@ -3212,6 +3447,120 @@ fn verified_report(
         }
     }
     Ok(report)
+}
+
+fn verified_outcome_for_entry(
+    journal: &JournalSummary,
+    entry: &ManifestEntry,
+) -> Result<JournalOutcome> {
+    journal
+        .records
+        .iter()
+        .rev()
+        .find(|record| {
+            record.scope == JournalScope::Entry
+                && record.target_name.as_deref() == Some(entry.target_name.as_str())
+                && record.state == JournalState::Verified
+        })
+        .and_then(|record| record.outcome)
+        .filter(|outcome| matches!(outcome, JournalOutcome::Created | JournalOutcome::Unchanged))
+        .ok_or_else(|| anyhow!("verified import journal is incomplete"))
+}
+
+fn restored_bundle_has_reactivation_provenance(
+    coven_home: &Path,
+    manifest: &ImportManifest,
+    journal: &JournalSummary,
+) -> Result<bool> {
+    let target = match open_existing_target_context(
+        coven_home,
+        &manifest.familiar_id,
+        &manifest.bundle_id,
+    ) {
+        Ok(target) => target,
+        Err(_) => return Ok(false),
+    };
+    for entry in &manifest.entries {
+        match verified_outcome_for_entry(journal, entry)? {
+            JournalOutcome::Created
+                if !verify_retained_restore_evidence(
+                    &target,
+                    &manifest.familiar_id,
+                    &manifest.bundle_id,
+                    entry,
+                ) =>
+            {
+                return Ok(false);
+            }
+            JournalOutcome::Created | JournalOutcome::Unchanged => {}
+            _ => unreachable!("verified outcomes are filtered by helper"),
+        }
+    }
+    Ok(true)
+}
+
+fn resume_reactivation(
+    coven_home: &Path,
+    bundle: &Bundle,
+    manifest: &ImportManifest,
+    journal: &mut JournalSummary,
+) -> Result<()> {
+    if journal.bundle_state == Some(JournalState::Restored) {
+        append_journal(
+            bundle,
+            journal,
+            JournalScope::Bundle,
+            JournalState::Reactivating,
+            None,
+            None,
+        )?;
+    }
+    if journal.bundle_state != Some(JournalState::Reactivating) {
+        bail!("memory import bundle is not reactivating");
+    }
+    if !restored_bundle_has_reactivation_provenance(coven_home, manifest, journal)? {
+        append_journal(
+            bundle,
+            journal,
+            JournalScope::Bundle,
+            JournalState::Invalidated,
+            None,
+            Some(JournalOutcome::ManualRecovery),
+        )?;
+        bail!("memory import bundle restore requires manual recovery");
+    }
+    for entry in &manifest.entries {
+        if journal
+            .entry_states
+            .get(&entry.target_name)
+            .is_some_and(|record| record.state == JournalState::Verified)
+        {
+            continue;
+        }
+        if journal
+            .entry_states
+            .get(&entry.target_name)
+            .is_none_or(|record| record.state != JournalState::Restored)
+        {
+            bail!("reactivating import journal is incomplete");
+        }
+        append_journal(
+            bundle,
+            journal,
+            JournalScope::Entry,
+            JournalState::Verified,
+            Some(entry),
+            Some(verified_outcome_for_entry(journal, entry)?),
+        )?;
+    }
+    append_journal(
+        bundle,
+        journal,
+        JournalScope::Bundle,
+        JournalState::Verified,
+        None,
+        None,
+    )
 }
 
 fn resume_rollback(
@@ -3610,6 +3959,7 @@ pub(crate) fn run_import(
             ImportPlanStatus::Preview => "Preview",
             ImportPlanStatus::Conflict => "Conflict",
             ImportPlanStatus::Verified => "Verified import",
+            ImportPlanStatus::Restored => "Restored import",
             ImportPlanStatus::RolledBack => "Rolled-back import",
             ImportPlanStatus::ManualRecovery => "Import requiring manual recovery",
         };
@@ -3626,6 +3976,7 @@ pub(crate) fn run_import(
                 match entry.status {
                     PlanEntryStatus::Create => "create",
                     PlanEntryStatus::Unchanged => "unchanged",
+                    PlanEntryStatus::Restored => "restored",
                     PlanEntryStatus::Conflict => "conflict",
                 }
             );
@@ -3641,8 +3992,591 @@ pub(crate) fn run_import(
     Ok(())
 }
 
-pub(crate) fn run_restore(_familiar: &str, _bundle: &str, _json: bool) -> Result<()> {
-    bail!("coven memory restore is not implemented yet")
+pub(crate) fn run_restore(familiar: &str, bundle: &str, json: bool) -> Result<()> {
+    let coven_home = crate::paths::coven_home_dir()?;
+    let report = restore_import_bundle(&coven_home, familiar, bundle)?;
+    if json {
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        println!(
+            "Logical restore for familiar `{familiar}`: {} suppressed, {} unchanged, {} retained.",
+            report.restored_count, report.unchanged_count, report.conflict_count
+        );
+        println!("Bundle: {}", report.bundle_id);
+        for entry in &report.entries {
+            println!(
+                "- {} -> {} [{}]",
+                entry.logical_label,
+                entry.target_name,
+                match entry.status {
+                    PlanEntryStatus::Create => "create",
+                    PlanEntryStatus::Unchanged => "unchanged",
+                    PlanEntryStatus::Restored => "suppressed",
+                    PlanEntryStatus::Conflict => "retained",
+                }
+            );
+        }
+        if report.status == ImportPlanStatus::Restored {
+            println!(
+                "Imported bytes remain private and recoverable but are hidden from Coven readers."
+            );
+        }
+    }
+    if report.status == ImportPlanStatus::ManualRecovery {
+        bail!("memory restore requires manual recovery");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn restore_import_bundle(
+    _coven_home: &Path,
+    _familiar: &str,
+    _bundle_id: &str,
+) -> Result<ImportPlan> {
+    bail!(
+        "memory import restore is unavailable on Windows because durable directory mutation cannot be guaranteed"
+    )
+}
+
+#[cfg(not(windows))]
+fn restore_import_bundle(coven_home: &Path, familiar: &str, bundle_id: &str) -> Result<ImportPlan> {
+    restore_import_bundle_with_hook(coven_home, familiar, bundle_id, &mut NoopRestoreHook)
+}
+
+#[cfg(all(test, not(windows)))]
+pub(crate) fn restore_import_bundle_for_test(
+    coven_home: &Path,
+    familiar: &str,
+    bundle_id: &str,
+) -> Result<ImportPlan> {
+    restore_import_bundle(coven_home, familiar, bundle_id)
+}
+
+#[cfg(not(windows))]
+fn restore_import_bundle_with_hook(
+    coven_home: &Path,
+    familiar: &str,
+    bundle_id: &str,
+    hook: &mut dyn RestoreHook,
+) -> Result<ImportPlan> {
+    validate_familiar_component(familiar)?;
+    validate_registered_familiar(coven_home, familiar)?;
+    let bundle_name = bundle_component(bundle_id)?;
+    let migration = open_locked_migration_familiar(coven_home, familiar)?;
+    let bundle = open_existing_bundle(&migration, &bundle_name)?;
+    let manifest = read_existing_manifest(&bundle)?;
+    validate_stored_manifest(&manifest, familiar, &bundle_name)?;
+    let mut journal = open_or_create_journal(&bundle)?;
+    validate_journal_against_manifest(&journal, &manifest)?;
+    if !matches!(
+        journal.bundle_state,
+        Some(
+            JournalState::Verified
+                | JournalState::Restoring
+                | JournalState::Restored
+                | JournalState::Invalidated
+        )
+    ) {
+        bail!("memory import bundle is not verified for restore");
+    }
+    if journal.bundle_state == Some(JournalState::Verified) {
+        append_journal(
+            &bundle,
+            &mut journal,
+            JournalScope::Bundle,
+            JournalState::Restoring,
+            None,
+            None,
+        )?;
+    }
+
+    let target = open_target_context(coven_home, familiar, bundle_id)?;
+    let restore_already_invalidated = journal.bundle_state == Some(JournalState::Invalidated);
+    let mut restored_count = 0_usize;
+    let mut unchanged_count = 0_usize;
+    let mut conflict_count = 0_usize;
+    let mut statuses = HashMap::new();
+
+    for entry in &manifest.entries {
+        let latest = journal.entry_states.get(&entry.target_name).cloned();
+        if let Some(record) = latest
+            .as_ref()
+            .filter(|record| record.state == JournalState::Restored)
+        {
+            match record.outcome {
+                Some(JournalOutcome::Suppressed) => {
+                    if !restore_already_invalidated
+                        && verify_retained_restore_evidence(&target, familiar, bundle_id, entry)
+                    {
+                        restored_count += 1;
+                        statuses.insert(entry.target_name.as_str(), PlanEntryStatus::Restored);
+                    } else {
+                        conflict_count += 1;
+                        statuses.insert(entry.target_name.as_str(), PlanEntryStatus::Conflict);
+                    }
+                }
+                Some(JournalOutcome::Unchanged) => {
+                    unchanged_count += 1;
+                    statuses.insert(entry.target_name.as_str(), PlanEntryStatus::Unchanged);
+                }
+                Some(JournalOutcome::ManualRecovery) => {
+                    conflict_count += 1;
+                    statuses.insert(entry.target_name.as_str(), PlanEntryStatus::Conflict);
+                }
+                _ => bail!("restored import journal has an invalid outcome"),
+            }
+            continue;
+        }
+
+        let verified_outcome = verified_outcome_for_entry(&journal, entry)?;
+
+        if verified_outcome == JournalOutcome::Unchanged {
+            append_restore_entry(
+                &bundle,
+                &mut journal,
+                entry,
+                JournalOutcome::Unchanged,
+                JournalOutcome::Unchanged,
+            )?;
+            unchanged_count += 1;
+            statuses.insert(entry.target_name.as_str(), PlanEntryStatus::Unchanged);
+            continue;
+        }
+        if verified_outcome != JournalOutcome::Created {
+            bail!("verified import journal has an invalid restore outcome");
+        }
+
+        let restoring_created = latest.as_ref().is_some_and(|record| {
+            record.state == JournalState::Restoring
+                && record.outcome == Some(JournalOutcome::Created)
+        });
+        match classify_restore_target(&target, entry)? {
+            RestoreTargetStatus::Exact(mut trusted) => {
+                if !restoring_created {
+                    append_journal(
+                        &bundle,
+                        &mut journal,
+                        JournalScope::Entry,
+                        JournalState::Restoring,
+                        Some(entry),
+                        Some(JournalOutcome::Created),
+                    )?;
+                }
+                match mark_exact_restore_target(
+                    &target,
+                    familiar,
+                    bundle_id,
+                    entry,
+                    &mut trusted,
+                    hook,
+                )? {
+                    JournalOutcome::Suppressed => {
+                        append_journal(
+                            &bundle,
+                            &mut journal,
+                            JournalScope::Entry,
+                            JournalState::Restored,
+                            Some(entry),
+                            Some(JournalOutcome::Suppressed),
+                        )?;
+                        restored_count += 1;
+                        statuses.insert(entry.target_name.as_str(), PlanEntryStatus::Restored);
+                    }
+                    JournalOutcome::ManualRecovery => {
+                        append_journal(
+                            &bundle,
+                            &mut journal,
+                            JournalScope::Entry,
+                            JournalState::Restored,
+                            Some(entry),
+                            Some(JournalOutcome::ManualRecovery),
+                        )?;
+                        conflict_count += 1;
+                        statuses.insert(entry.target_name.as_str(), PlanEntryStatus::Conflict);
+                    }
+                    _ => unreachable!("restore removal has only terminal outcomes"),
+                }
+            }
+            RestoreTargetStatus::Missing | RestoreTargetStatus::Conflict => {
+                append_restore_entry(
+                    &bundle,
+                    &mut journal,
+                    entry,
+                    JournalOutcome::ManualRecovery,
+                    JournalOutcome::ManualRecovery,
+                )?;
+                conflict_count += 1;
+                statuses.insert(entry.target_name.as_str(), PlanEntryStatus::Conflict);
+            }
+        }
+    }
+
+    if journal.bundle_state == Some(JournalState::Restored) && conflict_count > 0 {
+        append_journal(
+            &bundle,
+            &mut journal,
+            JournalScope::Bundle,
+            JournalState::Invalidated,
+            None,
+            Some(JournalOutcome::ManualRecovery),
+        )?;
+    } else if journal.bundle_state != Some(JournalState::Restored)
+        && journal.bundle_state != Some(JournalState::Invalidated)
+    {
+        append_journal(
+            &bundle,
+            &mut journal,
+            JournalScope::Bundle,
+            JournalState::Restored,
+            None,
+            if conflict_count > 0 {
+                Some(JournalOutcome::ManualRecovery)
+            } else {
+                None
+            },
+        )?;
+    }
+
+    let mut entries = manifest
+        .entries
+        .iter()
+        .map(|entry| PlanEntry {
+            logical_label: entry.source_label.clone(),
+            target_name: entry.target_name.clone(),
+            digest: entry.digest.clone(),
+            status: statuses
+                .get(entry.target_name.as_str())
+                .copied()
+                .unwrap_or(PlanEntryStatus::Conflict),
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.logical_label.cmp(&right.logical_label));
+    Ok(ImportPlan {
+        familiar_id: familiar.to_owned(),
+        source_kind: manifest.source_kind,
+        bundle_id: bundle_id.to_owned(),
+        status: if conflict_count > 0 {
+            ImportPlanStatus::ManualRecovery
+        } else {
+            ImportPlanStatus::Restored
+        },
+        apply_eligible: false,
+        file_count: entries.len(),
+        create_count: 0,
+        unchanged_count,
+        restored_count,
+        conflict_count,
+        entries,
+    })
+}
+
+fn append_restore_entry(
+    bundle: &Bundle,
+    journal: &mut JournalSummary,
+    entry: &ManifestEntry,
+    restoring_outcome: JournalOutcome,
+    restored_outcome: JournalOutcome,
+) -> Result<()> {
+    if journal
+        .entry_states
+        .get(&entry.target_name)
+        .is_none_or(|record| record.state != JournalState::Restoring)
+    {
+        append_journal(
+            bundle,
+            journal,
+            JournalScope::Entry,
+            JournalState::Restoring,
+            Some(entry),
+            Some(restoring_outcome),
+        )?;
+    }
+    append_journal(
+        bundle,
+        journal,
+        JournalScope::Entry,
+        JournalState::Restored,
+        Some(entry),
+        Some(restored_outcome),
+    )
+}
+
+enum RestoreTargetStatus {
+    Exact(cap_std::fs::File),
+    Missing,
+    Conflict,
+}
+
+fn classify_restore_target(
+    target: &TargetContext,
+    entry: &ManifestEntry,
+) -> Result<RestoreTargetStatus> {
+    match target.dir.symlink_metadata(&entry.target_name) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(RestoreTargetStatus::Missing),
+        Err(_) => Ok(RestoreTargetStatus::Conflict),
+        Ok(metadata)
+            if metadata.is_file()
+                && !metadata_is_windows_reparse_point(&metadata)
+                && metadata.len() == entry.byte_length =>
+        {
+            let mut options = OpenOptions::new();
+            options
+                .read(true)
+                .follow(FollowSymlinks::No)
+                .maybe_dir(true);
+            let mut file = match target.dir.open_with(&entry.target_name, &options) {
+                Ok(file) => file,
+                Err(_) => return Ok(RestoreTargetStatus::Conflict),
+            };
+            let digest = digest_stable_opened_file(&mut file);
+            if digest.as_deref() != Some(entry.digest.as_str())
+                || !verify_optional_private_entry(&target.work, &candidate_name(entry), entry)?
+                || !same_file_identity_with_handle(&target.work, &candidate_name(entry), &file)?
+            {
+                return Ok(RestoreTargetStatus::Conflict);
+            }
+            Ok(RestoreTargetStatus::Exact(file))
+        }
+        Ok(_) => Ok(RestoreTargetStatus::Conflict),
+    }
+}
+
+fn verify_retained_restore_evidence(
+    target: &TargetContext,
+    familiar: &str,
+    bundle_id: &str,
+    entry: &ManifestEntry,
+) -> bool {
+    let candidate = candidate_name(entry);
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .follow(FollowSymlinks::No)
+        .maybe_dir(true);
+    let canonical = match target.dir.open_with(&entry.target_name, &options) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let mut canonical = match verify_open_private_entry_file(canonical, entry) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    if verify_entry_file(&target.work, &candidate, entry).is_err()
+        || !matches!(
+            same_file_identity_with_handle(&target.work, &candidate, &canonical),
+            Ok(true)
+        )
+        || !opened_file_has_restore_marker(&mut canonical, familiar, bundle_id, entry)
+    {
+        return false;
+    }
+    true
+}
+
+#[cfg(unix)]
+fn read_restored_marker(file: &cap_std::fs::File) -> Option<RestoredMarker> {
+    let mut value = vec![0_u8; 1024];
+    let length = rustix::fs::fgetxattr(file, RESTORED_XATTR, &mut value).ok()?;
+    value.truncate(length);
+    serde_json::from_slice(&value).ok()
+}
+
+#[cfg(not(unix))]
+fn read_restored_marker(_file: &cap_std::fs::File) -> Option<RestoredMarker> {
+    None
+}
+
+fn opened_file_matches_restored_marker(
+    file: &mut cap_std::fs::File,
+    marker: &RestoredMarker,
+) -> bool {
+    if marker.protocol_version != IMPORT_PROTOCOL_VERSION {
+        return false;
+    }
+    if file.seek(SeekFrom::Start(0)).is_err() {
+        return false;
+    }
+    digest_stable_opened_file(file).as_deref() == Some(marker.digest.as_str())
+}
+
+fn opened_file_has_restore_marker(
+    file: &mut cap_std::fs::File,
+    familiar: &str,
+    bundle_id: &str,
+    entry: &ManifestEntry,
+) -> bool {
+    let Some(marker) = read_restored_marker(file) else {
+        return false;
+    };
+    marker.familiar_id == familiar
+        && marker.bundle_id == bundle_id
+        && marker.target_name == entry.target_name
+        && marker.digest == entry.digest
+        && opened_file_matches_restored_marker(file, &marker)
+}
+
+pub(crate) fn opened_file_is_logically_restored(
+    coven_home: &Path,
+    familiar: &str,
+    target_name: &str,
+    file: &mut cap_std::fs::File,
+) -> bool {
+    let Some(marker) = read_restored_marker(file) else {
+        return false;
+    };
+    if marker.protocol_version != IMPORT_PROTOCOL_VERSION
+        || marker.familiar_id != familiar
+        || marker.target_name != target_name
+        || validate_familiar_component(familiar).is_err()
+        || validate_target_name(target_name).is_err()
+        || bundle_component(&marker.bundle_id).is_err()
+        || !opened_file_matches_restored_marker(file, &marker)
+    {
+        return false;
+    }
+
+    let migration = match open_existing_migration_familiar(coven_home, familiar) {
+        Ok(migration) => migration,
+        Err(_) => return false,
+    };
+    let bundle = match open_existing_bundle_in(&migration, &marker.bundle_id) {
+        Ok(bundle) => bundle,
+        Err(_) => return false,
+    };
+    let manifest = match read_existing_manifest(&bundle) {
+        Ok(manifest) => manifest,
+        Err(_) => return false,
+    };
+    if validate_stored_manifest(&manifest, familiar, &marker.bundle_id).is_err() {
+        return false;
+    }
+    let Some(entry) = manifest
+        .entries
+        .iter()
+        .find(|entry| entry.target_name == target_name && entry.digest == marker.digest)
+    else {
+        return false;
+    };
+    let journal = match read_existing_journal(&bundle) {
+        Ok(journal) => journal,
+        Err(_) => return false,
+    };
+    if validate_journal_against_manifest(&journal, &manifest).is_err()
+        || journal.bundle_state != Some(JournalState::Restored)
+        || !journal.entry_states.get(target_name).is_some_and(|record| {
+            record.state == JournalState::Restored
+                && record.outcome == Some(JournalOutcome::Suppressed)
+        })
+    {
+        return false;
+    }
+    let target = match open_existing_target_context(coven_home, familiar, &marker.bundle_id) {
+        Ok(target) => target,
+        Err(_) => return false,
+    };
+    verify_entry_file(&target.work, &candidate_name(entry), entry).is_ok()
+        && matches!(
+            same_file_identity_with_handle(&target.work, &candidate_name(entry), file),
+            Ok(true)
+        )
+}
+
+#[cfg(unix)]
+fn mark_opened_file_restored(
+    file: &mut cap_std::fs::File,
+    familiar: &str,
+    bundle_id: &str,
+    entry: &ManifestEntry,
+) -> Result<bool> {
+    let marker = RestoredMarker {
+        protocol_version: IMPORT_PROTOCOL_VERSION,
+        familiar_id: familiar.to_owned(),
+        bundle_id: bundle_id.to_owned(),
+        target_name: entry.target_name.clone(),
+        digest: entry.digest.clone(),
+    };
+    let marker_bytes = serde_json::to_vec(&marker)?;
+    match rustix::fs::fsetxattr(
+        &*file,
+        RESTORED_XATTR,
+        &marker_bytes,
+        rustix::fs::XattrFlags::CREATE,
+    ) {
+        Ok(()) => {}
+        Err(_) if read_restored_marker(file).as_ref() == Some(&marker) => {}
+        Err(_) => return Ok(false),
+    }
+    file.sync_all()
+        .map_err(|_| anyhow!("unable to sync logical restore marker"))?;
+    Ok(opened_file_has_restore_marker(
+        file, familiar, bundle_id, entry,
+    ))
+}
+
+#[cfg(not(unix))]
+fn mark_opened_file_restored(
+    _file: &mut cap_std::fs::File,
+    _familiar: &str,
+    _bundle_id: &str,
+    _entry: &ManifestEntry,
+) -> Result<bool> {
+    Ok(false)
+}
+
+fn mark_exact_restore_target(
+    target: &TargetContext,
+    familiar: &str,
+    bundle_id: &str,
+    entry: &ManifestEntry,
+    trusted: &mut cap_std::fs::File,
+    hook: &mut dyn RestoreHook,
+) -> Result<JournalOutcome> {
+    let candidate = candidate_name(entry);
+    if !matches!(
+        same_file_identity_with_handle(&target.dir, &entry.target_name, trusted),
+        Ok(true)
+    ) || !matches!(
+        same_file_identity_with_handle(&target.work, &candidate, trusted),
+        Ok(true)
+    ) {
+        return Ok(JournalOutcome::ManualRecovery);
+    }
+    run_restore_step(hook, RestoreStep::BeforeMarker(entry.target_name.clone()))?;
+    if !mark_opened_file_restored(trusted, familiar, bundle_id, entry)? {
+        return Ok(JournalOutcome::ManualRecovery);
+    }
+    run_restore_step(
+        hook,
+        RestoreStep::AfterMarkerBeforeVerify(entry.target_name.clone()),
+    )?;
+    let owned = matches!(
+        same_file_identity_with_handle(&target.dir, &entry.target_name, trusted),
+        Ok(true)
+    ) && matches!(
+        same_file_identity_with_handle(&target.work, &candidate, trusted),
+        Ok(true)
+    ) && verify_entry_file(&target.work, &candidate, entry).is_ok()
+        && opened_file_has_restore_marker(trusted, familiar, bundle_id, entry);
+    if !owned {
+        return Ok(JournalOutcome::ManualRecovery);
+    }
+    run_restore_step(
+        hook,
+        RestoreStep::AfterVerifyBeforeJournal(entry.target_name.clone()),
+    )?;
+    if !matches!(
+        same_file_identity_with_handle(&target.dir, &entry.target_name, trusted),
+        Ok(true)
+    ) || !matches!(
+        same_file_identity_with_handle(&target.work, &candidate, trusted),
+        Ok(true)
+    ) || verify_entry_file(&target.work, &candidate, entry).is_err()
+        || !opened_file_has_restore_marker(trusted, familiar, bundle_id, entry)
+    {
+        return Ok(JournalOutcome::ManualRecovery);
+    }
+    Ok(JournalOutcome::Suppressed)
 }
 
 #[cfg(test)]
@@ -4920,9 +5854,9 @@ mod tests {
         apply_import_plan(temp.path(), &plan, &sources)?;
         let target = temp.path().join("memory/sage/memory.md");
         let staged = bundle_path(temp.path(), "sage", &plan.bundle_id)?.join("staged/memory.md");
-        fs::write(&target, b"user edit")?;
+        fs::write(&target, b"changed!")?;
 
-        assert_eq!(fs::read(target)?, b"user edit");
+        assert_eq!(fs::read(target)?, b"changed!");
         assert_eq!(fs::read(staged)?, b"original bytes");
         Ok(())
     }
@@ -6569,6 +7503,766 @@ mod tests {
             &target_metadata_before,
             &target_metadata_after
         ));
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn restore_logically_hides_only_verified_created_targets() -> Result<()> {
+        let temp = trusted_tempdir()?;
+        let workspace = temp.path().join("workspace");
+        write_registered_familiars(temp.path(), &[("sage", &workspace)])?;
+        let sources = vec![
+            DiscoveredSource {
+                source_label: "MEMORY.md".to_owned(),
+                bytes: b"created".to_vec(),
+            },
+            DiscoveredSource {
+                source_label: "notes/second.md".to_owned(),
+                bytes: b"preexisting".to_vec(),
+            },
+        ];
+        let existing = temp.path().join("memory/sage/notes-second.md");
+        fs::create_dir_all(existing.parent().expect("target has parent"))?;
+        fs::write(&existing, b"preexisting")?;
+        let plan = build_import_plan(
+            temp.path(),
+            "sage",
+            MemoryImportSourceKind::Native,
+            &sources,
+        )?;
+        let applied = apply_import_plan(temp.path(), &plan, &sources)?;
+        assert_eq!(applied.create_count, 1);
+        assert_eq!(applied.unchanged_count, 1);
+
+        let restored = restore_import_bundle(temp.path(), "sage", &plan.bundle_id)?;
+
+        assert_eq!(restored.status, ImportPlanStatus::Restored);
+        assert_eq!(restored.restored_count, 1);
+        assert_eq!(restored.unchanged_count, 1);
+        assert_eq!(
+            fs::read(temp.path().join("memory/sage/memory.md"))?,
+            b"created"
+        );
+        assert_eq!(fs::read(existing)?, b"preexisting");
+        let visible = crate::cockpit_sources::scan_memory(temp.path())?;
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].path, "sage/notes-second.md");
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn restore_retains_a_same_byte_replacement() -> Result<()> {
+        let temp = trusted_tempdir()?;
+        let workspace = temp.path().join("workspace");
+        write_registered_familiars(temp.path(), &[("sage", &workspace)])?;
+        let sources = vec![DiscoveredSource {
+            source_label: "MEMORY.md".to_owned(),
+            bytes: b"same bytes".to_vec(),
+        }];
+        let plan = build_import_plan(
+            temp.path(),
+            "sage",
+            MemoryImportSourceKind::Native,
+            &sources,
+        )?;
+        apply_import_plan(temp.path(), &plan, &sources)?;
+        let target = temp.path().join("memory/sage/memory.md");
+        fs::remove_file(&target)?;
+        fs::write(&target, b"same bytes")?;
+
+        let restored = restore_import_bundle(temp.path(), "sage", &plan.bundle_id)?;
+
+        assert_eq!(restored.status, ImportPlanStatus::ManualRecovery);
+        assert_eq!(restored.restored_count, 0);
+        assert_eq!(restored.conflict_count, 1);
+        assert_eq!(fs::read(target)?, b"same bytes");
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn invalidated_restore_cannot_reactivate_a_same_byte_replacement() -> Result<()> {
+        let temp = trusted_tempdir()?;
+        let workspace = temp.path().join("workspace");
+        write_registered_familiars(temp.path(), &[("sage", &workspace)])?;
+        let sources = vec![DiscoveredSource {
+            source_label: "MEMORY.md".to_owned(),
+            bytes: b"same bytes".to_vec(),
+        }];
+        let plan = build_import_plan(
+            temp.path(),
+            "sage",
+            MemoryImportSourceKind::Native,
+            &sources,
+        )?;
+        apply_import_plan(temp.path(), &plan, &sources)?;
+        restore_import_bundle(temp.path(), "sage", &plan.bundle_id)?;
+        let target = temp.path().join("memory/sage/memory.md");
+        fs::remove_file(&target)?;
+        fs::write(&target, b"same bytes")?;
+        let invalidated = restore_import_bundle(temp.path(), "sage", &plan.bundle_id)?;
+        assert_eq!(invalidated.status, ImportPlanStatus::ManualRecovery);
+        let reactivation_plan = build_import_plan(
+            temp.path(),
+            "sage",
+            MemoryImportSourceKind::Native,
+            &sources,
+        )?;
+
+        let error = apply_import_plan(temp.path(), &reactivation_plan, &sources)
+            .expect_err("invalidated restore provenance must block reactivation");
+
+        assert!(error.to_string().contains("manual recovery"), "{error:#}");
+        assert_eq!(fs::read(target)?, b"same bytes");
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn reactivation_revalidates_restore_provenance_before_transition() -> Result<()> {
+        let temp = trusted_tempdir()?;
+        let workspace = temp.path().join("workspace");
+        write_registered_familiars(temp.path(), &[("sage", &workspace)])?;
+        let sources = vec![DiscoveredSource {
+            source_label: "MEMORY.md".to_owned(),
+            bytes: b"same bytes".to_vec(),
+        }];
+        let plan = build_import_plan(
+            temp.path(),
+            "sage",
+            MemoryImportSourceKind::Native,
+            &sources,
+        )?;
+        apply_import_plan(temp.path(), &plan, &sources)?;
+        restore_import_bundle(temp.path(), "sage", &plan.bundle_id)?;
+        let target = temp.path().join("memory/sage/memory.md");
+        fs::remove_file(&target)?;
+        fs::write(&target, b"same bytes")?;
+        let reactivation_plan = build_import_plan(
+            temp.path(),
+            "sage",
+            MemoryImportSourceKind::Native,
+            &sources,
+        )?;
+
+        let error = apply_import_plan(temp.path(), &reactivation_plan, &sources)
+            .expect_err("reactivation must revalidate retained restore evidence");
+
+        assert!(error.to_string().contains("manual recovery"), "{error:#}");
+        let restored = restore_import_bundle(temp.path(), "sage", &plan.bundle_id)?;
+        assert_eq!(restored.status, ImportPlanStatus::ManualRecovery);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn restore_resumes_after_marker_before_journal_append() -> Result<()> {
+        let temp = trusted_tempdir()?;
+        let workspace = temp.path().join("workspace");
+        write_registered_familiars(temp.path(), &[("sage", &workspace)])?;
+        let sources = vec![DiscoveredSource {
+            source_label: "MEMORY.md".to_owned(),
+            bytes: b"remove once".to_vec(),
+        }];
+        let plan = build_import_plan(
+            temp.path(),
+            "sage",
+            MemoryImportSourceKind::Native,
+            &sources,
+        )?;
+        apply_import_plan(temp.path(), &plan, &sources)?;
+        let mut interrupted = false;
+        let mut hook = TestRestoreHook::new(|step: &RestoreStep| {
+            if !interrupted
+                && matches!(
+                    step,
+                    RestoreStep::AfterVerifyBeforeJournal(name) if name == "memory.md"
+                )
+            {
+                interrupted = true;
+                return Ok(RestoreHookAction::Interrupt);
+            }
+            Ok(RestoreHookAction::Continue)
+        });
+
+        restore_import_bundle_with_hook(temp.path(), "sage", &plan.bundle_id, &mut hook)
+            .expect_err("restore must interrupt after removal");
+        assert!(interrupted);
+        assert_eq!(
+            fs::read(temp.path().join("memory/sage/memory.md"))?,
+            b"remove once"
+        );
+
+        let restored = restore_import_bundle(temp.path(), "sage", &plan.bundle_id)?;
+
+        assert_eq!(restored.status, ImportPlanStatus::Restored);
+        assert_eq!(restored.restored_count, 1);
+        assert_eq!(restored.conflict_count, 0);
+        assert_eq!(crate::cockpit_sources::scan_memory(temp.path())?.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn restore_preserves_a_replacement_raced_before_marker() -> Result<()> {
+        let temp = trusted_tempdir()?;
+        let workspace = temp.path().join("workspace");
+        write_registered_familiars(temp.path(), &[("sage", &workspace)])?;
+        let sources = vec![DiscoveredSource {
+            source_label: "MEMORY.md".to_owned(),
+            bytes: b"same bytes".to_vec(),
+        }];
+        let plan = build_import_plan(
+            temp.path(),
+            "sage",
+            MemoryImportSourceKind::Native,
+            &sources,
+        )?;
+        apply_import_plan(temp.path(), &plan, &sources)?;
+        let target = temp.path().join("memory/sage/memory.md");
+        let mut raced = false;
+        let mut hook = TestRestoreHook::new(|step: &RestoreStep| {
+            if !raced && matches!(step, RestoreStep::BeforeMarker(name) if name == "memory.md") {
+                raced = true;
+                fs::remove_file(&target)?;
+                fs::write(&target, b"same bytes")?;
+            }
+            Ok(RestoreHookAction::Continue)
+        });
+
+        let restored =
+            restore_import_bundle_with_hook(temp.path(), "sage", &plan.bundle_id, &mut hook)?;
+
+        assert!(raced);
+        assert_eq!(restored.status, ImportPlanStatus::ManualRecovery);
+        assert_eq!(restored.conflict_count, 1);
+        assert_eq!(fs::read(target)?, b"same bytes");
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn restore_reports_manual_recovery_when_target_disappears_before_marker() -> Result<()> {
+        let temp = trusted_tempdir()?;
+        let workspace = temp.path().join("workspace");
+        write_registered_familiars(temp.path(), &[("sage", &workspace)])?;
+        let sources = vec![DiscoveredSource {
+            source_label: "MEMORY.md".to_owned(),
+            bytes: b"remove race".to_vec(),
+        }];
+        let plan = build_import_plan(
+            temp.path(),
+            "sage",
+            MemoryImportSourceKind::Native,
+            &sources,
+        )?;
+        apply_import_plan(temp.path(), &plan, &sources)?;
+        let target = temp.path().join("memory/sage/memory.md");
+        let mut raced = false;
+        let mut hook = TestRestoreHook::new(|step: &RestoreStep| {
+            if !raced && matches!(step, RestoreStep::BeforeMarker(name) if name == "memory.md") {
+                raced = true;
+                fs::remove_file(&target)?;
+            }
+            Ok(RestoreHookAction::Continue)
+        });
+
+        let restored =
+            restore_import_bundle_with_hook(temp.path(), "sage", &plan.bundle_id, &mut hook)?;
+
+        assert!(raced);
+        assert_eq!(restored.status, ImportPlanStatus::ManualRecovery);
+        assert_eq!(restored.conflict_count, 1);
+        assert!(!target.exists());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn restore_reports_manual_recovery_when_target_is_edited_after_marker() -> Result<()> {
+        let temp = trusted_tempdir()?;
+        let workspace = temp.path().join("workspace");
+        write_registered_familiars(temp.path(), &[("sage", &workspace)])?;
+        let sources = vec![DiscoveredSource {
+            source_label: "MEMORY.md".to_owned(),
+            bytes: b"original".to_vec(),
+        }];
+        let plan = build_import_plan(
+            temp.path(),
+            "sage",
+            MemoryImportSourceKind::Native,
+            &sources,
+        )?;
+        apply_import_plan(temp.path(), &plan, &sources)?;
+        let target = temp.path().join("memory/sage/memory.md");
+        let mut raced = false;
+        let mut hook = TestRestoreHook::new(|step: &RestoreStep| {
+            if !raced
+                && matches!(
+                    step,
+                    RestoreStep::AfterMarkerBeforeVerify(name) if name == "memory.md"
+                )
+            {
+                raced = true;
+                fs::write(&target, b"replacement")?;
+            }
+            Ok(RestoreHookAction::Continue)
+        });
+
+        let restored =
+            restore_import_bundle_with_hook(temp.path(), "sage", &plan.bundle_id, &mut hook)?;
+
+        assert!(raced);
+        assert_eq!(restored.status, ImportPlanStatus::ManualRecovery);
+        assert_eq!(restored.conflict_count, 1);
+        assert_eq!(fs::read(target)?, b"replacement");
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn restore_revalidates_candidate_at_the_prejournal_boundary() -> Result<()> {
+        let temp = trusted_tempdir()?;
+        let workspace = temp.path().join("workspace");
+        write_registered_familiars(temp.path(), &[("sage", &workspace)])?;
+        let sources = vec![DiscoveredSource {
+            source_label: "MEMORY.md".to_owned(),
+            bytes: b"candidate race".to_vec(),
+        }];
+        let plan = build_import_plan(
+            temp.path(),
+            "sage",
+            MemoryImportSourceKind::Native,
+            &sources,
+        )?;
+        apply_import_plan(temp.path(), &plan, &sources)?;
+        let candidate = temp
+            .path()
+            .join("memory/sage")
+            .join(TARGET_WORK_DIRECTORY)
+            .join(bundle_component(&plan.bundle_id)?)
+            .join("memory.md.candidate");
+        let mut raced = false;
+        let mut hook = TestRestoreHook::new(|step: &RestoreStep| {
+            if !raced
+                && matches!(
+                    step,
+                    RestoreStep::AfterVerifyBeforeJournal(name) if name == "memory.md"
+                )
+            {
+                raced = true;
+                fs::remove_file(&candidate)?;
+            }
+            Ok(RestoreHookAction::Continue)
+        });
+
+        let restored =
+            restore_import_bundle_with_hook(temp.path(), "sage", &plan.bundle_id, &mut hook)?;
+
+        assert!(raced);
+        assert_eq!(restored.status, ImportPlanStatus::ManualRecovery);
+        assert_eq!(restored.conflict_count, 1);
+        let visible = crate::cockpit_sources::scan_memory(temp.path())?;
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].path, "sage/memory.md");
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn restore_reports_and_retains_an_edited_target() -> Result<()> {
+        let temp = trusted_tempdir()?;
+        let workspace = temp.path().join("workspace");
+        write_registered_familiars(temp.path(), &[("sage", &workspace)])?;
+        let sources = vec![DiscoveredSource {
+            source_label: "MEMORY.md".to_owned(),
+            bytes: b"original".to_vec(),
+        }];
+        let plan = build_import_plan(
+            temp.path(),
+            "sage",
+            MemoryImportSourceKind::Native,
+            &sources,
+        )?;
+        apply_import_plan(temp.path(), &plan, &sources)?;
+        let target = temp.path().join("memory/sage/memory.md");
+        fs::write(&target, b"user edit")?;
+
+        let restored = restore_import_bundle(temp.path(), "sage", &plan.bundle_id)?;
+
+        assert_eq!(restored.status, ImportPlanStatus::ManualRecovery);
+        assert_eq!(restored.conflict_count, 1);
+        assert_eq!(restored.entries[0].status, PlanEntryStatus::Conflict);
+        assert_eq!(fs::read(target)?, b"user edit");
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn restore_reports_and_retains_missing_symlinked_and_nonregular_targets() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        for case in ["missing", "symlink", "directory"] {
+            let temp = trusted_tempdir()?;
+            let workspace = temp.path().join("workspace");
+            write_registered_familiars(temp.path(), &[("sage", &workspace)])?;
+            let sources = vec![DiscoveredSource {
+                source_label: "MEMORY.md".to_owned(),
+                bytes: b"original".to_vec(),
+            }];
+            let plan = build_import_plan(
+                temp.path(),
+                "sage",
+                MemoryImportSourceKind::Native,
+                &sources,
+            )?;
+            apply_import_plan(temp.path(), &plan, &sources)?;
+            let target = temp.path().join("memory/sage/memory.md");
+            fs::remove_file(&target)?;
+            match case {
+                "missing" => {}
+                "symlink" => {
+                    let external = temp.path().join("external");
+                    fs::write(&external, b"external")?;
+                    symlink(&external, &target)?;
+                }
+                "directory" => {
+                    fs::create_dir(&target)?;
+                    fs::write(target.join("sentinel"), b"directory")?;
+                }
+                _ => unreachable!(),
+            }
+
+            let restored = restore_import_bundle(temp.path(), "sage", &plan.bundle_id)?;
+
+            assert_eq!(restored.status, ImportPlanStatus::ManualRecovery);
+            assert_eq!(restored.conflict_count, 1);
+            match case {
+                "missing" => assert!(!target.exists()),
+                "symlink" => assert!(fs::symlink_metadata(&target)?.file_type().is_symlink()),
+                "directory" => {
+                    assert_eq!(fs::read(target.join("sentinel"))?, b"directory");
+                }
+                _ => unreachable!(),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn restore_is_idempotent() -> Result<()> {
+        let temp = trusted_tempdir()?;
+        let workspace = temp.path().join("workspace");
+        write_registered_familiars(temp.path(), &[("sage", &workspace)])?;
+        let sources = vec![DiscoveredSource {
+            source_label: "MEMORY.md".to_owned(),
+            bytes: b"restore once".to_vec(),
+        }];
+        let plan = build_import_plan(
+            temp.path(),
+            "sage",
+            MemoryImportSourceKind::Native,
+            &sources,
+        )?;
+        apply_import_plan(temp.path(), &plan, &sources)?;
+
+        let first = restore_import_bundle(temp.path(), "sage", &plan.bundle_id)?;
+        let second = restore_import_bundle(temp.path(), "sage", &plan.bundle_id)?;
+
+        assert_eq!(first.status, ImportPlanStatus::Restored);
+        assert_eq!(second.status, ImportPlanStatus::Restored);
+        assert_eq!(second.restored_count, 1);
+        assert_eq!(
+            fs::read(temp.path().join("memory/sage/memory.md"))?,
+            b"restore once"
+        );
+        assert_eq!(crate::cockpit_sources::scan_memory(temp.path())?.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn restored_bundle_can_be_reactivated_and_restored_again() -> Result<()> {
+        let temp = trusted_tempdir()?;
+        let workspace = temp.path().join("workspace");
+        write_registered_familiars(temp.path(), &[("sage", &workspace)])?;
+        let sources = vec![DiscoveredSource {
+            source_label: "MEMORY.md".to_owned(),
+            bytes: b"toggle".to_vec(),
+        }];
+        let plan = build_import_plan(
+            temp.path(),
+            "sage",
+            MemoryImportSourceKind::Native,
+            &sources,
+        )?;
+        apply_import_plan(temp.path(), &plan, &sources)?;
+        restore_import_bundle(temp.path(), "sage", &plan.bundle_id)?;
+        assert!(crate::cockpit_sources::scan_memory(temp.path())?.is_empty());
+        let reactivation_plan = build_import_plan(
+            temp.path(),
+            "sage",
+            MemoryImportSourceKind::Native,
+            &sources,
+        )?;
+
+        let reactivated = apply_import_plan(temp.path(), &reactivation_plan, &sources)?;
+
+        assert_eq!(reactivated.status, ImportPlanStatus::Verified);
+        assert_eq!(reactivated.create_count, 0);
+        assert_eq!(reactivated.unchanged_count, 1);
+        assert_eq!(crate::cockpit_sources::scan_memory(temp.path())?.len(), 1);
+
+        let restored = restore_import_bundle(temp.path(), "sage", &plan.bundle_id)?;
+
+        assert_eq!(restored.status, ImportPlanStatus::Restored);
+        assert_eq!(restored.restored_count, 1);
+        assert!(crate::cockpit_sources::scan_memory(temp.path())?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn reactivation_resumes_after_bundle_transition() -> Result<()> {
+        let temp = trusted_tempdir()?;
+        let workspace = temp.path().join("workspace");
+        write_registered_familiars(temp.path(), &[("sage", &workspace)])?;
+        let sources = vec![DiscoveredSource {
+            source_label: "MEMORY.md".to_owned(),
+            bytes: b"resume toggle".to_vec(),
+        }];
+        let plan = build_import_plan(
+            temp.path(),
+            "sage",
+            MemoryImportSourceKind::Native,
+            &sources,
+        )?;
+        apply_import_plan(temp.path(), &plan, &sources)?;
+        restore_import_bundle(temp.path(), "sage", &plan.bundle_id)?;
+        {
+            let migration = open_locked_migration_familiar(temp.path(), "sage")?;
+            let bundle = open_existing_bundle(&migration, &plan.bundle_id)?;
+            let mut journal = open_or_create_journal(&bundle)?;
+            append_journal(
+                &bundle,
+                &mut journal,
+                JournalScope::Bundle,
+                JournalState::Reactivating,
+                None,
+                None,
+            )?;
+        }
+        let reactivation_plan = build_import_plan(
+            temp.path(),
+            "sage",
+            MemoryImportSourceKind::Native,
+            &sources,
+        )?;
+
+        let reactivated = apply_import_plan(temp.path(), &reactivation_plan, &sources)?;
+
+        assert_eq!(reactivated.status, ImportPlanStatus::Verified);
+        assert_eq!(reactivated.unchanged_count, 1);
+        assert_eq!(crate::cockpit_sources::scan_memory(temp.path())?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn resumed_reactivation_invalidates_changed_restore_provenance() -> Result<()> {
+        let temp = trusted_tempdir()?;
+        let workspace = temp.path().join("workspace");
+        write_registered_familiars(temp.path(), &[("sage", &workspace)])?;
+        let sources = vec![DiscoveredSource {
+            source_label: "MEMORY.md".to_owned(),
+            bytes: b"resume replacement".to_vec(),
+        }];
+        let plan = build_import_plan(
+            temp.path(),
+            "sage",
+            MemoryImportSourceKind::Native,
+            &sources,
+        )?;
+        apply_import_plan(temp.path(), &plan, &sources)?;
+        restore_import_bundle(temp.path(), "sage", &plan.bundle_id)?;
+        {
+            let migration = open_locked_migration_familiar(temp.path(), "sage")?;
+            let bundle = open_existing_bundle(&migration, &plan.bundle_id)?;
+            let mut journal = open_or_create_journal(&bundle)?;
+            append_journal(
+                &bundle,
+                &mut journal,
+                JournalScope::Bundle,
+                JournalState::Reactivating,
+                None,
+                None,
+            )?;
+        }
+        let target = temp.path().join("memory/sage/memory.md");
+        fs::remove_file(&target)?;
+        fs::write(&target, b"resume replacement")?;
+        let reactivation_plan = build_import_plan(
+            temp.path(),
+            "sage",
+            MemoryImportSourceKind::Native,
+            &sources,
+        )?;
+
+        let error = apply_import_plan(temp.path(), &reactivation_plan, &sources)
+            .expect_err("resumed reactivation must revalidate restore provenance");
+
+        assert!(error.to_string().contains("manual recovery"), "{error:#}");
+        assert_eq!(fs::read(target)?, b"resume replacement");
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn restored_report_revalidates_marker_digest() -> Result<()> {
+        let temp = trusted_tempdir()?;
+        let workspace = temp.path().join("workspace");
+        write_registered_familiars(temp.path(), &[("sage", &workspace)])?;
+        let sources = vec![DiscoveredSource {
+            source_label: "MEMORY.md".to_owned(),
+            bytes: b"created".to_vec(),
+        }];
+        let plan = build_import_plan(
+            temp.path(),
+            "sage",
+            MemoryImportSourceKind::Native,
+            &sources,
+        )?;
+        apply_import_plan(temp.path(), &plan, &sources)?;
+        let target = temp.path().join("memory/sage/memory.md");
+        let first = restore_import_bundle(temp.path(), "sage", &plan.bundle_id)?;
+        assert_eq!(first.status, ImportPlanStatus::Restored);
+        fs::write(&target, b"replacement")?;
+
+        let second = restore_import_bundle(temp.path(), "sage", &plan.bundle_id)?;
+
+        assert_eq!(second.status, ImportPlanStatus::ManualRecovery);
+        assert_eq!(second.restored_count, 0);
+        assert_eq!(second.conflict_count, 1);
+        assert_eq!(fs::read(target)?, b"replacement");
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn canonical_reader_requires_target_bound_restore_provenance() -> Result<()> {
+        let temp = trusted_tempdir()?;
+        let workspace = temp.path().join("workspace");
+        write_registered_familiars(temp.path(), &[("sage", &workspace)])?;
+        let sources = vec![DiscoveredSource {
+            source_label: "MEMORY.md".to_owned(),
+            bytes: b"same bytes".to_vec(),
+        }];
+        let plan = build_import_plan(
+            temp.path(),
+            "sage",
+            MemoryImportSourceKind::Native,
+            &sources,
+        )?;
+        apply_import_plan(temp.path(), &plan, &sources)?;
+        restore_import_bundle(temp.path(), "sage", &plan.bundle_id)?;
+        let restored = fs::File::open(temp.path().join("memory/sage/memory.md"))?;
+        let mut marker = vec![0_u8; 1024];
+        let marker_len = rustix::fs::fgetxattr(&restored, RESTORED_XATTR, &mut marker)?;
+        marker.truncate(marker_len);
+        let unrelated_path = temp.path().join("memory/sage/unrelated.md");
+        fs::write(&unrelated_path, b"same bytes")?;
+        let unrelated = fs::File::open(&unrelated_path)?;
+        rustix::fs::fsetxattr(
+            &unrelated,
+            RESTORED_XATTR,
+            &marker,
+            rustix::fs::XattrFlags::CREATE,
+        )?;
+
+        let visible = crate::cockpit_sources::scan_memory(temp.path())?;
+
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].path, "sage/unrelated.md");
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn restore_is_isolated_to_one_familiar() -> Result<()> {
+        let temp = trusted_tempdir()?;
+        let sage_workspace = temp.path().join("sage-workspace");
+        let cody_workspace = temp.path().join("cody-workspace");
+        write_registered_familiars(
+            temp.path(),
+            &[("sage", &sage_workspace), ("cody", &cody_workspace)],
+        )?;
+        let sources = vec![DiscoveredSource {
+            source_label: "MEMORY.md".to_owned(),
+            bytes: b"sage".to_vec(),
+        }];
+        let plan = build_import_plan(
+            temp.path(),
+            "sage",
+            MemoryImportSourceKind::Native,
+            &sources,
+        )?;
+        apply_import_plan(temp.path(), &plan, &sources)?;
+        let cody = temp.path().join("memory/cody/sentinel.md");
+        fs::create_dir_all(cody.parent().expect("sentinel has parent"))?;
+        fs::write(&cody, b"cody")?;
+
+        restore_import_bundle(temp.path(), "sage", &plan.bundle_id)?;
+
+        assert_eq!(fs::read(cody)?, b"cody");
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn restore_resumes_after_interruption_after_marker_sync() -> Result<()> {
+        let temp = trusted_tempdir()?;
+        let workspace = temp.path().join("workspace");
+        write_registered_familiars(temp.path(), &[("sage", &workspace)])?;
+        let sources = vec![DiscoveredSource {
+            source_label: "MEMORY.md".to_owned(),
+            bytes: b"restore bytes".to_vec(),
+        }];
+        let plan = build_import_plan(
+            temp.path(),
+            "sage",
+            MemoryImportSourceKind::Native,
+            &sources,
+        )?;
+        apply_import_plan(temp.path(), &plan, &sources)?;
+        let target = temp.path().join("memory/sage/memory.md");
+        let mut interrupted = false;
+        let mut hook = TestRestoreHook::new(|step: &RestoreStep| {
+            if !interrupted
+                && matches!(
+                    step,
+                    RestoreStep::AfterMarkerBeforeVerify(name) if name == "memory.md"
+                )
+            {
+                interrupted = true;
+                return Ok(RestoreHookAction::Interrupt);
+            }
+            Ok(RestoreHookAction::Continue)
+        });
+
+        restore_import_bundle_with_hook(temp.path(), "sage", &plan.bundle_id, &mut hook)
+            .expect_err("restore must interrupt after marker sync");
+        assert!(interrupted);
+        assert_eq!(fs::read(&target)?, b"restore bytes");
+
+        let restored = restore_import_bundle(temp.path(), "sage", &plan.bundle_id)?;
+
+        assert_eq!(restored.status, ImportPlanStatus::Restored);
+        assert_eq!(restored.restored_count, 1);
+        assert_eq!(restored.conflict_count, 0);
+        assert_eq!(crate::cockpit_sources::scan_memory(temp.path())?.len(), 0);
         Ok(())
     }
 
