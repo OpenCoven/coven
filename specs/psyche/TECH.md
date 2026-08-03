@@ -1519,7 +1519,7 @@ Coven
 recomputes the metadata digest and streamed-byte hash. Repeating the same
 client-scoped `artifact_request_id` and request digest returns the original
 artifact; any field or byte change returns the W1-confirmed public
-intent-conflict response. Psyche verifies every echoed response field before
+intent conflict response. Psyche verifies every echoed response field before
 use. Coven expiry may shorten but never extend Psyche's requested lifetime.
 Without the capability, no media bytes or path enter Coven and the media parity
 release gate cannot pass.
