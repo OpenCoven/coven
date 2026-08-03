@@ -404,8 +404,8 @@ behavior:
   against a pinned real Coven build;
 - G8-G9 require adapter crash, fuzz, security, ambiguity, parity, and dedicated
   live-account evidence;
-- G10 requires privacy, export/restore, incident-response, migration,
-  token-rotation, and rollback drills plus a release security review with no
+- G10 requires privacy, export/restore, incident response, migration,
+  token rotation, and rollback drills plus a release security review with no
   open critical or high-severity issue; and
 - G12 requires clean-host, secret-scan, signed/checksummed artifact, SBOM,
   provenance, and distribution rollback evidence.
