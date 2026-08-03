@@ -181,6 +181,7 @@ mod tests {
         assert!(is_lock_contended(&fs2::lock_contended_error()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn anchored_exclusive_lock_stays_with_opened_home_after_path_replacement() -> Result<()> {
         let temp = tempfile::tempdir()?;
