@@ -681,6 +681,81 @@ describe("CovenAcpRuntime", () => {
     expect(events.at(-1)).toEqual({ type: "done", stopReason: "completed" });
   });
 
+  it.each(["created", "running"])(
+    "continues polling for known nonterminal harness-session status %s",
+    async (status) => {
+      const getSession = vi
+        .fn()
+        .mockResolvedValueOnce(session({ status }))
+        .mockResolvedValueOnce(session({ status: "completed", exitCode: 0 }));
+      const runtime = new CovenAcpRuntime({
+        config,
+        client: fakeClient({
+          listEvents: vi.fn(async () => []),
+          getSession,
+        }),
+        sleep: vi.fn(async () => undefined),
+      });
+      const handle = await runtime.ensureSession({
+        sessionKey: "agent:codex:test",
+        agent: "codex",
+        mode: "oneshot",
+        cwd: workspaceDir,
+      });
+
+      const events = await collect(
+        runtime.runTurn({
+          handle,
+          text: "Fix tests",
+          mode: "prompt",
+          requestId: `req-${status}`,
+        }),
+      );
+
+      expect(getSession).toHaveBeenCalledTimes(2);
+      expect(events.at(-1)).toEqual({ type: "done", stopReason: "completed" });
+    },
+  );
+
+  it.each([
+    ["failed", "error"],
+    ["killed", "cancelled"],
+    ["orphaned", "completed"],
+  ])(
+    "terminates polling for known terminal harness-session status %s",
+    async (status, stopReason) => {
+      const getSession = vi.fn(async () => session({ status }));
+      const runtime = new CovenAcpRuntime({
+        config,
+        client: fakeClient({
+          listEvents: vi.fn(async () => []),
+          getSession,
+        }),
+      });
+      const handle = await runtime.ensureSession({
+        sessionKey: "agent:codex:test",
+        agent: "codex",
+        mode: "oneshot",
+        cwd: workspaceDir,
+      });
+
+      const events = await collect(
+        runtime.runTurn({
+          handle,
+          text: "Fix tests",
+          mode: "prompt",
+          requestId: `req-${status}`,
+        }),
+      );
+
+      expect(getSession).toHaveBeenCalledTimes(1);
+      expect(events.at(-2)).toEqual(
+        expect.objectContaining({ type: "status", text: `coven session ${status}` }),
+      );
+      expect(events.at(-1)).toEqual({ type: "done", stopReason });
+    },
+  );
+
   it.each(["future_state", "active"])(
     "fails closed on unsupported harness-session status %s",
     async (status) => {
@@ -710,6 +785,44 @@ describe("CovenAcpRuntime", () => {
       expect(events.at(-1)).toEqual({ type: "done", stopReason: "error" });
     },
   );
+
+  it("sanitizes and bounds unsupported-status logs while attempting cleanup", async () => {
+    const logger = { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() };
+    const killSession = vi.fn(async () => undefined);
+    const unsafeStatus = `future\u001b]0;spoof\u0007_state\u202e${"x".repeat(500)}`;
+    const runtime = new CovenAcpRuntime({
+      config,
+      client: fakeClient({
+        listEvents: vi.fn(async () => []),
+        getSession: vi.fn(async () => session({ status: unsafeStatus })),
+        killSession,
+      }),
+      logger,
+    });
+    const handle = await runtime.ensureSession({
+      sessionKey: "agent:codex:test",
+      agent: "codex",
+      mode: "oneshot",
+      cwd: workspaceDir,
+    });
+
+    const events = await collect(
+      runtime.runTurn({
+        handle,
+        text: "Fix tests",
+        mode: "prompt",
+        requestId: "req-unsafe-status",
+      }),
+    );
+
+    expect(killSession).toHaveBeenCalledWith("session-1", undefined);
+    expect(events.at(-1)).toEqual({ type: "done", stopReason: "error" });
+    const warning = vi.mocked(logger.warn).mock.calls[0]?.[0];
+    expect(warning).toEqual(expect.any(String));
+    expect(warning).not.toContain(unsafeStatus);
+    expect(warning).not.toMatch(/[\u001b\u0007\u202e\r\n]/u);
+    expect(warning?.length).toBeLessThanOrEqual(280);
+  });
 
   it("fails and kills the Coven session when the daemon returns an unsafe event id", async () => {
     const client = fakeClient({
