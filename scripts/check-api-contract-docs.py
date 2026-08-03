@@ -33,7 +33,7 @@ TERMINAL = {
 }
 LEGACY_ROUTE = "/api/v1/api-version"
 HEALTH_ROUTE = "/api/v1/health"
-LITERAL_V1 = re.compile(r'(?:"v1"|\'v1\'|`v1`)', re.IGNORECASE)
+LITERAL_V1 = re.compile(r'(?:"v1"|\'v1\'|`v1`)')
 NAMED_CONTRACT = re.compile(
     r"\bcoven\.daemon\.v1\b|\bnamed[-\s]+(?:compatibility[-\s]+)?contract\b",
     re.IGNORECASE,
@@ -78,7 +78,8 @@ def presents_legacy_route_as_named_contract(text: str) -> bool:
     # This is deliberately bounded grammar, not general NLP. A sentence naming
     # the legacy route is in scope, as is one immediate sentence that explicitly
     # refers back with a pronoun or "this route". Later prose and explicit health
-    # sentences are independent. Coordinating clauses keep negation local.
+    # sentences are independent. Coordinating clauses keep negation and health
+    # exclusions local, including statements that mention both routes.
     for paragraph in re.split(r"\n\s*\n", text):
         if LEGACY_ROUTE not in paragraph:
             continue
@@ -86,7 +87,7 @@ def presents_legacy_route_as_named_contract(text: str) -> bool:
         statements = re.split(r"(?<=[.!?])\s+(?=[A-Z`|])", normalized)
         scoped_indexes: set[int] = set()
         for index, statement in enumerate(statements):
-            if LEGACY_ROUTE not in statement or HEALTH_ROUTE in statement:
+            if LEGACY_ROUTE not in statement:
                 continue
             scoped_indexes.add(index)
             if index + 1 >= len(statements):
@@ -100,6 +101,8 @@ def presents_legacy_route_as_named_contract(text: str) -> bool:
         for index in sorted(scoped_indexes):
             statement = statements[index]
             for clause in CLAUSE_BOUNDARY.split(statement):
+                if HEALTH_ROUTE in clause and LEGACY_ROUTE not in clause:
+                    continue
                 if not NAMED_CONTRACT.search(clause):
                     continue
                 for claim in CONTRACT_CLAIM.finditer(clause):

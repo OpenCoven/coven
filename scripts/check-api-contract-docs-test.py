@@ -98,6 +98,22 @@ Archive visibility is stored separately in `archived_at`.
                     errors,
                 )
 
+    def test_rejects_uppercase_quoted_and_backticked_v1(self) -> None:
+        for token in ('"V1"', "`V1`"):
+            with self.subTest(token=token):
+                documents = self.canonical_documents()
+                documents["docs/reference/api-contract.md"] = documents[
+                    "docs/reference/api-contract.md"
+                ].replace("literal `v1`", f"literal {token}")
+                errors = module.validate_documents(documents)
+                self.assertTrue(
+                    any(
+                        "legacy route explanation is missing" in error
+                        for error in errors
+                    ),
+                    errors,
+                )
+
     def test_rejects_api_version_route_as_compatibility_handshake(self) -> None:
         documents = self.canonical_documents()
         self.replace_legacy_explanation(
@@ -290,6 +306,26 @@ Archive visibility is stored separately in `archived_at`.
             ),
         )
         self.assertEqual(module.validate_documents(documents), [])
+
+    def test_rejects_same_statement_legacy_health_contradiction(self) -> None:
+        documents = self.canonical_documents()
+        self.replace_legacy_explanation(
+            documents,
+            "docs/reference/api-contract.md",
+            (
+                "`GET /api/v1/api-version`, not `GET /api/v1/health`, is the "
+                "`coven.daemon.v1` compatibility handshake and returns legacy "
+                "route-family literal `v1`."
+            ),
+        )
+        errors = module.validate_documents(documents)
+        self.assertTrue(
+            any(
+                "legacy route presented as named-contract handshake" in error
+                for error in errors
+            ),
+            errors,
+        )
 
     def test_requires_health_handshake_in_every_contract_guide(self) -> None:
         documents = self.canonical_documents()
