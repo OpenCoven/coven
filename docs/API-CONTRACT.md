@@ -1177,8 +1177,10 @@ Shared non-success responses use the structured error envelope:
 
 1. Call `GET /api/v1/health`.
 2. Verify `apiVersion === "coven.daemon.v1"` and `capabilities.structuredErrors === true`.
-3. Check `capabilities.eventCursor === "sequence"` before using `afterSeq` pagination.
-4. Only then depend on the documented `v1` sessions/events shapes.
+3. Verify `capabilities.sessions === true` before session requests and
+   `capabilities.events === true` before event requests.
+4. Check `capabilities.eventCursor === "sequence"` before using `afterSeq` pagination.
+5. Only then depend on the documented `v1` sessions/events shapes.
 
 ## Scope boundary
 
