@@ -30,7 +30,7 @@ const DEFAULT_HARNESSES: Record<string, string> = {
   claude: "claude",
   "claude-cli": "claude",
 };
-const SUPPORTED_COVEN_API_VERSION = "v1";
+const SUPPORTED_COVEN_API_CONTRACT = "coven.daemon.v1";
 const HEALTH_CHECK_TIMEOUT_MS = 5_000;
 const MAX_COVEN_PROMPT_BYTES = 500_000;
 const MIN_POLL_INTERVAL_MS = 25;
@@ -51,6 +51,11 @@ type CovenRuntimeSessionState = {
   agent: string;
   mode: string;
   sessionMode?: string;
+};
+
+type HealthCompatibilityError = {
+  code: "COVEN_UNSUPPORTED_API_VERSION" | "COVEN_UNSUPPORTED_CAPABILITY";
+  detail: string;
 };
 
 type CovenAcpRuntimeParams = {
@@ -277,17 +282,40 @@ function terminalStatusEvent(session: CovenSessionRecord): AcpRuntimeEvent {
   };
 }
 
-function unsupportedApiVersionDetail(health: CovenHealthResponse): string | null {
-  if (health.apiVersion !== SUPPORTED_COVEN_API_VERSION) {
-    const actual =
-      typeof health.apiVersion === "string" && health.apiVersion ? health.apiVersion : "missing";
-    return `expected apiVersion ${SUPPORTED_COVEN_API_VERSION}, got ${actual}`;
+function healthCompatibilityError(health: CovenHealthResponse): HealthCompatibilityError | null {
+  if (health.apiVersion !== SUPPORTED_COVEN_API_CONTRACT) {
+    const actual = typeof health.apiVersion === "string" ? health.apiVersion : "missing";
+    return {
+      code: "COVEN_UNSUPPORTED_API_VERSION",
+      detail: `expected apiVersion ${SUPPORTED_COVEN_API_CONTRACT}, got ${actual}; upgrade Coven to a compatible version`,
+    };
   }
-  if (
-    !Array.isArray(health.supportedApiVersions) ||
-    !health.supportedApiVersions.includes(SUPPORTED_COVEN_API_VERSION)
-  ) {
-    return `expected supportedApiVersions to include ${SUPPORTED_COVEN_API_VERSION}`;
+  if (health.capabilities?.sessions !== true) {
+    return {
+      code: "COVEN_UNSUPPORTED_CAPABILITY",
+      detail:
+        "expected capabilities.sessions to be true; upgrade Coven to a compatible version",
+    };
+  }
+  if (health.capabilities.events !== true) {
+    return {
+      code: "COVEN_UNSUPPORTED_CAPABILITY",
+      detail: "expected capabilities.events to be true; upgrade Coven to a compatible version",
+    };
+  }
+  if (health.capabilities.eventCursor !== "sequence") {
+    return {
+      code: "COVEN_UNSUPPORTED_CAPABILITY",
+      detail:
+        "expected capabilities.eventCursor to be sequence; upgrade Coven to a compatible version",
+    };
+  }
+  if (health.capabilities.structuredErrors !== true) {
+    return {
+      code: "COVEN_UNSUPPORTED_CAPABILITY",
+      detail:
+        "expected capabilities.structuredErrors to be true; upgrade Coven to a compatible version",
+    };
   }
   return null;
 }
@@ -316,13 +344,15 @@ export class CovenAcpRuntime implements AcpRuntime {
   ): Promise<AcpRuntimeHandle> {
     const agent = normalizeAgentId(input.agent);
     this.resolveHarness(agent);
-    if (!(await this.isCovenAvailable())) {
+    try {
+      await this.requireCovenCompatibility();
+    } catch (error) {
       if (!this.config.allowFallback) {
-        throw new AcpRuntimeError(
-          "ACP_BACKEND_UNAVAILABLE",
-          "Coven is unavailable and fallback is disabled.",
-        );
+        throw error;
       }
+      this.logger?.warn(
+        `coven compatibility check failed; falling back to ${this.config.fallbackBackend}: ${sanitizeErrorText(error)}`,
+      );
       return await this.ensureFallbackSession(input);
     }
     return {
@@ -355,6 +385,7 @@ export class CovenAcpRuntime implements AcpRuntime {
     let session: CovenSessionRecord | undefined;
     let sessionId: string;
     try {
+      await this.requireCovenCompatibility(input.signal);
       const prompt = boundedCovenPrompt(input.text);
       session = await this.client.launchSession(
         {
@@ -514,16 +545,19 @@ export class CovenAcpRuntime implements AcpRuntime {
   async doctor(): Promise<AcpRuntimeDoctorReport> {
     try {
       const health = await this.client.health();
-      const unsupportedApiVersion = unsupportedApiVersionDetail(health);
-      if (unsupportedApiVersion) {
+      const compatibilityError = healthCompatibilityError(health);
+      if (compatibilityError) {
         return {
           ok: false,
-          code: "COVEN_UNSUPPORTED_API_VERSION",
-          message: "Coven daemon API version is not supported.",
-          details: [unsupportedApiVersion],
+          code: compatibilityError.code,
+          message:
+            compatibilityError.code === "COVEN_UNSUPPORTED_API_VERSION"
+              ? "Coven daemon API version is not supported."
+              : "Coven daemon capability is not supported.",
+          details: [compatibilityError.detail],
         };
       }
-      return health.ok
+      return health.ok === true
         ? { ok: true, message: "Coven daemon is reachable." }
         : { ok: false, code: "COVEN_UNHEALTHY", message: "Coven daemon did not report healthy." };
     } catch (error) {
@@ -565,7 +599,24 @@ export class CovenAcpRuntime implements AcpRuntime {
     await fallback?.prepareFreshSession?.(input);
   }
 
-  private async isCovenAvailable(): Promise<boolean> {
+  private async requireCovenCompatibility(signal?: AbortSignal): Promise<void> {
+    if (signal) {
+      const health = await this.client.health(signal);
+      const compatibilityError = healthCompatibilityError(health);
+      if (compatibilityError) {
+        throw new AcpRuntimeError(
+          "ACP_BACKEND_UNAVAILABLE",
+          `Coven compatibility check failed: ${compatibilityError.detail}`,
+        );
+      }
+      if (health.ok !== true) {
+        throw new AcpRuntimeError(
+          "ACP_BACKEND_UNAVAILABLE",
+          "Coven daemon did not report healthy.",
+        );
+      }
+      return;
+    }
     const controller = new AbortController();
     const timeout = setTimeout(
       () => controller.abort(new Error("Coven health check timed out")),
@@ -573,9 +624,19 @@ export class CovenAcpRuntime implements AcpRuntime {
     );
     try {
       const health = await this.client.health(controller.signal);
-      return health.ok && unsupportedApiVersionDetail(health) === null;
-    } catch {
-      return false;
+      const compatibilityError = healthCompatibilityError(health);
+      if (compatibilityError) {
+        throw new AcpRuntimeError(
+          "ACP_BACKEND_UNAVAILABLE",
+          `Coven compatibility check failed: ${compatibilityError.detail}`,
+        );
+      }
+      if (health.ok !== true) {
+        throw new AcpRuntimeError(
+          "ACP_BACKEND_UNAVAILABLE",
+          "Coven daemon did not report healthy.",
+        );
+      }
     } finally {
       clearTimeout(timeout);
     }

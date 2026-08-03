@@ -25,22 +25,18 @@ export type CovenEventRecord = {
 };
 
 export type CovenHealthCapabilities = {
-  sessions: boolean;
-  events: boolean;
-  eventCursor: string;
-  structuredErrors: boolean;
+  sessions?: unknown;
+  events?: unknown;
+  eventCursor?: unknown;
+  structuredErrors?: unknown;
 };
 
 export type CovenHealthResponse = {
-  apiVersion: string;
-  covenVersion: string;
-  capabilities: CovenHealthCapabilities;
-  ok: boolean;
-  daemon?: {
-    pid: number;
-    startedAt: string;
-    socket: string;
-  } | null;
+  apiVersion?: unknown;
+  covenVersion?: unknown;
+  capabilities?: CovenHealthCapabilities;
+  ok?: unknown;
+  daemon?: unknown;
 };
 
 export type CovenEventsResponse = {
@@ -77,7 +73,6 @@ export type CovenListEventsOptions = {
 };
 
 const COVEN_API_URL_VERSION = "v1";
-const COVEN_API_CONTRACT_VERSION = "coven.daemon.v1";
 const COVEN_API_BASE_PATH = `/api/${COVEN_API_URL_VERSION}`;
 
 type RequestOptions = {
@@ -103,6 +98,10 @@ type SocketFingerprint = {
   uid: number;
   gid: number;
 };
+
+function isJsonRecord(value: unknown): value is JsonRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 
 export class CovenApiError extends Error {
   readonly status: number;
@@ -421,13 +420,21 @@ function requireNullableNumberField(
 
 function normalizeHealthResponse(value: unknown): CovenHealthResponse {
   const record = requireRecord(value, "Coven health");
-  if (record.apiVersion !== COVEN_API_CONTRACT_VERSION) {
-    throw new Error(`Coven API version is unsupported: ${String(record.apiVersion)}`);
-  }
-  if (typeof record.ok !== "boolean") {
-    throw new Error("Coven response field ok is invalid");
-  }
-  return record as CovenHealthResponse;
+  const capabilities = isJsonRecord(record.capabilities) ? record.capabilities : undefined;
+  return {
+    apiVersion: record.apiVersion,
+    covenVersion: record.covenVersion ?? record.coven_version,
+    capabilities: capabilities
+      ? {
+          sessions: capabilities.sessions,
+          events: capabilities.events,
+          eventCursor: capabilities.eventCursor ?? capabilities.event_cursor,
+          structuredErrors: capabilities.structuredErrors ?? capabilities.structured_errors,
+        }
+      : undefined,
+    ok: record.ok,
+    daemon: record.daemon,
+  };
 }
 
 function normalizeSessionRecord(value: unknown): CovenSessionRecord {

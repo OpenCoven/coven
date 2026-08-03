@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, expectTypeOf, it } from "vitest";
 import { __testing, CovenApiError, createCovenClient } from "./client.js";
 
 let tmpDir: string;
@@ -61,8 +61,49 @@ describe("createCovenClient", () => {
         const health = await createCovenClient(socketPath).health();
         expect(health.ok).toBe(true);
         expect(health.apiVersion).toBe("coven.daemon.v1");
-        expect(health.capabilities.structuredErrors).toBe(true);
+        expect(health.capabilities?.structuredErrors).toBe(true);
         expect(health.daemon).toBeNull();
+      },
+    );
+  });
+
+  it("preserves health contract fields as untrusted wire values", async () => {
+    await withServer(
+      (_req, res) => {
+        res.setHeader("Content-Type", "application/json");
+        res.end(
+          JSON.stringify({
+            apiVersion: "coven.daemon.v1",
+            ok: true,
+            capabilities: {
+              sessions: true,
+              events: false,
+              eventCursor: "offset",
+              structuredErrors: "yes",
+            },
+          }),
+        );
+      },
+      async (socketPath) => {
+        const health = await createCovenClient(socketPath).health();
+
+        expect(health).toEqual({
+          apiVersion: "coven.daemon.v1",
+          covenVersion: undefined,
+          capabilities: {
+            sessions: true,
+            events: false,
+            eventCursor: "offset",
+            structuredErrors: "yes",
+          },
+          ok: true,
+          daemon: undefined,
+        });
+        expectTypeOf(health.apiVersion).toEqualTypeOf<unknown>();
+        expectTypeOf(health.capabilities?.sessions).toEqualTypeOf<unknown>();
+        expectTypeOf(health.capabilities?.events).toEqualTypeOf<unknown>();
+        expectTypeOf(health.capabilities?.eventCursor).toEqualTypeOf<unknown>();
+        expectTypeOf(health.capabilities?.structuredErrors).toEqualTypeOf<unknown>();
       },
     );
   });
