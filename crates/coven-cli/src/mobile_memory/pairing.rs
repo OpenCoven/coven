@@ -27,6 +27,7 @@ pub struct PendingPairing {
     pub host_confirmed: bool,
     pub device_confirmed: bool,
     pub consumed: bool,
+    pub completed: Option<MobilePairedDevice>,
 }
 
 #[derive(Debug, Clone)]
@@ -54,7 +55,10 @@ pub struct EnrolledPairing {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PairingProgress {
     Pending,
-    Complete(MobilePairedDevice),
+    Complete {
+        device: MobilePairedDevice,
+        replayed: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,16 +102,27 @@ impl PairingManager {
         nonce: [u8; 32],
         expires_at: DateTime<Utc>,
     ) -> Result<PairingInvitation, PairingError> {
-        self.begin_pairing_with_id(Uuid::new_v4(), nonce, expires_at)
+        self.insert_pairing(Uuid::new_v4(), nonce, expires_at, Some(Utc::now()))
     }
 
+    #[cfg(test)]
     fn begin_pairing_with_id(
         &self,
         id: Uuid,
         nonce: [u8; 32],
         expires_at: DateTime<Utc>,
     ) -> Result<PairingInvitation, PairingError> {
-        let pending = PendingPairing {
+        self.insert_pairing(id, nonce, expires_at, None)
+    }
+
+    fn insert_pairing(
+        &self,
+        id: Uuid,
+        nonce: [u8; 32],
+        expires_at: DateTime<Utc>,
+        prune_before_insert: Option<DateTime<Utc>>,
+    ) -> Result<PairingInvitation, PairingError> {
+        let pairing = PendingPairing {
             id,
             nonce_hash: Sha256::digest(nonce).into(),
             expires_at,
@@ -116,16 +131,31 @@ impl PairingManager {
             host_confirmed: false,
             device_confirmed: false,
             consumed: false,
+            completed: None,
         };
-        self.pending
+        let mut pending = self
+            .pending
             .lock()
-            .map_err(|_| PairingError::InvalidRequest)?
-            .insert(id, pending);
+            .map_err(|_| PairingError::InvalidRequest)?;
+        if let Some(now) = prune_before_insert {
+            Self::prune_expired(&mut pending, now, |_| false);
+        }
+        pending.insert(id, pairing);
         Ok(PairingInvitation {
             id,
             nonce,
             expires_at,
         })
+    }
+
+    fn prune_expired<F>(
+        pending: &mut HashMap<Uuid, PendingPairing>,
+        now: DateTime<Utc>,
+        mut retain_expired: F,
+    ) where
+        F: FnMut(&PendingPairing) -> bool,
+    {
+        pending.retain(|_, pairing| pairing.expires_at > now || retain_expired(pairing));
     }
 
     pub fn enroll(
@@ -188,14 +218,20 @@ impl PairingManager {
         now: DateTime<Utc>,
     ) -> Result<EnrolledPairing, PairingError> {
         let nonce_hash: [u8; 32] = Sha256::digest(nonce).into();
-        let pairing_id = self
-            .pending
-            .lock()
-            .map_err(|_| PairingError::InvalidRequest)?
-            .values()
-            .find(|pairing| pairing.nonce_hash == nonce_hash)
-            .map(|pairing| pairing.id)
-            .ok_or(PairingError::PairingConsumed)?;
+        let pairing_id = {
+            let mut pending = self
+                .pending
+                .lock()
+                .map_err(|_| PairingError::InvalidRequest)?;
+            Self::prune_expired(&mut pending, now, |pairing| {
+                pairing.nonce_hash == nonce_hash
+            });
+            pending
+                .values()
+                .find(|pairing| pairing.nonce_hash == nonce_hash)
+                .map(|pairing| pairing.id)
+                .ok_or(PairingError::PairingConsumed)?
+        };
         self.enroll(pairing_id, nonce, request, host_fingerprint, now)
     }
 
@@ -259,8 +295,16 @@ impl PairingManager {
             .ok_or(PairingError::PairingConfirmationRequired)?;
         let expected = phrase_for_hash(transcript_hash);
         if phrase != expected {
-            pending.remove(&pairing_id);
+            if pairing.completed.is_none() {
+                pending.remove(&pairing_id);
+            }
             return Err(PairingError::PairingPhraseMismatch);
+        }
+        if let Some(device) = &pairing.completed {
+            return Ok(PairingProgress::Complete {
+                device: device.clone(),
+                replayed: true,
+            });
         }
         if host {
             pairing.host_confirmed = true;
@@ -285,13 +329,18 @@ impl PairingManager {
         self.registry
             .register(record.clone())
             .map_err(|_| PairingError::InvalidRequest)?;
-        pending.remove(&pairing_id);
-        Ok(PairingProgress::Complete(MobilePairedDevice {
+        let completed = MobilePairedDevice {
             id: record.id,
             display_name: record.display_name,
             paired_at: record.paired_at,
             scopes: vec![MobileDeviceScope::MemoryRead],
-        }))
+        };
+        pairing.device = None;
+        pairing.completed = Some(completed.clone());
+        Ok(PairingProgress::Complete {
+            device: completed,
+            replayed: false,
+        })
     }
 }
 
@@ -403,6 +452,19 @@ mod tests {
     use rand::random;
     use std::collections::HashSet;
 
+    fn assert_complete(progress: PairingProgress, replayed: bool) -> MobilePairedDevice {
+        match progress {
+            PairingProgress::Complete {
+                device,
+                replayed: actual,
+            } => {
+                assert_eq!(actual, replayed);
+                device
+            }
+            PairingProgress::Pending => panic!("expected pairing completion"),
+        }
+    }
+
     struct PairingHarness {
         _temp: tempfile::TempDir,
         manager: PairingManager,
@@ -505,10 +567,15 @@ mod tests {
             harness.confirm_host(&pending.phrase),
             PairingProgress::Pending
         );
-        assert!(matches!(
-            harness.confirm_device(&pending.phrase),
-            PairingProgress::Complete(_)
-        ));
+        assert_eq!(
+            assert_complete(harness.confirm_device(&pending.phrase), false),
+            MobilePairedDevice {
+                id: harness.devices()[0].id,
+                display_name: "Synthetic phone".to_owned(),
+                paired_at: harness.now,
+                scopes: vec![MobileDeviceScope::MemoryRead],
+            }
+        );
     }
 
     #[test]
@@ -522,6 +589,176 @@ mod tests {
             harness.enroll_with_nonce([7; 32]).unwrap_err(),
             PairingError::PairingConsumed
         );
+    }
+
+    #[test]
+    fn incomplete_pairing_mismatch_invalidates_the_retry_window() {
+        let harness = PairingHarness::new();
+        let pending = harness.enroll();
+        let mut wrong_phrase = pending.phrase.clone();
+        wrong_phrase[0] = "wrong".to_owned();
+
+        assert_eq!(
+            harness
+                .manager
+                .confirm_host(harness.pairing_id, &wrong_phrase, harness.now)
+                .unwrap_err(),
+            PairingError::PairingPhraseMismatch
+        );
+        assert_eq!(
+            harness
+                .manager
+                .confirm_host(harness.pairing_id, &pending.phrase, harness.now)
+                .unwrap_err(),
+            PairingError::PairingConsumed
+        );
+        assert!(harness.devices().is_empty());
+    }
+
+    #[test]
+    fn device_confirmation_retry_reuses_completed_device() {
+        let harness = PairingHarness::new();
+        let pending = harness.enroll();
+
+        assert_eq!(
+            harness.confirm_device(&pending.phrase),
+            PairingProgress::Pending
+        );
+        let device = assert_complete(harness.confirm_host(&pending.phrase), false);
+        let replay = assert_complete(harness.confirm_device(&pending.phrase), true);
+
+        assert_eq!(replay, device);
+        assert_eq!(harness.devices().len(), 1);
+    }
+
+    #[test]
+    fn host_confirmation_retry_reuses_completed_device() {
+        let harness = PairingHarness::new();
+        let pending = harness.enroll();
+
+        assert_eq!(
+            harness.confirm_host(&pending.phrase),
+            PairingProgress::Pending
+        );
+        let device = assert_complete(harness.confirm_device(&pending.phrase), false);
+        let replay = assert_complete(harness.confirm_host(&pending.phrase), true);
+
+        assert_eq!(replay, device);
+        assert_eq!(harness.devices().len(), 1);
+    }
+
+    #[test]
+    fn completed_pairing_rejects_wrong_phrase_but_keeps_retry_window() {
+        let harness = PairingHarness::new();
+        let pending = harness.enroll();
+
+        assert_eq!(
+            harness.confirm_host(&pending.phrase),
+            PairingProgress::Pending
+        );
+        let device = assert_complete(harness.confirm_device(&pending.phrase), false);
+        let mut wrong_phrase = pending.phrase.clone();
+        wrong_phrase[0] = "wrong".to_owned();
+
+        assert_eq!(
+            harness
+                .manager
+                .confirm_host(harness.pairing_id, &wrong_phrase, harness.now)
+                .unwrap_err(),
+            PairingError::PairingPhraseMismatch
+        );
+        assert_eq!(
+            assert_complete(harness.confirm_host(&pending.phrase), true),
+            device
+        );
+        assert_eq!(harness.devices().len(), 1);
+    }
+
+    #[test]
+    fn completed_pairing_retry_expires_on_original_deadline() {
+        let harness = PairingHarness::new();
+        let pending = harness.enroll();
+
+        assert_eq!(
+            harness.confirm_host(&pending.phrase),
+            PairingProgress::Pending
+        );
+        let device = assert_complete(harness.confirm_device(&pending.phrase), false);
+        assert_eq!(
+            assert_complete(harness.confirm_host(&pending.phrase), true),
+            device
+        );
+
+        assert_eq!(
+            harness
+                .manager
+                .confirm_device(
+                    harness.pairing_id,
+                    &pending.phrase,
+                    harness.now + Duration::minutes(6),
+                )
+                .unwrap_err(),
+            PairingError::PairingExpired
+        );
+        assert_eq!(harness.devices().len(), 1);
+    }
+
+    #[test]
+    fn later_pairing_operations_prune_expired_completed_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = Arc::new(DeviceRegistry::load(temp.path()).unwrap());
+        let manager = PairingManager::new(registry);
+        let pairing_id = Uuid::from_u128(1);
+        let expired_now = Utc::now() - Duration::minutes(6);
+        let pairing_nonce = [7; 32];
+        let signing_key = p256::SecretKey::from_slice(&[1; 32]).unwrap();
+        let public_key = signing_key.public_key().to_encoded_point(false);
+        let request = MobilePairingRequest {
+            protocol_version: MOBILE_PROTOCOL_VERSION,
+            pairing_nonce: URL_SAFE_NO_PAD.encode(pairing_nonce),
+            device_name: "Synthetic phone".to_owned(),
+            device_public_key: URL_SAFE_NO_PAD.encode(public_key.as_bytes()),
+            app_version: "1.0.0".to_owned(),
+            supported_protocol: super::super::contract::MobileProtocolRange {
+                minimum: 1,
+                maximum: 1,
+            },
+        };
+        manager
+            .begin_pairing_with_id(
+                pairing_id,
+                pairing_nonce,
+                expired_now + Duration::minutes(5),
+            )
+            .unwrap();
+        let enrolled = manager
+            .enroll(pairing_id, pairing_nonce, request, [3; 32], expired_now)
+            .unwrap();
+        assert_eq!(
+            manager
+                .confirm_host(pairing_id, &enrolled.phrase, expired_now)
+                .unwrap(),
+            PairingProgress::Pending
+        );
+        assert!(matches!(
+            manager
+                .confirm_device(pairing_id, &enrolled.phrase, expired_now)
+                .unwrap(),
+            PairingProgress::Complete {
+                replayed: false,
+                ..
+            }
+        ));
+        assert_eq!(manager.pending.lock().unwrap().len(), 1);
+
+        let next = manager
+            .begin_pairing([9; 32], Utc::now() + Duration::minutes(5))
+            .unwrap();
+
+        assert_eq!(manager.pending.lock().unwrap().len(), 1);
+        assert!(manager.pending.lock().unwrap().contains_key(&next.id));
+        assert!(!manager.pending.lock().unwrap().contains_key(&pairing_id));
+        assert_eq!(manager.registry.list_status().unwrap().len(), 1);
     }
 
     #[test]

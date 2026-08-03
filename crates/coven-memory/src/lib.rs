@@ -9,6 +9,7 @@ pub mod db;
 pub mod embed;
 pub mod index;
 pub mod ingest;
+pub mod promotion;
 
 use std::path::PathBuf;
 
