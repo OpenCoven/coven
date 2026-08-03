@@ -4,7 +4,7 @@
 
 **Goal:** Make PR #568 pass stable Windows compilation and parallel Ubuntu workspace tests without changing memory migration production behavior.
 
-**Architecture:** Remove a test-only Windows identity helper whose callers are already Unix-only. Add one test-only mutex shared by migration unit fixtures and the canonical reader migration regression, with the guard lifetime tied to each temporary fixture.
+**Architecture:** Remove a test-only Windows identity helper whose callers are already Unix-only. Keep private-directory permission changes capability-relative so `cap-std` can safely handle Linux `O_PATH` directory descriptors.
 
 **Tech Stack:** Rust, `std::sync`, `tempfile`, Cargo test harness, GitHub Actions
 
@@ -39,8 +39,8 @@ fn opened_metadata_stable_std(before: &fs::Metadata, after: &fs::Metadata) -> bo
 }
 ```
 
-Delete the `#[cfg(windows)]` and `#[cfg(not(any(unix, windows)))]` variants.
-Do not change the production `windows_opened_file_identity` function.
+Delete the `#[cfg(windows)]` variant. Retain the generic fallback and do not
+change the production `windows_opened_file_identity` function.
 
 - [ ] **Step 3: Verify stable Windows compilation**
 
@@ -67,129 +67,57 @@ git commit -s -m "fix(memory): keep Windows tests on stable Rust" \
   -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 ```
 
-### Task 2: Serialize only migration filesystem fixtures
+### Task 2: Harden private directories through the pinned capability
 
 **Files:**
-- Modify: `crates/coven-cli/src/memory_import.rs:1-30`
-- Modify: `crates/coven-cli/src/memory_import.rs:4583-4595`
-- Modify: `crates/coven-cli/src/memory_import.rs:8730-8745`
-- Modify: `crates/coven-cli/src/cockpit_sources.rs:1445-1455`
+- Modify: `crates/coven-cli/src/memory_import.rs:2100-2112`
 
-- [ ] **Step 1: Reproduce resource contention with the focused suite**
+- [ ] **Step 1: Confirm the Linux-specific failure shape**
 
 Run:
 
 ```bash
-(ulimit -n 256; cargo test -p coven-cli --bin coven --locked memory_import::tests -- --test-threads=8)
+gh run view 30780788323 --job 91584868249 --log-failed
 ```
 
-Expected before the repair: one or more tests fail during private-directory
-setup or before their apply hook runs. Record the exact failure. If the host
-does not reproduce GitHub's limit, continue using the hosted failure evidence:
-61 related failures headed by `unable to secure private import directory`.
+Expected before the repair: the first apply test and every later test that
+creates a private import directory fail, while discovery-only tests pass.
 
-- [ ] **Step 2: Add the shared test-only guard**
+- [ ] **Step 2: Use the capability-relative permission API**
 
-Near the top-level imports in `memory_import.rs`, add:
+Replace `secure_private_directory_handle` with:
 
 ```rust
-#[cfg(all(test, unix))]
-use std::sync::{Mutex, MutexGuard, OnceLock};
+#[cfg(unix)]
+fn secure_private_directory_handle(directory: &Dir) -> Result<()> {
+    use cap_std::fs::PermissionsExt;
 
-#[cfg(all(test, unix))]
-static MEMORY_IMPORT_TEST_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-
-#[cfg(all(test, unix))]
-pub(crate) fn acquire_memory_import_test_guard() -> MutexGuard<'static, ()> {
-    MEMORY_IMPORT_TEST_GUARD
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    directory
+        .set_permissions(".", cap_std::fs::Permissions::from_mode(0o700))
+        .map_err(|_| anyhow!("unable to secure private import directory"))
 }
 ```
 
-The mutex contains no protected data, so recovering a poisoned guard is safe
-and prevents one assertion panic from cascading into later tests.
+This keeps the operation relative to the pinned directory. On Linux,
+`cap-std` handles `O_PATH` by reopening safely through its capability root.
 
-- [ ] **Step 3: Bind the guard to trusted temporary-directory lifetime**
-
-In the `memory_import` test module, replace the `tempfile::TempDir` return type
-with this wrapper:
-
-```rust
-struct TrustedTempDir {
-    inner: tempfile::TempDir,
-    #[cfg(unix)]
-    _guard: MutexGuard<'static, ()>,
-}
-
-impl TrustedTempDir {
-    fn path(&self) -> &Path {
-        self.inner.path()
-    }
-}
-
-fn trusted_tempdir() -> Result<TrustedTempDir> {
-    #[cfg(unix)]
-    let guard = acquire_memory_import_test_guard();
-
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let worktree = manifest_dir
-        .parent()
-        .and_then(Path::parent)
-        .expect("coven-cli manifest must be inside the repository");
-    let repository = worktree
-        .parent()
-        .filter(|parent| parent.file_name() == Some(std::ffi::OsStr::new(".worktrees")))
-        .and_then(Path::parent)
-        .unwrap_or(worktree);
-    let test_root = repository.join("target/m");
-    fs::create_dir_all(&test_root)?;
-    let inner = tempfile::Builder::new()
-        .prefix("m")
-        .tempdir_in(test_root)?;
-
-    Ok(TrustedTempDir {
-        inner,
-        #[cfg(unix)]
-        _guard: guard,
-    })
-}
-```
-
-Keep `inner` before `_guard` so the temporary directory is removed before the
-mutex guard is released.
-
-- [ ] **Step 4: Put the canonical reader migration regression behind the same guard**
-
-At the start of
-`cockpit_sources::tests::opened_memory_record_rechecks_logical_restore_state`,
-add:
-
-```rust
-let _migration_guard = crate::memory_import::acquire_memory_import_test_guard();
-```
-
-The test already has `#[cfg(not(windows))]`; the helper is available on its
-supported Unix CI platform.
-
-- [ ] **Step 5: Run focused tests under parallel pressure**
+- [ ] **Step 3: Run focused tests**
 
 Run:
 
 ```bash
-(ulimit -n 256; cargo test -p coven-cli --bin coven --locked memory_import::tests -- --test-threads=8)
+cargo test -p coven-cli --bin coven --locked memory_import::tests
 cargo test -p coven-cli --bin coven --locked cockpit_sources::tests
 ```
 
 Expected: both commands pass, including the stale-record logical restore
 regression.
 
-- [ ] **Step 6: Commit fixture isolation**
+- [ ] **Step 4: Commit Linux directory hardening**
 
 ```bash
-git add crates/coven-cli/src/memory_import.rs crates/coven-cli/src/cockpit_sources.rs
-git commit -s -m "test(memory): isolate migration filesystem fixtures" \
+git add crates/coven-cli/src/memory_import.rs
+git commit -s -m "fix(memory): secure Linux import directories" \
   -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 ```
 
