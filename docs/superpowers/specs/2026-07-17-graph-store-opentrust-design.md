@@ -72,7 +72,10 @@ Typed relationships between nodes:
 - `status TEXT NOT NULL DEFAULT 'active'`
 - `created_at TEXT NOT NULL`
 - `updated_at TEXT NOT NULL`
-- `UNIQUE(source_node_id, target_node_id, kind, valid_from)`
+
+Do not use a table-level `UNIQUE(source_node_id, target_node_id, kind, valid_from)`
+constraint: SQLite treats `NULL` values as distinct, so it would allow duplicate
+timeless edges. Use the paired partial unique indexes specified below.
 
 #### `graph_claims`
 
@@ -120,6 +123,16 @@ Many-to-many links from claims to evidence:
 - `created_at TEXT NOT NULL`
 - `PRIMARY KEY(claim_id, evidence_id, relation)`
 
+#### `graph_edge_evidence`
+
+Many-to-many links from edges to evidence:
+
+- `edge_id INTEGER NOT NULL REFERENCES graph_edges(id) ON DELETE CASCADE`
+- `evidence_id INTEGER NOT NULL REFERENCES graph_evidence(id) ON DELETE CASCADE`
+- `relation TEXT NOT NULL DEFAULT 'supports'`
+- `created_at TEXT NOT NULL`
+- `PRIMARY KEY(edge_id, evidence_id, relation)`
+
 #### `graph_provenance`
 
 Append-only ledger for graph writes:
@@ -156,7 +169,7 @@ Links graph targets to Ward/threads authority records:
 - `id INTEGER PRIMARY KEY`
 - `graph_target_type TEXT NOT NULL`
 - `graph_target_id INTEGER NOT NULL`
-- `ward_audit_id INTEGER NOT NULL`
+- `ward_audit_id INTEGER NOT NULL REFERENCES ward_audit(id) ON DELETE RESTRICT`
 - `relation TEXT NOT NULL`
 - `created_at TEXT NOT NULL`
 - `UNIQUE(graph_target_type, graph_target_id, ward_audit_id, relation)`
@@ -197,6 +210,8 @@ Export generation must append `graph_provenance(action='export_generated')`.
 Create these indexes in v1:
 
 - `idx_graph_nodes_kind_key ON graph_nodes(kind, stable_key)`
+- unique `uq_graph_edges_timeless ON graph_edges(source_node_id, target_node_id, kind) WHERE valid_from IS NULL`
+- unique `uq_graph_edges_versioned ON graph_edges(source_node_id, target_node_id, kind, valid_from) WHERE valid_from IS NOT NULL`
 - `idx_graph_edges_source_kind ON graph_edges(source_node_id, kind, status)`
 - `idx_graph_edges_target_kind ON graph_edges(target_node_id, kind, status)`
 - `idx_graph_edges_validity ON graph_edges(valid_from, valid_until, status)`
@@ -205,6 +220,8 @@ Create these indexes in v1:
 - `idx_graph_claims_validity ON graph_claims(valid_from, valid_until, status)`
 - `idx_graph_evidence_source ON graph_evidence(source_type, source_id)`
 - `idx_graph_evidence_session_event ON graph_evidence(session_id, event_id)`
+- `idx_graph_claim_evidence_evidence ON graph_claim_evidence(evidence_id)`
+- `idx_graph_edge_evidence_evidence ON graph_edge_evidence(evidence_id)`
 - `idx_graph_provenance_target ON graph_provenance(target_type, target_id, created_at)`
 - `idx_graph_provenance_session_event ON graph_provenance(session_id, event_id)`
 - `idx_graph_ward_links_target ON graph_ward_links(graph_target_type, graph_target_id)`
@@ -368,7 +385,9 @@ Add targeted Rust tests for:
 - idempotent `GRAPH_SCHEMA_SQL`
 - append-only triggers for `graph_provenance`
 - node upsert uniqueness by `(kind, stable_key)`
+- timeless and versioned edge uniqueness under SQLite `NULL` semantics
 - edge traversal indexes and bounded query behavior
+- edge evidence linkage and reverse evidence lookup
 - claim assertion with evidence and provenance in one transaction
 - protected-surface graph writes requiring Ward linkage or Ward edit routing
 - vector reference deletion and rebuild not deleting graph facts
@@ -380,7 +399,7 @@ Docs-only filing of this design does not require Rust tests. Implementation pull
 ## Implementation sequence
 
 1. Add `graph_store.rs` with schema, indexes, append-only triggers, and schema-version initialization.
-2. Add typed Rust helpers for graph node, edge, claim, evidence, provenance, Ward link, embedding reference, and export writes.
+2. Add typed Rust helpers for graph node, edge, claim, claim/edge evidence links, provenance, Ward link, embedding reference, and export writes.
 3. Add transaction helpers that require provenance on every graph mutation.
 4. Add daemon API request and response types and handlers.
 5. Add capability negotiation.
