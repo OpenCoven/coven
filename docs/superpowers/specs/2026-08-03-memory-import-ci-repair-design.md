@@ -53,17 +53,19 @@ helper. Production Windows identity checks continue using
 
 ### Unix test isolation
 
-Introduce a test-only `TrustedTempDir` wrapper in the memory import test module.
-On Unix it owns:
+Introduce a test-only migration fixture mutex in the memory import module so
+the canonical reader regression test can use the same gate. Add a
+`TrustedTempDir` wrapper in the memory import test module. On Unix it owns:
 
 - a guard from a static `Mutex<()>`; and
 - the underlying `tempfile::TempDir`.
 
 The wrapper exposes `path()` and drops the temporary directory before releasing
-the guard. `trusted_tempdir()` acquires the guard before creating the fixture.
-This serializes only tests that exercise the migration private-directory and
-journal machinery. Preview tests that do not use this helper and all unrelated
-workspace tests remain parallel.
+the guard. `trusted_tempdir()` acquires the guard before creating the fixture. The
+cross-module canonical reader regression test acquires the same guard before
+constructing its migration fixture. This serializes only tests that exercise
+the migration private-directory and journal machinery. Preview tests that do
+not use this helper and all unrelated workspace tests remain parallel.
 
 The mutex acquisition must recover from poisoning because an assertion panic
 must not make every later test fail without running.
