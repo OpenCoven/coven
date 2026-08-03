@@ -106,7 +106,13 @@ sequenceDiagram
     Daemon-->>Client: 200 SessionRecord
     PTY-->>Store: append output / exit events
     PTY->>Daemon: process exits with code
-    Daemon->>Store: update status=completed|failed, exit_code
+    alt non-zero exit or wait error
+      Daemon->>Store: update status=failed, exit_code
+    else clean exit with conversation_id
+      Daemon->>Store: update status=idle, exit_code
+    else clean one-shot exit
+      Daemon->>Store: update status=completed, exit_code
+    end
   end
 ```
 
