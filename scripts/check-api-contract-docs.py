@@ -101,6 +101,18 @@ NEGATED_ABSENCE_VERB = re.compile(
     r")[^.;]{0,40}\b(?:excludes?|lacks?|omits?)\b",
     re.IGNORECASE,
 )
+HEALTH_FIELD_DECLARATION_VERB = re.compile(
+    r"\b(?:returns?|contains?|includes?|exposes?|provides?)\b",
+    re.IGNORECASE,
+)
+HEALTH_FIELD_DECLARATION_NOUN = re.compile(
+    r"\b(?:response|fields?|body|payload|schema|data)\b",
+    re.IGNORECASE,
+)
+PIPELESS_TABLE_BLOCK = re.compile(
+    r"^\s*[^|\n]+\|[^|\n]+(?:\|[^|\n]+)*\s*\n"
+    r"\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+(?:\n|$)"
+)
 STRUCTURAL_ROW_MARKER = "COVEN_DOC_STRUCTURAL_ROW"
 
 
@@ -157,19 +169,20 @@ def presents_legacy_route_as_named_contract(text: str) -> bool:
 def health_advertises_supported_api_versions(text: str) -> bool:
     # Scope follows explicit health references, one immediate route-pronoun
     # continuation, and contiguous Markdown field rows introduced by either,
-    # including a field block in the immediately following paragraph. Each
-    # field-bearing clause is then classified independently, so legacy route
-    # examples and explicit removal guidance remain valid.
+    # including a field block immediately following an explicit response-field
+    # opener. Each field-bearing clause is then classified independently, so
+    # legacy route examples and explicit removal guidance remain valid.
     pending_health_field_block = False
     for paragraph in re.split(r"\n\s*\n", text):
-        starts_with_row = bool(re.match(r"^\s*(?:[-*]\s+|\|)", paragraph))
+        starts_with_row = bool(
+            re.match(r"^\s*(?:[-*]\s+|\|)", paragraph)
+            or PIPELESS_TABLE_BLOCK.match(paragraph)
+        )
         inherited_paragraph_scope = pending_health_field_block and starts_with_row
         pending_health_field_block = False
         if not SUPPORTED_API_VERSIONS.search(paragraph):
             if not starts_with_row:
-                pending_health_field_block = bool(
-                    HEALTH_REFERENCE.search(paragraph)
-                )
+                pending_health_field_block = opens_health_field_block(paragraph)
             continue
         paragraph = re.sub(
             r"\n(?=\s*(?:[-*]\s+|\|))",
@@ -224,8 +237,20 @@ def health_advertises_supported_api_versions(text: str) -> bool:
                     continue
                 return True
         if not starts_with_row:
-            pending_health_field_block = bool(HEALTH_REFERENCE.search(paragraph))
+            pending_health_field_block = opens_health_field_block(paragraph)
     return False
+
+
+def opens_health_field_block(paragraph: str) -> bool:
+    normalized = re.sub(r"\s+", " ", paragraph).strip()
+    if not HEALTH_REFERENCE.search(normalized):
+        return False
+    declaration_verb = HEALTH_FIELD_DECLARATION_VERB.search(normalized)
+    declaration_noun = HEALTH_FIELD_DECLARATION_NOUN.search(normalized)
+    return bool(
+        (normalized.endswith(":") and (declaration_verb or declaration_noun))
+        or (declaration_verb and declaration_noun)
+    )
 
 
 def field_absence_is_explicit(clause: str) -> bool:

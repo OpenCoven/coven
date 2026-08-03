@@ -245,6 +245,12 @@ Archive visibility is stored separately in `archived_at`.
                 "|---|---|\n"
                 "| supportedApiVersions | array |\n"
             ),
+            (
+                "GET /api/v1/health returns these fields:\n\n"
+                "Field | Type\n"
+                "---|---\n"
+                "supportedApiVersions | array\n"
+            ),
         )
         for path in self.PUBLIC_CONTRACT_DOCS:
             for structure in structures:
@@ -289,15 +295,29 @@ Archive visibility is stored separately in `archived_at`.
                     )
 
     def test_resets_health_field_scope_after_intervening_prose(self) -> None:
+        guidance = (
+            (
+                "GET /api/v1/health returns documented fields.\n\n"
+                "This intervening prose is not a structural field block.\n\n"
+                "- supportedApiVersions belongs to an unrelated example.\n"
+            ),
+            (
+                "See the health guide for details.\n\n"
+                "- supportedApiVersions belongs to unrelated legacy example.\n"
+            ),
+            (
+                "Health negotiation is described above.\n\n"
+                "- GET /api/v1/api-version returns supportedApiVersions.\n"
+            ),
+        )
         for path in self.PUBLIC_CONTRACT_DOCS:
-            with self.subTest(path=path):
-                documents = self.canonical_documents()
-                documents[path] = documents["docs/API.md"] + (
-                    "\n\nGET /api/v1/health returns documented fields.\n"
-                    "\nThis intervening prose is not a structural field block.\n"
-                    "\n- supportedApiVersions belongs to an unrelated example.\n"
-                )
-                self.assertEqual(module.validate_documents(documents), [])
+            for statement in guidance:
+                with self.subTest(path=path, statement=statement):
+                    documents = self.canonical_documents()
+                    documents[path] = documents["docs/API.md"] + (
+                        f"\n\n{statement}"
+                    )
+                    self.assertEqual(module.validate_documents(documents), [])
 
     def test_accepts_supported_api_versions_in_legacy_field_lists(self) -> None:
         field_blocks = (
