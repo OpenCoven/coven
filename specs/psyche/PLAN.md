@@ -4,7 +4,7 @@
 > executable implementation checklist. Each workstream after W1 requires its
 > own approved, test-first child plan before production code begins.
 
-**Status:** W1 evidence complete 2026-08-02 - G3 review next
+**Status:** W1 complete and G3 approved 2026-08-02 - bounded implementation planning next
 
 **Goal:** Build Psyche as the clean-room, local-first, surface-neutral familiar
 runtime for a Coven, with durable intent and orchestration, evidence-first

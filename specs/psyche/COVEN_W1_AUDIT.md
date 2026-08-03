@@ -1,6 +1,6 @@
 # Psyche W1 Coven Contract Audit
 
-**Status:** Evidence complete; awaiting G3 review
+**Status:** W1 complete; G3 approved 2026-08-02
 
 **Audit date:** 2026-08-02
 
@@ -35,9 +35,10 @@ is authorized by this document.
   docs conflict with implementation at `GET /api/v1/api-version`, and the
   lifecycle docs omit live statuses implemented by Rust. These contradictions
   keep `C-S1` from `current` until a single exact contract is selected.
-- **High confidence:** G3 can approve this classification and dependency order,
-  but it must not declare G4 or G6 conformance. Implementation issues remain
-  blocked until the G3 decision is recorded.
+- **High confidence:** G3 approved this classification and dependency order on
+  2026-08-02. The decision permits bounded post-G3 planning and issue creation;
+  it does not declare G4 or G6 conformance or approve any implementation by
+  implication.
 
 ## 1. Research questions
 
@@ -424,13 +425,14 @@ binding. O3 precedes O4 because lookup/fencing requires an adopted request
 record. O5 and O6 bind to O2/O3 state. O7 proves their restart behavior. O8 is
 specified with each primitive and frozen before real-adapter conformance.
 
-## 9. G3 recommendation
+## 9. G3 decision
 
-**Recommendation: approve the W1 classification matrix and O1-O8 dependency
-order, with implementation still blocked until the approval is explicitly
-recorded.**
+**Decision: approved by Val on 2026-08-02.** The W1 classification matrix and
+O1-O8 dependency order are the accepted basis for bounded post-G3 planning.
+Endpoint names, implementation designs, and G4/G6 conformance remain subject
+to their own test-first plans and gates.
 
-Approval means:
+The approval means:
 
 1. `C-S2`, `C-S7`, and `C-S8` are the only current Psyche-relevant behaviors at
    the audited commit.
@@ -439,13 +441,12 @@ Approval means:
 3. `C-M4` is assigned to Psyche coordination, with Coven limited to C-S9's
    per-session acknowledgement.
 4. Existing scheduler/hub/Coven Calls surfaces cannot be cited as G4/G6 proof.
-5. After the G3 decision, maintainers may create the smallest bounded issues and
-   test-first child plans for O1-O8. Before that decision, `coven-psy1` remains
-   blocked.
+5. Maintainers may create the smallest bounded issues and test-first child plans
+   for O1-O8 after this decision is merged. Production child dispatch remains
+   blocked until G6.
 
-Rejection or revision should identify the exact row, classification, or
-ownership/order change. It should not authorize code while the matrix remains
-unresolved.
+Any later revision must identify the exact row, classification, or
+ownership/order change and pass through a separately reviewed contract update.
 
 ## 10. Verification record
 

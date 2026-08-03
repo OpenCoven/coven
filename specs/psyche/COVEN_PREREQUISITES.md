@@ -1,6 +1,6 @@
 # Psyche Coven Prerequisites
 
-**Status:** W1 evidence complete 2026-08-02 - G3 review required
+**Status:** W1 complete and G3 approved 2026-08-02 - bounded post-G3 planning permitted
 **Workstream:** W1
 **Gate:** G3
 **Owner:** Coven and Psyche maintainers
@@ -49,9 +49,10 @@ or surface policy engine.
 ## W1 audit artifact
 
 The completed evidence matrix is
-[`COVEN_W1_AUDIT.md`](./COVEN_W1_AUDIT.md). Its classifications remain pending
-until G3 review; this prerequisite document remains the behavior source, not a
-claim that planned gaps are implemented.
+[`COVEN_W1_AUDIT.md`](./COVEN_W1_AUDIT.md). Val approved its classifications
+and dependency order at G3 on 2026-08-02. This prerequisite document remains
+the behavior source; approval does not claim that planned gaps are implemented
+or that G4/G6 conformance exists.
 
 W1 produces one reviewable matrix with these columns:
 
