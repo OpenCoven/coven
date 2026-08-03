@@ -18,6 +18,11 @@ CONTRACT_DOCS = (
     "packages/openclaw-coven/README.md",
     "docs/OPERATIONAL-MODEL.md",
 )
+HEALTH_GUIDANCE_DOCS = CONTRACT_DOCS + (
+    "README.md",
+    "docs/CLIENT-INTEGRATION.md",
+    "docs/daemon/health.md",
+)
 LIFECYCLE_DOCS = (
     "docs/API-CONTRACT.md",
     "docs/SESSION-LIFECYCLE.md",
@@ -66,9 +71,27 @@ HEALTH_REFERENCE = re.compile(
     rf"{re.escape(HEALTH_ROUTE)}|\bhealth(?:\s+response)?\b",
     re.IGNORECASE,
 )
-REMOVAL_GUIDANCE = re.compile(
-    r"\b(?:has|have|had|is|are|was|were)\s+(?:been\s+)?removed\b|"
-    r"\bremoved\s+from\b",
+EXPLICIT_FIELD_ABSENCE = re.compile(
+    r"(?:"
+    r"\b(?:excludes?|lacks?|omits?)\b[^.;]{0,120}\bsupportedApiVersions\b|"
+    r"\bdoes\s+not\s+(?:include|return|contain|expose|advertise)\b"
+    r"[^.;]{0,120}\bsupportedApiVersions\b|"
+    r"\b(?:has|have|had)\s+(?:been\s+)?removed\b"
+    r"[^.;]{0,120}\bsupportedApiVersions\b|"
+    r"\bsupportedApiVersions\b[^.;]{0,120}"
+    r"\b(?:is|are|was|were)\s+absent\s+from\b|"
+    r"\bsupportedApiVersions\b[^.;]{0,120}"
+    r"\b(?:is|are|was|were)\s+not\s+"
+    r"(?:returned|included|contained|exposed|advertised)\s+by\b|"
+    r"\bsupportedApiVersions\b[^.;]{0,120}"
+    r"\b(?:has|have|had)\s+been\s+removed(?:\s+from)?\b|"
+    r"\bsupportedApiVersions\b[^.;]{0,120}"
+    r"\b(?:is|are|was|were)\s+(?:excluded|omitted|removed)\s+from\b"
+    r")",
+    re.IGNORECASE,
+)
+NEGATED_ABSENCE_VERB = re.compile(
+    r"\b(?:not|never)\b[^.;]{0,40}\b(?:excludes?|lacks?|omits?)\b",
     re.IGNORECASE,
 )
 STRUCTURAL_ROW_MARKER = "COVEN_DOC_STRUCTURAL_ROW"
@@ -164,29 +187,35 @@ def health_advertises_supported_api_versions(text: str) -> bool:
                 structural_health_scope = health_scoped
             if not health_scoped:
                 continue
-            if (
-                not inherited_health_scope
-                and LEGACY_ROUTE in statement
-                and not HEALTH_REFERENCE.search(statement)
-            ):
-                continue
 
-            for clause in CLAUSE_BOUNDARY.split(statement):
-                field = SUPPORTED_API_VERSIONS.search(clause)
-                if not field:
+            field_clauses = [
+                clause
+                for clause in CLAUSE_BOUNDARY.split(statement)
+                if SUPPORTED_API_VERSIONS.search(clause)
+            ]
+            health_absence_is_explicit = any(
+                field_absence_is_explicit(clause)
+                and (
+                    inherited_health_scope
+                    or HEALTH_REFERENCE.search(clause)
+                    or LEGACY_ROUTE not in clause
+                )
+                for clause in field_clauses
+            )
+            for clause in field_clauses:
+                if field_absence_is_explicit(clause):
                     continue
-                if (
-                    not inherited_health_scope
-                    and LEGACY_ROUTE in clause
-                    and not HEALTH_REFERENCE.search(clause)
-                ):
-                    continue
-                if NEGATION.search(clause[: field.start()]):
-                    continue
-                if REMOVAL_GUIDANCE.search(clause):
+                if LEGACY_ROUTE in clause and health_absence_is_explicit:
                     continue
                 return True
     return False
+
+
+def field_absence_is_explicit(clause: str) -> bool:
+    return bool(
+        EXPLICIT_FIELD_ABSENCE.search(clause)
+        and not NEGATED_ABSENCE_VERB.search(clause)
+    )
 
 
 def validate_documents(documents: dict[str, str]) -> list[str]:
@@ -204,7 +233,9 @@ def validate_documents(documents: dict[str, str]) -> list[str]:
             errors.append(f"{path}: legacy route explanation is missing")
         if presents_legacy_route_as_named_contract(text):
             errors.append(f"{path}: legacy route presented as named-contract handshake")
-        if health_advertises_supported_api_versions(text):
+
+    for path in HEALTH_GUIDANCE_DOCS:
+        if health_advertises_supported_api_versions(documents[path]):
             errors.append(f"{path}: health must not advertise supportedApiVersions")
 
     for path in LIFECYCLE_DOCS:
@@ -240,7 +271,7 @@ def validate_documents(documents: dict[str, str]) -> list[str]:
 
 
 def main() -> int:
-    paths = sorted(set(CONTRACT_DOCS + LIFECYCLE_DOCS))
+    paths = tuple(dict.fromkeys(CONTRACT_DOCS + LIFECYCLE_DOCS + HEALTH_GUIDANCE_DOCS))
     documents: dict[str, str] = {}
     for relative in paths:
         try:

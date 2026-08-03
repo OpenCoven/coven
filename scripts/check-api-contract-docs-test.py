@@ -21,6 +21,11 @@ class ApiContractDocsTests(unittest.TestCase):
         "packages/openclaw-coven/README.md",
         "docs/OPERATIONAL-MODEL.md",
     )
+    EXTRA_HEALTH_GUIDANCE_DOCS = (
+        "README.md",
+        "docs/CLIENT-INTEGRATION.md",
+        "docs/daemon/health.md",
+    )
 
     def canonical_documents(self) -> dict[str, str]:
         contract = """
@@ -39,7 +44,11 @@ New clients must not use the legacy route as proof of coven.daemon.v1 compatibil
 Synthetic `active` is not a harness-session state.
 Archive visibility is stored separately in `archived_at`.
 """
-        return {path: contract for path in module.CONTRACT_DOCS + module.LIFECYCLE_DOCS}
+        health_docs = getattr(module, "HEALTH_GUIDANCE_DOCS", ())
+        return {
+            path: contract
+            for path in module.CONTRACT_DOCS + module.LIFECYCLE_DOCS + health_docs
+        }
 
     def replace_legacy_explanation(
         self, documents: dict[str, str], path: str, replacement: str
@@ -60,6 +69,26 @@ Archive visibility is stored separately in `archived_at`.
             with self.subTest(path=path):
                 self.assertIn(path, module.CONTRACT_DOCS)
 
+    def test_guards_all_health_guidance(self) -> None:
+        health_docs = getattr(module, "HEALTH_GUIDANCE_DOCS", ())
+        self.assertTrue(set(module.CONTRACT_DOCS).issubset(health_docs))
+        for path in self.EXTRA_HEALTH_GUIDANCE_DOCS:
+            with self.subTest(path=path):
+                self.assertIn(path, health_docs)
+
+    def test_rejects_stale_health_claim_in_extra_guides(self) -> None:
+        for path in self.EXTRA_HEALTH_GUIDANCE_DOCS:
+            with self.subTest(path=path):
+                documents = self.canonical_documents()
+                documents[path] = (
+                    "GET /api/v1/health includes supportedApiVersions."
+                )
+                errors = module.validate_documents(documents)
+                self.assertIn(
+                    f"{path}: health must not advertise supportedApiVersions",
+                    errors,
+                )
+
     def test_rejects_supported_api_versions_in_health_guidance(self) -> None:
         for path in self.PUBLIC_CONTRACT_DOCS:
             with self.subTest(path=path):
@@ -76,6 +105,86 @@ Archive visibility is stored separately in `archived_at`.
                     ),
                     errors,
                 )
+
+    def test_rejects_shared_health_and_legacy_positive_predicate(self) -> None:
+        statements = (
+            (
+                "`GET /api/v1/health` and `GET /api/v1/api-version` include "
+                "`supportedApiVersions`."
+            ),
+            (
+                '"GET /api/v1/health" and "GET /api/v1/api-version" include '
+                '"supportedApiVersions".'
+            ),
+        )
+        for statement in statements:
+            with self.subTest(statement=statement):
+                documents = self.canonical_documents()
+                path = "packages/openclaw-coven/README.md"
+                documents[path] = documents["docs/API.md"] + f"\n\n{statement}\n"
+                errors = module.validate_documents(documents)
+                self.assertIn(
+                    f"{path}: health must not advertise supportedApiVersions",
+                    errors,
+                )
+
+    def test_accepts_legacy_field_after_explicit_health_absence(self) -> None:
+        statements = (
+            (
+                "GET /api/v1/health does not include supportedApiVersions; "
+                "GET /api/v1/api-version includes supportedApiVersions."
+            ),
+            (
+                "supportedApiVersions is absent from GET /api/v1/health; "
+                "GET /api/v1/api-version includes supportedApiVersions."
+            ),
+        )
+        for statement in statements:
+            with self.subTest(statement=statement):
+                documents = self.canonical_documents()
+                path = "packages/openclaw-coven/README.md"
+                documents[path] = documents["docs/API.md"] + f"\n\n{statement}\n"
+                self.assertEqual(module.validate_documents(documents), [])
+
+    def test_rejects_ambiguous_or_double_negative_health_disposition(self) -> None:
+        statements = (
+            "GET /api/v1/health does not omit supportedApiVersions.",
+            "GET /api/v1/health does not exclude supportedApiVersions.",
+            "GET /api/v1/health is not complete without supportedApiVersions.",
+            "GET /api/v1/health never omits supportedApiVersions.",
+            "supportedApiVersions is not omitted from GET /api/v1/health.",
+            "supportedApiVersions is not excluded from GET /api/v1/health.",
+            "supportedApiVersions is not complete without GET /api/v1/health.",
+            "supportedApiVersions is never omitted from GET /api/v1/health.",
+        )
+        for statement in statements:
+            with self.subTest(statement=statement):
+                documents = self.canonical_documents()
+                path = "packages/openclaw-coven/README.md"
+                documents[path] = documents["docs/API.md"] + f"\n\n{statement}\n"
+                errors = module.validate_documents(documents)
+                self.assertIn(
+                    f"{path}: health must not advertise supportedApiVersions",
+                    errors,
+                )
+
+    def test_accepts_explicit_health_field_absence_matrix(self) -> None:
+        statements = (
+            "GET /api/v1/health excludes supportedApiVersions.",
+            "GET /api/v1/health lacks supportedApiVersions.",
+            "GET /api/v1/health omits supportedApiVersions.",
+            "GET /api/v1/health does not include supportedApiVersions.",
+            "GET /api/v1/health has removed supportedApiVersions.",
+            "supportedApiVersions is absent from GET /api/v1/health.",
+            "supportedApiVersions is not returned by GET /api/v1/health.",
+            "supportedApiVersions has been removed from GET /api/v1/health.",
+        )
+        for statement in statements:
+            with self.subTest(statement=statement):
+                documents = self.canonical_documents()
+                path = "packages/openclaw-coven/README.md"
+                documents[path] = documents["docs/API.md"] + f"\n\n{statement}\n"
+                self.assertEqual(module.validate_documents(documents), [])
 
     def test_rejects_supported_api_versions_in_health_field_lists(self) -> None:
         structures = (
