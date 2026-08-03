@@ -1161,8 +1161,8 @@ Shared non-success responses use the structured error envelope:
 
 ## comux and OpenClaw bridge compatibility
 
-- comux reads the `capabilities` object from `/health` to decide which features to use.
-- The external OpenClaw bridge plugin OpenClaw bridge (`packages/openclaw-coven`) is updated in this repo alongside the daemon and uses `apiVersion === "coven.daemon.v1"` as its contract guard.
+- comux reads the `capabilities` object from `/api/v1/health` to decide which features to use.
+- The external OpenClaw bridge plugin (`packages/openclaw-coven`) is updated in this repo alongside the daemon and uses `apiVersion === "coven.daemon.v1"` as its contract guard.
 - Client updates to use `afterSeq` cursors and paginated event envelopes may happen independently of the daemon update; the daemon-enforced shape is the source of truth.
 - The `supportedApiVersions` field has been removed from the health response in `coven.daemon.v1`; clients should check `apiVersion` directly.
 

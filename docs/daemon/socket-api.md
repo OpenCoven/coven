@@ -23,6 +23,7 @@ GET /api/v1/health
 {
   "ok": true,
   "apiVersion": "coven.daemon.v1",
+  "covenVersion": "0.0.0",
   "capabilities": {
     "sessions": true,
     "events": true,
@@ -35,11 +36,14 @@ GET /api/v1/health
   },
   "daemon": {
     "pid": 31415,
-    "uptime": 4823,
-    "startedAt": "2026-05-15T19:31:02Z"
+    "startedAt": "2026-05-15T19:31:02Z",
+    "socket": "<covenHome>/coven.sock"
   }
 }
 ```
+
+`daemon` is `null` when daemon metadata is unavailable. A `hub` summary may
+also be present when the store-backed health summary is available.
 
 Negotiate the named `coven.daemon.v1` contract against this health
 `apiVersion`, then check every capability required by the operation before

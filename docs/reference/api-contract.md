@@ -15,9 +15,14 @@ Coven's local API is versioned as a **named contract**. The current value is `co
 
 - New fields can be added inside an existing contract version. Clients must ignore unknown fields.
 - New endpoints can be added inside an existing contract version. Clients must not assume the full URL space is fixed.
-- New capabilities are advertised through `GET /api/v1/capabilities`.
+- Operation-group availability flags are advertised by the `capabilities`
+  object from `GET /api/v1/health`. Control-plane catalog entries, policy
+  hints, and action ids are discovered separately through
+  `GET /api/v1/capabilities`.
 - Breaking changes — field removal, type change, semantics change — require a new contract version (`coven.daemon.v2`, ...).
-- The daemon will advertise both the current and previous version during a transition.
+- Health advertises one active named contract value. A contract transition
+  requires an explicit migration plan; clients must not infer plural named
+  contract support from the legacy route-family response.
 
 ## Negotiation
 

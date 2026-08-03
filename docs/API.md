@@ -68,6 +68,7 @@ Event payloads returned by `/events`, `/sessions/:id/events`, and `/sessions/:id
     "travel": true,
     "scheduler": true,
     "hub": true,
+    "executorDispatch": true,
     "eventCursor": "sequence",
     "structuredErrors": true
   },
@@ -149,6 +150,8 @@ Immediately completed safe actions return `200` with an event-shaped payload tha
 
 - Additive JSON fields are allowed in `v1` responses.
 - Existing required fields should not be removed or renamed inside `v1`.
-- Breaking response-shape or behavior changes require a new API version prefix.
+- Breaking response-shape or behavior changes require a new named `apiVersion`
+  value from `GET /api/v1/health`; they do not inherently require a new route
+  prefix.
 - External clients should call `/api/v1/health` before assuming compatibility.
 - Daemon changes that affect `/api/v1/health`, `/api/v1/sessions`, `/api/v1/events`, `/api/v1/sessions/:id/events`, input, or kill behavior should update client compatibility tests in the same repo.

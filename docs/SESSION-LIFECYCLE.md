@@ -35,11 +35,11 @@ stateDiagram-v2
   [*] --> created: coven run / POST /sessions
   created --> running: PTY spawn succeeds
   created --> failed: launch fails / stale unowned recovery
-  running --> idle: conversational turn completes; reusable
-  running --> completed: harness exits 0
+  running --> idle: clean conversational exit (conversation_id set)
+  running --> completed: clean one-shot exit
   running --> failed: harness exits non-zero
   running --> killed: kill request accepted and persisted
-  running --> orphaned: recovery cannot prove ownership
+  running --> orphaned: recovery cannot prove daemon ownership
 
   completed --> completed: archive sets / summon clears archived_at
   failed --> failed: archive sets / summon clears archived_at
@@ -52,7 +52,13 @@ stateDiagram-v2
   orphaned --> [*]: coven sacrifice --yes
 ```
 
-The diagram above is normative for the current store. `running` sessions cannot be archived or sacrificed directly — kill them or wait for exit first. Archive and summon change `archived_at`, not lifecycle status. `created → running` is the transition that establishes live execution; persistence-only transitions remain in the Rust authority layer.
+The diagram above is normative for the current store. A clean exit persists
+`idle` when `conversation_id` is set so the conversation remains extendable;
+a clean one-shot exit persists `completed`. `running` sessions cannot be
+archived or sacrificed directly — kill them or wait for exit first. Archive
+and summon change `archived_at`, not lifecycle status. `created → running` is
+the transition that establishes live execution; persistence-only transitions
+remain in the Rust authority layer.
 
 ## Launch path
 
@@ -162,7 +168,10 @@ Use sacrifice only when the session and its logs should be removed from the loca
 
 ## Orphan recovery
 
-If the daemon starts and finds sessions that were marked `running` from a previous daemon lifetime, those sessions are marked `orphaned`.
+If the daemon starts and finds daemon-owned, non-external sessions that were
+marked `running` from a previous daemon lifetime, those sessions are marked
+`orphaned`. Registered external sessions are excluded because the daemon does
+not own their runtime.
 
 An orphaned session means Coven no longer owns a live process for that record. The event log may still be useful, but live input and kill operations should fail.
 
