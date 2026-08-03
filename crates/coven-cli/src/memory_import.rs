@@ -2099,15 +2099,10 @@ fn reject_portable_sibling_collision(parent: &Dir, requested: &str) -> Result<()
 
 #[cfg(unix)]
 fn secure_private_directory_handle(directory: &Dir) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use cap_std::fs::PermissionsExt;
 
     directory
-        .try_clone()
-        .and_then(|clone| {
-            clone
-                .into_std_file()
-                .set_permissions(std::fs::Permissions::from_mode(0o700))
-        })
+        .set_permissions(".", cap_std::fs::Permissions::from_mode(0o700))
         .map_err(|_| anyhow!("unable to secure private import directory"))
 }
 
@@ -8706,14 +8701,6 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
 
         before.dev() == after.dev() && before.ino() == after.ino()
-    }
-
-    #[cfg(windows)]
-    fn opened_metadata_stable_std(before: &fs::Metadata, after: &fs::Metadata) -> bool {
-        use std::os::windows::fs::MetadataExt;
-
-        before.volume_serial_number() == after.volume_serial_number()
-            && before.file_index() == after.file_index()
     }
 
     #[cfg(not(any(unix, windows)))]
