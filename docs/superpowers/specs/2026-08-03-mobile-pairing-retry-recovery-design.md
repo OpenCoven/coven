@@ -1,6 +1,6 @@
 # Mobile Pairing Retry Recovery Design
 
-**Issue:** [#570](https://github.com/OpenCoven/coven/issues/570)  
+**Issue:** [#570](https://github.com/OpenCoven/coven/issues/570)
 **Parent recovery track:** [#541](https://github.com/OpenCoven/coven/issues/541)
 
 ## Goal
