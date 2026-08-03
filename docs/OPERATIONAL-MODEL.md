@@ -61,7 +61,11 @@ The Rust CLI/daemon should stay narrow and boring:
 - The daemon exposes a small local API over `<covenHome>/coven.sock`.
 - SQLite stores session metadata, archive state, and append-only event history.
 
-The local API should remain stable and intentionally small. The current public contract is `v1`; new clients should use `/api/v1/...` routes. Archive/summon/sacrifice are currently CLI/store rituals; live runtime control remains on the socket API:
+The local API should remain stable and intentionally small. The current named
+public contract is `coven.daemon.v1`, served under `/api/v1/...` routes. New
+clients negotiate it through `GET /api/v1/health`; the route prefix alone is
+not proof of named-contract support. Archive/summon/sacrifice are currently
+CLI/store rituals; live runtime control remains on the socket API:
 
 - `GET /api/v1/api-version`
 - `GET /api/v1/health`
@@ -72,7 +76,8 @@ The local API should remain stable and intentionally small. The current public c
 - `POST /api/v1/sessions/:id/input`
 - `POST /api/v1/sessions/:id/kill`
 
-Legacy unversioned routes remain as early-MVP aliases, but external clients should treat `v1` as the compatibility boundary.
+Legacy unversioned routes remain as early-MVP aliases, but external clients
+must not use an alias or route-family token as named-contract proof.
 
 ## Client responsibilities
 
@@ -105,11 +110,20 @@ The npm wrapper should only resolve and execute the native `coven` binary. It sh
 
 ## Compatibility policy
 
-Externalization makes the socket API a product contract. Add compatibility protections before broad distribution:
+Externalization makes the socket API a product contract. Clients negotiate
+compatibility with `GET /api/v1/health`, verify its named `apiVersion`, and
+check every capability required by the operation before a dependent request.
+Capabilities advertise availability and never grant permission.
 
-- include `apiVersion` and supported API versions in `GET /api/v1/health`;
-- keep legacy `GET /health` available as an early-MVP alias while new clients move to `/api/v1`;
-- add `covenVersion` in `GET /api/v1/health` only if clients need daemon build identity distinct from contract version;
+Additional compatibility protections before broad distribution:
+
+- retain `covenVersion` in health as daemon build identity distinct from the
+  named contract version;
+- treat `GET /api/v1/api-version` as a legacy route-family diagnostic whose
+  `apiVersion: "v1"` and `supportedApiVersions: ["v1"]` values are not proof of
+  `coven.daemon.v1` support;
+- keep legacy `GET /health` available as an early-MVP alias, but never
+  recommend it as the compatibility handshake;
 - use structured error codes for API failures;
 - paginate `GET /api/v1/events` with a daemon-enforced limit;
 - keep unknown fields ignored where safe and unknown required behavior rejected;

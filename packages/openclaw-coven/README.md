@@ -94,9 +94,22 @@ The plugin is a client, not a trust root. The Rust daemon must still validate pr
 The compatibility tests in `src/compat.test.ts` verify the plugin against the fixture files for the documented daemon API version. When the Rust daemon changes a response shape for `/api/v1/health`, `/api/v1/sessions`, or `/api/v1/events`, update the matching fixture and re-run the tests.
 
 Fixture field names follow the Rust daemon's serialization rules:
-- `GET /api/v1/health` — camelCase (`apiVersion`, `supportedApiVersions`, `ok`, `daemon.pid`, `daemon.startedAt`, `daemon.socket`)
+- `GET /api/v1/health` — camelCase: `ok`, named contract
+  `apiVersion: "coven.daemon.v1"`, `covenVersion`, nullable daemon metadata
+  (`daemon.pid`, `daemon.startedAt`, `daemon.socket`), and the exact current
+  capability fields `sessions`, `events`, `travel`, `scheduler`, `hub`,
+  `executorDispatch`, `eventCursor`, and `structuredErrors`. A store-backed
+  response may also include the optional `hub` summary.
 - `GET /api/v1/sessions`, `POST /api/v1/sessions`, `GET /api/v1/sessions/:id` — snake_case (`project_root`, `exit_code`, `created_at`, `updated_at`)
 - `GET /api/v1/events` — snake_case (`session_id`, `payload_json`, `created_at`)
+
+Separately, `GET /api/v1/api-version` is a legacy route-family diagnostic with
+literal `apiVersion: "v1"` and `supportedApiVersions: ["v1"]`; this is not
+proof of named-contract support.
+
+Clients negotiate compatibility with `GET /api/v1/health`, verify its named
+`apiVersion`, and check every capability required by an operation before
+sending a dependent request. Capabilities advertise availability and never grant permission.
 
 ## Development notes
 
