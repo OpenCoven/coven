@@ -227,17 +227,22 @@ function normalizePollIntervalMs(value: number): number {
 
 function normalizeStopReason(value: unknown): string {
   const normalized =
-    typeof value === "string" ? sanitizeStatusText(value).toLowerCase() : "completed";
+    typeof value === "string" ? sanitizeStatusText(value).toLowerCase() : "error";
   if (normalized === "completed" || normalized === "complete" || normalized === "success") {
     return "completed";
   }
   if (normalized === "killed" || normalized === "cancelled" || normalized === "canceled") {
     return "cancelled";
   }
-  if (normalized === "failed" || normalized === "failure" || normalized === "error") {
+  if (
+    normalized === "failed" ||
+    normalized === "failure" ||
+    normalized === "error" ||
+    normalized === "orphaned"
+  ) {
     return "error";
   }
-  return "completed";
+  return "error";
 }
 
 function eventToRuntimeEvents(event: CovenEventRecord): AcpRuntimeEvent[] {
@@ -246,26 +251,8 @@ function eventToRuntimeEvents(event: CovenEventRecord): AcpRuntimeEvent[] {
     const text = typeof payload.data === "string" ? sanitizeTerminalText(payload.data) : "";
     return text ? [{ type: "text_delta", text, stream: "output", tag: "agent_message_chunk" }] : [];
   }
-  if (event.kind === "exit") {
-    const status = sanitizeStatusField(
-      typeof payload.status === "string" ? payload.status : "completed",
-      "completed",
-    );
-    const exitCode = typeof payload.exitCode === "number" ? payload.exitCode : null;
-    return [
-      {
-        type: "status",
-        text: `coven session ${status}${exitCode == null ? "" : ` exitCode=${exitCode}`}`,
-        tag: "session_info_update",
-      },
-      { type: "done", stopReason: normalizeStopReason(status) },
-    ];
-  }
-  if (event.kind === "kill") {
-    return [
-      { type: "status", text: "coven session killed", tag: "session_info_update" },
-      { type: "done", stopReason: "cancelled" },
-    ];
+  if (event.kind === "exit" || event.kind === "kill") {
+    return [];
   }
   return [];
 }

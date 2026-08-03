@@ -720,7 +720,7 @@ describe("CovenAcpRuntime", () => {
   it.each([
     ["failed", "error"],
     ["killed", "cancelled"],
-    ["orphaned", "completed"],
+    ["orphaned", "error"],
   ])(
     "terminates polling for known terminal harness-session status %s",
     async (status, stopReason) => {
@@ -755,6 +755,169 @@ describe("CovenAcpRuntime", () => {
       expect(events.at(-1)).toEqual({ type: "done", stopReason });
     },
   );
+
+  it("uses persisted killed state instead of a late completed exit event", async () => {
+    const getSession = vi.fn(async () => session({ status: "killed" }));
+    const runtime = new CovenAcpRuntime({
+      config,
+      client: fakeClient({
+        listEvents: vi.fn(async () => [
+          event({
+            kind: "exit",
+            payloadJson: JSON.stringify({ status: "completed", exitCode: 0 }),
+          }),
+        ]),
+        getSession,
+      }),
+    });
+    const handle = await runtime.ensureSession({
+      sessionKey: "agent:codex:test",
+      agent: "codex",
+      mode: "oneshot",
+      cwd: workspaceDir,
+    });
+
+    const events = await collect(
+      runtime.runTurn({
+        handle,
+        text: "Fix tests",
+        mode: "prompt",
+        requestId: "req-late-exit",
+      }),
+    );
+
+    expect(getSession).toHaveBeenCalledTimes(1);
+    expect(events).toEqual([
+      expect.objectContaining({ type: "status", text: "coven session session-1 started (codex)" }),
+      expect.objectContaining({ type: "status", text: "coven session killed" }),
+      { type: "done", stopReason: "cancelled" },
+    ]);
+  });
+
+  it("continues polling when an exit event arrives while persisted state is idle", async () => {
+    const getSession = vi
+      .fn()
+      .mockResolvedValueOnce(session({ status: "idle" }))
+      .mockResolvedValueOnce(session({ status: "completed", exitCode: 0 }));
+    const runtime = new CovenAcpRuntime({
+      config,
+      client: fakeClient({
+        listEvents: vi
+          .fn()
+          .mockResolvedValueOnce([
+            event({
+              kind: "exit",
+              payloadJson: JSON.stringify({ status: "completed", exitCode: 0 }),
+            }),
+          ])
+          .mockResolvedValueOnce([]),
+        getSession,
+      }),
+      sleep: vi.fn(async () => undefined),
+    });
+    const handle = await runtime.ensureSession({
+      sessionKey: "agent:codex:test",
+      agent: "codex",
+      mode: "oneshot",
+      cwd: workspaceDir,
+    });
+
+    const events = await collect(
+      runtime.runTurn({
+        handle,
+        text: "Fix tests",
+        mode: "prompt",
+        requestId: "req-idle-exit",
+      }),
+    );
+
+    expect(getSession).toHaveBeenCalledTimes(2);
+    expect(events).toEqual([
+      expect.objectContaining({ type: "status", text: "coven session session-1 started (codex)" }),
+      expect.objectContaining({ type: "status", text: "coven session completed exitCode=0" }),
+      { type: "done", stopReason: "completed" },
+    ]);
+  });
+
+  it.each([
+    ["exit", "completed", "failed", "error"],
+    ["kill", "killed", "completed", "completed"],
+  ])(
+    "uses persisted ledger status instead of conflicting %s event evidence",
+    async (kind, eventStatus, ledgerStatus, stopReason) => {
+      const runtime = new CovenAcpRuntime({
+        config,
+        client: fakeClient({
+          listEvents: vi.fn(async () => [
+            event({
+              kind,
+              payloadJson: JSON.stringify({ status: eventStatus, exitCode: 0 }),
+            }),
+          ]),
+          getSession: vi.fn(async () => session({ status: ledgerStatus })),
+        }),
+      });
+      const handle = await runtime.ensureSession({
+        sessionKey: "agent:codex:test",
+        agent: "codex",
+        mode: "oneshot",
+        cwd: workspaceDir,
+      });
+
+      const events = await collect(
+        runtime.runTurn({
+          handle,
+          text: "Fix tests",
+          mode: "prompt",
+          requestId: `req-${kind}-disagreement`,
+        }),
+      );
+
+      expect(events.at(-2)).toEqual(
+        expect.objectContaining({ type: "status", text: `coven session ${ledgerStatus}` }),
+      );
+      expect(events.at(-1)).toEqual({ type: "done", stopReason });
+    },
+  );
+
+  it("does not terminate on kill event evidence before persisted killed state", async () => {
+    const getSession = vi
+      .fn()
+      .mockResolvedValueOnce(session({ status: "running" }))
+      .mockResolvedValueOnce(session({ status: "killed" }));
+    const runtime = new CovenAcpRuntime({
+      config,
+      client: fakeClient({
+        listEvents: vi
+          .fn()
+          .mockResolvedValueOnce([event({ kind: "kill", payloadJson: "{}" })])
+          .mockResolvedValueOnce([]),
+        getSession,
+      }),
+      sleep: vi.fn(async () => undefined),
+    });
+    const handle = await runtime.ensureSession({
+      sessionKey: "agent:codex:test",
+      agent: "codex",
+      mode: "oneshot",
+      cwd: workspaceDir,
+    });
+
+    const events = await collect(
+      runtime.runTurn({
+        handle,
+        text: "Fix tests",
+        mode: "prompt",
+        requestId: "req-kill-evidence",
+      }),
+    );
+
+    expect(getSession).toHaveBeenCalledTimes(2);
+    expect(events.at(-2)).toEqual(
+      expect.objectContaining({ type: "status", text: "coven session killed" }),
+    );
+    expect(events.at(-1)).toEqual({ type: "done", stopReason: "cancelled" });
+  });
 
   it.each(["future_state", "active"])(
     "fails closed on unsupported harness-session status %s",
@@ -986,10 +1149,11 @@ describe("CovenAcpRuntime", () => {
     );
   });
 
-  it("normalizes untrusted Coven exit status into bounded stop reasons", () => {
+  it("fails closed on untrusted persisted stop reasons and ignores terminal event outcomes", () => {
     expect(__testing.normalizeStopReason("completed")).toBe("completed");
     expect(__testing.normalizeStopReason("killed")).toBe("cancelled");
-    expect(__testing.normalizeStopReason("refusal")).toBe("completed");
+    expect(__testing.normalizeStopReason("orphaned")).toBe("error");
+    expect(__testing.normalizeStopReason("refusal")).toBe("error");
 
     expect(
       __testing.eventToRuntimeEvents(
@@ -998,7 +1162,10 @@ describe("CovenAcpRuntime", () => {
           payloadJson: JSON.stringify({ status: "refusal", exitCode: 0 }),
         }),
       ),
-    ).toContainEqual(expect.objectContaining({ type: "done", stopReason: "completed" }));
+    ).toEqual([]);
+    expect(
+      __testing.eventToRuntimeEvents(event({ kind: "kill", payloadJson: "{}" })),
+    ).toEqual([]);
   });
 
   it("guards daemon exitCode types before rendering terminal status text", () => {
