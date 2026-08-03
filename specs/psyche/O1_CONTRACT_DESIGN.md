@@ -1,6 +1,6 @@
 # Psyche O1 Coven Contract Design
 
-**Status:** Written spec approved; corrected child implementation plan ready for maintainer review
+**Status:** Implementation verified; delivery evidence is tracked in issue #567 and Bead `coven-psy-o1`
 
 **Decision date:** 2026-08-02
 

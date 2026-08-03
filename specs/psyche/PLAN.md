@@ -6,6 +6,13 @@
 
 **Status:** W1 complete and G3 approved 2026-08-02 - bounded implementation planning next
 
+**O1 implementation candidate:** Named-contract negotiation and lifecycle
+vocabulary pass focused Rust, TypeScript, and documentation guardrail tests.
+O1 remains incomplete until the reviewed PR merges and issue #567 plus Bead
+`coven-psy-o1` record the merge evidence. This candidate addresses only C-S1
+vocabulary and C-S8 documentation; C-S3-C-S6 and C-S9-C-S12 remain planned,
+and G4/G6 remain blocked.
+
 **Goal:** Build Psyche as the clean-room, local-first, surface-neutral familiar
 runtime for a Coven, with durable intent and orchestration, evidence-first
 verification, Telegram as the first production adapter, and Coven as the
