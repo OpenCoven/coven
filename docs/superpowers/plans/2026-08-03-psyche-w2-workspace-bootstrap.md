@@ -1084,15 +1084,18 @@ impl Extensions {
 /// `#[from]` for one. That type's `Display` renders the offending source line
 /// verbatim and its `Debug` carries `input: Some(<the entire file>)`, so holding
 /// one would leave every secret in the file a single `?err` away from a log. The
-/// deserializer error is reduced to a payload-free form at exactly one place —
-/// [`detail_from`] — which is what review should grep for. [`reduce_toml_error`]
-/// wraps it for the file-loading path only, so it is not the exhaustive one.
+/// deserializer error is reduced to its message string at exactly one place —
+/// [`detail_from`] — which is what review should grep for. (The message is not
+/// unconditionally value-free: serde diagnostics can embed offending scalar
+/// values; see the `detail` field docs.) [`reduce_toml_error`] wraps it for the
+/// file-loading path only, so it is not the exhaustive one.
 ///
-/// `Parse` has three construction sites, not two: the two deserializer paths
-/// above, plus the unversioned-extension-key branch in `load_inner`. That third
-/// one is built from a key this crate validated itself, never from a
-/// `toml::de::Error`, so `detail_from` covering two of three is correct rather
-/// than an omission.
+/// `Parse` has four construction sites: `Extensions::get` above (using
+/// [`detail_from`] directly), the two [`toml::from_str`] paths in `load_inner`
+/// below (via [`reduce_toml_error`]), and the unversioned-extension-key branch
+/// in `load_inner`. That last one is built from a key this crate validated
+/// itself, never from a `toml::de::Error`, so [`detail_from`] covering three of
+/// four is correct rather than an omission.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     /// The file is not valid TOML, or violates the strict schema.
@@ -1134,10 +1137,11 @@ pub enum ConfigError {
     },
 }
 
-/// The single place a deserializer error is reduced to message-only text.
+/// The single place a deserializer error is reduced to its message string.
 ///
-/// `toml::de::Error::message()` is the bare diagnostic; its `Display` would
-/// render the offending source line and its `Debug` carries the whole input.
+/// `toml::de::Error::message()` strips the offending source line (`Display`)
+/// and full input (`Debug`), but the message itself is not unconditionally
+/// value-free — serde diagnostics can embed offending scalar values.
 /// Every crossing of that boundary goes through this function, so review greps
 /// one name rather than auditing each `?`.
 fn detail_from(err: &toml::de::Error) -> String {
