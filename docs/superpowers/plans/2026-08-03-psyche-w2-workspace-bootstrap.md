@@ -1134,7 +1134,7 @@ pub enum ConfigError {
     },
 }
 
-/// The single place a deserializer error is reduced to payload-free text.
+/// The single place a deserializer error is reduced to message-only text.
 ///
 /// `toml::de::Error::message()` is the bare diagnostic; its `Display` would
 /// render the offending source line and its `Debug` carries the whole input.
@@ -1145,7 +1145,7 @@ fn detail_from(err: &toml::de::Error) -> String {
 }
 
 /// Reduces a deserializer error from the file-loading path, adding position and
-/// originating path to [`detail_from`]'s payload-free text.
+/// originating path to [`detail_from`]'s message-only text.
 ///
 /// Line and column are derived from `span()`, which is a byte offset and
 /// therefore carries no file content.
