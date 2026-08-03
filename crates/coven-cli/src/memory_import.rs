@@ -2119,9 +2119,14 @@ fn validate_private_directory_handle(directory: &Dir) -> Result<()> {
 
 #[cfg(unix)]
 fn sync_dir_handle(directory: &Dir) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .follow(FollowSymlinks::No)
+        .maybe_dir(true);
     directory
-        .try_clone()
-        .and_then(|clone| clone.into_std_file().sync_all())
+        .open_with(".", &options)
+        .and_then(|file| file.sync_all())
         .map_err(|_| anyhow!("unable to sync import directory"))
 }
 

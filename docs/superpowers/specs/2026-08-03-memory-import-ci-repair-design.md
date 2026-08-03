@@ -8,9 +8,10 @@ PR #568 passes its focused and local workspace gates but fails two hosted CI job
   `std::os::windows::fs::MetadataExt` file-identity methods.
 - Ubuntu fails every migration test that creates a private import directory.
   The first apply test fails immediately, while discovery-only tests pass.
-  `cap_std::fs::Dir` may hold an `O_PATH` descriptor on Linux, and converting
-  that descriptor to `std::fs::File` before calling `set_permissions` makes
-  `fchmod` fail.
+  `cap_std::fs::Dir` may hold an `O_PATH` descriptor on Linux. Converting that
+  descriptor to `std::fs::File` before calling `set_permissions` makes
+  `fchmod` fail, and calling `sync_all` on the cloned descriptor makes `fsync`
+  fail.
 
 The repair must not weaken production filesystem validation, change migration
 semantics, or serialize unrelated workspace tests.
@@ -59,7 +60,11 @@ Keep operating through the already-opened `cap_std::fs::Dir`. Set mode `0700`
 on `"."` with `Dir::set_permissions` and `cap_std::fs::PermissionsExt`.
 `cap-std` handles Linux `O_PATH` descriptors by using its capability-safe
 permission implementation, including its `/proc/self/fd` and normal-handle
-fallbacks. The subsequent ownership and mode validation remains unchanged.
+fallbacks.
+
+For durability, open `"."` relative to the same pinned directory with read,
+no-follow, and directory options, then call `sync_all` on that normal file
+descriptor. The subsequent ownership and mode validation remains unchanged.
 
 ### Error handling
 

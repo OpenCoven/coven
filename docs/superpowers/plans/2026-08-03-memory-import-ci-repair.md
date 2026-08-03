@@ -4,7 +4,7 @@
 
 **Goal:** Make PR #568 pass stable Windows compilation and parallel Ubuntu workspace tests without changing memory migration production behavior.
 
-**Architecture:** Remove a test-only Windows identity helper whose callers are already Unix-only. Keep private-directory permission changes capability-relative so `cap-std` can safely handle Linux `O_PATH` directory descriptors.
+**Architecture:** Remove a test-only Windows identity helper whose callers are already Unix-only. Keep private-directory permission and durability operations capability-relative while reopening a normal directory descriptor when Linux `O_PATH` cannot support `fchmod` or `fsync`.
 
 **Tech Stack:** Rust, `std::sync`, `tempfile`, Cargo test harness, GitHub Actions
 
@@ -70,7 +70,7 @@ git commit -s -m "fix(memory): keep Windows tests on stable Rust" \
 ### Task 2: Harden private directories through the pinned capability
 
 **Files:**
-- Modify: `crates/coven-cli/src/memory_import.rs:2100-2112`
+- Modify: `crates/coven-cli/src/memory_import.rs:2100-2130`
 
 - [ ] **Step 1: Confirm the Linux-specific failure shape**
 
@@ -101,7 +101,29 @@ fn secure_private_directory_handle(directory: &Dir) -> Result<()> {
 This keeps the operation relative to the pinned directory. On Linux,
 `cap-std` handles `O_PATH` by reopening safely through its capability root.
 
-- [ ] **Step 3: Run focused tests**
+- [ ] **Step 3: Reopen a normal directory descriptor for durability sync**
+
+Replace `sync_dir_handle` with:
+
+```rust
+#[cfg(unix)]
+fn sync_dir_handle(directory: &Dir) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .follow(FollowSymlinks::No)
+        .maybe_dir(true);
+    directory
+        .open_with(".", &options)
+        .and_then(|file| file.sync_all())
+        .map_err(|_| anyhow!("unable to sync import directory"))
+}
+```
+
+This opens `"."` under the pinned capability instead of calling `fsync` on the
+Linux `O_PATH` descriptor.
+
+- [ ] **Step 4: Run focused tests**
 
 Run:
 
@@ -113,7 +135,7 @@ cargo test -p coven-cli --bin coven --locked cockpit_sources::tests
 Expected: both commands pass, including the stale-record logical restore
 regression.
 
-- [ ] **Step 4: Commit Linux directory hardening**
+- [ ] **Step 5: Commit Linux directory hardening**
 
 ```bash
 git add crates/coven-cli/src/memory_import.rs
