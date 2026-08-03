@@ -3,8 +3,8 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::io::{self, Read};
-use std::path::Path;
+use std::io::{self, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
@@ -470,6 +470,7 @@ impl Error for MemoryContentError {
 }
 
 struct MemoryRoot {
+    coven_home: PathBuf,
     dir: Dir,
 }
 
@@ -491,7 +492,10 @@ impl MemoryRoot {
         if !metadata.is_dir() || metadata_is_windows_reparse_point(&metadata) {
             anyhow::bail!("refusing to open memory root through a reparse point or non-directory");
         }
-        Ok(Some(Self { dir }))
+        Ok(Some(Self {
+            coven_home: coven_home.to_path_buf(),
+            dir,
+        }))
     }
 
     fn open_familiar_dir(&self, familiar_id: &str) -> Result<Option<Dir>> {
@@ -623,6 +627,28 @@ impl MemoryRoot {
                 if !metadata.is_file() || metadata_is_windows_reparse_point(&metadata) {
                     continue;
                 }
+                let mut options = OpenOptions::new();
+                options
+                    .read(true)
+                    .follow(FollowSymlinks::No)
+                    .maybe_dir(true);
+                #[cfg(unix)]
+                options.custom_flags(libc::O_NONBLOCK);
+                let mut file = match familiar_dir.open_with(&file_name, &options) {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        return Err(error).context("failed to open memory-file entry");
+                    }
+                };
+                if crate::memory_import::opened_file_is_logically_restored(
+                    &self.coven_home,
+                    &familiar_id,
+                    &file_name,
+                    &mut file,
+                ) {
+                    continue;
+                }
                 let relative_path = format!("{familiar_id}/{file_name}");
                 let id = reserve_memory_id(&mut seen_ids, memory_id(&relative_path))?;
                 let modified = metadata.modified().ok().map(|modified| modified.into_std());
@@ -671,13 +697,23 @@ impl MemoryRoot {
             .maybe_dir(true);
         #[cfg(unix)]
         options.custom_flags(libc::O_NONBLOCK);
-        let file = familiar_dir
+        let mut file = familiar_dir
             .open_with(&record.file_name, &options)
             .map_err(classify_path_open_error)?;
         let metadata = file.metadata().map_err(classify_opened_handle_error)?;
         if !metadata.is_file() || metadata_is_windows_reparse_point(&metadata) {
             return Err(MemoryContentError::MissingOrUnsafe);
         }
+        if crate::memory_import::opened_file_is_logically_restored(
+            &self.coven_home,
+            &record.familiar_id,
+            &record.file_name,
+            &mut file,
+        ) {
+            return Err(MemoryContentError::MissingOrUnsafe);
+        }
+        file.seek(SeekFrom::Start(0))
+            .map_err(classify_opened_handle_error)?;
         Ok(file)
     }
 }
@@ -1403,6 +1439,51 @@ description = "..."
         assert_eq!(out[1].familiar_id, "sage");
         assert_eq!(out[1].path, "sage/notes.md");
         assert!(out[1].excerpt.starts_with("First paragraph"));
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn opened_memory_record_rechecks_logical_restore_state() -> Result<()> {
+        let test_root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/memory-reader-tests");
+        fs::create_dir_all(&test_root)?;
+        let test_root = fs::canonicalize(test_root)?;
+        let temp = tempfile::Builder::new()
+            .prefix("reader")
+            .tempdir_in(test_root)?;
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace)?;
+        fs::write(
+            temp.path().join(FAMILIARS_CONFIG_FILE),
+            format!(
+                "[[familiar]]\nid = \"sage\"\ndisplay_name = \"Sage\"\nrole = \"test\"\ndescription = \"test\"\nworkspace = {}\n",
+                serde_json::to_string(&workspace.to_string_lossy())?
+            ),
+        )?;
+        let sources = vec![crate::memory_import::DiscoveredSource {
+            source_label: "MEMORY.md".to_owned(),
+            bytes: b"restored content".to_vec(),
+        }];
+        let plan = crate::memory_import::build_import_plan(
+            temp.path(),
+            "sage",
+            crate::memory_import::MemoryImportSourceKind::Native,
+            &sources,
+        )?;
+        crate::memory_import::apply_import_plan(temp.path(), &plan, &sources)?;
+        let root = MemoryRoot::open(temp.path())?.expect("memory root exists");
+        let record = root
+            .enumerate_metadata()?
+            .into_iter()
+            .next()
+            .expect("applied memory is visible");
+        crate::memory_import::restore_import_bundle_for_test(temp.path(), "sage", &plan.bundle_id)?;
+
+        let error = read_record_content(&root, &record)
+            .expect_err("restored memory must not be read from a stale record");
+
+        assert!(matches!(error, MemoryContentError::MissingOrUnsafe));
         Ok(())
     }
 

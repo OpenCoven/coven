@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{SecondsFormat, Utc};
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use uuid::Uuid;
 
 mod api;
@@ -27,6 +27,7 @@ mod familiar_identity;
 mod harness;
 mod hub;
 mod memory_dashboard;
+mod memory_import;
 pub mod mobile_memory;
 mod observe;
 mod openclaw_repo;
@@ -106,23 +107,64 @@ struct Cli {
 
 impl Cli {
     fn validate(self) -> std::result::Result<Self, clap::Error> {
-        if matches!(
-            self.command,
-            Some(Command::Memory {
-                command: Some(_),
-                json: true,
-            })
-        ) {
-            let mut command = Cli::command();
-            let memory = command
-                .find_subcommand_mut("memory")
-                .expect("derived CLI must contain the memory command");
-            return Err(memory.error(
-                clap::error::ErrorKind::ArgumentConflict,
-                "the argument '--json' cannot be used with 'open'",
-            ));
+        if let Some(Command::Memory {
+            command: Some(memory_command),
+            json,
+        }) = &self.command
+        {
+            if *json {
+                let mut command = Cli::command();
+                let memory = command
+                    .find_subcommand_mut("memory")
+                    .expect("derived CLI must contain the memory command");
+                return Err(memory.error(
+                    clap::error::ErrorKind::ArgumentConflict,
+                    "the parent argument '--json' is only valid when listing memory",
+                ));
+            }
+
+            if matches!(
+                memory_command,
+                MemoryCommand::Import {
+                    source: MemoryImportSourceArg::Native,
+                    openclaw_root: Some(_),
+                    ..
+                }
+            ) {
+                let mut command = Cli::command();
+                let memory = command
+                    .find_subcommand_mut("memory")
+                    .expect("derived CLI must contain the memory command");
+                return Err(memory.error(
+                    clap::error::ErrorKind::ArgumentConflict,
+                    "'--openclaw-root' requires '--source openclaw'",
+                ));
+            }
         }
         Ok(self)
+    }
+}
+
+fn parse_nonempty_arg(value: &str) -> std::result::Result<String, String> {
+    if value.trim().is_empty() {
+        Err("value must not be empty".to_owned())
+    } else {
+        Ok(value.to_owned())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum MemoryImportSourceArg {
+    Native,
+    Openclaw,
+}
+
+impl From<MemoryImportSourceArg> for memory_import::MemoryImportSourceKind {
+    fn from(source: MemoryImportSourceArg) -> Self {
+        match source {
+            MemoryImportSourceArg::Native => Self::Native,
+            MemoryImportSourceArg::Openclaw => Self::Openclaw,
+        }
     }
 }
 
@@ -559,6 +601,28 @@ enum MemoryCommand {
     Mobile {
         #[command(subcommand)]
         command: MobileMemoryCommand,
+    },
+    #[command(about = "Preview or apply a familiar-scoped memory import")]
+    Import {
+        #[arg(long, value_name = "FAMILIAR", value_parser = parse_nonempty_arg)]
+        familiar: String,
+        #[arg(long, value_enum, default_value = "native")]
+        source: MemoryImportSourceArg,
+        #[arg(long, value_name = "PATH", required_if_eq("source", "openclaw"))]
+        openclaw_root: Option<PathBuf>,
+        #[arg(long, help = "Apply the import; otherwise only preview it")]
+        apply: bool,
+        #[arg(long, help = "Print the import report as JSON (machine-readable)")]
+        json: bool,
+    },
+    #[command(about = "Restore files created by a familiar memory import")]
+    Restore {
+        #[arg(long, value_name = "FAMILIAR", value_parser = parse_nonempty_arg)]
+        familiar: String,
+        #[arg(long, value_name = "BUNDLE", value_parser = parse_nonempty_arg)]
+        bundle: String,
+        #[arg(long, help = "Print the restore report as JSON (machine-readable)")]
+        json: bool,
     },
 }
 
@@ -1136,6 +1200,24 @@ fn run_cli(cli: Cli) -> Result<()> {
                     None => mobile_memory::run_devices(json),
                 },
             },
+            Some(MemoryCommand::Import {
+                familiar,
+                source,
+                openclaw_root,
+                apply,
+                json,
+            }) => memory_import::run_import(
+                &familiar,
+                source.into(),
+                openclaw_root.as_deref(),
+                apply,
+                json,
+            ),
+            Some(MemoryCommand::Restore {
+                familiar,
+                bundle,
+                json,
+            }) => memory_import::run_restore(&familiar, &bundle, json),
             None => observe::run_memory(json),
         },
         Some(Command::Research { json }) => observe::run_research(json),
@@ -4716,6 +4798,212 @@ mod tests {
                     json: false
                 })
             ));
+        }
+    }
+
+    #[test]
+    fn memory_import_cli_parses_preview_apply_openclaw_and_json() {
+        for (args, expect_apply, expect_json) in [
+            (
+                vec!["coven", "memory", "import", "--familiar", "sage"],
+                false,
+                false,
+            ),
+            (
+                vec!["coven", "memory", "import", "--familiar", "sage", "--apply"],
+                true,
+                false,
+            ),
+            (
+                vec!["coven", "memory", "import", "--familiar", "sage", "--json"],
+                false,
+                true,
+            ),
+        ] {
+            match Cli::try_parse_from(args)
+                .and_then(Cli::validate)
+                .expect("native import must parse")
+                .command
+            {
+                Some(Command::Memory {
+                    command:
+                        Some(MemoryCommand::Import {
+                            familiar,
+                            source,
+                            openclaw_root,
+                            apply,
+                            json,
+                        }),
+                    json: parent_json,
+                }) => {
+                    assert_eq!(familiar, "sage");
+                    assert_eq!(source, MemoryImportSourceArg::Native);
+                    assert_eq!(openclaw_root, None);
+                    assert_eq!(apply, expect_apply);
+                    assert_eq!(json, expect_json);
+                    assert!(!parent_json);
+                }
+                other => panic!("expected native import, got {other:?}"),
+            }
+        }
+
+        let root = PathBuf::from("fixtures/openclaw");
+        match Cli::try_parse_from([
+            "coven",
+            "memory",
+            "import",
+            "--familiar",
+            "sage",
+            "--source",
+            "openclaw",
+            "--openclaw-root",
+            root.to_str().expect("test path must be UTF-8"),
+        ])
+        .and_then(Cli::validate)
+        .expect("OpenClaw preview import must parse")
+        .command
+        {
+            Some(Command::Memory {
+                command:
+                    Some(MemoryCommand::Import {
+                        familiar,
+                        source,
+                        openclaw_root,
+                        apply,
+                        json,
+                    }),
+                json: parent_json,
+            }) => {
+                assert_eq!(familiar, "sage");
+                assert_eq!(source, MemoryImportSourceArg::Openclaw);
+                assert_eq!(openclaw_root.as_deref(), Some(root.as_path()));
+                assert!(!apply);
+                assert!(!json);
+                assert!(!parent_json);
+            }
+            other => panic!("expected OpenClaw preview import, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn memory_import_cli_parses_restore_and_nested_json() {
+        for (args, expect_json) in [
+            (
+                vec![
+                    "coven",
+                    "memory",
+                    "restore",
+                    "--familiar",
+                    "sage",
+                    "--bundle",
+                    "bundle-1",
+                ],
+                false,
+            ),
+            (
+                vec![
+                    "coven",
+                    "memory",
+                    "restore",
+                    "--familiar",
+                    "sage",
+                    "--bundle",
+                    "bundle-1",
+                    "--json",
+                ],
+                true,
+            ),
+        ] {
+            match Cli::try_parse_from(args)
+                .and_then(Cli::validate)
+                .expect("restore must parse")
+                .command
+            {
+                Some(Command::Memory {
+                    command:
+                        Some(MemoryCommand::Restore {
+                            familiar,
+                            bundle,
+                            json,
+                        }),
+                    json: parent_json,
+                }) => {
+                    assert_eq!(familiar, "sage");
+                    assert_eq!(bundle, "bundle-1");
+                    assert_eq!(json, expect_json);
+                    assert!(!parent_json);
+                }
+                other => panic!("expected restore command, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn memory_import_cli_rejects_invalid_source_roots_and_parent_json() {
+        for args in [
+            vec![
+                "coven",
+                "memory",
+                "import",
+                "--familiar",
+                "sage",
+                "--source",
+                "native",
+                "--openclaw-root",
+                "fixtures/openclaw",
+            ],
+            vec![
+                "coven",
+                "memory",
+                "import",
+                "--familiar",
+                "sage",
+                "--source",
+                "openclaw",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(args).and_then(Cli::validate).is_err(),
+                "invalid source/root combination must be rejected"
+            );
+        }
+
+        let error =
+            Cli::try_parse_from(["coven", "memory", "--json", "import", "--familiar", "sage"])
+                .and_then(Cli::validate)
+                .expect_err("parent list-only JSON must conflict with import");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        for args in [
+            vec!["coven", "memory", "import", "--familiar", ""],
+            vec![
+                "coven",
+                "memory",
+                "restore",
+                "--familiar",
+                "sage",
+                "--bundle",
+                "",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(args).and_then(Cli::validate).is_err(),
+                "familiar and bundle values must be nonempty"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_import_cli_preserves_existing_memory_parses() {
+        for args in [
+            vec!["coven", "memory"],
+            vec!["coven", "memory", "--json"],
+            vec!["coven", "memory", "open"],
+            vec!["coven", "memory", "mobile", "status"],
+        ] {
+            Cli::try_parse_from(args)
+                .and_then(Cli::validate)
+                .expect("existing memory command must remain valid");
         }
     }
 

@@ -1,11 +1,11 @@
 # Psyche Coven Prerequisites
 
-**Status:** W0 reconciled and G1 verified 2026-08-01 - W1 code and contract audit required
+**Status:** W1 complete and G3 approved 2026-08-02 - bounded post-G3 planning permitted
 **Workstream:** W1
 **Gate:** G3
 **Owner:** Coven and Psyche maintainers
 **Canonical decision:** [Familiar runtime design](./RUNTIME_DESIGN.md)
-**Companions:** [Decision dossier](./DECISION_DOSSIER.md), [Product specification](./PRODUCT.md), [Technical architecture](./TECH.md), [Threat model](./THREAT_MODEL.md), [Telegram parity ledger](./TELEGRAM_PARITY.md), [Program plan](./PLAN.md)
+**Companions:** [W1 audit](./COVEN_W1_AUDIT.md), [Decision dossier](./DECISION_DOSSIER.md), [Product specification](./PRODUCT.md), [Technical architecture](./TECH.md), [Threat model](./THREAT_MODEL.md), [Telegram parity ledger](./TELEGRAM_PARITY.md), [Program plan](./PLAN.md)
 
 ## Decision
 
@@ -47,6 +47,12 @@ not the familiar identity source, principal mapper, graph authority, verifier,
 or surface policy engine.
 
 ## W1 audit artifact
+
+The completed evidence matrix is
+[`COVEN_W1_AUDIT.md`](./COVEN_W1_AUDIT.md). Val approved its classifications
+and dependency order at G3 on 2026-08-02. This prerequisite document remains
+the behavior source; approval does not claim that planned gaps are implemented
+or that G4/G6 conformance exists.
 
 W1 produces one reviewable matrix with these columns:
 

@@ -188,6 +188,9 @@ ORDERED_ALPHABET_FIXTURES = {
 KNOWN_PUBLIC_DOCUMENTATION_TOKENS = {
     "support-dev.discord.com/hc/en-us/articles/6207308062871-What-are-Privileged-Intents",
 }
+KNOWN_PUBLIC_IDENTITY_TOKENS = {
+    "223556219+Copilot@users.noreply.github.com",
+}
 KNOWN_SAFE_LONG_PATH_ATOMS = {
     "ARCHITECTURE",
     "CONTRIBUTING",
@@ -872,7 +875,8 @@ def is_known_safe_entropy_token(
 ) -> bool:
     token = token_match.group(0)
     return bool(
-        re.fullmatch(r"[0-9a-f]{32,64}", token)
+        token in KNOWN_PUBLIC_IDENTITY_TOKENS
+        or re.fullmatch(r"[0-9a-f]{32,64}", token)
         or is_known_safe_lockfile_token(path, line, token_match)
         or is_local_path_like_token(token)
         or is_public_repo_url_like_token(token)

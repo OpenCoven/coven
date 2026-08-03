@@ -120,6 +120,39 @@ class SecretGuardLockfileTests(unittest.TestCase):
 
         self.assertEqual(hits, [("docs/example.md", 1, "private_key")])
 
+    def test_copilot_public_noreply_identity_is_not_high_entropy(self) -> None:
+        text = (
+            "Co-authored-by: Copilot "
+            "<223556219+Copilot@users.noreply.github.com>"
+        )
+
+        hits = check_secrets.scan_text(
+            text, "docs/superpowers/plans/example.md"
+        )
+
+        self.assertEqual(hits, [])
+
+    def test_other_noreply_identity_still_triggers_high_entropy(self) -> None:
+        text = (
+            "Co-authored-by: Example "
+            "<123456789+DefinitelyNotCopilot@users.noreply.github.com>"
+        )
+
+        hits = check_secrets.scan_text(
+            text, "docs/superpowers/plans/example.md"
+        )
+
+        self.assertEqual(
+            hits,
+            [
+                (
+                    "docs/superpowers/plans/example.md",
+                    1,
+                    "high_entropy",
+                )
+            ],
+        )
+
     def test_opencoven_github_urls_do_not_trigger_high_entropy(self) -> None:
         text = (
             "The canonical brand system lives in "

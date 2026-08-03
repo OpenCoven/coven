@@ -738,6 +738,7 @@ dependencies = [
  "rcgen",
  "regex",
  "rusqlite",
+ "rustix",
  "rustls",
  "rustls-pki-types",
  "serde",

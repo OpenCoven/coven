@@ -4,7 +4,7 @@
 > executable implementation checklist. Each workstream after W1 requires its
 > own approved, test-first child plan before production code begins.
 
-**Status:** W0 complete and G1 verified 2026-08-01 - W1 audit next
+**Status:** W1 complete and G3 approved 2026-08-02 - bounded implementation planning next
 
 **Goal:** Build Psyche as the clean-room, local-first, surface-neutral familiar
 runtime for a Coven, with durable intent and orchestration, evidence-first
@@ -13,7 +13,7 @@ independent bounded execution substrate.
 
 **Canonical decision:** [Familiar runtime design](./RUNTIME_DESIGN.md)
 
-**Companions:** [Decision dossier](./DECISION_DOSSIER.md), [Product specification](./PRODUCT.md), [Technical architecture](./TECH.md), [Threat model](./THREAT_MODEL.md), [Telegram parity ledger](./TELEGRAM_PARITY.md), [Coven prerequisites](./COVEN_PREREQUISITES.md)
+**Companions:** [W1 Coven audit](./COVEN_W1_AUDIT.md), [Decision dossier](./DECISION_DOSSIER.md), [Product specification](./PRODUCT.md), [Technical architecture](./TECH.md), [Threat model](./THREAT_MODEL.md), [Telegram parity ledger](./TELEGRAM_PARITY.md), [Coven prerequisites](./COVEN_PREREQUISITES.md)
 
 ## 1. Fixed program decisions
 
