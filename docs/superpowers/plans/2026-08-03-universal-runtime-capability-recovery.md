@@ -37,7 +37,7 @@ The public docs in scope are the live pages that still carry stale version or li
 - Test: `docs/sessions/lifecycle.md`
 - Test: `crates/coven-cli/src/api.rs`
 
-- [ ] **Step 1:** Update the live public docs so they use one canonical external API version vocabulary: `coven.daemon.v1` for the contract name and `/api/v1` for the route prefix. Remove stale `supportedApiVersions` guidance from `docs/ARCHITECTURE.md`, and remove stale `pending`/`archived` lifecycle guidance from `docs/sessions/lifecycle.md`.
+- [ ] **Step 1:** Update the live public docs so they use one canonical external API version vocabulary: `coven.daemon.v1` for the contract name and `/api/v1` for the route prefix. Remove stale `supportedApiVersions` guidance from `docs/ARCHITECTURE.md`, and remove `pending`/`archived` from the authoritative lifecycle-status set in `docs/sessions/lifecycle.md` without deleting valid archive metadata or ritual documentation.
 - [ ] **Step 2:** Enumerate the exact persisted session statuses used by Rust (`created`, `running`, `completed`, `failed`, `killed`, `idle`, `orphaned`), distinguish archive metadata from lifecycle status, and keep the lifecycle page aligned with the authoritative Rust store vocabulary.
 - [ ] **Step 3:** Change `GET /api/v1/api-version` in `crates/coven-cli/src/api.rs` so the payload reports the named contract string instead of the bare `v1` token.
 - [ ] **Step 4:** Add or update route tests in `crates/coven-cli/src/api.rs` covering the named version response and the current unknown-version failure path, plus exact docs assertions that keep `supportedApiVersions` documented for `GET /api/v1/api-version`, reject any claim that `GET /api/v1/health` returns it, and keep the stale lifecycle guidance out of the live pages.
@@ -45,7 +45,8 @@ The public docs in scope are the live pages that still carry stale version or li
 
   ```sh
   rg -n 'supportedApiVersions' docs/reference/api-contract.md
-  rg -n 'pending|archived' docs/sessions/lifecycle.md
+  rg -n 'created|running|completed|failed|killed|idle|orphaned' docs/sessions/lifecycle.md
+  rg -n 'archived_at|Archive / summon / sacrifice' docs/sessions/lifecycle.md
   ```
 
   then commit only the O1 contract-freeze changes.
