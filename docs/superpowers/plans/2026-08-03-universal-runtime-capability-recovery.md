@@ -8,23 +8,47 @@
 
 **Tech Stack:** Rust (`crates/coven-cli/src/api.rs`, `harness.rs`, `capabilities.rs`, `daemon.rs`, `store.rs`), the pinned shared schema types from `coven_runtime_spec` (`Capabilities`, `SandboxMapping`, `StreamArgs`), markdown API docs, existing Rust tests, secret/privacy guardrails.
 
+## File map
+
+- Modify: `docs/API-CONTRACT.md`
+- Modify: `docs/ARCHITECTURE.md`
+- Modify: `docs/reference/api-contract.md`
+- Modify: `docs/reference/api.md`
+- Modify: `docs/sessions/lifecycle.md`
+- Modify: `crates/coven-cli/src/api.rs`
+- Test: `docs/ARCHITECTURE.md`
+- Test: `docs/sessions/lifecycle.md`
+- Test: `crates/coven-cli/src/api.rs`
+
+The public docs in scope are the live pages that still carry stale version or lifecycle guidance. The freeze must update the version contract docs and the two user-facing anchors called out in the issue: `docs/ARCHITECTURE.md` and `docs/sessions/lifecycle.md`.
+
 ---
 
-### Task 1: Freeze the O1 public contract vocabulary
+### Task 1: Freeze the O1 public contract vocabulary in the live docs
 
 **Files:**
+- Modify: `docs/ARCHITECTURE.md`
 - Modify: `docs/API-CONTRACT.md`
 - Modify: `docs/reference/api-contract.md`
 - Modify: `docs/reference/api.md`
-- Modify: `docs/SESSION-LIFECYCLE.md`
+- Modify: `docs/sessions/lifecycle.md`
 - Modify: `crates/coven-cli/src/api.rs`
+- Test: `docs/ARCHITECTURE.md`
+- Test: `docs/sessions/lifecycle.md`
 - Test: `crates/coven-cli/src/api.rs`
 
-- [ ] **Step 1:** Update the public docs so they use one canonical external API version vocabulary: `coven.daemon.v1` for the contract name and `/api/v1` for the route prefix.
-- [ ] **Step 2:** Enumerate the exact persisted session statuses used by Rust (`created`, `running`, `completed`, `failed`, `killed`, `idle`, `orphaned`), distinguish archive metadata from lifecycle status, and define `idle` as the persisted conversational state written when a clean child exit leaves the conversation extendable.
+- [ ] **Step 1:** Update the live public docs so they use one canonical external API version vocabulary: `coven.daemon.v1` for the contract name and `/api/v1` for the route prefix. Remove stale `supportedApiVersions` guidance from `docs/ARCHITECTURE.md`, and remove stale `pending`/`archived` lifecycle guidance from `docs/sessions/lifecycle.md`.
+- [ ] **Step 2:** Enumerate the exact persisted session statuses used by Rust (`created`, `running`, `completed`, `failed`, `killed`, `idle`, `orphaned`), distinguish archive metadata from lifecycle status, and keep the lifecycle page aligned with the authoritative Rust store vocabulary.
 - [ ] **Step 3:** Change `GET /api/v1/api-version` in `crates/coven-cli/src/api.rs` so the payload reports the named contract string instead of the bare `v1` token.
-- [ ] **Step 4:** Add or update route tests in `crates/coven-cli/src/api.rs` covering the named version response and the current unknown-version failure path.
-- [ ] **Step 5:** Run focused tests for the version routes and session-lifecycle docs assertions, then commit only the O1 contract-freeze changes.
+- [ ] **Step 4:** Add or update route tests in `crates/coven-cli/src/api.rs` covering the named version response and the current unknown-version failure path, plus exact doc checks that fail if `supportedApiVersions` or the stale lifecycle guidance reappear in the live pages.
+- [ ] **Step 5:** Run focused tests for the version routes and these exact doc checks:
+
+  ```sh
+  rg -n 'supportedApiVersions' docs/ARCHITECTURE.md docs/API-CONTRACT.md docs/reference/api.md docs/reference/api-contract.md
+  rg -n 'pending|archived' docs/sessions/lifecycle.md
+  ```
+
+  then commit only the O1 contract-freeze changes.
 
 ### Task 2: Introduce Rust-owned effective runtime descriptor types
 
@@ -102,7 +126,7 @@
 
 - [ ] **Step 1:** After Tasks 4 and 5 create the new `crates/coven-cli/tests/runtime_descriptor_contract.rs` integration test, reusing the existing binary-invocation style from current contract tests instead of assuming a pre-existing doctor-only harness.
 - [ ] **Step 2:** Add regression assertions in that file that prove the daemon still advertises `coven.daemon.v1`, that the runtime routes remain separate from `/api/v1/capabilities/harnesses`, that explicit non-public `runtimeId` requests fail with `descriptor_unavailable` before spawn, that supported mismatches fail with `runtime_harness_mismatch`, and that harness-only `coven-code` launches remain governed by the current harness policy.
-- [ ] **Step 3:** Add or update focused `api.rs` unit tests so the documented persisted lifecycle vocabulary — including `idle` — matches authoritative Rust states.
+- [ ] **Step 3:** Add or update focused `api.rs` unit tests so the documented persisted lifecycle vocabulary in `docs/sessions/lifecycle.md` matches authoritative Rust states.
 - [ ] **Step 4:** Run `cargo fmt --check`.
 - [ ] **Step 5:** Run `cargo clippy --workspace --all-targets -- -D warnings`.
 - [ ] **Step 6:** Run `cargo test --workspace --locked`.
