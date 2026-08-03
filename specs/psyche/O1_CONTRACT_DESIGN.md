@@ -1,6 +1,6 @@
 # Psyche O1 Coven Contract Design
 
-**Status:** Approved direction; written-spec review pending
+**Status:** Written-spec and child-plan review passed; implementation pending
 
 **Decision date:** 2026-08-02
 
@@ -104,32 +104,41 @@ planned gap unless a later bounded design approves it.
 
 ## 3. Session lifecycle vocabulary
 
-The canonical daemon-owned or externally registered harness-session statuses
-are:
+The complete persisted `SessionRecord.status` wire vocabulary for daemon-owned
+or externally registered harness sessions is:
 
 | Status | Terminal | Meaning |
 |---|---:|---|
 | `created` | No | The durable row exists, but no live runtime has been established. A stale unowned row is recovered as `failed`. |
 | `running` | No | Coven owns a live runtime, or an external runtime is registered as live. |
+| `idle` | No | A conversational session completed a turn successfully and remains available for later input. Psyche's first one-shot execution adapter does not emit or accept this value as attempt completion. |
 | `completed` | Yes | The observed runtime exited successfully or an external owner reported successful completion. |
 | `failed` | Yes | Launch failed, the runtime exited unsuccessfully, or a stale `created` row was recovered without an owner. |
-| `killed` | Yes | An accepted operator termination won the terminal-state race. A later process observer cannot overwrite it. |
+| `killed` | Yes for the current ledger only | Coven accepted a kill request and preserved that decision against a later exit observer. This value does not prove acknowledged process termination and cannot satisfy Psyche cancellation until O5 defines terminal-or-unresolved acknowledgement. |
 | `orphaned` | Yes | Daemon recovery found a row marked `running` for which the new daemon cannot prove a live owned runtime. |
 
-The following values are explicitly outside that lifecycle:
+Psyche's first one-shot execution adapter uses `created`, `running`,
+`completed`, `failed`, `killed`, and `orphaned`. It treats `idle` as a valid
+current-contract value for conversational sessions but not as terminal evidence
+for a Psyche attempt.
+
+The following concepts are explicitly outside that harness-session lifecycle:
 
 - `active` is an internal synthetic Cast quest-anchor store value. It is not a
   daemon-owned harness-session state, is not terminal, and must not be emitted
-  for a newly created Psyche execution session.
-- `idle` is conversation presentation state. It is not a `SessionRecord`
-  lifecycle value.
+  for a newly created Psyche execution session. Because synthetic rows share the
+  store and may appear in an unfiltered raw session list, clients must classify
+  the row kind before interpreting its status.
 - archive is represented by `archived_at`. Archiving or summoning changes
   visibility without changing the stored lifecycle status.
 
-Terminal status is authoritative once persisted. In particular, a late
-observer may add truthful exit evidence but may not replace `killed` with
-`completed` or `failed`. `orphaned` means ownership is unresolved, not that the
-work completed.
+Terminal status is authoritative for the current persisted ledger once written.
+In particular, a late observer may add truthful exit evidence but may not
+replace `killed` with `completed` or `failed`. That race rule does not promote
+`killed` into process-termination acknowledgement. Psyche cancellation remains
+unresolved until the separately designed O5 contract reports its authoritative
+terminal-or-unresolved outcome. `orphaned` means ownership is unresolved, not
+that the work completed.
 
 ## 4. Client data flow
 
@@ -160,6 +169,7 @@ boundaries rather than defining speculative new codes:
 | Unknown `/api/<route-version>/...` prefix | Daemon returns `404 invalid_request` with the requested and supported route-token evidence currently provided by the contract. |
 | Unknown harness capability target | Daemon returns `404 harness_not_found`. |
 | Advertised action later denied | Daemon returns the action-specific structured denial; the client must not treat discovery as authorization. |
+| `idle` observed for a Psyche one-shot attempt | Client recognizes the current wire value but treats the attempt as nonterminal and incompatible with the one-shot completion path. |
 | Unknown session status | Client treats the record as incompatible/unresolved and does not infer a terminal result. |
 
 Diagnostics must remain redacted. Version, capability name, status, and public
@@ -196,11 +206,14 @@ The implementation plan must start with failing tests and cover at least:
    wrong, or malformed health capability values before dependent work;
 4. unknown route prefixes and unknown harness capability targets retain their
    exact structured failures;
-5. daemon-owned harness sessions use only `created`, `running`, `completed`,
-   `failed`, `killed`, or `orphaned`;
-6. `completed`, `failed`, `killed`, and `orphaned` are terminal, and late exit
-   observation cannot overwrite `killed`;
-7. `active`, `idle`, and archive visibility cannot be mistaken for harness
+5. daemon-owned and externally registered harness sessions use exactly
+   `created`, `running`, `idle`, `completed`, `failed`, `killed`, or `orphaned`,
+   while Psyche one-shot execution uses the subset that excludes `idle`;
+6. `completed`, `failed`, `killed`, and `orphaned` are ledger-terminal, late
+   exit observation cannot overwrite `killed`, and no O1 test represents
+   `killed` as acknowledged process termination;
+7. `idle` is nonterminal, a synthetic row carrying `active` cannot be mistaken
+   for a harness session, and archive visibility cannot be mistaken for harness
    terminal state; and
 8. canonical docs contain the named contract/route-token distinction and the
    complete lifecycle table without conflicting examples.
@@ -213,8 +226,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
 python scripts/check-secrets.py
 python3 scripts/check-coven-privacy.py --staged
-npm run build
-npm test
+npm --prefix packages/openclaw-coven run typecheck
+npm --prefix packages/openclaw-coven test
 ```
 
 It must also run the exact documentation guardrails and focused Rust/TypeScript
