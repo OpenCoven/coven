@@ -173,6 +173,11 @@ pub struct ChatMessage {
     pub sender: String,
     pub content: String,
     pub timestamp: String,
+    /// One-time startup "splash" greeting. These are dropped from the
+    /// transcript the first time the user submits a prompt (see
+    /// `collapse_startup_notices`) so the welcome line doesn't linger above
+    /// the conversation. Always `false` for real conversation messages.
+    pub startup_notice: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -494,7 +499,7 @@ impl App {
             client,
         };
 
-        app.push_system_message("Ready. Type a task or /help.");
+        app.push_startup_notice("Ready. Type a task or /help.");
 
         if app.active_agent.is_none() {
             app.push_system_message("No agents available. Run `coven doctor` to check your setup.");
@@ -516,7 +521,29 @@ impl App {
             sender: "coven".into(),
             content: content.to_string(),
             timestamp: timestamp_now(),
+            startup_notice: false,
         });
+    }
+
+    /// Push the one-time startup greeting. Tagged `startup_notice` so it is
+    /// collapsed out of the transcript on the user's first prompt.
+    fn push_startup_notice(&mut self, content: &str) {
+        self.messages.push(ChatMessage {
+            role: MessageRole::System,
+            sender: "coven".into(),
+            content: content.to_string(),
+            timestamp: timestamp_now(),
+            startup_notice: true,
+        });
+    }
+
+    /// Drop the one-time startup greeting the first time the user submits a
+    /// prompt, so the "splash" doesn't linger above the conversation. A
+    /// no-op once the notices are gone (after the first prompt, or after a
+    /// `/clear` that already wiped them), so it is safe to call on every
+    /// submission.
+    fn collapse_startup_notices(&mut self) {
+        self.messages.retain(|m| !m.startup_notice);
     }
 
     fn push_user_message(&mut self, content: &str) {
@@ -525,6 +552,7 @@ impl App {
             sender: "You".into(),
             content: content.to_string(),
             timestamp: timestamp_now(),
+            startup_notice: false,
         });
     }
 
@@ -534,6 +562,7 @@ impl App {
             sender: agent_name.to_string(),
             content: content.to_string(),
             timestamp: timestamp_now(),
+            startup_notice: false,
         });
     }
 
@@ -543,6 +572,7 @@ impl App {
             sender: "tool".into(),
             content: content.to_string(),
             timestamp: timestamp_now(),
+            startup_notice: false,
         });
     }
 
@@ -732,6 +762,9 @@ impl App {
         }
 
         self.record_history(&raw);
+        // The startup greeting has served its purpose once a real prompt is
+        // sent — collapse it so it doesn't sit above the conversation.
+        self.collapse_startup_notices();
         self.push_user_message(&raw);
         if raw.starts_with('/') {
             let result = self.launch_chat_session(&raw);
@@ -7978,6 +8011,42 @@ mod tests {
         assert!(matches!(app.messages[0].role, MessageRole::System));
         assert!(app.messages[0].content.contains("Chat cleared"));
         assert_eq!(app.scroll_offset, 0);
+    }
+
+    #[test]
+    fn startup_greeting_collapses_on_first_prompt() {
+        let client = RecordingChatClient::default();
+        let mut app = App::new_with_client(Box::new(client));
+
+        // A fresh app shows the one-time "splash" greeting, tagged so it can
+        // be collapsed later.
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.startup_notice && m.content.contains("Ready. Type a task")),
+            "fresh app should show the tagged startup greeting"
+        );
+
+        // A real conversation message is never tagged as a startup notice.
+        app.push_user_message("hello");
+
+        // Collapsing on submit drops the greeting but keeps real messages.
+        app.collapse_startup_notices();
+        assert!(
+            !app.messages.iter().any(|m| m.startup_notice),
+            "startup greeting should be gone after the first prompt"
+        );
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| matches!(m.role, MessageRole::User) && m.content == "hello"),
+            "the user's first message must survive the collapse"
+        );
+
+        // Idempotent: a second collapse is a harmless no-op.
+        let len_before = app.messages.len();
+        app.collapse_startup_notices();
+        assert_eq!(app.messages.len(), len_before);
     }
 
     #[test]
