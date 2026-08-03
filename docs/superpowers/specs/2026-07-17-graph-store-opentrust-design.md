@@ -24,7 +24,7 @@ The graph store must layer under the existing Coven and `coven-threads` trust mo
 - `threads_gate::WARD_MANIFEST_SCHEMA_SQL` owns per-familiar protected-surface baselines.
 - `threads_gate::gate_protected_edits()` validates protected familiar edits and stages `DegradeToProposal` outcomes in `<COVEN_HOME>/pending/`.
 - `Ward::apply` remains the final materialized familiar edit boundary.
-- `POST /familiars/{id}/edits` is the daemon's protected familiar write path.
+- `POST /api/v1/familiars/:id/edits` is the daemon's protected familiar write path.
 
 Graph APIs may observe Ward and threads state. They must not create a parallel authority path around it.
 
@@ -258,15 +258,15 @@ Every graph write must append a `graph_provenance` row in the same transaction a
 If a graph fact derives from or mutates a protected familiar surface, it must either:
 
 1. Link to an existing `ward_audit` row through `graph_ward_links`.
-2. Route the mutation through `POST /familiars/{id}/edits` first, allowing `threads_gate` and `Ward::apply` to permit, stage, or reject it.
+2. Route the mutation through `POST /api/v1/familiars/:id/edits` first, allowing `threads_gate` and `Ward::apply` to permit, stage, or reject it.
 
 Graph APIs must not write protected familiar identity or memory files directly. A graph write that would imply a protected surface mutation must fail closed unless it can prove the Ward path authorized the change.
 
 ## API surface
 
-Add endpoints under `/api/v1`.
+The endpoint labels below are fully qualified `/api/v1/*` routes.
 
-### `POST /graph/query`
+### `POST /api/v1/graph/query`
 
 Bounded graph traversal and claim lookup.
 
@@ -289,7 +289,7 @@ Response fields:
 - `evidence` when requested
 - `provenanceCursor` when more provenance is available
 
-### `GET /graph/evidence/:id?targetType=node|edge|claim|evidence`
+### `GET /api/v1/graph/:targetType/:targetId/evidence`
 
 Evidence and provenance lookup for a graph target.
 
@@ -302,7 +302,7 @@ Response fields:
 
 For protected familiar surfaces, include linked `ward_audit` metadata when present.
 
-### `POST /graph/diff`
+### `POST /api/v1/graph/diff`
 
 Temporal graph diff between two points in time.
 
@@ -326,7 +326,7 @@ Response fields:
 
 Temporal diff composes graph provenance with `ward_audit` where graph targets link to Ward-controlled surfaces.
 
-### `POST /graph/exports`
+### `POST /api/v1/graph/exports`
 
 Generate an export artifact for Kuzu, Neo4j, `.af`, or OpenTrust-style interchange.
 
