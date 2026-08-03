@@ -210,8 +210,11 @@ fn preview_conflict_is_whole_plan_ineligible_and_creates_nothing() -> Result<()>
     assert_eq!(report["entries"][0]["status"], "conflict");
     assert_eq!(report["entries"][1]["status"], "create");
     assert!(!temp.path().join("memory/sage/notes-new.md").exists());
-    assert!(!temp.path().join("memory-import").exists());
-    assert!(!temp.path().join("journal").exists());
+    assert!(!temp.path().join("memory-migrations").exists());
+    assert!(!temp
+        .path()
+        .join("memory/sage/.coven-migration-work")
+        .exists());
     Ok(())
 }
 
