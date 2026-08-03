@@ -159,8 +159,116 @@ runtime-descriptor addressing distinct:
   `supported_runtime` set.
 - If `runtimeId` is outside that set — including `coven-code`,
   `observational_scan` entries, or unknown ids — the daemon must fail before
-  argv construction or spawn with stable `404 runtime_not_found`. It must not
-  silently fall back to a harness-keyed launch.
+  argv construction or spawn with stable `404 descriptor_unavailable`. It must
+  not silently fall back to a harness-keyed launch.
+
+### v1 session request semantics
+
+`POST /api/v1/sessions` keeps the current required `harness` field in v1.
+`runtimeId` is optional and acts only as an explicit public-runtime selector and
+consistency check; it never replaces `harness`.
+
+The canonical public runtime mapping is intentionally closed:
+
+| `harness` | Canonical public `runtimeId` |
+|---|---|
+| `codex` | `codex` |
+| `claude` | `claude` |
+| `copilot` | `copilot` |
+| `coven-code` | none — harness-only, not a public runtime |
+
+The launch rules are:
+
+1. `harness` remains required and is validated with today's harness launch
+   policy first.
+2. If `runtimeId` is absent, the daemon preserves the existing harness-only
+   launch behavior exactly.
+3. If `runtimeId` is present, the daemon first resolves it against the public
+   supported-runtime descriptor set. Unknown, unsupported, or non-public ids —
+   including `coven-code` and observational-only scan ids — fail before spawn
+   with `404 descriptor_unavailable`.
+4. If `runtimeId` resolves, it must equal the canonical public runtime mapped
+   from `harness`. If it does not, or if the selected harness has no canonical
+   public runtime mapping, the daemon fails before spawn with stable
+   `400 runtime_harness_mismatch`.
+5. Only after both checks pass may the daemon evaluate required capabilities.
+   There is no fallback, downgrade, or ignore path for a supplied `runtimeId`.
+
+### Exact session request examples
+
+Accepted legacy harness-only launch:
+
+```json
+{
+  "projectRoot": "/repo",
+  "harness": "codex",
+  "prompt": "Fix the tests"
+}
+```
+
+Accepted explicit public runtime match:
+
+```json
+{
+  "projectRoot": "/repo",
+  "harness": "codex",
+  "runtimeId": "codex",
+  "prompt": "Fix the tests"
+}
+```
+
+Rejected public-runtime/harness mismatch:
+
+```json
+{
+  "error": {
+    "code": "runtime_harness_mismatch",
+    "details": {
+      "harness": "codex",
+      "runtimeId": "claude",
+      "canonicalRuntimeId": "codex"
+    }
+  }
+}
+```
+
+Rejected non-public runtime id:
+
+```json
+{
+  "error": {
+    "code": "descriptor_unavailable",
+    "details": {
+      "runtimeId": "coven-code"
+    }
+  }
+}
+```
+
+Preserved harness-only internal-tool launch:
+
+```json
+{
+  "projectRoot": "/repo",
+  "harness": "coven-code",
+  "prompt": "Open the TUI"
+}
+```
+
+Rejected attempt to pair a harness-only tool with a public runtime selector:
+
+```json
+{
+  "error": {
+    "code": "runtime_harness_mismatch",
+    "details": {
+      "harness": "coven-code",
+      "runtimeId": "codex",
+      "canonicalRuntimeId": null
+    }
+  }
+}
+```
 
 ## 3. Rust authority types
 
@@ -291,8 +399,32 @@ Each capability has exactly one state:
   evidence for safe use
 - `unsupported` - not provided by the supported runtime contract
 
-The descriptor must also carry a machine-readable `reason` for non-supported
-states. Clients may improve copy, but they must not reinterpret the state.
+The descriptor must also carry a machine-readable `reason`. Descriptor v1 keeps
+that reason vocabulary closed:
+
+- `harness_not_installed`
+- `version_unknown`
+- `version_too_old`
+- `capability_not_advertised`
+- `policy_denied`
+- `platform_unsupported`
+
+`supported` is the only state that serializes `reason: null`. Every
+non-supported capability state must serialize exactly one of the closed enum
+values above. The initial v1 mapping is:
+
+| `state` | `reason` | Required mapping rule |
+|---|---|---|
+| `supported` | `null` | Capability is available and enforceable on this host. |
+| `unavailable` | `harness_not_installed` | The required harness executable or local adapter prerequisite is missing. |
+| `unavailable` | `version_too_old` | The harness version is known and below the minimum version needed for the capability. |
+| `unverified` | `version_unknown` | The harness exists, but the daemon cannot determine a trustworthy version or equivalent evidence yet. |
+| `unsupported` | `capability_not_advertised` | The supported runtime contract or passive native evidence does not advertise the capability. |
+| `unsupported` | `policy_denied` | Coven intentionally withholds the capability even if a native surface may exist, because the public support policy does not admit it. |
+| `unsupported` | `platform_unsupported` | The capability is outside the supported runtime contract for the current OS or host class. |
+
+Clients may improve copy, but they must not reinterpret either the `state` or
+the closed `CapabilityReason` value.
 
 ## 5. Relationship to `/api/v1/capabilities/harnesses`
 
@@ -335,11 +467,12 @@ The evaluation algorithm is:
 The internal Rust result should distinguish:
 
 - `accepted`
+- `descriptor_unavailable`
+- `runtime_harness_mismatch`
 - `unknown_capability`
 - `unsupported_capability`
 - `unavailable_capability`
 - `unverified_capability`
-- `unsupported_runtime`
 
 ### Error and compatibility behavior
 
@@ -349,21 +482,25 @@ For the recovered design, the compatibility rules are:
 
 - Unknown required capability id: `400 invalid_request`
 - Unknown or publicly unsupported runtime id on the future `/api/v1/runtimes`
-  surface: `404 runtime_not_found`
+  surface: `404 descriptor_unavailable`
 - Explicit `runtimeId` on a future launch request that is not in the public
   supported-runtime set — including `coven-code` — must fail with the same
-  stable `404 runtime_not_found` before argv construction or spawn, while
+  stable `404 descriptor_unavailable` before argv construction or spawn, while
   harness-keyed launches without `runtimeId` continue under the current harness
   policy.
+- Explicit supported `runtimeId` values that do not equal the canonical public
+  runtime mapped from the required `harness` must fail before spawn with stable
+  `400 runtime_harness_mismatch`.
 - Known capability not in `supported` state: fail closed before launch with
   `409 runtime_capability_not_met` and `details` containing at least
   `{ runtimeId, capability, state, reason }`
 - Clients branch on code and `details`, never prose
 
 Because issue #567 is still open, this design does **not** claim that
-`runtime_not_found` or `runtime_capability_not_met` already exists today. The
-future implementation must add them explicitly and document them in
-`docs/API-CONTRACT.md` and `docs/reference/api.md` in the same change.
+`descriptor_unavailable`, `runtime_harness_mismatch`, or
+`runtime_capability_not_met` already exists today. The future implementation
+must add them explicitly and document them in `docs/API-CONTRACT.md` and
+`docs/reference/api.md` in the same change.
 
 ## 7. Lifecycle and descriptor truth
 
@@ -398,13 +535,20 @@ following are true:
 4. **Support policy stays scoped.** The public descriptor list includes only
    Codex, Claude Code, and GitHub Copilot CLI. `coven-code` remains excluded as
    a public runtime, and observational scans do not silently become supported.
-5. **Required capabilities fail closed.** The daemon rejects unknown or unmet
+5. **Session requests stay unambiguous.** `harness` remains required,
+   `runtimeId` stays optional, unsupported/non-public runtime ids return
+   `descriptor_unavailable`, supported mismatches return
+   `runtime_harness_mismatch`, and supplied `runtimeId` values are never
+   ignored or used as fallback hints.
+6. **Required capabilities fail closed.** The daemon rejects unknown or unmet
    required capabilities before launch.
-6. **Capability states are machine-readable.** Non-supported states expose exact
-   `state` and `reason` values.
-7. **Docs and tests land together.** Any new runtime endpoint or error code ships
-   with contract docs and executable regression coverage.
-8. **No speculative adapters.** The work does not promise registry adapters,
+7. **Capability states are machine-readable.** Non-supported states expose exact
+   `state` values plus the closed v1 `CapabilityReason` enum, and `supported`
+   serializes `reason: null`.
+8. **Docs and tests land together.** Any new runtime endpoint or error code ships
+   with exact request/error examples in contract docs and executable regression
+   coverage that asserts the exact enum/code values.
+9. **No speculative adapters.** The work does not promise registry adapters,
    downloadable plugins, or widened harness support.
 
 ## Implementation boundary
