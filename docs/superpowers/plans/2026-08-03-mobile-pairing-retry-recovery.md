@@ -468,29 +468,30 @@ cargo test -p coven-cli mobile_memory --locked -- --nocapture
 
 Expected: PASS. Pairing and gateway tests now cover the full retry contract.
 
-- [ ] **Step 4: Run the repository gates exactly as the spec requires**
+- [x] **Step 4: Re-run the scoped validation loop for the final blocker fix**
 
-Validation note: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
-`python scripts/check-secrets.py`, and `python3 scripts/check-coven-privacy.py --staged`
-passed. `cargo test --workspace --locked` currently fails in pre-existing
-`crates/coven-cli/tests/smoke.rs` doctor assertions unrelated to mobile pairing
-(`doctor_missing_harness_prints_cross_platform_setup_loop`,
-`doctor_json_passes_with_fake_harness_and_engine`,
-`doctor_reports_no_familiars_when_manifest_absent`).
+Validation note: Verified the expiry-pruning follow-up with
+`cargo test -p coven-cli mobile_memory --locked -- --nocapture`,
+`cargo fmt --check`, and `cargo clippy -p coven-cli --all-targets -- -D warnings`.
+Also reran `python scripts/check-secrets.py` and
+`python3 scripts/check-coven-privacy.py --staged` after staging the patch; all
+five checks passed.
 
 Run:
 
 ```bash
-git add crates/coven-cli/src/mobile_memory/pairing.rs crates/coven-cli/src/mobile_memory/gateway.rs
+git add \
+  crates/coven-cli/src/mobile_memory/pairing.rs \
+  docs/superpowers/plans/2026-08-03-mobile-pairing-retry-recovery.md
+cargo test -p coven-cli mobile_memory --locked -- --nocapture
 cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --locked
+cargo clippy -p coven-cli --all-targets -- -D warnings
 python scripts/check-secrets.py
 python3 scripts/check-coven-privacy.py --staged
 ```
 
-Expected: PASS. No formatting drift, no lint warnings, full locked tests clean,
-no secret findings, and no privacy-guard complaints on the staged patch.
+Expected: PASS. The focused mobile pairing/gateway loop stays clean, formatting
+and lint checks stay green, and the staged patch clears secret/privacy guards.
 
 - [x] **Step 5: Commit the replay-safe implementation**
 

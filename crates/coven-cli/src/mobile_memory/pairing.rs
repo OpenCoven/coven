@@ -102,16 +102,27 @@ impl PairingManager {
         nonce: [u8; 32],
         expires_at: DateTime<Utc>,
     ) -> Result<PairingInvitation, PairingError> {
-        self.begin_pairing_with_id(Uuid::new_v4(), nonce, expires_at)
+        self.insert_pairing(Uuid::new_v4(), nonce, expires_at, Some(Utc::now()))
     }
 
+    #[cfg(test)]
     fn begin_pairing_with_id(
         &self,
         id: Uuid,
         nonce: [u8; 32],
         expires_at: DateTime<Utc>,
     ) -> Result<PairingInvitation, PairingError> {
-        let pending = PendingPairing {
+        self.insert_pairing(id, nonce, expires_at, None)
+    }
+
+    fn insert_pairing(
+        &self,
+        id: Uuid,
+        nonce: [u8; 32],
+        expires_at: DateTime<Utc>,
+        prune_before_insert: Option<DateTime<Utc>>,
+    ) -> Result<PairingInvitation, PairingError> {
+        let pairing = PendingPairing {
             id,
             nonce_hash: Sha256::digest(nonce).into(),
             expires_at,
@@ -122,15 +133,29 @@ impl PairingManager {
             consumed: false,
             completed: None,
         };
-        self.pending
+        let mut pending = self
+            .pending
             .lock()
-            .map_err(|_| PairingError::InvalidRequest)?
-            .insert(id, pending);
+            .map_err(|_| PairingError::InvalidRequest)?;
+        if let Some(now) = prune_before_insert {
+            Self::prune_expired(&mut pending, now, |_| false);
+        }
+        pending.insert(id, pairing);
         Ok(PairingInvitation {
             id,
             nonce,
             expires_at,
         })
+    }
+
+    fn prune_expired<F>(
+        pending: &mut HashMap<Uuid, PendingPairing>,
+        now: DateTime<Utc>,
+        mut retain_expired: F,
+    ) where
+        F: FnMut(&PendingPairing) -> bool,
+    {
+        pending.retain(|_, pairing| pairing.expires_at > now || retain_expired(pairing));
     }
 
     pub fn enroll(
@@ -193,14 +218,20 @@ impl PairingManager {
         now: DateTime<Utc>,
     ) -> Result<EnrolledPairing, PairingError> {
         let nonce_hash: [u8; 32] = Sha256::digest(nonce).into();
-        let pairing_id = self
-            .pending
-            .lock()
-            .map_err(|_| PairingError::InvalidRequest)?
-            .values()
-            .find(|pairing| pairing.nonce_hash == nonce_hash)
-            .map(|pairing| pairing.id)
-            .ok_or(PairingError::PairingConsumed)?;
+        let pairing_id = {
+            let mut pending = self
+                .pending
+                .lock()
+                .map_err(|_| PairingError::InvalidRequest)?;
+            Self::prune_expired(&mut pending, now, |pairing| {
+                pairing.nonce_hash == nonce_hash
+            });
+            pending
+                .values()
+                .find(|pairing| pairing.nonce_hash == nonce_hash)
+                .map(|pairing| pairing.id)
+                .ok_or(PairingError::PairingConsumed)?
+        };
         self.enroll(pairing_id, nonce, request, host_fingerprint, now)
     }
 
@@ -670,6 +701,64 @@ mod tests {
             PairingError::PairingExpired
         );
         assert_eq!(harness.devices().len(), 1);
+    }
+
+    #[test]
+    fn later_pairing_operations_prune_expired_completed_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = Arc::new(DeviceRegistry::load(temp.path()).unwrap());
+        let manager = PairingManager::new(registry);
+        let pairing_id = Uuid::from_u128(1);
+        let expired_now = Utc::now() - Duration::minutes(6);
+        let pairing_nonce = [7; 32];
+        let signing_key = p256::SecretKey::from_slice(&[1; 32]).unwrap();
+        let public_key = signing_key.public_key().to_encoded_point(false);
+        let request = MobilePairingRequest {
+            protocol_version: MOBILE_PROTOCOL_VERSION,
+            pairing_nonce: URL_SAFE_NO_PAD.encode(pairing_nonce),
+            device_name: "Synthetic phone".to_owned(),
+            device_public_key: URL_SAFE_NO_PAD.encode(public_key.as_bytes()),
+            app_version: "1.0.0".to_owned(),
+            supported_protocol: super::super::contract::MobileProtocolRange {
+                minimum: 1,
+                maximum: 1,
+            },
+        };
+        manager
+            .begin_pairing_with_id(
+                pairing_id,
+                pairing_nonce,
+                expired_now + Duration::minutes(5),
+            )
+            .unwrap();
+        let enrolled = manager
+            .enroll(pairing_id, pairing_nonce, request, [3; 32], expired_now)
+            .unwrap();
+        assert_eq!(
+            manager
+                .confirm_host(pairing_id, &enrolled.phrase, expired_now)
+                .unwrap(),
+            PairingProgress::Pending
+        );
+        assert!(matches!(
+            manager
+                .confirm_device(pairing_id, &enrolled.phrase, expired_now)
+                .unwrap(),
+            PairingProgress::Complete {
+                replayed: false,
+                ..
+            }
+        ));
+        assert_eq!(manager.pending.lock().unwrap().len(), 1);
+
+        let next = manager
+            .begin_pairing([9; 32], Utc::now() + Duration::minutes(5))
+            .unwrap();
+
+        assert_eq!(manager.pending.lock().unwrap().len(), 1);
+        assert!(manager.pending.lock().unwrap().contains_key(&next.id));
+        assert!(!manager.pending.lock().unwrap().contains_key(&pairing_id));
+        assert_eq!(manager.registry.list_status().unwrap().len(), 1);
     }
 
     #[test]
