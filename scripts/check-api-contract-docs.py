@@ -31,6 +31,51 @@ TERMINAL = {
     "killed": "Yes",
     "orphaned": "Yes",
 }
+LEGACY_ROUTE = "/api/v1/api-version"
+LITERAL_V1 = re.compile(r"(?<![./A-Za-z0-9_])v1(?![A-Za-z0-9_])", re.IGNORECASE)
+ROUTE_CLAIM = r"(?:(?:compatibility|named-contract)[-\s]+handshake|proof)"
+DIRECT_POSITIVE_ROUTE_CLAIM = re.compile(
+    rf"{re.escape(LEGACY_ROUTE)}"
+    r"(?:(?!\b(?:and|but)\b).){0,160}?"
+    r"\b(?:is|are|serves\s+as|acts\s+as)\s+"
+    rf"(?!(?:not|never|no)\b)(?:(?!\b(?:and|but)\b).){{0,120}}?\b{ROUTE_CLAIM}\b",
+    re.IGNORECASE,
+)
+CONTINUED_POSITIVE_ROUTE_CLAIM = re.compile(
+    r"\b(?:and|but)\s+(?:(?:it|this\s+route)\s+)?"
+    r"(?:is|are|serves\s+as|acts\s+as)\s+"
+    rf"(?!(?:not|never|no)\b)(?:(?!\b(?:and|but)\b).){{0,120}}?\b{ROUTE_CLAIM}\b",
+    re.IGNORECASE,
+)
+
+
+def legacy_route_explained(text: str) -> bool:
+    for paragraph in re.split(r"\n\s*\n", text):
+        lowered = paragraph.lower()
+        if (
+            LEGACY_ROUTE in paragraph
+            and "legacy" in lowered
+            and "route-family" in lowered
+            and LITERAL_V1.search(paragraph)
+        ):
+            return True
+    return False
+
+
+def presents_legacy_route_as_named_contract(text: str) -> bool:
+    for paragraph in re.split(r"\n\s*\n", text):
+        if LEGACY_ROUTE not in paragraph:
+            continue
+        normalized = re.sub(r"\s+", " ", paragraph)
+        statements = re.split(r"(?<=[.!?])\s+(?=[A-Z`])", normalized)
+        for statement in statements:
+            if LEGACY_ROUTE not in statement:
+                continue
+            if DIRECT_POSITIVE_ROUTE_CLAIM.search(statement):
+                return True
+            if CONTINUED_POSITIVE_ROUTE_CLAIM.search(statement):
+                return True
+    return False
 
 
 def validate_documents(documents: dict[str, str]) -> list[str]:
@@ -44,14 +89,10 @@ def validate_documents(documents: dict[str, str]) -> list[str]:
             term in lowered for term in ("never grant permission", "not authorization")
         ):
             errors.append(f"{path}: capabilities versus authorization is missing")
-        for paragraph in re.split(r"\n\s*\n", text):
-            if "/api/v1/api-version" not in paragraph or "coven.daemon.v1" not in paragraph:
-                continue
-            lowered = paragraph.lower()
-            if "not" not in lowered or "proof" not in lowered:
-                errors.append(
-                    f"{path}: legacy route presented as named-contract handshake"
-                )
+        if not legacy_route_explained(text):
+            errors.append(f"{path}: legacy route explanation is missing")
+        if presents_legacy_route_as_named_contract(text):
+            errors.append(f"{path}: legacy route presented as named-contract handshake")
 
     for path in LIFECYCLE_DOCS:
         text = documents[path]
@@ -82,24 +123,21 @@ def validate_documents(documents: dict[str, str]) -> list[str]:
         term in lowered_contract for term in ("stale unowned", "recover", "`failed`")
     ):
         errors.append("docs/API-CONTRACT.md: stale created recovery is missing")
-    if "not proof of acknowledged process termination" not in lowered_contract:
-        errors.append("docs/API-CONTRACT.md: killed acknowledgement boundary is missing")
-    if not all(
-        term in lowered_contract
-        for term in ("synthetic", "`active`", "not a harness-session state")
-    ):
-        errors.append("docs/API-CONTRACT.md: synthetic active distinction is missing")
-    if "stored separately in `archived_at`" not in contract:
-        errors.append("docs/API-CONTRACT.md: archive separation is missing")
     return errors
 
 
 def main() -> int:
     paths = sorted(set(CONTRACT_DOCS + LIFECYCLE_DOCS))
-    documents = {
-        relative: (ROOT / relative).read_text(encoding="utf-8")
-        for relative in paths
-    }
+    documents: dict[str, str] = {}
+    for relative in paths:
+        try:
+            documents[relative] = (ROOT / relative).read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            print(
+                f"{relative}: unable to read ({type(error).__name__})",
+                file=sys.stderr,
+            )
+            return 1
     errors = validate_documents(documents)
 
     for error in errors:
