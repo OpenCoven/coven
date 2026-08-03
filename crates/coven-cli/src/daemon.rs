@@ -2255,6 +2255,7 @@ fn try_reserve_windows_daemon_pipe(
 
     let pipe_name = daemon_windows_pipe_name(coven_home);
     let name = pipe_name
+        .as_str()
         .to_ns_name::<GenericNamespaced>()
         .context("failed to create reset pipe reservation name")?;
     let security_descriptor = owner_only_pipe_security_descriptor()?;

@@ -10,7 +10,7 @@ use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
-use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
 use cap_std::{ambient_authority, fs::Dir};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -780,15 +780,12 @@ fn normal_components(path: &Path) -> Result<Vec<&OsStr>> {
 
 #[cfg(unix)]
 fn protect_private_dir(dir: &Dir) -> Result<()> {
-    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::PermissionsExt;
 
-    // SAFETY: the directory owns a valid file descriptor for the duration of
-    // the call; fchmod changes only that opened directory.
-    if unsafe { libc::fchmod(dir.as_raw_fd(), 0o700) } != 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("failed to protect reset backup directory");
-    }
-    Ok(())
+    open_syncable_directory(dir)?
+        .into_std()
+        .set_permissions(std::fs::Permissions::from_mode(0o700))
+        .context("failed to protect reset backup directory")
 }
 
 #[cfg(not(unix))]
@@ -798,14 +795,9 @@ fn protect_private_dir(_dir: &Dir) -> Result<()> {
 
 #[cfg(unix)]
 fn sync_directory(dir: &Dir) -> Result<()> {
-    use std::os::fd::AsRawFd;
-
-    // SAFETY: the directory owns a valid file descriptor for the duration of
-    // the call; fsync persists metadata for that opened directory.
-    if unsafe { libc::fsync(dir.as_raw_fd()) } != 0 {
-        return Err(std::io::Error::last_os_error()).context("failed to sync directory");
-    }
-    Ok(())
+    open_syncable_directory(dir)?
+        .sync_all()
+        .context("failed to sync directory")
 }
 
 #[cfg(windows)]
@@ -821,9 +813,20 @@ fn sync_directory(_dir: &Dir) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn open_syncable_directory(dir: &Dir) -> Result<cap_std::fs::File> {
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .follow(FollowSymlinks::No)
+        .maybe_dir(true);
+    dir.open_with(".", &options)
+        .context("failed to open directory for durability")
+}
+
 #[cfg(windows)]
 fn metadata_is_windows_reparse_point(metadata: &cap_std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
+    use cap_std::fs::MetadataExt;
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
     metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
