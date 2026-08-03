@@ -940,11 +940,11 @@ git commit -s --trailer "$COPILOT_TRAILER" \
   -m "docs: plan incomplete work recovery"
 ```
 
-Expected: a commit containing only the implementation plan and the
-repository-required DCO sign-off plus the session-required Copilot co-author
-trailer. Human contributor co-author trailers remain conditional under
-`AGENTS.md` and, when required, are added separately with additional
-`--trailer` arguments rather than replacing the required Copilot trailer.
+Expected: a commit containing only the implementation plan, the
+repository-required DCO sign-off, and the Copilot co-author trailer used for
+this plan commit. Human contributor co-author trailers remain conditional
+under `AGENTS.md` and, when required, are added separately with additional
+`--trailer` arguments.
 
 - [ ] **Step 4: Push the design branch**
 
