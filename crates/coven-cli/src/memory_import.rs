@@ -4096,6 +4096,7 @@ fn restore_import_bundle_with_hook(
     let mut restored_count = 0_usize;
     let mut unchanged_count = 0_usize;
     let mut conflict_count = 0_usize;
+    let mut restore_evidence_invalidated = false;
     let mut statuses = HashMap::new();
 
     for entry in &manifest.entries {
@@ -4112,6 +4113,7 @@ fn restore_import_bundle_with_hook(
                         restored_count += 1;
                         statuses.insert(entry.target_name.as_str(), PlanEntryStatus::Restored);
                     } else {
+                        restore_evidence_invalidated = true;
                         conflict_count += 1;
                         statuses.insert(entry.target_name.as_str(), PlanEntryStatus::Conflict);
                     }
@@ -4212,7 +4214,7 @@ fn restore_import_bundle_with_hook(
         }
     }
 
-    if journal.bundle_state == Some(JournalState::Restored) && conflict_count > 0 {
+    if journal.bundle_state == Some(JournalState::Restored) && restore_evidence_invalidated {
         append_journal(
             &bundle,
             &mut journal,
@@ -7548,6 +7550,48 @@ mod tests {
         let visible = crate::cockpit_sources::scan_memory(temp.path())?;
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].path, "sage/notes-second.md");
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn partial_restore_retry_keeps_suppressed_targets_hidden() -> Result<()> {
+        let temp = trusted_tempdir()?;
+        let workspace = temp.path().join("workspace");
+        write_registered_familiars(temp.path(), &[("sage", &workspace)])?;
+        let sources = vec![
+            DiscoveredSource {
+                source_label: "MEMORY.md".to_owned(),
+                bytes: b"created".to_vec(),
+            },
+            DiscoveredSource {
+                source_label: "notes/second.md".to_owned(),
+                bytes: b"second".to_vec(),
+            },
+        ];
+        let plan = build_import_plan(
+            temp.path(),
+            "sage",
+            MemoryImportSourceKind::Native,
+            &sources,
+        )?;
+        apply_import_plan(temp.path(), &plan, &sources)?;
+        let conflict = temp.path().join("memory/sage/notes-second.md");
+        fs::write(&conflict, b"user edit")?;
+
+        let first = restore_import_bundle(temp.path(), "sage", &plan.bundle_id)?;
+        let second = restore_import_bundle(temp.path(), "sage", &plan.bundle_id)?;
+        let visible = crate::cockpit_sources::scan_memory(temp.path())?;
+
+        assert_eq!(first.status, ImportPlanStatus::ManualRecovery);
+        assert_eq!(first.restored_count, 1);
+        assert_eq!(first.conflict_count, 1);
+        assert_eq!(second.status, ImportPlanStatus::ManualRecovery);
+        assert_eq!(second.restored_count, 1);
+        assert_eq!(second.conflict_count, 1);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].path, "sage/notes-second.md");
+        assert_eq!(fs::read(conflict)?, b"user edit");
         Ok(())
     }
 
