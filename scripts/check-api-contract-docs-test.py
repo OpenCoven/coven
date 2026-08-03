@@ -104,6 +104,35 @@ Archive visibility is stored separately in `archived_at`.
                         errors,
                     )
 
+    def test_rejects_legacy_source_inside_health_field_lists(self) -> None:
+        structures = (
+            (
+                "GET /api/v1/health returns:\n"
+                "- supportedApiVersions (source: GET /api/v1/api-version)\n"
+            ),
+            (
+                "GET /api/v1/health returns:\n"
+                "| Field | Source |\n"
+                "|---|---|\n"
+                "| supportedApiVersions | GET /api/v1/api-version |\n"
+            ),
+        )
+        for path in self.PUBLIC_CONTRACT_DOCS:
+            for structure in structures:
+                with self.subTest(path=path, structure=structure):
+                    documents = self.canonical_documents()
+                    documents[path] = documents["docs/API.md"] + (
+                        f"\n\n{structure}"
+                    )
+                    errors = module.validate_documents(documents)
+                    self.assertTrue(
+                        any(
+                            "health must not advertise supportedApiVersions" in error
+                            for error in errors
+                        ),
+                        errors,
+                    )
+
     def test_bounds_health_field_list_scope_to_one_paragraph(self) -> None:
         documents = self.canonical_documents()
         path = "packages/openclaw-coven/README.md"

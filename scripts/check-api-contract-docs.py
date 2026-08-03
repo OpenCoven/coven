@@ -151,6 +151,7 @@ def health_advertises_supported_api_versions(text: str) -> bool:
                     )
                 continue
             is_structural_row = statement.startswith(STRUCTURAL_ROW_MARKER)
+            inherited_health_scope = is_structural_row and structural_health_scope
             health_scoped = structural_health_scope if is_structural_row else bool(
                 HEALTH_REFERENCE.search(statement)
             )
@@ -163,14 +164,22 @@ def health_advertises_supported_api_versions(text: str) -> bool:
                 structural_health_scope = health_scoped
             if not health_scoped:
                 continue
-            if LEGACY_ROUTE in statement and not HEALTH_REFERENCE.search(statement):
+            if (
+                not inherited_health_scope
+                and LEGACY_ROUTE in statement
+                and not HEALTH_REFERENCE.search(statement)
+            ):
                 continue
 
             for clause in CLAUSE_BOUNDARY.split(statement):
                 field = SUPPORTED_API_VERSIONS.search(clause)
                 if not field:
                     continue
-                if LEGACY_ROUTE in clause and not HEALTH_REFERENCE.search(clause):
+                if (
+                    not inherited_health_scope
+                    and LEGACY_ROUTE in clause
+                    and not HEALTH_REFERENCE.search(clause)
+                ):
                     continue
                 if NEGATION.search(clause[: field.start()]):
                     continue
