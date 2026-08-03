@@ -50,10 +50,17 @@ layer:
 
 - `api.rs` defines the public daemon contract boundary and structured error
   envelope.
-- `harness.rs` defines `HarnessCommandSpec`, `Capabilities`,
-  `SandboxMapping`, `StreamArgs`, and `ContinuityArgs` for launch-time behavior.
-- `capabilities.rs` defines `HarnessCapabilityManifest` and the aggregate
-  response returned by `/api/v1/capabilities/harnesses`.
+- `harness.rs` defines `HarnessCommandSpec` and `ContinuityArgs` for
+  launch-time behavior. Its `capabilities`, `sandbox`, and `stream_args`
+  fields use the pinned shared-spec dependency
+  `coven_runtime_spec::{Capabilities, SandboxMapping, StreamArgs}`
+  (`crates/coven-cli/Cargo.toml` pins tag `v0.2.0`; `Cargo.lock` locks commit
+  `2f0e068027f36b1dd32d919f54a40a3baede54c2`). Those shared types are schema
+  inputs, but Coven's Rust adapters and launch-time capability evaluation remain
+  authoritative for actual argv construction, denial, and spawn behavior.
+- `capabilities.rs` defines `HarnessCapabilityManifest`, raw
+  `CapabilityWarning { kind, path, message }`, and the aggregate response
+  returned by `/api/v1/capabilities/harnesses`.
 - `store.rs` and `daemon.rs` define authoritative session lifecycle behavior,
   including persisted states such as `created`, `running`, `completed`,
   `failed`, `killed`, `idle`, and `orphaned`.
@@ -137,6 +144,24 @@ runtime-descriptor listing. `internal_tool` and `observational_scan` entries may
 have internal structs or diagnostics, but they are excluded from the public
 runtime handshake unless a later policy decision explicitly widens support.
 
+### Harness launches versus public runtime descriptors
+
+The recovered design keeps current harness-keyed launches and future public
+runtime-descriptor addressing distinct:
+
+- Existing launch surfaces that name a harness directly continue under today's
+  Rust harness policy. That includes the current supported public harnesses and
+  existing harness-only launches such as `coven-code`.
+- Those harness-keyed launches do **not** require a public runtime descriptor to
+  exist first.
+- A future request that explicitly supplies `runtimeId` opts into the public
+  runtime-descriptor resolver. Rust must resolve that id only against the public
+  `supported_runtime` set.
+- If `runtimeId` is outside that set — including `coven-code`,
+  `observational_scan` entries, or unknown ids — the daemon must fail before
+  argv construction or spawn with stable `404 runtime_not_found`. It must not
+  silently fall back to a harness-keyed launch.
+
 ## 3. Rust authority types
 
 Future implementation should add explicit Rust-owned effective-descriptor types,
@@ -154,6 +179,14 @@ pub struct EffectiveRuntimeDescriptor {
     pub native_integrations: NativeIntegrationSummary,
     pub warnings: Vec<RuntimeWarning>,
 }
+
+pub struct RuntimeWarning {
+    pub code: RuntimeWarningCode,
+    pub scope: RuntimeWarningScope,
+    pub capability_id: Option<String>,
+    pub path: Option<String>,
+    pub message: String,
+}
 ```
 
 Supporting types should include:
@@ -167,6 +200,8 @@ Supporting types should include:
 - `NativeIntegrationSummary`
 - `RequiredCapabilitySet`
 - `RequiredCapabilityEvaluation`
+- `RuntimeWarningCode`
+- `RuntimeWarningScope`
 
 These are **derived authority types**. They do not replace existing launch
 specs or scan manifests. Instead:
@@ -175,6 +210,44 @@ specs or scan manifests. Instead:
 - `HarnessCapabilityManifest` stays the source for raw native scan data; and
 - `EffectiveRuntimeDescriptor` becomes the source for client-facing capability
   truth.
+
+`RuntimeWarning` is a stable contract type, not an open-ended passthrough bag.
+For descriptor v1 its fields and enums are:
+
+- `code` (`RuntimeWarningCode`, serialized snake_case):
+  - `launch_spec_gap`
+  - `host_availability_undetermined`
+  - `native_scan_parse_error`
+  - `native_scan_permission_denied`
+- `scope` (`RuntimeWarningScope`, serialized snake_case):
+  - `runtime`
+  - `capability`
+  - `native_integration`
+- `capability_id` (`Option<String>`) — present only when the warning is tied to
+  one capability family such as `conversation.stream`.
+- `path` (`Option<String>`) — present only for warnings derived from local file
+  inspection.
+- `message` (`String`) — human-readable explanatory prose. Clients may display
+  it, but compatibility branches on `code`, `scope`, and the other structured
+  fields rather than prose text.
+
+Descriptor v1 warning mapping is intentionally closed:
+
+- raw `CapabilityWarning.kind == "parse_error"` maps to
+  `code = native_scan_parse_error`;
+- raw `CapabilityWarning.kind == "permission_denied"` maps to
+  `code = native_scan_permission_denied`; and
+- any widened raw warning-kind vocabulary requires an explicit descriptor-schema
+  update rather than passthrough strings.
+
+`warnings` is an ordered list, not a set. The resolver returns it in this
+stable order:
+
+1. `scope` order: `runtime`, then `capability`, then `native_integration`;
+2. within a scope, `code` order as declared above;
+3. then `capability_id` (lexicographic, missing last);
+4. then `path` (lexicographic, missing last); and
+5. finally `message` (lexicographic).
 
 ## 4. Effective descriptor semantics
 
@@ -277,6 +350,11 @@ For the recovered design, the compatibility rules are:
 - Unknown required capability id: `400 invalid_request`
 - Unknown or publicly unsupported runtime id on the future `/api/v1/runtimes`
   surface: `404 runtime_not_found`
+- Explicit `runtimeId` on a future launch request that is not in the public
+  supported-runtime set — including `coven-code` — must fail with the same
+  stable `404 runtime_not_found` before argv construction or spawn, while
+  harness-keyed launches without `runtimeId` continue under the current harness
+  policy.
 - Known capability not in `supported` state: fail closed before launch with
   `409 runtime_capability_not_met` and `details` containing at least
   `{ runtimeId, capability, state, reason }`
@@ -293,9 +371,15 @@ Psyche's W1 audit requires exact terminal vocabulary and exact capability
 negotiation. The recovered runtime design therefore adopts two hard rules:
 
 1. Effective runtime descriptors must reference only authoritative persisted
-   lifecycle states documented by Coven's Rust store/runtime behavior.
-2. Conversation-only states such as `idle` must be documented precisely and must
-   not be collapsed into generic success prose.
+   lifecycle states documented by Coven's Rust store/runtime behavior:
+   `created`, `running`, `completed`, `failed`, `killed`, `idle`, and
+   `orphaned`. Archive remains separate metadata in `archived_at`, not a
+   lifecycle status.
+2. `idle` is an authoritative persisted status, not a UI-only synonym. Rust
+   writes `idle` when a conversation-grouped session child exits cleanly but
+   the conversation remains extendable via `conversation_id`; the exit event for
+   that child still records `completed`, so consumers must preserve both pieces
+   of meaning instead of flattening `idle` into generic success prose.
 
 A runtime descriptor may advertise conversation features such as resume or
 streaming, but it must not redefine session terminal semantics.
