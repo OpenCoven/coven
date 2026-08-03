@@ -16,7 +16,11 @@ symlink, deletes a project directory, contacts GitHub, revokes a credential,
 or changes remote state.
 
 Preview is the default. A reset moves selected state into a recoverable backup
-under `COVEN_HOME/reset-backups/`; it does not permanently delete it.
+under `COVEN_HOME/reset-backups/`; it does not permanently delete it. Apply is
+currently supported on Unix platforms. Windows supports feature discovery and
+preview, but rejects `--apply` before creating locks or changing state because
+Windows does not provide the durable directory-entry ordering this recovery
+contract requires.
 
 ```sh
 # Discover exact local categories and their warnings.
@@ -67,11 +71,14 @@ while the daemon, a harness run, or any other Coven command is active. It also
 holds the daemon lifecycle and serve locks and probes daemon health so a daemon
 started by an older CLI cannot overlap the reset. Stale lock files alone do not
 block reset. The command opens the active `COVEN_HOME` once and acquires reset
-locks and performs moves relative to that same directory handle. Each ancestor
-is opened without following symlinks or Windows reparse points, so replacing a
-validated path component cannot redirect a move. If one path in a feature
-fails, earlier moves for that feature are rolled back; independent features
-continue and each outcome is reported.
+locks and performs moves relative to that same directory handle. On Unix, the
+direct parent is required to be current-user-owned and not writable by other
+users, and its identity is checked across the handle open. Windows preview
+walks parent components without following reparse points. Reset-target
+ancestors are always opened without following symlinks or reparse points, so
+replacing a validated path component cannot redirect a move. If one path in a
+feature fails, earlier moves for that feature are rolled back; independent
+features continue and each outcome is reported.
 
 Before the first move, Coven durably records the complete relative-path
 transaction in `reset-transaction.json`. Normal commands refuse to start while
@@ -79,6 +86,10 @@ that marker exists. If reset is interrupted, the next `coven reset ... --apply`
 rolls every completed move back to its original location before starting the
 new reset. This keeps session records and their artifact key together even
 across termination or power loss.
+
+This durable apply contract is currently Unix-only. Windows preview uses the
+same allowlist and no-follow path validation, but apply remains fail-closed
+until Coven has a Windows transaction mechanism with equivalent crash ordering.
 
 Successful moves are placed under a directory such as:
 
@@ -146,7 +157,7 @@ contains secret values, tokens, or credential contents.
 | Exit code | Meaning |
 | --- | --- |
 | `0` | Preview or reset completed; missing categories may be reported when other selected work completed. |
-| `2` | Invalid selection, unknown feature, duplicate feature, or incompatible flags. |
+| `2` | Invalid selection, unknown feature, duplicate feature, incompatible flags, or `--apply` on Windows. |
 | `3` | Confirmation is required, another Coven command holds the shared state lock, or a legacy daemon is active. |
 | `4` | None of the selected categories has local state. |
 | `5` | One or more selected categories could not be backed up/reset; inspect the report and local backup. |

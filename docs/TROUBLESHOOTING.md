@@ -124,6 +124,10 @@ coven daemon stop
 coven reset --feature projects --apply
 ```
 
+`--apply` is currently Unix-only. On Windows, use preview to identify the
+affected local paths and follow the manual recovery guidance in the reset
+reference.
+
 See [`coven reset`](/reference/cli-reset) for all categories, JSON output, and
 documented exit codes.
 

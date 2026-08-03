@@ -108,7 +108,7 @@ flowchart TB
 | `coven patch openclaw <prompt>` | Local OpenClaw rescue loop. Does not commit or push. |
 | `coven logs prune` | Prune expired encrypted raw artifacts and old redacted event logs; see [cli-logs](cli-logs.md). |
 | `coven vacuum` | Rebuild the session event FTS index, compact the SQLite store, and print integrity status; see [cli-vacuum](cli-vacuum.md). |
-| `coven reset` | Preview or recoverably reset explicit local `COVEN_HOME` categories. After the daemon and other active Coven commands stop, `--apply` moves selected state to `reset-backups/`; `--all` also requires `--apply`. See [cli-reset](cli-reset.md). |
+| `coven reset` | Preview explicit local `COVEN_HOME` categories on every platform. On Unix, after the daemon and other active Coven commands stop, `--apply` moves selected state to `reset-backups/`; Windows apply is fail-closed. `--all` also requires `--apply`. See [cli-reset](cli-reset.md). |
 | `coven wt <branch>` | Create or enter a sibling `<repo>.wt/<branch-slug>` git worktree; see [cli-wt](cli-wt.md). |
 | `coven wt --list/--doctor/--prune-merged/--prune-stale DAYS` | Inspect and clean Coven protocol worktrees; see [cli-wt](cli-wt.md). |
 | `coven claim acquire/release/heartbeat/canary <branch>` | Manage TTL-bounded branch ownership for the current agent; see [cli-claim](cli-claim.md). |

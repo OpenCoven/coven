@@ -445,13 +445,14 @@ Coven works with zero configuration. State lives under `COVEN_HOME` (default `~/
 Retention defaults (30 days for redacted event logs, 7 days for optional raw encrypted artifacts) and manual pruning via `coven logs prune` are covered in [`docs/reference/cli-logs.md`](docs/reference/cli-logs.md).
 
 For debugging local state without deleting an entire profile, use `coven reset`
-to preview or recoverably reset selected familiar, project, GitHub/Copilot, or
-runtime-adapter state, plus secret, cache, session, or metadata state. Runtime
+to preview selected familiar, project, GitHub/Copilot, or runtime-adapter state,
+plus secret, cache, session, or metadata state. Runtime
 selectors cover Coven-local Claude, OpenClaw, Hermes, OpenCode, Grok Build, and
 Gemini records only; mobile gateway state has its own selector. After
-`coven daemon stop` and after other active Coven commands finish, `--apply`
-moves only the selected state into `COVEN_HOME/reset-backups/`. It never changes
-a provider CLI, login, or account, and project reset never deletes a checkout.
+`coven daemon stop` and after other active Coven commands finish, Unix
+`--apply` moves only the selected state into `COVEN_HOME/reset-backups/`.
+Windows currently supports preview only. Reset never changes a provider CLI,
+login, or account, and project reset never deletes a checkout.
 Session reset keeps encrypted artifact records and their key together. See
 [`docs/reference/cli-reset.md`](docs/reference/cli-reset.md).
 

@@ -5,6 +5,7 @@
 //! network service, or accepts arbitrary user-provided paths.
 
 use std::ffi::{OsStr, OsString};
+#[cfg(test)]
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -302,20 +303,55 @@ struct RootedHome {
 }
 
 impl RootedHome {
-    fn open(path: &Path) -> Result<Self> {
-        let dir = Dir::open_ambient_dir(path, ambient_authority())
-            .with_context(|| format!("failed to open COVEN_HOME {}", path.display()))?;
-        let metadata = dir
-            .dir_metadata()
-            .with_context(|| format!("failed to inspect COVEN_HOME {}", path.display()))?;
-        if !metadata.is_dir() || metadata_is_windows_reparse_point(&metadata) {
+    fn open_existing(path: &Path, protect: bool) -> Result<Option<Self>> {
+        if path
+            .components()
+            .all(|component| component == Component::CurDir)
+        {
+            let dir = Dir::open_ambient_dir(".", ambient_authority())
+                .context("failed to open COVEN_HOME current directory")?;
+            validate_opened_home(&dir, path, protect)?;
+            return Ok(Some(Self { dir }));
+        }
+        let parent_path = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
+        let parent_path = parent_path.unwrap_or_else(|| Path::new("."));
+        let name = path.file_name().ok_or_else(|| {
+            ResetError::new(
+                ResetErrorKind::UnsafePath,
+                format!(
+                    "COVEN_HOME {} must not be a filesystem root",
+                    path.display()
+                ),
+            )
+        })?;
+        let Some(parent) = open_trusted_parent(parent_path)? else {
+            return Ok(None);
+        };
+        let metadata = match parent.symlink_metadata(name) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect COVEN_HOME {}", path.display()));
+            }
+        };
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata_is_windows_reparse_point(&metadata)
+        {
             return Err(ResetError::new(
                 ResetErrorKind::UnsafePath,
                 format!("COVEN_HOME {} is not a real directory", path.display()),
             )
             .into());
         }
-        Ok(Self { dir })
+        let dir = parent
+            .open_dir_nofollow(name)
+            .with_context(|| format!("failed to open COVEN_HOME {}", path.display()))?;
+        validate_opened_home(&dir, path, protect)?;
+        Ok(Some(Self { dir }))
     }
 
     fn target_exists(&self, relative: &Path) -> Result<bool> {
@@ -764,6 +800,136 @@ impl RootedHome {
     }
 }
 
+fn validate_opened_home(dir: &Dir, path: &Path, protect: bool) -> Result<()> {
+    let metadata = dir
+        .dir_metadata()
+        .with_context(|| format!("failed to inspect COVEN_HOME {}", path.display()))?;
+    if !metadata.is_dir() || metadata_is_windows_reparse_point(&metadata) {
+        return Err(ResetError::new(
+            ResetErrorKind::UnsafePath,
+            format!("COVEN_HOME {} is not a real directory", path.display()),
+        )
+        .into());
+    }
+    validate_private_home(dir, path, protect)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_trusted_parent(path: &Path) -> Result<Option<Dir>> {
+    use std::os::unix::fs::MetadataExt;
+
+    let before = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to inspect COVEN_HOME parent {}", path.display())
+            });
+        }
+    };
+    // SAFETY: geteuid() only reads the effective uid and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if !before.is_dir()
+        || before.file_type().is_symlink()
+        || before.uid() != euid
+        || before.mode() & 0o022 != 0
+    {
+        return Err(ResetError::new(
+            ResetErrorKind::UnsafePath,
+            format!(
+                "COVEN_HOME parent {} must be a real directory owned by the current user and not writable by other users",
+                path.display()
+            ),
+        )
+        .into());
+    }
+    let dir = Dir::open_ambient_dir(path, ambient_authority())
+        .with_context(|| format!("failed to open COVEN_HOME parent {}", path.display()))?;
+    let after = dir
+        .dir_metadata()
+        .with_context(|| format!("failed to inspect COVEN_HOME parent {}", path.display()))?;
+    if before.dev() != cap_fs_ext::MetadataExt::dev(&after)
+        || before.ino() != cap_fs_ext::MetadataExt::ino(&after)
+    {
+        return Err(ResetError::new(
+            ResetErrorKind::UnsafePath,
+            format!(
+                "COVEN_HOME parent {} changed while it was being opened",
+                path.display()
+            ),
+        )
+        .into());
+    }
+    Ok(Some(dir))
+}
+
+#[cfg(windows)]
+fn open_trusted_parent(path: &Path) -> Result<Option<Dir>> {
+    let absolute = std::path::absolute(path)
+        .with_context(|| format!("failed to resolve COVEN_HOME parent {}", path.display()))?;
+    let root = absolute.ancestors().last().ok_or_else(|| {
+        ResetError::new(
+            ResetErrorKind::UnsafePath,
+            format!(
+                "COVEN_HOME parent {} has no filesystem root",
+                path.display()
+            ),
+        )
+    })?;
+    let mut dir = Dir::open_ambient_dir(root, ambient_authority())
+        .with_context(|| format!("failed to open filesystem root {}", root.display()))?;
+    let relative = absolute.strip_prefix(root).with_context(|| {
+        format!(
+            "failed to anchor COVEN_HOME parent {} at {}",
+            path.display(),
+            root.display()
+        )
+    })?;
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err(ResetError::new(
+                ResetErrorKind::UnsafePath,
+                format!("COVEN_HOME parent {} is not normalized", path.display()),
+            )
+            .into());
+        };
+        let metadata = match dir.symlink_metadata(name) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect COVEN_HOME parent {}", path.display())
+                });
+            }
+        };
+        if !metadata.is_dir() || metadata_is_windows_reparse_point(&metadata) {
+            return Err(ResetError::new(
+                ResetErrorKind::UnsafePath,
+                format!(
+                    "COVEN_HOME parent {} crosses a reparse point or non-directory",
+                    path.display()
+                ),
+            )
+            .into());
+        }
+        dir = dir
+            .open_dir_nofollow(name)
+            .with_context(|| format!("failed to open COVEN_HOME parent {}", path.display()))?;
+    }
+    Ok(Some(dir))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_trusted_parent(path: &Path) -> Result<Option<Dir>> {
+    match Dir::open_ambient_dir(path, ambient_authority()) {
+        Ok(dir) => Ok(Some(dir)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to open COVEN_HOME parent {}", path.display())),
+    }
+}
+
 fn normal_components(path: &Path) -> Result<Vec<&OsStr>> {
     validate_relative_path(path)?;
     path.components()
@@ -786,6 +952,40 @@ fn protect_private_dir(dir: &Dir) -> Result<()> {
         .into_std()
         .set_permissions(std::fs::Permissions::from_mode(0o700))
         .context("failed to protect reset backup directory")
+}
+
+#[cfg(unix)]
+fn validate_private_home(dir: &Dir, path: &Path, protect: bool) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let file = open_syncable_directory(dir)?.into_std();
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect COVEN_HOME {}", path.display()))?;
+    // SAFETY: geteuid() only reads the effective uid and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if metadata.uid() != euid {
+        anyhow::bail!(
+            "refusing to use COVEN_HOME {}: it is owned by uid {}, not the current user (uid {euid})",
+            path.display(),
+            metadata.uid()
+        );
+    }
+    if protect {
+        file.set_permissions(std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to protect COVEN_HOME {}", path.display()))?;
+    } else if metadata.mode() & 0o077 != 0 {
+        anyhow::bail!(
+            "refusing to preview COVEN_HOME {} because its permissions are not private",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_private_home(_dir: &Dir, _path: &Path, _protect: bool) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -849,9 +1049,27 @@ pub(crate) fn run(request: ResetRequest<'_>, list_features: bool) -> Result<()> 
         return render_features(request.json);
     }
 
+    reject_unsupported_apply(request.apply)?;
     let report = execute(crate::coven_home_dir()?, request)?;
     render_report(&report, request.json)?;
     report_exit(&report)
+}
+
+#[cfg(windows)]
+fn reject_unsupported_apply(apply: bool) -> Result<()> {
+    if apply {
+        return Err(ResetError::new(
+            ResetErrorKind::InvalidSelection,
+            "`coven reset --apply` is unavailable on Windows because Windows does not provide the durable directory-entry ordering required for recoverable reset; preview remains available",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn reject_unsupported_apply(_apply: bool) -> Result<()> {
+    Ok(())
 }
 
 fn render_features(json: bool) -> Result<()> {
@@ -907,8 +1125,8 @@ fn execute(coven_home: PathBuf, request: ResetRequest<'_>) -> Result<ResetReport
         .into());
     }
 
-    let home = resolve_coven_home(&coven_home)?;
-    let rooted_home = home.as_deref().map(RootedHome::open).transpose()?;
+    let rooted_home = RootedHome::open_existing(&coven_home, request.apply)?;
+    let home = rooted_home.as_ref().map(|_| coven_home);
     if !request.apply {
         if rooted_home
             .as_ref()
@@ -978,23 +1196,6 @@ fn select_features(requested: &[String], all: bool) -> Result<Vec<&'static Reset
     }
     selected.sort_by_key(|feature| feature.name);
     Ok(selected)
-}
-
-fn resolve_coven_home(home: &Path) -> Result<Option<PathBuf>> {
-    match fs::symlink_metadata(home) {
-        Ok(metadata) if metadata.is_dir() => fs::canonicalize(home)
-            .with_context(|| format!("failed to resolve COVEN_HOME {}", home.display()))
-            .map(Some),
-        Ok(_) => Err(ResetError::new(
-            ResetErrorKind::UnsafePath,
-            format!("COVEN_HOME {} is not a directory", home.display()),
-        )
-        .into()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => {
-            Err(error).with_context(|| format!("failed to inspect COVEN_HOME {}", home.display()))
-        }
-    }
 }
 
 fn build_plan(
@@ -1348,7 +1549,20 @@ mod tests {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(home, fs::Permissions::from_mode(0o700))?;
+        }
         fs::write(path, contents)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn protect_test_home(home: &Path) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(home, fs::Permissions::from_mode(0o700))?;
         Ok(())
     }
 
@@ -1475,8 +1689,8 @@ mod tests {
         write_state(&home, "familiars.toml", "familiar")?;
         write_state(&home, "repos.toml", "project")?;
         let selected = select_features(&["familiars".to_string(), "projects".to_string()], false)?;
-        let resolved = resolve_coven_home(&home)?;
-        let rooted = resolved.as_deref().map(RootedHome::open).transpose()?;
+        let rooted = RootedHome::open_existing(&home, true)?;
+        let resolved = rooted.as_ref().map(|_| home.clone());
         let plan = build_plan(rooted.as_ref(), &selected)?;
         let blocked_backup = home.join(BACKUP_DIR).join("fixture").join("familiars");
         fs::create_dir_all(blocked_backup.parent().expect("backup parent"))?;
@@ -1578,6 +1792,7 @@ mod tests {
         let home = temp.path().join("coven-home");
         let outside = temp.path().join("outside");
         fs::create_dir_all(&home)?;
+        protect_test_home(&home)?;
         fs::write(&outside, "outside-state")?;
         symlink(&outside, home.join("repos.toml"))?;
         let error = execute(home, request(&["projects"], false, false)).unwrap_err();
@@ -1596,6 +1811,7 @@ mod tests {
         let home = temp.path().join("coven-home");
         let outside = temp.path().join("outside");
         fs::create_dir_all(&home)?;
+        protect_test_home(&home)?;
         fs::create_dir_all(&outside)?;
         fs::write(outside.join("github.json"), "outside-state")?;
         symlink(&outside, home.join("adapters"))?;
@@ -1705,7 +1921,7 @@ mod tests {
         let home = temp.path().join("coven-home");
         write_state(&home, "coven.sqlite3", "encrypted-session-record")?;
         write_state(&home, "keys/session-artifacts.key", "artifact-key")?;
-        let rooted = RootedHome::open(&fs::canonicalize(&home)?)?;
+        let rooted = RootedHome::open_existing(&home, true)?.expect("opened home");
         let transaction = ResetTransaction {
             version: 1,
             backup_id: "interrupted".to_string(),
@@ -1783,8 +1999,8 @@ mod tests {
         write_state(&home, "familiars.toml", "registry")?;
         write_state(&home, "familiars/identity.md", "identity")?;
         let selected = select_features(&["familiars".to_string()], false)?;
-        let resolved = resolve_coven_home(&home)?;
-        let rooted = resolved.as_deref().map(RootedHome::open).transpose()?;
+        let rooted = RootedHome::open_existing(&home, true)?;
+        let resolved = rooted.as_ref().map(|_| home.clone());
         let plan = build_plan(rooted.as_ref(), &selected)?;
         write_state(
             &home,
@@ -1812,12 +2028,13 @@ mod tests {
         let home = temp.path().join("coven-home");
         let outside = temp.path().join("outside");
         fs::create_dir_all(&home)?;
+        protect_test_home(&home)?;
         fs::create_dir_all(&outside)?;
         write_state(&home, "repos.toml", "project")?;
         symlink(&outside, home.join(BACKUP_DIR))?;
         let selected = select_features(&["projects".to_string()], false)?;
-        let resolved = resolve_coven_home(&home)?;
-        let rooted = resolved.as_deref().map(RootedHome::open).transpose()?;
+        let rooted = RootedHome::open_existing(&home, true)?;
+        let resolved = rooted.as_ref().map(|_| home.clone());
         let plan = build_plan(rooted.as_ref(), &selected)?;
 
         let error = apply_plan(&resolved, rooted.as_ref(), &plan, "fixture").unwrap_err();
@@ -1826,5 +2043,126 @@ mod tests {
         assert_eq!(fs::read_to_string(home.join("repos.toml"))?, "project");
         assert!(fs::read_dir(outside)?.next().is_none());
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_home_stays_anchored_after_path_replacement() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().join("coven-home");
+        let moved = temp.path().join("moved-home");
+        let outside = temp.path().join("outside");
+        write_state(&home, "repos.toml", "original")?;
+        fs::create_dir_all(&outside)?;
+        fs::write(outside.join("repos.toml"), "outside")?;
+
+        let rooted = RootedHome::open_existing(&home, false)?.expect("opened home");
+        fs::rename(&home, &moved)?;
+        symlink(&outside, &home)?;
+
+        let plan = build_plan(
+            Some(&rooted),
+            &select_features(&["projects".to_string()], false)?,
+        )?;
+        assert_eq!(plan[0].targets.len(), 1);
+        assert_eq!(fs::read_to_string(moved.join("repos.toml"))?, "original");
+        assert_eq!(fs::read_to_string(outside.join("repos.toml"))?, "outside");
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn symlinked_home_is_refused_without_touching_target() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().join("coven-home");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&outside)?;
+        fs::write(outside.join("repos.toml"), "outside")?;
+        create_dir_symlink(&outside, &home)?;
+
+        let error = match RootedHome::open_existing(&home, false) {
+            Ok(_) => panic!("symlinked COVEN_HOME should be refused"),
+            Err(error) => error,
+        };
+        let error = error.downcast::<ResetError>()?;
+        assert_eq!(error.exit_code(), 6);
+        assert_eq!(fs::read_to_string(outside.join("repos.toml"))?, "outside");
+        Ok(())
+    }
+
+    #[test]
+    fn current_directory_home_is_not_misclassified_as_a_filesystem_root() {
+        if let Err(error) = RootedHome::open_existing(Path::new("."), false) {
+            assert!(
+                !error.to_string().contains("filesystem root"),
+                "current-directory COVEN_HOME must not be treated as a root: {error}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_home_parent_is_refused_without_touching_target() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let real_parent = temp.path().join("real-parent");
+        let linked_parent = temp.path().join("linked-parent");
+        let real_home = real_parent.join("coven-home");
+        fs::create_dir_all(&real_home)?;
+        protect_test_home(&real_home)?;
+        fs::write(real_home.join("repos.toml"), "outside")?;
+        symlink(&real_parent, &linked_parent)?;
+
+        let error = match RootedHome::open_existing(&linked_parent.join("coven-home"), false) {
+            Ok(_) => panic!("symlinked COVEN_HOME parent should be refused"),
+            Err(error) => error,
+        };
+        let error = error.downcast::<ResetError>()?;
+        assert_eq!(error.exit_code(), 6);
+        assert_eq!(fs::read_to_string(real_home.join("repos.toml"))?, "outside");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_home_parent_is_refused() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let parent = temp.path().join("shared-parent");
+        let home = parent.join("coven-home");
+        fs::create_dir_all(&home)?;
+        protect_test_home(&home)?;
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o777))?;
+
+        let error = match RootedHome::open_existing(&home, false) {
+            Ok(_) => panic!("other-writable COVEN_HOME parent should be refused"),
+            Err(error) => error,
+        };
+        let error = error.downcast::<ResetError>()?;
+        assert_eq!(error.exit_code(), 6);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn create_dir_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_dir_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other("failed to create test junction"))
+        }
     }
 }
