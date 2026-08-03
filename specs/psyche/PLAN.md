@@ -13,7 +13,7 @@ independent bounded execution substrate.
 
 **Canonical decision:** [Familiar runtime design](./RUNTIME_DESIGN.md)
 
-**Companions:** [W1 Coven audit](./COVEN_W1_AUDIT.md), [Decision dossier](./DECISION_DOSSIER.md), [Product specification](./PRODUCT.md), [Technical architecture](./TECH.md), [Threat model](./THREAT_MODEL.md), [Telegram parity ledger](./TELEGRAM_PARITY.md), [Coven prerequisites](./COVEN_PREREQUISITES.md)
+**Companions:** [W1 Coven audit](./COVEN_W1_AUDIT.md), [O1 contract design](./O1_CONTRACT_DESIGN.md), [Decision dossier](./DECISION_DOSSIER.md), [Product specification](./PRODUCT.md), [Technical architecture](./TECH.md), [Threat model](./THREAT_MODEL.md), [Telegram parity ledger](./TELEGRAM_PARITY.md), [Coven prerequisites](./COVEN_PREREQUISITES.md)
 
 ## 1. Fixed program decisions
 
