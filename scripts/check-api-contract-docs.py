@@ -71,6 +71,7 @@ REMOVAL_GUIDANCE = re.compile(
     r"\bremoved\s+from\b",
     re.IGNORECASE,
 )
+STRUCTURAL_ROW_MARKER = "COVEN_DOC_STRUCTURAL_ROW"
 
 
 def legacy_route_explained(text: str) -> bool:
@@ -124,24 +125,42 @@ def presents_legacy_route_as_named_contract(text: str) -> bool:
 
 
 def health_advertises_supported_api_versions(text: str) -> bool:
-    # Scope follows explicit health references plus one immediate route-pronoun
-    # continuation. Each field-bearing clause is then classified independently,
-    # so legacy-route examples and explicit removal guidance remain valid.
+    # Scope follows explicit health references, one immediate route-pronoun
+    # continuation, and contiguous Markdown field rows introduced by either.
+    # Each field-bearing clause is then classified independently, so legacy
+    # route examples and explicit removal guidance remain valid.
     for paragraph in re.split(r"\n\s*\n", text):
         if not SUPPORTED_API_VERSIONS.search(paragraph):
             continue
-        paragraph = re.sub(r"\n(?=\s*(?:[-*]\s+|\|))", ". ", paragraph)
+        starts_with_row = bool(re.match(r"^\s*(?:[-*]\s+|\|)", paragraph))
+        paragraph = re.sub(
+            r"\n(?=\s*(?:[-*]\s+|\|))",
+            f". {STRUCTURAL_ROW_MARKER} ",
+            paragraph,
+        )
+        if starts_with_row:
+            paragraph = f"{STRUCTURAL_ROW_MARKER} {paragraph}"
         normalized = re.sub(r"\s+", " ", paragraph)
         statements = re.split(r"(?<=[.!?;])\s+(?=[A-Z`|*\-])", normalized)
+        structural_health_scope = False
         for index, statement in enumerate(statements):
             if not SUPPORTED_API_VERSIONS.search(statement):
+                if not statement.startswith(STRUCTURAL_ROW_MARKER):
+                    structural_health_scope = bool(
+                        HEALTH_REFERENCE.search(statement)
+                    )
                 continue
-            health_scoped = bool(HEALTH_REFERENCE.search(statement))
-            if not health_scoped and index > 0:
-                health_scoped = bool(
-                    HEALTH_REFERENCE.search(statements[index - 1])
-                    and ROUTE_CONTINUATION.search(statement)
-                )
+            is_structural_row = statement.startswith(STRUCTURAL_ROW_MARKER)
+            health_scoped = structural_health_scope if is_structural_row else bool(
+                HEALTH_REFERENCE.search(statement)
+            )
+            if not is_structural_row:
+                if not health_scoped and index > 0:
+                    health_scoped = bool(
+                        HEALTH_REFERENCE.search(statements[index - 1])
+                        and ROUTE_CONTINUATION.search(statement)
+                    )
+                structural_health_scope = health_scoped
             if not health_scoped:
                 continue
             if LEGACY_ROUTE in statement and not HEALTH_REFERENCE.search(statement):

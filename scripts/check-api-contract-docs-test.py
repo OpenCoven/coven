@@ -77,6 +77,61 @@ Archive visibility is stored separately in `archived_at`.
                     errors,
                 )
 
+    def test_rejects_supported_api_versions_in_health_field_lists(self) -> None:
+        structures = (
+            "GET /api/v1/health returns:\n- supportedApiVersions\n",
+            "GET /api/v1/health returns:\n* supportedApiVersions\n",
+            (
+                "GET /api/v1/health returns:\n"
+                "| Field | Type |\n"
+                "|---|---|\n"
+                "| supportedApiVersions | array |\n"
+            ),
+        )
+        for path in self.PUBLIC_CONTRACT_DOCS:
+            for structure in structures:
+                with self.subTest(path=path, structure=structure):
+                    documents = self.canonical_documents()
+                    documents[path] = documents["docs/API.md"] + (
+                        f"\n\n{structure}"
+                    )
+                    errors = module.validate_documents(documents)
+                    self.assertTrue(
+                        any(
+                            "health must not advertise supportedApiVersions" in error
+                            for error in errors
+                        ),
+                        errors,
+                    )
+
+    def test_bounds_health_field_list_scope_to_one_paragraph(self) -> None:
+        documents = self.canonical_documents()
+        path = "packages/openclaw-coven/README.md"
+        documents[path] = documents["docs/API.md"] + (
+            "\n\nGET /api/v1/health returns documented fields.\n"
+            "\n- supportedApiVersions belongs to an unrelated example.\n"
+        )
+        self.assertEqual(module.validate_documents(documents), [])
+
+    def test_accepts_supported_api_versions_in_legacy_field_lists(self) -> None:
+        documents = self.canonical_documents()
+        path = "packages/openclaw-coven/README.md"
+        documents[path] = documents["docs/API.md"] + (
+            "\n\nGET /api/v1/api-version is a legacy route-family diagnostic "
+            "returning literal `v1` with fields:\n"
+            "- supportedApiVersions\n"
+        )
+        self.assertEqual(module.validate_documents(documents), [])
+
+    def test_accepts_removed_supported_api_versions_health_field(self) -> None:
+        documents = self.canonical_documents()
+        path = "packages/openclaw-coven/README.md"
+        documents[path] = documents["docs/API.md"] + (
+            "\n\nGET /api/v1/health returns documented fields:\n"
+            "- supportedApiVersions has been removed\n"
+        )
+        self.assertEqual(module.validate_documents(documents), [])
+
     def test_accepts_explicit_supported_api_versions_health_removal(self) -> None:
         guidance = (
             "GET /api/v1/health does not include supportedApiVersions.",
