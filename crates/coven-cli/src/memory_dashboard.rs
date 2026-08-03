@@ -90,14 +90,32 @@ fn resolve() -> Option<LaunchCommand> {
     )
 }
 
+fn dashboard_not_installed_error() -> anyhow::Error {
+    anyhow!(
+        "The Coven Memory dashboard is not installed.\n\n  \
+         npm install -g @opencoven/coven-memory-dashboard\n\n\
+         Then rerun: coven memory open"
+    )
+}
+
+fn ensure_daemon_ready() -> Result<()> {
+    let coven_home = crate::coven_home_dir()?;
+    let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
+    crate::daemon::ensure_background_server(&coven_home, &current_exe, crate::current_timestamp())?;
+    Ok(())
+}
+
+fn prepare_open_with(
+    resolve_launch: impl FnOnce() -> Option<LaunchCommand>,
+    ensure_daemon: impl FnOnce() -> Result<()>,
+) -> Result<LaunchCommand> {
+    let launch = resolve_launch().ok_or_else(dashboard_not_installed_error)?;
+    ensure_daemon().context("failed to start or reach Coven daemon for Memory")?;
+    Ok(launch)
+}
+
 pub fn run_open() -> Result<()> {
-    let launch = resolve().ok_or_else(|| {
-        anyhow!(
-            "The Coven Memory dashboard is not installed.\n\n  \
-             npm install -g @opencoven/coven-memory-dashboard\n\n\
-             Then rerun: coven memory open"
-        )
-    })?;
+    let launch = prepare_open_with(resolve, ensure_daemon_ready)?;
     let status = Command::new(&launch.program)
         .args(&launch.args)
         .status()
@@ -145,5 +163,61 @@ mod tests {
         fs::write(&entry, "").unwrap();
 
         assert!(resolve_from(None, Some(entry.as_os_str()), None, None).is_none());
+    }
+
+    #[test]
+    fn missing_dashboard_does_not_start_daemon() {
+        let daemon_called = std::cell::Cell::new(false);
+
+        let error = prepare_open_with(
+            || None,
+            || {
+                daemon_called.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("missing dashboard must fail");
+
+        assert!(!daemon_called.get());
+        assert!(error.to_string().contains("dashboard is not installed"));
+    }
+
+    #[test]
+    fn daemon_failure_prevents_dashboard_preparation() {
+        let launch = LaunchCommand {
+            program: PathBuf::from("dashboard"),
+            args: Vec::new(),
+        };
+
+        let error = prepare_open_with(
+            || Some(launch),
+            || anyhow::bail!("socket did not become ready"),
+        )
+        .expect_err("daemon failure must stop launch preparation");
+
+        assert!(error
+            .to_string()
+            .contains("failed to start or reach Coven daemon for Memory"));
+    }
+
+    #[test]
+    fn ready_daemon_returns_the_resolved_dashboard() {
+        let launch = LaunchCommand {
+            program: PathBuf::from("dashboard"),
+            args: vec![OsString::from("entry")],
+        };
+
+        let prepared = prepare_open_with(
+            || {
+                Some(LaunchCommand {
+                    program: launch.program.clone(),
+                    args: launch.args.clone(),
+                })
+            },
+            || Ok(()),
+        )
+        .expect("ready daemon permits dashboard launch");
+
+        assert_eq!(prepared, launch);
     }
 }
