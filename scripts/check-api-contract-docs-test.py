@@ -150,6 +150,11 @@ Archive visibility is stored separately in `archived_at`.
         statements = (
             "GET /api/v1/health does not omit supportedApiVersions.",
             "GET /api/v1/health does not exclude supportedApiVersions.",
+            "GET /api/v1/health cannot omit supportedApiVersions.",
+            "GET /api/v1/health can't omit supportedApiVersions.",
+            "GET /api/v1/health doesn't omit supportedApiVersions.",
+            "GET /api/v1/health fails to omit supportedApiVersions.",
+            "GET /api/v1/health no longer omits supportedApiVersions.",
             "GET /api/v1/health is not complete without supportedApiVersions.",
             "GET /api/v1/health never omits supportedApiVersions.",
             "supportedApiVersions is not omitted from GET /api/v1/health.",
@@ -174,6 +179,17 @@ Archive visibility is stored separately in `archived_at`.
             "GET /api/v1/health lacks supportedApiVersions.",
             "GET /api/v1/health omits supportedApiVersions.",
             "GET /api/v1/health does not include supportedApiVersions.",
+            "GET /api/v1/health doesn't include supportedApiVersions.",
+            (
+                "GET /api/v1/health and GET /api/v1/api-version do not "
+                "include supportedApiVersions."
+            ),
+            (
+                "GET /api/v1/health and GET /api/v1/api-version don't "
+                "include supportedApiVersions."
+            ),
+            "GET /api/v1/health did not include supportedApiVersions.",
+            "GET /api/v1/health didn't include supportedApiVersions.",
             "GET /api/v1/health has removed supportedApiVersions.",
             "supportedApiVersions is absent from GET /api/v1/health.",
             "supportedApiVersions is not returned by GET /api/v1/health.",

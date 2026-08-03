@@ -74,7 +74,8 @@ HEALTH_REFERENCE = re.compile(
 EXPLICIT_FIELD_ABSENCE = re.compile(
     r"(?:"
     r"\b(?:excludes?|lacks?|omits?)\b[^.;]{0,120}\bsupportedApiVersions\b|"
-    r"\bdoes\s+not\s+(?:include|return|contain|expose|advertise)\b"
+    r"\b(?:(?:do|does|did)\s+not|(?:don|doesn|didn)['’]t)\s+"
+    r"(?:include|return|contain|expose|advertise)\b"
     r"[^.;]{0,120}\bsupportedApiVersions\b|"
     r"\b(?:has|have|had)\s+(?:been\s+)?removed\b"
     r"[^.;]{0,120}\bsupportedApiVersions\b|"
@@ -91,7 +92,13 @@ EXPLICIT_FIELD_ABSENCE = re.compile(
     re.IGNORECASE,
 )
 NEGATED_ABSENCE_VERB = re.compile(
-    r"\b(?:not|never)\b[^.;]{0,40}\b(?:excludes?|lacks?|omits?)\b",
+    r"(?:"
+    r"\b(?:not|never|cannot)\b|"
+    r"\bcan['’]t\b|"
+    r"\b(?:don|doesn|didn)['’]t\b|"
+    r"\b(?:fails?|failed)\s+to\b|"
+    r"\bno\s+longer\b"
+    r")[^.;]{0,40}\b(?:excludes?|lacks?|omits?)\b",
     re.IGNORECASE,
 )
 STRUCTURAL_ROW_MARKER = "COVEN_DOC_STRUCTURAL_ROW"
