@@ -7,7 +7,7 @@ use std::{
 #[cfg(test)]
 use std::{collections::HashMap, sync::Mutex};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use base64::Engine;
 use chrono::{Duration, SecondsFormat, Utc};
 use rusqlite::{params, Connection, ErrorCode, OpenFlags, OptionalExtension};
@@ -77,6 +77,34 @@ pub struct EventRecord {
     pub session_id: String,
     pub kind: String,
     pub payload_json: String,
+    pub created_at: String,
+}
+
+/// Durable handoff state. A handoff is offered from one source session, then
+/// claimed, acknowledged by that source, and finally imported or launched by
+/// the destination. Generation is scoped to a source session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffRecord {
+    pub id: String,
+    pub session_id: String,
+    pub generation: i64,
+    pub packet_json: String,
+    pub event_cursor: i64,
+    pub workspace_json: String,
+    pub state: String,
+    pub claimant: Option<String>,
+    pub idempotency_key: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffContinuationRecord {
+    pub id: String,
+    pub handoff_id: String,
+    pub source_session_id: String,
+    pub generation: i64,
+    pub destination: String,
     pub created_at: String,
 }
 
@@ -471,6 +499,46 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_events_session_created_at
             ON events(session_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS session_handoffs (
+            id TEXT PRIMARY KEY NOT NULL,
+            session_id TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            packet_json TEXT NOT NULL,
+            event_cursor INTEGER NOT NULL,
+            workspace_json TEXT NOT NULL,
+            state TEXT NOT NULL,
+            claimant TEXT,
+            idempotency_key TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(session_id, generation),
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_session_handoffs_session
+            ON session_handoffs(session_id, generation DESC);
+
+        CREATE TABLE IF NOT EXISTS session_input_leases (
+            id TEXT PRIMARY KEY NOT NULL,
+            session_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_session_input_leases_session
+            ON session_input_leases(session_id);
+
+        CREATE TABLE IF NOT EXISTS handoff_continuations (
+            id TEXT PRIMARY KEY NOT NULL,
+            handoff_id TEXT NOT NULL,
+            source_session_id TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            destination TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(handoff_id, destination),
+            FOREIGN KEY (handoff_id) REFERENCES session_handoffs(id) ON DELETE CASCADE
+        );
 
         CREATE TABLE IF NOT EXISTS sensitive_artifacts (
             id TEXT PRIMARY KEY NOT NULL,
@@ -2806,6 +2874,266 @@ pub fn insert_json_event(
         created_at: created_at.to_string(),
     };
     insert_event(conn, &record)
+}
+
+fn handoff_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HandoffRecord> {
+    Ok(HandoffRecord {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        generation: row.get(2)?,
+        packet_json: row.get(3)?,
+        event_cursor: row.get(4)?,
+        workspace_json: row.get(5)?,
+        state: row.get(6)?,
+        claimant: row.get(7)?,
+        idempotency_key: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    })
+}
+
+const HANDOFF_COLUMNS: &str = "id, session_id, generation, packet_json, event_cursor, workspace_json, state, claimant, idempotency_key, created_at, updated_at";
+
+pub fn create_handoff(
+    conn: &mut Connection,
+    id: &str,
+    session_id: &str,
+    packet_json: &str,
+    event_cursor: i64,
+    workspace_json: &str,
+    now: &str,
+) -> Result<HandoffRecord> {
+    let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let generation: i64 = transaction.query_row(
+        "SELECT COALESCE(MAX(generation), 0) + 1 FROM session_handoffs WHERE session_id = ?1",
+        [session_id],
+        |row| row.get(0),
+    )?;
+    transaction.execute(
+        "INSERT INTO session_handoffs (
+            id, session_id, generation, packet_json, event_cursor, workspace_json,
+            state, claimant, idempotency_key, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'offered', NULL, NULL, ?7, ?7)",
+        params![
+            id,
+            session_id,
+            generation,
+            packet_json,
+            event_cursor,
+            workspace_json,
+            now
+        ],
+    )?;
+    let record = transaction.query_row(
+        &format!("SELECT {HANDOFF_COLUMNS} FROM session_handoffs WHERE id = ?1"),
+        [id],
+        handoff_record_from_row,
+    )?;
+    transaction.commit()?;
+    Ok(record)
+}
+
+pub fn get_handoff(conn: &Connection, handoff_id: &str) -> Result<Option<HandoffRecord>> {
+    conn.query_row(
+        &format!("SELECT {HANDOFF_COLUMNS} FROM session_handoffs WHERE id = ?1"),
+        [handoff_id],
+        handoff_record_from_row,
+    )
+    .optional()
+    .context("failed to read session handoff")
+}
+
+pub fn list_handoffs(conn: &Connection, session_id: &str) -> Result<Vec<HandoffRecord>> {
+    let mut statement = conn.prepare(&format!(
+        "SELECT {HANDOFF_COLUMNS} FROM session_handoffs WHERE session_id = ?1 ORDER BY generation ASC"
+    ))?;
+    let records = statement
+        .query_map([session_id], handoff_record_from_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to list session handoffs")?;
+    Ok(records)
+}
+
+/// Atomically claims an offered handoff. A live source input lease makes the
+/// claim fail rather than allowing a last-writer-wins handoff race.
+pub fn claim_handoff(
+    conn: &mut Connection,
+    handoff_id: &str,
+    expected_generation: i64,
+    claimant: &str,
+    idempotency_key: &str,
+    now: &str,
+) -> Result<HandoffRecord> {
+    let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let current = transaction.query_row(
+        &format!("SELECT {HANDOFF_COLUMNS} FROM session_handoffs WHERE id = ?1"),
+        [handoff_id],
+        handoff_record_from_row,
+    )?;
+    if current.generation != expected_generation {
+        bail!("stale_generation");
+    }
+    if current.state != "offered" {
+        if current.claimant.as_deref() == Some(claimant)
+            && current.idempotency_key.as_deref() == Some(idempotency_key)
+        {
+            transaction.commit()?;
+            return Ok(current);
+        }
+        bail!("handoff_already_claimed");
+    }
+    let input_in_flight: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_input_leases WHERE session_id = ?1)",
+        [&current.session_id],
+        |row| row.get(0),
+    )?;
+    if input_in_flight {
+        bail!("source_input_in_flight");
+    }
+    transaction.execute(
+        "UPDATE session_handoffs
+         SET state = 'claimed', claimant = ?2, idempotency_key = ?3, updated_at = ?4
+         WHERE id = ?1 AND state = 'offered'",
+        params![handoff_id, claimant, idempotency_key, now],
+    )?;
+    let claimed = transaction.query_row(
+        &format!("SELECT {HANDOFF_COLUMNS} FROM session_handoffs WHERE id = ?1"),
+        [handoff_id],
+        handoff_record_from_row,
+    )?;
+    transaction.commit()?;
+    Ok(claimed)
+}
+
+pub fn acknowledge_handoff(
+    conn: &mut Connection,
+    handoff_id: &str,
+    claimant: &str,
+    event_cursor: i64,
+    now: &str,
+) -> Result<HandoffRecord> {
+    let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let current = transaction.query_row(
+        &format!("SELECT {HANDOFF_COLUMNS} FROM session_handoffs WHERE id = ?1"),
+        [handoff_id],
+        handoff_record_from_row,
+    )?;
+    if current.claimant.as_deref() != Some(claimant) {
+        bail!("claimant_mismatch");
+    }
+    if current.event_cursor != event_cursor {
+        bail!("transcript_diverged");
+    }
+    match current.state.as_str() {
+        "acknowledged" => {
+            transaction.commit()?;
+            return Ok(current);
+        }
+        "claimed" => {}
+        _ => bail!("handoff_not_claimed"),
+    }
+    transaction.execute(
+        "UPDATE session_handoffs SET state = 'acknowledged', updated_at = ?2 WHERE id = ?1",
+        params![handoff_id, now],
+    )?;
+    let acknowledged = transaction.query_row(
+        &format!("SELECT {HANDOFF_COLUMNS} FROM session_handoffs WHERE id = ?1"),
+        [handoff_id],
+        handoff_record_from_row,
+    )?;
+    transaction.commit()?;
+    Ok(acknowledged)
+}
+
+pub fn create_handoff_continuation(
+    conn: &mut Connection,
+    id: &str,
+    handoff_id: &str,
+    destination: &str,
+    now: &str,
+) -> Result<HandoffContinuationRecord> {
+    let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let handoff = transaction.query_row(
+        &format!("SELECT {HANDOFF_COLUMNS} FROM session_handoffs WHERE id = ?1"),
+        [handoff_id],
+        handoff_record_from_row,
+    )?;
+    if handoff.state != "acknowledged" && handoff.state != "continued" {
+        bail!("source_acknowledgement_required");
+    }
+    let existing = transaction
+        .query_row(
+            "SELECT id, handoff_id, source_session_id, generation, destination, created_at
+             FROM handoff_continuations WHERE handoff_id = ?1 AND destination = ?2",
+            params![handoff_id, destination],
+            |row| {
+                Ok(HandoffContinuationRecord {
+                    id: row.get(0)?,
+                    handoff_id: row.get(1)?,
+                    source_session_id: row.get(2)?,
+                    generation: row.get(3)?,
+                    destination: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            },
+        )
+        .optional()?;
+    if let Some(existing) = existing {
+        transaction.commit()?;
+        return Ok(existing);
+    }
+    transaction.execute(
+        "INSERT INTO handoff_continuations (id, handoff_id, source_session_id, generation, destination, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![id, handoff_id, handoff.session_id, handoff.generation, destination, now],
+    )?;
+    transaction.execute(
+        "UPDATE session_handoffs SET state = 'continued', updated_at = ?2 WHERE id = ?1",
+        params![handoff_id, now],
+    )?;
+    transaction.commit()?;
+    Ok(HandoffContinuationRecord {
+        id: id.to_string(),
+        handoff_id: handoff_id.to_string(),
+        source_session_id: handoff.session_id,
+        generation: handoff.generation,
+        destination: destination.to_string(),
+        created_at: now.to_string(),
+    })
+}
+
+/// Acquire a short source-input lease. A concurrent claim either sees this
+/// lease and rejects safely, or commits first and prevents the lease entirely.
+pub fn acquire_session_input_lease(
+    conn: &mut Connection,
+    lease_id: &str,
+    session_id: &str,
+    now: &str,
+) -> Result<bool> {
+    let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let fenced: bool = transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM session_handoffs
+             WHERE session_id = ?1 AND state IN ('claimed', 'acknowledged', 'continued')
+         )",
+        [session_id],
+        |row| row.get(0),
+    )?;
+    if fenced {
+        transaction.commit()?;
+        return Ok(false);
+    }
+    transaction.execute(
+        "INSERT INTO session_input_leases (id, session_id, created_at) VALUES (?1, ?2, ?3)",
+        params![lease_id, session_id, now],
+    )?;
+    transaction.commit()?;
+    Ok(true)
+}
+
+pub fn release_session_input_lease(conn: &Connection, lease_id: &str) -> Result<()> {
+    conn.execute("DELETE FROM session_input_leases WHERE id = ?1", [lease_id])?;
+    Ok(())
 }
 
 pub fn list_events(conn: &Connection, session_id: &str) -> Result<Vec<EventRecord>> {

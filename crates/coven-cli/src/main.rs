@@ -24,6 +24,7 @@ mod engine_install;
 mod eval_loop;
 mod executor_node;
 mod familiar_identity;
+mod handoff;
 mod harness;
 mod hub;
 mod memory_dashboard;

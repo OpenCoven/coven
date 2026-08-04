@@ -20,6 +20,7 @@ use crate::{
     control_plane,
     daemon::DaemonStatus,
     encrypted_artifacts::SensitiveArtifactStore,
+    handoff::{HandoffPacketV1, WorkspaceSnapshot},
     harness::{ConversationHint, HarnessLaunchMode},
     privacy, session_launch, store, ward,
 };
@@ -125,6 +126,7 @@ pub struct HealthCapabilities {
     pub executor_dispatch: bool,
     pub event_cursor: String,
     pub structured_errors: bool,
+    pub session_handoff: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -247,6 +249,7 @@ pub fn health_response(daemon: Option<DaemonStatus>) -> HealthResponse {
             executor_dispatch: true,
             event_cursor: "sequence".to_string(),
             structured_errors: true,
+            session_handoff: true,
         },
         daemon,
         hub: None,
@@ -656,6 +659,35 @@ pub fn handle_request_with_runtime(
         ("POST", path) if path.starts_with("/sessions/") && path.ends_with("/kill") => {
             let session_id = session_action_id(path, "/kill");
             kill_session(coven_home, session_id, runtime)
+        }
+        ("POST", path) if path.starts_with("/sessions/") && path.ends_with("/handoffs") => {
+            let session_id = session_action_id(path, "/handoffs");
+            emit_handoff(coven_home, session_id, body)
+        }
+        ("POST", path)
+            if path.starts_with("/sessions/")
+                && path.contains("/handoffs/")
+                && path.ends_with("/claim") =>
+        {
+            claim_session_handoff(coven_home, path, body)
+        }
+        ("POST", path)
+            if path.starts_with("/sessions/")
+                && path.contains("/handoffs/")
+                && path.ends_with("/ack") =>
+        {
+            acknowledge_session_handoff(coven_home, path, body)
+        }
+        ("POST", path)
+            if path.starts_with("/sessions/")
+                && path.contains("/handoffs/")
+                && path.ends_with("/continuations") =>
+        {
+            import_handoff_continuation(coven_home, path, body)
+        }
+        ("GET", path) if path.starts_with("/sessions/") && path.ends_with("/handoffs") => {
+            let session_id = session_action_id(path, "/handoffs");
+            list_session_handoffs(coven_home, session_id, query.unwrap_or_default())
         }
         ("GET", path) if path.starts_with("/sessions/") && path.ends_with("/log") => {
             let session_id = session_action_id(path, "/log");
@@ -1870,6 +1902,365 @@ fn complete_external_session(
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HandoffClaimRequest {
+    expected_generation: i64,
+    claimant: String,
+    idempotency_key: String,
+    destination_workspace: WorkspaceSnapshot,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HandoffAcknowledgementRequest {
+    claimant: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HandoffContinuationRequest {
+    destination: String,
+}
+
+fn emit_handoff(coven_home: &Path, session_id: &str, body: Option<&str>) -> Result<ApiResponse> {
+    let payload = match parse_body(body) {
+        Ok(payload) => payload,
+        Err(error) => return api_error(400, "invalid_request", &error.to_string(), None),
+    };
+    let packet: HandoffPacketV1 = match serde_json::from_value(payload) {
+        Ok(packet) => packet,
+        Err(error) => return api_error(400, "invalid_request", &error.to_string(), None),
+    };
+    if let Err(error) = packet.validate(session_id) {
+        return handoff_error(error, session_id);
+    }
+    let packet = match packet.redacted() {
+        Ok(packet) => packet,
+        Err(error) => return handoff_error(error, session_id),
+    };
+    let mut conn = store::open_store(&store_path(coven_home))?;
+    let Some(session) = store::get_session(&conn, session_id)? else {
+        return api_error(
+            404,
+            "session_not_found",
+            "Session was not found.",
+            Some(json!({ "sessionId": session_id })),
+        );
+    };
+    if session.status != "running" {
+        return session_not_live_response(session_id);
+    }
+    let workspace = WorkspaceSnapshot::capture(Path::new(&session.project_root));
+    let event_cursor = store::list_events(&conn, session_id)?
+        .last()
+        .map(|event| event.seq)
+        .unwrap_or(0);
+    let now = current_timestamp();
+    let record = store::create_handoff(
+        &mut conn,
+        &format!("handoff_{}", Uuid::new_v4()),
+        session_id,
+        &serde_json::to_string(&packet)?,
+        event_cursor,
+        &serde_json::to_string(&workspace)?,
+        &now,
+    )?;
+    json_response(
+        201,
+        &json!({
+            "handoff": record,
+            "packet": packet,
+            "eventCursor": event_cursor,
+            "workspace": workspace,
+        }),
+    )
+}
+
+fn list_session_handoffs(coven_home: &Path, session_id: &str, query: &str) -> Result<ApiResponse> {
+    let conn = store::open_store(&store_path(coven_home))?;
+    if store::get_session(&conn, session_id)?.is_none() {
+        return api_error(
+            404,
+            "session_not_found",
+            "Session was not found.",
+            Some(json!({ "sessionId": session_id })),
+        );
+    }
+    let mut handoffs = store::list_handoffs(&conn, session_id)?;
+    if query_param(query, "latest") == Some("true") {
+        handoffs = handoffs.into_iter().rev().take(1).collect();
+    }
+    json_response(200, &json!({ "handoffs": handoffs }))
+}
+
+fn claim_session_handoff(coven_home: &Path, path: &str, body: Option<&str>) -> Result<ApiResponse> {
+    let Some((session_id, handoff_id)) = handoff_route_parts(path, "/claim") else {
+        return api_error(404, "not_found", "Route not found.", None);
+    };
+    let payload = match parse_body(body) {
+        Ok(payload) => payload,
+        Err(error) => return api_error(400, "invalid_request", &error.to_string(), None),
+    };
+    let request: HandoffClaimRequest = match serde_json::from_value(payload) {
+        Ok(request) => request,
+        Err(error) => return api_error(400, "invalid_request", &error.to_string(), None),
+    };
+    if request.claimant.trim().is_empty() || request.idempotency_key.trim().is_empty() {
+        return api_error(
+            400,
+            "invalid_request",
+            "claimant and idempotencyKey must be non-empty.",
+            None,
+        );
+    }
+    let mut conn = store::open_store(&store_path(coven_home))?;
+    let Some(handoff) = store::get_handoff(&conn, handoff_id)? else {
+        return api_error(404, "handoff_not_found", "Handoff was not found.", None);
+    };
+    if handoff.session_id != session_id {
+        return api_error(404, "handoff_not_found", "Handoff was not found.", None);
+    }
+    let Some(session) = store::get_session(&conn, session_id)? else {
+        return api_error(404, "session_not_found", "Session was not found.", None);
+    };
+    let source_workspace: WorkspaceSnapshot = serde_json::from_str(&handoff.workspace_json)
+        .context("stored handoff workspace snapshot is invalid")?;
+    let current_workspace = WorkspaceSnapshot::capture(Path::new(&session.project_root));
+    let current_cursor = store::list_events(&conn, session_id)?
+        .last()
+        .map(|event| event.seq)
+        .unwrap_or(0);
+    if current_cursor != handoff.event_cursor {
+        return api_error(
+            409,
+            "transcript_diverged",
+            "Source transcript changed after the handoff snapshot.",
+            Some(
+                json!({ "handoffId": handoff_id, "expectedCursor": handoff.event_cursor, "actualCursor": current_cursor }),
+            ),
+        );
+    }
+    if !source_workspace.compatible_with(&current_workspace)
+        || !source_workspace.compatible_with(&request.destination_workspace)
+    {
+        return api_error(
+            409,
+            "workspace_diverged",
+            "Source or destination workspace does not match the handoff snapshot.",
+            Some(json!({ "handoffId": handoff_id, "generation": handoff.generation })),
+        );
+    }
+    let claimed = match store::claim_handoff(
+        &mut conn,
+        handoff_id,
+        request.expected_generation,
+        &request.claimant,
+        &request.idempotency_key,
+        &current_timestamp(),
+    ) {
+        Ok(record) => record,
+        Err(error) => return handoff_error(error, session_id),
+    };
+    json_response(
+        200,
+        &json!({ "handoff": claimed, "sourceInputFenced": true }),
+    )
+}
+
+fn acknowledge_session_handoff(
+    coven_home: &Path,
+    path: &str,
+    body: Option<&str>,
+) -> Result<ApiResponse> {
+    let Some((session_id, handoff_id)) = handoff_route_parts(path, "/ack") else {
+        return api_error(404, "not_found", "Route not found.", None);
+    };
+    let payload = match parse_body(body) {
+        Ok(payload) => payload,
+        Err(error) => return api_error(400, "invalid_request", &error.to_string(), None),
+    };
+    let request: HandoffAcknowledgementRequest = match serde_json::from_value(payload) {
+        Ok(request) => request,
+        Err(error) => return api_error(400, "invalid_request", &error.to_string(), None),
+    };
+    let mut conn = store::open_store(&store_path(coven_home))?;
+    let Some(handoff) = store::get_handoff(&conn, handoff_id)? else {
+        return api_error(404, "handoff_not_found", "Handoff was not found.", None);
+    };
+    if handoff.session_id != session_id {
+        return api_error(404, "handoff_not_found", "Handoff was not found.", None);
+    }
+    let current_cursor = store::list_events(&conn, session_id)?
+        .last()
+        .map(|event| event.seq)
+        .unwrap_or(0);
+    if current_cursor != handoff.event_cursor {
+        return api_error(
+            409,
+            "transcript_diverged",
+            "Source transcript changed after the handoff snapshot.",
+            Some(
+                json!({ "handoffId": handoff_id, "expectedCursor": handoff.event_cursor, "actualCursor": current_cursor }),
+            ),
+        );
+    }
+    let acknowledged = match store::acknowledge_handoff(
+        &mut conn,
+        handoff_id,
+        &request.claimant,
+        current_cursor,
+        &current_timestamp(),
+    ) {
+        Ok(record) => record,
+        Err(error) => return handoff_error(error, session_id),
+    };
+    json_response(200, &json!({ "handoff": acknowledged }))
+}
+
+fn import_handoff_continuation(
+    coven_home: &Path,
+    path: &str,
+    body: Option<&str>,
+) -> Result<ApiResponse> {
+    let Some((session_id, handoff_id)) = handoff_route_parts(path, "/continuations") else {
+        return api_error(404, "not_found", "Route not found.", None);
+    };
+    let payload = match parse_body(body) {
+        Ok(payload) => payload,
+        Err(error) => return api_error(400, "invalid_request", &error.to_string(), None),
+    };
+    let request: HandoffContinuationRequest = match serde_json::from_value(payload) {
+        Ok(request) => request,
+        Err(error) => return api_error(400, "invalid_request", &error.to_string(), None),
+    };
+    if request.destination.trim().is_empty() {
+        return api_error(
+            400,
+            "invalid_request",
+            "destination must be non-empty.",
+            None,
+        );
+    }
+    let mut conn = store::open_store(&store_path(coven_home))?;
+    let Some(handoff) = store::get_handoff(&conn, handoff_id)? else {
+        return api_error(404, "handoff_not_found", "Handoff was not found.", None);
+    };
+    if handoff.session_id != session_id {
+        return api_error(404, "handoff_not_found", "Handoff was not found.", None);
+    }
+    let already_imported = handoff.state == "continued";
+    let packet: HandoffPacketV1 =
+        serde_json::from_str(&handoff.packet_json).context("stored handoff packet is invalid")?;
+    let continuation = match store::create_handoff_continuation(
+        &mut conn,
+        &format!("continuation_{}", Uuid::new_v4()),
+        handoff_id,
+        &request.destination,
+        &current_timestamp(),
+    ) {
+        Ok(record) => record,
+        Err(error) => return handoff_error(error, session_id),
+    };
+    let prompt = packet.continuation_prompt()?;
+    if !already_imported {
+        insert_event(
+            &conn,
+            coven_home,
+            session_id,
+            "handoff.continuation_imported",
+            json!({ "handoffId": handoff_id, "generation": handoff.generation, "continuationId": continuation.id }),
+        )?;
+    }
+    json_response(
+        201,
+        &json!({
+            "continuation": continuation,
+            "packet": packet,
+            "prompt": prompt,
+            "provenance": { "sourceSessionId": session_id, "handoffId": handoff_id, "generation": handoff.generation },
+        }),
+    )
+}
+
+fn handoff_route_parts<'a>(path: &'a str, suffix: &str) -> Option<(&'a str, &'a str)> {
+    let rest = path.strip_prefix("/sessions/")?.strip_suffix(suffix)?;
+    let (session_id, handoff_id) = rest.split_once("/handoffs/")?;
+    (!session_id.is_empty() && !handoff_id.is_empty()).then_some((session_id, handoff_id))
+}
+
+fn handoff_error(error: anyhow::Error, session_id: &str) -> Result<ApiResponse> {
+    let message = error.to_string();
+    let (status, code, copy) = if message == "too_large" {
+        (
+            413,
+            "handoff_too_large",
+            "Handoff packet exceeds the 64 KiB limit.",
+        )
+    } else if message.starts_with("schema_mismatch") {
+        (
+            400,
+            "handoff_schema_mismatch",
+            "Handoff packet schema is not supported.",
+        )
+    } else if message.starts_with("missing_field") {
+        (
+            400,
+            "handoff_missing_field",
+            "Handoff packet has a required empty field.",
+        )
+    } else if message == "session_mismatch" {
+        (
+            422,
+            "handoff_session_mismatch",
+            "Handoff packet belongs to another session.",
+        )
+    } else if message == "stale_generation" {
+        (
+            409,
+            "handoff_stale_generation",
+            "Handoff generation is stale.",
+        )
+    } else if message == "handoff_already_claimed" {
+        (
+            409,
+            "handoff_already_claimed",
+            "Handoff was already claimed by another destination.",
+        )
+    } else if message == "source_input_in_flight" {
+        (
+            409,
+            "source_input_in_flight",
+            "Source input is still in flight; retry the takeover.",
+        )
+    } else if message == "transcript_diverged" {
+        (
+            409,
+            "transcript_diverged",
+            "Source transcript changed after the handoff snapshot.",
+        )
+    } else if message == "claimant_mismatch" {
+        (
+            409,
+            "handoff_claimant_mismatch",
+            "Only the claimant may acknowledge this handoff.",
+        )
+    } else if message == "source_acknowledgement_required" {
+        (
+            409,
+            "source_acknowledgement_required",
+            "Source acknowledgement is required before continuation import.",
+        )
+    } else {
+        (
+            409,
+            "handoff_state_conflict",
+            "Handoff state does not permit this operation.",
+        )
+    };
+    api_error(status, code, copy, Some(json!({ "sessionId": session_id })))
+}
+
 fn session_launch_from_payload(payload: Value) -> Result<SessionLaunch> {
     let project_root = required_string(&payload, "projectRoot")?;
     let cwd = payload.get("cwd").and_then(Value::as_str);
@@ -2006,7 +2397,7 @@ fn record_input(
     body: Option<&str>,
     runtime: &dyn SessionRuntime,
 ) -> Result<ApiResponse> {
-    let conn = store::open_store(&store_path(coven_home))?;
+    let mut conn = store::open_store(&store_path(coven_home))?;
     let Some(session) = store::get_session(&conn, session_id)? else {
         return api_error(
             404,
@@ -2044,7 +2435,17 @@ fn record_input(
             Some(json!({ "sessionId": session_id })),
         );
     }
-    if let Err(error) = runtime.send_input(session_id, &payload) {
+    let lease_id = Uuid::new_v4().to_string();
+    if !store::acquire_session_input_lease(&mut conn, &lease_id, session_id, &current_timestamp())?
+    {
+        return api_error(
+            409,
+            "session_handoff_active",
+            "Session input is fenced by a committed handoff takeover.",
+            Some(json!({ "sessionId": session_id })),
+        );
+    }
+    let result = if let Err(error) = runtime.send_input(session_id, &payload) {
         // Match the typed sentinel from the daemon runtime instead of
         // substring-matching the error message — refactoring the prose
         // later can't accidentally route the not-live case to the
@@ -2053,17 +2454,21 @@ fn record_input(
             .downcast_ref::<crate::daemon::NotLiveError>()
             .is_some()
         {
-            return session_not_live_response(session_id);
+            session_not_live_response(session_id)
+        } else {
+            api_error(
+                500,
+                "send_input_failed",
+                &error.to_string(),
+                Some(json!({ "sessionId": session_id })),
+            )
         }
-        return api_error(
-            500,
-            "send_input_failed",
-            &error.to_string(),
-            Some(json!({ "sessionId": session_id })),
-        );
-    }
-    insert_event(&conn, coven_home, session_id, "input", payload)?;
-    json_response(202, &json!({ "ok": true, "accepted": true }))
+    } else {
+        insert_event(&conn, coven_home, session_id, "input", payload)?;
+        json_response(202, &json!({ "ok": true, "accepted": true }))
+    };
+    store::release_session_input_lease(&conn, &lease_id)?;
+    result
 }
 
 fn kill_session(
@@ -6342,6 +6747,7 @@ mod tests {
         assert_eq!(body["capabilities"]["events"], true);
         assert_eq!(body["capabilities"]["eventCursor"], "sequence");
         assert_eq!(body["capabilities"]["structuredErrors"], true);
+        assert_eq!(body["capabilities"]["sessionHandoff"], true);
         Ok(())
     }
 
@@ -8413,6 +8819,236 @@ mod tests {
             transcript_path: None,
         };
         crate::store::insert_session(&conn, &session)?;
+        Ok(())
+    }
+
+    fn portable_handoff_fixture() -> anyhow::Result<(tempfile::TempDir, WorkspaceSnapshot)> {
+        let temp = tempfile::tempdir()?;
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo)?;
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "tests@example.invalid"],
+            vec!["config", "user.name", "Coven tests"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/opencoven/handoff.git",
+            ],
+            vec!["commit", "--allow-empty", "-m", "initial"],
+        ] {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .status()?;
+            assert!(status.success());
+        }
+        let snapshot = WorkspaceSnapshot::capture(&repo);
+        assert!(snapshot.portable);
+        let conn = crate::store::open_store(&temp.path().join("coven.sqlite3"))?;
+        crate::store::insert_session(
+            &conn,
+            &crate::store::SessionRecord {
+                id: "session-1".to_string(),
+                project_root: repo.to_string_lossy().into_owned(),
+                harness: "codex".to_string(),
+                title: "handoff fixture".to_string(),
+                status: "running".to_string(),
+                exit_code: None,
+                archived_at: None,
+                created_at: "2026-08-04T00:00:00Z".to_string(),
+                updated_at: "2026-08-04T00:00:00Z".to_string(),
+                conversation_id: None,
+                familiar_id: None,
+                labels: Vec::new(),
+                visibility: "private".to_string(),
+                external: false,
+                transcript_path: None,
+            },
+        )?;
+        Ok((temp, snapshot))
+    }
+
+    fn handoff_packet() -> Value {
+        json!({
+            "schema": "coven.handoff.v1",
+            "trigger": "user_initiated",
+            "from": { "harness": "codex" },
+            "to": { "harness": "claude" },
+            "taskContext": { "originalGoal": "Fix the handoff", "constraints": [], "scopeNotes": "" },
+            "currentState": { "lastAction": "Read the source", "loadedContextSummary": "Authorization: Bearer secret", "openQuestions": [] },
+            "filesTouched": [],
+            "risks": [],
+            "verification": { "latestVerdicts": [], "stale": false, "notes": "" },
+            "nextAction": { "instruction": "Run the focused test.", "doNotDo": [], "expectedOutcome": "green" },
+            "meta": { "sessionId": "session-1", "createdAt": 1, "redactionVersion": 1 }
+        })
+    }
+
+    #[test]
+    fn handoff_claim_acknowledgement_import_fences_source_and_is_idempotent() -> anyhow::Result<()>
+    {
+        let (temp, workspace) = portable_handoff_fixture()?;
+        let offered = handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/session-1/handoffs",
+            temp.path(),
+            None,
+            Some(&handoff_packet().to_string()),
+        )?;
+        assert_eq!(offered.status, 201);
+        let offered: Value = serde_json::from_str(&offered.body)?;
+        assert_eq!(
+            offered["packet"]["currentState"]["loadedContextSummary"],
+            "[REDACTED]"
+        );
+        let handoff_id = offered["handoff"]["id"].as_str().unwrap();
+        let generation = offered["handoff"]["generation"].as_i64().unwrap();
+        let claim = json!({
+            "expectedGeneration": generation,
+            "claimant": "device:phone-1",
+            "idempotencyKey": "claim-1",
+            "destinationWorkspace": workspace,
+        });
+        let stale = handle_request_with_body(
+            "POST", &format!("/api/v1/sessions/session-1/handoffs/{handoff_id}/claim"),
+            temp.path(), None,
+            Some(&json!({ "expectedGeneration": generation - 1, "claimant": "device:phone-1", "idempotencyKey": "stale", "destinationWorkspace": offered["workspace"] }).to_string()),
+        )?;
+        assert_eq!(stale.status, 409);
+        let claimed = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/sessions/session-1/handoffs/{handoff_id}/claim"),
+            temp.path(),
+            None,
+            Some(&claim.to_string()),
+        )?;
+        assert_eq!(claimed.status, 200);
+        let retry = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/sessions/session-1/handoffs/{handoff_id}/claim"),
+            temp.path(),
+            None,
+            Some(&claim.to_string()),
+        )?;
+        assert_eq!(retry.status, 200);
+        let recovered = handle_request(
+            "GET",
+            "/api/v1/sessions/session-1/handoffs?latest=true",
+            temp.path(),
+            None,
+        )?;
+        assert_eq!(
+            serde_json::from_str::<Value>(&recovered.body)?["handoffs"][0]["state"],
+            "claimed"
+        );
+        let input = handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/session-1/input",
+            temp.path(),
+            None,
+            Some(r#"{"data":"late"}"#),
+        )?;
+        assert_eq!(input.status, 409);
+        let acknowledgement = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/sessions/session-1/handoffs/{handoff_id}/ack"),
+            temp.path(),
+            None,
+            Some(r#"{"claimant":"device:phone-1"}"#),
+        )?;
+        assert_eq!(acknowledgement.status, 200);
+        let imported = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/sessions/session-1/handoffs/{handoff_id}/continuations"),
+            temp.path(),
+            None,
+            Some(r#"{"destination":"device:phone-1"}"#),
+        )?;
+        assert_eq!(imported.status, 201);
+        let imported: Value = serde_json::from_str(&imported.body)?;
+        assert_eq!(imported["provenance"]["sourceSessionId"], "session-1");
+        assert_eq!(imported["provenance"]["generation"], generation);
+        assert!(imported["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("untrusted context"));
+        let retry_import = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/sessions/session-1/handoffs/{handoff_id}/continuations"),
+            temp.path(),
+            None,
+            Some(r#"{"destination":"device:phone-1"}"#),
+        )?;
+        let retry_import: Value = serde_json::from_str(&retry_import.body)?;
+        assert_eq!(
+            retry_import["continuation"]["id"],
+            imported["continuation"]["id"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn handoff_claim_fails_closed_when_transcript_or_workspace_diverges() -> anyhow::Result<()> {
+        let (temp, workspace) = portable_handoff_fixture()?;
+        let offered = handle_request_with_body(
+            "POST",
+            "/sessions/session-1/handoffs",
+            temp.path(),
+            None,
+            Some(&handoff_packet().to_string()),
+        )?;
+        let offered: Value = serde_json::from_str(&offered.body)?;
+        let handoff_id = offered["handoff"]["id"].as_str().unwrap();
+        let generation = offered["handoff"]["generation"].as_i64().unwrap();
+        let input = handle_request_with_body(
+            "POST",
+            "/sessions/session-1/input",
+            temp.path(),
+            None,
+            Some(r#"{"data":"new source input"}"#),
+        )?;
+        assert_eq!(input.status, 202);
+        let transcript_conflict = handle_request_with_body(
+            "POST", &format!("/sessions/session-1/handoffs/{handoff_id}/claim"), temp.path(), None,
+            Some(&json!({ "expectedGeneration": generation, "claimant": "device:phone-1", "idempotencyKey": "claim-1", "destinationWorkspace": workspace }).to_string()),
+        )?;
+        assert_eq!(transcript_conflict.status, 409);
+        let body: Value = serde_json::from_str(&transcript_conflict.body)?;
+        assert_eq!(body["error"]["code"], "transcript_diverged");
+
+        let fresh = handle_request_with_body(
+            "POST",
+            "/sessions/session-1/handoffs",
+            temp.path(),
+            None,
+            Some(&handoff_packet().to_string()),
+        )?;
+        let fresh: Value = serde_json::from_str(&fresh.body)?;
+        let handoff_id = fresh["handoff"]["id"].as_str().unwrap();
+        let generation = fresh["handoff"]["generation"].as_i64().unwrap();
+        let mut wrong_workspace = workspace;
+        wrong_workspace.commit = Some("different".to_string());
+        let workspace_conflict = handle_request_with_body(
+            "POST",
+            &format!("/sessions/session-1/handoffs/{handoff_id}/claim"),
+            temp.path(),
+            None,
+            Some(
+                &json!({
+                    "expectedGeneration": generation,
+                    "claimant": "device:phone-1",
+                    "idempotencyKey": "claim-2",
+                    "destinationWorkspace": wrong_workspace,
+                })
+                .to_string(),
+            ),
+        )?;
+        assert_eq!(workspace_conflict.status, 409);
+        let body: Value = serde_json::from_str(&workspace_conflict.body)?;
+        assert_eq!(body["error"]["code"], "workspace_diverged");
         Ok(())
     }
 
