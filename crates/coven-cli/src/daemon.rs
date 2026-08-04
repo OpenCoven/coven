@@ -2080,15 +2080,17 @@ fn rotate_recovery_log(path: &Path, incoming_bytes: u64, max_bytes: u64, backups
 
     for index in (1..=backups).rev() {
         let destination = PathBuf::from(format!("{}.{}", path.display(), index));
-        if index == backups {
-            let _ = std::fs::remove_file(&destination);
-        }
         let source = if index == 1 {
             path.to_path_buf()
         } else {
             PathBuf::from(format!("{}.{}", path.display(), index - 1))
         };
         if source.exists() {
+            // Windows does not replace an existing destination for
+            // `std::fs::rename`, unlike Unix. Only remove a slot immediately
+            // before replacing it, so a lone older archive survives a partial
+            // prior rotation where its newer source is absent.
+            let _ = std::fs::remove_file(&destination);
             let _ = std::fs::rename(source, destination);
         }
     }
@@ -5569,6 +5571,21 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(format!("{}.1", path.display()))?,
             "abcdefgh"
+        );
+        assert_eq!(
+            std::fs::read_to_string(format!("{}.2", path.display()))?,
+            "12345678"
+        );
+
+        // A partial prior rotation can leave an older archive without its
+        // newer neighbor. Keep the surviving history rather than deleting it
+        // merely because there is no source to shift into its slot.
+        std::fs::remove_file(format!("{}.1", path.display()))?;
+        std::fs::write(&path, "ijklmnop")?;
+        rotate_recovery_log(&path, 4, 10, 2);
+        assert_eq!(
+            std::fs::read_to_string(format!("{}.1", path.display()))?,
+            "ijklmnop"
         );
         assert_eq!(
             std::fs::read_to_string(format!("{}.2", path.display()))?,
