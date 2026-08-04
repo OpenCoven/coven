@@ -22,6 +22,9 @@ Memory is what turns a harness session into a persistent familiar. OpenCoven tre
   <Card title="Semantic memory" href="/memory/semantic" icon="lightbulb">
     Embeddings and concept-based recall.
   </Card>
+  <Card title="Attested promotion" href="/memory/attested-promotion" icon="shield-check">
+    Durable authority rules for promoting verified archival memory.
+  </Card>
 </Columns>
 
 ## How memory relates to Coven sessions
