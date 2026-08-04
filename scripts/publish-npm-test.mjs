@@ -20,6 +20,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { defaultTargetName, isMainModule, isOidcContext, nativeTargetNamesForPackageSet, packageVersionPublished, publishArgs, publishEnv, releaseVersion, targetPackageName, validatePublishToken, validatePublishVersion, wrapperPackageDirName, wrapperPackageNameList, wrapperTextForPackage } from './publish-npm.mjs';
 import { parseReleaseTag } from './release-npm-context.mjs';
 import { nativePackageSet } from './release-npm-recovery-contract.mjs';
+import { platformMatrix } from './release-npm-platform-matrix.mjs';
 
 const OIDC_ENV = {
   ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'fake-oidc-token',
@@ -235,6 +236,20 @@ test('native package sets keep historical recovery explicit', () => {
   assert.deepEqual(nativeTargetNamesForPackageSet('pre-intel'), ['macos', 'linux-x64', 'windows']);
   assert.deepEqual(nativeTargetNamesForPackageSet('post-intel'), ['macos', 'macos-x64', 'linux-x64', 'windows']);
   assert.throws(() => nativeTargetNamesForPackageSet('unexpected'), /Unsupported native package set/);
+});
+
+test('release platform matrix omits Intel macOS for pre-Intel recovery', () => {
+  assert.deepEqual(platformMatrix('pre-intel'), {
+    include: [
+      { 'npm-target': 'macos', 'rust-target': 'aarch64-apple-darwin', runner: 'macos-26', binary: 'coven' },
+      { 'npm-target': 'linux-x64', 'rust-target': 'x86_64-unknown-linux-gnu', runner: 'ubuntu-latest', binary: 'coven' },
+      { 'npm-target': 'windows', 'rust-target': 'x86_64-pc-windows-msvc', runner: 'windows-latest', binary: 'coven.exe' }
+    ]
+  });
+  assert.equal(
+    platformMatrix('post-intel').include.some((entry) => entry['npm-target'] === 'macos-x64'),
+    true
+  );
 });
 
 test('linux x64 target publishes under linux native package name', () => {
@@ -510,8 +525,12 @@ test('release workflow builds and dry-runs linux x64 package', () => {
     import.meta.url
   );
   const workflow = readFileSync(workflowPath, 'utf8');
-  assert.match(workflow, /npm-target: linux-x64/);
-  assert.match(workflow, /rust-target: x86_64-unknown-linux-gnu/);
+  const matrixScript = readFileSync(
+    new URL(['..', 'scripts', 'release-npm-platform-matrix.mjs'].join('/'), import.meta.url),
+    'utf8'
+  );
+  assert.match(matrixScript, /'npm-target': 'linux-x64'/);
+  assert.match(matrixScript, /'rust-target': 'x86_64-unknown-linux-gnu'/);
   assert.match(workflow, /node scripts\/publish-npm\.mjs --target=linux-x64 --skip-build --dry-run --skip-wrapper/);
   assert.match(workflow, /node scripts\/publish-npm\.mjs --target=linux-x64 --skip-build --publish --skip-wrapper/);
 });
@@ -522,10 +541,15 @@ test('release workflow builds macOS package on arm64 runner', () => {
     import.meta.url
   );
   const workflow = readFileSync(workflowPath, 'utf8');
-  assert.match(workflow, /npm-target: macos/);
-  assert.match(workflow, /rust-target: aarch64-apple-darwin/);
-  assert.match(workflow, /runner: macos-26/);
-  assert.doesNotMatch(workflow, /runner: macos-latest/);
+  const matrixScript = readFileSync(
+    new URL(['..', 'scripts', 'release-npm-platform-matrix.mjs'].join('/'), import.meta.url),
+    'utf8'
+  );
+  assert.match(matrixScript, /'npm-target': 'macos'/);
+  assert.match(matrixScript, /'rust-target': 'aarch64-apple-darwin'/);
+  assert.match(matrixScript, /runner: 'macos-26'/);
+  assert.doesNotMatch(matrixScript, /runner: 'macos-latest'/);
+  assert.match(workflow, /matrix: \$\{\{ fromJSON\(needs\.verify-tag\.outputs\.platform_matrix\) \}\}/);
 });
 
 test('release workflow builds and publishes Intel macOS as a separate target', () => {
@@ -534,10 +558,15 @@ test('release workflow builds and publishes Intel macOS as a separate target', (
     import.meta.url
   );
   const workflow = readFileSync(workflowPath, 'utf8');
-  assert.match(workflow, /npm-target: macos-x64/);
-  assert.match(workflow, /rust-target: x86_64-apple-darwin/);
-  assert.match(workflow, /runner: macos-15-intel/);
-  assert.match(workflow, /name: coven-macos-x64/);
+  const matrixScript = readFileSync(
+    new URL(['..', 'scripts', 'release-npm-platform-matrix.mjs'].join('/'), import.meta.url),
+    'utf8'
+  );
+  assert.match(matrixScript, /'npm-target': 'macos-x64'/);
+  assert.match(matrixScript, /'rust-target': 'x86_64-apple-darwin'/);
+  assert.match(matrixScript, /runner: 'macos-15-intel'/);
+  assert.match(workflow, /name: coven-\$\{\{ matrix\.npm-target \}\}/);
+  assert.match(workflow, /release-npm-platform-matrix\.mjs/);
   assert.match(workflow, /cargo build --release --package coven-cli --target \$\{\{ matrix\.rust-target \}\}/);
   assert.match(workflow, /node scripts\/publish-npm\.mjs --target=macos-x64 --skip-build --dry-run --skip-wrapper/);
   assert.match(workflow, /node scripts\/publish-npm\.mjs --target=macos-x64 --skip-build --publish --skip-wrapper/);
@@ -557,10 +586,14 @@ test('release workflow builds and dry-runs windows package', () => {
     import.meta.url
   );
   const workflow = readFileSync(workflowPath, 'utf8');
-  assert.match(workflow, /npm-target: windows/);
-  assert.match(workflow, /rust-target: x86_64-pc-windows-msvc/);
-  assert.match(workflow, /runner: windows-latest/);
-  assert.match(workflow, /binary: coven\.exe/);
+  const matrixScript = readFileSync(
+    new URL(['..', 'scripts', 'release-npm-platform-matrix.mjs'].join('/'), import.meta.url),
+    'utf8'
+  );
+  assert.match(matrixScript, /'npm-target': 'windows'/);
+  assert.match(matrixScript, /'rust-target': 'x86_64-pc-windows-msvc'/);
+  assert.match(matrixScript, /runner: 'windows-latest'/);
+  assert.match(matrixScript, /binary: 'coven\.exe'/);
   assert.match(workflow, /node scripts\/publish-npm\.mjs --target=windows --skip-build --dry-run --skip-wrapper/);
   assert.match(workflow, /node scripts\/publish-npm\.mjs --target=windows --skip-build --publish --skip-wrapper/);
 });
