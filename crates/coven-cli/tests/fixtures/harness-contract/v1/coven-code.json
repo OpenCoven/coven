@@ -1,0 +1,11 @@
+{
+  "adapterId": "coven-code",
+  "offer": { "contract": "coven.harness", "versions": ["coven.harness.v1"], "optionalExtensions": ["input.image.v1", "output.tool-use.v1"] },
+  "capabilities": { "stream": true, "preassigned_session_id": true, "think": true, "speed": true },
+  "sessionId": "fixture-coven-code",
+  "frames": [
+    { "type": "ready", "session_id": "fixture-coven-code" },
+    { "type": "output", "session_id": "fixture-coven-code", "sequence": 1, "kind": "semantic", "text": "engine response" },
+    { "type": "terminal", "session_id": "fixture-coven-code", "sequence": 2, "outcome": "completed" }
+  ]
+}

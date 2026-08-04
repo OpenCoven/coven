@@ -6,6 +6,8 @@ title: "Harness adapters"
 description: "Reference for Coven harness adapters: the PTY contract, session metadata, project root canonicalization, and capability negotiation each adapter implements."
 ---
 
-> Canonical content currently lives in the [harness adapter guide](/HARNESS-ADAPTERS) (`docs/HARNESS-ADAPTERS.md`). This reference page will be filled in once the adapter contract stabilizes.
-
-Stub — fill in.
+The invocation and support-policy guide is [Harness adapter guide](/HARNESS-ADAPTERS).
+The normative runner-to-adapter protocol is [Adapter contract](/ADAPTER-SPEC):
+negotiation, capability extensions, input/output framing, lifecycle,
+cancellation, errors, migration policy, and conformance fixtures all live
+there.

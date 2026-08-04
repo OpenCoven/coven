@@ -1,0 +1,10 @@
+{
+  "adapterId": "external-fixture",
+  "offer": { "contract": "coven.harness", "versions": ["coven.harness.v1"], "optionalExtensions": ["future.telemetry.v9"] },
+  "sessionId": "fixture-external",
+  "frames": [
+    { "type": "ready", "session_id": "fixture-external", "futureReadyField": true },
+    { "type": "output", "session_id": "fixture-external", "sequence": 1, "kind": "raw", "text": "external adapter raw output", "futureOutputField": "ignored" },
+    { "type": "terminal", "session_id": "fixture-external", "sequence": 2, "outcome": "completed" }
+  ]
+}

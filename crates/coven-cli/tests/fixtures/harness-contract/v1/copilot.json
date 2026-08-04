@@ -1,0 +1,11 @@
+{
+  "adapterId": "copilot",
+  "offer": { "contract": "coven.harness", "versions": ["coven.harness.v1"] },
+  "capabilities": { "stream": false, "preassigned_session_id": true, "think": true, "speed": true },
+  "sessionId": "fixture-copilot",
+  "frames": [
+    { "type": "ready", "session_id": "fixture-copilot" },
+    { "type": "output", "session_id": "fixture-copilot", "sequence": 1, "kind": "text", "text": "partial output" },
+    { "type": "terminal", "session_id": "fixture-copilot", "sequence": 2, "outcome": "failed", "error": { "code": "provider_error", "message": "upstream rejected the turn" } }
+  ]
+}

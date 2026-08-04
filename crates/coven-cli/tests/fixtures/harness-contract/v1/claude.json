@@ -1,0 +1,13 @@
+{
+  "adapterId": "claude",
+  "offer": { "contract": "coven.harness", "versions": ["coven.harness.v1"], "optionalExtensions": ["input.image.v1"] },
+  "capabilities": { "stream": true, "preassigned_session_id": true, "think": true, "speed": true },
+  "sessionId": "fixture-claude",
+  "cancellationRequestId": "cancel-claude",
+  "frames": [
+    { "type": "ready", "session_id": "fixture-claude" },
+    { "type": "output", "session_id": "fixture-claude", "sequence": 1, "kind": "semantic", "text": "partial turn" },
+    { "type": "cancellation_acknowledged", "session_id": "fixture-claude", "request_id": "cancel-claude" },
+    { "type": "terminal", "session_id": "fixture-claude", "sequence": 2, "outcome": "cancelled" }
+  ]
+}

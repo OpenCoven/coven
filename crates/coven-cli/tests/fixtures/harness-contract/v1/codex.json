@@ -1,0 +1,11 @@
+{
+  "adapterId": "codex",
+  "offer": { "contract": "coven.harness", "versions": ["coven.harness.v1"] },
+  "capabilities": { "stream": false, "preassigned_session_id": false, "think": false, "speed": false },
+  "sessionId": "fixture-codex",
+  "frames": [
+    { "type": "ready", "session_id": "fixture-codex" },
+    { "type": "output", "session_id": "fixture-codex", "sequence": 1, "kind": "semantic", "text": "reply" },
+    { "type": "terminal", "session_id": "fixture-codex", "sequence": 2, "outcome": "completed" }
+  ]
+}

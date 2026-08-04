@@ -18,6 +18,12 @@ The goal is a harness-neutral runtime:
 - Provider auth, model/provider config, tools, skills, and memory stay inside that external harness.
 - Clients can discover supported adapters with `coven adapter list` instead of hard-coding "Codex vs Claude" assumptions.
 
+The runner-to-adapter wire and lifecycle boundary is now specified separately
+as [the versioned adapter contract](reference/adapter-spec.md). Manifest data
+describes invocation; the contract defines how an adapter proves capability,
+input, output, terminal state, cancellation, and error behavior without
+depending on embedded runner internals.
+
 ## Current adapter shape
 
 A Coven harness adapter defines:
