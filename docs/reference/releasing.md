@@ -6,7 +6,7 @@ read_when:
 title: "Releasing Coven to npm"
 ---
 
-Coven publishes the `@opencoven/cli` wrapper and its three native platform packages (`@opencoven/cli-macos`, `@opencoven/cli-linux-x64`, `@opencoven/cli-windows`) automatically from the **Release npm packages** GitHub Actions workflow.
+Coven publishes the `@opencoven/cli` wrapper and its four native platform packages (`@opencoven/cli-macos`, `@opencoven/cli-macos-x64`, `@opencoven/cli-linux-x64`, `@opencoven/cli-windows`) automatically from the **Release npm packages** GitHub Actions workflow.
 
 The release is **driven by a signed git tag**. No `workflow_dispatch`, no manual approval click, no long-lived npm token: a maintainer runs `git tag -s vX.Y.Z` + `git push`, and the workflow verifies the tag signature, runs the full gate matrix, dry-runs, then publishes using **npm trusted publishing over GitHub Actions OIDC**, attaching a provenance attestation to every package.
 
@@ -19,6 +19,7 @@ Before the first OIDC release, configure trusted publishing for every package. W
 ```sh
 npm trust github @opencoven/cli --repository OpenCoven/coven --file release-npm.yml --allow-publish --yes
 npm trust github @opencoven/cli-macos --repository OpenCoven/coven --file release-npm.yml --allow-publish --yes
+npm trust github @opencoven/cli-macos-x64 --repository OpenCoven/coven --file release-npm.yml --allow-publish --yes
 npm trust github @opencoven/cli-linux-x64 --repository OpenCoven/coven --file release-npm.yml --allow-publish --yes
 npm trust github @opencoven/cli-windows --repository OpenCoven/coven --file release-npm.yml --allow-publish --yes
 ```
@@ -27,7 +28,7 @@ Leave the environment unset. Verify the result with `npm trust list <package>`.
 
 The npm website exposes the same configuration:
 
-For each of `@opencoven/cli`, `@opencoven/cli-macos`, `@opencoven/cli-linux-x64`, `@opencoven/cli-windows`:
+For each of `@opencoven/cli`, `@opencoven/cli-macos`, `@opencoven/cli-macos-x64`, `@opencoven/cli-linux-x64`, `@opencoven/cli-windows`:
 
 1. Sign in to npmjs.com as an account with publish rights on `@opencoven`.
 2. Open the package settings page (e.g. `https://www.npmjs.com/package/@opencoven/cli/access`).
@@ -38,7 +39,7 @@ For each of `@opencoven/cli`, `@opencoven/cli-macos`, `@opencoven/cli-linux-x64`
    - **Environment name**: leave blank (the workflow no longer uses a GitHub environment for the publish step).
 4. Save.
 
-Once all four packages are configured, the legacy `NPM_ACCESS_TOKEN` secret on the `npm-publish` GitHub environment is no longer needed and should be deleted as the final step of cutover so it cannot be reused to bypass OIDC:
+Once all five packages are configured, the legacy `NPM_ACCESS_TOKEN` secret on the `npm-publish` GitHub environment is no longer needed and should be deleted as the final step of cutover so it cannot be reused to bypass OIDC:
 
 ```sh
 gh secret delete NPM_ACCESS_TOKEN --env npm-publish --repo OpenCoven/coven
@@ -80,24 +81,26 @@ That single push is the entire release. The workflow takes over from there.
 
 1. **Release gates** — `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test --workspace --locked`, `python3 scripts/check-secrets.py`.
 2. **Verify signed release tag** — confirms the pushed ref is an annotated tag (not lightweight) and that GitHub has cryptographically verified the maintainer's signature. The workflow consults `gh api /repos/{owner}/{repo}/git/tags/{sha}` and requires `.verification.verified == true`. Any other state aborts the release.
-3. **Build platform binaries** — matrix builds the release binary for `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, and `x86_64-pc-windows-msvc`, then uploads each as an artifact.
+3. **Build platform binaries** — matrix builds the release binary for `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, and `x86_64-pc-windows-msvc`, then uploads each as an artifact.
 4. **npm publish dry-run** — repacks the wrapper and native packages at the tag version and runs `npm publish --dry-run` for each. This is the same code path as the real publish minus the registry write, so a failure here means the real publish would also fail.
-5. **npm publish** — authenticates via GitHub Actions OIDC (`permissions: id-token: write`), then runs `npm publish --provenance --access public` for the three native packages and the wrapper. Each published tarball gets a provenance attestation linking it to this exact workflow run and commit SHA, visible on each package's npm page.
+5. **npm publish** — authenticates via GitHub Actions OIDC (`permissions: id-token: write`), then runs `npm publish --provenance --access public` for the four native packages and the wrapper. Each published tarball gets a provenance attestation linking it to this exact workflow run and commit SHA, visible on each package's npm page.
 
 ### Postflight
 
 ```sh
 npm view @opencoven/cli version dist-tags
 npm view @opencoven/cli-macos version dist-tags
+npm view @opencoven/cli-macos-x64 version dist-tags
 npm view @opencoven/cli-linux-x64 version dist-tags
 npm view @opencoven/cli-windows version dist-tags
 ```
 
-All four should now show the tag's version as `latest`. The package pages on npmjs.com should display a **"Provenance"** badge with a link back to the GitHub Actions run.
+All five should now show the tag's version as `latest`. The package pages on npmjs.com should display a **"Provenance"** badge with a link back to the GitHub Actions run.
 
 Create or update the matching GitHub Release from the successful workflow artifacts. Package the downloaded binaries with the same public asset names as prior releases:
 
 - `coven-vX.Y.Z-macos-aarch64.tar.gz`
+- `coven-vX.Y.Z-macos-x64.tar.gz`
 - `coven-vX.Y.Z-linux-x64.tar.gz`
 - `coven-vX.Y.Z-windows-x64.zip`
 - `SHA256SUMS`
@@ -108,24 +111,25 @@ If publishing stopped after Linux and Windows succeeded but before macOS and the
 
 ### Recover a partial npm publication
 
-The recovery path exists for one exact registry state:
+The recovery path exists only for one exact registry state per supported historical native-package set:
 
 - `@opencoven/cli-linux-x64@X.Y.Z` and `@opencoven/cli-windows@X.Y.Z` already exist.
 - `@opencoven/cli-macos@X.Y.Z` and `@opencoven/cli@X.Y.Z` do not exist.
+- If the original release wrapper declares the post-Intel set, `@opencoven/cli-macos-x64@X.Y.Z` also does not exist. The workflow rejects incomplete, unexpected, or mixed package sets.
 
-Fix the trusted-publisher configuration and land the release-only workflow repair on `main`. Then create a **new signed recovery tag** whose commit descends from the original release. The workflow requires that the original release tag is an ancestor and that every intervening changed path is on its release-only allowlist.
+Fix the trusted-publisher configuration on a temporary recovery branch created from the original release tag. Then create a **new signed recovery tag** whose commit descends from that tag. The workflow requires the original tag to be an ancestor and every intervening changed path to be on its release-only allowlist; unlike normal releases, recovery tags do not need to include unrelated later `main` commits.
 
 ```sh
-git fetch origin main --tags
-git checkout main
-git pull --ff-only origin main
+git fetch origin --tags
+git switch -c release/vX.Y.Z-recovery.N vX.Y.Z
+# Cherry-pick only the reviewed release-recovery fixes; do not merge main.
 git tag -s vX.Y.Z-recovery.N -m "Recover partial vX.Y.Z npm publication"
-git push origin vX.Y.Z-recovery.N
+git push origin release/vX.Y.Z-recovery.N vX.Y.Z-recovery.N
 ```
 
 Never move or reuse the original release tag or a recovery tag. Increment `N` if a later, separately-reviewed recovery attempt is required.
 
-Before publishing, the recovery workflow verifies both signed tags, ancestry, the changed-path allowlist, and the exact npm registry state above. It then skips the already-published Linux and Windows packages and publishes macOS followed by the wrapper through OIDC with provenance.
+Before publishing, the recovery workflow verifies both signed tags, ancestry, the changed-path allowlist, the original wrapper's complete package set, and the exact npm registry state above. It then skips the already-published Linux and Windows packages and publishes the missing macOS package or packages before the wrapper through OIDC with provenance.
 
 ## Recovering from a refused release
 
@@ -162,10 +166,11 @@ The new workflow does not expose a manual publish path. If you ever need to publ
 2. Build the native binaries:
    ```sh
    cargo build --release --target aarch64-apple-darwin
+   cargo build --release --target x86_64-apple-darwin
    cargo build --release --target x86_64-unknown-linux-gnu
    cargo build --release --target x86_64-pc-windows-msvc
    ```
-3. Authenticate to npm with a freshly issued, narrowly-scoped granular token that covers all four packages (delete it immediately after).
+3. Authenticate to npm with a freshly issued, narrowly-scoped granular token that covers all five packages (delete it immediately after).
 4. Run `scripts/publish-npm.mjs --publish` for each target with `COVEN_NPM_VERSION` set to the tag version. The script's fallback path accepts `NPM_TOKEN` / `NODE_AUTH_TOKEN` when OIDC is not detected.
 5. Publish the wrapper last, after all native packages are live, so users do not see a wrapper that points at native packages that don't yet exist at that version.
 6. Revoke the temporary token.

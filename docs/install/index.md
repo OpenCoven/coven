@@ -34,6 +34,7 @@ coven run claude "describe this repo"
 | Environment | Recommended path | Notes |
 | --- | --- | --- |
 | macOS Apple Silicon | [npm wrapper](/install/npm) or [macOS install](/install/macos) | Uses the universal `@opencoven/cli` package and the native macOS package. |
+| Intel macOS x64 | [npm wrapper](/install/npm) or [macOS install](/install/macos) | Uses the universal `@opencoven/cli` package and the Intel native macOS package. |
 | glibc-based Linux x64 | [npm wrapper](/install/npm) or [Linux install](/install/linux) | Alpine/musl is not part of the npm binary target today; build from source there. |
 | Windows x64 | [Windows install](/install/windows) | Run Coven and harness CLIs from the same PowerShell, Windows Terminal, or native Windows shell. |
 | WSL2 | [WSL2 install](/install/wsl2) | Treat WSL2 as a Linux environment and keep `COVEN_HOME` on the WSL filesystem. |

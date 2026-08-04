@@ -40,6 +40,7 @@ available.
 | Platform | Native package |
 | --- | --- |
 | macOS Apple Silicon | `@opencoven/cli-macos` |
+| Intel macOS x64 | `@opencoven/cli-macos-x64` |
 | glibc-based Linux x64 | `@opencoven/cli-linux-x64` |
 | Windows x64 | `@opencoven/cli-windows` |
 

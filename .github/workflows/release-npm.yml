@@ -56,6 +56,7 @@ jobs:
       release_mode: ${{ steps.release-context.outputs.release_mode }}
       release_tag: ${{ steps.release-context.outputs.release_tag }}
       npm_version: ${{ steps.release-context.outputs.npm_version }}
+      native_package_set: ${{ steps.recovery-contract.outputs.native_package_set || 'post-intel' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6.0.0
         with:
@@ -63,7 +64,7 @@ jobs:
       - name: Derive stable or recovery release context
         id: release-context
         run: node scripts/release-npm-context.mjs "$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
-      - name: Confirm tag is annotated, signer-authorized, and points to main
+      - name: Confirm tag is annotated and signer-authorized
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_RELEASE_ALLOWED_SIGNERS: ${{ vars.NPM_RELEASE_ALLOWED_SIGNERS }}
@@ -115,12 +116,12 @@ jobs:
             exit 1
           fi
           printf '%s\n' "$verify_output"
-          git fetch --no-tags origin main
-          if ! git merge-base --is-ancestor "$TAGGED_COMMIT_SHA" origin/main; then
-            echo "::error::Refusing release: tagged commit $TAGGED_COMMIT_SHA is not contained in origin/main."
-            exit 1
-          fi
           if [ "$RELEASE_MODE" != "recovery" ]; then
+            git fetch --no-tags origin main
+            if ! git merge-base --is-ancestor "$TAGGED_COMMIT_SHA" origin/main; then
+              echo "::error::Refusing release: tagged commit $TAGGED_COMMIT_SHA is not contained in origin/main."
+              exit 1
+            fi
             exit 0
           fi
           if ! BASE_TAG_OBJECT_SHA=$(git rev-parse "$RELEASE_TAG^{tag}" 2>/dev/null); then
@@ -154,6 +155,8 @@ jobs:
             case "$changed_path" in
               .github/workflows/release-npm.yml|\
               scripts/release-npm-context.mjs|\
+              scripts/release-npm-recovery-contract.mjs|\
+              scripts/publish-npm.mjs|\
               scripts/publish-npm-test.mjs|\
               docs/reference/releasing.md|\
               docs/superpowers/specs/2026-08-01-release-partial-publish-recovery-design.md|\
@@ -165,6 +168,15 @@ jobs:
                 ;;
             esac
           done < <(git diff --name-only "$BASE_COMMIT_SHA..$TAGGED_COMMIT_SHA")
+      - name: Verify recovery package contract
+        id: recovery-contract
+        if: steps.release-context.outputs.release_mode == 'recovery'
+        env:
+          RELEASE_TAG: ${{ steps.release-context.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          BASE_COMMIT_SHA=$(git rev-parse "$RELEASE_TAG^{}")
+          node scripts/release-npm-recovery-contract.mjs "$BASE_COMMIT_SHA" >> "$GITHUB_OUTPUT"
 
   build-platform:
     name: Build ${{ matrix.npm-target }}
@@ -179,6 +191,10 @@ jobs:
           - npm-target: macos
             rust-target: aarch64-apple-darwin
             runner: macos-26
+            binary: coven
+          - npm-target: macos-x64
+            rust-target: x86_64-apple-darwin
+            runner: macos-15-intel
             binary: coven
           - npm-target: linux-x64
             rust-target: x86_64-unknown-linux-gnu
@@ -221,6 +237,11 @@ jobs:
       - run: chmod +x target/aarch64-apple-darwin/release/coven
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.0
         with:
+          name: coven-macos-x64
+          path: target/x86_64-apple-darwin/release
+      - run: chmod +x target/x86_64-apple-darwin/release/coven
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.0
+        with:
           name: coven-linux-x64
           path: target/x86_64-unknown-linux-gnu/release
       - run: chmod +x target/x86_64-unknown-linux-gnu/release/coven
@@ -228,7 +249,11 @@ jobs:
         with:
           name: coven-windows
           path: target/x86_64-pc-windows-msvc/release
-      - run: node scripts/publish-npm.mjs --target=macos --skip-build --dry-run
+      - run: node scripts/publish-npm.mjs --target=macos --skip-build --dry-run --skip-wrapper
+        env:
+          COVEN_NPM_VERSION: ${{ needs.verify-tag.outputs.npm_version }}
+      - run: node scripts/publish-npm.mjs --target=macos-x64 --skip-build --dry-run --skip-wrapper
+        if: needs.verify-tag.outputs.release_mode == 'normal' || needs.verify-tag.outputs.native_package_set == 'post-intel'
         env:
           COVEN_NPM_VERSION: ${{ needs.verify-tag.outputs.npm_version }}
       - run: node scripts/publish-npm.mjs --target=linux-x64 --skip-build --dry-run --skip-wrapper
@@ -239,6 +264,10 @@ jobs:
         if: needs.verify-tag.outputs.release_mode == 'normal'
         env:
           COVEN_NPM_VERSION: ${{ needs.verify-tag.outputs.npm_version }}
+      - run: node scripts/publish-npm.mjs --wrapper-only --dry-run
+        env:
+          COVEN_NPM_VERSION: ${{ needs.verify-tag.outputs.npm_version }}
+          COVEN_NPM_NATIVE_PACKAGE_SET: ${{ needs.verify-tag.outputs.native_package_set }}
 
   npm-publish:
     name: npm publish
@@ -263,6 +292,11 @@ jobs:
       - run: chmod +x target/aarch64-apple-darwin/release/coven
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.0
         with:
+          name: coven-macos-x64
+          path: target/x86_64-apple-darwin/release
+      - run: chmod +x target/x86_64-apple-darwin/release/coven
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.0
+        with:
           name: coven-linux-x64
           path: target/x86_64-unknown-linux-gnu/release
       - run: chmod +x target/x86_64-unknown-linux-gnu/release/coven
@@ -283,6 +317,7 @@ jobs:
         if: needs.verify-tag.outputs.release_mode == 'recovery'
         env:
           NPM_VERSION: ${{ needs.verify-tag.outputs.npm_version }}
+          NATIVE_PACKAGE_SET: ${{ needs.verify-tag.outputs.native_package_set }}
         run: |
           set -euo pipefail
           expect_published() {
@@ -310,6 +345,12 @@ jobs:
           expect_published @opencoven/cli-linux-x64
           expect_published @opencoven/cli-windows
           expect_missing @opencoven/cli-macos
+          if [ "${NATIVE_PACKAGE_SET:?}" = "post-intel" ]; then
+            expect_missing @opencoven/cli-macos-x64
+          elif [ "$NATIVE_PACKAGE_SET" != "pre-intel" ]; then
+            echo "::error::Unsupported recovery native package set $NATIVE_PACKAGE_SET."
+            exit 1
+          fi
           expect_missing @opencoven/cli
       - run: node scripts/publish-npm.mjs --target=linux-x64 --skip-build --publish --skip-wrapper
         if: needs.verify-tag.outputs.release_mode == 'normal'
@@ -319,6 +360,14 @@ jobs:
         if: needs.verify-tag.outputs.release_mode == 'normal'
         env:
           COVEN_NPM_VERSION: ${{ needs.verify-tag.outputs.npm_version }}
-      - run: node scripts/publish-npm.mjs --target=macos --skip-build --publish
+      - run: node scripts/publish-npm.mjs --target=macos-x64 --skip-build --publish --skip-wrapper
+        if: needs.verify-tag.outputs.release_mode == 'normal' || needs.verify-tag.outputs.native_package_set == 'post-intel'
         env:
           COVEN_NPM_VERSION: ${{ needs.verify-tag.outputs.npm_version }}
+      - run: node scripts/publish-npm.mjs --target=macos --skip-build --publish --skip-wrapper
+        env:
+          COVEN_NPM_VERSION: ${{ needs.verify-tag.outputs.npm_version }}
+      - run: node scripts/publish-npm.mjs --wrapper-only --publish
+        env:
+          COVEN_NPM_VERSION: ${{ needs.verify-tag.outputs.npm_version }}
+          COVEN_NPM_NATIVE_PACKAGE_SET: ${{ needs.verify-tag.outputs.native_package_set }}

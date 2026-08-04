@@ -18,6 +18,13 @@ const targets = {
     rustTarget: 'aarch64-apple-darwin',
     binaryName: 'coven'
   },
+  'macos-x64': {
+    packageName: '@opencoven/cli-macos-x64',
+    os: 'darwin',
+    cpu: 'x64',
+    rustTarget: 'x86_64-apple-darwin',
+    binaryName: 'coven'
+  },
   'linux-x64': {
     packageName: '@opencoven/cli-linux-x64',
     os: 'linux',
@@ -32,6 +39,11 @@ const targets = {
     rustTarget: 'x86_64-pc-windows-msvc',
     binaryName: 'coven.exe'
   }
+};
+
+const nativePackageSets = {
+  'pre-intel': ['macos', 'linux-x64', 'windows'],
+  'post-intel': ['macos', 'macos-x64', 'linux-x64', 'windows']
 };
 
 if (isMainModule()) {
@@ -54,41 +66,50 @@ function main() {
   const dryRun = args.has('--dry-run') || !args.has('--publish');
   const skipBuild = args.has('--skip-build');
   const skipWrapper = args.has('--skip-wrapper');
+  const wrapperOnly = args.has('--wrapper-only');
   const version = releaseVersion(process.env, wrapperPackageVersion());
   const target = targets[targetName];
 
-  if (!target) {
+  if (wrapperOnly && skipWrapper) {
+    fail('--wrapper-only and --skip-wrapper cannot be used together');
+  }
+  if (!wrapperOnly && !target) {
     fail(`Unsupported npm target ${targetName}. Known targets: ${Object.keys(targets).join(', ')}`);
   }
 
   validatePublishVersion(version, dryRun);
   validatePublishToken(process.env, dryRun);
 
-  if (!skipBuild) {
-    run('cargo', ['build', '--release', '--target', target.rustTarget]);
-  }
-
-  const binaryPath = path.join(repoRoot, 'target', target.rustTarget, 'release', target.binaryName);
-  if (!existsSync(binaryPath)) {
-    fail(`Built binary not found at ${binaryPath}`);
-  }
-
   rmSync(distRoot, { recursive: true, force: true });
   mkdirSync(distRoot, { recursive: true });
 
-  const platformDir = writePlatformPackage(targetName, target, binaryPath, version);
+  if (!wrapperOnly) {
+    if (!skipBuild) {
+      run('cargo', ['build', '--release', '--target', target.rustTarget]);
+    }
 
-  publishPackage(target.packageName, version, dryRun, platformDir);
+    const binaryPath = path.join(repoRoot, 'target', target.rustTarget, 'release', target.binaryName);
+    if (!existsSync(binaryPath)) {
+      fail(`Built binary not found at ${binaryPath}`);
+    }
+
+    const platformDir = writePlatformPackage(targetName, target, binaryPath, version);
+    publishPackage(target.packageName, version, dryRun, platformDir);
+  }
 
   if (!skipWrapper) {
     for (const packageName of wrapperPackageNames) {
-      const wrapperDir = writeWrapperPackage(version, packageName);
+      const wrapperDir = writeWrapperPackage(version, packageName, nativeTargetNamesForPackageSet());
       publishPackage(packageName, version, dryRun, wrapperDir);
     }
   }
 
   console.log(`Prepared npm packages in ${distRoot}`);
-  console.log(`${dryRun ? 'Dry-run completed' : 'Publish completed'} for ${target.packageName}${skipWrapper ? '' : ` and ${wrapperPackageNames.join(', ')}`} at version ${version}.`);
+  const publishedNames = [
+    ...(wrapperOnly ? [] : [target.packageName]),
+    ...(skipWrapper ? [] : wrapperPackageNames)
+  ];
+  console.log(`${dryRun ? 'Dry-run completed' : 'Publish completed'} for ${publishedNames.join(', ')} at version ${version}.`);
 }
 
 function publishPackage(packageName, version, dryRun, cwd) {
@@ -140,7 +161,7 @@ function writePlatformPackage(targetName, target, binaryPath, version) {
   return outDir;
 }
 
-function writeWrapperPackage(version, packageName = primaryWrapperPackageName) {
+function writeWrapperPackage(version, packageName = primaryWrapperPackageName, nativeTargetNames = nativeTargetNamesForPackageSet()) {
   const outDir = path.join(distRoot, wrapperPackageDirName(packageName));
   cpSync(path.join(repoRoot, 'npm', 'coven'), outDir, { recursive: true });
   const packagePath = path.join(outDir, 'package.json');
@@ -149,7 +170,12 @@ function writeWrapperPackage(version, packageName = primaryWrapperPackageName) {
   packageJson.version = version;
   for (const optionalName of Object.keys(packageJson.optionalDependencies)) {
     if (optionalName.startsWith('@opencoven/cli-')) {
-      packageJson.optionalDependencies[optionalName] = version;
+      const targetName = Object.entries(targets).find(([, target]) => target.packageName === optionalName)?.[0];
+      if (targetName && !nativeTargetNames.includes(targetName)) {
+        delete packageJson.optionalDependencies[optionalName];
+      } else {
+        packageJson.optionalDependencies[optionalName] = version;
+      }
     }
   }
   writeFileSync(packagePath, `${JSON.stringify(packageJson, null, 2)}\n`);
@@ -186,6 +212,14 @@ export function targetPackageName(targetName) {
   return targets[targetName]?.packageName;
 }
 
+export function nativeTargetNamesForPackageSet(packageSet = process.env.COVEN_NPM_NATIVE_PACKAGE_SET ?? 'post-intel') {
+  const targetNames = nativePackageSets[packageSet];
+  if (!targetNames) {
+    throw new Error(`Unsupported native package set ${packageSet}. Known sets: ${Object.keys(nativePackageSets).join(', ')}`);
+  }
+  return [...targetNames];
+}
+
 export function wrapperPackageNameList() {
   return [...wrapperPackageNames];
 }
@@ -197,6 +231,9 @@ export function wrapperPackageDirName(packageName) {
 export function defaultTargetName(platform, arch) {
   if (platform === 'darwin' && arch === 'arm64') {
     return 'macos';
+  }
+  if (platform === 'darwin' && arch === 'x64') {
+    return 'macos-x64';
   }
   if (platform === 'win32' && arch === 'x64') {
     return 'windows';
@@ -212,9 +249,13 @@ if ('NODE_TEST_CONTEXT' in process.env) {
     assert.strictEqual(defaultTargetName('darwin', 'arm64'), 'macos');
   });
 
+  test('defaultTargetName maps darwin x64 to macos-x64', () => {
+    assert.strictEqual(defaultTargetName('darwin', 'x64'), 'macos-x64');
+  });
+
   test('defaultTargetName falls back to platform-arch for non-special cases', () => {
     assert.strictEqual(defaultTargetName('linux', 'x64'), 'linux-x64');
-    assert.strictEqual(defaultTargetName('darwin', 'x64'), 'darwin-x64');
+    assert.strictEqual(defaultTargetName('freebsd', 'x64'), 'freebsd-x64');
   });
 
   test('defaultTargetName maps win32 x64 to windows', () => {

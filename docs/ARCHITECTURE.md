@@ -197,6 +197,7 @@ The npm wrapper packages are live for early adopters:
 
 - `@opencoven/cli`
 - `@opencoven/cli-macos`
+- `@opencoven/cli-macos-x64`
 - `@opencoven/cli-linux-x64`
 - `@opencoven/cli-windows` once the next Windows-enabled release is published
 

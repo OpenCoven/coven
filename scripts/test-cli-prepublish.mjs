@@ -13,7 +13,7 @@
 //      is resolved, executable, and can start the daemon with isolated state.
 //
 // Flags:
-//   --target=<name>       Override the npm target (macos, linux-x64, windows).
+//   --target=<name>       Override the npm target (macos, macos-x64, linux-x64, windows).
 //                         Defaults to the local platform.
 //   --dashboard-tarball=<path>
 //                         Install a locally packed dashboard companion and
@@ -48,6 +48,7 @@ const DEFAULT_COMMAND_TIMEOUT_MS = 120_000;
 
 const PLATFORM_TARGETS = {
   macos: { packageName: '@opencoven/cli-macos', binaryName: 'coven' },
+  'macos-x64': { packageName: '@opencoven/cli-macos-x64', binaryName: 'coven' },
   'linux-x64': { packageName: '@opencoven/cli-linux-x64', binaryName: 'coven' },
   windows: { packageName: '@opencoven/cli-windows', binaryName: 'coven.exe' }
 };

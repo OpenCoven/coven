@@ -8,7 +8,7 @@ description: "Reference for the coven CLI commands: doctor, status, reset, daemo
 ---
 
 
-The user-facing command is always `coven`. Wrapper packages like `@opencoven/cli`, `@opencoven/cli-macos`, and `@opencoven/cli-linux-x64` install the same binary.
+The user-facing command is always `coven`. Wrapper packages like `@opencoven/cli`, `@opencoven/cli-macos`, `@opencoven/cli-macos-x64`, and `@opencoven/cli-linux-x64` install the same binary.
 
 ```mermaid
 flowchart TB

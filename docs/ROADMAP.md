@@ -101,6 +101,7 @@ Shipped:
 - Published npm wrapper packages:
   - `@opencoven/cli`
   - `@opencoven/cli-macos`
+  - `@opencoven/cli-macos-x64`
   - `@opencoven/cli-linux-x64`
 - External OpenClaw bridge package kept outside OpenClaw core as an advanced compatibility path.
 - Architecture, operational model, product spec, brand docs, and MVP plan.

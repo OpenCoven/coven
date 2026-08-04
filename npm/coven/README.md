@@ -29,6 +29,7 @@ upgrade instruction while other Coven commands continue to work.
 Current early-adopter packages target:
 
 - `@opencoven/cli-macos` for macOS Apple Silicon
+- `@opencoven/cli-macos-x64` for Intel macOS x64
 - `@opencoven/cli-linux-x64` for glibc-based Linux x64 distributions
 - `@opencoven/cli-windows` for Windows x64
 

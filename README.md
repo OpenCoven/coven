@@ -168,6 +168,7 @@ dashboard requires Node.js 24 or newer; on an older runtime, only
 | -------------------------- | ---------------------------------------------- |
 | `@opencoven/cli`           | Universal wrapper — auto-selects your platform |
 | `@opencoven/cli-macos`     | macOS Apple Silicon                            |
+| `@opencoven/cli-macos-x64` | macOS Intel x64                                |
 | `@opencoven/cli-linux-x64` | Linux x64                                      |
 | `@opencoven/cli-windows`   | Windows x64                                    |
 | `@opencoven/coven-memory-dashboard` | Optional loopback memory dashboard companion |

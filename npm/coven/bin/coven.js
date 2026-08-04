@@ -7,6 +7,7 @@ const require = createRequire(import.meta.url);
 
 const PLATFORM_PACKAGES = {
   'darwin-arm64': '@opencoven/cli-macos',
+  'darwin-x64': '@opencoven/cli-macos-x64',
   'linux-x64': '@opencoven/cli-linux-x64',
   'win32-x64': '@opencoven/cli-windows'
 };
@@ -19,7 +20,7 @@ const MEMORY_DASHBOARD_MIN_NODE_MAJOR = 24;
 function resolveBinary() {
   if (!packageName) {
     throw new Error(
-      `Unsupported platform ${platformKey}. Coven v0 publishes native npm packages for macOS Apple Silicon, glibc-based Linux x64, and Windows x64.`
+      `Unsupported platform ${platformKey}. Coven v0 publishes native npm packages for macOS Apple Silicon, Intel macOS x64, glibc-based Linux x64, and Windows x64.`
     );
   }
 
