@@ -206,8 +206,44 @@ fn append_home_surfaces(
     );
     push_path(
         surfaces,
+        "state.executor_node_config",
+        &home.join("executor.json"),
+        source,
+        cwd,
+    );
+    push_path(
+        surfaces,
         "state.exports",
         &home.join("exports"),
+        source,
+        cwd,
+    );
+    push_path(surfaces, "state.memory", &home.join("memory"), source, cwd);
+    push_path(
+        surfaces,
+        "state.pending_proposals",
+        &home.join("pending"),
+        source,
+        cwd,
+    );
+    push_path(
+        surfaces,
+        "state.research",
+        &home.join("research"),
+        source,
+        cwd,
+    );
+    push_path(
+        surfaces,
+        "state.reset_backups",
+        &home.join("reset-backups"),
+        source,
+        cwd,
+    );
+    push_path(
+        surfaces,
+        "state.travel_profiles",
+        &home.join("travel").join("profiles"),
         source,
         cwd,
     );
@@ -217,6 +253,13 @@ fn append_home_surfaces(
         surfaces,
         "logs.redacted_events",
         &home.join(STORE_FILE_NAME),
+        source,
+        cwd,
+    );
+    push_path(
+        surfaces,
+        "logs.daemon_recovery",
+        &crate::daemon::daemon_recovery_log_path(home),
         source,
         cwd,
     );
@@ -265,9 +308,16 @@ fn append_unresolved_home_surfaces(surfaces: &mut Vec<PathSurface>, cwd: &Path) 
         "state.familiar_manifest",
         "state.familiar_workspaces",
         "state.coven_calls",
+        "state.executor_node_config",
         "state.exports",
+        "state.memory",
+        "state.pending_proposals",
+        "state.research",
+        "state.reset_backups",
+        "state.travel_profiles",
         "logs.redacted_events",
         "logs.encrypted_artifacts",
+        "logs.daemon_recovery",
         "dashboard.chat_settings",
         "dashboard.chat_conversations",
     ] {

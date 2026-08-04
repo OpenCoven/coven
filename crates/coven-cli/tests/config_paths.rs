@@ -85,6 +85,26 @@ fn paths_json_is_stable_and_creates_no_profile_state() {
     );
     assert_eq!(surfaces["store.session_ledger"]["status"], "resolved");
     assert_eq!(
+        surfaces["state.executor_node_config"]["path"],
+        coven_home.join("executor.json").display().to_string()
+    );
+    assert_eq!(
+        surfaces["state.pending_proposals"]["path"],
+        coven_home.join("pending").display().to_string()
+    );
+    assert_eq!(
+        surfaces["state.travel_profiles"]["path"],
+        coven_home
+            .join("travel")
+            .join("profiles")
+            .display()
+            .to_string()
+    );
+    assert_eq!(
+        surfaces["logs.daemon_recovery"]["path"],
+        coven_home.join("daemon-recovery.log").display().to_string()
+    );
+    assert_eq!(
         surfaces["engine.managed_cache"]["path"],
         profile_home.join(".coven/engine").display().to_string(),
         "the managed engine cache follows the isolated user home, not COVEN_HOME"
