@@ -9,6 +9,26 @@ description: "Reference for GET /api/v1/health, the Coven daemon liveness endpoi
 Daemon health is the signal that the background process is reachable and using
 the expected socket for the active `COVEN_HOME`.
 
+## Storage health and retention
+
+`GET /api/v1/health` also includes a `storage` object. It reports the SQLite
+database and WAL sizes, free space on the `COVEN_HOME` filesystem, the oldest
+retained event, ages of the last prune and checkpoint, and the event-writer
+backlog. Current direct-write releases report a zero backlog; a later dedicated
+writer preserves the same fields.
+
+The daemon runs retention in small background transactions after startup. It
+uses the configured raw-artifact and redacted-event retention windows, never
+runs `VACUUM` automatically, and uses a non-blocking WAL checkpoint only after
+the WAL reaches its maintenance threshold. If free disk falls below 256 MiB,
+maintenance is blocked rather than creating more WAL pressure; `storage.status`
+becomes `critical` and `maintenanceBlocked` is true so an operator can free
+space before retrying. `coven vacuum` remains the explicit repair/compaction
+operation.
+
+Recovery logging is rotated at 4 MiB with three retained archives
+(`daemon-recovery.log.1` through `.3`).
+
 Use:
 
 ```sh

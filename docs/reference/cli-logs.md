@@ -11,6 +11,13 @@ Session events are stored redacted; sensitive raw artifacts are kept
 separately with a short retention window. `coven logs prune` applies both
 retention windows to the local store.
 
+When the daemon is running, the same windows are also applied automatically in
+small background transactions. The scheduled path never runs `VACUUM`; use
+[`coven vacuum`](cli-vacuum.md) when an operator explicitly wants FTS rebuild
+and database compaction. If the `COVEN_HOME` filesystem has less than 256 MiB
+free, scheduled maintenance pauses and reports the pressure through
+`GET /api/v1/health` instead of adding WAL writes on an exhausted filesystem.
+
 ```sh
 coven logs prune --dry-run     # report what would be pruned
 coven logs prune               # prune expired rows

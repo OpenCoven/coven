@@ -154,6 +154,11 @@ pub struct HealthResponse {
     /// paths that do not have a live runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_writer: Option<crate::event_writer::EventWriterHealth>,
+    /// Local SQLite pressure and bounded-maintenance state. This remains
+    /// present when collection fails so health consumers can distinguish a
+    /// storage problem from a daemon that is simply not running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<store::StorageHealth>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -270,6 +275,7 @@ pub fn health_response(daemon: Option<DaemonStatus>) -> HealthResponse {
         daemon,
         hub: None,
         event_writer: None,
+        storage: None,
     }
 }
 
@@ -283,6 +289,10 @@ fn health_response_with_hub(
     if let Ok(summary) = crate::hub::hub_health_summary(coven_home) {
         response.hub = serde_json::from_value(summary).ok();
     }
+    response.storage = Some(
+        store::storage_health(coven_home)
+            .unwrap_or_else(|error| store::unavailable_storage_health(error)),
+    );
     response
 }
 
@@ -6726,6 +6736,7 @@ mod tests {
         assert!(response.capabilities.structured_errors);
         assert_eq!(response.daemon, None);
         assert_eq!(response.hub, None);
+        assert_eq!(response.storage, None);
     }
 
     #[test]
@@ -6755,6 +6766,9 @@ mod tests {
         assert!(response.body.contains(r#""executorDispatch":true"#));
         assert!(response.body.contains(r#""role":"hub""#));
         assert!(response.body.contains(r#""structuredErrors":true"#));
+        assert!(response.body.contains(r#""storage":{"status""#));
+        assert!(response.body.contains(r#""writerBacklogEvents":0"#));
+        assert!(response.body.contains(r#""freeDiskBytes""#));
         Ok(())
     }
 
