@@ -96,6 +96,10 @@ fn paths_json_is_stable_and_creates_no_profile_state() {
         coven_home.join("executor.json").display().to_string()
     );
     assert_eq!(
+        surfaces["state.skills"]["path"],
+        coven_home.join("skills").display().to_string()
+    );
+    assert_eq!(
         surfaces["state.shared_lock"]["path"],
         coven_home.join("state.lock").display().to_string()
     );

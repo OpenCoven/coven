@@ -56,12 +56,12 @@ later write the location.
 
 The report covers the Coven home, session ledger, repository registry,
 privacy policy, trusted and external adapter roots, settings, managed and
-resolved engine locations, mobile and daemon state, familiar state, call,
-executor, export, memory, proposal, research, reset-backup, and travel state,
-the profile and daemon coordination locks, the pending reset marker, the daemon
-recovery log, and the Chat dashboard state. Redacted events and encrypted
-artifacts are both stored in the session ledger, so their distinct IDs can
-legitimately point to the same SQLite file.
+resolved engine locations, mobile and daemon state, familiar state, skills,
+call, executor, export, memory, proposal, research, reset-backup, and travel
+state, the profile and daemon coordination locks, the pending reset marker, the
+daemon recovery log, and the Chat dashboard state. Redacted events and
+encrypted artifacts are both stored in the session ledger, so their distinct
+IDs can legitimately point to the same SQLite file.
 
 The optional Memory dashboard is a separately installed process without a
 Coven-owned state-path contract. It is reported as `unsupported` rather than

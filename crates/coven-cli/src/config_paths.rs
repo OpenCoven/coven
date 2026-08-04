@@ -231,6 +231,7 @@ fn append_home_surfaces(
         source,
         cwd,
     );
+    push_path(surfaces, "state.skills", &home.join("skills"), source, cwd);
     push_path(
         surfaces,
         "state.coven_calls",
@@ -345,6 +346,7 @@ fn append_unresolved_home_surfaces(surfaces: &mut Vec<PathSurface>, cwd: &Path) 
         "state.daemon_ipc",
         "state.familiar_manifest",
         "state.familiar_workspaces",
+        "state.skills",
         "state.coven_calls",
         "state.executor_node_config",
         "state.exports",
