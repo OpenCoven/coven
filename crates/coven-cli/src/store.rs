@@ -3445,13 +3445,18 @@ pub fn run_scheduled_maintenance(
 ) -> Result<ScheduledMaintenanceReport> {
     let free_disk_bytes = fs2::available_space(coven_home)
         .with_context(|| format!("failed to inspect free disk for {}", coven_home.display()))?;
+    run_scheduled_maintenance_with_free_disk(coven_home, now, free_disk_bytes)
+}
+
+fn run_scheduled_maintenance_with_free_disk(
+    coven_home: &Path,
+    now: &str,
+    free_disk_bytes: u64,
+) -> Result<ScheduledMaintenanceReport> {
     if free_disk_bytes < MAINTENANCE_MIN_FREE_DISK_BYTES {
-        let conn = open_store(&coven_home.join("coven.sqlite3"))?;
-        set_store_meta(
-            &conn,
-            MAINTENANCE_LAST_ERROR_KEY,
-            "maintenance blocked: free disk below safety watermark",
-        )?;
+        // Do not record this in SQLite: opening a write transaction here would
+        // add WAL pressure precisely when the watermark is meant to prevent it.
+        // `storage_health` derives the blocked state from free disk directly.
         return Ok(ScheduledMaintenanceReport {
             raw_artifacts_pruned: 0,
             events_pruned: 0,
@@ -4902,6 +4907,27 @@ mod tests {
         assert_eq!(health.oldest_retained_event_at, None);
         assert_eq!(health.writer_backlog_events, 0);
         assert_eq!(health.writer_backlog_bytes, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn scheduled_maintenance_below_watermark_does_not_open_or_write_the_store() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let home = temp_dir.path();
+
+        let report = run_scheduled_maintenance_with_free_disk(
+            home,
+            "2026-04-27T06:00:00Z",
+            MAINTENANCE_MIN_FREE_DISK_BYTES - 1,
+        )?;
+
+        assert!(report.blocked_by_free_disk);
+        assert_eq!(report.events_pruned, 0);
+        assert_eq!(report.raw_artifacts_pruned, 0);
+        assert!(
+            !home.join("coven.sqlite3").exists(),
+            "the safety path must not create a database or WAL writes"
+        );
         Ok(())
     }
 

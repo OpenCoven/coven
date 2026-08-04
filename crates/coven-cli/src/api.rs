@@ -289,10 +289,8 @@ fn health_response_with_hub(
     if let Ok(summary) = crate::hub::hub_health_summary(coven_home) {
         response.hub = serde_json::from_value(summary).ok();
     }
-    response.storage = Some(
-        store::storage_health(coven_home)
-            .unwrap_or_else(|error| store::unavailable_storage_health(error)),
-    );
+    response.storage =
+        Some(store::storage_health(coven_home).unwrap_or_else(store::unavailable_storage_health));
     response
 }
 
