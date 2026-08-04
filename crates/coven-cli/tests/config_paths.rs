@@ -54,8 +54,15 @@ fn surfaces(report: &Value) -> BTreeMap<&str, &Value> {
 #[test]
 fn paths_json_is_stable_and_creates_no_profile_state() {
     let temp = TempDir::new().expect("temporary directory");
-    let profile_home = temp.path().join("profile");
     let coven_home = temp.path().join("isolated-coven-home");
+
+    #[cfg(not(windows))]
+    let expected_managed_engine_root = temp.path().join("profile").join(".coven").join("engine");
+    #[cfg(windows)]
+    let expected_managed_engine_root = dirs_next::home_dir()
+        .expect("platform user home")
+        .join(".coven")
+        .join("engine");
 
     let first = run_paths(&temp, &coven_home, &[]);
     let second = run_paths(&temp, &coven_home, &[]);
@@ -106,12 +113,18 @@ fn paths_json_is_stable_and_creates_no_profile_state() {
     );
     assert_eq!(
         surfaces["engine.managed_cache"]["path"],
-        profile_home.join(".coven/engine").display().to_string(),
-        "the managed engine cache follows the isolated user home, not COVEN_HOME"
+        expected_managed_engine_root.display().to_string(),
+        "the managed engine cache follows the platform user home, not COVEN_HOME"
     );
+    #[cfg(unix)]
     assert_eq!(
         surfaces["engine.managed_cache"]["source"], "environment",
         "the managed engine cache inherits the isolated HOME override"
+    );
+    #[cfg(windows)]
+    assert_eq!(
+        surfaces["engine.managed_cache"]["source"], "default",
+        "Windows uses the native profile resolver rather than HOME or USERPROFILE"
     );
     assert_eq!(
         surfaces["engine.resolved_binary"]["status"], "not_applicable",
@@ -187,7 +200,9 @@ fn paths_json_prefers_environment_roots_without_reading_secret_contents() {
     assert_eq!(
         surfaces["settings.user"]["path"],
         temp.path()
-            .join("xdg-config/coven/settings.json")
+            .join("xdg-config")
+            .join("coven")
+            .join("settings.json")
             .display()
             .to_string()
     );

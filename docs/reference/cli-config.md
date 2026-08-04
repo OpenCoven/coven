@@ -71,8 +71,10 @@ guessing a location.
 `COVEN_HOME` selects the Coven store root, but it does not move every
 per-user location. Settings follow `XDG_CONFIG_HOME` (or the platform config
 default), and the managed engine cache follows the user home directory by
-design. Isolated runners should set `COVEN_HOME`, `XDG_CONFIG_HOME`, and an
-appropriate user-home environment, then verify the resulting report.
+design. Isolated runners should set `COVEN_HOME`, `XDG_CONFIG_HOME`, and any
+user-home override honored by their platform, then verify the resulting
+report. On Windows, the native profile resolver can continue to select the OS
+account profile, so `COVEN_HOME` alone does not isolate the managed cache.
 
 The command reports paths only. It never serializes the contents of settings,
 privacy, adapter manifests, or the session ledger.
