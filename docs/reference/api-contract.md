@@ -65,7 +65,8 @@ GET /api/v1/health
     "hub": true,
     "executorDispatch": true,
     "eventCursor": "sequence",
-    "structuredErrors": true
+    "structuredErrors": true,
+    "sessionHandoff": true
   },
   "daemon": { "pid": 12345, "startedAt": "2026-07-14T12:00:00Z", "socket": "<covenHome>/coven.sock" }
 }

@@ -70,7 +70,8 @@ Event payloads returned by `/events`, `/sessions/:id/events`, and `/sessions/:id
     "hub": true,
     "executorDispatch": true,
     "eventCursor": "sequence",
-    "structuredErrors": true
+    "structuredErrors": true,
+    "sessionHandoff": true
   },
   "daemon": {
     "pid": 12345,

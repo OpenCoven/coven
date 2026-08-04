@@ -1,7 +1,25 @@
 # Coven Handoff Packet — TECH
 
-**Status:** Draft v1 · 2026-05-26
+**Status:** Implemented daemon contract · 2026-08-04
 **Companion to:** [PRODUCT.md](./PRODUCT.md)
+
+## Implemented ownership contract
+
+The daemon implementation adds a durable handoff state machine around this
+packet: `offered → claimed → acknowledged → continued`. Claiming is a
+generation compare-and-swap, is idempotent for the same claimant and key, and
+fences source input. Claim and acknowledgement reject when the source event
+cursor changed; claim also rejects when the portable Git workspace snapshot
+(hashed origin identity, commit, branch, dirty state, and paths) differs.
+
+The authoritative route shapes and error codes are in
+[Session handoff](../../docs/daemon/session-handoff.md). That document
+supersedes the earlier API, CLI, artifact, TCP, and automatic-fallback
+proposals below, which remain design history rather than implemented behavior.
+Packets are returned only inside a fixed **untrusted-context** prompt prelude;
+they are never system messages or privileged instructions. The API remains
+local-Unix-socket-only: a companion requires a separately paired authenticated
+transport.
 
 ## Wire schema (`coven.handoff.v1`)
 

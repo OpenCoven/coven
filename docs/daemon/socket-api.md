@@ -32,7 +32,8 @@ GET /api/v1/health
     "hub": true,
     "executorDispatch": true,
     "eventCursor": "sequence",
-    "structuredErrors": true
+    "structuredErrors": true,
+    "sessionHandoff": true
   },
   "daemon": {
     "pid": 31415,
@@ -68,9 +69,19 @@ diagnostic whose literal `v1` values are not proof of named-contract support.
 | `GET /api/v1/memory/:id` | Read validated markdown content for a list id. |
 | `POST /api/v1/sessions/:id/input` | Forward input to a live session. |
 | `POST /api/v1/sessions/:id/kill` | Kill a live session. |
+| `POST /api/v1/sessions/:id/handoffs` | Offer a redacted, generation-fenced handoff. |
+| `GET /api/v1/sessions/:id/handoffs` | Read stored handoff state. |
+| `POST /api/v1/sessions/:id/handoffs/:handoffId/claim` | Claim a handoff generation. |
+| `POST /api/v1/sessions/:id/handoffs/:handoffId/ack` | Acknowledge a quiesced source. |
+| `POST /api/v1/sessions/:id/handoffs/:handoffId/continuations` | Record continuation import. |
 | `POST /api/v1/store/vacuum` | Rebuild the event FTS index and compact the SQLite store. |
 
 Detailed shapes live in the [API reference](/reference/api).
+
+Session handoff is a **local-socket** operation. A companion must use a
+separately paired authenticated transport; exposing these endpoints directly
+to a remote listener would bypass this socket's same-user trust boundary. See
+[Session handoff](/daemon/session-handoff).
 
 Memory path entries must be UTF-8 regular `.md` files; invalid names,
 symlinks, Windows reparse points, non-files/non-directories, and entries that

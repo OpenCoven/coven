@@ -51,7 +51,8 @@ proof of `coven.daemon.v1` support.
     "hub": true,
     "executorDispatch": true,
     "eventCursor": "sequence",
-    "structuredErrors": true
+    "structuredErrors": true,
+    "sessionHandoff": true
   },
   "daemon": {
     "pid": 12345,
@@ -81,6 +82,7 @@ If the daemon metadata is unavailable, `daemon` may be `null`. The `hub` block r
 | `executorDispatch`| boolean | Hub-outbound executor poll/dispatch APIs are available.          |
 | `eventCursor`     | string  | Cursor type supported; `"sequence"` means `afterSeq` is stable.  |
 | `structuredErrors`| boolean | All errors use the `{ error: { code, message, details } }` shape.|
+| `sessionHandoff` | boolean | Durable generation-fenced session handoff routes are available. |
 
 ## Structured error envelope
 

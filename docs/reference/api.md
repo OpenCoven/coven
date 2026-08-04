@@ -22,7 +22,7 @@ flowchart LR
   Root --> Hub["/hub"]
 ```
 
-All error responses use the structured envelope documented in the [API contract](/API-CONTRACT#structured-error-envelope): `{ "error": { "code", "message", "details" } }`. Unknown routes, action ids, and API versions fail closed. Clients negotiate the named `coven.daemon.v1` contract with `GET /api/v1/health`, then check every capability required by the operation. Boolean operation-group flags (`sessions`, `events`, `travel`, `scheduler`, `hub`, `executorDispatch`) are advertised in the health `capabilities` block — treat a group as unavailable unless health advertises it. Capabilities advertise availability and never grant permission.
+All error responses use the structured envelope documented in the [API contract](/API-CONTRACT#structured-error-envelope): `{ "error": { "code", "message", "details" } }`. Unknown routes, action ids, and API versions fail closed. Clients negotiate the named `coven.daemon.v1` contract with `GET /api/v1/health`, then check every capability required by the operation. Boolean operation-group flags (`sessions`, `events`, `travel`, `scheduler`, `hub`, `executorDispatch`, `sessionHandoff`) are advertised in the health `capabilities` block — treat a group as unavailable unless health advertises it. Capabilities advertise availability and never grant permission.
 
 ## Contract and discovery
 
@@ -35,9 +35,9 @@ All error responses use the structured envelope documented in the [API contract]
 | GET | `/api/v1/capabilities/:harness` | One harness's capability manifest (`?refresh=1` re-scans). | manifest object · `404 harness_not_found` |
 | POST | `/api/v1/actions` | Route a known control-plane action id (intent envelope). | `{ ok, accepted, status, event }` · `400 invalid_request` |
 
-The health `capabilities` object currently contains all eight fields:
+The health `capabilities` object currently contains all nine fields:
 `sessions`, `events`, `travel`, `scheduler`, `hub`, `executorDispatch`,
-`eventCursor`, and `structuredErrors`. `daemon` is either `null` or
+`eventCursor`, `structuredErrors`, and `sessionHandoff`. `daemon` is either `null` or
 `{ pid, startedAt, socket }`, where the socket is under
 `<covenHome>/coven.sock`; the optional `hub` field is a control-plane summary.
 
@@ -54,10 +54,20 @@ The health `capabilities` object currently contains all eight fields:
 | GET | `/api/v1/sessions/:id/log` | Read bounded redacted log previews. | — | `[{ ts, level, message }]` | `404 session_not_found` |
 | POST | `/api/v1/sessions/:id/input` | Forward input to a live session. | `{ data }` | `{ ok, accepted }` | `400`, `404`, `409 session_not_live`, `500 send_input_failed` |
 | POST | `/api/v1/sessions/:id/kill` | Kill a live session. | — | `{ ok, accepted }` | `404`, `409 session_not_live`, `500 kill_failed` |
+| POST | `/api/v1/sessions/:id/handoffs` | Validate, redact, and offer a `coven.handoff.v1` packet. | packet | `{ handoff, packet, eventCursor, workspace }` | `400`, `404`, `409`, `413 handoff_too_large` |
+| GET | `/api/v1/sessions/:id/handoffs` | Read durable handoffs (`?latest=true` narrows to the latest). | `?latest=true` | `{ handoffs }` | `404` |
+| POST | `/api/v1/sessions/:id/handoffs/:handoffId/claim` | Atomically claim a generation and fence source input. | `{ expectedGeneration, claimant, idempotencyKey, destinationWorkspace }` | `{ handoff, sourceInputFenced }` | `409 handoff_stale_generation`, `handoff_already_claimed`, `transcript_diverged`, `workspace_diverged` |
+| POST | `/api/v1/sessions/:id/handoffs/:handoffId/ack` | Acknowledge a quiesced source cursor. | `{ claimant }` | `{ handoff }` | `409` |
+| POST | `/api/v1/sessions/:id/handoffs/:handoffId/continuations` | Record a destination import and return a fixed untrusted-context prelude. | `{ destination }` | `{ continuation, packet, prompt, provenance }` | `409 source_acknowledgement_required` |
 | GET | `/api/v1/sessions/:id/artifacts/:artifactId` | Read one raw (unredacted) artifact. | `?raw=1` required | raw payload | `400` (missing `raw=1`), `403 raw_artifacts_disabled`, `404` |
 | GET | `/api/v1/events` | Read paginated redacted events for a session. | `?sessionId` required, `?afterSeq`, `?afterEventId`, `?limit` | `{ events, nextCursor, hasMore }` | `400 invalid_request` |
 
 Event payloads are redacted by default; the raw artifact route requires explicit local raw-artifact persistence. See [STREAM-JSON](/STREAM-JSON) for event payload shapes.
+
+Handoff routes are local-socket-only and require the `sessionHandoff`
+capability. They do not authenticate remote callers; a companion needs a
+separately paired authenticated transport. See
+[Session handoff](/daemon/session-handoff).
 
 ## Observability reads
 
