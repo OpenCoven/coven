@@ -67,9 +67,23 @@ GET /api/v1/health
     "eventCursor": "sequence",
     "structuredErrors": true
   },
-  "daemon": { "pid": 12345, "startedAt": "2026-07-14T12:00:00Z", "socket": "<covenHome>/coven.sock" }
+  "daemon": { "pid": 12345, "startedAt": "2026-07-14T12:00:00Z", "socket": "<covenHome>/coven.sock" },
+  "eventWriter": {
+    "state": "healthy",
+    "queuedBytes": 0,
+    "capacityBytes": 2097152,
+    "droppedOutputEvents": 0,
+    "droppedOutputBytes": 0,
+    "connectionOpens": 1,
+    "transactions": 42,
+    "committedEvents": 513
+  }
 }
 ```
+
+When present, `eventWriter.state` is `healthy`, `pressured`, or `failed`.
+Pressure reports explicitly rejected raw output; lifecycle and terminal events
+reserve queue capacity and are never discarded for queue pressure.
 
 If a client requires a capability the daemon does not advertise, the client should fail loudly with a remediation hint (`upgrade Coven to >= N`).
 

@@ -18,12 +18,20 @@ coven daemon status
 Typical healthy output:
 
 ```text
-Coven daemon: running (pid 12345, socket /home/alex/.coven/coven.sock)
+Coven daemon: running (pid 12345, socket <covenHome>/coven.sock)
 ```
 
 `running` means Coven found daemon metadata and verified the process/socket.
 For scripts, `coven daemon status --json` adds an `ok` field that reports
 whether the daemon health response succeeded.
+
+`GET /api/v1/health` also includes an additive `eventWriter` object for a
+running daemon. `state: "healthy"` means live-session event persistence is
+keeping up. `"pressured"` means one or more raw PTY chunks were rejected after
+the bounded queue filled; inspect `droppedOutputEvents` and
+`droppedOutputBytes`. `"failed"` means the dedicated SQLite writer could not
+commit, and `lastError` carries the diagnostic. Lifecycle events are never
+dropped for queue pressure.
 
 ## Status values
 

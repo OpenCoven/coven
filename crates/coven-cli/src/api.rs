@@ -148,6 +148,10 @@ pub struct HealthResponse {
     /// response is built without store access (e.g. CLI status printing).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hub: Option<HubHealth>,
+    /// Daemon-owned event persistence health.  Omitted for status rendering
+    /// paths that do not have a live runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_writer: Option<crate::event_writer::EventWriterHealth>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,6 +219,10 @@ pub trait SessionRuntime {
     fn launch_session(&self, launch: &SessionLaunch) -> Result<()>;
     fn send_input(&self, session_id: &str, payload: &Value) -> Result<()>;
     fn kill_session(&self, session_id: &str) -> Result<()>;
+
+    fn event_writer_health(&self) -> Option<crate::event_writer::EventWriterHealth> {
+        None
+    }
 }
 
 pub struct NoopSessionRuntime;
@@ -250,11 +258,17 @@ pub fn health_response(daemon: Option<DaemonStatus>) -> HealthResponse {
         },
         daemon,
         hub: None,
+        event_writer: None,
     }
 }
 
-fn health_response_with_hub(coven_home: &Path, daemon: Option<DaemonStatus>) -> HealthResponse {
+fn health_response_with_hub(
+    coven_home: &Path,
+    daemon: Option<DaemonStatus>,
+    event_writer: Option<crate::event_writer::EventWriterHealth>,
+) -> HealthResponse {
     let mut response = health_response(daemon);
+    response.event_writer = event_writer;
     if let Ok(summary) = crate::hub::hub_health_summary(coven_home) {
         response.hub = serde_json::from_value(summary).ok();
     }
@@ -315,7 +329,10 @@ pub fn handle_request_with_runtime(
                 "supportedApiVersions": SUPPORTED_API_ROUTE_VERSIONS,
             }),
         ),
-        ("GET", "/health") => json_response(200, &health_response_with_hub(coven_home, daemon)),
+        ("GET", "/health") => json_response(
+            200,
+            &health_response_with_hub(coven_home, daemon, runtime.event_writer_health()),
+        ),
         ("GET", "/capabilities") => json_response(200, &control_plane::capabilities()),
         ("GET", "/overview") => overview_response(coven_home),
         ("POST", "/actions") => {

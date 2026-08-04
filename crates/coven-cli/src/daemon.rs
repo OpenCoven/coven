@@ -85,6 +85,7 @@ impl std::error::Error for NotLiveError {}
 #[derive(Default)]
 pub struct LiveSessionRuntime {
     coven_home: Option<PathBuf>,
+    event_writer: Option<crate::event_writer::EventWriter>,
     sessions: Arc<Mutex<HashMap<String, LiveSessionHandle>>>,
 }
 
@@ -163,11 +164,19 @@ impl LiveSessionExitCleanup {
 }
 
 impl LiveSessionRuntime {
+    #[cfg(test)]
     pub fn with_coven_home(coven_home: PathBuf) -> Self {
-        Self {
+        Self::try_with_coven_home(coven_home)
+            .expect("daemon event writer must start for a live session runtime")
+    }
+
+    pub fn try_with_coven_home(coven_home: PathBuf) -> Result<Self> {
+        let event_writer = crate::event_writer::EventWriter::start(coven_home.clone())?;
+        Ok(Self {
             coven_home: Some(coven_home),
+            event_writer: Some(event_writer),
             sessions: Arc::default(),
-        }
+        })
     }
 
     #[allow(dead_code)]
@@ -246,7 +255,7 @@ impl LiveSessionRuntime {
             registration: Arc::clone(&registration),
         };
         (
-            output_observer_with_cleanup(self.coven_home.clone(), session_id, Some(cleanup)),
+            output_observer_with_cleanup(self.event_writer.clone(), session_id, Some(cleanup)),
             registration,
         )
     }
@@ -515,6 +524,12 @@ impl SessionRuntime for LiveSessionRuntime {
             .map_err(|_| anyhow::anyhow!("live session killer lock poisoned"))?;
         killer.kill()
     }
+
+    fn event_writer_health(&self) -> Option<crate::event_writer::EventWriterHealth> {
+        self.event_writer
+            .as_ref()
+            .map(crate::event_writer::EventWriter::health)
+    }
 }
 
 fn piped_killer(pid: u32) -> Box<dyn RuntimeKiller> {
@@ -682,18 +697,26 @@ impl RuntimeKiller for Box<dyn portable_pty::ChildKiller + Send + Sync> {
 
 #[cfg(test)]
 fn output_observer(coven_home: PathBuf, session_id: String) -> pty_runner::DetachedPtyObserver {
-    output_observer_with_cleanup(Some(coven_home), session_id, None)
+    let writer =
+        crate::event_writer::EventWriter::start(coven_home).expect("test event writer must start");
+    output_observer_with_cleanup(Some(writer), session_id, None)
 }
 
 fn output_observer_with_cleanup(
-    coven_home: Option<PathBuf>,
+    writer: Option<crate::event_writer::EventWriter>,
     session_id: String,
     cleanup: Option<LiveSessionExitCleanup>,
 ) -> pty_runner::DetachedPtyObserver {
-    let output_home = coven_home.clone();
+    let output_writer = writer.clone();
     let output_session_id = session_id.clone();
-    let exit_home = coven_home;
+    let exit_writer = writer;
     let exit_session_id = session_id;
+    // The piped runner drains stdout and stderr independently.  Serialize the
+    // final output submission with exit so a late stderr callback cannot add a
+    // newly accepted output event after the exit barrier has committed.
+    let event_closed = Arc::new(Mutex::new(false));
+    let output_closed = Arc::clone(&event_closed);
+    let exit_closed = event_closed;
     // UTF-8 boundary safety is enforced by `drain_detached_output` in
     // pty_runner per-source (separate buffers for stdout and stderr in
     // stream mode), so each chunk we receive here is already valid
@@ -706,100 +729,66 @@ fn output_observer_with_cleanup(
             }
             let text = String::from_utf8(chunk)
                 .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned());
-            if let Some(output_home) = output_home.as_deref() {
-                let _ = record_session_event(
-                    output_home,
-                    &output_session_id,
-                    "output",
-                    json!({ "data": text }),
+            let closed = output_closed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if *closed {
+                eprintln!(
+                    "coven daemon: discarded output observed after exit barrier for session `{output_session_id}`"
                 );
+                return;
+            }
+            if let Some(writer) = output_writer.as_ref() {
+                match writer.record_output(&output_session_id, text) {
+                    Ok(true) => {}
+                    Ok(false) => eprintln!(
+                        "coven daemon: event writer is pressured; raw output for session `{output_session_id}` was rejected"
+                    ),
+                    Err(error) => eprintln!(
+                        "coven daemon: event writer failed while recording output for session `{output_session_id}`: {error:#}"
+                    ),
+                }
             }
         }),
         on_exit: Box::new(move |result| {
+            let mut closed = exit_closed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *closed = true;
             if let Some(cleanup) = cleanup {
                 cleanup.mark_exited();
             }
-            if let Some(exit_home) = exit_home.as_deref() {
-                if let Err(error) = record_session_exit(exit_home, &exit_session_id, result) {
+            if let Some(writer) = exit_writer.as_ref() {
+                if let Err(error) = writer.record_exit(&exit_session_id, result) {
                     eprintln!(
                         "coven daemon: failed to persist exit for session `{exit_session_id}`: {error:#}"
                     );
                 }
             }
+            drop(closed);
         }),
     }
 }
 
+#[cfg(test)]
 fn record_session_exit(
     coven_home: &Path,
     session_id: &str,
     result: pty_runner::PtyRunResult,
 ) -> Result<()> {
-    let conn = crate::store::open_store(&coven_home.join("coven.sqlite3"))?;
-    if let Some(session) = crate::store::get_session(&conn, session_id)? {
-        if session.status == "running" {
-            // For conversation-grouped sessions (chat), a clean harness exit
-            // is not the end of the conversation — the user can prompt again
-            // and the daemon will resume into a sibling session under the
-            // same `conversation_id`. Persist `idle` so API consumers (the
-            // cockpit / dashboard) can distinguish "harness child terminated
-            // cleanly, conversation still extendable" from "session failed".
-            // Failed exits (non-zero / wait error) still surface as failure
-            // so consumers don't mistake a crashed harness for a fresh slot.
-            let persisted_status =
-                if session.conversation_id.is_some() && result.status == "completed" {
-                    "idle"
-                } else {
-                    result.status
-                };
-            crate::store::update_session_status_if_current(
-                &conn,
-                session_id,
-                "running",
-                persisted_status,
-                result.exit_code,
-                &crate::api::current_timestamp(),
-            )?;
-        }
-    }
-    crate::store::insert_event_with_privacy(
-        &conn,
-        coven_home,
-        &crate::store::EventRecord {
-            seq: 0,
-            id: uuid::Uuid::new_v4().to_string(),
-            session_id: session_id.to_string(),
-            kind: "exit".to_string(),
-            payload_json: serde_json::to_string(&json!({
-                "status": result.status,
-                "exitCode": result.exit_code,
-            }))
-            .context("failed to serialize exit event payload")?,
-            created_at: crate::api::current_timestamp(),
-        },
-    )
+    crate::event_writer::EventWriter::start(coven_home.to_path_buf())?
+        .record_exit(session_id, result)
 }
 
+#[cfg(test)]
 fn record_session_event(
     coven_home: &Path,
     session_id: &str,
     kind: &str,
     payload: Value,
 ) -> Result<()> {
-    let conn = crate::store::open_store(&coven_home.join("coven.sqlite3"))?;
-    crate::store::insert_event_with_privacy(
-        &conn,
-        coven_home,
-        &crate::store::EventRecord {
-            seq: 0,
-            id: uuid::Uuid::new_v4().to_string(),
-            session_id: session_id.to_string(),
-            kind: kind.to_string(),
-            payload_json: serde_json::to_string(&payload)
-                .context("failed to serialize session event payload")?,
-            created_at: crate::api::current_timestamp(),
-        },
-    )
+    crate::event_writer::EventWriter::start(coven_home.to_path_buf())?
+        .record(session_id, kind, payload)
 }
 
 pub fn daemon_status_path(coven_home: &Path) -> PathBuf {
@@ -2350,9 +2339,9 @@ pub fn serve_forever(
     );
     recover_orphaned_sessions(coven_home, &started_at)?;
     recover_stale_created_sessions(coven_home, &started_at)?;
-    let runtime = Arc::new(LiveSessionRuntime::with_coven_home(
+    let runtime = Arc::new(LiveSessionRuntime::try_with_coven_home(
         coven_home.to_path_buf(),
-    ));
+    )?);
     start_threads_proposal_scheduler(coven_home)?;
 
     if let Some(addr) = tcp_addr {
@@ -2875,9 +2864,9 @@ pub fn serve_forever(
     write_status(coven_home, &status)?;
     recover_orphaned_sessions(coven_home, &started_at)?;
 
-    let runtime = Arc::new(LiveSessionRuntime::with_coven_home(
+    let runtime = Arc::new(LiveSessionRuntime::try_with_coven_home(
         coven_home.to_path_buf(),
-    ));
+    )?);
     start_threads_proposal_scheduler(coven_home)?;
 
     const MAX_INFLIGHT: usize = 64;

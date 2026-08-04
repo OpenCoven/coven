@@ -58,6 +58,16 @@ proof of `coven.daemon.v1` support.
     "startedAt": "2026-05-09T06:43:00Z",
     "socket": "/var/lib/coven/coven.sock"
   },
+  "eventWriter": {
+    "state": "healthy",
+    "queuedBytes": 0,
+    "capacityBytes": 2097152,
+    "droppedOutputEvents": 0,
+    "droppedOutputBytes": 0,
+    "connectionOpens": 1,
+    "transactions": 42,
+    "committedEvents": 513
+  },
   "hub": {
     "role": "hub",
     "hubId": "hub_01J...",
@@ -68,6 +78,13 @@ proof of `coven.daemon.v1` support.
 ```
 
 If the daemon metadata is unavailable, `daemon` may be `null`. The `hub` block reports the daemon's control-plane role and node availability summary; full node detail lives at `GET /api/v1/hub/status`.
+
+`eventWriter` is present for the daemon-owned live-session runtime. Its
+`state` is `healthy`, `pressured`, or `failed`. A pressured writer reports raw
+output that could not enter the byte-bounded queue; lifecycle, tool, error, and
+exit events reserve capacity and are not dropped for pressure. A failed writer
+includes `lastError`; clients should surface it as degraded persistence rather
+than treating the daemon's liveness as successful event durability.
 
 ### Capability fields
 

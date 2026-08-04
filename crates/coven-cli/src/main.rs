@@ -22,6 +22,7 @@ mod encrypted_artifacts;
 mod engine;
 mod engine_install;
 mod eval_loop;
+mod event_writer;
 mod executor_node;
 mod familiar_identity;
 mod harness;
