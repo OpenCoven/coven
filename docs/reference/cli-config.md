@@ -58,9 +58,10 @@ The report covers the Coven home, session ledger, repository registry,
 privacy policy, trusted and external adapter roots, settings, managed and
 resolved engine locations, mobile and daemon state, familiar state, call,
 executor, export, memory, proposal, research, reset-backup, and travel state,
-the daemon recovery log, and the Chat dashboard state. Redacted events and
-encrypted artifacts are both stored in the session ledger, so their distinct
-IDs can legitimately point to the same SQLite file.
+the profile and daemon coordination locks, the pending reset marker, the daemon
+recovery log, and the Chat dashboard state. Redacted events and encrypted
+artifacts are both stored in the session ledger, so their distinct IDs can
+legitimately point to the same SQLite file.
 
 The optional Memory dashboard is a separately installed process without a
 Coven-owned state-path contract. It is reported as `unsupported` rather than
@@ -69,12 +70,12 @@ guessing a location.
 ## Isolation caveat
 
 `COVEN_HOME` selects the Coven store root, but it does not move every
-per-user location. Settings follow `XDG_CONFIG_HOME` (or the platform config
-default), and the managed engine cache follows the user home directory by
-design. Isolated runners should set `COVEN_HOME`, `XDG_CONFIG_HOME`, and any
-user-home override honored by their platform, then verify the resulting
-report. On Windows, the native profile resolver can continue to select the OS
-account profile, so `COVEN_HOME` alone does not isolate the managed cache.
+per-user location. Settings follow `XDG_CONFIG_HOME` or `$HOME/.config`, and
+the managed engine cache follows the user home directory by design. Isolated
+runners should set `COVEN_HOME`, `XDG_CONFIG_HOME`, and any user-home override
+honored by their platform, then verify the resulting report. On Windows, the
+native profile resolver can continue to select the OS account profile, so
+`COVEN_HOME` alone does not isolate the managed cache.
 
 The command reports paths only. It never serializes the contents of settings,
 privacy, adapter manifests, or the session ledger.

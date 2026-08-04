@@ -96,6 +96,25 @@ fn paths_json_is_stable_and_creates_no_profile_state() {
         coven_home.join("executor.json").display().to_string()
     );
     assert_eq!(
+        surfaces["state.shared_lock"]["path"],
+        coven_home.join("state.lock").display().to_string()
+    );
+    assert_eq!(
+        surfaces["state.reset_transaction"]["path"],
+        coven_home
+            .join("reset-transaction.json")
+            .display()
+            .to_string()
+    );
+    assert_eq!(
+        surfaces["state.daemon_lifecycle_lock"]["path"],
+        coven_home.join("daemon.lock").display().to_string()
+    );
+    assert_eq!(
+        surfaces["state.daemon_serve_lock"]["path"],
+        coven_home.join("daemon-serve.lock").display().to_string()
+    );
+    assert_eq!(
         surfaces["state.pending_proposals"]["path"],
         coven_home.join("pending").display().to_string()
     );
@@ -111,6 +130,19 @@ fn paths_json_is_stable_and_creates_no_profile_state() {
         surfaces["logs.daemon_recovery"]["path"],
         coven_home.join("daemon-recovery.log").display().to_string()
     );
+    #[cfg(windows)]
+    {
+        let daemon_ipc = surfaces["state.daemon_ipc"]["path"]
+            .as_str()
+            .expect("Windows daemon IPC path");
+        assert!(
+            daemon_ipc.starts_with(r"\\.\pipe\coven-daemon-"),
+            "expected fully qualified Coven named pipe, got {daemon_ipc}"
+        );
+        assert!(daemon_ipc.ends_with(".sock"));
+        assert_eq!(surfaces["state.daemon_ipc"]["status"], "resolved");
+        assert_eq!(surfaces["state.daemon_ipc"]["source"], "environment");
+    }
     assert_eq!(
         surfaces["engine.managed_cache"]["path"],
         expected_managed_engine_root.display().to_string(),

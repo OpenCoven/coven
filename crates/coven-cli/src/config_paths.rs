@@ -173,6 +173,34 @@ fn append_home_surfaces(
         source,
         cwd,
     );
+    push_path(
+        surfaces,
+        "state.shared_lock",
+        &crate::state_lock::shared_lock_path(home),
+        source,
+        cwd,
+    );
+    push_path(
+        surfaces,
+        "state.reset_transaction",
+        &home.join(crate::state_lock::RESET_TRANSACTION_FILE),
+        source,
+        cwd,
+    );
+    push_path(
+        surfaces,
+        "state.daemon_lifecycle_lock",
+        &crate::daemon::daemon_lifecycle_lock_path(home),
+        source,
+        cwd,
+    );
+    push_path(
+        surfaces,
+        "state.daemon_serve_lock",
+        &crate::daemon::daemon_serve_lock_path(home),
+        source,
+        cwd,
+    );
     #[cfg(unix)]
     push_path(
         surfaces,
@@ -182,7 +210,13 @@ fn append_home_surfaces(
         cwd,
     );
     #[cfg(windows)]
-    push_terminal(surfaces, "state.daemon_ipc", PathStatus::NotApplicable);
+    push_path(
+        surfaces,
+        "state.daemon_ipc",
+        &crate::daemon::windows_pipe_path(home),
+        source,
+        cwd,
+    );
     push_path(
         surfaces,
         "state.familiar_manifest",
@@ -304,6 +338,10 @@ fn append_unresolved_home_surfaces(surfaces: &mut Vec<PathSurface>, cwd: &Path) 
         "state.mobile",
         "state.sensitive_artifact_key",
         "state.daemon_metadata",
+        "state.shared_lock",
+        "state.reset_transaction",
+        "state.daemon_lifecycle_lock",
+        "state.daemon_serve_lock",
         "state.daemon_ipc",
         "state.familiar_manifest",
         "state.familiar_workspaces",

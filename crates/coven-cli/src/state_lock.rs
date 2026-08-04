@@ -1,6 +1,4 @@
-use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
@@ -154,8 +152,8 @@ fn validate_lock_file(_file: &std::fs::File, _path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-pub(crate) fn lock_path(coven_home: &Path) -> PathBuf {
+/// Path of the profile-wide shared-state coordination lock.
+pub(crate) fn shared_lock_path(coven_home: &Path) -> PathBuf {
     coven_home.join(STATE_LOCK_FILE)
 }
 
@@ -211,7 +209,7 @@ mod tests {
         outside
             .as_file()
             .set_permissions(std::fs::Permissions::from_mode(0o640))?;
-        symlink(outside.path(), lock_path(home.path()))?;
+        symlink(outside.path(), shared_lock_path(home.path()))?;
 
         assert!(acquire_shared(home.path()).is_err());
         assert_eq!(

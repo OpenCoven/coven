@@ -975,7 +975,7 @@ pub fn ensure_background_server(
     Ok(status)
 }
 
-fn daemon_lifecycle_lock_path(coven_home: &Path) -> PathBuf {
+pub(crate) fn daemon_lifecycle_lock_path(coven_home: &Path) -> PathBuf {
     coven_home.join("daemon.lock")
 }
 
@@ -2132,7 +2132,7 @@ fn install_daemon_panic_hook(coven_home: &Path, socket_path: &Path, status_path:
 /// `daemon.lock` *lifecycle* lock that `ensure_background_server` holds only
 /// across a start/stop — this one is held by the `serve` process for its entire
 /// life, so it must be a separate file or the two would deadlock at startup.
-fn daemon_serve_lock_path(coven_home: &Path) -> PathBuf {
+pub(crate) fn daemon_serve_lock_path(coven_home: &Path) -> PathBuf {
     coven_home.join("daemon-serve.lock")
 }
 
@@ -2829,6 +2829,16 @@ fn owner_only_pipe_security_descriptor(
 #[cfg(windows)]
 pub(crate) fn windows_pipe_name(coven_home: &Path) -> String {
     daemon_windows_pipe_name(coven_home)
+}
+
+/// Fully qualified Windows named-pipe endpoint for this Coven profile.
+///
+/// `windows_pipe_name` remains the name passed to `interprocess`, while
+/// diagnostics need the concrete endpoint users can compare against a profile
+/// root without treating the IPC surface as absent.
+#[cfg(windows)]
+pub(crate) fn windows_pipe_path(coven_home: &Path) -> PathBuf {
+    PathBuf::from(r"\\.\pipe").join(daemon_windows_pipe_name(coven_home))
 }
 
 #[cfg(windows)]
