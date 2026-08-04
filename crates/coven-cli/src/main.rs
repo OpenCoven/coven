@@ -15,6 +15,7 @@ use uuid::Uuid;
 mod api;
 mod capabilities;
 mod cockpit_sources;
+mod config_paths;
 mod control_plane;
 mod coven_calls;
 mod daemon;
@@ -180,6 +181,11 @@ enum Command {
     Doctor {
         #[arg(long, help = "Print checks as JSON (machine-readable)")]
         json: bool,
+    },
+    #[command(about = "Report resolved configuration and state paths")]
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
     },
     #[command(about = "Generate shell completions (bash, zsh, fish, elvish, powershell)")]
     Completions {
@@ -590,6 +596,15 @@ enum Command {
     Code {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigCommand {
+    #[command(about = "Print the versioned resolved-path diagnostic")]
+    Paths {
+        #[arg(long, help = "Print the diagnostic as machine-readable JSON")]
+        json: bool,
     },
 }
 
@@ -1034,6 +1049,19 @@ fn main() -> Result<()> {
         }
     }
 
+    let cli = Cli::parse().validate().unwrap_or_else(|error| error.exit());
+    // This diagnostic must not create COVEN_HOME through the shared state lock
+    // or read settings contents during startup. It is deliberately the one
+    // command that runs before normal state initialization.
+    if matches!(
+        &cli.command,
+        Some(Command::Config {
+            command: ConfigCommand::Paths { .. }
+        })
+    ) {
+        return run_cli(cli);
+    }
+
     let loaded =
         settings::user_settings_path().as_deref().and_then(|path| {
             match settings::load_from(path) {
@@ -1046,7 +1074,6 @@ fn main() -> Result<()> {
         });
     settings::init_cached(loaded);
 
-    let cli = Cli::parse().validate().unwrap_or_else(|error| error.exit());
     // Resolve --color before anything renders: theme::mode() caches on
     // first use, so the override must be recorded ahead of any output.
     theme::set_color_choice(match cli.color.as_str() {
@@ -1099,6 +1126,14 @@ fn run_cli(cli: Cli) -> Result<()> {
     match cli.command {
         None | Some(Command::Chat) | Some(Command::Tui) => run_shared_interactive_shell(),
         Some(Command::Doctor { json }) => run_doctor(json),
+        Some(Command::Config {
+            command: ConfigCommand::Paths { json },
+        }) => {
+            if !json {
+                bail!("`coven config paths` requires `--json`");
+            }
+            config_paths::print_json()
+        }
         Some(Command::Completions { shell }) => {
             use clap::CommandFactory;
             clap_complete::generate(
@@ -4733,6 +4768,12 @@ mod tests {
         assert!(matches!(
             Cli::parse_from(["coven", "doctor", "--json"]).command,
             Some(Command::Doctor { json: true })
+        ));
+        assert!(matches!(
+            Cli::parse_from(["coven", "config", "paths", "--json"]).command,
+            Some(Command::Config {
+                command: ConfigCommand::Paths { json: true }
+            })
         ));
     }
 

@@ -26,6 +26,10 @@ When `COVEN_HOME` is set, the daemon uses:
 - `<COVEN_HOME>/privacy.toml` for local log privacy settings when present.
 - `<COVEN_HOME>/keys/session-artifacts.key` for the local encrypted artifact key when raw artifact persistence is enabled.
 
+Run `coven config paths --json` to inspect the complete resolved path surface
+without starting the daemon or creating state. It also shows settings and the
+managed engine cache, which intentionally use separate per-user roots.
+
 ## Log privacy
 
 Session logs are redacted by default before they are stored in SQLite or returned through the API.

@@ -180,7 +180,7 @@ pub fn load_calls(coven_home: &Path) -> Result<Vec<CovenCallRecord>> {
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
-fn calls_path(coven_home: &Path) -> PathBuf {
+pub(crate) fn calls_path(coven_home: &Path) -> PathBuf {
     coven_home.join(CALLS_FILE)
 }
 

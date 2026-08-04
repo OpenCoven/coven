@@ -47,5 +47,8 @@ TERM=xterm-256color coven tui
 | Variable | Effect |
 |---|---|
 | `COVEN_HOME` | Overrides the default state directory (`~/.coven`). Use this to keep multiple Coven profiles on one machine, or to relocate state to a different disk. |
+| `XDG_CONFIG_HOME` | On platforms that support it, overrides the root containing `coven/settings.json`. This is separate from `COVEN_HOME`. |
 
-See [Getting started](/GETTING-STARTED) for the default setup flow and daemon checks.
+Use `coven config paths --json` to audit the paths selected for the current
+process without creating profile state. See [Getting started](/GETTING-STARTED)
+for the default setup flow and daemon checks.

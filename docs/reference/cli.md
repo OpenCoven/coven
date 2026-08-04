@@ -130,6 +130,7 @@ flowchart TB
 |---|---|
 | `coven run` | `--cwd <path>`, `--title <text>`, `--detach`, `--model <id>`, `--permission <full\|read-only>`, `--think`, `--speed fast\|balanced\|thorough` |
 | `coven doctor` | `--json` |
+| `coven config paths` | `--json` (required) |
 | `coven daemon status` | `--json` |
 | `coven sessions` | `--plain`, `--json`, `--all`, `--manage` |
 | `coven sessions events` | `--after-seq <SEQ>`, `--limit <N>`, `--json` |
@@ -221,6 +222,7 @@ execution. `coven reset` reserves explicit local-recovery codes: see
 - [Getting started](/GETTING-STARTED)
 - [Workflow guides](/guides)
 - [Developer core-functionality guide](/development/cli-core-functionality)
+- [Configuration path diagnostic](cli-config.md)
 - [Coven TUI](/start/coven-tui)
 - [Session lifecycle](/SESSION-LIFECYCLE)
 - [Harness adapter guide](/HARNESS-ADAPTERS)
