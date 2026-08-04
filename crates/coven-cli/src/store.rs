@@ -3445,13 +3445,30 @@ pub fn run_scheduled_maintenance(
 ) -> Result<ScheduledMaintenanceReport> {
     let free_disk_bytes = fs2::available_space(coven_home)
         .with_context(|| format!("failed to inspect free disk for {}", coven_home.display()))?;
-    run_scheduled_maintenance_with_free_disk(coven_home, now, free_disk_bytes)
+    let config =
+        privacy::load_with_settings(coven_home, crate::settings::cached()).unwrap_or_default();
+    run_scheduled_maintenance_with_config_and_free_disk(coven_home, now, free_disk_bytes, &config)
 }
 
+#[cfg(test)]
 fn run_scheduled_maintenance_with_free_disk(
     coven_home: &Path,
     now: &str,
     free_disk_bytes: u64,
+) -> Result<ScheduledMaintenanceReport> {
+    run_scheduled_maintenance_with_config_and_free_disk(
+        coven_home,
+        now,
+        free_disk_bytes,
+        &PrivacyConfig::default(),
+    )
+}
+
+fn run_scheduled_maintenance_with_config_and_free_disk(
+    coven_home: &Path,
+    now: &str,
+    free_disk_bytes: u64,
+    config: &PrivacyConfig,
 ) -> Result<ScheduledMaintenanceReport> {
     if free_disk_bytes < MAINTENANCE_MIN_FREE_DISK_BYTES {
         // Do not record this in SQLite: opening a write transaction here would
@@ -3465,7 +3482,6 @@ fn run_scheduled_maintenance_with_free_disk(
         });
     }
 
-    let config = privacy::load_config(coven_home).unwrap_or_default();
     let raw_cutoff = retention_cutoff(now, config.raw_artifact_retention_days.max(1));
     let event_cutoff = retention_cutoff(now, config.log_retention_days.max(1));
     let store_path = coven_home.join("coven.sqlite3");
@@ -4907,6 +4923,45 @@ mod tests {
         assert_eq!(health.oldest_retained_event_at, None);
         assert_eq!(health.writer_backlog_events, 0);
         assert_eq!(health.writer_backlog_bytes, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn scheduled_maintenance_honors_configured_event_retention() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let home = temp_dir.path();
+        let path = home.join("coven.sqlite3");
+        let conn = open_store(&path)?;
+        insert_session(&conn, &session_record("session-1", "2026-04-27T06:00:00Z"))?;
+        insert_event(
+            &conn,
+            &EventRecord {
+                seq: 0,
+                id: "configured-expired".to_string(),
+                session_id: "session-1".to_string(),
+                kind: "output".to_string(),
+                payload_json: r#"{"data":"expired"}"#.to_string(),
+                created_at: "2026-04-25T00:00:00Z".to_string(),
+            },
+        )?;
+        drop(conn);
+
+        let config = PrivacyConfig {
+            persist_raw_artifacts: false,
+            raw_artifact_retention_days: 7,
+            log_retention_days: 1,
+            extra_patterns: Vec::new(),
+        };
+        let report = run_scheduled_maintenance_with_config_and_free_disk(
+            home,
+            "2026-04-27T06:00:00Z",
+            MAINTENANCE_MIN_FREE_DISK_BYTES,
+            &config,
+        )?;
+
+        assert_eq!(report.events_pruned, 1);
+        let conn = open_store(&path)?;
+        assert!(list_events(&conn, "session-1")?.is_empty());
         Ok(())
     }
 
