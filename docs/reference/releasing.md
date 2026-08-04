@@ -165,10 +165,10 @@ The new workflow does not expose a manual publish path. If you ever need to publ
 1. Cut a signed tag locally as above so the artifact you publish is reproducible.
 2. Build the native binaries:
    ```sh
-   cargo build --release --target aarch64-apple-darwin
-   cargo build --release --target x86_64-apple-darwin
-   cargo build --release --target x86_64-unknown-linux-gnu
-   cargo build --release --target x86_64-pc-windows-msvc
+   cargo build --release --package coven-cli --target aarch64-apple-darwin
+   cargo build --release --package coven-cli --target x86_64-apple-darwin
+   cargo build --release --package coven-cli --target x86_64-unknown-linux-gnu
+   cargo build --release --package coven-cli --target x86_64-pc-windows-msvc
    ```
 3. Authenticate to npm with a freshly issued, narrowly-scoped granular token that covers all five packages (delete it immediately after).
 4. Run `scripts/publish-npm.mjs --publish` for each target with `COVEN_NPM_VERSION` set to the tag version. The script's fallback path accepts `NPM_TOKEN` / `NODE_AUTH_TOKEN` when OIDC is not detected.

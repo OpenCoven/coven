@@ -85,7 +85,7 @@ function main() {
 
   if (!wrapperOnly) {
     if (!skipBuild) {
-      run('cargo', ['build', '--release', '--target', target.rustTarget]);
+      run('cargo', ['build', '--release', '--package', 'coven-cli', '--target', target.rustTarget]);
     }
 
     const binaryPath = path.join(repoRoot, 'target', target.rustTarget, 'release', target.binaryName);

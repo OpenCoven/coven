@@ -161,7 +161,7 @@ jobs:
       - name: Install native link dependencies (Linux only)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
-      - run: cargo build --release --target ${{ matrix.rust-target }}
+      - run: cargo build --release --package coven-cli --target ${{ matrix.rust-target }}
       - run: node scripts/test-cli-prepublish.mjs --target=${{ matrix.npm-target }} --skip-build --skip-secrets-scan
         env:
           COVEN_NPM_DRY_RUN_VERSION: 999.0.0
