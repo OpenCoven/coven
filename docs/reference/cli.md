@@ -113,6 +113,7 @@ flowchart TB
 | `coven wt --list/--doctor/--prune-merged/--prune-stale DAYS` | Inspect and clean Coven protocol worktrees; see [cli-wt](cli-wt.md). |
 | `coven claim acquire/release/heartbeat/canary <branch>` | Manage TTL-bounded branch ownership for the current agent; see [cli-claim](cli-claim.md). |
 | `coven claim status` | Print branch claims from the current repository; see [cli-claim](cli-claim.md). |
+| `coven maintenance acquire/heartbeat/release/status` | Fence new Coven writers for one repository and drain existing session/claim writers; see [cli-maintenance](cli-maintenance.md). |
 | `coven hooks install` | Install local protocol hooks that block unsafe commits and protected pushes; see [cli-claim](cli-claim.md). |
 | `coven engine status/install/which` | Manage the pinned Coven engine (`coven-code`); see [cli-engine](cli-engine.md). |
 | `coven executor probe/run-job` | Stateless executor-node protocol commands, hub-dispatched over SSH; see [cli-executor](cli-executor.md). |

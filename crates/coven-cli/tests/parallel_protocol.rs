@@ -67,6 +67,37 @@ fn claim_acquire_blocks_other_agent_until_release() -> anyhow::Result<()> {
 }
 
 #[test]
+fn maintenance_fence_blocks_claim_mutations_and_releases_cleanly() -> anyhow::Result<()> {
+    let repo = TestRepo::new()?;
+    let acquired = repo.coven(["maintenance", "acquire", "cave-delete", "--json"])?;
+    assert_success("maintenance acquire", &acquired);
+    let owner: serde_json::Value = serde_json::from_slice(&acquired.stdout)?;
+    let generation = owner["owner"]["generation"]
+        .as_str()
+        .expect("maintenance acquire returns fenced generation");
+
+    let blocked = repo.coven_with_env(
+        ["claim", "acquire", "issue-538"],
+        [("COVEN_AGENT_ID", "cody")],
+    )?;
+    assert_failure("claim acquire while fenced", &blocked);
+    assert_stderr_contains(
+        "claim acquire while fenced",
+        &blocked,
+        "repository maintenance",
+    );
+
+    let released = repo.coven(["maintenance", "release", "cave-delete", generation])?;
+    assert_success("maintenance release", &released);
+    let claim = repo.coven_with_env(
+        ["claim", "acquire", "issue-538"],
+        [("COVEN_AGENT_ID", "cody")],
+    )?;
+    assert_success("claim acquire after maintenance release", &claim);
+    Ok(())
+}
+
+#[test]
 fn default_claim_identity_blocks_same_user_in_another_worktree() -> anyhow::Result<()> {
     let repo = TestRepo::new()?;
     let first_worktree = repo.add_worktree("first-session", "feature/first-session")?;

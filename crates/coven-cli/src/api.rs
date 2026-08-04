@@ -213,6 +213,14 @@ pub struct SessionLaunch {
 
 pub trait SessionRuntime {
     fn launch_session(&self, launch: &SessionLaunch) -> Result<()>;
+    fn launch_session_with_writer(
+        &self,
+        launch: &SessionLaunch,
+        writer: crate::maintenance_gate::WriterLease,
+    ) -> Result<()> {
+        drop(writer);
+        self.launch_session(launch)
+    }
     fn send_input(&self, session_id: &str, payload: &Value) -> Result<()>;
     fn kill_session(&self, session_id: &str) -> Result<()>;
 }
@@ -1713,6 +1721,35 @@ fn launch_session(
             }
         };
     launch.familiar_id = familiar_ctx.as_ref().map(|familiar| familiar.id.clone());
+    let writer = match crate::maintenance_gate::MaintenanceGate::discover_optional(Path::new(
+        &launch.project_root,
+    ))
+    .and_then(|gate| match gate {
+        Some(gate) => gate
+            .acquire_writer(format!("daemon-session-{}", launch.id), "session")
+            .map(Some),
+        None => Ok(None),
+    }) {
+        Ok(writer) => writer,
+        Err(error) => {
+            let gate_error = error.downcast_ref::<crate::maintenance_gate::GateError>();
+            let (code, details) = match gate_error {
+                Some(crate::maintenance_gate::GateError::OwnerHeld(owner)) => (
+                    "maintenance_locked",
+                    Some(json!({ "owner": owner, "sessionId": launch.id })),
+                ),
+                Some(_) => (
+                    "maintenance_state_invalid",
+                    Some(json!({ "sessionId": launch.id })),
+                ),
+                None => (
+                    "maintenance_gate_unavailable",
+                    Some(json!({ "sessionId": launch.id })),
+                ),
+            };
+            return api_error(423, code, &error.to_string(), details);
+        }
+    };
     let conn = store::open_store(&store_path(coven_home))?;
     let now = current_timestamp();
     let record = session_launch::new_session_record(session_launch::NewSessionParams {
@@ -1728,7 +1765,10 @@ fn launch_session(
         visibility: None,
     });
     store::insert_session(&conn, &record)?;
-    if let Err(error) = runtime.launch_session(&launch) {
+    if let Err(error) = match writer {
+        Some(writer) => runtime.launch_session_with_writer(&launch, writer),
+        None => runtime.launch_session(&launch),
+    } {
         // Don't propagate to the accept loop — that crashes the daemon.
         // Runtime launch failures are user-facing (missing harness CLI,
         // missing auth, child closed stdin during stream-mode init):
@@ -7438,6 +7478,46 @@ mod tests {
             .to_string_lossy()
         );
         assert!(list.body.contains(r#""title":"Demo""#));
+        Ok(())
+    }
+
+    #[test]
+    fn launch_request_returns_structured_maintenance_lock_without_creating_session(
+    ) -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let init = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&project_root)
+            .status()?;
+        assert!(init.success());
+        let gate = crate::maintenance_gate::MaintenanceGate::discover(&project_root)?;
+        let owner = gate.acquire_owner("cave-delete")?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello coven"
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 423);
+        assert!(response.body.contains(r#""code":"maintenance_locked""#));
+        assert!(response.body.contains("cave-delete"));
+        assert!(runtime.launches.borrow().is_empty());
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        assert!(store::list_sessions(&conn)?.is_empty());
+        owner.release()?;
         Ok(())
     }
 

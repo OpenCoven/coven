@@ -26,6 +26,7 @@ mod executor_node;
 mod familiar_identity;
 mod harness;
 mod hub;
+mod maintenance_gate;
 mod memory_dashboard;
 mod memory_import;
 pub mod mobile_memory;
@@ -425,6 +426,11 @@ enum Command {
     Claim {
         #[command(subcommand)]
         command: ClaimCommand,
+    },
+    #[command(about = "Acquire and inspect repository maintenance exclusion")]
+    Maintenance {
+        #[command(subcommand)]
+        command: MaintenanceCommand,
     },
     #[command(about = "Install Coven Parallel Work Protocol git hooks")]
     Hooks {
@@ -994,6 +1000,37 @@ enum ClaimCommand {
 }
 
 #[derive(Subcommand, Debug)]
+enum MaintenanceCommand {
+    #[command(about = "Fence new Coven writers and begin draining existing writers")]
+    Acquire {
+        #[arg(help = "Stable owner id, usually supplied by the coordinating client")]
+        owner: String,
+        #[arg(
+            long,
+            default_value_t = 0,
+            help = "Wait up to this many milliseconds for existing writers to drain"
+        )]
+        wait_ms: u64,
+        #[arg(long, help = "Print the owner fence and writer state as JSON")]
+        json: bool,
+    },
+    #[command(about = "Renew an existing maintenance owner lease")]
+    Heartbeat {
+        owner: String,
+        generation: String,
+        #[arg(long, help = "Print the owner fence and writer state as JSON")]
+        json: bool,
+    },
+    #[command(about = "Release an existing maintenance owner fence")]
+    Release { owner: String, generation: String },
+    #[command(about = "Show the maintenance owner and active writer intents")]
+    Status {
+        #[arg(long, help = "Print state as JSON")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum HooksCommand {
     #[command(about = "Install pre-commit and pre-push protocol hooks")]
     Install,
@@ -1282,6 +1319,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             ClaimCommand::Canary { branch } => parallel_protocol::claim_canary(&branch),
             ClaimCommand::Status { json } => parallel_protocol::claim_status(json),
         },
+        Some(Command::Maintenance { command }) => run_maintenance_command(command),
         Some(Command::Hooks { command }) => match command {
             HooksCommand::Install => parallel_protocol::hooks_install(),
         },
@@ -1314,6 +1352,99 @@ fn run_cli(cli: Cli) -> Result<()> {
         Some(Command::Models { args }) => run_engine_passthrough(Some("models"), &args),
         Some(Command::Acp { args }) => run_engine_passthrough(Some("acp"), &args),
         Some(Command::Code { args }) => run_engine_passthrough(None, &args),
+    }
+}
+
+fn run_maintenance_command(command: MaintenanceCommand) -> Result<()> {
+    let cwd = std::env::current_dir().context("failed to read current directory")?;
+    let gate = maintenance_gate::MaintenanceGate::discover(&cwd)?;
+    match command {
+        MaintenanceCommand::Status { json } => {
+            let status = gate.status()?;
+            render_maintenance_status(&status, json)
+        }
+        MaintenanceCommand::Acquire {
+            owner,
+            wait_ms,
+            json,
+        } => {
+            let mut lease = gate.acquire_owner(owner)?;
+            let deadline = std::time::Instant::now() + Duration::from_millis(wait_ms);
+            let mut status = lease.refresh_phase()?;
+            while !status.writers.is_empty() && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(25));
+                status = lease.refresh_phase()?;
+            }
+            if json {
+                println!("{}", serde_json::to_string(&status)?);
+            } else {
+                let owner = status.owner.expect("owner lease remains present");
+                println!(
+                    "maintenance {} generation {} until {}",
+                    match owner.phase {
+                        maintenance_gate::OwnerPhase::Held => "held",
+                        maintenance_gate::OwnerPhase::Draining => "draining",
+                    },
+                    owner.generation,
+                    owner.expires_at
+                );
+                if !status.writers.is_empty() {
+                    println!("waiting for {} writer intent(s)", status.writers.len());
+                }
+            }
+            Ok(())
+        }
+        MaintenanceCommand::Heartbeat {
+            owner,
+            generation,
+            json,
+        } => {
+            let status = gate.heartbeat_owner(&owner, &generation)?;
+            render_maintenance_status(&status, json)
+        }
+        MaintenanceCommand::Release { owner, generation } => {
+            gate.release_owner(&owner, &generation)?;
+            println!("released maintenance fence for {owner}");
+            Ok(())
+        }
+    }
+}
+
+fn render_maintenance_status(status: &maintenance_gate::GateStatus, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(status)?);
+        return Ok(());
+    }
+    match &status.owner {
+        Some(owner) => println!(
+            "owner: {} ({:?}, generation {}, expires {})",
+            owner.owner_id, owner.phase, owner.generation, owner.expires_at
+        ),
+        None => println!("owner: none"),
+    }
+    if status.writers.is_empty() {
+        println!("writers: none");
+    } else {
+        for writer in &status.writers {
+            println!(
+                "writer: {} {} until {}",
+                writer.kind, writer.id, writer.expires_at
+            );
+        }
+    }
+    Ok(())
+}
+
+fn acquire_session_writer(
+    project_root: &Path,
+    kind: &str,
+) -> Result<Option<maintenance_gate::WriterLease>> {
+    let gate = maintenance_gate::MaintenanceGate::discover_optional(project_root)?;
+    match gate {
+        Some(gate) => gate
+            .acquire_writer(format!("{}-{}", kind, Uuid::new_v4()), kind)
+            .map(Some),
+        None => Ok(None),
     }
 }
 
@@ -2910,6 +3041,7 @@ fn launch_patch_session(request: &patch::PatchRequest) -> Result<String> {
         request.harness_id.as_str(),
         session_launch::HarnessCheck::Available,
     )?;
+    let _maintenance_writer = acquire_session_writer(&request.repo.root, "patch-session")?;
     let coven_home = coven_home_dir()?;
     let store_path = coven_home.join(STORE_FILE_NAME);
     let conn = store::open_store(&store_path)?;
@@ -3654,6 +3786,7 @@ fn run_session(
             )),
             session_launch::LaunchPathError::Cwd(error) => error.context("failed to resolve cwd"),
         })?;
+    let _maintenance_writer = acquire_session_writer(&project_root, "session")?;
     let coven_home = coven_home_dir()?;
     let store_path = coven_store_path()?;
     let conn = store::open_store(&store_path)?;

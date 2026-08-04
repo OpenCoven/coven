@@ -112,9 +112,24 @@ struct LiveSessionHandle {
     registration: Arc<LiveSessionRegistration>,
 }
 
-#[derive(Default)]
 struct LiveSessionRegistration {
     exited: AtomicBool,
+    writer: Mutex<Option<crate::maintenance_gate::WriterLease>>,
+}
+
+impl LiveSessionRegistration {
+    fn new(writer: Option<crate::maintenance_gate::WriterLease>) -> Self {
+        Self {
+            exited: AtomicBool::new(false),
+            writer: Mutex::new(writer),
+        }
+    }
+
+    fn release_writer(&self) {
+        if let Ok(mut writer) = self.writer.lock() {
+            drop(writer.take());
+        }
+    }
 }
 
 struct LiveSessionExitCleanup {
@@ -156,6 +171,7 @@ impl LiveSessionExitCleanup {
         };
         drop(sessions);
         drop(removed);
+        self.registration.release_writer();
         if was_poisoned {
             report_poisoned();
         }
@@ -192,7 +208,7 @@ impl LiveSessionRuntime {
             kind,
             input,
             killer,
-            Arc::new(LiveSessionRegistration::default()),
+            Arc::new(LiveSessionRegistration::new(None)),
         )
     }
 
@@ -232,6 +248,7 @@ impl LiveSessionRuntime {
         Ok(())
     }
 
+    #[cfg(test)]
     fn observer_for_session(
         &self,
         session_id: String,
@@ -239,7 +256,18 @@ impl LiveSessionRuntime {
         pty_runner::DetachedPtyObserver,
         Arc<LiveSessionRegistration>,
     ) {
-        let registration = Arc::new(LiveSessionRegistration::default());
+        self.observer_for_session_with_writer(session_id, None)
+    }
+
+    fn observer_for_session_with_writer(
+        &self,
+        session_id: String,
+        writer: Option<crate::maintenance_gate::WriterLease>,
+    ) -> (
+        pty_runner::DetachedPtyObserver,
+        Arc<LiveSessionRegistration>,
+    ) {
+        let registration = Arc::new(LiveSessionRegistration::new(writer));
         let cleanup = LiveSessionExitCleanup {
             session_id: session_id.clone(),
             sessions: Arc::downgrade(&self.sessions),
@@ -346,6 +374,32 @@ static CLAUDE_JSON_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 
 impl SessionRuntime for LiveSessionRuntime {
     fn launch_session(&self, launch: &SessionLaunch) -> Result<()> {
+        self.launch_session_inner(launch, None)
+    }
+
+    fn launch_session_with_writer(
+        &self,
+        launch: &SessionLaunch,
+        writer: crate::maintenance_gate::WriterLease,
+    ) -> Result<()> {
+        self.launch_session_inner(launch, Some(writer))
+    }
+
+    fn send_input(&self, session_id: &str, payload: &Value) -> Result<()> {
+        LiveSessionRuntime::send_input(self, session_id, payload)
+    }
+
+    fn kill_session(&self, session_id: &str) -> Result<()> {
+        LiveSessionRuntime::kill_session(self, session_id)
+    }
+}
+
+impl LiveSessionRuntime {
+    fn launch_session_inner(
+        &self,
+        launch: &SessionLaunch,
+        writer: Option<crate::maintenance_gate::WriterLease>,
+    ) -> Result<()> {
         let familiar_ctx = match (&self.coven_home, launch.familiar_id.as_deref()) {
             (Some(home), familiar_id) => {
                 crate::familiar_identity::resolve_optional(home, familiar_id)?
@@ -367,7 +421,8 @@ impl SessionRuntime for LiveSessionRuntime {
                 ..Default::default()
             },
         )?;
-        let (observer, registration) = self.observer_for_session(launch.id.clone());
+        let (observer, registration) =
+            self.observer_for_session_with_writer(launch.id.clone(), writer);
         let observer = Some(observer);
 
         if launch.launch_mode == crate::harness::HarnessLaunchMode::Stream {
@@ -3618,7 +3673,7 @@ mod tests {
         use std::panic::{catch_unwind, AssertUnwindSafe};
 
         let runtime = LiveSessionRuntime::default();
-        let registration = Arc::new(LiveSessionRegistration::default());
+        let registration = Arc::new(LiveSessionRegistration::new(None));
         runtime.register_kind_with_registration(
             "poison-report-session".to_string(),
             LiveSessionKind::Pty,

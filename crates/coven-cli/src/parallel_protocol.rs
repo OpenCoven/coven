@@ -86,6 +86,7 @@ pub(crate) fn run_wt_command(
 
 pub(crate) fn claim_acquire(branch: &str) -> Result<()> {
     let repo = Repo::discover()?;
+    let _writer = claim_writer(&repo, "claim-acquire")?;
     let agent_id = agent_id(&repo);
 
     // Creating the claim file is the only step that decides the race, so it
@@ -164,6 +165,7 @@ pub(crate) fn claim_acquire(branch: &str) -> Result<()> {
 
 pub(crate) fn claim_release(branch: &str) -> Result<()> {
     let repo = Repo::discover()?;
+    let _writer = claim_writer(&repo, "claim-release")?;
     let agent_id = agent_id(&repo);
     match read_claim(&repo, branch)? {
         ClaimFileState::Parsed(existing) => {
@@ -193,6 +195,7 @@ pub(crate) fn claim_release(branch: &str) -> Result<()> {
 
 pub(crate) fn claim_heartbeat(branch: &str) -> Result<()> {
     let repo = Repo::discover()?;
+    let _writer = claim_writer(&repo, "claim-heartbeat")?;
     let agent_id = agent_id(&repo);
     let now = unix_now();
     let mut claim = match read_claim(&repo, branch)? {
@@ -230,6 +233,7 @@ pub(crate) fn claim_heartbeat(branch: &str) -> Result<()> {
 
 pub(crate) fn claim_canary(branch: &str) -> Result<()> {
     let repo = Repo::discover()?;
+    let _writer = claim_writer(&repo, "claim-canary")?;
     let head = current_head()?;
     let canary_path = repo.common_dir.join("AGENT_HEAD_AT_START");
     fs::write(&canary_path, format!("branch={branch}\nhead={head}\n"))
@@ -961,6 +965,14 @@ impl Repo {
         };
         Ok(Self { root, common_dir })
     }
+}
+
+fn claim_writer(repo: &Repo, kind: &str) -> Result<crate::maintenance_gate::WriterLease> {
+    let gate = crate::maintenance_gate::MaintenanceGate::discover(&repo.root)?;
+    gate.acquire_writer(
+        format!("claim-{}-{}", std::process::id(), uuid::Uuid::new_v4()),
+        kind,
+    )
 }
 
 fn install_hook(hooks_dir: &Path, hook: &str, contents: &str) -> Result<()> {

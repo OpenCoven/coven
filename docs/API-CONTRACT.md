@@ -135,6 +135,9 @@ All API errors use the following stable envelope. Clients must branch on `error.
 | `project_root_violation`| 400        | Reserved. Cwd-outside-root currently emits `invalid_request` with the violation message in the body; promoting to its own code would let clients branch without parsing prose. |
 | `pty_spawn_failed`     | 500         | Reserved. PTY spawn failures currently emit `launch_failed`; promoting to its own code would let clients distinguish "the PTY couldn't open" (likely a host issue) from "the harness CLI errored at startup" (likely an auth/config issue). |
 | `launch_failed`        | 500         | Daemon accepted the launch payload but the runtime (PTY/pipe spawn, initial-message write, harness CLI startup) failed. `details.sessionId` is the row that was inserted and marked `failed`. |
+| `maintenance_locked`   | 423         | A valid repository maintenance owner is draining or holds the common-directory gate. `details.owner` carries its fenced generation and deadline. |
+| `maintenance_state_invalid` | 423  | The repository maintenance protocol contains malformed or ambiguous state. Coven fails closed rather than launching a writer. |
+| `maintenance_gate_unavailable` | 423 | Coven could not establish a repository maintenance writer intent. |
 | `send_input_failed`    | 500         | Daemon accepted the input payload but the runtime write failed (closed pipe, killed process, IO error). `details.sessionId` is the affected session. |
 | `kill_failed`          | 500         | Daemon accepted the kill request but the runtime signal/kill call failed (permission, missing process, IO error). `details.sessionId` is the affected session. |
 | `runtime_unavailable`  | 503         | The session runtime is unavailable.              |
