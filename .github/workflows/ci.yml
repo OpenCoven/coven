@@ -50,9 +50,11 @@ jobs:
       - name: Build coven
         run: cargo build -p coven-cli --locked
       - name: Validate benchmark runner
-        run: node --test scripts/benchmark-cli.test.mjs
+        run: node --test scripts/benchmark-cli.test.mjs scripts/benchmark-chaos.test.mjs
       - name: Collect non-gating baseline artifact
         run: node scripts/benchmark-cli.mjs --binary target/debug/coven --iterations 3 --output coven-perf.json
+      - name: Collect concurrent runtime baseline artifact
+        run: node scripts/benchmark-chaos.mjs --binary target/debug/coven --output coven-chaos.json
       - name: Collect deterministic TUI scheduling metric
         run: |
           set -o pipefail
@@ -63,6 +65,7 @@ jobs:
           name: coven-cli-performance-baseline
           path: |
             coven-perf.json
+            coven-chaos.json
             coven-tui-metrics.txt
           if-no-files-found: error
 

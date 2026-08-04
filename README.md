@@ -664,6 +664,26 @@ poll/draw counters. These outputs are trend data: CI uploads them as artifacts
 and validates fixture construction, but does not fail pull requests on
 wall-clock thresholds.
 
+### Concurrent runtime baseline
+
+Run the complementary concurrent-session baseline before making a throughput,
+storage, or cancellation optimization:
+
+```bash
+cargo build -p coven-cli --locked
+node scripts/benchmark-chaos.mjs --binary target/debug/coven --output /tmp/coven-chaos.json
+```
+
+The command always exercises 1, 8, and 32 concurrent deterministic harness
+sessions, records launch-to-first-output percentiles, throughput, cancellation
+acknowledgement, and SQLite file growth, and writes a redacted JSON report.
+It deliberately labels metrics that the current runtime cannot expose (SQLite
+connection/transaction counts and an event-writer queue) rather than deriving
+or inventing them. The bounded writer work in #596 must replace those labels
+with direct counters; Cave owns the slow-WebSocket-consumer lane in #4317.
+Fault-injection and platform-specific crash coverage remain explicit matrix
+entries, so a trend artifact cannot be mistaken for a passing chaos test.
+
 ### Architecture rules for contributors
 
 - **Rust is the authority layer.** Process launch, cwd/project-root validation, PTY lifecycle, session persistence, and socket request enforcement are all Rust's responsibility. TypeScript clients improve UX but are never the trust boundary.
