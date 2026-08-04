@@ -256,6 +256,13 @@ fn append_home_surfaces(
     push_path(surfaces, "state.memory", &home.join("memory"), source, cwd);
     push_path(
         surfaces,
+        "state.memory_migrations",
+        &home.join(crate::memory_import::MIGRATIONS_DIRECTORY),
+        source,
+        cwd,
+    );
+    push_path(
+        surfaces,
         "state.pending_proposals",
         &home.join("pending"),
         source,
@@ -351,6 +358,7 @@ fn append_unresolved_home_surfaces(surfaces: &mut Vec<PathSurface>, cwd: &Path) 
         "state.executor_node_config",
         "state.exports",
         "state.memory",
+        "state.memory_migrations",
         "state.pending_proposals",
         "state.research",
         "state.reset_backups",

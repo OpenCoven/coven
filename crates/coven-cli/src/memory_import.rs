@@ -1049,7 +1049,8 @@ fn opened_metadata_stable(before: &cap_std::fs::Metadata, after: &cap_std::fs::M
 }
 
 const IMPORT_PROTOCOL_VERSION: u32 = 1;
-const MIGRATIONS_DIRECTORY: &str = "memory-migrations";
+/// Root for durable familiar-memory import journals and staged bundles.
+pub(crate) const MIGRATIONS_DIRECTORY: &str = "memory-migrations";
 const MANIFEST_FILE: &str = "manifest.json";
 const JOURNAL_FILE: &str = "journal.jsonl";
 const STAGED_DIRECTORY: &str = "staged";
