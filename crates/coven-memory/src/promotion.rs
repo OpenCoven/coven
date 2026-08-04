@@ -217,11 +217,7 @@ pub fn reconcile_promotion(
             }
         }
         PromotionJournalState::MetadataPending | PromotionJournalState::VectorsDurable => {
-            if snapshot_and_attestation_valid
-                && metadata_row_present
-                && vectors_valid
-                && !manifest_valid
-            {
+            if snapshot_and_attestation_valid && metadata_row_present && vectors_valid {
                 ReconciliationAction::RollForward
             } else {
                 ReconciliationAction::ManualRecovery
@@ -261,8 +257,8 @@ pub fn validate_portable_reference(reference: &str) -> Result<()> {
     if reference.starts_with("agent:") {
         bail!("runtime-specific session keys are not portable");
     }
-    if is_absolute_on_any_supported_platform(reference) {
-        bail!("absolute paths are not portable");
+    if is_absolute_or_drive_qualified_on_any_supported_platform(reference) {
+        bail!("absolute or drive-relative paths are not portable");
     }
     if reference.split(['/', '\\']).any(|segment| segment == "..") {
         bail!("parent traversal is not allowed in portable references");
@@ -280,19 +276,17 @@ pub fn validate_portable_reference(reference: &str) -> Result<()> {
     Ok(())
 }
 
-fn is_absolute_on_any_supported_platform(value: &str) -> bool {
+fn is_absolute_or_drive_qualified_on_any_supported_platform(value: &str) -> bool {
     if value.starts_with('/') || value.starts_with('\\') {
         return true;
     }
     let bytes = value.as_bytes();
-    bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && matches!(bytes[2], b'/' | b'\\')
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 fn validate_ulid(value: &str, field: &str) -> Result<()> {
     if value.len() != 26
+        || !matches!(value.as_bytes().first(), Some(b'0'..=b'7'))
         || !value
             .bytes()
             .all(|byte| matches!(byte, b'0'..=b'9' | b'A'..=b'H' | b'J'..=b'K' | b'M'..=b'N' | b'P'..=b'T' | b'V'..=b'Z'))
@@ -370,10 +364,14 @@ mod tests {
     }
 
     #[test]
-    fn portable_reference_rejects_absolute_paths_on_every_supported_platform() {
-        for reference in ["/absolute/example.md", r"C:\absolute\example.md"] {
-            let error = validate_portable_reference(reference).expect_err("absolute path");
-            assert!(error.to_string().contains("absolute"));
+    fn portable_reference_rejects_non_relative_paths_on_every_supported_platform() {
+        for reference in [
+            "/absolute/example.md",
+            r"C:\absolute\example.md",
+            r"C:drive-relative\example.md",
+        ] {
+            let error = validate_portable_reference(reference).expect_err("non-relative path");
+            assert!(error.to_string().contains("paths are not portable"));
         }
     }
 
@@ -399,6 +397,10 @@ mod tests {
         invalid_ulid.claim_id.make_ascii_lowercase();
         assert!(invalid_ulid.validate().is_err());
 
+        let mut overflowing_ulid = claim();
+        overflowing_ulid.claim_id.replace_range(..1, "Z");
+        assert!(overflowing_ulid.validate().is_err());
+
         let mut invalid_mobile = claim();
         invalid_mobile.mobile_projection.as_mut().unwrap().memory_id = CLAIM_ID.to_owned();
         assert!(invalid_mobile.validate().is_err());
@@ -419,7 +421,7 @@ mod tests {
     }
 
     #[test]
-    fn journal_is_append_only_and_requires_all_artifacts_to_roll_forward() {
+    fn journal_is_append_only_and_rolls_forward_completed_artifacts() {
         assert!(PromotionJournalState::Prepared
             .can_transition_to(PromotionJournalState::SnapshotDurable));
         assert!(!PromotionJournalState::Prepared.can_transition_to(PromotionJournalState::Visible));
@@ -431,7 +433,7 @@ mod tests {
                 true,
                 true,
                 true,
-                false
+                true
             ),
             ReconciliationAction::RollForward
         );
