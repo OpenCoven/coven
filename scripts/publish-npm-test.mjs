@@ -542,6 +542,13 @@ test('release workflow builds and publishes Intel macOS as a separate target', (
   assert.match(workflow, /node scripts\/publish-npm\.mjs --target=macos-x64 --skip-build --publish --skip-wrapper/);
 });
 
+test('CI smoke-tests the Intel macOS wrapper on its native runner', () => {
+  const workflowPath = new URL(['..', '.github', 'workflows', 'ci.yml'].join('/'), import.meta.url);
+  const workflow = readFileSync(workflowPath, 'utf8');
+  assert.match(workflow, /os: macos-15-intel[\s\S]*npm-target: macos-x64[\s\S]*rust-target: x86_64-apple-darwin/);
+  assert.match(workflow, /node scripts\/test-cli-prepublish\.mjs --target=\$\{\{ matrix\.npm-target \}\} --skip-build --skip-secrets-scan/);
+});
+
 test('release workflow builds and dry-runs windows package', () => {
   const workflowPath = new URL(
     ['..', '.github', 'workflows', 'release-npm.yml'].join('/'),
