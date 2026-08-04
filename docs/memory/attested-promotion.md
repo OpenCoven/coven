@@ -13,7 +13,7 @@ There is intentionally no `coven memory promote` command yet. The Rust contract 
 ## Identity and privacy
 
 - The canonical claim-log identity is an uppercase ULID. It is portable and is used for attestation and supersession links.
-- A portable reference may be a relative path or `session://<familiar>/<date>/<slug>`. Runtime session keys, absolute paths, and traversal segments are rejected.
+- A portable reference may be a relative path or `session://<familiar>/<date>/<slug>`. Runtime session keys, absolute and Windows drive-relative paths, and traversal segments are rejected.
 - Privacy is explicit (`public`, `private`, or `restricted`); a caller may not infer it from a filename or familiar.
 - `verified` claims carry snapshot and evidence SHA-256 digests. Claims without adequate evidence must remain `needs-review`.
 - Existing mobile memory DTOs use UUIDs. A promotion is omitted from that API until it has an explicit UUID projection; ULIDs are never put into its UUID supersession fields.
