@@ -285,7 +285,7 @@ fn run_worker(
         }
         Err(error) => {
             let message = format!("failed to open daemon event writer: {error:#}");
-            fail_writer(&shared, message.clone());
+            let _ = fail_writer(&shared, message.clone());
             let _ = ready.send(Err(message));
             return;
         }
@@ -295,9 +295,9 @@ fn run_worker(
         let batch = take_batch(&shared);
         let bytes: usize = batch.iter().map(|item| item.bytes).sum();
         let result = commit_batch(&mut conn, &coven_home, &batch);
-        release_bytes(&shared, bytes);
         match result {
             Ok(committed) => {
+                release_bytes(&shared, bytes);
                 let mut health = lock_health(&shared);
                 health.transactions += 1;
                 health.committed_events += committed as u64;
@@ -306,8 +306,15 @@ fn run_worker(
             }
             Err(error) => {
                 let message = format!("event writer commit failed: {error:#}");
-                fail_writer(&shared, message.clone());
+                // Latch failure before releasing capacity. Otherwise a producer
+                // can enqueue a critical event in the release/failure window and
+                // wait forever after this worker exits.
+                let pending = fail_writer(&shared, message.clone());
                 complete(&batch, Err(message));
+                complete(
+                    &pending,
+                    Err("event writer stopped after a commit failure".to_string()),
+                );
                 return;
             }
         }
@@ -487,13 +494,17 @@ fn complete(batch: &[QueuedEvent], result: std::result::Result<(), String>) {
     }
 }
 
-fn fail_writer(shared: &Arc<Shared>, message: String) {
+fn fail_writer(shared: &Arc<Shared>, message: String) -> Vec<QueuedEvent> {
     let mut queue = lock_queue(shared);
     queue.failed = Some(message.clone());
+    queue.queued_bytes = 0;
+    let pending = queue.items.drain(..).collect();
     let mut health = lock_health(shared);
     health.state = "failed".to_string();
+    health.queued_bytes = 0;
     health.last_error = Some(message);
     shared.available.notify_all();
+    pending
 }
 
 fn lock_queue(shared: &Arc<Shared>) -> std::sync::MutexGuard<'_, Queue> {
@@ -562,6 +573,26 @@ mod tests {
     }
 
     #[test]
+    fn flushes_live_output_after_the_coalesce_window() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let conn = store::open_store(&home.path().join(STORE_FILE_NAME))?;
+        store::insert_session(&conn, &session("s-1"))?;
+        let writer = EventWriter::start(home.path().to_path_buf())?;
+        assert!(writer.record_output("s-1", "still running".to_string())?);
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let events = store::list_events(&conn, "s-1")?;
+            if events.iter().any(|event| event.kind == "output") {
+                break;
+            }
+            anyhow::ensure!(Instant::now() < deadline, "live output did not flush");
+            thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn one_connection_and_batched_transactions_handle_noisy_output() -> Result<()> {
         let home = tempfile::tempdir()?;
         let conn = store::open_store(&home.path().join(STORE_FILE_NAME))?;
@@ -615,5 +646,58 @@ mod tests {
             },
         )?;
         Ok(())
+    }
+
+    #[test]
+    fn writer_failure_drains_queued_critical_completions() {
+        let shared = Arc::new(Shared {
+            queue: Mutex::new(Queue {
+                items: VecDeque::new(),
+                queued_bytes: EVENT_OVERHEAD_BYTES,
+                failed: None,
+            }),
+            available: Condvar::new(),
+            capacity_bytes: DEFAULT_CAPACITY_BYTES,
+            output_capacity_bytes: DEFAULT_CAPACITY_BYTES - RESERVED_CRITICAL_BYTES,
+            health: Mutex::new(EventWriterHealth {
+                state: "healthy".to_string(),
+                queued_bytes: EVENT_OVERHEAD_BYTES,
+                capacity_bytes: DEFAULT_CAPACITY_BYTES,
+                dropped_output_events: 0,
+                dropped_output_bytes: 0,
+                connection_opens: 0,
+                transactions: 0,
+                committed_events: 0,
+                last_error: None,
+            }),
+        });
+        let (completion, receiver) = mpsc::sync_channel(1);
+        lock_queue(&shared).items.push_back(QueuedEvent {
+            event: PendingEvent::Record(store::EventRecord {
+                seq: 0,
+                id: "event".to_string(),
+                session_id: "s-1".to_string(),
+                kind: "error".to_string(),
+                payload_json: "{}".to_string(),
+                created_at: "2026-08-04T00:00:00Z".to_string(),
+            }),
+            bytes: EVENT_OVERHEAD_BYTES,
+            completion: Some(completion),
+        });
+
+        let pending = fail_writer(&shared, "simulated failure".to_string());
+        complete(
+            &pending,
+            Err("event writer stopped after a commit failure".to_string()),
+        );
+
+        assert!(receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .is_err());
+        assert!(lock_queue(&shared).items.is_empty());
+        let health = lock_health(&shared);
+        assert_eq!(health.state, "failed");
+        assert_eq!(health.queued_bytes, 0);
     }
 }

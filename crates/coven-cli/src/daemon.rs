@@ -3166,26 +3166,30 @@ mod tests {
     }
 
     #[test]
-    fn output_observer_records_each_callback_as_an_event() -> Result<()> {
+    fn output_observer_coalesces_callbacks_and_flushes_before_exit() -> Result<()> {
         // UTF-8 boundary safety lives in pty_runner::drain_detached_output
-        // now (see its tests). The observer's only job is to take each
-        // chunk it receives and persist it as an `output` event. This
-        // test pins that minimal contract by feeding the observer two
-        // pre-decoded chunks and checking they show up verbatim in the
-        // events table.
+        // now (see its tests). The writer may combine adjacent chunks, but
+        // every accepted byte must be persisted before the terminal event.
         let temp_dir = tempfile::tempdir()?;
         let conn = crate::store::open_store(&temp_dir.path().join("coven.sqlite3"))?;
         let session = session_record("buffered");
         crate::store::insert_session(&conn, &session)?;
 
         let observer = output_observer(temp_dir.path().to_path_buf(), session.id.clone());
-        let pty_runner::DetachedPtyObserver { mut on_output, .. } = observer;
+        let pty_runner::DetachedPtyObserver {
+            mut on_output,
+            on_exit,
+        } = observer;
 
         // The drain layer would only ever hand us valid-UTF-8 slices,
         // so simulate that: a complete emoji and then a plain ASCII
         // chunk, each fully decodable on its own.
         on_output("🎉".as_bytes().to_vec());
         on_output(b" done".to_vec());
+        on_exit(pty_runner::PtyRunResult {
+            status: "completed",
+            exit_code: Some(0),
+        });
 
         let events = crate::store::list_events(&conn, &session.id)?;
         let mut decoded = String::new();
