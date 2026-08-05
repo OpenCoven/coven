@@ -10,7 +10,7 @@ description: "Coven supports coding-agent CLIs as harnesses through PTY adapters
 
 A **harness** is an external coding-agent CLI that Coven can launch and supervise inside an explicit project root. Coven owns the PTY, the session record, and the event log; the harness owns the conversation, the tool calls, and provider authentication.
 
-For adapter authors, the versioned [Adapter contract](/ADAPTER-SPEC) defines
+For adapter authors, the versioned [Adapter contract](/reference/adapter-spec) defines
 the negotiated capability, stream, lifecycle, cancellation, and error boundary
 between the Rust runner and each harness integration.
 
