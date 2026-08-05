@@ -2860,35 +2860,36 @@ pub fn insert_event_with_privacy(
     insert_event_raw(conn, record, &redacted_payload, redaction_status, sensitive)?;
 
     if config.persist_raw_artifacts && sensitive {
-        let artifact_result =
-            retention_expires_at(&record.created_at, config.raw_artifact_retention_days).and_then(
-                |expires_at| {
-                    SensitiveArtifactStore::load(coven_home)
-                        .and_then(|store| {
-                            store.encrypt(
-                                &record.session_id,
-                                &record.id,
-                                &record.kind,
-                                record.payload_json.as_bytes(),
-                            )
-                        })
-                        .and_then(|encrypted| {
-                            insert_sensitive_artifact(
-                                conn,
-                                &SensitiveArtifactRecord {
-                                    id: record.id.clone(),
-                                    session_id: record.session_id.clone(),
-                                    event_id: record.id.clone(),
-                                    kind: record.kind.clone(),
-                                    nonce: encrypted.nonce,
-                                    ciphertext: encrypted.ciphertext,
-                                    created_at: record.created_at.clone(),
-                                    expires_at,
-                                },
-                            )
-                        })
-                },
-            );
+        let artifact_result = retention_expires_at(
+            &record.created_at,
+            config.raw_artifact_retention_days.max(1),
+        )
+        .and_then(|expires_at| {
+            SensitiveArtifactStore::load(coven_home)
+                .and_then(|store| {
+                    store.encrypt(
+                        &record.session_id,
+                        &record.id,
+                        &record.kind,
+                        record.payload_json.as_bytes(),
+                    )
+                })
+                .and_then(|encrypted| {
+                    insert_sensitive_artifact(
+                        conn,
+                        &SensitiveArtifactRecord {
+                            id: record.id.clone(),
+                            session_id: record.session_id.clone(),
+                            event_id: record.id.clone(),
+                            kind: record.kind.clone(),
+                            nonce: encrypted.nonce,
+                            ciphertext: encrypted.ciphertext,
+                            created_at: record.created_at.clone(),
+                            expires_at,
+                        },
+                    )
+                })
+        });
         redaction_status = if artifact_result.is_ok() {
             "redacted_raw_encrypted"
         } else {
@@ -3698,20 +3699,22 @@ fn storage_health_with_free_disk_or_unavailable(
     event_writer: Option<&crate::event_writer::EventWriterHealth>,
 ) -> StorageHealth {
     storage_health_with_free_disk(coven_home, free_disk_bytes, event_writer).unwrap_or_else(
-        |error| unavailable_storage_health(error, Some(free_disk_bytes), event_writer),
+        |error| unavailable_storage_health(coven_home, error, Some(free_disk_bytes), event_writer),
     )
 }
 
 pub fn unavailable_storage_health(
+    coven_home: &Path,
     _error: impl ToString,
     known_free_disk_bytes: Option<u64>,
     event_writer: Option<&crate::event_writer::EventWriterHealth>,
 ) -> StorageHealth {
+    let store_path = coven_home.join("coven.sqlite3");
     let (writer_backlog_events, writer_backlog_bytes) = writer_backlog(event_writer);
     StorageHealth {
         status: "degraded".to_string(),
-        database_bytes: 0,
-        wal_bytes: 0,
+        database_bytes: file_size(&store_path),
+        wal_bytes: file_size(&wal_path(&store_path)),
         oldest_retained_event_at: None,
         last_prune_at: None,
         prune_age_seconds: None,
@@ -4937,6 +4940,33 @@ mod tests {
     }
 
     #[test]
+    fn raw_artifact_zero_day_retention_uses_the_one_day_minimum() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        std::fs::write(
+            temp_dir.path().join("privacy.toml"),
+            "persist_raw_artifacts = true\nraw_artifact_retention_days = 0\n",
+        )?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+        insert_session(&conn, &session_record("session-1", "2026-04-27T06:00:00Z"))?;
+        let fake = fake_openai_key();
+        let record = EventRecord {
+            seq: 0,
+            id: "event-zero-retention".to_string(),
+            session_id: "session-1".to_string(),
+            kind: "output".to_string(),
+            payload_json: serde_json::json!({ "data": format!("secret {fake}") }).to_string(),
+            created_at: "2026-04-27T06:01:00Z".to_string(),
+        };
+
+        insert_event_with_privacy(&conn, temp_dir.path(), &record)?;
+
+        let artifact = get_sensitive_artifact(&conn, "session-1", "event-zero-retention")?
+            .expect("artifact should use the minimum retention instead of expiring immediately");
+        assert_eq!(artifact.expires_at, "2026-04-28T06:01:00.000000000Z");
+        Ok(())
+    }
+
+    #[test]
     fn raw_artifact_key_failure_keeps_redacted_event_only() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         std::fs::write(
@@ -5372,14 +5402,6 @@ mod tests {
         Ok(())
     }
 
-    fn unavailable_storage_health_for_test(
-        error: impl ToString,
-        known_free_disk_bytes: Option<u64>,
-        event_writer: Option<&crate::event_writer::EventWriterHealth>,
-    ) -> StorageHealth {
-        unavailable_storage_health(error, known_free_disk_bytes, event_writer)
-    }
-
     fn storage_health_after_sampling_free_disk_for_test(
         coven_home: &Path,
         free_disk_bytes: u64,
@@ -5393,7 +5415,11 @@ mod tests {
     ) -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let home = temp_dir.path();
-        open_store(&home.join("coven.sqlite3"))?;
+        let store_path = home.join("coven.sqlite3");
+        open_store(&store_path)?;
+        let expected_database_bytes = std::fs::metadata(&store_path)?.len();
+        let wal_path = wal_path(&store_path);
+        std::fs::write(&wal_path, b"wal")?;
         std::fs::write(
             home.join("privacy.toml"),
             "log_retention_days = \"broken\"\n",
@@ -5418,6 +5444,8 @@ mod tests {
         );
 
         assert_eq!(health.status, "degraded");
+        assert_eq!(health.database_bytes, expected_database_bytes);
+        assert_eq!(health.wal_bytes, 3);
         assert_eq!(health.free_disk_bytes, MAINTENANCE_MIN_FREE_DISK_BYTES);
         assert!(!health.maintenance_blocked);
         assert_eq!(health.writer_backlog_events, 7);
@@ -5476,7 +5504,9 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_storage_health_without_known_free_disk_preserves_backlog_without_blocking() {
+    fn unavailable_storage_health_without_known_free_disk_preserves_backlog_without_blocking(
+    ) -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
         let writer = crate::event_writer::EventWriterHealth {
             state: "pressured".to_string(),
             queued_events: 7,
@@ -5490,7 +5520,7 @@ mod tests {
             last_error: None,
         };
 
-        let health = unavailable_storage_health_for_test("boom", None, Some(&writer));
+        let health = unavailable_storage_health(temp_dir.path(), "boom", None, Some(&writer));
 
         assert_eq!(health.status, "degraded");
         assert_eq!(health.free_disk_bytes, 0);
@@ -5501,6 +5531,7 @@ mod tests {
             health.last_maintenance_error.as_deref(),
             Some("storage health unavailable")
         );
+        Ok(())
     }
 
     #[test]

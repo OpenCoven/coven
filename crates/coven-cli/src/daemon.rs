@@ -2043,6 +2043,7 @@ pub fn daemon_recovery_log_path(coven_home: &Path) -> PathBuf {
 
 const DAEMON_RECOVERY_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const DAEMON_RECOVERY_LOG_BACKUPS: u8 = 3;
+const DAEMON_RECOVERY_LOG_TRUNCATION_MARKER: &str = "... [truncated]\n";
 
 fn recovery_log_lock() -> &'static Mutex<()> {
     static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
@@ -2051,7 +2052,26 @@ fn recovery_log_lock() -> &'static Mutex<()> {
 
 pub fn append_daemon_recovery_log(coven_home: &Path, msg: &str) {
     let path = daemon_recovery_log_path(coven_home);
-    let line = format!("[{}] {}\n", crate::api::current_timestamp(), msg);
+    let timestamp = crate::api::current_timestamp();
+    let prefix = format!("[{timestamp}] ");
+    let max_bytes = DAEMON_RECOVERY_LOG_MAX_BYTES as usize;
+    let full_len = prefix.len().saturating_add(msg.len()).saturating_add(1);
+    let mut line = String::with_capacity(full_len.min(max_bytes));
+    line.push_str(&prefix);
+    if full_len <= max_bytes {
+        line.push_str(msg);
+        line.push('\n');
+    } else {
+        let message_bytes = max_bytes
+            .saturating_sub(prefix.len())
+            .saturating_sub(DAEMON_RECOVERY_LOG_TRUNCATION_MARKER.len());
+        let mut truncate_at = message_bytes.min(msg.len());
+        while !msg.is_char_boundary(truncate_at) {
+            truncate_at -= 1;
+        }
+        line.push_str(&msg[..truncate_at]);
+        line.push_str(DAEMON_RECOVERY_LOG_TRUNCATION_MARKER);
+    }
     let _guard = recovery_log_lock()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -5570,14 +5590,52 @@ mod tests {
         append_daemon_recovery_log(temp_dir.path(), "first event");
         append_daemon_recovery_log(temp_dir.path(), "second event");
         let log = std::fs::read_to_string(daemon_recovery_log_path(temp_dir.path()))?;
+        let mut entries = log.split_inclusive('\n');
+        for expected in ["first event", "second event"] {
+            let entry = entries.next().expect("expected recovery log entry");
+            assert!(
+                entry.starts_with('['),
+                "entry should start with a timestamp"
+            );
+            let (_, message) = entry
+                .split_once("] ")
+                .expect("entry should separate timestamp and message");
+            assert_eq!(message, format!("{expected}\n"));
+        }
+        assert!(entries.next().is_none(), "unexpected recovery log entry");
+        Ok(())
+    }
+
+    #[test]
+    fn append_daemon_recovery_log_truncates_oversized_ascii_entry() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let message = "x".repeat(DAEMON_RECOVERY_LOG_MAX_BYTES as usize + 1024);
+
+        append_daemon_recovery_log(temp_dir.path(), &message);
+
+        let log = std::fs::read(daemon_recovery_log_path(temp_dir.path()))?;
         assert!(
-            log.contains("first event"),
-            "log should record the first event, got: {log}"
+            log.len() <= DAEMON_RECOVERY_LOG_MAX_BYTES as usize,
+            "active recovery log exceeded its byte bound: {}",
+            log.len()
         );
         assert!(
-            log.contains("second event"),
-            "second append should not overwrite the first, got: {log}"
+            log.ends_with(b"... [truncated]\n"),
+            "oversized entry should end with a truncation marker"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn append_daemon_recovery_log_truncates_multibyte_entry_on_char_boundary() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let message = "🧙".repeat(DAEMON_RECOVERY_LOG_MAX_BYTES as usize / "🧙".len() + 1024);
+
+        append_daemon_recovery_log(temp_dir.path(), &message);
+
+        let log = std::fs::read_to_string(daemon_recovery_log_path(temp_dir.path()))?;
+        assert!(log.len() <= DAEMON_RECOVERY_LOG_MAX_BYTES as usize);
+        assert!(log.ends_with("... [truncated]\n"));
         Ok(())
     }
 

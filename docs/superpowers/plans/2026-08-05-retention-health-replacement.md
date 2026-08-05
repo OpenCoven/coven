@@ -331,7 +331,9 @@ Change the unavailable constructor to:
 
 ```rust
 pub fn unavailable_storage_health(
+    coven_home: &Path,
     _error: impl ToString,
+    known_free_disk_bytes: Option<u64>,
     event_writer: Option<&crate::event_writer::EventWriterHealth>,
 ) -> StorageHealth
 ```
@@ -520,7 +522,7 @@ fn health_response_with_hub(
     }
     response.storage = Some(
         store::storage_health(coven_home, event_writer.as_ref()).unwrap_or_else(|error| {
-            store::unavailable_storage_health(error, event_writer.as_ref())
+            store::unavailable_storage_health(coven_home, error, None, event_writer.as_ref())
         }),
     );
     response.event_writer = event_writer;
