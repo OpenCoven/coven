@@ -6766,7 +6766,8 @@ mod tests {
         assert!(response.body.contains(r#""scheduler":true"#));
         assert!(response.body.contains(r#""hub":true"#));
         assert!(response.body.contains(r#""executorDispatch":true"#));
-        assert!(!response.body.contains(r#""role":"hub""#));
+let body: serde_json::Value = serde_json::from_str(&response.body)?;
+assert!(body.get("hub").is_none() || body["hub"].is_null());
         assert!(response.body.contains(r#""structuredErrors":true"#));
         assert!(response.body.contains(r#""storage":{"status""#));
         assert!(response.body.contains(r#""writerBacklogEvents":0"#));
