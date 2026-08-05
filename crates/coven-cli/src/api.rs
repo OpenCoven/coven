@@ -6766,11 +6766,15 @@ mod tests {
         assert!(response.body.contains(r#""scheduler":true"#));
         assert!(response.body.contains(r#""hub":true"#));
         assert!(response.body.contains(r#""executorDispatch":true"#));
-        assert!(response.body.contains(r#""role":"hub""#));
         assert!(response.body.contains(r#""structuredErrors":true"#));
         assert!(response.body.contains(r#""storage":{"status""#));
         assert!(response.body.contains(r#""writerBacklogEvents":0"#));
         assert!(response.body.contains(r#""freeDiskBytes""#));
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert!(
+            body.get("hub").is_none(),
+            "health must omit hub state when no initialized store exists"
+        );
         Ok(())
     }
 
@@ -6803,6 +6807,46 @@ mod tests {
                 last_error: None,
             })
         }
+    }
+
+    #[test]
+    fn health_does_not_create_store_files_in_writable_empty_home() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let writable_probe = temp_dir.path().join("writable-probe");
+        std::fs::write(&writable_probe, "probe")?;
+        std::fs::remove_file(writable_probe)?;
+
+        let response = handle_request("GET", "/health", temp_dir.path(), None)?;
+
+        assert_eq!(response.status, 200);
+        for file_name in ["coven.sqlite3", "coven.sqlite3-wal", "coven.sqlite3-shm"] {
+            assert!(
+                !temp_dir.path().join(file_name).exists(),
+                "{file_name} must not be created by health"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn hub_status_does_not_create_store_files_in_writable_empty_home() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let writable_probe = temp_dir.path().join("writable-probe");
+        std::fs::write(&writable_probe, "probe")?;
+        std::fs::remove_file(writable_probe)?;
+
+        let response = handle_request("GET", "/api/v1/hub/status", temp_dir.path(), None)?;
+
+        assert_eq!(response.status, 503);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "hub_unavailable");
+        for file_name in ["coven.sqlite3", "coven.sqlite3-wal", "coven.sqlite3-shm"] {
+            assert!(
+                !temp_dir.path().join(file_name).exists(),
+                "{file_name} must not be created by hub status"
+            );
+        }
+        Ok(())
     }
 
     #[test]

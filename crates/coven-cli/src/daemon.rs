@@ -2456,7 +2456,12 @@ pub(crate) fn acquire_serve_lock(coven_home: &Path) -> Result<std::fs::File> {
 }
 
 fn initialize_daemon_store(coven_home: &Path) -> Result<()> {
-    crate::store::initialize_store(&coven_home.join("coven.sqlite3"))
+    let store_path = coven_home.join("coven.sqlite3");
+    crate::store::initialize_store(&store_path)?;
+    let conn = crate::store::open_initialized_store(&store_path)?;
+    crate::hub::initialize_hub_identity(&conn)
+        .context("failed to initialize hub identity during daemon startup")?;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -3132,8 +3137,35 @@ mod tests {
     fn daemon_store_initialization_prepares_request_connections() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         initialize_daemon_store(temp_dir.path())?;
-        let conn = crate::store::open_initialized_store(&temp_dir.path().join("coven.sqlite3"))?;
+        let store_path = temp_dir.path().join("coven.sqlite3");
+        let conn = crate::store::open_initialized_store(&store_path)?;
         assert!(crate::store::list_sessions(&conn)?.is_empty());
+        let hub_id: String = conn.query_row(
+            "SELECT value FROM store_meta WHERE key = ?1",
+            [crate::hub::HUB_ID_META_KEY],
+            |row| row.get(0),
+        )?;
+        assert!(hub_id.starts_with("hub_"));
+
+        initialize_daemon_store(temp_dir.path())?;
+        let health = crate::api::handle_request("GET", "/health", temp_dir.path(), None)?;
+        assert_eq!(health.status, 200);
+        let health: serde_json::Value = serde_json::from_str(&health.body)?;
+        assert_eq!(health["hub"]["hubId"], hub_id);
+        assert_eq!(health["hub"]["nodesTotal"], 0);
+        assert_eq!(health["hub"]["nodesAvailable"], 0);
+
+        let summary = crate::hub::hub_health_summary(temp_dir.path())?;
+        assert_eq!(summary["hubId"], hub_id);
+        assert_eq!(summary["nodesTotal"], 0);
+        assert_eq!(summary["nodesAvailable"], 0);
+
+        let status = crate::hub::hub_status(temp_dir.path())?;
+        assert_eq!(status.status, 200);
+        let status: serde_json::Value = serde_json::from_str(&status.body)?;
+        assert_eq!(status["hubId"], hub_id);
+        assert_eq!(status["nodesTotal"], 0);
+        assert_eq!(status["nodesAvailable"], 0);
         Ok(())
     }
 

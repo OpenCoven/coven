@@ -3158,7 +3158,17 @@ fn run_logs_command(command: LogsCommand) -> Result<()> {
 
 fn prune_logs_command(dry_run: bool, raw_days: Option<u64>, event_days: Option<u64>) -> Result<()> {
     let home = coven_home_dir()?;
-    let config = privacy::load_with_settings(&home, settings::cached()).unwrap_or_default();
+    prune_logs_at_home(&home, dry_run, raw_days, event_days)
+}
+
+fn prune_logs_at_home(
+    home: &Path,
+    dry_run: bool,
+    raw_days: Option<u64>,
+    event_days: Option<u64>,
+) -> Result<()> {
+    let config = privacy::load_with_settings(home, settings::cached())
+        .context("failed to load privacy configuration for log pruning")?;
     let raw_days = raw_days
         .unwrap_or(config.raw_artifact_retention_days)
         .max(1);
@@ -6407,6 +6417,59 @@ mod tests {
             }
             other => panic!("expected logs prune command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn logs_prune_rejects_malformed_privacy_config_without_deleting_events() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let store_path = home.join(STORE_FILE_NAME);
+        let conn = store::open_store(&store_path)?;
+        store::insert_session(
+            &conn,
+            &test_session_record("prune-session", "completed", "codex", "Prune test", None),
+        )?;
+        store::insert_event(
+            &conn,
+            &store::EventRecord {
+                seq: 0,
+                id: "old-event".to_string(),
+                session_id: "prune-session".to_string(),
+                kind: "output".to_string(),
+                payload_json: r#"{"message":"old"}"#.to_string(),
+                created_at: "2000-01-01T00:00:00Z".to_string(),
+            },
+        )?;
+        drop(conn);
+        std::fs::write(home.join("privacy.toml"), "log_retention_days = [")?;
+
+        let result = prune_logs_at_home(home, false, None, None);
+        let conn = store::open_store(&store_path)?;
+        let remaining = store::list_events(&conn, "prune-session")?;
+
+        assert!(
+            result.is_err() && remaining.len() == 1,
+            "malformed privacy config must fail closed; result={result:?}, remaining_events={}",
+            remaining.len()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn logs_prune_rejects_malformed_privacy_config_without_creating_store() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let store_path = home.join(STORE_FILE_NAME);
+        std::fs::write(home.join("privacy.toml"), "log_retention_days = [")?;
+
+        let result = prune_logs_at_home(home, false, None, None);
+
+        assert!(
+            result.is_err() && !store_path.exists(),
+            "malformed privacy config must fail before store access; result={result:?}, store_exists={}",
+            store_path.exists()
+        );
+        Ok(())
     }
 
     #[test]

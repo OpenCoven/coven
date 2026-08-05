@@ -10,7 +10,7 @@
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -38,6 +38,20 @@ fn store_path(coven_home: &Path) -> std::path::PathBuf {
 
 fn hub_id(conn: &Connection) -> Result<String> {
     store::get_or_insert_store_meta(conn, HUB_ID_META_KEY, &format!("hub_{}", Uuid::new_v4()))
+}
+
+fn read_hub_id(conn: &Connection) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT value FROM store_meta WHERE key = ?1",
+        [HUB_ID_META_KEY],
+        |row| row.get(0),
+    )
+    .optional()
+    .context("failed to read hub id")
+}
+
+pub(crate) fn initialize_hub_identity(conn: &Connection) -> Result<String> {
+    hub_id(conn)
 }
 
 fn parse_capabilities(json_text: &str) -> Vec<String> {
@@ -173,19 +187,35 @@ pub(crate) fn apply_redispatch_outcome(
 }
 
 pub fn hub_health_summary(coven_home: &Path) -> Result<Value> {
-    let conn = store::open_store(&store_path(coven_home))?;
+    let conn = store::open_existing_store_read_only(&store_path(coven_home))?
+        .context("Coven store does not exist")?;
     let nodes = store::list_nodes(&conn)?;
     let available = nodes.iter().filter(|node| node.available).count();
     Ok(json!({
         "role": HUB_ROLE,
-        "hubId": hub_id(&conn)?,
+        "hubId": read_hub_id(&conn)?.context("hub identity is not initialized")?,
         "nodesTotal": nodes.len(),
         "nodesAvailable": available,
     }))
 }
 
 pub fn hub_status(coven_home: &Path) -> Result<ApiResponse> {
-    let conn = store::open_store(&store_path(coven_home))?;
+    let Some(conn) = store::open_existing_store_read_only(&store_path(coven_home))? else {
+        return api_error(
+            503,
+            "hub_unavailable",
+            "Hub state is unavailable until daemon startup completes.",
+            None,
+        );
+    };
+    let Some(hub_id) = read_hub_id(&conn)? else {
+        return api_error(
+            503,
+            "hub_unavailable",
+            "Hub identity is unavailable until daemon startup completes.",
+            None,
+        );
+    };
     let nodes = store::list_nodes(&conn)?;
     let jobs = store::list_hub_jobs(&conn, None)?;
     let queues = store::list_executor_queues(&conn)?;
@@ -206,7 +236,7 @@ pub fn hub_status(coven_home: &Path) -> Result<ApiResponse> {
         200,
         &json!({
             "role": HUB_ROLE,
-            "hubId": hub_id(&conn)?,
+            "hubId": hub_id,
             "nodes": node_views,
             "nodesTotal": nodes.len(),
             "nodesAvailable": nodes.iter().filter(|node| node.available).count(),
@@ -257,9 +287,12 @@ pub fn register_node(coven_home: &Path, body: Option<&str>) -> Result<ApiRespons
     if request.role.trim().is_empty() {
         return api_error(400, "invalid_request", "role is required.", None);
     }
-    let conn = store::open_store(&store_path(coven_home))?;
+    let mut conn = store::open_store(&store_path(coven_home))?;
+    let transaction = conn
+        .transaction()
+        .context("failed to begin node registration transaction")?;
     let now = current_timestamp();
-    let existing = store::get_node(&conn, &request.node_id)?;
+    let existing = store::get_node(&transaction, &request.node_id)?;
     let capabilities_json = serde_json::to_string(&request.capabilities)
         .context("failed to serialize node capabilities")?;
     let transport_config_json = match &request.transport_config {
@@ -319,7 +352,11 @@ pub fn register_node(coven_home: &Path, body: Option<&str>) -> Result<ApiRespons
             .unwrap_or_else(|| now.clone()),
         updated_at: now,
     };
-    store::upsert_node(&conn, &record)?;
+    store::upsert_node(&transaction, &record)?;
+    hub_id(&transaction)?;
+    transaction
+        .commit()
+        .context("failed to commit node registration")?;
     json_response(
         if existing.is_some() { 200 } else { 201 },
         &node_response(&record),
@@ -1104,6 +1141,87 @@ mod tests {
             ),
         )?;
         assert_eq!(status, 201);
+        Ok(())
+    }
+
+    #[test]
+    fn registering_node_initializes_hub_identity_for_health() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        register_gpu_node(&temp, "node_a")?;
+
+        let (status, health) = get(&temp, "/api/v1/health")?;
+        assert_eq!(status, 200);
+        assert_eq!(health["hub"]["role"], "hub");
+        assert_eq!(health["hub"]["nodesTotal"], 1);
+        assert_eq!(health["hub"]["nodesAvailable"], 1);
+        let hub_id = health["hub"]["hubId"]
+            .as_str()
+            .expect("registration should initialize the hub identity");
+        assert!(hub_id.starts_with("hub_"));
+
+        let (status, _) = post(
+            &temp,
+            "/api/v1/hub/nodes",
+            r#"{"nodeId":"node_a","role":"compute_executor","transport":"ssh","capabilities":["gpu","long-running-loop"]}"#,
+        )?;
+        assert_eq!(status, 200);
+        let (_, health_after_registration) = get(&temp, "/api/v1/health")?;
+        assert_eq!(health_after_registration["hub"]["hubId"], hub_id);
+
+        let (_, status) = get(&temp, "/api/v1/hub/status")?;
+        assert_eq!(status["hubId"], hub_id);
+        Ok(())
+    }
+
+    #[test]
+    fn hub_status_reports_unavailable_without_creating_or_mutating_store() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store_path = super::store_path(temp.path());
+
+        let (status, body) = get(&temp, "/api/v1/hub/status")?;
+        assert_eq!(status, 503);
+        assert_eq!(body["error"]["code"], "hub_unavailable");
+        assert!(!store_path.exists());
+
+        let conn = crate::store::open_store(&store_path)?;
+        drop(conn);
+        let before = std::fs::metadata(&store_path)?.len();
+        let (status, body) = get(&temp, "/api/v1/hub/status")?;
+        assert_eq!(status, 503);
+        assert_eq!(body["error"]["code"], "hub_unavailable");
+        assert_eq!(std::fs::metadata(&store_path)?.len(), before);
+        Ok(())
+    }
+
+    #[test]
+    fn node_registration_rolls_back_when_hub_identity_initialization_fails() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store_path = super::store_path(temp.path());
+        let conn = crate::store::open_store(&store_path)?;
+        conn.execute_batch(
+            "CREATE TRIGGER reject_hub_identity_insert
+             BEFORE INSERT ON store_meta
+             WHEN NEW.key = 'travel_source_hub_id'
+             BEGIN
+                 SELECT RAISE(FAIL, 'hub identity insertion rejected');
+             END;",
+        )?;
+        drop(conn);
+
+        let result = handle_request_with_body(
+            "POST",
+            "/api/v1/hub/nodes",
+            temp.path(),
+            None,
+            Some(r#"{"nodeId":"node_atomic","role":"compute_executor","capabilities":["gpu"]}"#),
+        );
+        assert!(result.is_err());
+
+        let conn = crate::store::open_initialized_store(&store_path)?;
+        assert!(
+            crate::store::get_node(&conn, "node_atomic")?.is_none(),
+            "failed hub identity initialization must roll back node registration"
+        );
         Ok(())
     }
 
