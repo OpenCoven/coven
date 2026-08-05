@@ -565,13 +565,8 @@ impl GateLock {
     }
 
     fn acquire_with_wait(path: PathBuf, wait: Duration) -> Result<Self> {
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .with_context(|| format!("failed to open {}", path.display()))?;
+        let file = crate::state_lock::open_lock_file(&path)
+            .with_context(|| format!("failed to open maintenance lock {}", path.display()))?;
         let started = Instant::now();
         loop {
             match file.try_lock_exclusive() {
@@ -621,6 +616,8 @@ fn unix_now() -> u64 {
 mod tests {
     use super::*;
     use std::fs::FileTimes;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
 
     fn assert_contended(error: &anyhow::Error) {
         assert!(error
@@ -668,6 +665,40 @@ mod tests {
         let error = GateLock::acquire_with_wait(gate.lock_path(), Duration::ZERO).unwrap_err();
 
         assert_contended(&error);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_gate_lock_is_refused_without_touching_the_target() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let gate = MaintenanceGate::at(temp.path().to_path_buf());
+        gate.ensure_layout()?;
+        let outside = tempfile::NamedTempFile::new()?;
+        fs::write(outside.path(), b"outside-lock-target")?;
+        symlink(outside.path(), gate.lock_path())?;
+
+        let error = GateLock::acquire(gate.lock_path()).expect_err("symlinked gate lock must fail");
+
+        assert!(format!("{error:#}").contains(&gate.lock_path().display().to_string()));
+        assert_eq!(fs::read(outside.path())?, b"outside-lock-target");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multiply_linked_gate_lock_is_refused() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let gate = MaintenanceGate::at(temp.path().to_path_buf());
+        gate.ensure_layout()?;
+        fs::write(gate.lock_path(), b"lock")?;
+        let alias = temp.path().join("lock-alias");
+        fs::hard_link(gate.lock_path(), &alias)?;
+
+        let error =
+            GateLock::acquire(gate.lock_path()).expect_err("multiply linked gate lock must fail");
+
+        assert!(format!("{error:#}").contains(&gate.lock_path().display().to_string()));
         Ok(())
     }
 

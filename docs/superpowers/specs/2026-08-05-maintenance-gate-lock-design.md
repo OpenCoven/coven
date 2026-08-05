@@ -23,7 +23,8 @@ advisory lock provided by the existing `fs2` dependency.
 will:
 
 1. Open the persistent gate lock file for reading and writing, creating it when
-   absent.
+   absent, through the repository's existing no-follow, single-link validated
+   lock-file helper.
 2. Call `try_lock_exclusive`.
 3. Retry recognized contention every 10 milliseconds.
 4. Return `GateError::Contended` after the existing five-second wait.
@@ -54,8 +55,9 @@ upgrading so every participant uses the same lock protocol.
 
 Only errors recognized as lock contention are retried. The existing bounded
 wait and `GateError::Contended` result are preserved. File-open and lock errors
-remain explicit and include the affected path. Unlock errors are not surfaced
-from `Drop`, consistent with existing lock cleanup behavior.
+remain explicit and include maintenance-lock path context on top of the shared
+helper's validation failures. Unlock errors are not surfaced from `Drop`,
+consistent with existing lock cleanup behavior.
 
 ## Tests
 
@@ -63,7 +65,9 @@ Add focused unit tests that demonstrate:
 
 - a second `GateLock` cannot acquire while the first holder is live;
 - acquisition succeeds after the first holder drops; and
-- an old lock-file modification time does not allow takeover of a live holder.
+- an old lock-file modification time does not allow takeover of a live holder;
+- a symlinked maintenance lock path is refused without touching the target; and
+- a multiply linked maintenance lock file is refused.
 
 Existing maintenance owner and writer tests continue to cover unchanged
 protocol behavior.
@@ -73,4 +77,5 @@ protocol behavior.
 - Redesigning owner or writer lease records.
 - Adding PID, generation, or heartbeat data to the internal lock file.
 - Changing maintenance CLI or HTTP response contracts.
-- Broad filesystem hardening beyond the stale-lock race.
+- Broad hardening of owner or writer metadata files beyond the stale-lock race,
+  while preserving lock-path safety through the existing validated helper.
