@@ -13,7 +13,7 @@ import {
   waitForOutputEvent
 } from './benchmark-cli.mjs';
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const DEFAULT_CONCURRENCY = [1, 8, 32];
 const POLL_ATTEMPTS = 160;
 const POLL_DELAY_MS = 25;
@@ -110,7 +110,7 @@ export function storageMetricStatus() {
     },
     eventQueueDepth: {
       status: 'measured',
-      source: 'eventWriter.queuedEvents/eventWriter.queuedBytes'
+      source: 'periodic samples of eventWriter.queuedEvents/eventWriter.queuedBytes'
     },
     rss: {
       status: 'measured',
@@ -180,8 +180,8 @@ export function summarizeRuntimeMetrics(samples) {
       delta: transactionsEnd - transactionsStart
     },
     eventQueueDepth: {
-      peakEvents: Math.max(...samples.map((sample) => requiredCounter(sample.eventWriter, 'queuedEvents'))),
-      peakBytes: Math.max(...samples.map((sample) => requiredCounter(sample.eventWriter, 'queuedBytes')))
+      maxSampledEvents: Math.max(...samples.map((sample) => requiredCounter(sample.eventWriter, 'queuedEvents'))),
+      maxSampledBytes: Math.max(...samples.map((sample) => requiredCounter(sample.eventWriter, 'queuedBytes')))
     },
     rss: {
       samplesBytes: rssSamples,
@@ -429,6 +429,7 @@ export async function runConcurrencyScenario({ binary, root, concurrency, enviro
     let observing = true;
     const observation = observeWriterHealth(socketPath, runtimeSamples, () => observing);
     let launches;
+    let completedAt;
     try {
       launches = await Promise.all(
         Array.from({ length: concurrency }, async () => {
@@ -460,11 +461,11 @@ export async function runConcurrencyScenario({ binary, root, concurrency, enviro
           return { id, firstOutputMs: Number(process.hrtime.bigint() - launchedAt) / 1_000_000 };
         })
       );
+      completedAt = process.hrtime.bigint();
     } finally {
       observing = false;
       await observation;
     }
-    const completedAt = process.hrtime.bigint();
     const elapsedMs = Number(completedAt - startedAt) / 1_000_000;
     runtimeSamples.push(await fullRuntimeSnapshot({ binary, covenHome, env, socketPath }));
 

@@ -677,11 +677,13 @@ node scripts/benchmark-chaos.mjs --binary target/debug/coven --output /tmp/coven
 
 The command always exercises 1, 8, and 32 concurrent deterministic harness
 sessions, records launch-to-first-output percentiles, throughput, cancellation
-acknowledgement, SQLite file growth, writer connection/transaction deltas, peak
-writer backlog, and sampled daemon RSS, and writes a redacted JSON report. The
-writer measurements come from the live health contract; RSS is resolved by the
-exact daemon PID through `coven pc top --json`, without retaining process names
-or command lines. Cave owns the slow-WebSocket-consumer lane in #4317.
+to-terminal latency, SQLite file growth, writer connection/transaction deltas,
+maximum sampled writer backlog, and sampled daemon RSS, and writes a redacted
+JSON report. The writer queue values are periodic samples rather than
+daemon-maintained high-water marks. Writer measurements come from the live
+health contract; RSS is resolved by the exact daemon PID through
+`coven pc top --json`, without retaining process names or command lines. Cave
+owns the slow-WebSocket-consumer lane in #4317.
 
 Unsafe host-level faults use deterministic equivalents rather than filling a
 real disk or killing an unrelated process: the report names the exact Rust

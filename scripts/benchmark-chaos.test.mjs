@@ -62,7 +62,7 @@ test('describes live writer metrics and deterministic fault equivalents', () => 
   );
 });
 
-test('summarizes writer counter deltas, peak backlog, and sampled RSS', () => {
+test('summarizes writer counter deltas, sampled backlog maxima, and sampled RSS', () => {
   assert.deepEqual(
     summarizeRuntimeMetrics([
       {
@@ -96,7 +96,7 @@ test('summarizes writer counter deltas, peak backlog, and sampled RSS', () => {
     {
       sqliteConnectionOpens: { start: 1, end: 1, delta: 0 },
       sqliteTransactions: { start: 2, end: 12, delta: 10 },
-      eventQueueDepth: { peakEvents: 5, peakBytes: 4096 },
+      eventQueueDepth: { maxSampledEvents: 5, maxSampledBytes: 4096 },
       rss: {
         samplesBytes: [10 * 1024 * 1024, 14 * 1024 * 1024, 12 * 1024 * 1024],
         peakBytes: 14 * 1024 * 1024
@@ -135,7 +135,7 @@ test('report contains no fixture paths or prompt content', () => {
     environment: { GITHUB_ACTIONS: 'true', HOME: '/private/fixture', PROMPT: 'secret prompt' }
   });
   const serialized = JSON.stringify(report);
-  assert.equal(report.schemaVersion, 2);
+  assert.equal(report.schemaVersion, 3);
   assert.doesNotMatch(serialized, /private\/fixture|secret prompt/);
   assert.equal(Object.hasOwn(report.environment, 'host'), false);
   assert.equal(Object.hasOwn(report.environment, 'runner'), false);
@@ -257,6 +257,6 @@ test('closes the throughput timing window before diagnostic sampling', async () 
   const source = await readFile(new URL('./benchmark-chaos.mjs', import.meta.url), 'utf8');
   assert.match(
     source,
-    /const completedAt = process\.hrtime\.bigint\(\);\n\s+const elapsedMs = .*;\n\s+runtimeSamples\.push\(await fullRuntimeSnapshot/
+    /completedAt = process\.hrtime\.bigint\(\);\n\s+} finally \{\n\s+observing = false;\n\s+await observation;\n\s+}\n\s+const elapsedMs = .*;\n\s+runtimeSamples\.push\(await fullRuntimeSnapshot/
   );
 });
