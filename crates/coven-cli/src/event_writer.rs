@@ -34,6 +34,7 @@ pub struct EventWriterHealth {
     /// `healthy`, `pressured`, or `failed`.  Pressure remains visible for the
     /// daemon lifetime so a rejected raw chunk is never silently forgotten.
     pub state: String,
+    #[serde(default)]
     pub queued_events: usize,
     pub queued_bytes: usize,
     pub capacity_bytes: usize,
@@ -537,6 +538,23 @@ fn lock_health(shared: &Arc<Shared>) -> std::sync::MutexGuard<'_, EventWriterHea
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn health_deserializes_payload_without_queued_event_count() -> Result<()> {
+        let health: EventWriterHealth = serde_json::from_value(serde_json::json!({
+            "state": "healthy",
+            "queuedBytes": 0,
+            "capacityBytes": DEFAULT_CAPACITY_BYTES,
+            "droppedOutputEvents": 0,
+            "droppedOutputBytes": 0,
+            "connectionOpens": 1,
+            "transactions": 2,
+            "committedEvents": 3
+        }))?;
+
+        assert_eq!(health.queued_events, 0);
+        Ok(())
+    }
 
     #[test]
     fn queue_health_counts_events_until_completion() {

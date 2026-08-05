@@ -23,6 +23,7 @@ const FTS_BACKFILL_COMPLETE_KEY: &str = "events_fts_backfill_complete";
 const MAINTENANCE_LAST_PRUNE_KEY: &str = "maintenance_last_prune_at";
 const MAINTENANCE_LAST_CHECKPOINT_KEY: &str = "maintenance_last_checkpoint_at";
 const MAINTENANCE_LAST_ERROR_KEY: &str = "maintenance_last_error";
+const MAINTENANCE_LAST_ERROR_PUBLIC_MESSAGE: &str = "maintenance pass failed";
 const MAINTENANCE_EVENT_BATCH_SIZE: i64 = 500;
 const MAINTENANCE_ARTIFACT_BATCH_SIZE: i64 = 500;
 const MAINTENANCE_MAX_BATCHES_PER_TICK: i64 = 10;
@@ -997,6 +998,17 @@ pub fn open_existing_store_read_only(path: &Path) -> Result<Option<Connection>> 
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("failed to open Coven store read-only at {}", path.display()))?;
     configure_read_only_connection(&conn)?;
+    Ok(Some(conn))
+}
+
+fn open_existing_store_writable(path: &Path) -> Result<Option<Connection>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .with_context(|| format!("failed to open Coven store writable at {}", path.display()))?;
+    configure_runtime_writable_connection(&conn)?;
     Ok(Some(conn))
 }
 
@@ -3460,23 +3472,26 @@ pub fn run_scheduled_maintenance(
 ) -> Result<ScheduledMaintenanceReport> {
     let free_disk_bytes = fs2::available_space(coven_home)
         .with_context(|| format!("failed to inspect free disk for {}", coven_home.display()))?;
-    let config =
-        privacy::load_with_settings(coven_home, crate::settings::cached()).unwrap_or_default();
-    run_scheduled_maintenance_with_config_and_free_disk(coven_home, now, free_disk_bytes, &config)
+    run_scheduled_maintenance_with_free_disk(coven_home, now, free_disk_bytes)
 }
 
-#[cfg(test)]
 fn run_scheduled_maintenance_with_free_disk(
     coven_home: &Path,
     now: &str,
     free_disk_bytes: u64,
 ) -> Result<ScheduledMaintenanceReport> {
-    run_scheduled_maintenance_with_config_and_free_disk(
-        coven_home,
-        now,
-        free_disk_bytes,
-        &PrivacyConfig::default(),
-    )
+    if free_disk_bytes < MAINTENANCE_MIN_FREE_DISK_BYTES {
+        return Ok(ScheduledMaintenanceReport {
+            raw_artifacts_pruned: 0,
+            events_pruned: 0,
+            checkpoint_ran: false,
+            blocked_by_free_disk: true,
+        });
+    }
+
+    let config = privacy::load_with_settings(coven_home, crate::settings::cached())
+        .context("failed to load privacy settings for scheduled maintenance")?;
+    run_scheduled_maintenance_with_config_and_free_disk(coven_home, now, free_disk_bytes, &config)
 }
 
 fn run_scheduled_maintenance_with_config_and_free_disk(
@@ -3568,10 +3583,41 @@ pub fn storage_health(
     coven_home: &Path,
     event_writer: Option<&crate::event_writer::EventWriterHealth>,
 ) -> Result<StorageHealth> {
-    let store_path = coven_home.join("coven.sqlite3");
-    let conn = open_store(&store_path)?;
     let free_disk_bytes = fs2::available_space(coven_home)
         .with_context(|| format!("failed to inspect free disk for {}", coven_home.display()))?;
+    storage_health_with_free_disk(coven_home, free_disk_bytes, event_writer)
+}
+
+fn storage_health_with_free_disk(
+    coven_home: &Path,
+    free_disk_bytes: u64,
+    event_writer: Option<&crate::event_writer::EventWriterHealth>,
+) -> Result<StorageHealth> {
+    let store_path = coven_home.join("coven.sqlite3");
+    let database_bytes = file_size(&store_path);
+    let wal_bytes = file_size(&wal_path(&store_path));
+    let maintenance_blocked = free_disk_bytes < MAINTENANCE_MIN_FREE_DISK_BYTES;
+    let (writer_backlog_events, writer_backlog_bytes) = writer_backlog(event_writer);
+    if maintenance_blocked {
+        return Ok(StorageHealth {
+            status: "critical".to_string(),
+            database_bytes,
+            wal_bytes,
+            oldest_retained_event_at: None,
+            last_prune_at: None,
+            prune_age_seconds: None,
+            last_checkpoint_at: None,
+            checkpoint_age_seconds: None,
+            writer_backlog_events,
+            writer_backlog_bytes,
+            free_disk_bytes,
+            maintenance_blocked: true,
+            last_maintenance_error: None,
+        });
+    }
+
+    let conn = open_existing_store_read_only(&store_path)?
+        .ok_or_else(|| anyhow::anyhow!("Coven store is unavailable"))?;
     let config =
         privacy::load_with_settings(coven_home, crate::settings::cached()).unwrap_or_default();
     // `MIN(created_at)` is NULL on an empty ledger, so the column type has to be
@@ -3592,10 +3638,7 @@ pub fn storage_health(
     let last_prune_at = get_store_meta(&conn, MAINTENANCE_LAST_PRUNE_KEY)?;
     let last_checkpoint_at = get_store_meta(&conn, MAINTENANCE_LAST_CHECKPOINT_KEY)?;
     let last_maintenance_error =
-        get_store_meta(&conn, MAINTENANCE_LAST_ERROR_KEY)?.filter(|value| !value.is_empty());
-    let database_bytes = file_size(&store_path);
-    let wal_bytes = file_size(&wal_path(&store_path));
-    let maintenance_blocked = free_disk_bytes < MAINTENANCE_MIN_FREE_DISK_BYTES;
+        public_maintenance_error(get_store_meta(&conn, MAINTENANCE_LAST_ERROR_KEY)?);
     let status = if maintenance_blocked {
         "critical"
     } else if retention_lagging
@@ -3608,7 +3651,6 @@ pub fn storage_health(
         "ok"
     };
 
-    let (writer_backlog_events, writer_backlog_bytes) = writer_backlog(event_writer);
     Ok(StorageHealth {
         status: status.to_string(),
         database_bytes,
@@ -3658,9 +3700,20 @@ fn writer_backlog(event_writer: Option<&crate::event_writer::EventWriterHealth>)
 }
 
 pub fn record_maintenance_error(coven_home: &Path, error: impl ToString) {
-    if let Ok(conn) = open_store(&coven_home.join("coven.sqlite3")) {
-        let _ = set_store_meta(&conn, MAINTENANCE_LAST_ERROR_KEY, &error.to_string());
+    let _ = error.to_string();
+    if let Ok(Some(conn)) = open_existing_store_writable(&coven_home.join("coven.sqlite3")) {
+        let _ = set_store_meta(
+            &conn,
+            MAINTENANCE_LAST_ERROR_KEY,
+            MAINTENANCE_LAST_ERROR_PUBLIC_MESSAGE,
+        );
     }
+}
+
+fn public_maintenance_error(value: Option<String>) -> Option<String> {
+    value
+        .filter(|value| !value.is_empty())
+        .map(|_| MAINTENANCE_LAST_ERROR_PUBLIC_MESSAGE.to_string())
 }
 
 fn maintenance_age_seconds(timestamp: Option<&str>) -> Option<u64> {
@@ -3679,7 +3732,9 @@ fn parse_rfc3339_utc(timestamp: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 }
 
 fn wal_path(store_path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}-wal", store_path.display()))
+    let mut wal_path = store_path.as_os_str().to_os_string();
+    wal_path.push("-wal");
+    PathBuf::from(wal_path)
 }
 
 fn file_size(path: &Path) -> u64 {
@@ -5062,6 +5117,91 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_maintenance_with_malformed_privacy_config_returns_err_and_preserves_rows(
+    ) -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let home = temp_dir.path();
+        let path = home.join("coven.sqlite3");
+        let conn = open_store(&path)?;
+        insert_session(&conn, &session_record("session-1", "2026-04-27T06:00:00Z"))?;
+        insert_event(
+            &conn,
+            &EventRecord {
+                seq: 0,
+                id: "prunable-event".to_string(),
+                session_id: "session-1".to_string(),
+                kind: "output".to_string(),
+                payload_json: r#"{"data":"expired"}"#.to_string(),
+                created_at: "2026-04-25T00:00:00Z".to_string(),
+            },
+        )?;
+        drop(conn);
+        std::fs::write(
+            home.join("privacy.toml"),
+            "log_retention_days = \"broken\"\n",
+        )?;
+
+        let error = run_scheduled_maintenance(home, "2026-04-27T06:00:00Z")
+            .expect_err("malformed privacy config must fail closed");
+
+        assert!(error.to_string().contains("privacy"));
+        let conn = open_store(&path)?;
+        assert_eq!(list_events(&conn, "session-1")?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn storage_health_below_watermark_does_not_create_missing_store_and_returns_critical(
+    ) -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let home = temp_dir.path();
+        let writer = crate::event_writer::EventWriterHealth {
+            state: "pressured".to_string(),
+            queued_events: 7,
+            queued_bytes: 8192,
+            capacity_bytes: 2 * 1024 * 1024,
+            dropped_output_events: 1,
+            dropped_output_bytes: 512,
+            connection_opens: 1,
+            transactions: 3,
+            committed_events: 12,
+            last_error: None,
+        };
+
+        let health = storage_health_with_free_disk(
+            home,
+            MAINTENANCE_MIN_FREE_DISK_BYTES - 1,
+            Some(&writer),
+        )?;
+
+        assert_eq!(health.status, "critical");
+        assert!(health.maintenance_blocked);
+        assert_eq!(health.database_bytes, 0);
+        assert_eq!(health.wal_bytes, 0);
+        assert_eq!(health.writer_backlog_events, 7);
+        assert_eq!(health.writer_backlog_bytes, 8192);
+        assert_eq!(health.free_disk_bytes, MAINTENANCE_MIN_FREE_DISK_BYTES - 1);
+        assert!(health.oldest_retained_event_at.is_none());
+        assert!(health.last_prune_at.is_none());
+        assert!(health.last_checkpoint_at.is_none());
+        assert!(health.last_maintenance_error.is_none());
+        assert!(!home.join("coven.sqlite3").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn storage_health_above_watermark_errors_for_missing_store_without_creation() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = temp_dir.path();
+
+        let error = storage_health_with_free_disk(home, MAINTENANCE_MIN_FREE_DISK_BYTES, None)
+            .expect_err("missing store above the watermark must be unavailable");
+
+        assert!(error.to_string().contains("store"));
+        assert!(!home.join("coven.sqlite3").exists());
+    }
+
+    #[test]
     fn thirty_day_synthetic_workload_converges_to_a_stable_store_size() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let home = temp_dir.path();
@@ -5206,6 +5346,28 @@ mod tests {
 
         assert_eq!(health.writer_backlog_events, 7);
         assert_eq!(health.writer_backlog_bytes, 8192);
+        Ok(())
+    }
+
+    #[test]
+    fn storage_health_sanitizes_persisted_maintenance_errors() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let home = temp_dir.path();
+        open_store(&home.join("coven.sqlite3"))?;
+
+        let path_bearing_error = "store maintenance pass failed: failed to read /private/home";
+        record_maintenance_error(home, path_bearing_error);
+
+        let health = storage_health_with_free_disk(home, MAINTENANCE_MIN_FREE_DISK_BYTES, None)?;
+
+        assert_eq!(
+            health.last_maintenance_error.as_deref(),
+            Some(MAINTENANCE_LAST_ERROR_PUBLIC_MESSAGE)
+        );
+        assert_ne!(
+            health.last_maintenance_error.as_deref(),
+            Some(path_bearing_error)
+        );
         Ok(())
     }
 

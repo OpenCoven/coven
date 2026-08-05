@@ -2124,7 +2124,6 @@ fn start_threads_proposal_scheduler(coven_home: &Path) -> Result<()> {
 /// store helper intentionally performs no automatic VACUUM.
 fn start_store_maintenance_scheduler(coven_home: &Path) -> Result<()> {
     const INTERVAL: Duration = Duration::from_secs(60);
-    const MAX_PASSES_PER_TICK: usize = 10;
     let home = coven_home.to_path_buf();
     std::thread::Builder::new()
         .name("coven-store-maintenance".into())
@@ -2132,27 +2131,43 @@ fn start_store_maintenance_scheduler(coven_home: &Path) -> Result<()> {
             std::thread::sleep(INTERVAL);
             let now = crate::api::current_timestamp();
 
-            // A single maintenance call can still leave backlog when
-            // per-table deletes are bounded. Run a short catch-up loop so a
-            // large retention debt cannot drift indefinitely.
-            for _ in 0..MAX_PASSES_PER_TICK {
-                match crate::store::run_scheduled_maintenance(&home, &now) {
-                    Ok(report) => {
-                        if report.raw_artifacts_pruned == 0 && report.events_pruned == 0 {
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        let details = format!("store maintenance pass failed: {error:#}");
-                        crate::store::record_maintenance_error(&home, &details);
-                        append_daemon_recovery_log(&home, &details);
-                        break;
-                    }
-                }
+            // The store helper owns the bounded convergence loop so one
+            // scheduler tick cannot multiply the configured batch budget.
+            if let Err(error) = crate::store::run_scheduled_maintenance(&home, &now) {
+                let details = format!("store maintenance pass failed: {error:#}");
+                record_store_maintenance_failure(&home, &details);
             }
         })
         .context("failed to spawn store maintenance scheduler")?;
     Ok(())
+}
+
+fn record_store_maintenance_failure(coven_home: &Path, details: &str) {
+    record_store_maintenance_failure_with_free_disk_check(
+        coven_home,
+        details,
+        fs2::available_space(coven_home),
+    );
+}
+
+fn record_store_maintenance_failure_with_free_disk_check(
+    coven_home: &Path,
+    details: &str,
+    free_disk_check: std::io::Result<u64>,
+) {
+    append_daemon_recovery_log(coven_home, details);
+    match free_disk_check {
+        Ok(free_disk_bytes) if free_disk_bytes >= crate::store::MAINTENANCE_MIN_FREE_DISK_BYTES => {
+            crate::store::record_maintenance_error(coven_home, details);
+        }
+        Ok(_) => {}
+        Err(error) => append_daemon_recovery_log(
+            coven_home,
+            &format!(
+                "store maintenance error not persisted: failed to inspect free disk: {error:#}"
+            ),
+        ),
+    }
 }
 
 /// Cleans up the Unix-domain socket file and `daemon.json` when the daemon
@@ -5563,6 +5578,22 @@ mod tests {
             log.contains("second event"),
             "second append should not overwrite the first, got: {log}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_failures_below_watermark_log_without_creating_store() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+
+        record_store_maintenance_failure_with_free_disk_check(
+            temp_dir.path(),
+            "store maintenance pass failed: failed to read /private/home",
+            Ok(crate::store::MAINTENANCE_MIN_FREE_DISK_BYTES - 1),
+        );
+
+        let log = std::fs::read_to_string(daemon_recovery_log_path(temp_dir.path()))?;
+        assert!(log.contains("store maintenance pass failed"));
+        assert!(!temp_dir.path().join("coven.sqlite3").exists());
         Ok(())
     }
 
