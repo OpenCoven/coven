@@ -25,6 +25,7 @@ const MAINTENANCE_LAST_CHECKPOINT_KEY: &str = "maintenance_last_checkpoint_at";
 const MAINTENANCE_LAST_ERROR_KEY: &str = "maintenance_last_error";
 const MAINTENANCE_EVENT_BATCH_SIZE: i64 = 500;
 const MAINTENANCE_ARTIFACT_BATCH_SIZE: i64 = 500;
+const MAINTENANCE_MAX_BATCHES_PER_TICK: i64 = 10;
 const MAINTENANCE_CHECKPOINT_WAL_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAINTENANCE_MIN_FREE_DISK_BYTES: u64 = 256 * 1024 * 1024;
 const MAINTENANCE_WARN_FREE_DISK_BYTES: u64 = 1024 * 1024 * 1024;
@@ -606,6 +607,9 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_sensitive_artifacts_expires_at
             ON sensitive_artifacts(expires_at);
 
+        CREATE INDEX IF NOT EXISTS idx_sensitive_artifacts_created_at
+            ON sensitive_artifacts(created_at);
+
         CREATE TABLE IF NOT EXISTS repositories (
             id TEXT PRIMARY KEY NOT NULL,
             path TEXT NOT NULL,
@@ -980,7 +984,10 @@ fn ensure_sensitive_artifacts_table(conn: &Connection) -> Result<()> {
             ON sensitive_artifacts(session_id, created_at);
 
         CREATE INDEX IF NOT EXISTS idx_sensitive_artifacts_expires_at
-            ON sensitive_artifacts(expires_at);",
+            ON sensitive_artifacts(expires_at);
+
+        CREATE INDEX IF NOT EXISTS idx_sensitive_artifacts_created_at
+            ON sensitive_artifacts(created_at);",
     )
     .context("failed to initialize sensitive artifact schema")
 }
@@ -3486,14 +3493,30 @@ fn run_scheduled_maintenance_with_config_and_free_disk(
     let event_cutoff = retention_cutoff(now, config.log_retention_days.max(1));
     let store_path = coven_home.join("coven.sqlite3");
     let conn = open_store(&store_path)?;
-    let raw_artifacts_pruned = prune_sensitive_artifacts_bounded(
-        &conn,
-        now,
-        &raw_cutoff,
-        MAINTENANCE_ARTIFACT_BATCH_SIZE,
-    )?;
-    let events_pruned =
-        prune_events_older_than_bounded(&conn, &event_cutoff, MAINTENANCE_EVENT_BATCH_SIZE)?;
+    let mut raw_artifacts_pruned = 0usize;
+    let mut events_pruned = 0usize;
+
+    for _ in 0..MAINTENANCE_MAX_BATCHES_PER_TICK {
+        let raw_batch = prune_sensitive_artifacts_bounded(
+            &conn,
+            now,
+            &raw_cutoff,
+            MAINTENANCE_ARTIFACT_BATCH_SIZE,
+        )?;
+        let event_batch =
+            prune_events_older_than_bounded(&conn, &event_cutoff, MAINTENANCE_EVENT_BATCH_SIZE)?;
+
+        raw_artifacts_pruned += raw_batch;
+        events_pruned += event_batch;
+
+        // Convergence loop keeps startup backlog from stalling one minute behind
+        // while still enforcing a predictable per-tick upper bound.
+        if raw_batch < MAINTENANCE_ARTIFACT_BATCH_SIZE && event_batch < MAINTENANCE_EVENT_BATCH_SIZE
+        {
+            break;
+        }
+    }
+
     // Record a successful pass even when nothing was expired. Operators need
     // the age of the maintenance loop itself, not merely the most recent row
     // deletion, to tell a healthy empty ledger from a stalled scheduler.
@@ -3533,9 +3556,21 @@ pub fn storage_health(coven_home: &Path) -> Result<StorageHealth> {
     let conn = open_store(&store_path)?;
     let free_disk_bytes = fs2::available_space(coven_home)
         .with_context(|| format!("failed to inspect free disk for {}", coven_home.display()))?;
+    let config =
+        privacy::load_with_settings(coven_home, crate::settings::cached()).unwrap_or_default();
     let oldest_retained_event_at = conn
         .query_row("SELECT MIN(created_at) FROM events", [], |row| row.get(0))
         .context("failed to read oldest retained event")?;
+    let retention_cutoff = retention_cutoff(
+        &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+        config.log_retention_days.max(1),
+    );
+    let retention_cutoff = parse_rfc3339_utc(&retention_cutoff);
+    let retention_lagging = oldest_retained_event_at
+        .as_deref()
+        .and_then(parse_rfc3339_utc)
+        .zip(retention_cutoff)
+        .is_some_and(|(oldest_at, retention_cutoff)| oldest_at < retention_cutoff);
     let last_prune_at = get_store_meta(&conn, MAINTENANCE_LAST_PRUNE_KEY)?;
     let last_checkpoint_at = get_store_meta(&conn, MAINTENANCE_LAST_CHECKPOINT_KEY)?;
     let last_maintenance_error =
@@ -3545,7 +3580,8 @@ pub fn storage_health(coven_home: &Path) -> Result<StorageHealth> {
     let maintenance_blocked = free_disk_bytes < MAINTENANCE_MIN_FREE_DISK_BYTES;
     let status = if maintenance_blocked {
         "critical"
-    } else if free_disk_bytes < MAINTENANCE_WARN_FREE_DISK_BYTES
+    } else if retention_lagging
+        || free_disk_bytes < MAINTENANCE_WARN_FREE_DISK_BYTES
         || wal_bytes >= MAINTENANCE_CHECKPOINT_WAL_BYTES
         || last_maintenance_error.is_some()
     {
@@ -3605,6 +3641,12 @@ fn maintenance_age_seconds(timestamp: Option<&str>) -> Option<u64> {
         .to_std()
         .ok()
         .map(|duration| duration.as_secs())
+}
+
+fn parse_rfc3339_utc(timestamp: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
 }
 
 fn wal_path(store_path: &Path) -> PathBuf {
@@ -4910,7 +4952,11 @@ mod tests {
         )?;
         drop(conn);
 
-        let report = run_scheduled_maintenance(home, "2026-04-27T06:00:00Z")?;
+        let report = run_scheduled_maintenance_with_free_disk(
+            home,
+            "2026-04-27T06:00:00Z",
+            MAINTENANCE_WARN_FREE_DISK_BYTES,
+        )?;
         assert_eq!(report.events_pruned, 1);
         assert!(!report.checkpoint_ran);
         assert!(!report.blocked_by_free_disk);
@@ -5015,7 +5061,11 @@ mod tests {
                 },
             )?;
             drop(conn);
-            run_scheduled_maintenance(home, &created_at)?;
+            run_scheduled_maintenance_with_free_disk(
+                home,
+                &created_at,
+                MAINTENANCE_WARN_FREE_DISK_BYTES,
+            )?;
 
             if day == 45 {
                 let conn = open_store(&path)?;
@@ -5036,6 +5086,72 @@ mod tests {
             final_pages <= pages_at_steady_state.expect("steady-state sample") + 2,
             "page count should converge once expiration matches ingestion"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn scheduled_maintenance_catches_up_after_backlog() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let home = temp_dir.path();
+        let path = home.join("coven.sqlite3");
+        let conn = open_store(&path)?;
+        insert_session(&conn, &session_record("session-1", "2026-01-01T00:00:00Z"))?;
+        for day in 0..1200 {
+            insert_event(
+                &conn,
+                &EventRecord {
+                    seq: 0,
+                    id: format!("event-{day}"),
+                    session_id: "session-1".to_string(),
+                    kind: "output".to_string(),
+                    payload_json: serde_json::json!({ "data": day }).to_string(),
+                    created_at: "2025-01-01T00:00:00Z".to_string(),
+                },
+            )?;
+        }
+        drop(conn);
+
+        let report = run_scheduled_maintenance_with_free_disk(
+            home,
+            "2026-01-31T00:00:00Z",
+            MAINTENANCE_WARN_FREE_DISK_BYTES,
+        )?;
+        assert!(
+            report.events_pruned > MAINTENANCE_EVENT_BATCH_SIZE as usize,
+            "single tick should advance through multiple bounded maintenance batches"
+        );
+
+        let conn = open_store(&path)?;
+        let retained: i64 = conn.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
+        assert_eq!(retained, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn storage_health_flags_stale_retention() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let home = temp_dir.path();
+        let path = home.join("coven.sqlite3");
+        let conn = open_store(&path)?;
+        insert_session(&conn, &session_record("session-1", "2010-01-01T00:00:00Z"))?;
+        insert_event(
+            &conn,
+            &EventRecord {
+                seq: 0,
+                id: "ancient".to_string(),
+                session_id: "session-1".to_string(),
+                kind: "output".to_string(),
+                payload_json: r#"{"data":"ancient"}"#.to_string(),
+                created_at: "2010-01-01T00:00:00Z".to_string(),
+            },
+        )?;
+
+        let health = storage_health(home)?;
+        assert_eq!(
+            health.oldest_retained_event_at.as_deref(),
+            Some("2010-01-01T00:00:00Z")
+        );
+        assert_ne!(health.status, "ok");
         Ok(())
     }
 
