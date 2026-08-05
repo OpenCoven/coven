@@ -7,7 +7,7 @@
 //! be overtaken by a following exit event.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     path::PathBuf,
     sync::{mpsc, Arc, Condvar, Mutex},
     thread,
@@ -67,6 +67,13 @@ struct Queue {
     queued_events: usize,
     queued_bytes: usize,
     failed: Option<String>,
+    truncations: HashMap<String, OutputTruncation>,
+}
+
+struct OutputTruncation {
+    dropped_events: u64,
+    dropped_bytes: u64,
+    created_at: String,
 }
 
 struct QueuedEvent {
@@ -105,6 +112,7 @@ impl EventWriter {
                 queued_events: 0,
                 queued_bytes: 0,
                 failed: None,
+                truncations: HashMap::new(),
             }),
             available: Condvar::new(),
             capacity_bytes,
@@ -200,14 +208,40 @@ impl EventWriter {
         if let Some(error) = &queue.failed {
             return Err(anyhow!(error.clone()));
         }
+        let (session_id, dropped_bytes, created_at) = match &event {
+            PendingEvent::Output {
+                session_id,
+                data,
+                created_at,
+            } => (session_id, data.len(), created_at),
+            _ => unreachable!("enqueue_output only accepts output events"),
+        };
         if bytes > self.shared.output_capacity_bytes
             || queue.queued_bytes.saturating_add(bytes) > self.shared.output_capacity_bytes
         {
+            record_output_drop(&mut queue, session_id, dropped_bytes, created_at);
             let mut health = self.lock_health();
             health.state = "pressured".to_string();
-            health.dropped_output_events += 1;
-            health.dropped_output_bytes += bytes.saturating_sub(EVENT_OVERHEAD_BYTES) as u64;
+            health.dropped_output_events = health.dropped_output_events.saturating_add(1);
+            health.dropped_output_bytes = health
+                .dropped_output_bytes
+                .saturating_add(dropped_bytes as u64);
             return Ok(false);
+        }
+        let marker = take_truncation_marker(&mut queue, session_id);
+        let marker_bytes = marker.as_ref().map_or(0, |item| item.bytes);
+        assert!(
+            queue
+                .queued_bytes
+                .saturating_add(marker_bytes)
+                .saturating_add(bytes)
+                <= self.shared.capacity_bytes,
+            "accepted output exceeded event writer capacity"
+        );
+        if let Some(marker) = marker {
+            queue.queued_events += 1;
+            queue.queued_bytes += marker.bytes;
+            queue.items.push_back(marker);
         }
         queue.queued_events += 1;
         queue.queued_bytes += bytes;
@@ -465,6 +499,43 @@ fn output_record(session_id: &str, data: &str, created_at: &str) -> Result<store
     })
 }
 
+fn record_output_drop(queue: &mut Queue, session_id: &str, dropped_bytes: usize, created_at: &str) {
+    let truncation = queue
+        .truncations
+        .entry(session_id.to_string())
+        .or_insert_with(|| OutputTruncation {
+            dropped_events: 0,
+            dropped_bytes: 0,
+            created_at: created_at.to_string(),
+        });
+    truncation.dropped_events = truncation.dropped_events.saturating_add(1);
+    truncation.dropped_bytes = truncation
+        .dropped_bytes
+        .saturating_add(dropped_bytes as u64);
+}
+
+fn take_truncation_marker(queue: &mut Queue, session_id: &str) -> Option<QueuedEvent> {
+    let truncation = queue.truncations.remove(session_id)?;
+    let payload_json = serde_json::to_string(&json!({
+        "droppedEvents": truncation.dropped_events,
+        "droppedBytes": truncation.dropped_bytes,
+    }))
+    .expect("truncation marker payload is always serializable");
+    let bytes = payload_json.len().saturating_add(EVENT_OVERHEAD_BYTES);
+    Some(QueuedEvent {
+        event: PendingEvent::Record(store::EventRecord {
+            seq: 0,
+            id: Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            kind: "output_truncated".to_string(),
+            payload_json,
+            created_at: truncation.created_at,
+        }),
+        bytes,
+        completion: None,
+    })
+}
+
 fn flush_output(
     conn: &Connection,
     coven_home: &std::path::Path,
@@ -682,6 +753,7 @@ mod tests {
                 queued_events: 2,
                 queued_bytes: EVENT_OVERHEAD_BYTES * 2,
                 failed: None,
+                truncations: HashMap::new(),
             }),
             available: Condvar::new(),
             capacity_bytes: DEFAULT_CAPACITY_BYTES,
@@ -715,6 +787,7 @@ mod tests {
                 queued_events: 0,
                 queued_bytes: 0,
                 failed: None,
+                truncations: HashMap::new(),
             }),
             available: Condvar::new(),
             capacity_bytes: DEFAULT_CAPACITY_BYTES,
@@ -882,6 +955,72 @@ mod tests {
     }
 
     #[test]
+    fn recovered_output_is_preceded_by_one_exact_truncation_marker() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let conn = store::open_store(&home.path().join(STORE_FILE_NAME))?;
+        store::insert_session(&conn, &session("s-1"))?;
+        let writer = EventWriter::start_with_capacity(
+            home.path().to_path_buf(),
+            RESERVED_CRITICAL_BYTES + 1024,
+        )?;
+
+        assert!(!writer.record_output("s-1", "x".repeat(2048))?);
+        assert!(!writer.record_output("s-1", "x".repeat(3072))?);
+        assert!(writer.record_output("s-1", "recovered".to_string())?);
+        writer.record_exit(
+            "s-1",
+            PtyRunResult {
+                status: "completed",
+                exit_code: Some(0),
+            },
+        )?;
+
+        let events = store::list_events(&conn, "s-1")?;
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["output_truncated", "output", "exit"]
+        );
+        let marker_payload: serde_json::Value = serde_json::from_str(&events[0].payload_json)?;
+        assert_eq!(marker_payload["droppedEvents"], 2);
+        assert_eq!(marker_payload["droppedBytes"], 5120);
+        assert!(events[0].created_at <= events[1].created_at);
+        Ok(())
+    }
+
+    #[test]
+    fn accepted_output_without_pressure_has_no_truncation_marker() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let conn = store::open_store(&home.path().join(STORE_FILE_NAME))?;
+        store::insert_session(&conn, &session("s-1"))?;
+        let writer = EventWriter::start_with_capacity(
+            home.path().to_path_buf(),
+            RESERVED_CRITICAL_BYTES + 1024,
+        )?;
+
+        assert!(writer.record_output("s-1", "accepted".to_string())?);
+        writer.record_exit(
+            "s-1",
+            PtyRunResult {
+                status: "completed",
+                exit_code: Some(0),
+            },
+        )?;
+
+        let events = store::list_events(&conn, "s-1")?;
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["output", "exit"]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn writer_failure_drains_queued_critical_completions() {
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue {
@@ -889,6 +1028,7 @@ mod tests {
                 queued_events: 1,
                 queued_bytes: EVENT_OVERHEAD_BYTES,
                 failed: None,
+                truncations: HashMap::new(),
             }),
             available: Condvar::new(),
             capacity_bytes: DEFAULT_CAPACITY_BYTES,
