@@ -46,6 +46,10 @@ commands, so it does not need to implement the advisory lock independently.
 Owner generations, writer generations, heartbeat intervals, lease expiry, and
 fail-closed malformed-record handling remain unchanged.
 
+An already-running binary built before this fix does not participate in the
+advisory lock. Long-running Coven daemons must therefore be restarted after
+upgrading so every participant uses the same lock protocol.
+
 ## Error Handling
 
 Only errors recognized as lock contention are retried. The existing bounded
