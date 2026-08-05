@@ -12,6 +12,7 @@
 #   merged_count    — number of PRs merged
 #   deleted_count   — number of branches deleted
 #   kept_count      — number of REVIEW branches skipped
+#   skipped_count   — number of open PRs the merge gate refused
 
 set -euo pipefail
 
@@ -23,6 +24,7 @@ STALE="${STALE_DAYS:-30}"
 merged_count=0
 deleted_count=0
 kept_count=0
+skipped_count=0
 
 # ── colour helpers ────────────────────────────────────────────────────────────
 bold()  { printf '\033[1m%s\033[0m' "$*"; }
@@ -75,11 +77,53 @@ last_commit_days_ago() {
   echo $(( (now - ts) / 86400 ))
 }
 
+# Reason this PR must not be auto-merged, or empty when it is safe to merge.
+#
+# This action runs unattended and `main` is not branch-protected, so nothing
+# except this gate stands between a red or contested PR and the default branch.
+# Fail closed: anything we cannot positively confirm as green and uncontested
+# is reported and left for a human.
+merge_block_reason() {
+  local pr="$1" json
+  json=$(gh pr view "$pr" \
+    --json isDraft,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup 2>/dev/null) || {
+    echo "could not read PR state"
+    return 0
+  }
+
+  jq -r '
+    def named: (.name // .context // "check");
+    def concl: (.conclusion // .state // "");
+    def stat:  (.status // "");
+
+    ([ .statusCheckRollup[]?
+       | select(concl | IN("FAILURE", "TIMED_OUT", "CANCELLED",
+                           "STARTUP_FAILURE", "ACTION_REQUIRED", "ERROR"))
+       | named ]) as $failing
+    | ([ .statusCheckRollup[]?
+         | select((stat | IN("QUEUED", "IN_PROGRESS", "WAITING", "PENDING"))
+                  or (concl == "" and stat == ""))
+         | named ]) as $pending
+    | if .isDraft then "draft"
+      elif .reviewDecision == "CHANGES_REQUESTED" then "changes requested by a reviewer"
+      elif .mergeable == "CONFLICTING" then "conflicts with the base branch"
+      elif .mergeable != "MERGEABLE" then "mergeability not yet computed by GitHub"
+      elif ($failing | length) > 0 then "failing checks: " + ($failing | join(", "))
+      elif ($pending | length) > 0 then "checks still running: " + ($pending | join(", "))
+      elif (.statusCheckRollup | length) == 0 then "no checks have run"
+      elif .mergeStateStatus == "BLOCKED" then "blocked by branch protection"
+      elif .mergeStateStatus != "CLEAN" then
+        "merge state is " + (.mergeStateStatus // "unknown") + ", not CLEAN"
+      else "" end
+  ' <<<"$json"
+}
+
 # ── Step 2 — classify ─────────────────────────────────────────────────────────
 declare -a OPEN_LIST=()      # branches with open PRs
 declare -a MERGED_LIST=()    # branches with merged PRs
-declare -a SUPERSEDED_LIST=()# no PR, 0 unique commits (or stale)
+declare -a SUPERSEDED_LIST=() # no PR, 0 unique commits (or stale)
 declare -a REVIEW_LIST=()    # no PR, >0 unique commits — need human decision
+declare -a SKIPPED_LIST=()   # open PRs the merge gate refused, as "#N — reason"
 
 log "Classifying branches…"
 echo ""
@@ -149,59 +193,37 @@ fi
 
 # ── Step 5 — merge OPEN PRs ───────────────────────────────────────────────────
 echo ""
-log "Rebasing and merging open PRs (one at a time)…"
+log "Merging open PRs that pass the gate (one at a time)…"
 
 for branch in "${OPEN_LIST[@]}"; do
   pr=$(pr_number_for "$branch")
   title=$(pr_title_for "$branch")
   log "  PR #$pr — $title"
 
-  if [[ "$DRY" == "true" ]]; then
-    log "  [dry-run] would rebase $branch onto $BASE and merge #$pr"
+  # Gate first: never touch a PR we would not be allowed to merge. Rebasing and
+  # force-pushing a blocked PR is itself destructive, so this runs before any
+  # write to the branch.
+  reason=$(merge_block_reason "$pr")
+  if [[ -n "$reason" ]]; then
+    warn "  $(yellow 'skipped') #$pr — $reason"
+    SKIPPED_LIST+=("#$pr ($branch) — $reason")
+    (( skipped_count++ )) || true
     continue
   fi
 
-  # Checkout and rebase
-  git checkout "$branch" -q 2>/dev/null || {
-    git checkout -b "$branch" "origin/$branch" -q
-  }
-  git fetch origin "$BASE":$BASE -q 2>/dev/null || true
-
-  if ! git rebase "origin/$BASE" -q 2>/dev/null; then
-    # Auto-resolve: take base for files not owned by this branch
-    owned=$(git diff --name-only "origin/$BASE"..."$branch" 2>/dev/null || true)
-    git diff --name-only --diff-filter=U | while IFS= read -r conflict; do
-      if echo "$owned" | grep -qxF "$conflict"; then
-        warn "    conflict in owned file $conflict — leaving for manual resolution"
-        git rebase --abort
-        warn "    aborted rebase for #$pr; skipping"
-        continue 2
-      else
-        git checkout "origin/$BASE" -- "$conflict"
-        git add "$conflict"
-      fi
-    done
-    git rebase --continue --no-edit -q 2>/dev/null || {
-      git rebase --abort 2>/dev/null || true
-      warn "  rebase failed for #$pr ($branch) — skipping"
-      continue
-    }
+  if [[ "$DRY" == "true" ]]; then
+    log "  [dry-run] would merge #$pr ($STRATEGY)"
+    continue
   fi
 
-  git push --force-with-lease origin "$branch" -q
-
-  # Merge
   merge_flag="--$STRATEGY"
-  if gh pr merge "$pr" $merge_flag --delete-branch 2>&1; then
+  if gh pr merge "$pr" "$merge_flag" --delete-branch 2>&1; then
     log "  $(green '✓') merged #$pr"
     (( merged_count++ )) || true
   else
     warn "  merge failed for #$pr — check CI or conflicts"
+    SKIPPED_LIST+=("#$pr ($branch) — merge API call failed")
   fi
-
-  # Re-sync base before next iteration
-  git checkout "$BASE" -q
-  git pull -q
 done
 
 # ── Step 6 — final state ──────────────────────────────────────────────────────
@@ -220,10 +242,20 @@ echo "  Remote branches remaining (excl. $BASE): $remaining_branches"
   echo "| Metric | Count |"
   echo "|--------|-------|"
   echo "| PRs merged | $merged_count |"
+  echo "| PRs held by the merge gate | $skipped_count |"
   echo "| Branches deleted | $deleted_count |"
   echo "| REVIEW branches skipped | $kept_count |"
   echo "| Open PRs remaining | $remaining_open |"
   echo ""
+
+  if [[ ${#SKIPPED_LIST[@]} -gt 0 ]]; then
+    echo "### 🚦 PRs held by the merge gate"
+    echo ""
+    for entry in "${SKIPPED_LIST[@]}"; do
+      echo "- $entry"
+    done
+    echo ""
+  fi
 
   if [[ ${#REVIEW_LIST[@]} -gt 0 ]]; then
     echo "### ⚠️ REVIEW branches (need manual decision)"
@@ -245,6 +277,7 @@ echo "  Remote branches remaining (excl. $BASE): $remaining_branches"
   echo "merged_count=$merged_count"
   echo "deleted_count=$deleted_count"
   echo "kept_count=$kept_count"
+  echo "skipped_count=$skipped_count"
 } >> "${GITHUB_OUTPUT:-/dev/null}"
 
-log "Done. merged=$merged_count deleted=$deleted_count kept=$kept_count"
+log "Done. merged=$merged_count skipped=$skipped_count deleted=$deleted_count kept=$kept_count"

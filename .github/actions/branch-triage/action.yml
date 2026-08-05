@@ -1,8 +1,8 @@
 name: Branch Triage
 description: >
-  Classify, rebase, merge, and prune git branches.
-  Merges open PRs, deletes merged/superseded branches, removes orphaned
-  worktrees, and writes a Markdown summary to the job summary.
+  Classify, merge, and prune git branches.
+  Merges open PRs that pass a CI-and-review gate, deletes merged/superseded
+  branches, and writes a Markdown summary to the job summary.
 
 inputs:
   base-branch:
@@ -43,6 +43,9 @@ outputs:
   kept-count:
     description: Number of REVIEW branches left untouched (need manual decision).
     value: ${{ steps.triage.outputs.kept_count }}
+  skipped-count:
+    description: Number of open PRs the merge gate refused to merge.
+    value: ${{ steps.triage.outputs.skipped_count }}
 
 runs:
   using: composite
