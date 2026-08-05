@@ -3699,8 +3699,7 @@ fn writer_backlog(event_writer: Option<&crate::event_writer::EventWriterHealth>)
         .unwrap_or_default()
 }
 
-pub fn record_maintenance_error(coven_home: &Path, error: impl ToString) {
-    let _ = error.to_string();
+pub fn record_maintenance_error(coven_home: &Path, _details: impl ToString) {
     if let Ok(Some(conn)) = open_existing_store_writable(&coven_home.join("coven.sqlite3")) {
         let _ = set_store_meta(
             &conn,
