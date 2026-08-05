@@ -2456,7 +2456,10 @@ pub(crate) fn acquire_serve_lock(coven_home: &Path) -> Result<std::fs::File> {
 }
 
 fn initialize_daemon_store(coven_home: &Path) -> Result<()> {
-    crate::store::initialize_store(&coven_home.join("coven.sqlite3"))
+    crate::store::initialize_store(&coven_home.join("coven.sqlite3"))?;
+    crate::hub::initialize_hub_identity(coven_home)
+        .context("failed to initialize hub identity during daemon startup")?;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -3134,6 +3137,12 @@ mod tests {
         initialize_daemon_store(temp_dir.path())?;
         let conn = crate::store::open_initialized_store(&temp_dir.path().join("coven.sqlite3"))?;
         assert!(crate::store::list_sessions(&conn)?.is_empty());
+        let hub_id: String = conn.query_row(
+            "SELECT value FROM store_meta WHERE key = ?1",
+            [crate::hub::HUB_ID_META_KEY],
+            |row| row.get(0),
+        )?;
+        assert!(hub_id.starts_with("hub_"));
         Ok(())
     }
 

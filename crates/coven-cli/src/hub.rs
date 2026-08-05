@@ -40,6 +40,20 @@ fn hub_id(conn: &Connection) -> Result<String> {
     store::get_or_insert_store_meta(conn, HUB_ID_META_KEY, &format!("hub_{}", Uuid::new_v4()))
 }
 
+fn read_hub_id(conn: &Connection) -> Result<String> {
+    conn.query_row(
+        "SELECT value FROM store_meta WHERE key = ?1",
+        [HUB_ID_META_KEY],
+        |row| row.get(0),
+    )
+    .context("failed to read hub id")
+}
+
+pub(crate) fn initialize_hub_identity(coven_home: &Path) -> Result<String> {
+    let conn = store::open_initialized_store(&store_path(coven_home))?;
+    hub_id(&conn)
+}
+
 fn parse_capabilities(json_text: &str) -> Vec<String> {
     serde_json::from_str(json_text).unwrap_or_default()
 }
@@ -177,23 +191,17 @@ pub fn hub_health_summary(coven_home: &Path) -> Result<Value> {
         .context("Coven store does not exist")?;
     let nodes = store::list_nodes(&conn)?;
     let available = nodes.iter().filter(|node| node.available).count();
-    let hub_id: String = conn
-        .query_row(
-            "SELECT value FROM store_meta WHERE key = ?1",
-            [HUB_ID_META_KEY],
-            |row| row.get(0),
-        )
-        .context("failed to read hub id")?;
     Ok(json!({
         "role": HUB_ROLE,
-        "hubId": hub_id,
+        "hubId": read_hub_id(&conn)?,
         "nodesTotal": nodes.len(),
         "nodesAvailable": available,
     }))
 }
 
 pub fn hub_status(coven_home: &Path) -> Result<ApiResponse> {
-    let conn = store::open_store(&store_path(coven_home))?;
+    let conn = store::open_existing_store_read_only(&store_path(coven_home))?
+        .context("Coven store does not exist")?;
     let nodes = store::list_nodes(&conn)?;
     let jobs = store::list_hub_jobs(&conn, None)?;
     let queues = store::list_executor_queues(&conn)?;
@@ -214,7 +222,7 @@ pub fn hub_status(coven_home: &Path) -> Result<ApiResponse> {
         200,
         &json!({
             "role": HUB_ROLE,
-            "hubId": hub_id(&conn)?,
+            "hubId": read_hub_id(&conn)?,
             "nodes": node_views,
             "nodesTotal": nodes.len(),
             "nodesAvailable": nodes.iter().filter(|node| node.available).count(),
