@@ -7,10 +7,17 @@
 //! nodes that go unavailable keep their subqueue held on the hub until they
 //! recover or the scheduler explicitly redispatches their work.
 
-use std::path::Path;
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        OnceLock, RwLock,
+    },
+};
 
 use anyhow::{bail, Context, Result};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -32,8 +39,26 @@ const JOB_STATE_ASSIGNED: &str = "assigned";
 const JOB_STATE_HELD: &str = "held";
 const TERMINAL_JOB_STATES: [&str; 3] = ["completed", "failed", "cancelled"];
 
+#[derive(Clone)]
+struct VersionedStatusSnapshot {
+    revision: u64,
+    value: Option<Value>,
+}
+
+static HUB_STATUS_SNAPSHOTS: OnceLock<RwLock<HashMap<PathBuf, VersionedStatusSnapshot>>> =
+    OnceLock::new();
+static HUB_STATUS_REVISION: AtomicU64 = AtomicU64::new(0);
+
 fn store_path(coven_home: &Path) -> std::path::PathBuf {
     coven_home.join("coven.sqlite3")
+}
+
+fn hub_status_snapshots() -> &'static RwLock<HashMap<PathBuf, VersionedStatusSnapshot>> {
+    HUB_STATUS_SNAPSHOTS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn next_status_revision() -> u64 {
+    HUB_STATUS_REVISION.fetch_add(1, Ordering::Relaxed) + 1
 }
 
 fn hub_id(conn: &Connection) -> Result<String> {
@@ -186,39 +211,13 @@ pub(crate) fn apply_redispatch_outcome(
     Ok(true)
 }
 
-pub fn hub_health_summary(coven_home: &Path) -> Result<Value> {
-    let conn = store::open_existing_store_read_only(&store_path(coven_home))?
-        .context("Coven store does not exist")?;
-    let nodes = store::list_nodes(&conn)?;
-    let available = nodes.iter().filter(|node| node.available).count();
-    Ok(json!({
-        "role": HUB_ROLE,
-        "hubId": read_hub_id(&conn)?.context("hub identity is not initialized")?,
-        "nodesTotal": nodes.len(),
-        "nodesAvailable": available,
-    }))
-}
-
-pub fn hub_status(coven_home: &Path) -> Result<ApiResponse> {
-    let Some(conn) = store::open_existing_store_read_only(&store_path(coven_home))? else {
-        return api_error(
-            503,
-            "hub_unavailable",
-            "Hub state is unavailable until daemon startup completes.",
-            None,
-        );
+fn status_snapshot(conn: &Connection) -> Result<Option<Value>> {
+    let Some(hub_id) = read_hub_id(conn)? else {
+        return Ok(None);
     };
-    let Some(hub_id) = read_hub_id(&conn)? else {
-        return api_error(
-            503,
-            "hub_unavailable",
-            "Hub identity is unavailable until daemon startup completes.",
-            None,
-        );
-    };
-    let nodes = store::list_nodes(&conn)?;
-    let jobs = store::list_hub_jobs(&conn, None)?;
-    let queues = store::list_executor_queues(&conn)?;
+    let nodes = store::list_nodes(conn)?;
+    let jobs = store::list_hub_jobs(conn, None)?;
+    let queues = store::list_executor_queues(conn)?;
     let count_state = |state: &str| jobs.iter().filter(|job| job.state == state).count();
     let node_views: Vec<Value> = nodes.iter().map(node_response).collect();
     let queue_views: Vec<Value> = queues
@@ -232,23 +231,158 @@ pub fn hub_status(coven_home: &Path) -> Result<ApiResponse> {
             })
         })
         .collect();
-    json_response(
-        200,
-        &json!({
-            "role": HUB_ROLE,
-            "hubId": hub_id,
-            "nodes": node_views,
-            "nodesTotal": nodes.len(),
-            "nodesAvailable": nodes.iter().filter(|node| node.available).count(),
-            "globalQueue": {
-                "queued": count_state(JOB_STATE_QUEUED),
-                "assigned": count_state(JOB_STATE_ASSIGNED),
-                "held": count_state(JOB_STATE_HELD),
-                "total": jobs.len(),
+    Ok(Some(json!({
+        "role": HUB_ROLE,
+        "hubId": hub_id,
+        "nodes": node_views,
+        "nodesTotal": nodes.len(),
+        "nodesAvailable": nodes.iter().filter(|node| node.available).count(),
+        "globalQueue": {
+            "queued": count_state(JOB_STATE_QUEUED),
+            "assigned": count_state(JOB_STATE_ASSIGNED),
+            "held": count_state(JOB_STATE_HELD),
+            "total": jobs.len(),
+        },
+        "executorQueues": queue_views,
+    })))
+}
+
+pub(crate) fn refresh_status_snapshot_from_connection(
+    coven_home: &Path,
+    conn: &Connection,
+) -> Result<()> {
+    let revision = next_status_revision();
+    if let Err(error) = refresh_status_snapshot_from_connection_at(coven_home, conn, revision) {
+        invalidate_status_snapshot_at(coven_home, revision);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn refresh_status_snapshot_from_connection_at(
+    coven_home: &Path,
+    conn: &Connection,
+    revision: u64,
+) -> Result<()> {
+    let snapshot = status_snapshot(conn)?;
+    let mut snapshots = hub_status_snapshots()
+        .write()
+        .map_err(|_| anyhow::anyhow!("hub status snapshot lock poisoned"))?;
+    if snapshots
+        .get(coven_home)
+        .is_none_or(|current| revision >= current.revision)
+    {
+        snapshots.insert(
+            coven_home.to_path_buf(),
+            VersionedStatusSnapshot {
+                revision,
+                value: snapshot,
             },
-            "executorQueues": queue_views,
-        }),
-    )
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn refresh_status_snapshot(coven_home: &Path) -> Result<()> {
+    refresh_status_snapshot_at(coven_home, next_status_revision())
+}
+
+fn refresh_status_snapshot_at(coven_home: &Path, revision: u64) -> Result<()> {
+    let path = store_path(coven_home);
+    if !path.exists() {
+        invalidate_status_snapshot_at(coven_home, revision);
+        return Ok(());
+    }
+    let conn = match store::open_initialized_store(&path) {
+        Ok(conn) => conn,
+        Err(error) => {
+            invalidate_status_snapshot_at(coven_home, revision);
+            return Err(error);
+        }
+    };
+    if let Err(error) = refresh_status_snapshot_from_connection_at(coven_home, &conn, revision) {
+        invalidate_status_snapshot_at(coven_home, revision);
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub(crate) fn with_status_mutation(
+    coven_home: &Path,
+    operation: impl FnOnce() -> Result<ApiResponse>,
+) -> Result<ApiResponse> {
+    with_status_mutation_using(coven_home, operation, refresh_status_snapshot)
+}
+
+fn with_status_mutation_using(
+    coven_home: &Path,
+    operation: impl FnOnce() -> Result<ApiResponse>,
+    refresh: impl FnOnce(&Path) -> Result<()>,
+) -> Result<ApiResponse> {
+    let operation_result = operation();
+    let refresh_result = refresh(coven_home);
+    if let Err(error) = refresh_result {
+        crate::daemon::append_daemon_recovery_log(
+            coven_home,
+            &format!("hub status snapshot refresh failed after mutation: {error:#}"),
+        );
+    }
+    operation_result
+}
+
+fn invalidate_status_snapshot_at(coven_home: &Path, revision: u64) {
+    if let Ok(mut snapshots) = hub_status_snapshots().write() {
+        if snapshots
+            .get(coven_home)
+            .is_none_or(|current| revision >= current.revision)
+        {
+            snapshots.insert(
+                coven_home.to_path_buf(),
+                VersionedStatusSnapshot {
+                    revision,
+                    value: None,
+                },
+            );
+        }
+    }
+}
+
+fn cached_status_snapshot(coven_home: &Path) -> Result<Option<Value>> {
+    Ok(hub_status_snapshots()
+        .read()
+        .map_err(|_| anyhow::anyhow!("hub status snapshot lock poisoned"))?
+        .get(coven_home)
+        .and_then(|snapshot| snapshot.value.clone()))
+}
+
+pub fn hub_health_summary(coven_home: &Path) -> Result<Value> {
+    let snapshot =
+        cached_status_snapshot(coven_home)?.context("hub status snapshot is unavailable")?;
+    Ok(json!({
+        "role": snapshot["role"],
+        "hubId": snapshot["hubId"],
+        "nodesTotal": snapshot["nodesTotal"],
+        "nodesAvailable": snapshot["nodesAvailable"],
+    }))
+}
+
+pub fn hub_status(coven_home: &Path) -> Result<ApiResponse> {
+    hub_status_from_snapshot_result(cached_status_snapshot(coven_home))
+}
+
+fn hub_status_from_snapshot_result(snapshot: Result<Option<Value>>) -> Result<ApiResponse> {
+    let snapshot = match snapshot {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) | Err(_) => {
+            return api_error(
+                503,
+                "hub_unavailable",
+                "Hub state is unavailable until daemon startup completes.",
+                None,
+            );
+        }
+    };
+    json_response(200, &snapshot)
 }
 
 #[derive(Debug, Deserialize)]
@@ -272,6 +406,11 @@ fn default_true() -> bool {
     true
 }
 
+fn begin_node_registration_transaction(conn: &mut Connection) -> Result<Transaction<'_>> {
+    conn.transaction_with_behavior(TransactionBehavior::Immediate)
+        .context("failed to begin node registration transaction")
+}
+
 pub fn register_node(coven_home: &Path, body: Option<&str>) -> Result<ApiResponse> {
     let payload = match parse_body(body) {
         Ok(payload) => payload,
@@ -288,9 +427,7 @@ pub fn register_node(coven_home: &Path, body: Option<&str>) -> Result<ApiRespons
         return api_error(400, "invalid_request", "role is required.", None);
     }
     let mut conn = store::open_store(&store_path(coven_home))?;
-    let transaction = conn
-        .transaction()
-        .context("failed to begin node registration transaction")?;
+    let transaction = begin_node_registration_transaction(&mut conn)?;
     let now = current_timestamp();
     let existing = store::get_node(&transaction, &request.node_id)?;
     let capabilities_json = serde_json::to_string(&request.capabilities)
@@ -1226,6 +1363,172 @@ mod tests {
     }
 
     #[test]
+    fn node_registration_reserves_the_writer_before_reading_existing_state() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store_path = super::store_path(temp.path());
+        let mut registration = crate::store::open_store(&store_path)?;
+        let mut contender = crate::store::open_initialized_store(&store_path)?;
+        contender.busy_timeout(std::time::Duration::ZERO)?;
+
+        let transaction = super::begin_node_registration_transaction(&mut registration)?;
+        assert!(crate::store::get_node(&transaction, "node_reserved")?.is_none());
+
+        let contender_blocked = contender
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .is_err();
+        assert!(
+            contender_blocked,
+            "registration must reserve SQLite's writer before reading existing node state"
+        );
+
+        drop(transaction);
+        contender
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?
+            .rollback()?;
+        Ok(())
+    }
+
+    #[test]
+    fn older_status_refresh_cannot_overwrite_newer_snapshot() -> anyhow::Result<()> {
+        let cache_key = tempfile::tempdir()?;
+        let older = tempfile::tempdir()?;
+        let newer = tempfile::tempdir()?;
+
+        let older_response = super::register_node(
+            older.path(),
+            Some(r#"{"nodeId":"node_old","role":"stationary_executor"}"#),
+        )?;
+        assert_eq!(older_response.status, 201);
+        let newer_response = super::register_node(
+            newer.path(),
+            Some(r#"{"nodeId":"node_new","role":"stationary_executor"}"#),
+        )?;
+        assert_eq!(newer_response.status, 201);
+
+        let older_conn = crate::store::open_initialized_store(&super::store_path(older.path()))?;
+        let newer_conn = crate::store::open_initialized_store(&super::store_path(newer.path()))?;
+        let older_revision = super::next_status_revision();
+        let newer_revision = super::next_status_revision();
+        super::refresh_status_snapshot_from_connection_at(
+            cache_key.path(),
+            &newer_conn,
+            newer_revision,
+        )?;
+        super::refresh_status_snapshot_from_connection_at(
+            cache_key.path(),
+            &older_conn,
+            older_revision,
+        )?;
+
+        let status = super::hub_status(cache_key.path())?;
+        let body: serde_json::Value = serde_json::from_str(&status.body)?;
+        assert_eq!(body["nodes"][0]["nodeId"], "node_new");
+        Ok(())
+    }
+
+    #[test]
+    fn mutation_error_refreshes_partially_committed_state() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store_path = super::store_path(temp.path());
+        crate::store::initialize_store(&store_path)?;
+        let conn = crate::store::open_initialized_store(&store_path)?;
+        super::initialize_hub_identity(&conn)?;
+        super::refresh_status_snapshot_from_connection(temp.path(), &conn)?;
+        drop(conn);
+
+        let error = super::with_status_mutation(temp.path(), || {
+            let response = super::register_node(
+                temp.path(),
+                Some(r#"{"nodeId":"node_committed","role":"stationary_executor"}"#),
+            )?;
+            assert_eq!(response.status, 201);
+            anyhow::bail!("simulated post-commit failure");
+        })
+        .expect_err("operation must retain its original failure");
+        assert!(error.to_string().contains("simulated post-commit failure"));
+
+        let status = super::hub_status(temp.path())?;
+        let body: serde_json::Value = serde_json::from_str(&status.body)?;
+        assert_eq!(body["nodes"][0]["nodeId"], "node_committed");
+        Ok(())
+    }
+
+    #[test]
+    fn successful_mutation_survives_refresh_failure_and_invalidates_status() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store_path = super::store_path(temp.path());
+        crate::store::initialize_store(&store_path)?;
+        let conn = crate::store::open_initialized_store(&store_path)?;
+        super::initialize_hub_identity(&conn)?;
+        super::refresh_status_snapshot_from_connection(temp.path(), &conn)?;
+        drop(conn);
+
+        let failure_revision = super::next_status_revision();
+        let response = super::with_status_mutation_using(
+            temp.path(),
+            || {
+                super::register_node(
+                    temp.path(),
+                    Some(r#"{"nodeId":"node_committed","role":"stationary_executor"}"#),
+                )
+            },
+            |home| {
+                super::invalidate_status_snapshot_at(home, failure_revision);
+                anyhow::bail!("simulated snapshot refresh failure")
+            },
+        )?;
+        assert_eq!(response.status, 201);
+
+        let conn = crate::store::open_initialized_store(&store_path)?;
+        assert!(crate::store::get_node(&conn, "node_committed")?.is_some());
+
+        let status = super::hub_status(temp.path())?;
+        assert_eq!(status.status, 503);
+        let body: serde_json::Value = serde_json::from_str(&status.body)?;
+        assert_eq!(body["error"]["code"], "hub_unavailable");
+
+        let log = std::fs::read_to_string(crate::daemon::daemon_recovery_log_path(temp.path()))?;
+        assert!(log.contains("hub status snapshot refresh failed"));
+        assert!(log.contains("simulated snapshot refresh failure"));
+        Ok(())
+    }
+
+    #[test]
+    fn mutation_error_remains_primary_when_snapshot_refresh_also_fails() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let failure_revision = super::next_status_revision();
+
+        let error = super::with_status_mutation_using(
+            temp.path(),
+            || anyhow::bail!("operation failed"),
+            |home| {
+                super::invalidate_status_snapshot_at(home, failure_revision);
+                anyhow::bail!("simulated snapshot refresh failure")
+            },
+        )
+        .expect_err("operation failure must remain the result");
+
+        assert!(error.to_string().contains("operation failed"));
+        assert!(!error.to_string().contains("snapshot refresh failure"));
+        let log = std::fs::read_to_string(crate::daemon::daemon_recovery_log_path(temp.path()))?;
+        assert!(log.contains("hub status snapshot refresh failed"));
+        assert!(log.contains("simulated snapshot refresh failure"));
+        Ok(())
+    }
+
+    #[test]
+    fn hub_status_maps_snapshot_read_failure_to_structured_unavailable() -> anyhow::Result<()> {
+        let response = super::hub_status_from_snapshot_result(Err(anyhow::anyhow!(
+            "hub status snapshot lock poisoned"
+        )))?;
+
+        assert_eq!(response.status, 503);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "hub_unavailable");
+        Ok(())
+    }
+
+    #[test]
     fn hub_status_exposes_role_and_node_availability() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         register_gpu_node(&temp, "node_a")?;
@@ -1680,6 +1983,13 @@ mod tests {
         let (_, node) = get(&temp, "/api/v1/hub/nodes/node_gone")?;
         assert_eq!(node["available"], false);
         assert!(!node["lastError"].as_str().unwrap().is_empty());
+
+        let (_, status) = get(&temp, "/api/v1/hub/status")?;
+        let status_node = status["nodes"]
+            .as_array()
+            .and_then(|nodes| nodes.iter().find(|node| node["nodeId"] == "node_gone"))
+            .ok_or_else(|| anyhow::anyhow!("failed dispatch node missing from hub status"))?;
+        assert_eq!(status_node["available"], false);
         Ok(())
     }
 

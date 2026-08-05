@@ -289,12 +289,19 @@ fn health_response_with_hub(
         response.hub = serde_json::from_value(summary).ok();
     }
     response.storage = Some(
-        store::storage_health(coven_home, event_writer.as_ref()).unwrap_or_else(|error| {
+        store::cached_storage_health(coven_home, event_writer.as_ref()).unwrap_or_else(|error| {
             store::unavailable_storage_health(coven_home, error, None, event_writer.as_ref())
         }),
     );
     response.event_writer = event_writer;
     response
+}
+
+fn hub_mutation_response(
+    coven_home: &Path,
+    operation: impl FnOnce() -> Result<ApiResponse>,
+) -> Result<ApiResponse> {
+    crate::hub::with_status_mutation(coven_home, operation)
 }
 
 #[allow(dead_code)]
@@ -620,28 +627,38 @@ pub fn handle_request_with_runtime(
             let q = query.unwrap_or_default();
             travel_state(coven_home, q)
         }
-        ("POST", "/scheduler/decisions") => scheduler_decision(coven_home, body),
-        ("POST", "/scheduler/redispatch") => scheduler_redispatch(coven_home, body),
+        ("POST", "/scheduler/decisions") => {
+            hub_mutation_response(coven_home, || scheduler_decision(coven_home, body))
+        }
+        ("POST", "/scheduler/redispatch") => {
+            hub_mutation_response(coven_home, || scheduler_redispatch(coven_home, body))
+        }
         ("GET", "/hub/status") => crate::hub::hub_status(coven_home),
-        ("POST", "/hub/nodes") => crate::hub::register_node(coven_home, body),
+        ("POST", "/hub/nodes") => {
+            hub_mutation_response(coven_home, || crate::hub::register_node(coven_home, body))
+        }
         ("GET", "/hub/nodes") => crate::hub::list_nodes(coven_home),
         ("POST", path) if path.starts_with("/hub/nodes/") && path.ends_with("/health") => {
             let node_id = path
                 .trim_start_matches("/hub/nodes/")
                 .trim_end_matches("/health");
-            crate::hub::report_node_health(coven_home, node_id, body)
+            hub_mutation_response(coven_home, || {
+                crate::hub::report_node_health(coven_home, node_id, body)
+            })
         }
         ("POST", path) if path.starts_with("/hub/nodes/") && path.ends_with("/poll") => {
             let node_id = path
                 .trim_start_matches("/hub/nodes/")
                 .trim_end_matches("/poll");
-            crate::hub::poll_node(coven_home, node_id)
+            hub_mutation_response(coven_home, || crate::hub::poll_node(coven_home, node_id))
         }
         ("POST", path) if path.starts_with("/hub/nodes/") && path.ends_with("/dispatch") => {
             let node_id = path
                 .trim_start_matches("/hub/nodes/")
                 .trim_end_matches("/dispatch");
-            crate::hub::dispatch_to_node(coven_home, node_id, body)
+            hub_mutation_response(coven_home, || {
+                crate::hub::dispatch_to_node(coven_home, node_id, body)
+            })
         }
         ("GET", path) if path.starts_with("/hub/dispatches/") => {
             let job_id = path.trim_start_matches("/hub/dispatches/");
@@ -651,7 +668,9 @@ pub fn handle_request_with_runtime(
             let node_id = path.trim_start_matches("/hub/nodes/");
             crate::hub::get_node(coven_home, node_id)
         }
-        ("POST", "/hub/jobs") => crate::hub::enqueue_job(coven_home, body),
+        ("POST", "/hub/jobs") => {
+            hub_mutation_response(coven_home, || crate::hub::enqueue_job(coven_home, body))
+        }
         ("GET", "/hub/jobs") => {
             let q = query.unwrap_or_default();
             crate::hub::list_jobs(coven_home, q)
@@ -660,13 +679,17 @@ pub fn handle_request_with_runtime(
             let job_id = path
                 .trim_start_matches("/hub/jobs/")
                 .trim_end_matches("/assign");
-            crate::hub::assign_job(coven_home, job_id, body)
+            hub_mutation_response(coven_home, || {
+                crate::hub::assign_job(coven_home, job_id, body)
+            })
         }
         ("POST", path) if path.starts_with("/hub/jobs/") && path.ends_with("/complete") => {
             let job_id = path
                 .trim_start_matches("/hub/jobs/")
                 .trim_end_matches("/complete");
-            crate::hub::complete_job(coven_home, job_id, body)
+            hub_mutation_response(coven_home, || {
+                crate::hub::complete_job(coven_home, job_id, body)
+            })
         }
         ("GET", path) if path.starts_with("/hub/jobs/") => {
             let job_id = path.trim_start_matches("/hub/jobs/");
@@ -6847,6 +6870,79 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    fn sqlite_file_contents(coven_home: &Path) -> anyhow::Result<Vec<Option<Vec<u8>>>> {
+        ["coven.sqlite3", "coven.sqlite3-wal", "coven.sqlite3-shm"]
+            .into_iter()
+            .map(|file_name| {
+                let path = coven_home.join(file_name);
+                if path.exists() {
+                    Ok(Some(std::fs::read(path)?))
+                } else {
+                    Ok(None)
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn health_and_hub_status_do_not_touch_initialized_store_files() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store_path = temp_dir.path().join("coven.sqlite3");
+        crate::store::initialize_store(&store_path)?;
+        let conn = crate::store::open_initialized_store(&store_path)?;
+        crate::hub::initialize_hub_identity(&conn)?;
+        crate::hub::refresh_status_snapshot_from_connection(temp_dir.path(), &conn)?;
+        crate::store::refresh_storage_health_snapshot_from_connection(
+            temp_dir.path(),
+            &conn,
+            None,
+        )?;
+        drop(conn);
+
+        let before = sqlite_file_contents(temp_dir.path())?;
+        let health = handle_request("GET", "/health", temp_dir.path(), None)?;
+        let status = handle_request("GET", "/api/v1/hub/status", temp_dir.path(), None)?;
+        let after = sqlite_file_contents(temp_dir.path())?;
+
+        assert_eq!(health.status, 200);
+        assert_eq!(status.status, 200);
+        assert_eq!(after, before);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn health_and_hub_status_work_without_store_directory_write_access() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir()?;
+        let store_path = temp_dir.path().join("coven.sqlite3");
+        crate::store::initialize_store(&store_path)?;
+        let conn = crate::store::open_initialized_store(&store_path)?;
+        crate::hub::initialize_hub_identity(&conn)?;
+        crate::hub::refresh_status_snapshot_from_connection(temp_dir.path(), &conn)?;
+        crate::store::refresh_storage_health_snapshot_from_connection(
+            temp_dir.path(),
+            &conn,
+            None,
+        )?;
+        drop(conn);
+
+        let before = sqlite_file_contents(temp_dir.path())?;
+        let original_permissions = std::fs::metadata(temp_dir.path())?.permissions();
+        std::fs::set_permissions(temp_dir.path(), std::fs::Permissions::from_mode(0o500))?;
+        let result = (|| -> anyhow::Result<()> {
+            let health = handle_request("GET", "/health", temp_dir.path(), None)?;
+            let status = handle_request("GET", "/api/v1/hub/status", temp_dir.path(), None)?;
+            assert_eq!(health.status, 200);
+            assert_eq!(status.status, 200);
+            assert_eq!(sqlite_file_contents(temp_dir.path())?, before);
+            Ok(())
+        })();
+        std::fs::set_permissions(temp_dir.path(), original_permissions)?;
+        result
     }
 
     #[test]

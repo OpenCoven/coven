@@ -1,11 +1,11 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{OnceLock, RwLock},
 };
 
 #[cfg(test)]
-use std::{collections::HashMap, sync::Mutex};
+use std::sync::Mutex;
 
 use anyhow::{bail, Context, Result};
 use base64::Engine;
@@ -155,6 +155,20 @@ pub struct StorageHealth {
     pub maintenance_blocked: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_maintenance_error: Option<String>,
+}
+
+#[derive(Clone)]
+struct StorageHealthSnapshot {
+    health: StorageHealth,
+    retention_lagging: bool,
+    degraded: bool,
+}
+
+static STORAGE_HEALTH_SNAPSHOTS: OnceLock<RwLock<HashMap<PathBuf, StorageHealthSnapshot>>> =
+    OnceLock::new();
+
+fn storage_health_snapshots() -> &'static RwLock<HashMap<PathBuf, StorageHealthSnapshot>> {
+    STORAGE_HEALTH_SNAPSHOTS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3600,6 +3614,7 @@ fn run_scheduled_maintenance_with_config_and_free_disk(
 
 /// Gather storage pressure without mutating the database. Health callers use
 /// this after daemon startup has initialized the schema.
+#[cfg(test)]
 pub fn storage_health(
     coven_home: &Path,
     event_writer: Option<&crate::event_writer::EventWriterHealth>,
@@ -3613,21 +3628,190 @@ pub fn storage_health(
     ))
 }
 
+pub fn cached_storage_health(
+    coven_home: &Path,
+    event_writer: Option<&crate::event_writer::EventWriterHealth>,
+) -> Result<StorageHealth> {
+    let free_disk_bytes = fs2::available_space(coven_home)
+        .with_context(|| format!("failed to inspect free disk for {}", coven_home.display()))?;
+    cached_storage_health_with_free_disk(coven_home, free_disk_bytes, event_writer)
+}
+
+pub(crate) fn cached_storage_health_with_free_disk(
+    coven_home: &Path,
+    free_disk_bytes: u64,
+    event_writer: Option<&crate::event_writer::EventWriterHealth>,
+) -> Result<StorageHealth> {
+    let snapshot = storage_health_snapshots()
+        .read()
+        .map_err(|_| anyhow::anyhow!("storage health snapshot lock poisoned"))?
+        .get(coven_home)
+        .cloned()
+        .context("storage health snapshot is unavailable")?;
+    let mut health = snapshot.health;
+    let store_path = coven_home.join("coven.sqlite3");
+    health.database_bytes = file_size(&store_path);
+    health.wal_bytes = file_size(&wal_path(&store_path));
+    health.free_disk_bytes = free_disk_bytes;
+    health.maintenance_blocked = health.free_disk_bytes < MAINTENANCE_MIN_FREE_DISK_BYTES;
+    if event_writer.is_some() {
+        (health.writer_backlog_events, health.writer_backlog_bytes) = writer_backlog(event_writer);
+    }
+    health.prune_age_seconds = maintenance_age_seconds(health.last_prune_at.as_deref());
+    health.checkpoint_age_seconds = maintenance_age_seconds(health.last_checkpoint_at.as_deref());
+    if snapshot.degraded {
+        health.status = "degraded".to_string();
+    } else if health.maintenance_blocked {
+        health.status = "critical".to_string();
+    } else if snapshot.retention_lagging
+        || health.free_disk_bytes < MAINTENANCE_WARN_FREE_DISK_BYTES
+        || health.wal_bytes >= MAINTENANCE_CHECKPOINT_WAL_BYTES
+        || health.last_maintenance_error.is_some()
+    {
+        health.status = "warning".to_string();
+    } else {
+        health.status = "ok".to_string();
+    }
+    Ok(health)
+}
+
+pub fn refresh_storage_health_snapshot_from_connection(
+    coven_home: &Path,
+    conn: &Connection,
+    event_writer: Option<&crate::event_writer::EventWriterHealth>,
+) -> Result<()> {
+    let free_disk_bytes = fs2::available_space(coven_home)
+        .with_context(|| format!("failed to inspect free disk for {}", coven_home.display()))?;
+    refresh_storage_health_snapshot_from_connection_with_free_disk(
+        coven_home,
+        conn,
+        free_disk_bytes,
+        event_writer,
+    )
+}
+
+pub(crate) fn refresh_storage_health_snapshot_from_connection_with_free_disk(
+    coven_home: &Path,
+    conn: &Connection,
+    free_disk_bytes: u64,
+    event_writer: Option<&crate::event_writer::EventWriterHealth>,
+) -> Result<()> {
+    let previous = if free_disk_bytes < MAINTENANCE_MIN_FREE_DISK_BYTES {
+        storage_health_snapshots()
+            .read()
+            .map_err(|_| anyhow::anyhow!("storage health snapshot lock poisoned"))?
+            .get(coven_home)
+            .cloned()
+    } else {
+        None
+    };
+    let mut snapshot =
+        storage_health_snapshot_from_connection(coven_home, conn, free_disk_bytes, event_writer)?;
+    if let Some(previous) = previous {
+        let database_bytes = snapshot.health.database_bytes;
+        let wal_bytes = snapshot.health.wal_bytes;
+        snapshot = previous;
+        snapshot.health.status = "critical".to_string();
+        snapshot.health.database_bytes = database_bytes;
+        snapshot.health.wal_bytes = wal_bytes;
+        snapshot.health.free_disk_bytes = free_disk_bytes;
+        snapshot.health.maintenance_blocked = true;
+        if event_writer.is_some() {
+            (
+                snapshot.health.writer_backlog_events,
+                snapshot.health.writer_backlog_bytes,
+            ) = writer_backlog(event_writer);
+        }
+    }
+    storage_health_snapshots()
+        .write()
+        .map_err(|_| anyhow::anyhow!("storage health snapshot lock poisoned"))?
+        .insert(coven_home.to_path_buf(), snapshot);
+    Ok(())
+}
+
+pub fn cache_unavailable_storage_health(
+    coven_home: &Path,
+    event_writer: Option<&crate::event_writer::EventWriterHealth>,
+) -> Result<()> {
+    let known_free_disk_bytes = fs2::available_space(coven_home).ok();
+    mark_storage_health_snapshot_degraded(
+        coven_home,
+        known_free_disk_bytes,
+        event_writer,
+        "storage health unavailable",
+    )
+}
+
+pub(crate) fn mark_storage_health_snapshot_maintenance_failure(
+    coven_home: &Path,
+    known_free_disk_bytes: Option<u64>,
+    event_writer: Option<&crate::event_writer::EventWriterHealth>,
+) -> Result<()> {
+    mark_storage_health_snapshot_degraded(
+        coven_home,
+        known_free_disk_bytes,
+        event_writer,
+        MAINTENANCE_LAST_ERROR_PUBLIC_MESSAGE,
+    )
+}
+
+fn mark_storage_health_snapshot_degraded(
+    coven_home: &Path,
+    known_free_disk_bytes: Option<u64>,
+    event_writer: Option<&crate::event_writer::EventWriterHealth>,
+    prior_snapshot_error: &str,
+) -> Result<()> {
+    let mut snapshots = storage_health_snapshots()
+        .write()
+        .map_err(|_| anyhow::anyhow!("storage health snapshot lock poisoned"))?;
+    if let Some(snapshot) = snapshots.get_mut(coven_home) {
+        snapshot.degraded = true;
+        snapshot.health.status = "degraded".to_string();
+        snapshot.health.last_maintenance_error = Some(prior_snapshot_error.to_string());
+        if let Some(free_disk_bytes) = known_free_disk_bytes {
+            snapshot.health.free_disk_bytes = free_disk_bytes;
+            snapshot.health.maintenance_blocked = free_disk_bytes < MAINTENANCE_MIN_FREE_DISK_BYTES;
+        }
+        if event_writer.is_some() {
+            (
+                snapshot.health.writer_backlog_events,
+                snapshot.health.writer_backlog_bytes,
+            ) = writer_backlog(event_writer);
+        }
+        return Ok(());
+    }
+
+    let health = unavailable_storage_health(
+        coven_home,
+        "storage health snapshot refresh failed",
+        known_free_disk_bytes,
+        event_writer,
+    );
+    snapshots.insert(
+        coven_home.to_path_buf(),
+        StorageHealthSnapshot {
+            health,
+            retention_lagging: false,
+            degraded: true,
+        },
+    );
+    Ok(())
+}
+
+#[cfg(test)]
 fn storage_health_with_free_disk(
     coven_home: &Path,
     free_disk_bytes: u64,
     event_writer: Option<&crate::event_writer::EventWriterHealth>,
 ) -> Result<StorageHealth> {
-    let store_path = coven_home.join("coven.sqlite3");
-    let database_bytes = file_size(&store_path);
-    let wal_bytes = file_size(&wal_path(&store_path));
-    let maintenance_blocked = free_disk_bytes < MAINTENANCE_MIN_FREE_DISK_BYTES;
-    let (writer_backlog_events, writer_backlog_bytes) = writer_backlog(event_writer);
-    if maintenance_blocked {
+    if free_disk_bytes < MAINTENANCE_MIN_FREE_DISK_BYTES {
+        let store_path = coven_home.join("coven.sqlite3");
+        let (writer_backlog_events, writer_backlog_bytes) = writer_backlog(event_writer);
         return Ok(StorageHealth {
             status: "critical".to_string(),
-            database_bytes,
-            wal_bytes,
+            database_bytes: file_size(&store_path),
+            wal_bytes: file_size(&wal_path(&store_path)),
             oldest_retained_event_at: None,
             last_prune_at: None,
             prune_age_seconds: None,
@@ -3640,6 +3824,54 @@ fn storage_health_with_free_disk(
             last_maintenance_error: None,
         });
     }
+    let config = privacy::load_with_settings(coven_home, crate::settings::cached())
+        .context("failed to load privacy settings for storage health")?;
+    let retention_cutoff = retention_cutoff(
+        &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+        config.log_retention_days.max(1),
+    )?;
+    parse_rfc3339_utc(&retention_cutoff).context("failed to parse calculated retention cutoff")?;
+    let store_path = coven_home.join("coven.sqlite3");
+    let conn = open_existing_store_read_only(&store_path)?
+        .ok_or_else(|| anyhow::anyhow!("Coven store is unavailable"))?;
+    Ok(
+        storage_health_snapshot_from_connection(coven_home, &conn, free_disk_bytes, event_writer)?
+            .health,
+    )
+}
+
+fn storage_health_snapshot_from_connection(
+    coven_home: &Path,
+    conn: &Connection,
+    free_disk_bytes: u64,
+    event_writer: Option<&crate::event_writer::EventWriterHealth>,
+) -> Result<StorageHealthSnapshot> {
+    let store_path = coven_home.join("coven.sqlite3");
+    let database_bytes = file_size(&store_path);
+    let wal_bytes = file_size(&wal_path(&store_path));
+    let maintenance_blocked = free_disk_bytes < MAINTENANCE_MIN_FREE_DISK_BYTES;
+    let (writer_backlog_events, writer_backlog_bytes) = writer_backlog(event_writer);
+    if maintenance_blocked {
+        return Ok(StorageHealthSnapshot {
+            health: StorageHealth {
+                status: "critical".to_string(),
+                database_bytes,
+                wal_bytes,
+                oldest_retained_event_at: None,
+                last_prune_at: None,
+                prune_age_seconds: None,
+                last_checkpoint_at: None,
+                checkpoint_age_seconds: None,
+                writer_backlog_events,
+                writer_backlog_bytes,
+                free_disk_bytes,
+                maintenance_blocked: true,
+                last_maintenance_error: None,
+            },
+            retention_lagging: false,
+            degraded: false,
+        });
+    }
 
     let config = privacy::load_with_settings(coven_home, crate::settings::cached())
         .context("failed to load privacy settings for storage health")?;
@@ -3649,8 +3881,6 @@ fn storage_health_with_free_disk(
     )?;
     let retention_cutoff = parse_rfc3339_utc(&retention_cutoff)
         .context("failed to parse calculated retention cutoff")?;
-    let conn = open_existing_store_read_only(&store_path)?
-        .ok_or_else(|| anyhow::anyhow!("Coven store is unavailable"))?;
     // `MIN(created_at)` is NULL on an empty ledger, so the column type has to be
     // stated: `row.get` cannot infer `Option<String>` from the comparison below.
     let oldest_retained_event_at: Option<String> = conn
@@ -3660,10 +3890,10 @@ fn storage_health_with_free_disk(
         .as_deref()
         .and_then(parse_rfc3339_utc)
         .is_some_and(|oldest_at| oldest_at < retention_cutoff);
-    let last_prune_at = get_store_meta(&conn, MAINTENANCE_LAST_PRUNE_KEY)?;
-    let last_checkpoint_at = get_store_meta(&conn, MAINTENANCE_LAST_CHECKPOINT_KEY)?;
+    let last_prune_at = get_store_meta(conn, MAINTENANCE_LAST_PRUNE_KEY)?;
+    let last_checkpoint_at = get_store_meta(conn, MAINTENANCE_LAST_CHECKPOINT_KEY)?;
     let last_maintenance_error =
-        public_maintenance_error(get_store_meta(&conn, MAINTENANCE_LAST_ERROR_KEY)?);
+        public_maintenance_error(get_store_meta(conn, MAINTENANCE_LAST_ERROR_KEY)?);
     let status = if maintenance_blocked {
         "critical"
     } else if retention_lagging
@@ -3676,23 +3906,28 @@ fn storage_health_with_free_disk(
         "ok"
     };
 
-    Ok(StorageHealth {
-        status: status.to_string(),
-        database_bytes,
-        wal_bytes,
-        oldest_retained_event_at,
-        prune_age_seconds: maintenance_age_seconds(last_prune_at.as_deref()),
-        last_prune_at,
-        checkpoint_age_seconds: maintenance_age_seconds(last_checkpoint_at.as_deref()),
-        last_checkpoint_at,
-        writer_backlog_events,
-        writer_backlog_bytes,
-        free_disk_bytes,
-        maintenance_blocked,
-        last_maintenance_error,
+    Ok(StorageHealthSnapshot {
+        health: StorageHealth {
+            status: status.to_string(),
+            database_bytes,
+            wal_bytes,
+            oldest_retained_event_at,
+            prune_age_seconds: maintenance_age_seconds(last_prune_at.as_deref()),
+            last_prune_at,
+            checkpoint_age_seconds: maintenance_age_seconds(last_checkpoint_at.as_deref()),
+            last_checkpoint_at,
+            writer_backlog_events,
+            writer_backlog_bytes,
+            free_disk_bytes,
+            maintenance_blocked,
+            last_maintenance_error,
+        },
+        retention_lagging,
+        degraded: false,
     })
 }
 
+#[cfg(test)]
 fn storage_health_with_free_disk_or_unavailable(
     coven_home: &Path,
     free_disk_bytes: u64,
@@ -5483,6 +5718,102 @@ mod tests {
             .expect_err("malformed privacy config must fail closed above the watermark");
 
         assert!(error.to_string().contains("privacy"));
+        Ok(())
+    }
+
+    #[test]
+    fn cached_storage_health_clears_recovered_disk_and_wal_status() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let home = temp_dir.path();
+        open_store(&home.join("coven.sqlite3"))?;
+        storage_health_snapshots().write().unwrap().insert(
+            home.to_path_buf(),
+            StorageHealthSnapshot {
+                health: StorageHealth {
+                    status: "critical".to_string(),
+                    database_bytes: 1,
+                    wal_bytes: MAINTENANCE_CHECKPOINT_WAL_BYTES,
+                    oldest_retained_event_at: None,
+                    last_prune_at: None,
+                    prune_age_seconds: None,
+                    last_checkpoint_at: None,
+                    checkpoint_age_seconds: None,
+                    writer_backlog_events: 0,
+                    writer_backlog_bytes: 0,
+                    free_disk_bytes: MAINTENANCE_MIN_FREE_DISK_BYTES - 1,
+                    maintenance_blocked: true,
+                    last_maintenance_error: None,
+                },
+                retention_lagging: false,
+                degraded: false,
+            },
+        );
+
+        let health =
+            cached_storage_health_with_free_disk(home, MAINTENANCE_WARN_FREE_DISK_BYTES, None)?;
+
+        assert_eq!(health.wal_bytes, 0);
+        assert!(!health.maintenance_blocked);
+        assert_eq!(health.status, "ok");
+        Ok(())
+    }
+
+    #[test]
+    fn low_disk_refresh_retains_prior_lag_and_error_causes() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let home = temp_dir.path();
+        let path = home.join("coven.sqlite3");
+        let conn = open_store(&path)?;
+        insert_session(&conn, &session_record("session-1", "2010-01-01T00:00:00Z"))?;
+        insert_event(
+            &conn,
+            &EventRecord {
+                seq: 0,
+                id: "ancient".to_string(),
+                session_id: "session-1".to_string(),
+                kind: "output".to_string(),
+                payload_json: r#"{"data":"ancient"}"#.to_string(),
+                created_at: "2010-01-01T00:00:00Z".to_string(),
+            },
+        )?;
+        record_maintenance_error(home, "failed to read /private/home");
+
+        refresh_storage_health_snapshot_from_connection_with_free_disk(
+            home,
+            &conn,
+            MAINTENANCE_WARN_FREE_DISK_BYTES,
+            None,
+        )?;
+        let before =
+            cached_storage_health_with_free_disk(home, MAINTENANCE_WARN_FREE_DISK_BYTES, None)?;
+        assert_eq!(before.status, "warning");
+        assert_eq!(
+            before.oldest_retained_event_at.as_deref(),
+            Some("2010-01-01T00:00:00Z")
+        );
+        assert_eq!(
+            before.last_maintenance_error.as_deref(),
+            Some(MAINTENANCE_LAST_ERROR_PUBLIC_MESSAGE)
+        );
+
+        refresh_storage_health_snapshot_from_connection_with_free_disk(
+            home,
+            &conn,
+            MAINTENANCE_MIN_FREE_DISK_BYTES - 1,
+            None,
+        )?;
+        let recovered =
+            cached_storage_health_with_free_disk(home, MAINTENANCE_WARN_FREE_DISK_BYTES, None)?;
+
+        assert_eq!(recovered.status, "warning");
+        assert_eq!(
+            recovered.oldest_retained_event_at,
+            before.oldest_retained_event_at
+        );
+        assert_eq!(
+            recovered.last_maintenance_error,
+            before.last_maintenance_error
+        );
         Ok(())
     }
 
