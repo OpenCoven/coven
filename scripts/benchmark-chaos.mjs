@@ -110,7 +110,7 @@ export function storageMetricStatus() {
     },
     eventQueueDepth: {
       status: 'measured',
-      source: 'periodic samples of eventWriter.queuedEvents/eventWriter.queuedBytes'
+      source: 'maxima of periodic eventWriter.queuedEvents/eventWriter.queuedBytes samples'
     },
     rss: {
       status: 'measured',
