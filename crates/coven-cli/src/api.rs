@@ -289,14 +289,9 @@ fn health_response_with_hub(
         response.hub = serde_json::from_value(summary).ok();
     }
     response.storage = Some(
-        match store::storage_health(coven_home, event_writer.as_ref()) {
-            Ok(storage) => storage,
-            Err(error) => {
-                let mut storage = store::unavailable_storage_health(error, event_writer.as_ref());
-                storage.maintenance_blocked = false;
-                storage
-            }
-        },
+        store::storage_health(coven_home, event_writer.as_ref()).unwrap_or_else(|error| {
+            store::unavailable_storage_health(error, None, event_writer.as_ref())
+        }),
     );
     response.event_writer = event_writer;
     response
