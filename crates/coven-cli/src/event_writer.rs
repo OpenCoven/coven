@@ -7,7 +7,7 @@
 //! be overtaken by a following exit event.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::{mpsc, Arc, Condvar, Mutex},
     thread,
@@ -68,6 +68,7 @@ struct Queue {
     queued_bytes: usize,
     failed: Option<String>,
     truncations: HashMap<String, OutputTruncation>,
+    closing_sessions: HashSet<String>,
 }
 
 struct OutputTruncation {
@@ -122,6 +123,7 @@ impl EventWriter {
                 queued_bytes: 0,
                 failed: None,
                 truncations: HashMap::new(),
+                closing_sessions: HashSet::new(),
             }),
             available: Condvar::new(),
             capacity_bytes,
@@ -225,7 +227,8 @@ impl EventWriter {
             } => (session_id, data.len(), created_at),
             _ => unreachable!("enqueue_output only accepts output events"),
         };
-        if bytes > self.shared.output_capacity_bytes
+        if queue.closing_sessions.contains(session_id)
+            || bytes > self.shared.output_capacity_bytes
             || queue.queued_bytes.saturating_add(bytes) > self.shared.output_capacity_bytes
         {
             record_output_drop(&mut queue, session_id, dropped_bytes, created_at);
@@ -239,7 +242,7 @@ impl EventWriter {
         }
         let marker = take_truncation_marker(&mut queue, session_id);
         let marker_bytes = marker.as_ref().map_or(0, |item| item.bytes);
-        assert!(
+        anyhow::ensure!(
             queue
                 .queued_bytes
                 .saturating_add(marker_bytes)
@@ -270,9 +273,41 @@ impl EventWriter {
             "critical event exceeds event writer capacity"
         );
         let session_id = event.session_id().to_string();
+        let marker = {
+            let mut queue = self.lock_queue();
+            loop {
+                if let Some(error) = &queue.failed {
+                    return Err(anyhow!(error.clone()));
+                }
+                if queue.closing_sessions.insert(session_id.clone()) {
+                    break take_truncation_marker(&mut queue, &session_id);
+                }
+                queue = self
+                    .shared
+                    .available
+                    .wait(queue)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        };
+
+        let result = self.enqueue_closed_critical(event, bytes, marker);
+        let mut queue = self.lock_queue();
+        queue.closing_sessions.remove(&session_id);
+        self.shared.available.notify_all();
+        result
+    }
+
+    fn enqueue_closed_critical(
+        &self,
+        event: PendingEvent,
+        bytes: usize,
+        marker: Option<QueuedEvent>,
+    ) -> Result<()> {
         let (completion_tx, completion_rx) = mpsc::sync_channel(1);
         let mut queue = self.lock_queue();
-        let marker = take_truncation_marker(&mut queue, &session_id);
+        if let Some(error) = &queue.failed {
+            return Err(anyhow!(error.clone()));
+        }
         let marker_bytes = marker.as_ref().map_or(0, |item| item.bytes);
         if marker_bytes.saturating_add(bytes) <= self.shared.capacity_bytes {
             loop {
@@ -341,8 +376,40 @@ impl EventWriter {
                 marker_rx,
                 "event writer stopped before committing truncation marker",
             )?;
-            self.enqueue_critical(event, bytes)
+            self.enqueue_closed_critical_event(event, bytes)
         }
+    }
+
+    fn enqueue_closed_critical_event(&self, event: PendingEvent, bytes: usize) -> Result<()> {
+        let (completion_tx, completion_rx) = mpsc::sync_channel(1);
+        let mut queue = self.lock_queue();
+        loop {
+            if let Some(error) = &queue.failed {
+                return Err(anyhow!(error.clone()));
+            }
+            if queue.queued_bytes.saturating_add(bytes) <= self.shared.capacity_bytes {
+                break;
+            }
+            queue = self
+                .shared
+                .available
+                .wait(queue)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        queue.queued_events += 1;
+        queue.queued_bytes += bytes;
+        self.update_queue_health(queue.queued_events, queue.queued_bytes);
+        queue.items.push_back(QueuedEvent {
+            event,
+            bytes,
+            completion: Some(completion_tx),
+        });
+        self.shared.available.notify_one();
+        drop(queue);
+        receive_completion(
+            completion_rx,
+            "event writer stopped before committing a critical event",
+        )
     }
 
     fn lock_queue(&self) -> std::sync::MutexGuard<'_, Queue> {
@@ -675,6 +742,7 @@ fn fail_writer(shared: &Arc<Shared>, message: String) -> Vec<QueuedEvent> {
     let mut queue = lock_queue(shared);
     queue.failed = Some(message.clone());
     queue.truncations.clear();
+    queue.closing_sessions.clear();
     queue.queued_events = 0;
     queue.queued_bytes = 0;
     let pending = queue.items.drain(..).collect();
@@ -816,6 +884,7 @@ mod tests {
                 queued_bytes: EVENT_OVERHEAD_BYTES * 2,
                 failed: None,
                 truncations: HashMap::new(),
+                closing_sessions: HashSet::new(),
             }),
             available: Condvar::new(),
             capacity_bytes: DEFAULT_CAPACITY_BYTES,
@@ -850,6 +919,7 @@ mod tests {
                 queued_bytes: 0,
                 failed: None,
                 truncations: HashMap::new(),
+                closing_sessions: HashSet::new(),
             }),
             available: Condvar::new(),
             capacity_bytes: DEFAULT_CAPACITY_BYTES,
@@ -888,6 +958,145 @@ mod tests {
         let health = lock_health(&shared);
         assert_eq!(health.queued_events, 1);
         assert_eq!(health.queued_bytes, EVENT_OVERHEAD_BYTES + "hello".len());
+        Ok(())
+    }
+
+    #[test]
+    fn critical_boundary_prevents_same_session_output_from_overtaking_marker() -> Result<()> {
+        let capacity = RESERVED_CRITICAL_BYTES + 1024;
+        let blocked_bytes = capacity - 256;
+        let shared = Arc::new(Shared {
+            queue: Mutex::new(Queue {
+                items: VecDeque::from([QueuedEvent {
+                    event: PendingEvent::Output {
+                        session_id: "other".to_string(),
+                        data: "blocked".to_string(),
+                        created_at: "2026-08-04T00:00:00Z".to_string(),
+                    },
+                    bytes: blocked_bytes,
+                    completion: None,
+                }]),
+                queued_events: 1,
+                queued_bytes: blocked_bytes,
+                failed: None,
+                truncations: HashMap::from([(
+                    "s-1".to_string(),
+                    OutputTruncation {
+                        dropped_events: 1,
+                        dropped_bytes: 2048,
+                        created_at: "2026-08-04T00:00:01Z".to_string(),
+                    },
+                )]),
+                closing_sessions: HashSet::new(),
+            }),
+            available: Condvar::new(),
+            capacity_bytes: capacity,
+            output_capacity_bytes: capacity - RESERVED_CRITICAL_BYTES,
+            health: Mutex::new(EventWriterHealth {
+                state: "pressured".to_string(),
+                queued_events: 1,
+                queued_bytes: blocked_bytes,
+                capacity_bytes: capacity,
+                dropped_output_events: 1,
+                dropped_output_bytes: 2048,
+                connection_opens: 0,
+                transactions: 0,
+                committed_events: 0,
+                last_error: None,
+            }),
+        });
+        let writer = EventWriter {
+            shared: Arc::clone(&shared),
+        };
+        let critical_writer = writer.clone();
+        let critical = thread::spawn(move || {
+            critical_writer.enqueue_critical(
+                PendingEvent::Record(store::EventRecord {
+                    seq: 0,
+                    id: "critical".to_string(),
+                    session_id: "s-1".to_string(),
+                    kind: "tool_result".to_string(),
+                    payload_json: "{}".to_string(),
+                    created_at: "2026-08-04T00:00:02Z".to_string(),
+                }),
+                EVENT_OVERHEAD_BYTES,
+            )
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if lock_queue(&shared).closing_sessions.contains("s-1") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "critical event did not claim its session boundary"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(!writer.enqueue_output(
+            PendingEvent::Output {
+                session_id: "s-1".to_string(),
+                data: "later".to_string(),
+                created_at: "2026-08-04T00:00:03Z".to_string(),
+            },
+            EVENT_OVERHEAD_BYTES + "later".len(),
+        )?);
+
+        {
+            let mut queue = lock_queue(&shared);
+            queue.items.clear();
+            queue.queued_events = 0;
+            queue.queued_bytes = 0;
+            shared.available.notify_all();
+        }
+
+        let queued = loop {
+            let mut queue = lock_queue(&shared);
+            if queue.items.len() == 2 {
+                queue.queued_events = 0;
+                queue.queued_bytes = 0;
+                break queue.items.drain(..).collect::<Vec<_>>();
+            }
+            drop(queue);
+            assert!(
+                Instant::now() < deadline,
+                "critical boundary events were not queued"
+            );
+            thread::sleep(Duration::from_millis(1));
+        };
+
+        assert_eq!(
+            queued
+                .iter()
+                .map(|item| match &item.event {
+                    PendingEvent::Record(record) => record.kind.as_str(),
+                    _ => "unexpected",
+                })
+                .collect::<Vec<_>>(),
+            ["output_truncated", "tool_result"]
+        );
+        let marker = match &queued[0].event {
+            PendingEvent::Record(record) => {
+                serde_json::from_str::<serde_json::Value>(&record.payload_json)?
+            }
+            _ => unreachable!("first boundary event must be the truncation marker"),
+        };
+        assert_eq!(marker["droppedEvents"], 1);
+        assert_eq!(marker["droppedBytes"], 2048);
+        let queue = lock_queue(&shared);
+        let later_episode = queue
+            .truncations
+            .get("s-1")
+            .expect("output after the claimed boundary starts the next episode");
+        assert_eq!(later_episode.dropped_events, 1);
+        assert_eq!(later_episode.dropped_bytes, 5);
+        drop(queue);
+
+        complete(&queued, Ok(()));
+        critical.join().expect("critical producer panicked")?;
+        assert!(!lock_queue(&shared).closing_sessions.contains("s-1"));
         Ok(())
     }
 
@@ -1193,6 +1402,7 @@ mod tests {
                 queued_bytes: EVENT_OVERHEAD_BYTES,
                 failed: None,
                 truncations: HashMap::new(),
+                closing_sessions: HashSet::new(),
             }),
             available: Condvar::new(),
             capacity_bytes: DEFAULT_CAPACITY_BYTES,

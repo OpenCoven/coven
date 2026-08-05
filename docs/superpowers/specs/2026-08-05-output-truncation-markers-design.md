@@ -85,10 +85,17 @@ reservation available, so the small marker cannot make the queue exceed its
 total capacity. For critical events and exit, the existing condition-variable
 wait accounts for both items before either is queued.
 
+Claiming a critical boundary linearizes that event for its session before any
+capacity wait. While the boundary is pending, same-session raw output remains
+non-blocking but is rejected into the next pressure episode; it cannot overtake
+the saved marker or boundary event. Other critical producers for that session
+wait until the owner commits or fails the boundary.
+
 If a maximum-sized critical event and its marker cannot fit together, the
 writer queues and synchronously acknowledges the marker first, then queues the
-critical event through the existing path. This preserves the prior maximum
-critical-event size instead of creating an impossible capacity wait.
+critical event while retaining ownership of the session boundary. This
+preserves the prior maximum critical-event size instead of creating an
+impossible capacity wait.
 
 The marker has no independent completion channel. A following critical event's
 acknowledgement proves both records committed in order because they share the
