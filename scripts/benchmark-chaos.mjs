@@ -6,13 +6,14 @@ import { fileURLToPath } from 'node:url';
 import {
   harnessSessionRequest,
   isolatedEnvironment,
+  runCommand,
   socketRequest,
   startDaemon,
   stopDaemon,
   waitForOutputEvent
 } from './benchmark-cli.mjs';
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const DEFAULT_CONCURRENCY = [1, 8, 32];
 const POLL_ATTEMPTS = 160;
 const POLL_DELAY_MS = 25;
@@ -100,16 +101,20 @@ export function redactedEnvironment(environment = process.env) {
 export function storageMetricStatus() {
   return {
     sqliteConnectionOpens: {
-      status: 'unavailable',
-      reason: 'The current daemon does not expose per-process connection counters.'
+      status: 'measured',
+      source: 'eventWriter.connectionOpens'
     },
     sqliteTransactions: {
-      status: 'unavailable',
-      reason: 'The current daemon does not expose committed transaction counters.'
+      status: 'measured',
+      source: 'eventWriter.transactions'
     },
     eventQueueDepth: {
-      status: 'not_applicable',
-      reason: 'Events are persisted synchronously; #596 owns the bounded writer queue.'
+      status: 'measured',
+      source: 'eventWriter.queuedEvents/eventWriter.queuedBytes'
+    },
+    rss: {
+      status: 'measured',
+      source: 'daemon PID sampled through coven pc top --json'
     }
   };
 }
@@ -121,12 +126,14 @@ export function chaosCoverage() {
       reason: 'Cave owns WebSocket consumer buffering and replay (#4317).'
     },
     diskFull: {
-      status: 'blocked_by_injection',
-      reason: 'A cross-platform storage fault hook is not present in the daemon.'
+      status: 'covered_by_storage_regressions',
+      reason: 'A deterministic free-space seam exercises the fail-closed path without filling a host disk.',
+      evidence: 'store::tests::scheduled_maintenance_below_watermark_does_not_open_or_write_the_store'
     },
     lockedDatabase: {
-      status: 'covered_by_store_regressions',
-      reason: 'The store suite owns deterministic SQLite lock assertions.'
+      status: 'covered_by_event_writer_regressions',
+      reason: 'The writer suite holds real SQLite locks across bounded retry and recovery assertions.',
+      evidence: 'event_writer::tests::transient_sqlite_lock_is_retried'
     },
     stalledChild: {
       status: 'covered',
@@ -134,9 +141,100 @@ export function chaosCoverage() {
     },
     crashRestart: {
       status: 'covered_by_daemon_regressions',
-      reason: 'Daemon recovery tests own process-crash and orphan-recovery assertions.'
+      reason: 'Daemon recovery tests own process-crash and orphan-recovery assertions.',
+      evidence: 'daemon::tests::recovers_persisted_running_sessions_as_orphaned'
     }
   };
+}
+
+function requiredCounter(writer, field) {
+  const value = writer?.[field];
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`event writer health has invalid ${field}`);
+  }
+  return value;
+}
+
+export function summarizeRuntimeMetrics(samples) {
+  if (samples.length === 0) throw new Error('cannot summarize runtime metrics without samples');
+  const first = samples[0].eventWriter;
+  const last = samples.at(-1).eventWriter;
+  const opensStart = requiredCounter(first, 'connectionOpens');
+  const opensEnd = requiredCounter(last, 'connectionOpens');
+  const transactionsStart = requiredCounter(first, 'transactions');
+  const transactionsEnd = requiredCounter(last, 'transactions');
+  const rssSamples = samples
+    .map((sample) => sample.residentSetBytes)
+    .filter((value) => Number.isSafeInteger(value) && value >= 0);
+  if (rssSamples.length === 0) throw new Error('runtime metrics contain no RSS samples');
+
+  return {
+    sqliteConnectionOpens: {
+      start: opensStart,
+      end: opensEnd,
+      delta: opensEnd - opensStart
+    },
+    sqliteTransactions: {
+      start: transactionsStart,
+      end: transactionsEnd,
+      delta: transactionsEnd - transactionsStart
+    },
+    eventQueueDepth: {
+      peakEvents: Math.max(...samples.map((sample) => requiredCounter(sample.eventWriter, 'queuedEvents'))),
+      peakBytes: Math.max(...samples.map((sample) => requiredCounter(sample.eventWriter, 'queuedBytes')))
+    },
+    rss: {
+      samplesBytes: rssSamples,
+      peakBytes: Math.max(...rssSamples)
+    }
+  };
+}
+
+export function residentSetBytesFromProcessList(output, daemonPid) {
+  const processes = JSON.parse(output)?.processes;
+  if (!Array.isArray(processes)) throw new Error('pc top output has no process list');
+  const daemon = processes.find((process) => process?.pid === daemonPid);
+  if (!daemon) throw new Error(`daemon pid ${daemonPid} is absent from pc top output`);
+  if (!Number.isSafeInteger(daemon.memory_mb) || daemon.memory_mb < 0) {
+    throw new Error(`daemon pid ${daemonPid} has invalid RSS`);
+  }
+  return daemon.memory_mb * 1024 * 1024;
+}
+
+async function daemonResidentSetBytes(binary, covenHome, env) {
+  const daemon = JSON.parse(await readFile(join(covenHome, 'daemon.json'), 'utf8'));
+  if (!Number.isSafeInteger(daemon.pid) || daemon.pid <= 0) {
+    throw new Error('daemon metadata has no valid pid');
+  }
+  const result = runCommand({
+    command: binary,
+    args: ['pc', 'top', '--json', '--n', '100000'],
+    env
+  });
+  return residentSetBytesFromProcessList(result.stdout, daemon.pid);
+}
+
+async function runtimeHealthSnapshot(socketPath, request = socketRequest) {
+  const response = await request(socketPath, { method: 'GET', path: '/api/v1/health' });
+  if (response.statusCode !== 200) throw new Error(`health returned ${response.statusCode}`);
+  const health = JSON.parse(response.body);
+  if (!health.eventWriter || typeof health.eventWriter !== 'object') {
+    throw new Error('health has no live event writer metrics');
+  }
+  return { eventWriter: health.eventWriter };
+}
+
+async function observeWriterHealth(socketPath, samples, isRunning) {
+  while (isRunning()) {
+    samples.push(await runtimeHealthSnapshot(socketPath));
+    await new Promise((resolve) => setTimeout(resolve, POLL_DELAY_MS));
+  }
+}
+
+async function fullRuntimeSnapshot({ binary, covenHome, env, socketPath }) {
+  const snapshot = await runtimeHealthSnapshot(socketPath);
+  snapshot.residentSetBytes = await daemonResidentSetBytes(binary, covenHome, env);
+  return snapshot;
 }
 
 async function fixtureEnvironment(root, environment) {
@@ -322,41 +420,51 @@ export async function storeFootprint(covenHome) {
 export async function runConcurrencyScenario({ binary, root, concurrency, environment = process.env }) {
   const { covenHome, env, markerPath } = await fixtureEnvironment(root, environment);
   const socketPath = await startDaemon({ binary, covenHome, env });
-  const footprintBefore = await storeFootprint(covenHome);
   let ids = [];
 
   try {
+    const footprintBefore = await storeFootprint(covenHome);
+    const runtimeSamples = [await fullRuntimeSnapshot({ binary, covenHome, env, socketPath })];
     const startedAt = process.hrtime.bigint();
-    const launches = await Promise.all(
-      Array.from({ length: concurrency }, async () => {
-        const launchedAt = process.hrtime.bigint();
-        const response = await socketRequest(socketPath, harnessSessionRequest({ projectRoot: root }));
-        if (response.statusCode !== 201) throw new Error(`launch returned ${response.statusCode}`);
-        const id = JSON.parse(response.body).id;
-        if (typeof id !== 'string' || id.length === 0) throw new Error('launch response has no id');
-        try {
-          await waitForOutputEvent(socketPath, id, {
-            attempts: LAUNCH_POLL_ATTEMPTS,
-            delayMs: POLL_DELAY_MS
-          });
-        } catch (error) {
-          const diagnostic = await describeScenarioFailure({
-            socketPath,
-            sessionId: id,
-            markerPath,
-            expectedExecutions: concurrency
-          });
-          throw new Error(formatScenarioTimeout({
-            concurrency,
-            error,
-            diagnostic,
-            fixtureRoot: root
-          }));
-        }
-        return { id, firstOutputMs: Number(process.hrtime.bigint() - launchedAt) / 1_000_000 };
-      })
-    );
-    ids = launches.map((launch) => launch.id);
+    let observing = true;
+    const observation = observeWriterHealth(socketPath, runtimeSamples, () => observing);
+    let launches;
+    try {
+      launches = await Promise.all(
+        Array.from({ length: concurrency }, async () => {
+          const launchedAt = process.hrtime.bigint();
+          const response = await socketRequest(socketPath, harnessSessionRequest({ projectRoot: root }));
+          if (response.statusCode !== 201) throw new Error(`launch returned ${response.statusCode}`);
+          const id = JSON.parse(response.body).id;
+          if (typeof id !== 'string' || id.length === 0) throw new Error('launch response has no id');
+          ids.push(id);
+          try {
+            await waitForOutputEvent(socketPath, id, {
+              attempts: LAUNCH_POLL_ATTEMPTS,
+              delayMs: POLL_DELAY_MS
+            });
+          } catch (error) {
+            const diagnostic = await describeScenarioFailure({
+              socketPath,
+              sessionId: id,
+              markerPath,
+              expectedExecutions: concurrency
+            });
+            throw new Error(formatScenarioTimeout({
+              concurrency,
+              error,
+              diagnostic,
+              fixtureRoot: root
+            }));
+          }
+          return { id, firstOutputMs: Number(process.hrtime.bigint() - launchedAt) / 1_000_000 };
+        })
+      );
+    } finally {
+      observing = false;
+      await observation;
+    }
+    runtimeSamples.push(await fullRuntimeSnapshot({ binary, covenHome, env, socketPath }));
     const completedAt = process.hrtime.bigint();
     const elapsedMs = Number(completedAt - startedAt) / 1_000_000;
 
@@ -371,6 +479,7 @@ export async function runConcurrencyScenario({ binary, root, concurrency, enviro
     const cancellationMs = Number(process.hrtime.bigint() - cancellationStartedAt) / 1_000_000;
     ids = [];
     const footprintAfter = await storeFootprint(covenHome);
+    runtimeSamples.push(await fullRuntimeSnapshot({ binary, covenHome, env, socketPath }));
 
     return {
       status: 'passed',
@@ -379,7 +488,10 @@ export async function runConcurrencyScenario({ binary, root, concurrency, enviro
       throughputSessionsPerSecond: Number((concurrency / (elapsedMs / 1_000)).toFixed(3)),
       cancellation: { allSessionsMs: Number(cancellationMs.toFixed(3)), terminalStates: concurrency },
       diskGrowthBytes: footprintAfter.totalBytes - footprintBefore.totalBytes,
-      storage: storageMetricStatus()
+      storage: {
+        availability: storageMetricStatus(),
+        measurements: summarizeRuntimeMetrics(runtimeSamples)
+      }
     };
   } finally {
     await Promise.all(

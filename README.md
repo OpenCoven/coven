@@ -677,13 +677,18 @@ node scripts/benchmark-chaos.mjs --binary target/debug/coven --output /tmp/coven
 
 The command always exercises 1, 8, and 32 concurrent deterministic harness
 sessions, records launch-to-first-output percentiles, throughput, cancellation
-acknowledgement, and SQLite file growth, and writes a redacted JSON report.
-It deliberately labels metrics that the current runtime cannot expose (SQLite
-connection/transaction counts and an event-writer queue) rather than deriving
-or inventing them. The bounded writer work in #596 must replace those labels
-with direct counters; Cave owns the slow-WebSocket-consumer lane in #4317.
-Fault-injection and platform-specific crash coverage remain explicit matrix
-entries, so a trend artifact cannot be mistaken for a passing chaos test.
+acknowledgement, SQLite file growth, writer connection/transaction deltas, peak
+writer backlog, and sampled daemon RSS, and writes a redacted JSON report. The
+writer measurements come from the live health contract; RSS is resolved by the
+exact daemon PID through `coven pc top --json`, without retaining process names
+or command lines. Cave owns the slow-WebSocket-consumer lane in #4317.
+
+Unsafe host-level faults use deterministic equivalents rather than filling a
+real disk or killing an unrelated process: the report names the exact Rust
+regressions for the free-disk watermark, real SQLite lock/retry behavior, and
+persisted-session crash recovery. These coverage entries remain separate from
+trend measurements, so a timing artifact cannot be mistaken for a passing
+failure-path test.
 
 CI runs this step as `continue-on-error`, so it collects trend data without
 gating merges — matching how the rest of this section describes these

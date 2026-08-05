@@ -320,12 +320,13 @@ test('runScenario uses the supplied isolated environment', () => {
 test('runCommand accepts an expected nonzero exit and preserves environment isolation', () => {
   const result = runCommand({
     command: process.execPath,
-    args: ['--eval', "process.exit(process.env.COVEN_HOME === '/fixture/home' ? 1 : 7)"],
+    args: ['--eval', "process.stdout.write('captured'); process.exit(process.env.COVEN_HOME === '/fixture/home' ? 1 : 7)"],
     allowedExitCodes: [1],
     env: { ...process.env, COVEN_HOME: '/fixture/home' }
   });
 
   assert.equal(result.status, 1);
+  assert.equal(result.stdout, 'captured');
 });
 
 test('runCommand includes captured stderr when a lifecycle command fails', () => {

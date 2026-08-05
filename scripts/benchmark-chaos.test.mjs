@@ -5,6 +5,8 @@ import {
   buildReport,
   chaosCoverage,
   parseOptions,
+  residentSetBytesFromProcessList,
+  summarizeRuntimeMetrics,
   storageMetricStatus,
   summarize,
   validateReport
@@ -49,10 +51,76 @@ test('summarizes p50, p95, and p99 using nearest rank', () => {
   });
 });
 
-test('records unavailable writer counters without pretending they are measured', () => {
-  assert.equal(storageMetricStatus().sqliteConnectionOpens.status, 'unavailable');
-  assert.equal(storageMetricStatus().eventQueueDepth.status, 'not_applicable');
-  assert.equal(chaosCoverage().diskFull.status, 'blocked_by_injection');
+test('describes live writer metrics and deterministic fault equivalents', () => {
+  assert.equal(storageMetricStatus().sqliteConnectionOpens.status, 'measured');
+  assert.equal(storageMetricStatus().eventQueueDepth.status, 'measured');
+  assert.equal(chaosCoverage().diskFull.status, 'covered_by_storage_regressions');
+  assert.match(
+    chaosCoverage().diskFull.evidence,
+    /scheduled_maintenance_below_watermark_does_not_open_or_write_the_store/
+  );
+});
+
+test('summarizes writer counter deltas, peak backlog, and sampled RSS', () => {
+  assert.deepEqual(
+    summarizeRuntimeMetrics([
+      {
+        eventWriter: {
+          connectionOpens: 1,
+          transactions: 2,
+          queuedEvents: 0,
+          queuedBytes: 0
+        },
+        residentSetBytes: 10 * 1024 * 1024
+      },
+      {
+        eventWriter: {
+          connectionOpens: 1,
+          transactions: 9,
+          queuedEvents: 5,
+          queuedBytes: 4096
+        },
+        residentSetBytes: 14 * 1024 * 1024
+      },
+      {
+        eventWriter: {
+          connectionOpens: 1,
+          transactions: 12,
+          queuedEvents: 0,
+          queuedBytes: 0
+        },
+        residentSetBytes: 12 * 1024 * 1024
+      }
+    ]),
+    {
+      sqliteConnectionOpens: { start: 1, end: 1, delta: 0 },
+      sqliteTransactions: { start: 2, end: 12, delta: 10 },
+      eventQueueDepth: { peakEvents: 5, peakBytes: 4096 },
+      rss: {
+        samplesBytes: [10 * 1024 * 1024, 14 * 1024 * 1024, 12 * 1024 * 1024],
+        peakBytes: 14 * 1024 * 1024
+      }
+    }
+  );
+});
+
+test('selects daemon RSS by exact PID without retaining process details', () => {
+  assert.equal(
+    residentSetBytesFromProcessList(
+      JSON.stringify({
+        processes: [
+          { pid: 41, name: 'other', memory_mb: 99, argv: ['private'] },
+          { pid: 42, name: 'coven', memory_mb: 17, argv: ['/private/coven'] }
+        ]
+      }),
+      42
+    ),
+    17 * 1024 * 1024
+  );
+  assert.throws(
+    () => residentSetBytesFromProcessList('{"processes":[]}', 42),
+    /daemon pid 42 is absent/
+  );
 });
 
 test('report contains no fixture paths or prompt content', () => {
@@ -66,6 +134,7 @@ test('report contains no fixture paths or prompt content', () => {
     environment: { GITHUB_ACTIONS: 'true', HOME: '/private/fixture', PROMPT: 'secret prompt' }
   });
   const serialized = JSON.stringify(report);
+  assert.equal(report.schemaVersion, 2);
   assert.doesNotMatch(serialized, /private\/fixture|secret prompt/);
   assert.equal(Object.hasOwn(report.environment, 'host'), false);
   assert.equal(Object.hasOwn(report.environment, 'runner'), false);

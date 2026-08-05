@@ -120,7 +120,7 @@ export function runCommand({
     const stderr = result.stderr.trim();
     throw new Error(`command exited with ${result.status}${stderr ? `: ${stderr}` : ''}`);
   }
-  return { status: result.status };
+  return { status: result.status, stdout: result.stdout, stderr: result.stderr };
 }
 
 export function externalSessionRequest({ id, projectRoot }) {
