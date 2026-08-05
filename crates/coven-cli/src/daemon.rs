@@ -2050,9 +2050,7 @@ fn recovery_log_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-pub fn append_daemon_recovery_log(coven_home: &Path, msg: &str) {
-    let path = daemon_recovery_log_path(coven_home);
-    let timestamp = crate::api::current_timestamp();
+fn format_daemon_recovery_log_entry(timestamp: &str, msg: &str) -> String {
     let prefix = format!("[{timestamp}] ");
     let max_bytes = DAEMON_RECOVERY_LOG_MAX_BYTES as usize;
     let full_len = prefix.len().saturating_add(msg.len()).saturating_add(1);
@@ -2072,6 +2070,12 @@ pub fn append_daemon_recovery_log(coven_home: &Path, msg: &str) {
         line.push_str(&msg[..truncate_at]);
         line.push_str(DAEMON_RECOVERY_LOG_TRUNCATION_MARKER);
     }
+    line
+}
+
+pub fn append_daemon_recovery_log(coven_home: &Path, msg: &str) {
+    let path = daemon_recovery_log_path(coven_home);
+    let line = format_daemon_recovery_log_entry(&crate::api::current_timestamp(), msg);
     let _guard = recovery_log_lock()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
