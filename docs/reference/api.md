@@ -29,7 +29,7 @@ All error responses use the structured envelope documented in the [API contract]
 | Method | Path | Purpose | Success |
 |---|---|---|---|
 | GET | `/api/v1/api-version` | Read the legacy route-family token. | `{ apiVersion: "v1", supportedApiVersions: ["v1"] }` |
-| GET | `/api/v1/health` | Daemon reachability, version, capabilities, pid, hub summary, and local storage pressure. | `{ ok, apiVersion, covenVersion, capabilities, daemon, hub, storage }` |
+| GET | `/api/v1/health` | Daemon reachability, version, capabilities, pid, hub summary, event-writer state, and local storage pressure. | `{ ok, apiVersion, covenVersion, capabilities, daemon, hub, eventWriter, storage }` |
 | GET | `/api/v1/capabilities` | Control-plane capability catalog with policy hints and action ids. | `{ capabilities: [...] }` |
 | GET | `/api/v1/capabilities/harnesses` | Aggregate of harness-native capability manifests plus Coven skills (`?refresh=1` re-scans). | `{ coven_skills, harness_capabilities, scanned_at }` |
 | GET | `/api/v1/capabilities/:harness` | One harness's capability manifest (`?refresh=1` re-scans). | manifest object · `404 harness_not_found` |
@@ -40,12 +40,17 @@ The health `capabilities` object currently contains all nine fields:
 `eventCursor`, `structuredErrors`, and `sessionHandoff`. `daemon` is either `null` or
 `{ pid, startedAt, socket }`, where the socket is under
 `<covenHome>/coven.sock`; the optional `hub` field is a control-plane summary.
+The optional `eventWriter` field reports the daemon-owned persistence queue,
+including its state, exact queued events/bytes, capacity, dropped output,
+connection, transaction, commit, and last-error counters.
 The optional `storage` field is `{ status, databaseBytes, walBytes,
 oldestRetainedEventAt, lastPruneAt, pruneAgeSeconds, lastCheckpointAt,
 checkpointAgeSeconds, writerBacklogEvents, writerBacklogBytes, freeDiskBytes,
 maintenanceBlocked, lastMaintenanceError? }`. `status` is `ok`, `warning`,
 `critical`, or `degraded`; clients should surface `critical` and `degraded`
 before storage exhaustion rather than treating a reachable daemon as healthy.
+`writerBacklogEvents` and `writerBacklogBytes` mirror the same live queue
+snapshot reported by `eventWriter`.
 
 ## Sessions and events
 

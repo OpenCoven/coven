@@ -285,12 +285,15 @@ fn health_response_with_hub(
     event_writer: Option<crate::event_writer::EventWriterHealth>,
 ) -> HealthResponse {
     let mut response = health_response(daemon);
-    response.event_writer = event_writer;
     if let Ok(summary) = crate::hub::hub_health_summary(coven_home) {
         response.hub = serde_json::from_value(summary).ok();
     }
-    response.storage =
-        Some(store::storage_health(coven_home).unwrap_or_else(store::unavailable_storage_health));
+    response.storage = Some(
+        store::storage_health(coven_home, event_writer.as_ref()).unwrap_or_else(|error| {
+            store::unavailable_storage_health(error, event_writer.as_ref())
+        }),
+    );
+    response.event_writer = event_writer;
     response
 }
 
@@ -6734,6 +6737,7 @@ mod tests {
         assert!(response.capabilities.structured_errors);
         assert_eq!(response.daemon, None);
         assert_eq!(response.hub, None);
+        assert_eq!(response.event_writer, None);
         assert_eq!(response.storage, None);
     }
 
@@ -6767,6 +6771,58 @@ mod tests {
         assert!(response.body.contains(r#""storage":{"status""#));
         assert!(response.body.contains(r#""writerBacklogEvents":0"#));
         assert!(response.body.contains(r#""freeDiskBytes""#));
+        Ok(())
+    }
+
+    struct HealthRuntime;
+
+    impl SessionRuntime for HealthRuntime {
+        fn launch_session(&self, _launch: &SessionLaunch) -> Result<()> {
+            Ok(())
+        }
+
+        fn send_input(&self, _session_id: &str, _payload: &Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn event_writer_health(&self) -> Option<crate::event_writer::EventWriterHealth> {
+            Some(crate::event_writer::EventWriterHealth {
+                state: "pressured".to_string(),
+                queued_events: 3,
+                queued_bytes: 4096,
+                capacity_bytes: 2 * 1024 * 1024,
+                dropped_output_events: 1,
+                dropped_output_bytes: 256,
+                connection_opens: 1,
+                transactions: 4,
+                committed_events: 20,
+                last_error: None,
+            })
+        }
+    }
+
+    #[test]
+    fn health_uses_one_live_writer_snapshot_for_both_surfaces() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let response = handle_request_with_runtime(
+            "GET",
+            "/health",
+            temp_dir.path(),
+            None,
+            None,
+            &HealthRuntime,
+        )?;
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+
+        assert_eq!(body["capabilities"]["sessionHandoff"], true);
+        assert_eq!(body["eventWriter"]["queuedEvents"], 3);
+        assert_eq!(body["eventWriter"]["queuedBytes"], 4096);
+        assert_eq!(body["storage"]["writerBacklogEvents"], 3);
+        assert_eq!(body["storage"]["writerBacklogBytes"], 4096);
         Ok(())
     }
 

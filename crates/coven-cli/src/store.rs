@@ -119,11 +119,8 @@ pub struct HandoffContinuationRecord {
 
 /// Storage and maintenance state exposed through the daemon health contract.
 ///
-/// `writer_backlog_events` / `writer_backlog_bytes` are reported as zero here.
-/// The dedicated event writer landed in #607 after this struct was written and
-/// owns its own queue depth, surfaced separately as `eventWriter.queuedBytes`;
-/// wiring these two fields to it is tracked as follow-up rather than guessed at
-/// during a rebase.
+/// The backlog fields mirror the optional live event-writer snapshot supplied
+/// by the health route and default to zero when no runtime snapshot exists.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StorageHealth {
@@ -3563,7 +3560,10 @@ fn run_scheduled_maintenance_with_config_and_free_disk(
 
 /// Gather storage pressure without mutating the database. Health callers use
 /// this after daemon startup has initialized the schema.
-pub fn storage_health(coven_home: &Path) -> Result<StorageHealth> {
+pub fn storage_health(
+    coven_home: &Path,
+    event_writer: Option<&crate::event_writer::EventWriterHealth>,
+) -> Result<StorageHealth> {
     let store_path = coven_home.join("coven.sqlite3");
     let conn = open_store(&store_path)?;
     let free_disk_bytes = fs2::available_space(coven_home)
@@ -3604,6 +3604,7 @@ pub fn storage_health(coven_home: &Path) -> Result<StorageHealth> {
         "ok"
     };
 
+    let (writer_backlog_events, writer_backlog_bytes) = writer_backlog(event_writer);
     Ok(StorageHealth {
         status: status.to_string(),
         database_bytes,
@@ -3613,15 +3614,19 @@ pub fn storage_health(coven_home: &Path) -> Result<StorageHealth> {
         last_prune_at,
         checkpoint_age_seconds: maintenance_age_seconds(last_checkpoint_at.as_deref()),
         last_checkpoint_at,
-        writer_backlog_events: 0,
-        writer_backlog_bytes: 0,
+        writer_backlog_events,
+        writer_backlog_bytes,
         free_disk_bytes,
         maintenance_blocked,
         last_maintenance_error,
     })
 }
 
-pub fn unavailable_storage_health(_error: impl ToString) -> StorageHealth {
+pub fn unavailable_storage_health(
+    _error: impl ToString,
+    event_writer: Option<&crate::event_writer::EventWriterHealth>,
+) -> StorageHealth {
+    let (writer_backlog_events, writer_backlog_bytes) = writer_backlog(event_writer);
     StorageHealth {
         status: "degraded".to_string(),
         database_bytes: 0,
@@ -3631,8 +3636,8 @@ pub fn unavailable_storage_health(_error: impl ToString) -> StorageHealth {
         prune_age_seconds: None,
         last_checkpoint_at: None,
         checkpoint_age_seconds: None,
-        writer_backlog_events: 0,
-        writer_backlog_bytes: 0,
+        writer_backlog_events,
+        writer_backlog_bytes,
         free_disk_bytes: 0,
         maintenance_blocked: true,
         // The socket API is a compatibility boundary. Do not turn an I/O
@@ -3640,6 +3645,12 @@ pub fn unavailable_storage_health(_error: impl ToString) -> StorageHealth {
         // in the local recovery log.
         last_maintenance_error: Some("storage health unavailable".to_string()),
     }
+}
+
+fn writer_backlog(event_writer: Option<&crate::event_writer::EventWriterHealth>) -> (u64, u64) {
+    event_writer
+        .map(|health| (health.queued_events as u64, health.queued_bytes as u64))
+        .unwrap_or_default()
 }
 
 pub fn record_maintenance_error(coven_home: &Path, error: impl ToString) {
@@ -4975,7 +4986,7 @@ mod tests {
         assert!(!report.checkpoint_ran);
         assert!(!report.blocked_by_free_disk);
 
-        let health = storage_health(home)?;
+        let health = storage_health(home, None)?;
         assert_eq!(
             health.last_prune_at.as_deref(),
             Some("2026-04-27T06:00:00Z")
@@ -5160,12 +5171,37 @@ mod tests {
             },
         )?;
 
-        let health = storage_health(home)?;
+        let health = storage_health(home, None)?;
         assert_eq!(
             health.oldest_retained_event_at.as_deref(),
             Some("2010-01-01T00:00:00Z")
         );
         assert_ne!(health.status, "ok");
+        Ok(())
+    }
+
+    #[test]
+    fn storage_health_uses_live_writer_backlog() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let home = temp_dir.path();
+        open_store(&home.join("coven.sqlite3"))?;
+        let writer = crate::event_writer::EventWriterHealth {
+            state: "pressured".to_string(),
+            queued_events: 7,
+            queued_bytes: 8192,
+            capacity_bytes: 2 * 1024 * 1024,
+            dropped_output_events: 1,
+            dropped_output_bytes: 512,
+            connection_opens: 1,
+            transactions: 3,
+            committed_events: 12,
+            last_error: None,
+        };
+
+        let health = storage_health(home, Some(&writer))?;
+
+        assert_eq!(health.writer_backlog_events, 7);
+        assert_eq!(health.writer_backlog_bytes, 8192);
         Ok(())
     }
 

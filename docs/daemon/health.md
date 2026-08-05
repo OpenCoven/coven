@@ -14,8 +14,9 @@ the expected socket for the active `COVEN_HOME`.
 `GET /api/v1/health` also includes a `storage` object. It reports the SQLite
 database and WAL sizes, free space on the `COVEN_HOME` filesystem, the oldest
 retained event, ages of the last prune and checkpoint, and the event-writer
-backlog. Current direct-write releases report a zero backlog; a later dedicated
-writer preserves the same fields.
+backlog. The optional `eventWriter` block reports the live queue snapshot, and
+`storage.writerBacklogEvents` / `storage.writerBacklogBytes` mirror that same
+snapshot.
 
 The daemon runs retention in small background transactions after startup. It
 uses the configured raw-artifact and redacted-event retention windows, never
@@ -45,13 +46,20 @@ Coven daemon: running (pid 12345, socket <covenHome>/coven.sock)
 For scripts, `coven daemon status --json` adds an `ok` field that reports
 whether the daemon health response succeeded.
 
-`GET /api/v1/health` also includes an additive `eventWriter` object for a
+`GET /api/v1/health` also includes an optional `eventWriter` object for a
 running daemon. `state: "healthy"` means live-session event persistence is
 keeping up. `"pressured"` means one or more raw PTY chunks were rejected after
 the bounded queue filled; inspect `droppedOutputEvents` and
-`droppedOutputBytes`. `"failed"` means the dedicated SQLite writer could not
-commit, and `lastError` carries the diagnostic. Lifecycle events are never
-dropped for queue pressure.
+`droppedOutputBytes`. `"failed"` means the writer could not commit, and
+`lastError` carries the diagnostic. Lifecycle events are never dropped for
+queue pressure.
+
+The same response includes `storage` health. Its `writerBacklogEvents` and
+`writerBacklogBytes` fields mirror the live `eventWriter` queue snapshot, while
+the remaining fields report SQLite/WAL size, retention and checkpoint age, free
+disk, and maintenance errors. `critical` means the free-disk safety watermark
+has paused scheduled maintenance; `degraded` means storage health could not be
+collected.
 
 ## Status values
 

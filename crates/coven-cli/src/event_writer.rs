@@ -34,6 +34,7 @@ pub struct EventWriterHealth {
     /// `healthy`, `pressured`, or `failed`.  Pressure remains visible for the
     /// daemon lifetime so a rejected raw chunk is never silently forgotten.
     pub state: String,
+    pub queued_events: usize,
     pub queued_bytes: usize,
     pub capacity_bytes: usize,
     pub dropped_output_events: u64,
@@ -60,6 +61,7 @@ struct Shared {
 
 struct Queue {
     items: VecDeque<QueuedEvent>,
+    queued_events: usize,
     queued_bytes: usize,
     failed: Option<String>,
 }
@@ -97,6 +99,7 @@ impl EventWriter {
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue {
                 items: VecDeque::new(),
+                queued_events: 0,
                 queued_bytes: 0,
                 failed: None,
             }),
@@ -105,6 +108,7 @@ impl EventWriter {
             output_capacity_bytes: capacity_bytes - RESERVED_CRITICAL_BYTES,
             health: Mutex::new(EventWriterHealth {
                 state: "healthy".to_string(),
+                queued_events: 0,
                 queued_bytes: 0,
                 capacity_bytes,
                 dropped_output_events: 0,
@@ -202,8 +206,9 @@ impl EventWriter {
             health.dropped_output_bytes += bytes.saturating_sub(EVENT_OVERHEAD_BYTES) as u64;
             return Ok(false);
         }
+        queue.queued_events += 1;
         queue.queued_bytes += bytes;
-        self.update_queued_bytes(queue.queued_bytes);
+        self.update_queue_health(queue.queued_events, queue.queued_bytes);
         queue.items.push_back(QueuedEvent {
             event,
             bytes,
@@ -233,8 +238,9 @@ impl EventWriter {
                 .wait(queue)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
+        queue.queued_events += 1;
         queue.queued_bytes += bytes;
-        self.update_queued_bytes(queue.queued_bytes);
+        self.update_queue_health(queue.queued_events, queue.queued_bytes);
         queue.items.push_back(QueuedEvent {
             event,
             bytes,
@@ -265,8 +271,10 @@ impl EventWriter {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn update_queued_bytes(&self, bytes: usize) {
-        self.lock_health().queued_bytes = bytes;
+    fn update_queue_health(&self, events: usize, bytes: usize) {
+        let mut health = self.lock_health();
+        health.queued_events = events;
+        health.queued_bytes = bytes;
     }
 }
 
@@ -297,7 +305,7 @@ fn run_worker(
         let result = commit_batch(&mut conn, &coven_home, &batch);
         match result {
             Ok(committed) => {
-                release_bytes(&shared, bytes);
+                release_capacity(&shared, batch.len(), bytes);
                 let mut health = lock_health(&shared);
                 health.transactions += 1;
                 health.committed_events += committed as u64;
@@ -479,10 +487,13 @@ fn record_exit(
     )
 }
 
-fn release_bytes(shared: &Arc<Shared>, bytes: usize) {
+fn release_capacity(shared: &Arc<Shared>, events: usize, bytes: usize) {
     let mut queue = lock_queue(shared);
+    queue.queued_events = queue.queued_events.saturating_sub(events);
     queue.queued_bytes = queue.queued_bytes.saturating_sub(bytes);
-    lock_health(shared).queued_bytes = queue.queued_bytes;
+    let mut health = lock_health(shared);
+    health.queued_events = queue.queued_events;
+    health.queued_bytes = queue.queued_bytes;
     shared.available.notify_all();
 }
 
@@ -497,10 +508,12 @@ fn complete(batch: &[QueuedEvent], result: std::result::Result<(), String>) {
 fn fail_writer(shared: &Arc<Shared>, message: String) -> Vec<QueuedEvent> {
     let mut queue = lock_queue(shared);
     queue.failed = Some(message.clone());
+    queue.queued_events = 0;
     queue.queued_bytes = 0;
     let pending = queue.items.drain(..).collect();
     let mut health = lock_health(shared);
     health.state = "failed".to_string();
+    health.queued_events = 0;
     health.queued_bytes = 0;
     health.last_error = Some(message);
     shared.available.notify_all();
@@ -524,6 +537,88 @@ fn lock_health(shared: &Arc<Shared>) -> std::sync::MutexGuard<'_, EventWriterHea
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_health_counts_events_until_completion() {
+        let shared = Arc::new(Shared {
+            queue: Mutex::new(Queue {
+                items: VecDeque::new(),
+                queued_events: 2,
+                queued_bytes: EVENT_OVERHEAD_BYTES * 2,
+                failed: None,
+            }),
+            available: Condvar::new(),
+            capacity_bytes: DEFAULT_CAPACITY_BYTES,
+            output_capacity_bytes: DEFAULT_CAPACITY_BYTES - RESERVED_CRITICAL_BYTES,
+            health: Mutex::new(EventWriterHealth {
+                state: "healthy".to_string(),
+                queued_events: 2,
+                queued_bytes: EVENT_OVERHEAD_BYTES * 2,
+                capacity_bytes: DEFAULT_CAPACITY_BYTES,
+                dropped_output_events: 0,
+                dropped_output_bytes: 0,
+                connection_opens: 0,
+                transactions: 0,
+                committed_events: 0,
+                last_error: None,
+            }),
+        });
+
+        release_capacity(&shared, 1, EVENT_OVERHEAD_BYTES);
+
+        let health = lock_health(&shared);
+        assert_eq!(health.queued_events, 1);
+        assert_eq!(health.queued_bytes, EVENT_OVERHEAD_BYTES);
+    }
+
+    #[test]
+    fn accepted_output_updates_queue_health_immediately() -> Result<()> {
+        let shared = Arc::new(Shared {
+            queue: Mutex::new(Queue {
+                items: VecDeque::new(),
+                queued_events: 0,
+                queued_bytes: 0,
+                failed: None,
+            }),
+            available: Condvar::new(),
+            capacity_bytes: DEFAULT_CAPACITY_BYTES,
+            output_capacity_bytes: DEFAULT_CAPACITY_BYTES - RESERVED_CRITICAL_BYTES,
+            health: Mutex::new(EventWriterHealth {
+                state: "healthy".to_string(),
+                queued_events: 0,
+                queued_bytes: 0,
+                capacity_bytes: DEFAULT_CAPACITY_BYTES,
+                dropped_output_events: 0,
+                dropped_output_bytes: 0,
+                connection_opens: 0,
+                transactions: 0,
+                committed_events: 0,
+                last_error: None,
+            }),
+        });
+        let writer = EventWriter {
+            shared: Arc::clone(&shared),
+        };
+
+        assert!(writer.enqueue_output(
+            PendingEvent::Output {
+                session_id: "s-1".to_string(),
+                data: "hello".to_string(),
+                created_at: "2026-08-04T00:00:00Z".to_string(),
+            },
+            EVENT_OVERHEAD_BYTES + "hello".len()
+        )?);
+
+        let queue = lock_queue(&shared);
+        assert_eq!(queue.queued_events, 1);
+        assert_eq!(queue.queued_bytes, EVENT_OVERHEAD_BYTES + "hello".len());
+        drop(queue);
+
+        let health = lock_health(&shared);
+        assert_eq!(health.queued_events, 1);
+        assert_eq!(health.queued_bytes, EVENT_OVERHEAD_BYTES + "hello".len());
+        Ok(())
+    }
 
     fn session(id: &str) -> store::SessionRecord {
         store::SessionRecord {
@@ -638,6 +733,8 @@ mod tests {
         let health = writer.health();
         assert_eq!(health.state, "pressured");
         assert_eq!(health.dropped_output_events, 1);
+        assert_eq!(health.queued_events, 0);
+        assert_eq!(health.queued_bytes, 0);
         writer.record_exit(
             "s-1",
             PtyRunResult {
@@ -653,6 +750,7 @@ mod tests {
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue {
                 items: VecDeque::new(),
+                queued_events: 1,
                 queued_bytes: EVENT_OVERHEAD_BYTES,
                 failed: None,
             }),
@@ -661,6 +759,7 @@ mod tests {
             output_capacity_bytes: DEFAULT_CAPACITY_BYTES - RESERVED_CRITICAL_BYTES,
             health: Mutex::new(EventWriterHealth {
                 state: "healthy".to_string(),
+                queued_events: 1,
                 queued_bytes: EVENT_OVERHEAD_BYTES,
                 capacity_bytes: DEFAULT_CAPACITY_BYTES,
                 dropped_output_events: 0,
@@ -698,6 +797,7 @@ mod tests {
         assert!(lock_queue(&shared).items.is_empty());
         let health = lock_health(&shared);
         assert_eq!(health.state, "failed");
+        assert_eq!(health.queued_events, 0);
         assert_eq!(health.queued_bytes, 0);
     }
 }
