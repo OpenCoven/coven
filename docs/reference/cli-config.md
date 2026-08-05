@@ -17,10 +17,10 @@ state.
 COVEN_HOME=/tmp/coven-profile coven config paths --json
 ```
 
-The command does not create directories or files, open the SQLite store, load
-configuration contents, start or contact the daemon, download an engine, or
-make network requests. Each run writes exactly one JSON document to standard
-output.
+The command does not create directories or files, open the SQLite store,
+inspect familiar workspace contents, start or contact the daemon, download an
+engine, or make network requests. It reads `familiars.toml` to resolve declared
+workspace paths. Each run writes exactly one JSON document to standard output.
 
 ## Schema
 
@@ -44,11 +44,13 @@ Schema version 1 has this shape:
 
 Every surface has a stable `id`, a `status`, `source`, and `access`. A
 `resolved` surface has one absolute `path`, or a `paths` array for the
-environment-provided adapter search roots. Terminal `not_applicable`,
-`unsupported`, and `unresolved` surfaces intentionally omit `path`.
+environment-provided adapter search roots and configured familiar workspaces.
+Terminal `not_applicable`, `unsupported`, and `unresolved` surfaces
+intentionally omit `path`.
 
 `source` is `environment` when an applicable environment override selected
-the location and `default` otherwise. `access` is always `read_only`: it
+the location, `configuration` when `familiars.toml` selected familiar
+workspaces, and `default` otherwise. `access` is always `read_only`: it
 describes this diagnostic invocation, not whether another Coven command may
 later write the location.
 
@@ -78,8 +80,8 @@ honored by their platform, then verify the resulting report. On Windows, the
 native profile resolver can continue to select the OS account profile, so
 `COVEN_HOME` alone does not isolate the managed cache.
 
-The command reports paths only. It never serializes the contents of settings,
-privacy, adapter manifests, or the session ledger.
+The command reports paths only. It never serializes non-path contents from
+`familiars.toml`, settings, privacy, adapter manifests, or the session ledger.
 
 ## Related
 

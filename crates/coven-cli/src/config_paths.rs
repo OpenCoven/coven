@@ -1,9 +1,10 @@
 //! Versioned, side-effect-free reporting of Coven's resolved on-disk paths.
 //!
 //! This module intentionally describes locations without opening stores,
-//! creating directories, loading configuration contents, or probing a daemon.
-//! It is the machine-readable contract used by isolated runners to prove which
-//! roots a Coven invocation would consume.
+//! creating directories, or probing a daemon. It reads `familiars.toml` only
+//! to resolve declared workspace roots. It is the machine-readable contract
+//! used by isolated runners to prove which roots a Coven invocation would
+//! consume.
 
 use std::path::{Path, PathBuf};
 
@@ -49,6 +50,7 @@ pub enum PathStatus {
 #[serde(rename_all = "snake_case")]
 pub enum PathSource {
     Environment,
+    Configuration,
     Default,
 }
 
@@ -86,9 +88,9 @@ impl ProcessRoots {
 
 /// Build the stable report for `coven config paths --json`.
 ///
-/// The only filesystem observation is the existing engine resolver's regular
-/// file check. This does not create state, spawn a process, or read any
-/// configuration contents. All other paths are lexical derivations.
+/// Filesystem observations are limited to the engine resolver's regular-file
+/// check and reading `familiars.toml` for workspace declarations. This does
+/// not create state, spawn a process, or inspect workspace contents.
 pub fn report() -> PathsReport {
     let roots = ProcessRoots::capture();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -224,13 +226,27 @@ fn append_home_surfaces(
         source,
         cwd,
     );
-    push_path(
-        surfaces,
-        "state.familiar_workspaces",
-        &home.join("familiars"),
-        source,
-        cwd,
-    );
+    match crate::cockpit_sources::familiar_workspaces(home) {
+        Ok(paths) if !paths.is_empty() => push_paths(
+            surfaces,
+            "state.familiar_workspaces",
+            paths.iter().map(PathBuf::as_path),
+            PathSource::Configuration,
+            cwd,
+        ),
+        Ok(_) => push_path(
+            surfaces,
+            "state.familiar_workspaces",
+            &home.join("familiars"),
+            source,
+            cwd,
+        ),
+        Err(_) => push_terminal(
+            surfaces,
+            "state.familiar_workspaces",
+            PathStatus::Unresolved,
+        ),
+    }
     push_path(surfaces, "state.skills", &home.join("skills"), source, cwd);
     push_path(
         surfaces,
@@ -470,6 +486,26 @@ fn push_path(
         status: PathStatus::Resolved,
         path: Some(absolute_path(path, cwd).display().to_string()),
         paths: Vec::new(),
+        source,
+        access: AccessMode::ReadOnly,
+    });
+}
+
+fn push_paths<'a>(
+    surfaces: &mut Vec<PathSurface>,
+    id: &'static str,
+    paths: impl IntoIterator<Item = &'a Path>,
+    source: PathSource,
+    cwd: &Path,
+) {
+    surfaces.push(PathSurface {
+        id,
+        status: PathStatus::Resolved,
+        path: None,
+        paths: paths
+            .into_iter()
+            .map(|path| absolute_path(path, cwd).display().to_string())
+            .collect(),
         source,
         access: AccessMode::ReadOnly,
     });

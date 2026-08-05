@@ -15,6 +15,7 @@ fn run_paths(temp: &TempDir, coven_home: &Path, extra: &[(&str, OsString)]) -> O
     let mut command = Command::new(env!("CARGO_BIN_EXE_coven"));
     command
         .args(["config", "paths", "--json"])
+        .current_dir(temp.path())
         .env_remove("COVEN_ENGINE_BIN")
         .env_remove("COVEN_HARNESS_ADAPTER_MANIFEST")
         .env_remove("COVEN_HARNESS_ADAPTER_DIRS")
@@ -258,6 +259,79 @@ fn paths_json_prefers_environment_roots_without_reading_secret_contents() {
             adapter_two.display().to_string(),
         ])
     );
+}
+
+#[test]
+fn paths_json_reports_configured_familiar_workspaces() {
+    let temp = TempDir::new().expect("temporary directory");
+    let coven_home = temp.path().join("selected-coven-home");
+    let external_workspace = temp.path().join("external").join("nova");
+    fs::create_dir_all(&coven_home).expect("create COVEN_HOME");
+    fs::write(
+        coven_home.join("familiars.toml"),
+        format!(
+            r#"
+[[familiar]]
+id = "sage"
+display_name = "Sage"
+role = "Research"
+description = "Reads."
+workspace = "relative/sage"
+
+[[familiar]]
+id = "nova"
+display_name = "Nova"
+role = "Orchestration"
+description = "Coordinates."
+workspace = {}
+
+[[familiar]]
+id = "cody"
+display_name = "Cody"
+role = "Code"
+description = "Builds."
+"#,
+            serde_json::to_string(&external_workspace).expect("serialize workspace")
+        ),
+    )
+    .expect("write familiar manifest");
+
+    let report = report(&run_paths(&temp, &coven_home, &[]));
+    let surfaces = surfaces(&report);
+    let command_cwd = fs::canonicalize(temp.path()).expect("canonical command cwd");
+
+    assert_eq!(
+        surfaces["state.familiar_workspaces"]["paths"],
+        serde_json::json!([
+            command_cwd.join("relative/sage").display().to_string(),
+            external_workspace.display().to_string(),
+            coven_home.join("familiars/cody").display().to_string(),
+        ])
+    );
+    assert_eq!(
+        surfaces["state.familiar_workspaces"]["source"],
+        "configuration"
+    );
+    assert!(
+        surfaces["state.familiar_workspaces"].get("path").is_none(),
+        "configured workspaces must replace the misleading default root"
+    );
+}
+
+#[test]
+fn paths_json_does_not_guess_workspaces_when_familiar_manifest_is_invalid() {
+    let temp = TempDir::new().expect("temporary directory");
+    let coven_home = temp.path().join("selected-coven-home");
+    fs::create_dir_all(&coven_home).expect("create COVEN_HOME");
+    fs::write(coven_home.join("familiars.toml"), "[[familiar]\n")
+        .expect("write invalid familiar manifest");
+
+    let report = report(&run_paths(&temp, &coven_home, &[]));
+    let surface = &surfaces(&report)["state.familiar_workspaces"];
+
+    assert_eq!(surface["status"], "unresolved");
+    assert!(surface.get("path").is_none());
+    assert!(surface.get("paths").is_none());
 }
 
 #[test]

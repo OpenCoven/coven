@@ -95,18 +95,23 @@ pub(crate) fn familiar_workspace(coven_home: &Path, familiar_id: &str) -> std::p
         .unwrap_or_else(|| coven_home.join("familiars").join(familiar_id))
 }
 
+pub(crate) fn familiar_workspaces(coven_home: &Path) -> Result<Vec<PathBuf>> {
+    Ok(read_familiar_entries(coven_home)?
+        .into_iter()
+        .map(|entry| {
+            entry
+                .workspace
+                .map(expand_workspace)
+                .unwrap_or_else(|| coven_home.join("familiars").join(entry.id))
+        })
+        .collect())
+}
+
 pub fn read_familiars(coven_home: &Path) -> Result<Vec<FamiliarDto>> {
-    let path = coven_home.join(FAMILIARS_CONFIG_FILE);
-    let raw = match fs::read_to_string(&path) {
-        Ok(raw) => raw,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
-    };
-    let parsed: FamiliarsFile =
-        toml::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))?;
+    let entries = read_familiar_entries(coven_home)?;
     let memory_root = coven_home.join(MEMORY_DIR);
-    let mut out = Vec::with_capacity(parsed.familiar.len());
-    for entry in parsed.familiar {
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
         let memory_dir = memory_root.join(&entry.id);
         let memory_freshness = latest_mtime(&memory_dir)
             .map(relative_time)
@@ -131,22 +136,35 @@ pub fn read_familiars(coven_home: &Path) -> Result<Vec<FamiliarDto>> {
             last_seen: "—".to_string(),
             active_sessions: 0,
             memory_freshness,
-            workspace: entry.workspace.map(|p| {
-                // Expand leading ~ to home directory
-                if let Some(rest) = p.strip_prefix("~/") {
-                    dirs_next::home_dir()
-                        .map(|home| home.join(rest))
-                        .unwrap_or_else(|| std::path::PathBuf::from(&p))
-                } else if p == "~" {
-                    dirs_next::home_dir().unwrap_or_else(|| std::path::PathBuf::from(&p))
-                } else {
-                    std::path::PathBuf::from(p)
-                }
-            }),
+            workspace: entry.workspace.map(expand_workspace),
             id: entry.id,
         });
     }
     Ok(out)
+}
+
+fn read_familiar_entries(coven_home: &Path) -> Result<Vec<FamiliarEntry>> {
+    let path = coven_home.join(FAMILIARS_CONFIG_FILE);
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
+    };
+    let parsed: FamiliarsFile =
+        toml::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))?;
+    Ok(parsed.familiar)
+}
+
+fn expand_workspace(workspace: String) -> PathBuf {
+    if let Some(rest) = workspace.strip_prefix("~/") {
+        dirs_next::home_dir()
+            .map(|home| home.join(rest))
+            .unwrap_or_else(|| PathBuf::from(&workspace))
+    } else if workspace == "~" {
+        dirs_next::home_dir().unwrap_or_else(|| PathBuf::from(&workspace))
+    } else {
+        PathBuf::from(workspace)
+    }
 }
 
 /// Outcome of a [`write_familiar_icon`] call.
