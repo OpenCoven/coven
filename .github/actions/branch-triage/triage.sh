@@ -65,13 +65,19 @@ pr_title_for() {
 branch_is_open_pr()   { open_branches  | grep -qxF "$1"; }
 branch_is_merged_pr() { merged_branches | grep -qxF "$1"; }
 
+# Branch names reach these helpers with the `origin/` prefix stripped, because
+# that bare form is what `gh pr list` reports as `headRefName` and what the
+# report prints. Git, however, can only resolve the remote-tracking ref: a CI
+# checkout has exactly one local branch (the base), so `git log <branch>` exits
+# 128 for every other name and `set -e` kills the run. Always resolve through
+# `origin/`, and never let a single unresolvable ref abort the whole triage.
 unique_commits() {
-  git log --oneline "$1" ^"origin/$BASE" 2>/dev/null | wc -l | tr -d ' '
+  git log --oneline "origin/$1" ^"origin/$BASE" 2>/dev/null | wc -l | tr -d ' ' || echo 0
 }
 
 last_commit_days_ago() {
   local ts
-  ts=$(git log -1 --format="%ct" "$1" 2>/dev/null || echo 0)
+  ts=$(git log -1 --format="%ct" "origin/$1" 2>/dev/null || echo 0)
   local now
   now=$(date +%s)
   echo $(( (now - ts) / 86400 ))
@@ -186,7 +192,7 @@ if [[ ${#REVIEW_LIST[@]} -gt 0 ]]; then
   for branch in "${REVIEW_LIST[@]}"; do
     uniq=$(unique_commits "$branch")
     echo "  $(yellow '→') $branch  ($(bold $uniq) unique commit(s))"
-    git log --oneline "$branch" ^"origin/$BASE" 2>/dev/null | head -5 | sed 's/^/      /'
+    git log --oneline "origin/$branch" ^"origin/$BASE" 2>/dev/null | head -5 | sed 's/^/      /' || true
   done
   (( kept_count += ${#REVIEW_LIST[@]} )) || true
 fi
