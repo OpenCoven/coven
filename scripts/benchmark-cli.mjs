@@ -17,7 +17,9 @@ export function summarizeSamples(samples) {
       sorted.length % 2 === 1
         ? sorted[middle]
         : (sorted[middle - 1] + sorted[middle]) / 2,
+    p50Ms: sorted[Math.ceil(sorted.length * 0.5) - 1],
     p95Ms: sorted[Math.ceil(sorted.length * 0.95) - 1],
+    p99Ms: sorted[Math.ceil(sorted.length * 0.99) - 1],
     maxMs: sorted.at(-1)
   };
 }
@@ -456,6 +458,36 @@ export function stopDaemon({ binary, env, run = runCommand }) {
   run({ command: binary, args: ['daemon', 'stop'], allowedExitCodes: [0], env });
 }
 
+export async function measureColdDaemonStarts({
+  binary,
+  fixtureRoot,
+  environment,
+  iterations,
+  makeDirectory = (path) => mkdir(path, { recursive: true }),
+  start = startDaemon,
+  stop = stopDaemon,
+  now = () => process.hrtime.bigint()
+}) {
+  const samplesMs = [];
+
+  for (let iteration = 0; iteration < iterations; iteration += 1) {
+    const covenHome = join(fixtureRoot, `d-${iteration}`);
+    const env = isolatedEnvironment(covenHome, environment);
+    await makeDirectory(join(covenHome, 'user-home'));
+    const startedAt = now();
+
+    try {
+      await start({ binary, covenHome, env });
+      const elapsedMs = Number(now() - startedAt) / 1_000_000;
+      samplesMs.push(Number(elapsedMs.toFixed(3)));
+    } finally {
+      await stop({ binary, covenHome, env });
+    }
+  }
+
+  return { samplesMs, summary: summarizeSamples(samplesMs) };
+}
+
 export async function registerExternalSessions({
   socketPath,
   count,
@@ -652,6 +684,7 @@ export async function collectBenchmarkScenarios({
   environment,
   makeDirectory = (path) => mkdir(path, { recursive: true }),
   collectCore = collectCoreScenarios,
+  measureColdStarts = measureColdDaemonStarts,
   measureHarness = measureHarnessOutput,
   measureEvents = measureEventTails,
   measureLists = measureSessionLists,
@@ -667,6 +700,12 @@ export async function collectBenchmarkScenarios({
   });
 
   if (options.sessionCounts.length > 0) {
+    scenarios.daemon_cold_start = await measureColdStarts({
+      binary: options.binary,
+      fixtureRoot,
+      environment,
+      iterations: options.iterations
+    });
     scenarios.harness_first_output = await measureHarness({
       binary: options.binary,
       fixtureRoot,

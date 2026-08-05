@@ -19,6 +19,7 @@ import {
   prepareEventTail,
   measureEventTails,
   measureCapabilityReads,
+  measureColdDaemonStarts,
   measureSessionLists,
   registerInputEvents,
   registerExternalSessions,
@@ -37,11 +38,13 @@ import {
   waitForHealth
 } from './benchmark-cli.mjs';
 
-test('summarizeSamples reports deterministic median and nearest-rank p95', () => {
+test('summarizeSamples reports deterministic p50, p95, and p99', () => {
   assert.deepEqual(summarizeSamples([9, 1, 5, 3, 7]), {
     minMs: 1,
     medianMs: 5,
+    p50Ms: 5,
     p95Ms: 9,
+    p99Ms: 9,
     maxMs: 9
   });
 });
@@ -400,6 +403,44 @@ test('stopDaemon shuts down through the same isolated command boundary', () => {
   ]);
 });
 
+test('measureColdDaemonStarts uses a fresh home per sample and always stops it', async () => {
+  const calls = [];
+  const ticks = [0n, 1_250_000n, 2_000_000n, 5_500_000n];
+  const report = await measureColdDaemonStarts({
+    binary: '/tmp/coven',
+    fixtureRoot: '/fixture/root',
+    environment: { PATH: '/fixture/bin' },
+    iterations: 2,
+    makeDirectory: async (path) => calls.push(['mkdir', path]),
+    start: async ({ covenHome, env }) => {
+      calls.push(['start', covenHome, env.COVEN_HOME]);
+      return `${covenHome}/coven.sock`;
+    },
+    stop: ({ covenHome, env }) => calls.push(['stop', covenHome, env.COVEN_HOME]),
+    now: () => ticks.shift()
+  });
+
+  assert.deepEqual(report, {
+    samplesMs: [1.25, 3.5],
+    summary: {
+      minMs: 1.25,
+      medianMs: 2.375,
+      p50Ms: 1.25,
+      p95Ms: 3.5,
+      p99Ms: 3.5,
+      maxMs: 3.5
+    }
+  });
+  assert.deepEqual(calls, [
+    ['mkdir', '/fixture/root/d-0/user-home'],
+    ['start', '/fixture/root/d-0', '/fixture/root/d-0'],
+    ['stop', '/fixture/root/d-0', '/fixture/root/d-0'],
+    ['mkdir', '/fixture/root/d-1/user-home'],
+    ['start', '/fixture/root/d-1', '/fixture/root/d-1'],
+    ['stop', '/fixture/root/d-1', '/fixture/root/d-1']
+  ]);
+});
+
 test('registerExternalSessions seeds deterministic rows through the socket API', async () => {
   const calls = [];
   await registerExternalSessions({
@@ -558,6 +599,10 @@ test('collectBenchmarkScenarios merges core and daemon fixture reports', async (
       calls.push(['core', env.COVEN_HOME]);
       return { help: { samplesMs: [1], exitCodes: [0], summary: { minMs: 1 } } };
     },
+    measureColdStarts: async (input) => {
+      calls.push(['cold-start', input.fixtureRoot, input.iterations]);
+      return { samplesMs: [6], summary: { p50Ms: 6, p95Ms: 6, p99Ms: 6 } };
+    },
     measureHarness: async (input) => {
       calls.push(['harness', input.fixtureRoot, input.iterations]);
       return { samplesMs: [3], statusCodes: [201], summary: { minMs: 3 } };
@@ -578,6 +623,7 @@ test('collectBenchmarkScenarios merges core and daemon fixture reports', async (
 
   assert.deepEqual(Object.keys(scenarios), [
     'help',
+    'daemon_cold_start',
     'harness_first_output',
     'event_tail_2',
     'sessions_2',
@@ -586,6 +632,7 @@ test('collectBenchmarkScenarios merges core and daemon fixture reports', async (
   assert.deepEqual(calls, [
     ['mkdir', '/fixture/root/c/user-home'],
     ['core', '/fixture/root/c'],
+    ['cold-start', '/fixture/root', 2],
     ['harness', '/fixture/root', 2],
     ['events', '/fixture/root', [2]],
     ['lists', '/fixture/root', [2]],
@@ -601,6 +648,7 @@ test('collectBenchmarkScenarios records warmed capability reads', async () => {
     environment: { PATH: '/fixture/bin' },
     makeDirectory: async () => {},
     collectCore: () => ({ help: { samplesMs: [1], exitCodes: [0], summary: { minMs: 1 } } }),
+    measureColdStarts: async () => ({ samplesMs: [6], summary: { p50Ms: 6 } }),
     measureHarness: async () => ({ samplesMs: [3], statusCodes: [201], summary: { minMs: 3 } }),
     measureEvents: async () => ({ event_tail_2: { samplesMs: [4], statusCodes: [200], summary: { minMs: 4 } } }),
     measureLists: async () => ({ sessions_2: { samplesMs: [2], statusCodes: [200], summary: { minMs: 2 } } }),

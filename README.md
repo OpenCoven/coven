@@ -657,13 +657,16 @@ node scripts/benchmark-cli.mjs --binary target/debug/coven --iterations 3 --outp
 cargo test -p coven-cli --bin coven tui::chat::events::tests::benchmark_schedule_metrics_emit_json --locked -- --ignored --nocapture
 ```
 
-The runner uses a disposable `COVEN_HOME`, a fixture-only fake Codex executable,
-and the local socket API. It records command startup, daemon session-listing,
-event-tail, and harness-first-output timings without reading real configuration,
-prompts, or session logs. The ignored Rust test prints deterministic TUI
-poll/draw counters. These outputs are trend data: CI uploads them as artifacts
-and validates fixture construction, but does not fail pull requests on
-wall-clock thresholds.
+The runner uses disposable `COVEN_HOME` directories, a fixture-only fake Codex
+executable, and the local socket API. It records command startup, cold daemon
+start-to-health, daemon session-listing, event-tail, and harness-first-output
+timings without reading real configuration, prompts, or session logs. Each cold
+start sample gets a fresh home and a matching daemon stop. The ignored Rust test
+prints deterministic TUI poll/draw counters. These outputs are trend data: CI
+uploads them as artifacts and validates fixture construction, but does not fail
+pull requests on wall-clock thresholds. Cave's managed-start contract retains
+its 8-second hard deadline; benchmark p50/p95/p99 values do not replace that
+product-level timeout.
 
 ### Concurrent runtime baseline
 
