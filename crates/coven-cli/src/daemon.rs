@@ -401,6 +401,16 @@ impl SessionRuntime for LiveSessionRuntime {
     fn kill_session(&self, session_id: &str) -> Result<()> {
         LiveSessionRuntime::kill_session(self, session_id)
     }
+
+    /// Must stay in this trait impl: `api::handle_request_with_runtime` reaches
+    /// the runtime through `&dyn SessionRuntime`, so an inherent method of the
+    /// same name is unreachable and `GET /health` silently falls back to the
+    /// trait's `None` default.
+    fn event_writer_health(&self) -> Option<crate::event_writer::EventWriterHealth> {
+        self.event_writer
+            .as_ref()
+            .map(crate::event_writer::EventWriter::health)
+    }
 }
 
 impl LiveSessionRuntime {
@@ -578,12 +588,6 @@ impl LiveSessionRuntime {
             .lock()
             .map_err(|_| anyhow::anyhow!("live session killer lock poisoned"))?;
         killer.kill()
-    }
-
-    fn event_writer_health(&self) -> Option<crate::event_writer::EventWriterHealth> {
-        self.event_writer
-            .as_ref()
-            .map(crate::event_writer::EventWriter::health)
     }
 }
 
