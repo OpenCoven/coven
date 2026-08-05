@@ -96,6 +96,15 @@ enum PendingEvent {
     },
 }
 
+impl PendingEvent {
+    fn session_id(&self) -> &str {
+        match self {
+            Self::Output { session_id, .. } | Self::Exit { session_id, .. } => session_id,
+            Self::Record(record) => &record.session_id,
+        }
+    }
+}
+
 impl EventWriter {
     pub fn start(coven_home: PathBuf) -> Result<Self> {
         Self::start_with_capacity(coven_home, DEFAULT_CAPACITY_BYTES)
@@ -260,37 +269,79 @@ impl EventWriter {
             bytes <= self.shared.capacity_bytes,
             "critical event exceeds event writer capacity"
         );
+        let session_id = event.session_id().to_string();
         let (completion_tx, completion_rx) = mpsc::sync_channel(1);
         let mut queue = self.lock_queue();
-        loop {
-            if let Some(error) = &queue.failed {
-                return Err(anyhow!(error.clone()));
+        let marker = take_truncation_marker(&mut queue, &session_id);
+        let marker_bytes = marker.as_ref().map_or(0, |item| item.bytes);
+        if marker_bytes.saturating_add(bytes) <= self.shared.capacity_bytes {
+            loop {
+                if let Some(error) = &queue.failed {
+                    return Err(anyhow!(error.clone()));
+                }
+                if queue
+                    .queued_bytes
+                    .saturating_add(marker_bytes)
+                    .saturating_add(bytes)
+                    <= self.shared.capacity_bytes
+                {
+                    break;
+                }
+                queue = self
+                    .shared
+                    .available
+                    .wait(queue)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
             }
-            if queue.queued_bytes.saturating_add(bytes) <= self.shared.capacity_bytes {
-                break;
+
+            if let Some(marker) = marker {
+                queue.queued_events += 1;
+                queue.queued_bytes += marker.bytes;
+                queue.items.push_back(marker);
             }
-            queue = self
-                .shared
-                .available
-                .wait(queue)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
-        queue.queued_events += 1;
-        queue.queued_bytes += bytes;
-        self.update_queue_health(queue.queued_events, queue.queued_bytes);
-        queue.items.push_back(QueuedEvent {
-            event,
-            bytes,
-            completion: Some(completion_tx),
-        });
-        self.shared.available.notify_one();
-        drop(queue);
-        match completion_rx
-            .recv()
-            .context("event writer stopped before committing a critical event")?
-        {
-            Ok(()) => Ok(()),
-            Err(message) => Err(anyhow!(message)),
+            queue.queued_events += 1;
+            queue.queued_bytes += bytes;
+            self.update_queue_health(queue.queued_events, queue.queued_bytes);
+            queue.items.push_back(QueuedEvent {
+                event,
+                bytes,
+                completion: Some(completion_tx),
+            });
+            self.shared.available.notify_one();
+            drop(queue);
+            receive_completion(
+                completion_rx,
+                "event writer stopped before committing a critical event",
+            )
+        } else {
+            let mut marker =
+                marker.expect("marker is required when combined capacity is impossible");
+            let (marker_tx, marker_rx) = mpsc::sync_channel(1);
+            loop {
+                if let Some(error) = &queue.failed {
+                    return Err(anyhow!(error.clone()));
+                }
+                if queue.queued_bytes.saturating_add(marker.bytes) <= self.shared.capacity_bytes {
+                    break;
+                }
+                queue = self
+                    .shared
+                    .available
+                    .wait(queue)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            marker.completion = Some(marker_tx);
+            queue.queued_events += 1;
+            queue.queued_bytes += marker.bytes;
+            queue.items.push_back(marker);
+            self.update_queue_health(queue.queued_events, queue.queued_bytes);
+            self.shared.available.notify_one();
+            drop(queue);
+            receive_completion(
+                marker_rx,
+                "event writer stopped before committing truncation marker",
+            )?;
+            self.enqueue_critical(event, bytes)
         }
     }
 
@@ -610,9 +661,20 @@ fn complete(batch: &[QueuedEvent], result: std::result::Result<(), String>) {
     }
 }
 
+fn receive_completion(
+    receiver: mpsc::Receiver<std::result::Result<(), String>>,
+    context: &'static str,
+) -> Result<()> {
+    match receiver.recv().context(context)? {
+        Ok(()) => Ok(()),
+        Err(message) => Err(anyhow!(message)),
+    }
+}
+
 fn fail_writer(shared: &Arc<Shared>, message: String) -> Vec<QueuedEvent> {
     let mut queue = lock_queue(shared);
     queue.failed = Some(message.clone());
+    queue.truncations.clear();
     queue.queued_events = 0;
     queue.queued_bytes = 0;
     let pending = queue.items.drain(..).collect();
@@ -951,6 +1013,108 @@ mod tests {
                 exit_code: Some(1),
             },
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn exit_closes_pressure_episode_before_terminal_event() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let conn = store::open_store(&home.path().join(STORE_FILE_NAME))?;
+        store::insert_session(&conn, &session("s-1"))?;
+        let writer = EventWriter::start_with_capacity(
+            home.path().to_path_buf(),
+            RESERVED_CRITICAL_BYTES + 1024,
+        )?;
+
+        assert!(!writer.record_output("s-1", "x".repeat(2048))?);
+        writer.record_exit(
+            "s-1",
+            PtyRunResult {
+                status: "failed",
+                exit_code: Some(1),
+            },
+        )?;
+
+        let events = store::list_events(&conn, "s-1")?;
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["output_truncated", "exit"]
+        );
+        let marker_payload: serde_json::Value = serde_json::from_str(&events[0].payload_json)?;
+        assert_eq!(marker_payload["droppedEvents"], 1);
+        assert_eq!(marker_payload["droppedBytes"], 2048);
+        Ok(())
+    }
+
+    #[test]
+    fn pressure_episodes_are_isolated_per_session() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let conn = store::open_store(&home.path().join(STORE_FILE_NAME))?;
+        store::insert_session(&conn, &session("s-1"))?;
+        store::insert_session(&conn, &session("s-2"))?;
+        let writer = EventWriter::start_with_capacity(
+            home.path().to_path_buf(),
+            RESERVED_CRITICAL_BYTES + 1024,
+        )?;
+
+        assert!(!writer.record_output("s-1", "x".repeat(2048))?);
+        assert!(!writer.record_output("s-2", "x".repeat(3072))?);
+        writer.record_exit(
+            "s-1",
+            PtyRunResult {
+                status: "completed",
+                exit_code: Some(0),
+            },
+        )?;
+        writer.record_exit(
+            "s-2",
+            PtyRunResult {
+                status: "completed",
+                exit_code: Some(0),
+            },
+        )?;
+
+        for (session_id, dropped_bytes) in [("s-1", 2048), ("s-2", 3072)] {
+            let events = store::list_events(&conn, session_id)?;
+            assert_eq!(events[0].kind, "output_truncated");
+            let marker_payload: serde_json::Value = serde_json::from_str(&events[0].payload_json)?;
+            assert_eq!(marker_payload["droppedEvents"], 1);
+            assert_eq!(marker_payload["droppedBytes"], dropped_bytes);
+            assert_eq!(events[1].kind, "exit");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_critical_event_commits_marker_before_waiting_for_its_own_capacity() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let conn = store::open_store(&home.path().join(STORE_FILE_NAME))?;
+        store::insert_session(&conn, &session("s-1"))?;
+        let capacity = RESERVED_CRITICAL_BYTES + 1024;
+        let writer = EventWriter::start_with_capacity(home.path().to_path_buf(), capacity)?;
+
+        assert!(!writer.record_output("s-1", "x".repeat(2048))?);
+        let record = store::EventRecord {
+            seq: 0,
+            id: "event".to_string(),
+            session_id: "s-1".to_string(),
+            kind: "error".to_string(),
+            payload_json: "{}".to_string(),
+            created_at: "2026-08-04T00:00:00Z".to_string(),
+        };
+        writer.enqueue_critical(PendingEvent::Record(record), capacity - 1)?;
+
+        let events = store::list_events(&conn, "s-1")?;
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["output_truncated", "error"]
+        );
         Ok(())
     }
 
