@@ -289,9 +289,14 @@ fn health_response_with_hub(
         response.hub = serde_json::from_value(summary).ok();
     }
     response.storage = Some(
-        store::storage_health(coven_home, event_writer.as_ref()).unwrap_or_else(|error| {
-            store::unavailable_storage_health(error, None, event_writer.as_ref())
-        }),
+        match store::storage_health(coven_home, event_writer.as_ref()) {
+            Ok(storage) => storage,
+            Err(error) => {
+                let mut storage = store::unavailable_storage_health(error, event_writer.as_ref());
+                storage.maintenance_blocked = false;
+                storage
+            }
+        },
     );
     response.event_writer = event_writer;
     response
@@ -6805,14 +6810,6 @@ mod tests {
         }
     }
 
-    fn unavailable_storage_health_for_api_test(
-        error: impl ToString,
-        known_free_disk_bytes: Option<u64>,
-        event_writer: Option<&crate::event_writer::EventWriterHealth>,
-    ) -> store::StorageHealth {
-        store::unavailable_storage_health(error, known_free_disk_bytes, event_writer)
-    }
-
     #[test]
     fn health_uses_one_live_writer_snapshot_for_both_surfaces() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
@@ -6835,29 +6832,32 @@ mod tests {
     }
 
     #[test]
-    fn health_response_serializes_degraded_storage_without_false_maintenance_blocking(
-    ) -> anyhow::Result<()> {
-        let writer = HealthRuntime
-            .event_writer_health()
-            .expect("health runtime provides writer snapshot");
-        let mut response = health_response(None);
-        response.event_writer = Some(writer.clone());
-        response.storage = Some(unavailable_storage_health_for_api_test(
-            "storage health unavailable",
-            Some(store::MAINTENANCE_MIN_FREE_DISK_BYTES),
-            Some(&writer),
-        ));
+    fn health_degrades_when_storage_collection_cannot_start() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let parent_file = temp_dir.path().join("not-a-dir");
+        std::fs::write(&parent_file, "marker")?;
+        let missing_home = parent_file.join("missing-home");
+        let response = handle_request_with_runtime(
+            "GET",
+            "/health",
+            &missing_home,
+            None,
+            None,
+            &HealthRuntime,
+        )?;
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
 
-        let body = serde_json::to_value(response)?;
-
+        assert_eq!(response.status, 200);
         assert_eq!(body["storage"]["status"], "degraded");
-        assert_eq!(
-            body["storage"]["freeDiskBytes"],
-            serde_json::json!(store::MAINTENANCE_MIN_FREE_DISK_BYTES)
-        );
+        assert_eq!(body["storage"]["freeDiskBytes"], 0);
         assert_eq!(body["storage"]["maintenanceBlocked"], false);
         assert_eq!(body["storage"]["writerBacklogEvents"], 3);
         assert_eq!(body["storage"]["writerBacklogBytes"], 4096);
+        assert!(body.get("eventWriter").is_some());
+        assert!(body["eventWriter"].is_object());
+        assert!(parent_file.is_file());
+        assert!(!missing_home.exists());
+        assert!(!missing_home.join("coven.sqlite3").exists());
         Ok(())
     }
 
