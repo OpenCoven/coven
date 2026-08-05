@@ -12,10 +12,11 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -23,7 +24,6 @@ const GATE_DIR: &str = "coven-maintenance-gate";
 const OWNER_FILE: &str = "owner";
 const WRITERS_DIR: &str = "writers";
 const LOCK_FILE: &str = "lock";
-const LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
 const LOCK_WAIT: Duration = Duration::from_secs(5);
 const WRITER_TTL: Duration = Duration::from_secs(90);
 const OWNER_TTL: Duration = Duration::from_secs(120);
@@ -553,36 +553,37 @@ impl OwnerLease {
     }
 }
 
+#[derive(Debug)]
 struct GateLock {
-    path: PathBuf,
+    file: fs::File,
 }
 
 impl GateLock {
     fn acquire(path: PathBuf) -> Result<Self> {
-        let started = SystemTime::now();
+        Self::acquire_with_wait(path, LOCK_WAIT)
+    }
+
+    fn acquire_with_wait(path: PathBuf, wait: Duration) -> Result<Self> {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        let started = Instant::now();
         loop {
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(_) => return Ok(Self { path }),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if is_stale(&path, LOCK_STALE_AFTER) {
-                        let _ = fs::remove_file(&path);
-                    }
-                    if SystemTime::now()
-                        .duration_since(started)
-                        .unwrap_or_default()
-                        > LOCK_WAIT
-                    {
+            match file.try_lock_exclusive() {
+                Ok(()) => return Ok(Self { file }),
+                Err(error) if crate::state_lock::is_lock_contended(&error) => {
+                    if started.elapsed() >= wait {
                         return Err(GateError::Contended.into());
                     }
                     thread::sleep(Duration::from_millis(10));
                 }
                 Err(error) => {
                     return Err(error)
-                        .with_context(|| format!("failed to acquire {}", path.display()))
+                        .with_context(|| format!("failed to acquire {}", path.display()));
                 }
             }
         }
@@ -591,16 +592,8 @@ impl GateLock {
 
 impl Drop for GateLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let _ = FileExt::unlock(&self.file);
     }
-}
-
-fn is_stale(path: &Path, after: Duration) -> bool {
-    fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-        .is_some_and(|age| age > after)
 }
 
 fn writer_file_name(id: &str) -> String {
@@ -626,6 +619,56 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::FileTimes;
+
+    fn assert_contended(error: &anyhow::Error) {
+        assert!(error
+            .downcast_ref::<GateError>()
+            .is_some_and(|error| matches!(error, GateError::Contended)));
+    }
+
+    #[test]
+    fn live_gate_lock_blocks_a_second_acquirer() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let gate = MaintenanceGate::at(temp.path().to_path_buf());
+        gate.ensure_layout()?;
+        let _first = GateLock::acquire(gate.lock_path())?;
+
+        let error = GateLock::acquire_with_wait(gate.lock_path(), Duration::ZERO).unwrap_err();
+
+        assert_contended(&error);
+        Ok(())
+    }
+
+    #[test]
+    fn dropping_gate_lock_allows_the_next_acquirer() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let gate = MaintenanceGate::at(temp.path().to_path_buf());
+        gate.ensure_layout()?;
+        let first = GateLock::acquire(gate.lock_path())?;
+        drop(first);
+
+        let _second = GateLock::acquire_with_wait(gate.lock_path(), Duration::ZERO)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn stale_mtime_does_not_allow_live_gate_lock_takeover() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let gate = MaintenanceGate::at(temp.path().to_path_buf());
+        gate.ensure_layout()?;
+        let _first = GateLock::acquire(gate.lock_path())?;
+        let lock_file = fs::OpenOptions::new().write(true).open(gate.lock_path())?;
+        lock_file.set_times(
+            FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(120)),
+        )?;
+
+        let error = GateLock::acquire_with_wait(gate.lock_path(), Duration::ZERO).unwrap_err();
+
+        assert_contended(&error);
+        Ok(())
+    }
 
     #[test]
     fn owner_rejects_a_writer_until_release() -> Result<()> {
