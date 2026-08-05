@@ -1,10 +1,11 @@
 //! Repository-wide maintenance exclusion for Coven writers.
 //!
 //! The files live below git's *common* directory, not a worktree's `.git`
-//! link, so every worktree of one checkout observes the same state.  This is
-//! deliberately a protocol built from exclusive file creation and fenced
-//! records rather than an advisory process lock: Cave and the CLI are separate
-//! processes and must make the same decision before they mutate a repository.
+//! link, so every worktree of one checkout observes the same state. Owner and
+//! writer state remain fenced records, while short metadata mutations are
+//! serialized by a cross-process advisory lock used by Coven processes. Cave
+//! participates through Coven's CLI/API commands rather than implementing the
+//! lock itself.
 
 use std::{
     fs,
