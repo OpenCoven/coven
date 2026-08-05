@@ -33,6 +33,41 @@ class SecretGuardLockfileTests(unittest.TestCase):
 
         self.assertEqual(hits, [])
 
+    def test_nested_scoped_node_modules_keys_do_not_trigger_high_entropy(self) -> None:
+        lines = [
+            '    "node_modules/@mariozechner/pi-ai/node_modules/http-proxy-agent": {',
+            '    "node_modules/@scope/parent/node_modules/@nested/child/node_modules/final-package": {',
+        ]
+
+        for line in lines:
+            with self.subTest(line=line):
+                self.assertIsNotNone(check_secrets.LOCKFILE_NODE_MODULE_KEY.fullmatch(line))
+                self.assertEqual(
+                    check_secrets.scan_text(line, "packages/example/package-lock.json"),
+                    [],
+                )
+
+    def test_nested_unscoped_node_modules_keys_do_not_trigger_high_entropy(self) -> None:
+        lines = [
+            '    "node_modules/parent-package/node_modules/child-package": {',
+            '    "node_modules/parent-package/node_modules/child-package/node_modules/grandchild-package": {',
+        ]
+
+        for line in lines:
+            with self.subTest(line=line):
+                self.assertIsNotNone(check_secrets.LOCKFILE_NODE_MODULE_KEY.fullmatch(line))
+                self.assertEqual(
+                    check_secrets.scan_text(line, "packages/example/package-lock.json"),
+                    [],
+                )
+
+    def test_nested_node_modules_shaped_source_line_still_triggers_entropy(self) -> None:
+        line = '    "node_modules/@mariozechner/pi-ai/node_modules/http-proxy-agent": {'
+
+        hits = check_secrets.scan_text(line, "src/dependency-map.ts")
+
+        self.assertEqual(hits, [("src/dependency-map.ts", 1, "high_entropy")])
+
     def test_lockfile_integrity_hashes_do_not_trigger_high_entropy(self) -> None:
         digest = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/ABCDEFGHIJKLMNOPQRSTUVWXYZ"
         text = "\n".join(
