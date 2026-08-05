@@ -43,6 +43,11 @@ log "Fetching all remotes and pruning stale tracking refs…"
 git fetch --all --prune -q
 git checkout "$BASE" -q
 git pull -q
+BASE_REF="refs/remotes/origin/$BASE"
+git show-ref --verify --quiet "$BASE_REF" || {
+  err "base branch is unavailable: $BASE_REF"
+  exit 1
+}
 
 # ── Step 1 — collect PR data ──────────────────────────────────────────────────
 log "Loading open and merged PR data from GitHub…"
@@ -72,12 +77,20 @@ branch_is_merged_pr() { merged_branches | grep -qxF "$1"; }
 # 128 for every other name and `set -e` kills the run. Always resolve through
 # `origin/`, and never let a single unresolvable ref abort the whole triage.
 unique_commits() {
-  git log --oneline "origin/$1" ^"origin/$BASE" 2>/dev/null | wc -l | tr -d ' ' || echo 0
+  local ref="refs/remotes/origin/$1"
+  if ! git show-ref --verify --quiet "$ref"; then
+    echo 0
+    return
+  fi
+  git rev-list --count "$ref" ^"$BASE_REF"
 }
 
 last_commit_days_ago() {
-  local ts
-  ts=$(git log -1 --format="%ct" "origin/$1" 2>/dev/null || echo 0)
+  local ref="refs/remotes/origin/$1"
+  local ts=0
+  if git show-ref --verify --quiet "$ref"; then
+    ts=$(git log -1 --format="%ct" "$ref")
+  fi
   local now
   now=$(date +%s)
   echo $(( (now - ts) / 86400 ))
@@ -161,13 +174,14 @@ while IFS= read -r branch; do
     REVIEW_LIST+=("$branch")
     printf "%-52s %-12s %-8s %s\n" "$branch" "$(yellow $cat)" "$uniq" "—"
   fi
-done < <(git branch -r | sed 's|^\s*origin/||' | grep -v '^HEAD' | sort)
+done < <(git for-each-ref --format='%(refname:strip=3)' refs/remotes/origin | grep -v '^HEAD$' | sort)
 
 echo ""
 
 # ── Step 3 — delete MERGED + SUPERSEDED ──────────────────────────────────────
 log "Deleting MERGED and SUPERSEDED branches…"
-for branch in "${MERGED_LIST[@]}" "${SUPERSEDED_LIST[@]}"; do
+delete_branch() {
+  local branch="$1"
   if [[ "$DRY" == "true" ]]; then
     log "[dry-run] would delete: $branch"
   else
@@ -179,7 +193,18 @@ for branch in "${MERGED_LIST[@]}" "${SUPERSEDED_LIST[@]}"; do
     git branch -D "$branch" 2>/dev/null || true
     (( deleted_count++ )) || true
   fi
-done
+}
+
+if [[ ${#MERGED_LIST[@]} -gt 0 ]]; then
+  for branch in "${MERGED_LIST[@]}"; do
+    delete_branch "$branch"
+  done
+fi
+if [[ ${#SUPERSEDED_LIST[@]} -gt 0 ]]; then
+  for branch in "${SUPERSEDED_LIST[@]}"; do
+    delete_branch "$branch"
+  done
+fi
 
 # Prune gone tracking refs
 # `git remote prune` has no `-q`; it exits 129 on the unknown switch and, under
@@ -195,7 +220,8 @@ if [[ ${#REVIEW_LIST[@]} -gt 0 ]]; then
   for branch in "${REVIEW_LIST[@]}"; do
     uniq=$(unique_commits "$branch")
     echo "  $(yellow '→') $branch  ($(bold $uniq) unique commit(s))"
-    git log --oneline "origin/$branch" ^"origin/$BASE" 2>/dev/null | head -5 | sed 's/^/      /' || true
+    ref="refs/remotes/origin/$branch"
+    git log --oneline "$ref" ^"$BASE_REF" 2>/dev/null | head -5 | sed 's/^/      /' || true
   done
   (( kept_count += ${#REVIEW_LIST[@]} )) || true
 fi
@@ -204,43 +230,48 @@ fi
 echo ""
 log "Merging open PRs that pass the gate (one at a time)…"
 
-for branch in "${OPEN_LIST[@]}"; do
-  pr=$(pr_number_for "$branch")
-  title=$(pr_title_for "$branch")
-  log "  PR #$pr — $title"
+if [[ ${#OPEN_LIST[@]} -gt 0 ]]; then
+  for branch in "${OPEN_LIST[@]}"; do
+    pr=$(pr_number_for "$branch")
+    title=$(pr_title_for "$branch")
+    log "  PR #$pr — $title"
 
-  # Gate first: never touch a PR we would not be allowed to merge. Rebasing and
-  # force-pushing a blocked PR is itself destructive, so this runs before any
-  # write to the branch.
-  reason=$(merge_block_reason "$pr")
-  if [[ -n "$reason" ]]; then
-    warn "  $(yellow 'skipped') #$pr — $reason"
-    SKIPPED_LIST+=("#$pr ($branch) — $reason")
-    (( skipped_count++ )) || true
-    continue
-  fi
+    # Gate first: never touch a PR we would not be allowed to merge. Rebasing and
+    # force-pushing a blocked PR is itself destructive, so this runs before any
+    # write to the branch.
+    reason=$(merge_block_reason "$pr")
+    if [[ -n "$reason" ]]; then
+      warn "  $(yellow 'skipped') #$pr — $reason"
+      SKIPPED_LIST+=("#$pr ($branch) — $reason")
+      (( skipped_count++ )) || true
+      continue
+    fi
 
-  if [[ "$DRY" == "true" ]]; then
-    log "  [dry-run] would merge #$pr ($STRATEGY)"
-    continue
-  fi
+    if [[ "$DRY" == "true" ]]; then
+      log "  [dry-run] would merge #$pr ($STRATEGY)"
+      continue
+    fi
 
-  merge_flag="--$STRATEGY"
-  if gh pr merge "$pr" "$merge_flag" --delete-branch 2>&1; then
-    log "  $(green '✓') merged #$pr"
-    (( merged_count++ )) || true
-  else
-    warn "  merge failed for #$pr — check CI or conflicts"
-    SKIPPED_LIST+=("#$pr ($branch) — merge API call failed")
-  fi
-done
+    merge_flag="--$STRATEGY"
+    if gh pr merge "$pr" "$merge_flag" --delete-branch 2>&1; then
+      log "  $(green '✓') merged #$pr"
+      (( merged_count++ )) || true
+    else
+      warn "  merge failed for #$pr — check CI or conflicts"
+      SKIPPED_LIST+=("#$pr ($branch) — merge API call failed")
+    fi
+  done
+fi
 
 # ── Step 6 — final state ──────────────────────────────────────────────────────
 echo ""
 log "Final state:"
 git fetch --prune -q
 remaining_open=$(gh pr list --state open --json number --limit 50 | jq 'length')
-remaining_branches=$(git branch -r | grep -v 'HEAD' | grep -v "origin/$BASE$" | wc -l | tr -d ' ')
+remaining_branches=$(
+  git for-each-ref --format='%(refname:strip=3)' refs/remotes/origin |
+    awk -v base="$BASE" '$0 != "HEAD" && $0 != base { count++ } END { print count + 0 }'
+)
 echo "  Open PRs remaining : $remaining_open"
 echo "  Remote branches remaining (excl. $BASE): $remaining_branches"
 
