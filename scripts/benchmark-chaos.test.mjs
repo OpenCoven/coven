@@ -76,7 +76,11 @@ test('fixture harness records child execution before emitting output', async () 
   const module = await import('./benchmark-chaos.mjs');
   assert.equal(typeof module.fixtureHarnessScript, 'function');
   const script = module.fixtureHarnessScript();
-  assert.ok(script.indexOf('COVEN_BENCHMARK_MARKERS') < script.indexOf('COVEN_BENCHMARK_READY'));
+  const markerIndex = script.indexOf('COVEN_BENCHMARK_MARKERS');
+  const readyIndex = script.indexOf('COVEN_BENCHMARK_READY');
+  assert.notEqual(markerIndex, -1);
+  assert.notEqual(readyIndex, -1);
+  assert.ok(markerIndex < readyIndex);
   assert.match(script, /printf "started\\n"/);
 });
 
