@@ -20,7 +20,7 @@ Markdown API documentation
 **Files:**
 - Modify: `crates/coven-cli/src/event_writer.rs`
 
-- [ ] **Step 1: Write failing recovery-boundary tests**
+- [x] **Step 1: Write failing recovery-boundary tests**
 
 Add these tests beside `pressure_is_visible_when_raw_output_exceeds_its_budget`:
 
@@ -80,7 +80,7 @@ fn accepted_output_without_pressure_has_no_truncation_marker() -> Result<()> {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run:
 
@@ -90,7 +90,7 @@ cargo test -p coven-cli event_writer::tests::recovered_output_is_preceded_by_one
 
 Expected: FAIL because no `output_truncated` event exists.
 
-- [ ] **Step 3: Add queue-owned episode state**
+- [x] **Step 3: Add queue-owned episode state**
 
 Import `HashMap` and add the episode type and queue field:
 
@@ -118,7 +118,7 @@ struct OutputTruncation {
 Initialize `truncations: HashMap::new()` in production and test `Queue`
 constructors.
 
-- [ ] **Step 4: Add marker construction helpers**
+- [x] **Step 4: Add marker construction helpers**
 
 Add these helpers above `take_batch`:
 
@@ -166,7 +166,7 @@ fn take_truncation_marker(queue: &mut Queue, session_id: &str) -> Option<QueuedE
 }
 ```
 
-- [ ] **Step 5: Record drops and queue a marker before recovered output**
+- [x] **Step 5: Record drops and queue a marker before recovered output**
 
 In `enqueue_output`, extract the output fields before the pressure check. On
 rejection, update the episode and existing health counters. On acceptance,
@@ -216,7 +216,7 @@ queue.items.push_back(QueuedEvent {
 });
 ```
 
-- [ ] **Step 6: Run the event-writer tests**
+- [x] **Step 6: Run the event-writer tests**
 
 Run:
 
@@ -226,7 +226,7 @@ cargo test -p coven-cli event_writer::tests::
 
 Expected: all event-writer tests pass.
 
-- [ ] **Step 7: Commit the recovery-boundary implementation**
+- [x] **Step 7: Commit the recovery-boundary implementation**
 
 ```bash
 git add crates/coven-cli/src/event_writer.rs
@@ -238,7 +238,7 @@ git commit -s -m "fix: mark recovered output truncation"
 **Files:**
 - Modify: `crates/coven-cli/src/event_writer.rs`
 
-- [ ] **Step 1: Write failing critical-boundary tests**
+- [x] **Step 1: Write failing critical-boundary tests**
 
 Add tests covering exit, independent sessions, and an event that cannot share
 one capacity window with its marker:
@@ -334,7 +334,7 @@ fn oversized_critical_event_commits_marker_before_waiting_for_its_own_capacity()
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run:
 
@@ -344,7 +344,7 @@ cargo test -p coven-cli event_writer::tests::exit_closes_pressure_episode_before
 
 Expected: FAIL because exit currently bypasses the active episode map.
 
-- [ ] **Step 3: Add a session-id accessor**
+- [x] **Step 3: Add a session-id accessor**
 
 Add:
 
@@ -359,7 +359,7 @@ impl PendingEvent {
 }
 ```
 
-- [ ] **Step 4: Queue marker and critical event atomically when they fit**
+- [x] **Step 4: Queue marker and critical event atomically when they fit**
 
 Refactor `enqueue_critical` so it removes the session episode while holding the
 queue lock, waits for `marker.bytes + bytes`, pushes the marker first, and gives
@@ -417,7 +417,7 @@ fn receive_completion(
 }
 ```
 
-- [ ] **Step 5: Handle the oversized sequential case without deadlock**
+- [x] **Step 5: Handle the oversized sequential case without deadlock**
 
 When `marker_bytes + bytes > capacity`, queue the marker alone with an internal
 completion sender, wait for its commit, then call `enqueue_critical` again for
@@ -450,7 +450,7 @@ receive_completion(marker_rx)?;
 self.enqueue_critical(event, bytes)
 ```
 
-- [ ] **Step 6: Clear active episodes on writer failure**
+- [x] **Step 6: Clear active episodes on writer failure**
 
 In `fail_writer`, add:
 
@@ -458,7 +458,7 @@ In `fail_writer`, add:
 queue.truncations.clear();
 ```
 
-- [ ] **Step 7: Run event-writer and daemon observer tests**
+- [x] **Step 7: Run event-writer and daemon observer tests**
 
 Run:
 
@@ -469,7 +469,7 @@ cargo test -p coven-cli daemon::tests::output_observer
 
 Expected: all selected tests pass.
 
-- [ ] **Step 8: Commit critical-boundary behavior**
+- [x] **Step 8: Commit critical-boundary behavior**
 
 ```bash
 git add crates/coven-cli/src/event_writer.rs
@@ -483,7 +483,7 @@ git commit -s -m "fix: preserve truncation markers before terminal events"
 - Modify: `docs/reference/api-contract.md`
 - Modify: `docs/daemon/health.md`
 
-- [ ] **Step 1: Document pressure visibility and output coalescing**
+- [x] **Step 1: Document pressure visibility and output coalescing**
 
 After the `eventWriter` health description in `docs/API-CONTRACT.md`, add:
 
@@ -510,7 +510,7 @@ In the events response section, add an `output_truncated` example:
 }
 ```
 
-- [ ] **Step 2: Update concise health references**
+- [x] **Step 2: Update concise health references**
 
 Add one sentence to both `docs/reference/api-contract.md` and
 `docs/daemon/health.md`:
@@ -520,7 +520,7 @@ Each affected session also receives one ordered `output_truncated` event with
 exact dropped-event and dropped-byte totals when its pressure episode closes.
 ```
 
-- [ ] **Step 3: Check documentation consistency**
+- [x] **Step 3: Check documentation consistency**
 
 Run:
 
@@ -533,7 +533,7 @@ git diff --check
 Expected: all three documents describe the same event name and camelCase
 payload fields; `git diff --check` exits 0.
 
-- [ ] **Step 4: Commit the API documentation**
+- [x] **Step 4: Commit the API documentation**
 
 ```bash
 git add docs/API-CONTRACT.md docs/reference/api-contract.md docs/daemon/health.md
@@ -545,7 +545,7 @@ git commit -s -m "docs: define output truncation events"
 **Files:**
 - Modify: `docs/superpowers/plans/2026-08-05-output-truncation-markers.md`
 
-- [ ] **Step 1: Run focused behavior tests**
+- [x] **Step 1: Run focused behavior tests**
 
 Run:
 
@@ -556,7 +556,7 @@ cargo test -p coven-cli daemon::tests::output_observer
 
 Expected: all selected tests pass with zero failures.
 
-- [ ] **Step 2: Run repository gates**
+- [x] **Step 2: Run repository gates**
 
 Run:
 
@@ -572,13 +572,13 @@ git diff --check origin/main...HEAD
 Expected: every command exits 0. Run the workspace test from a worktree inside
 `.worktrees/` so Unix socket paths stay below `SUN_LEN`.
 
-- [ ] **Step 3: Request independent code review**
+- [x] **Step 3: Request independent code review**
 
 Review the full `origin/main...HEAD` diff against issue #611. Require the
 reviewer to check queue bounds, per-session isolation, ordering, critical-event
 acknowledgements, append-only event semantics, and privacy.
 
-- [ ] **Step 4: Mark the plan complete and commit**
+- [x] **Step 4: Mark the plan complete and commit**
 
 Change all completed checkboxes in this plan to `[x]`, then run:
 
