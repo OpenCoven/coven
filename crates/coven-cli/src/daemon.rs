@@ -2124,18 +2124,33 @@ fn start_threads_proposal_scheduler(coven_home: &Path) -> Result<()> {
 /// store helper intentionally performs no automatic VACUUM.
 fn start_store_maintenance_scheduler(coven_home: &Path) -> Result<()> {
     const INTERVAL: Duration = Duration::from_secs(60);
+    const MAX_PASSES_PER_TICK: usize = 10;
     let home = coven_home.to_path_buf();
     std::thread::Builder::new()
         .name("coven-store-maintenance".into())
         .spawn(move || loop {
             std::thread::sleep(INTERVAL);
             let now = crate::api::current_timestamp();
-            if let Err(error) = crate::store::run_scheduled_maintenance(&home, &now) {
-                crate::store::record_maintenance_error(&home, "maintenance pass failed");
-                append_daemon_recovery_log(
-                    &home,
-                    &format!("store maintenance pass failed: {error:#}"),
-                );
+
+            // A single maintenance call can still leave backlog when
+            // per-table deletes are bounded. Run a short catch-up loop so a
+            // large retention debt cannot drift indefinitely.
+            for _ in 0..MAX_PASSES_PER_TICK {
+                match crate::store::run_scheduled_maintenance(&home, &now) {
+                    Ok(report) => {
+                        if report.raw_artifacts_pruned == 0 && report.events_pruned == 0 {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        crate::store::record_maintenance_error(&home, "maintenance pass failed");
+                        append_daemon_recovery_log(
+                            &home,
+                            &format!("store maintenance pass failed: {error:#}"),
+                        );
+                        break;
+                    }
+                }
             }
         })
         .context("failed to spawn store maintenance scheduler")?;
