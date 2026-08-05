@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -16,6 +16,14 @@ const SCHEMA_VERSION = 1;
 const DEFAULT_CONCURRENCY = [1, 8, 32];
 const POLL_ATTEMPTS = 160;
 const POLL_DELAY_MS = 25;
+// The first scenario absorbs every cold-start cost — daemon spawn, store
+// initialization, first PTY — inside a single sample, so launch-to-first-output
+// varies by well over an order of magnitude with host load: the same machine has
+// produced 642 ms and 20.3 s for `sessions_1`.  `POLL_ATTEMPTS` allows roughly
+// four seconds of polling, which a two-core CI runner misses routinely.  This
+// budget exists only to bound a hang; it does not affect the reported metric,
+// which is measured from the clock, not from the number of polls.
+const LAUNCH_POLL_ATTEMPTS = 2400;
 
 function optionValue(args, index, option) {
   const arg = args[index];
@@ -130,8 +138,41 @@ async function fixtureEnvironment(root, environment) {
     '#!/bin/sh\nprintf "COVEN_BENCHMARK_READY\\n"\ntrap "exit 0" INT TERM\nwhile :; do sleep 60; done\n',
     { mode: 0o700 }
   );
+  // `writeFile`'s `mode` applies only when the file is created and is masked by
+  // the process umask, so it cannot be relied on to leave the bit set.  A
+  // harness without it spawns nothing, no output event is ever recorded, and
+  // the wait below fails as an indistinguishable timeout — so assert the bit
+  // rather than trusting either call.
+  await chmod(harness, 0o700);
+  await assertExecutable(harness);
   const env = isolatedEnvironment(covenHome, environment);
   return { covenHome, env: { ...env, PATH: `${bin}:${env.PATH ?? ''}` } };
+}
+
+async function assertExecutable(path) {
+  const mode = (await stat(path)).mode & 0o777;
+  if ((mode & 0o100) === 0) {
+    throw new Error(`fixture harness ${path} is not owner-executable (mode ${mode.toString(8)})`);
+  }
+}
+
+/// Describe what the session actually produced, so a wait timeout distinguishes
+/// "the harness never started" from "the harness was slow".
+async function describeSession(socketPath, sessionId) {
+  try {
+    const [session, events] = await Promise.all([
+      socketRequest(socketPath, { method: 'GET', path: `/api/v1/sessions/${sessionId}` }),
+      socketRequest(socketPath, { method: 'GET', path: `/api/v1/sessions/${sessionId}/events?limit=20` })
+    ]);
+    const status = session.statusCode === 200 ? JSON.parse(session.body).status : `HTTP ${session.statusCode}`;
+    const kinds =
+      events.statusCode === 200
+        ? (JSON.parse(events.body).events ?? []).map((event) => event.kind)
+        : [`HTTP ${events.statusCode}`];
+    return `status=${status} events=[${kinds.join(', ') || 'none'}]`;
+  } catch (error) {
+    return `session state unavailable: ${error.message}`;
+  }
 }
 
 async function waitForSessionExit(socketPath, sessionId, request = socketRequest) {
@@ -190,7 +231,16 @@ export async function runConcurrencyScenario({ binary, root, concurrency, enviro
         if (response.statusCode !== 201) throw new Error(`launch returned ${response.statusCode}`);
         const id = JSON.parse(response.body).id;
         if (typeof id !== 'string' || id.length === 0) throw new Error('launch response has no id');
-        await waitForOutputEvent(socketPath, id, { attempts: POLL_ATTEMPTS, delayMs: POLL_DELAY_MS });
+        try {
+          await waitForOutputEvent(socketPath, id, {
+            attempts: LAUNCH_POLL_ATTEMPTS,
+            delayMs: POLL_DELAY_MS
+          });
+        } catch (error) {
+          throw new Error(
+            `sessions_${concurrency}: ${error.message} — ${await describeSession(socketPath, id)}`
+          );
+        }
         return { id, firstOutputMs: Number(process.hrtime.bigint() - launchedAt) / 1_000_000 };
       })
     );
