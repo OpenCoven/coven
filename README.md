@@ -685,6 +685,13 @@ with direct counters; Cave owns the slow-WebSocket-consumer lane in #4317.
 Fault-injection and platform-specific crash coverage remain explicit matrix
 entries, so a trend artifact cannot be mistaken for a passing chaos test.
 
+CI runs this step as `continue-on-error`, so it collects trend data without
+gating merges — matching how the rest of this section describes these
+baselines. The deterministic fixture tests (`benchmark-chaos.test.mjs`) still
+gate. The 32-session scenario is intermittently unable to run on a two-core
+runner, where a live session can record no events at all; see #615. Expect
+`coven-chaos.json` to be absent from the uploaded artifact on those runs.
+
 ### Architecture rules for contributors
 
 - **Rust is the authority layer.** Process launch, cwd/project-root validation, PTY lifecycle, session persistence, and socket request enforcement are all Rust's responsibility. TypeScript clients improve UX but are never the trust boundary.

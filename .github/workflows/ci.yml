@@ -53,7 +53,12 @@ jobs:
         run: node --test scripts/benchmark-cli.test.mjs scripts/benchmark-chaos.test.mjs
       - name: Collect non-gating baseline artifact
         run: node scripts/benchmark-cli.mjs --binary target/debug/coven --iterations 3 --output coven-perf.json
+      # Trend collection only, and intermittently unable to run 32 concurrent
+      # sessions on a two-core runner (#615) — a live session there can record
+      # no events at all. Collection must not gate merges; the deterministic
+      # unit tests above still do. Drop `continue-on-error` once #615 is fixed.
       - name: Collect concurrent runtime baseline artifact
+        continue-on-error: true
         run: node scripts/benchmark-chaos.mjs --binary target/debug/coven --output coven-chaos.json
       - name: Collect deterministic TUI scheduling metric
         run: |
