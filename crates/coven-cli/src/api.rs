@@ -6844,7 +6844,10 @@ mod tests {
 
         assert_eq!(response.status, 200);
         assert_eq!(body["storage"]["status"], "degraded");
-        assert!(body["storage"]["freeDiskBytes"].is_number());
+        assert!(
+            body["storage"]["freeDiskBytes"].is_u64(),
+            "free-space sampling may be known for the enclosing drive or unknown as zero"
+        );
         assert_eq!(body["storage"]["maintenanceBlocked"], false);
         assert_eq!(body["storage"]["writerBacklogEvents"], 3);
         assert_eq!(body["storage"]["writerBacklogBytes"], 4096);
