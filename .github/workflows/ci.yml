@@ -59,7 +59,7 @@ jobs:
       # unit tests above still do. Drop `continue-on-error` once #615 is fixed.
       - name: Collect concurrent runtime baseline artifact
         continue-on-error: true
-        run: node scripts/benchmark-chaos.mjs --binary target/debug/coven --output coven-chaos.json
+        run: node scripts/benchmark-chaos.mjs --binary /nonexistent/coven --output coven-chaos.json
       - name: Collect deterministic TUI scheduling metric
         run: |
           set -o pipefail
