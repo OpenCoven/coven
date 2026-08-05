@@ -23,7 +23,8 @@ not proof of `coven.daemon.v1` support.
 flowchart LR
   subgraph Clients["Client layer"]
     User[Developer]
-    CLI["coven CLI / TUI"]
+    CLI["coven run CLI"]
+    SocketClients["TUI / socket clients"]
     Comux["comux cockpit"]
     OpenClaw[OpenClaw]
     Plugin["OpenClaw bridge plugin"]
@@ -52,8 +53,12 @@ flowchart LR
 
   User --> CLI
   CLI -->|direct commands| Rust["Coven Rust CLI"]
-  Rust --> Daemon
+  Rust --> Boundary
+  Rust --> Store
+  Rust --> Events
 
+  User --> SocketClients
+  SocketClients -->|"HTTP over Unix socket"| Daemon
   Comux -->|"HTTP over Unix socket"| Daemon
   OpenClaw --> Plugin
   Plugin -->|"HTTP over Unix socket"| Daemon
@@ -80,24 +85,34 @@ flowchart LR
 ```mermaid
 sequenceDiagram
   participant U as User
-  participant C as coven CLI/TUI
+  participant C as coven Rust CLI
+  participant X as Socket client
   participant D as Rust daemon
   participant S as SQLite store
   participant H as Harness PTY
 
   U->>C: coven run codex "fix tests"
   activate C
-  C->>D: POST /api/v1/sessions (projectRoot, cwd, harness, prompt)
-  activate D
-  D->>D: canonicalize projectRoot + cwd
-  D->>D: reject outside-root or unsupported harness
-  D->>S: create session metadata
-  D->>H: spawn validated argv in PTY
+  C->>C: canonicalize root/cwd; validate harness
+  C->>S: insert new row (status=created)
+  C->>S: transition row to running
+  C->>H: launch validated argv directly
   activate H
   H-->>S: output / exit events
-  D-->>C: session id + running status
-  deactivate D
   deactivate C
+
+  X->>D: POST /api/v1/sessions
+  activate D
+  D->>D: canonicalize root/cwd; validate harness
+  D->>S: insert new row (status=running)
+  D->>H: launch validated argv in PTY
+  alt launch fails
+    D->>S: transition new row to failed
+    D-->>X: 500 launch_failed
+  else launch succeeds
+    D-->>X: 201 SessionRecord
+  end
+  deactivate D
 
   Note over U,C: Browse and manage sessions
 

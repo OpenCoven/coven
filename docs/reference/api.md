@@ -49,7 +49,7 @@ The health `capabilities` object currently contains all nine fields:
 | POST | `/api/v1/sessions` | Launch a project-scoped harness session. | `{ projectRoot, cwd?, harness, prompt, title?, launchMode?, conversation?, conversationId? }` | `SessionRecord` | `400 invalid_request`, `500 launch_failed` |
 | POST | `/api/v1/sessions/external` | Register (or idempotently re-register) an externally launched session. | session descriptor | `201` new / `200` existing | `400`, `409 session_id_conflict` |
 | GET | `/api/v1/sessions/:id` | Fetch one session. | — | `SessionRecord` | `404 session_not_found` |
-| POST | `/api/v1/sessions/:id/complete` | Mark an external session completed. | `{ exitCode?, ... }` | updated record | `404`, `409` (not external) |
+| POST | `/api/v1/sessions/:id/complete` | Mark an external session completed. | `{ exitCode?, ... }` | updated record | `404 session_not_found`, `422 not_external_session` |
 | GET | `/api/v1/sessions/:id/events` | Read redacted session events. | `?afterSeq`, `?afterEventId`, `?limit` | `{ events, nextCursor, hasMore }` | `404 session_not_found` |
 | GET | `/api/v1/sessions/:id/log` | Read bounded redacted log previews. | — | `[{ ts, level, message }]` | `404 session_not_found` |
 | POST | `/api/v1/sessions/:id/input` | Forward input to a live session. | `{ data }` | `{ ok, accepted }` | `400`, `404`, `409 session_not_live`, `500 send_input_failed` |

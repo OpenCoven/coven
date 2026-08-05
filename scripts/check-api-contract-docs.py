@@ -260,6 +260,49 @@ def field_absence_is_explicit(clause: str) -> bool:
     )
 
 
+def has_stale_created_failure_recovery(text: str) -> bool:
+    units: list[tuple[str, bool]] = []
+    prose_lines: list[str] = []
+    for line in text.lower().splitlines():
+        if line.lstrip().startswith("|"):
+            cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+            if cells and cells[0].strip("`") == "created":
+                units.append((" ".join(cells[1:]), True))
+            prose_lines.append("")
+        else:
+            prose_lines.append(line)
+    for paragraph in re.split(r"\n\s*\n", "\n".join(prose_lines)):
+        sentence_text = re.sub(r"\s*\n\s*", " ", paragraph)
+        units.extend(
+            (unit, False) for unit in re.split(r"(?<=[.!?])\s+", sentence_text)
+        )
+
+    for unit, created_row in units:
+        recovery = re.search(r"\brecover(?:s|ed)?\b", unit)
+        if not (
+            recovery
+            and re.search(r"\bstale\b", unit)
+            and re.search(r"\bunowned\b", unit)
+            and (created_row or re.search(r"\bcreated\b", unit))
+        ):
+            continue
+        recovery_clause = unit[recovery.start() :]
+        targets = re.findall(
+            r"(?:\b(?:as|to)\s+|(?:->|→)\s*)`?"
+            r"(created|running|idle|completed|failed|killed|orphaned)`?\b",
+            recovery_clause,
+        )
+        targets.extend(
+            re.findall(
+                r"\bor\s+`?(created|running|idle|completed|failed|killed|orphaned)`?\b",
+                recovery_clause,
+            )
+        )
+        if targets and set(targets) == {"failed"}:
+            return True
+    return False
+
+
 def validate_documents(documents: dict[str, str]) -> list[str]:
     errors: list[str] = []
     for path in CONTRACT_DOCS:
@@ -293,21 +336,22 @@ def validate_documents(documents: dict[str, str]) -> list[str]:
                     f"{path}: incorrect terminal classification for {status}"
                 )
         lowered = text.lower()
-        if "not proof of acknowledged process termination" not in lowered:
+        if not re.search(
+            r"not proof (?:of acknowledged process termination|"
+            r"that process termination was acknowledged)",
+            lowered,
+        ):
             errors.append(f"{path}: killed acknowledgement boundary is missing")
         if not all(
             term in lowered
             for term in ("synthetic", "`active`", "not a harness-session state")
         ):
             errors.append(f"{path}: synthetic active distinction is missing")
-        if "stored separately in `archived_at`" not in lowered:
+        if not re.search(r"stored separately (?:in|as) `archived_at`", lowered):
             errors.append(f"{path}: archive separation is missing")
 
     contract = documents["docs/API-CONTRACT.md"]
-    lowered_contract = contract.lower()
-    if not all(
-        term in lowered_contract for term in ("stale unowned", "recover", "`failed`")
-    ):
+    if not has_stale_created_failure_recovery(contract):
         errors.append("docs/API-CONTRACT.md: stale created recovery is missing")
     return errors
 

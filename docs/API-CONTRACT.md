@@ -474,20 +474,21 @@ Endpoints that return this shape:
 
 The `external` field is `true` for sessions registered via `POST /api/v1/sessions/external`; it is `false` for all daemon-launched sessions. The `transcript_path` field carries the absolute path to the external session's transcript file when provided at registration; it is `null` for daemon-launched sessions and for external sessions where no path was supplied.
 
-| Status | Terminal in the current ledger | Meaning |
-|---|---:|---|
-| `created` | No | Durable row exists; no live runtime has been established. Recovery moves a stale unowned row to `failed`. |
-| `running` | No | A daemon-owned or registered external runtime is live. |
-| `idle` | No | A conversational turn completed and the session remains reusable. |
-| `completed` | Yes | Runtime completion was successful. |
-| `failed` | Yes | Launch or runtime completion failed. |
-| `killed` | Yes | A kill request was accepted and persisted; this is not proof of acknowledged process termination. |
-| `orphaned` | Yes | Recovery cannot prove ownership of a row previously marked running. |
+Classify the row kind before interpreting `status`. Synthetic `active` rows can appear in raw store or list output, but `active` is not a harness-session state.
 
-Archive visibility is stored separately in `archived_at` and does not change
-the lifecycle status. Synthetic Cast quest-anchor rows may use `active`; that
-store value is not a harness-session state and must be classified by row kind
-before interpreting status.
+| Harness-session status | Terminal? | Meaning |
+|---|---|---|
+| `created` | No | Ledger row exists before runtime ownership. Stale unowned `created` rows recover to `failed`. |
+| `running` | No | Reported live state. Inspect `external` to determine whether Coven owns and supervises the runtime. |
+| `idle` | No | Reusable conversational session is waiting for more work. |
+| `completed` | Yes | Harness session completed successfully. |
+| `failed` | Yes | Launch or execution failed. |
+| `killed` | Yes | Terminal in the current ledger. This status is not proof that process termination was acknowledged. |
+| `orphaned` | Yes | Runtime ownership was lost and the outcome remains unresolved. |
+
+Archive is not a session status. It is stored separately in `archived_at`; archive and summon preserve the existing lifecycle status of every non-running session, including `created` and `idle`.
+
+External `running` sessions are not daemon-control targets: `POST /api/v1/sessions/:id/input` returns `409 session_not_live` because Coven has no owned live runtime, and `POST /api/v1/sessions/:id/kill` returns `422 external_session_not_killable` as documented below.
 
 ## `POST /api/v1/sessions/external`
 

@@ -716,6 +716,70 @@ Archive visibility is stored separately in `archived_at`.
                     errors,
                 )
 
+    def test_rejects_stale_created_recovery_as_running(self) -> None:
+        documents = self.canonical_documents()
+        documents["docs/API-CONTRACT.md"] = documents[
+            "docs/API-CONTRACT.md"
+        ].replace(
+            "stale unowned rows recover as `failed`.",
+            "stale unowned `created` rows recover as `running`.",
+        )
+        documents["docs/API-CONTRACT.md"] += (
+            "\nAn unrelated operation is marked as `failed`.\n"
+        )
+        errors = module.validate_documents(documents)
+        self.assertTrue(any("stale created recovery" in error for error in errors))
+
+    def test_rejects_unrelated_failure_in_same_created_row(self) -> None:
+        documents = self.canonical_documents()
+        documents["docs/API-CONTRACT.md"] = documents[
+            "docs/API-CONTRACT.md"
+        ].replace(
+            "stale unowned rows recover as `failed`.",
+            "stale unowned rows recover as `running`; another operation marks `failed`.",
+        )
+        errors = module.validate_documents(documents)
+        self.assertTrue(any("stale created recovery" in error for error in errors))
+
+    def test_rejects_ambiguous_stale_created_recovery_targets(self) -> None:
+        for replacement in (
+            "stale unowned rows recover as `running` or as `failed`.",
+            "stale unowned rows recover as `failed` or as `running`.",
+        ):
+            with self.subTest(replacement=replacement):
+                documents = self.canonical_documents()
+                documents["docs/API-CONTRACT.md"] = documents[
+                    "docs/API-CONTRACT.md"
+                ].replace("stale unowned rows recover as `failed`.", replacement)
+                errors = module.validate_documents(documents)
+                self.assertTrue(
+                    any("stale created recovery" in error for error in errors)
+                )
+
+    def test_accepts_line_wrapped_stale_created_recovery_sentence(self) -> None:
+        documents = self.canonical_documents()
+        documents["docs/API-CONTRACT.md"] = documents[
+            "docs/API-CONTRACT.md"
+        ].replace(
+            "stale unowned rows recover as `failed`.",
+            "Rows begin without runtime ownership.",
+        )
+        documents["docs/API-CONTRACT.md"] += (
+            "\nStale unowned `created` rows recover\nas `failed`.\n"
+        )
+        self.assertEqual(module.validate_documents(documents), [])
+
+    def test_requires_stale_and_unowned_created_recovery(self) -> None:
+        documents = self.canonical_documents()
+        documents["docs/API-CONTRACT.md"] = documents[
+            "docs/API-CONTRACT.md"
+        ].replace(
+            "stale unowned rows recover as `failed`.",
+            "Unowned rows recover as `failed`.",
+        )
+        errors = module.validate_documents(documents)
+        self.assertTrue(any("stale created recovery" in error for error in errors))
+
     def test_main_reports_missing_document_without_traceback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             stderr = io.StringIO()

@@ -17,8 +17,8 @@
 - `packages/openclaw-coven/src/client.test.ts` - prove health parsing does not promote untrusted capability values into typed authority.
 - `packages/openclaw-coven/src/runtime.ts` - apply the OpenClaw bridge's fail-closed named-contract/capability policy and explicit lifecycle interpretation.
 - `packages/openclaw-coven/src/runtime.test.ts` - prove mismatches stop before launch and `idle`/unknown states are not inferred as completed work.
-- `packages/openclaw-coven/package.json` - declare the existing pnpm toolchain, provide reproducible test/typecheck scripts, and add exact test-time dependencies.
-- `packages/openclaw-coven/pnpm-lock.yaml` - update the existing package lock without introducing a second package manager.
+- `packages/openclaw-coven/package.json` - provide reproducible test/typecheck scripts and exact test-time dependencies.
+- `packages/openclaw-coven/package-lock.json` - keep the package's CI install reproducible.
 - `.github/workflows/ci.yml` - run the OpenClaw bridge checks in CI.
 - `docs/API-CONTRACT.md` - canonical single-page handshake, legacy route diagnostic, and `SessionRecord.status` contract.
 - `docs/reference/api-contract.md` - condensed named-contract negotiation guidance.
@@ -36,98 +36,42 @@
 
 **Files:**
 - Modify: `packages/openclaw-coven/package.json`
-- Modify: `packages/openclaw-coven/pnpm-lock.yaml`
+- Modify: `packages/openclaw-coven/package-lock.json`
 - Modify: `.github/workflows/ci.yml`
 
-- [ ] **Step 1: Add package scripts and exact development dependencies**
+- [ ] **Step 1: Declare the package checks and exact test dependencies**
 
-Update `packages/openclaw-coven/package.json` with:
+Preserve all package metadata and peer dependencies. Add the exact OpenClaw test
+version required by `openclaw.build.openclawVersion`, TypeScript, Node types, and
+Vitest. The package scripts are `typecheck` (`tsc --noEmit`) and `test`
+(`vitest run`); do not refer to a nonexistent `build` script. Keep the npm
+lockfile used by the package's CI job synchronized with `package.json`.
 
-```json
-{
-  "packageManager": "pnpm@10.11.1",
-  "scripts": {
-    "build": "tsc --noEmit",
-    "test": "vitest run",
-    "typecheck": "tsc --noEmit"
-  },
-  "devDependencies": {
-    "@types/node": "^24.0.0",
-    "openclaw": "2026.4.26",
-    "typescript": "^5.9.0",
-    "vitest": "^4.1.10"
-  }
-}
-```
-
-Preserve every existing package metadata, peer dependency, and OpenClaw plugin
-field. The exact OpenClaw development version matches
-`openclaw.build.openclawVersion`; the published peer range remains unchanged.
-The package already carries `pnpm-lock.yaml`, so keep pnpm as its sole lockfile
-and record the locally verified pnpm version instead of adding an npm lock.
-
-- [ ] **Step 2: Update and prove the existing pnpm lockfile**
+- [ ] **Step 2: Install reproducibly and prove the package checks**
 
 Run:
 
 ```bash
-corepack enable
-corepack prepare pnpm@10.11.1 --activate
-pnpm --dir packages/openclaw-coven install --lockfile-only --ignore-scripts
-pnpm --dir packages/openclaw-coven install --frozen-lockfile --ignore-scripts
-```
-
-Expected: `packages/openclaw-coven/pnpm-lock.yaml` is updated in place,
-dependencies install with the lockfile frozen, the existing
-`autoInstallPeers: false` setting remains intact, no npm lockfile appears, and
-no package lifecycle script runs.
-
-- [ ] **Step 3: Prove the baseline package tests execute**
-
-Run:
-
-```bash
+npm --prefix packages/openclaw-coven ci --ignore-scripts
 npm --prefix packages/openclaw-coven run typecheck
 npm --prefix packages/openclaw-coven test -- src/client.test.ts src/runtime.test.ts
 ```
 
-Expected: the existing tests execute rather than failing module resolution. If
-the pre-change baseline has a real assertion or type failure, record the exact
-failure before changing O1 behavior; do not weaken compiler or test settings.
+Expected: the frozen `package-lock.json` install succeeds without lifecycle
+scripts, TypeScript passes, and the focused Vitest suites execute.
 
-- [ ] **Step 4: Add a dedicated CI job**
+- [ ] **Step 3: Keep CI synchronized with the package**
 
-Add this job to `.github/workflows/ci.yml`:
+The `openclaw-bridge` job must use the repository's current checkout and Node
+action versions, install from `packages/openclaw-coven/package-lock.json` with
+`npm ci --ignore-scripts`, then run `npm run typecheck` and `npm test`. Do not
+add a build invocation unless a `build` script is first added to `package.json`.
+Task 5 adds the documentation guard to the existing Python policy job.
 
-```yaml
-  openclaw-bridge:
-    name: OpenClaw bridge
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 24
-      - name: Activate pinned pnpm
-        run: |
-          corepack enable
-          corepack prepare pnpm@10.11.1 --activate
-      - run: pnpm install --frozen-lockfile --ignore-scripts
-        working-directory: packages/openclaw-coven
-      - run: pnpm run build
-        working-directory: packages/openclaw-coven
-      - run: pnpm test
-        working-directory: packages/openclaw-coven
-```
-
-Use the repository's current checkout/setup-node major versions and Node 24;
-do not copy older action versions into the workflow. Task 5 adds the docs guard
-to the existing Python-based secret-guard job after the guard exists.
-
-- [ ] **Step 5: Commit the package test workflow**
+- [ ] **Step 4: Commit the package test workflow**
 
 ```bash
-git add packages/openclaw-coven/package.json packages/openclaw-coven/pnpm-lock.yaml .github/workflows/ci.yml
+git add packages/openclaw-coven/package.json packages/openclaw-coven/package-lock.json .github/workflows/ci.yml
 git commit -m "test(openclaw): add reproducible package checks"
 ```
 
@@ -349,6 +293,46 @@ it("reports an unsupported named Coven contract in doctor", async () => {
     ],
   });
 });
+
+it.each([
+  [undefined, "missing"],
+  [1, "missing"],
+  ["", "missing"],
+  ["v1", "v1"],
+] as const)(
+  "treats missing or malformed Coven API version %j as unavailable before launch",
+  async (apiVersion, actual) => {
+    const launchSession = vi.fn(async () => session());
+    const runtime = new CovenAcpRuntime({
+      config,
+      client: fakeClient({
+        health: vi.fn(async () => ({
+          ...(await fakeClient().health()),
+          apiVersion,
+        })),
+        launchSession,
+      }),
+    });
+
+    const detail =
+      `expected apiVersion coven.daemon.v1, got ${actual}; ` +
+      "upgrade Coven to a compatible version";
+    await expect(runtime.doctor()).resolves.toMatchObject({
+      ok: false,
+      code: "COVEN_UNSUPPORTED_API_VERSION",
+      details: [detail],
+    });
+    await expect(
+      runtime.ensureSession({
+        sessionKey: "agent:codex:test",
+        agent: "codex",
+        mode: "oneshot",
+        cwd: workspaceDir,
+      }),
+    ).rejects.toThrow(detail);
+    expect(launchSession).not.toHaveBeenCalled();
+  },
+);
 
 it.each([
   [
@@ -732,6 +716,33 @@ it("does not treat conversational idle as one-shot completion", async () => {
   expect(events.at(-1)).toEqual({ type: "done", stopReason: "completed" });
 });
 
+it.each([
+  ["completed", "completed"],
+  ["failed", "error"],
+  ["killed", "cancelled"],
+  ["orphaned", "error"],
+])("maps terminal session status %s to %s", async (status, stopReason) => {
+  const runtime = new CovenAcpRuntime({
+    config,
+    client: fakeClient({
+      listEvents: vi.fn(async () => []),
+      getSession: vi.fn(async () => session({ status })),
+    }),
+  });
+  const handle = await runtime.ensureSession({
+    sessionKey: "agent:codex:test",
+    agent: "codex",
+    mode: "oneshot",
+    cwd: workspaceDir,
+  });
+
+  const events = await collect(
+    runtime.runTurn({ handle, text: "Fix tests", mode: "prompt", requestId: "req-terminal" }),
+  );
+
+  expect(events.at(-1)).toEqual({ type: "done", stopReason });
+});
+
 it.each(["future_state", "active"])(
   "fails closed on unsupported harness-session status %s",
   async (status) => {
@@ -763,7 +774,8 @@ it.each(["future_state", "active"])(
 Run:
 
 ```bash
-npm --prefix packages/openclaw-coven test -- src/runtime.test.ts -t "idle|unsupported harness-session"
+npm --prefix packages/openclaw-coven test -- src/runtime.test.ts -t \
+  "idle|terminal session status|unsupported harness-session"
 ```
 
 Expected: `idle` is currently treated as terminal completion, and the unknown status is also inferred terminal.
@@ -798,7 +810,19 @@ Change the poll condition to:
 if (sessionDisposition(latest.status) === "terminal") {
 ```
 
-Do not describe `killed` as process-exit acknowledgement. This helper classifies only the current ledger status; O5 owns cancellation acknowledgement.
+Also extend `normalizeStopReason` so persisted terminal results map explicitly:
+
+```typescript
+completed -> completed
+failed -> error
+killed -> cancelled
+orphaned -> error
+```
+
+The `orphaned` value is unresolved ownership evidence and must never be reported
+as successful completion. Do not describe `killed` as process-exit
+acknowledgement. These helpers classify only the current ledger status; O5 owns
+cancellation acknowledgement.
 
 - [ ] **Step 4: Run the focused runtime tests**
 
@@ -808,7 +832,9 @@ Run:
 npm --prefix packages/openclaw-coven test -- src/runtime.test.ts
 ```
 
-Expected: all runtime tests pass; `idle` continues polling, unknown values end in the existing sanitized polling-error path, and current `killed` behavior is unchanged.
+Expected: all runtime tests pass; `idle` continues polling, unknown values end
+in the existing sanitized polling-error path, `orphaned` reports an error, and
+`killed` reports cancellation without claiming process-exit acknowledgement.
 
 - [ ] **Step 5: Commit lifecycle interpretation**
 
@@ -908,9 +934,11 @@ store value is not a harness-session state and must be classified by row kind
 before interpreting status.
 ```
 
-Update lifecycle diagrams to include `running -> idle`, `running -> killed`,
-and archive/summon paths for every terminal status. Do not rename `created` to
-`pending`, and do not describe `killed` as termination acknowledgement.
+Update lifecycle diagrams to include `running -> idle` and `running -> killed`.
+Omit archive and summon from lifecycle-state transitions, or show them only as
+an independent `archived_at` visibility overlay applicable to every non-running
+status, including `created` and `idle`. Do not rename `created` to `pending`,
+and do not describe `killed` as termination acknowledgement.
 
 - [ ] **Step 4: Inspect the documentation diff**
 
@@ -941,230 +969,60 @@ git commit -m "docs(api): clarify contract and session lifecycle"
 
 - [ ] **Step 1: Write failing guardrail tests**
 
-Create `scripts/check-api-contract-docs-test.py`:
+Build focused stdlib `unittest` fixtures around `validate_documents`. Tests must
+prove the guard accepts the canonical corpus and rejects each independent drift:
 
-```python
-from __future__ import annotations
+- any contract guide fails to tie `/api/v1/health` to `coven.daemon.v1` as the
+  `apiVersion`/named-contract compatibility handshake in the same paragraph or
+  Markdown table row;
+- `/api/v1/api-version` is presented as the named-contract handshake, including
+  affirmative text followed by an unrelated or later denial;
+- capabilities are described without the authorization boundary;
+- any lifecycle status is missing or has the wrong terminal classification;
+- stale, unowned `created` recovery is not mapped unambiguously to `failed` in
+  the same sentence or Markdown table row, or that unit names a competing
+  recovery target;
+- `killed` is described as acknowledged termination;
+- synthetic `active` is presented as a harness-session status; or
+- archive visibility is not kept separate in `archived_at`.
 
-import importlib.util
-import pathlib
-import unittest
-
-SCRIPT = pathlib.Path(__file__).with_name("check-api-contract-docs.py")
-SPEC = importlib.util.spec_from_file_location("check_api_contract_docs", SCRIPT)
-assert SPEC and SPEC.loader
-module = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(module)
-
-
-class ApiContractDocsTests(unittest.TestCase):
-    def canonical_documents(self) -> dict[str, str]:
-        contract = """
-Clients negotiate compatibility with GET /api/v1/health and coven.daemon.v1.
-Capabilities advertise availability and never grant permission.
-GET /api/v1/api-version is a legacy route-family diagnostic.
-New clients must not use the legacy route as proof of coven.daemon.v1 compatibility.
-| `created` | No | stale unowned rows recover as `failed`. |
-| `running` | No | live |
-| `idle` | No | reusable |
-| `completed` | Yes | success |
-| `failed` | Yes | failure |
-| `killed` | Yes | accepted |
-| `orphaned` | Yes | unresolved |
-`killed` is not proof of acknowledged process termination.
-Synthetic `active` is not a harness-session state.
-Archive visibility is stored separately in `archived_at`.
-"""
-        return {
-            path: contract
-            for path in module.CONTRACT_DOCS + module.LIFECYCLE_DOCS
-        }
-
-    def test_accepts_canonical_handshake_and_lifecycle(self) -> None:
-        self.assertEqual(module.validate_documents(self.canonical_documents()), [])
-
-    def test_rejects_legacy_endpoint_as_named_handshake(self) -> None:
-        documents = self.canonical_documents()
-        documents["docs/reference/api-contract.md"] = (
-            "The legacy route-family GET /api/v1/api-version is the "
-            "coven.daemon.v1 compatibility handshake."
-        )
-        errors = module.validate_documents(documents)
-        self.assertTrue(any("legacy route" in error for error in errors))
-
-    def test_requires_health_handshake_in_every_contract_guide(self) -> None:
-        documents = self.canonical_documents()
-        documents["docs/ARCHITECTURE.md"] = "coven.daemon.v1"
-        errors = module.validate_documents(documents)
-        self.assertTrue(any("missing health handshake" in error for error in errors))
-
-    def test_requires_all_lifecycle_and_authority_boundaries(self) -> None:
-        documents = self.canonical_documents()
-        documents["docs/API-CONTRACT.md"] = (
-            "GET /api/v1/health coven.daemon.v1 `created` `running` `completed`"
-        )
-        errors = module.validate_documents(documents)
-        self.assertTrue(any("missing lifecycle status idle" in error for error in errors))
-        self.assertTrue(any("capabilities versus authorization" in error for error in errors))
-        self.assertTrue(any("synthetic active distinction" in error for error in errors))
-
-    def test_rejects_idle_as_terminal(self) -> None:
-        documents = self.canonical_documents()
-        documents["docs/SESSION-LIFECYCLE.md"] = documents[
-            "docs/SESSION-LIFECYCLE.md"
-        ].replace("| `idle` | No |", "| `idle` | Yes |")
-        errors = module.validate_documents(documents)
-        self.assertTrue(
-            any("incorrect terminal classification for idle" in error for error in errors)
-        )
-
-
-if __name__ == "__main__":
-    unittest.main()
-```
+Do not weaken a negative fixture by satisfying its requirement elsewhere in the
+same document. Keep tests behavioral rather than embedding a full final script
+snapshot.
 
 - [ ] **Step 2: Run the guardrail tests and confirm failure**
-
-Run:
 
 ```bash
 python3 scripts/check-api-contract-docs-test.py
 ```
 
-Expected: import fails because `scripts/check-api-contract-docs.py` does not exist.
+Expected: the new behavioral tests fail because the guard is absent or does not
+yet enforce every relationship above.
 
 - [ ] **Step 3: Implement the stdlib guardrail**
 
-Create `scripts/check-api-contract-docs.py`:
-
-```python
-#!/usr/bin/env python3
-from __future__ import annotations
-
-import pathlib
-import re
-import sys
-
-ROOT = pathlib.Path(__file__).resolve().parents[1]
-CONTRACT_DOCS = (
-    "docs/API-CONTRACT.md",
-    "docs/API.md",
-    "docs/reference/api-contract.md",
-    "docs/reference/api.md",
-    "docs/daemon/socket-api.md",
-    "docs/daemon/capabilities-handshake.md",
-    "docs/ARCHITECTURE.md",
-)
-LIFECYCLE_DOCS = (
-    "docs/API-CONTRACT.md",
-    "docs/SESSION-LIFECYCLE.md",
-    "docs/sessions/lifecycle.md",
-)
-STATUSES = ("created", "running", "idle", "completed", "failed", "killed", "orphaned")
-TERMINAL = {
-    "created": "No",
-    "running": "No",
-    "idle": "No",
-    "completed": "Yes",
-    "failed": "Yes",
-    "killed": "Yes",
-    "orphaned": "Yes",
-}
-
-
-def validate_documents(documents: dict[str, str]) -> list[str]:
-    errors: list[str] = []
-    for path in CONTRACT_DOCS:
-        text = documents[path]
-        if "/api/v1/health" not in text or "coven.daemon.v1" not in text:
-            errors.append(f"{path}: missing health handshake")
-        lowered = text.lower()
-        if "capabilit" not in lowered or not any(
-            term in lowered for term in ("never grant permission", "not authorization")
-        ):
-            errors.append(f"{path}: capabilities versus authorization is missing")
-        for paragraph in re.split(r"\n\s*\n", text):
-            if "/api/v1/api-version" not in paragraph or "coven.daemon.v1" not in paragraph:
-                continue
-            lowered = paragraph.lower()
-            if "not" not in lowered or "proof" not in lowered:
-                errors.append(f"{path}: legacy route presented as named-contract handshake")
-
-    for path in LIFECYCLE_DOCS:
-        text = documents[path]
-        for status in STATUSES:
-            if f"`{status}`" not in text:
-                errors.append(f"{path}: missing lifecycle status {status}")
-                continue
-            terminal = TERMINAL[status]
-            pattern = rf"\|\s*`{status}`\s*\|\s*{terminal}\b"
-            if not re.search(pattern, text):
-                errors.append(
-                    f"{path}: incorrect terminal classification for {status}"
-                )
-        lowered = text.lower()
-        if "not proof of acknowledged process termination" not in lowered:
-            errors.append(f"{path}: killed acknowledgement boundary is missing")
-        if not all(term in lowered for term in ("synthetic", "`active`", "not a harness-session state")):
-            errors.append(f"{path}: synthetic active distinction is missing")
-        if "stored separately in `archived_at`" not in lowered:
-            errors.append(f"{path}: archive separation is missing")
-
-    contract = documents["docs/API-CONTRACT.md"]
-    lowered_contract = contract.lower()
-    if not all(term in lowered_contract for term in ("stale unowned", "recover", "`failed`")):
-        errors.append("docs/API-CONTRACT.md: stale created recovery is missing")
-    if "not proof of acknowledged process termination" not in lowered_contract:
-        errors.append("docs/API-CONTRACT.md: killed acknowledgement boundary is missing")
-    if not all(term in lowered_contract for term in ("synthetic", "`active`", "not a harness-session state")):
-        errors.append("docs/API-CONTRACT.md: synthetic active distinction is missing")
-    if "stored separately in `archived_at`" not in contract:
-        errors.append("docs/API-CONTRACT.md: archive separation is missing")
-    return errors
-
-
-def main() -> int:
-    paths = sorted(set(CONTRACT_DOCS + LIFECYCLE_DOCS))
-    documents = {
-        relative: (ROOT / relative).read_text(encoding="utf-8")
-        for relative in paths
-    }
-    errors = validate_documents(documents)
-
-    for error in errors:
-        print(error, file=sys.stderr)
-    return 1 if errors else 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-```
+Implement `validate_documents(documents) -> list[str]` and a repository-reading
+`main()` using only Python's standard library. The guard must cover every
+contract and lifecycle guide listed by the tests, validate relationships within
+the relevant paragraph/table row rather than by loose whole-file keyword
+presence, report path-specific diagnostics, and exit nonzero for any error.
+Keep the implementation synchronized with the committed guard tests; this plan
+intentionally does not duplicate the script as an exact snapshot.
 
 - [ ] **Step 4: Run unit and repository guardrail checks**
-
-Run:
 
 ```bash
 python3 scripts/check-api-contract-docs-test.py
 python3 scripts/check-api-contract-docs.py
 ```
 
-Expected: both commands exit 0.
+Expected: both commands exit 0 without reducing any negative coverage.
 
 - [ ] **Step 5: Add the guardrail to the existing Python CI job**
 
-Add these steps after the current privacy/secret unit tests in the
-`secret-guard` job:
-
-```yaml
-      - run: python3 scripts/check-api-contract-docs-test.py
-      - run: python3 scripts/check-api-contract-docs.py
-```
-
-Keep the current `actions/checkout@v7.0.1` and `actions/setup-python@v7`
-versions unchanged. The guard belongs here because it is a Python repository
-policy check, while the `openclaw-bridge` job remains scoped to package build
-and tests.
+Add both commands to the existing `secret-guard` job after its current Python
+unit checks. Preserve the workflow's current checkout and setup-python action
+versions. The OpenClaw job remains scoped to its package typecheck and tests.
 
 - [ ] **Step 6: Commit the documentation guardrail**
 
@@ -1188,7 +1046,6 @@ cargo test -p coven-cli api::tests::rejects_unknown_api_version_prefixes
 cargo test -p coven-cli api::tests::unknown_harness_capability_manifest_fails_closed_with_structured_error
 cargo test -p coven-cli daemon::tests::exit_event_does_not_overwrite_killed_session_status
 cargo test -p coven-cli daemon::tests::clean_exit_on_conversational_session_persists_as_idle
-npm --prefix packages/openclaw-coven run build
 npm --prefix packages/openclaw-coven run typecheck
 npm --prefix packages/openclaw-coven test -- src/client.test.ts src/runtime.test.ts
 python3 scripts/check-api-contract-docs-test.py
@@ -1204,7 +1061,6 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
 python scripts/check-secrets.py
-npm --prefix packages/openclaw-coven run build
 npm --prefix packages/openclaw-coven test
 ```
 
@@ -1233,9 +1089,13 @@ and G4/G6 remain blocked.
 
 ```bash
 git add crates/coven-cli/src/api.rs \
+  crates/coven-cli/src/main.rs \
+  crates/coven-cli/src/pty_runner.rs \
+  crates/coven-cli/src/store.rs \
+  crates/coven-cli/tests/stream_json_integration.rs \
   .github/workflows/ci.yml \
   packages/openclaw-coven/package.json \
-  packages/openclaw-coven/pnpm-lock.yaml \
+  packages/openclaw-coven/package-lock.json \
   packages/openclaw-coven/src/client.ts \
   packages/openclaw-coven/src/client.test.ts \
   packages/openclaw-coven/src/runtime.ts \
@@ -1244,6 +1104,7 @@ git add crates/coven-cli/src/api.rs \
   docs/API.md \
   docs/reference/api-contract.md \
   docs/reference/api.md \
+  docs/reference/cli-run.md \
   docs/daemon/socket-api.md \
   docs/daemon/capabilities-handshake.md \
   docs/ARCHITECTURE.md \
@@ -1252,7 +1113,8 @@ git add crates/coven-cli/src/api.rs \
   scripts/check-api-contract-docs.py \
   scripts/check-api-contract-docs-test.py \
   specs/psyche/O1_CONTRACT_DESIGN.md \
-  specs/psyche/PLAN.md
+  specs/psyche/PLAN.md \
+  docs/superpowers/plans/2026-08-03-psyche-o1-contract-implementation.md
 python3 scripts/check-coven-privacy.py --staged
 git diff --cached --check
 ```

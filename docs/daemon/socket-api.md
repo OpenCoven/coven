@@ -13,7 +13,8 @@ The daemon does not use OAuth, JWTs, bearer tokens, API keys, or browser cookies
 
 ## Handshake
 
-Always start with:
+Always start with `GET /api/v1/health` as the compatibility handshake for the
+named `coven.daemon.v1` contract:
 
 ```http
 GET /api/v1/health
