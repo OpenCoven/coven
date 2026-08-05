@@ -3603,7 +3603,11 @@ pub fn storage_health(
 ) -> Result<StorageHealth> {
     let free_disk_bytes = fs2::available_space(coven_home)
         .with_context(|| format!("failed to inspect free disk for {}", coven_home.display()))?;
-    storage_health_with_free_disk(coven_home, free_disk_bytes, event_writer)
+    Ok(storage_health_with_free_disk_or_unavailable(
+        coven_home,
+        free_disk_bytes,
+        event_writer,
+    ))
 }
 
 fn storage_health_with_free_disk(
@@ -3686,8 +3690,19 @@ fn storage_health_with_free_disk(
     })
 }
 
+fn storage_health_with_free_disk_or_unavailable(
+    coven_home: &Path,
+    free_disk_bytes: u64,
+    event_writer: Option<&crate::event_writer::EventWriterHealth>,
+) -> StorageHealth {
+    storage_health_with_free_disk(coven_home, free_disk_bytes, event_writer).unwrap_or_else(
+        |error| unavailable_storage_health(error, Some(free_disk_bytes), event_writer),
+    )
+}
+
 pub fn unavailable_storage_health(
     _error: impl ToString,
+    known_free_disk_bytes: Option<u64>,
     event_writer: Option<&crate::event_writer::EventWriterHealth>,
 ) -> StorageHealth {
     let (writer_backlog_events, writer_backlog_bytes) = writer_backlog(event_writer);
@@ -3702,8 +3717,8 @@ pub fn unavailable_storage_health(
         checkpoint_age_seconds: None,
         writer_backlog_events,
         writer_backlog_bytes,
-        free_disk_bytes: 0,
-        maintenance_blocked: true,
+        free_disk_bytes: known_free_disk_bytes.unwrap_or(0),
+        maintenance_blocked: false,
         // The socket API is a compatibility boundary. Do not turn an I/O
         // failure into a COVEN_HOME path disclosure; detailed diagnostics stay
         // in the local recovery log.
@@ -5210,6 +5225,63 @@ mod tests {
         Ok(())
     }
 
+    fn unavailable_storage_health_for_test(
+        error: impl ToString,
+        known_free_disk_bytes: Option<u64>,
+        event_writer: Option<&crate::event_writer::EventWriterHealth>,
+    ) -> StorageHealth {
+        unavailable_storage_health(error, known_free_disk_bytes, event_writer)
+    }
+
+    fn storage_health_after_sampling_free_disk_for_test(
+        coven_home: &Path,
+        free_disk_bytes: u64,
+        event_writer: Option<&crate::event_writer::EventWriterHealth>,
+    ) -> StorageHealth {
+        storage_health_with_free_disk_or_unavailable(coven_home, free_disk_bytes, event_writer)
+    }
+
+    #[test]
+    fn storage_health_fallback_with_known_healthy_free_disk_is_degraded_without_blocking(
+    ) -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let home = temp_dir.path();
+        open_store(&home.join("coven.sqlite3"))?;
+        std::fs::write(
+            home.join("privacy.toml"),
+            "log_retention_days = \"broken\"\n",
+        )?;
+        let writer = crate::event_writer::EventWriterHealth {
+            state: "pressured".to_string(),
+            queued_events: 7,
+            queued_bytes: 8192,
+            capacity_bytes: 2 * 1024 * 1024,
+            dropped_output_events: 1,
+            dropped_output_bytes: 512,
+            connection_opens: 1,
+            transactions: 3,
+            committed_events: 12,
+            last_error: None,
+        };
+
+        let health = storage_health_after_sampling_free_disk_for_test(
+            home,
+            MAINTENANCE_MIN_FREE_DISK_BYTES,
+            Some(&writer),
+        );
+
+        assert_eq!(health.status, "degraded");
+        assert_eq!(health.free_disk_bytes, MAINTENANCE_MIN_FREE_DISK_BYTES);
+        assert!(!health.maintenance_blocked);
+        assert_eq!(health.writer_backlog_events, 7);
+        assert_eq!(health.writer_backlog_bytes, 8192);
+        assert_eq!(
+            health.last_maintenance_error.as_deref(),
+            Some("storage health unavailable")
+        );
+        Ok(())
+    }
+
     #[test]
     fn storage_health_above_watermark_errors_for_missing_store_without_creation() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -5237,6 +5309,34 @@ mod tests {
 
         assert!(error.to_string().contains("privacy"));
         Ok(())
+    }
+
+    #[test]
+    fn unavailable_storage_health_without_known_free_disk_preserves_backlog_without_blocking() {
+        let writer = crate::event_writer::EventWriterHealth {
+            state: "pressured".to_string(),
+            queued_events: 7,
+            queued_bytes: 8192,
+            capacity_bytes: 2 * 1024 * 1024,
+            dropped_output_events: 1,
+            dropped_output_bytes: 512,
+            connection_opens: 1,
+            transactions: 3,
+            committed_events: 12,
+            last_error: None,
+        };
+
+        let health = unavailable_storage_health_for_test("boom", None, Some(&writer));
+
+        assert_eq!(health.status, "degraded");
+        assert_eq!(health.free_disk_bytes, 0);
+        assert!(!health.maintenance_blocked);
+        assert_eq!(health.writer_backlog_events, 7);
+        assert_eq!(health.writer_backlog_bytes, 8192);
+        assert_eq!(
+            health.last_maintenance_error.as_deref(),
+            Some("storage health unavailable")
+        );
     }
 
     #[test]

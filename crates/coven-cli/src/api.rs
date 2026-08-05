@@ -290,7 +290,7 @@ fn health_response_with_hub(
     }
     response.storage = Some(
         store::storage_health(coven_home, event_writer.as_ref()).unwrap_or_else(|error| {
-            store::unavailable_storage_health(error, event_writer.as_ref())
+            store::unavailable_storage_health(error, None, event_writer.as_ref())
         }),
     );
     response.event_writer = event_writer;
@@ -6805,6 +6805,14 @@ mod tests {
         }
     }
 
+    fn unavailable_storage_health_for_api_test(
+        error: impl ToString,
+        known_free_disk_bytes: Option<u64>,
+        event_writer: Option<&crate::event_writer::EventWriterHealth>,
+    ) -> store::StorageHealth {
+        store::unavailable_storage_health(error, known_free_disk_bytes, event_writer)
+    }
+
     #[test]
     fn health_uses_one_live_writer_snapshot_for_both_surfaces() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
@@ -6821,6 +6829,33 @@ mod tests {
         assert_eq!(body["capabilities"]["sessionHandoff"], true);
         assert_eq!(body["eventWriter"]["queuedEvents"], 3);
         assert_eq!(body["eventWriter"]["queuedBytes"], 4096);
+        assert_eq!(body["storage"]["writerBacklogEvents"], 3);
+        assert_eq!(body["storage"]["writerBacklogBytes"], 4096);
+        Ok(())
+    }
+
+    #[test]
+    fn health_response_serializes_degraded_storage_without_false_maintenance_blocking(
+    ) -> anyhow::Result<()> {
+        let writer = HealthRuntime
+            .event_writer_health()
+            .expect("health runtime provides writer snapshot");
+        let mut response = health_response(None);
+        response.event_writer = Some(writer.clone());
+        response.storage = Some(unavailable_storage_health_for_api_test(
+            "storage health unavailable",
+            Some(store::MAINTENANCE_MIN_FREE_DISK_BYTES),
+            Some(&writer),
+        ));
+
+        let body = serde_json::to_value(response)?;
+
+        assert_eq!(body["storage"]["status"], "degraded");
+        assert_eq!(
+            body["storage"]["freeDiskBytes"],
+            serde_json::json!(store::MAINTENANCE_MIN_FREE_DISK_BYTES)
+        );
+        assert_eq!(body["storage"]["maintenanceBlocked"], false);
         assert_eq!(body["storage"]["writerBacklogEvents"], 3);
         assert_eq!(body["storage"]["writerBacklogBytes"], 4096);
         Ok(())
