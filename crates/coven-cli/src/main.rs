@@ -3163,10 +3163,10 @@ fn prune_logs_command(dry_run: bool, raw_days: Option<u64>, event_days: Option<u
         .unwrap_or(config.raw_artifact_retention_days)
         .max(1);
     let event_days = event_days.unwrap_or(config.log_retention_days).max(1);
-    let conn = store::open_store(&home.join(STORE_FILE_NAME))?;
     let now = current_timestamp();
-    let raw_cutoff = store::retention_cutoff(&now, raw_days);
-    let event_cutoff = store::retention_cutoff(&now, event_days);
+    let raw_cutoff = store::retention_cutoff(&now, raw_days)?;
+    let event_cutoff = store::retention_cutoff(&now, event_days)?;
+    let conn = store::open_store(&home.join(STORE_FILE_NAME))?;
     let raw_count = store::count_prunable_sensitive_artifacts(&conn, &now, &raw_cutoff)?;
     let event_count = store::count_events_older_than(&conn, &event_cutoff)?;
 

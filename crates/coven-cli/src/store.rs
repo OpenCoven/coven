@@ -2860,33 +2860,35 @@ pub fn insert_event_with_privacy(
     insert_event_raw(conn, record, &redacted_payload, redaction_status, sensitive)?;
 
     if config.persist_raw_artifacts && sensitive {
-        let artifact_result = SensitiveArtifactStore::load(coven_home)
-            .and_then(|store| {
-                store.encrypt(
-                    &record.session_id,
-                    &record.id,
-                    &record.kind,
-                    record.payload_json.as_bytes(),
-                )
-            })
-            .and_then(|encrypted| {
-                insert_sensitive_artifact(
-                    conn,
-                    &SensitiveArtifactRecord {
-                        id: record.id.clone(),
-                        session_id: record.session_id.clone(),
-                        event_id: record.id.clone(),
-                        kind: record.kind.clone(),
-                        nonce: encrypted.nonce,
-                        ciphertext: encrypted.ciphertext,
-                        created_at: record.created_at.clone(),
-                        expires_at: retention_expires_at(
-                            &record.created_at,
-                            config.raw_artifact_retention_days,
-                        ),
-                    },
-                )
-            });
+        let artifact_result =
+            retention_expires_at(&record.created_at, config.raw_artifact_retention_days).and_then(
+                |expires_at| {
+                    SensitiveArtifactStore::load(coven_home)
+                        .and_then(|store| {
+                            store.encrypt(
+                                &record.session_id,
+                                &record.id,
+                                &record.kind,
+                                record.payload_json.as_bytes(),
+                            )
+                        })
+                        .and_then(|encrypted| {
+                            insert_sensitive_artifact(
+                                conn,
+                                &SensitiveArtifactRecord {
+                                    id: record.id.clone(),
+                                    session_id: record.session_id.clone(),
+                                    event_id: record.id.clone(),
+                                    kind: record.kind.clone(),
+                                    nonce: encrypted.nonce,
+                                    ciphertext: encrypted.ciphertext,
+                                    created_at: record.created_at.clone(),
+                                    expires_at,
+                                },
+                            )
+                        })
+                },
+            );
         redaction_status = if artifact_result.is_ok() {
             "redacted_raw_encrypted"
         } else {
@@ -3530,8 +3532,8 @@ fn run_scheduled_maintenance_with_config_and_free_disk(
         });
     }
 
-    let raw_cutoff = retention_cutoff(now, config.raw_artifact_retention_days.max(1));
-    let event_cutoff = retention_cutoff(now, config.log_retention_days.max(1));
+    let raw_cutoff = retention_cutoff(now, config.raw_artifact_retention_days.max(1))?;
+    let event_cutoff = retention_cutoff(now, config.log_retention_days.max(1))?;
     let store_path = coven_home.join("coven.sqlite3");
     let conn = open_store(&store_path)?;
     let mut raw_artifacts_pruned = 0usize;
@@ -3640,6 +3642,12 @@ fn storage_health_with_free_disk(
 
     let config = privacy::load_with_settings(coven_home, crate::settings::cached())
         .context("failed to load privacy settings for storage health")?;
+    let retention_cutoff = retention_cutoff(
+        &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+        config.log_retention_days.max(1),
+    )?;
+    let retention_cutoff = parse_rfc3339_utc(&retention_cutoff)
+        .context("failed to parse calculated retention cutoff")?;
     let conn = open_existing_store_read_only(&store_path)?
         .ok_or_else(|| anyhow::anyhow!("Coven store is unavailable"))?;
     // `MIN(created_at)` is NULL on an empty ledger, so the column type has to be
@@ -3647,16 +3655,10 @@ fn storage_health_with_free_disk(
     let oldest_retained_event_at: Option<String> = conn
         .query_row("SELECT MIN(created_at) FROM events", [], |row| row.get(0))
         .context("failed to read oldest retained event")?;
-    let retention_cutoff = retention_cutoff(
-        &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-        config.log_retention_days.max(1),
-    );
-    let retention_cutoff = parse_rfc3339_utc(&retention_cutoff);
     let retention_lagging = oldest_retained_event_at
         .as_deref()
         .and_then(parse_rfc3339_utc)
-        .zip(retention_cutoff)
-        .is_some_and(|(oldest_at, retention_cutoff)| oldest_at < retention_cutoff);
+        .is_some_and(|oldest_at| oldest_at < retention_cutoff);
     let last_prune_at = get_store_meta(&conn, MAINTENANCE_LAST_PRUNE_KEY)?;
     let last_checkpoint_at = get_store_meta(&conn, MAINTENANCE_LAST_CHECKPOINT_KEY)?;
     let last_maintenance_error =
@@ -3795,18 +3797,29 @@ fn set_store_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn retention_cutoff(now: &str, days: u64) -> String {
-    let parsed = chrono::DateTime::parse_from_rfc3339(now)
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now());
-    (parsed - Duration::days(days as i64)).to_rfc3339_opts(SecondsFormat::Nanos, true)
+fn retention_duration(days: u64) -> Result<Duration> {
+    let days = i64::try_from(days).context("retention days exceed the supported integer range")?;
+    Duration::try_days(days).context("retention days exceed the supported duration range")
 }
 
-fn retention_expires_at(created_at: &str, days: u64) -> String {
+pub fn retention_cutoff(now: &str, days: u64) -> Result<String> {
+    let parsed = chrono::DateTime::parse_from_rfc3339(now)
+        .map(|dt| dt.with_timezone(&Utc))
+        .context("invalid retention cutoff timestamp")?;
+    let cutoff = parsed
+        .checked_sub_signed(retention_duration(days)?)
+        .context("retention cutoff timestamp exceeds the supported date range")?;
+    Ok(cutoff.to_rfc3339_opts(SecondsFormat::Nanos, true))
+}
+
+fn retention_expires_at(created_at: &str, days: u64) -> Result<String> {
     let parsed = chrono::DateTime::parse_from_rfc3339(created_at)
         .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now());
-    (parsed + Duration::days(days as i64)).to_rfc3339_opts(SecondsFormat::Nanos, true)
+        .context("invalid retention expiry timestamp")?;
+    let expires_at = parsed
+        .checked_add_signed(retention_duration(days)?)
+        .context("retention expiry timestamp exceeds the supported date range")?;
+    Ok(expires_at.to_rfc3339_opts(SecondsFormat::Nanos, true))
 }
 
 pub fn artifact_payload(record: &SensitiveArtifactRecord) -> EncryptedPayload {
@@ -4959,6 +4972,38 @@ mod tests {
     }
 
     #[test]
+    fn raw_artifact_unrepresentable_retention_keeps_redacted_event_only() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        std::fs::write(
+            temp_dir.path().join("privacy.toml"),
+            "persist_raw_artifacts = true\nraw_artifact_retention_days = 100000000\n",
+        )?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+        insert_session(&conn, &session_record("session-1", "2026-04-27T06:00:00Z"))?;
+        let fake = fake_openai_key();
+        let record = EventRecord {
+            seq: 0,
+            id: "event-overflow".to_string(),
+            session_id: "session-1".to_string(),
+            kind: "input".to_string(),
+            payload_json: serde_json::json!({ "data": format!("secret {fake}") }).to_string(),
+            created_at: "2026-04-27T06:01:00Z".to_string(),
+        };
+
+        insert_event_with_privacy(&conn, temp_dir.path(), &record)?;
+
+        let (payload, status): (String, String) = conn.query_row(
+            "SELECT payload_json, redaction_status FROM events WHERE id = 'event-overflow'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert!(!payload.contains(&fake));
+        assert_eq!(status, "redacted_raw_unavailable");
+        assert_eq!(count_sensitive_artifacts(&conn)?, 0);
+        Ok(())
+    }
+
+    #[test]
     fn pruning_removes_expired_artifacts_and_old_events() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let conn = open_store(&temp_dir.path().join("coven.db"))?;
@@ -4995,7 +5040,7 @@ mod tests {
 
         let pruned_artifacts =
             prune_sensitive_artifacts(&conn, "2026-05-01T00:00:00Z", "2026-04-24T00:00:00Z")?;
-        let cutoff = retention_cutoff("2026-05-01T00:00:00Z", 7);
+        let cutoff = retention_cutoff("2026-05-01T00:00:00Z", 7)?;
         let pruned_events = prune_events_older_than(&conn, &cutoff)?;
 
         assert_eq!(pruned_artifacts, 1);
@@ -5124,6 +5169,108 @@ mod tests {
         assert_eq!(report.events_pruned, 1);
         let conn = open_store(&path)?;
         assert!(list_events(&conn, "session-1")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn scheduled_maintenance_unrepresentable_retention_preserves_existing_rows() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let home = temp_dir.path();
+        let path = home.join("coven.sqlite3");
+        let conn = open_store(&path)?;
+        insert_session(&conn, &session_record("session-1", "2026-04-27T06:00:00Z"))?;
+        insert_event(
+            &conn,
+            &EventRecord {
+                seq: 0,
+                id: "retained-event".to_string(),
+                session_id: "session-1".to_string(),
+                kind: "output".to_string(),
+                payload_json: r#"{"data":"retain me"}"#.to_string(),
+                created_at: "2026-04-25T00:00:00Z".to_string(),
+            },
+        )?;
+        drop(conn);
+        let config = PrivacyConfig {
+            persist_raw_artifacts: false,
+            raw_artifact_retention_days: 7,
+            log_retention_days: u64::MAX,
+            extra_patterns: Vec::new(),
+        };
+
+        run_scheduled_maintenance_with_config_and_free_disk(
+            home,
+            "2026-04-27T06:00:00Z",
+            MAINTENANCE_MIN_FREE_DISK_BYTES,
+            &config,
+        )
+        .expect_err("unrepresentable retention must fail closed");
+
+        let conn = open_store(&path)?;
+        assert_eq!(list_events(&conn, "session-1")?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn scheduled_maintenance_unrepresentable_retention_does_not_create_store() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let home = temp_dir.path();
+        let config = PrivacyConfig {
+            persist_raw_artifacts: false,
+            raw_artifact_retention_days: u64::MAX,
+            log_retention_days: 30,
+            extra_patterns: Vec::new(),
+        };
+
+        run_scheduled_maintenance_with_config_and_free_disk(
+            home,
+            "2026-04-27T06:00:00Z",
+            MAINTENANCE_MIN_FREE_DISK_BYTES,
+            &config,
+        )
+        .expect_err("unrepresentable retention must fail before opening the store");
+
+        assert!(!home.join("coven.sqlite3").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn scheduled_maintenance_invalid_timestamp_does_not_create_store() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let home = temp_dir.path();
+
+        run_scheduled_maintenance_with_config_and_free_disk(
+            home,
+            "not-a-timestamp",
+            MAINTENANCE_MIN_FREE_DISK_BYTES,
+            &PrivacyConfig::default(),
+        )
+        .expect_err("invalid maintenance timestamps must fail before opening the store");
+
+        assert!(!home.join("coven.sqlite3").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn scheduled_maintenance_timestamp_range_overflow_does_not_create_store() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let home = temp_dir.path();
+        let config = PrivacyConfig {
+            persist_raw_artifacts: false,
+            raw_artifact_retention_days: 7,
+            log_retention_days: 100_000_000,
+            extra_patterns: Vec::new(),
+        };
+
+        run_scheduled_maintenance_with_config_and_free_disk(
+            home,
+            "2026-04-27T06:00:00Z",
+            MAINTENANCE_MIN_FREE_DISK_BYTES,
+            &config,
+        )
+        .expect_err("timestamp range overflow must fail before opening the store");
+
+        assert!(!home.join("coven.sqlite3").exists());
         Ok(())
     }
 
@@ -5308,6 +5455,23 @@ mod tests {
             .expect_err("malformed privacy config must fail closed above the watermark");
 
         assert!(error.to_string().contains("privacy"));
+        Ok(())
+    }
+
+    #[test]
+    fn storage_health_unrepresentable_retention_does_not_open_missing_store() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let home = temp_dir.path();
+        std::fs::write(
+            home.join("privacy.toml"),
+            "log_retention_days = 9223372036854775807\n",
+        )?;
+
+        let error = storage_health_with_free_disk(home, MAINTENANCE_MIN_FREE_DISK_BYTES, None)
+            .expect_err("unrepresentable retention must fail before opening the store");
+
+        assert!(error.to_string().contains("retention"));
+        assert!(!home.join("coven.sqlite3").exists());
         Ok(())
     }
 
@@ -5552,7 +5716,7 @@ mod tests {
             },
         )?;
 
-        let cutoff = retention_cutoff("2026-04-27T00:00:00Z", 1);
+        let cutoff = retention_cutoff("2026-04-27T00:00:00Z", 1)?;
 
         assert_eq!(
             count_prunable_sensitive_artifacts(&conn, "2026-04-27T00:00:00Z", &cutoff)?,
@@ -5639,7 +5803,7 @@ mod tests {
         }
 
         let now = "2026-04-27T00:00:00Z";
-        let cutoff = retention_cutoff(now, 1);
+        let cutoff = retention_cutoff(now, 1)?;
         assert_eq!(count_prunable_sensitive_artifacts(&conn, now, &cutoff)?, 4);
 
         let first_pruned = prune_sensitive_artifacts_bounded(&conn, now, &cutoff, 2)?;
