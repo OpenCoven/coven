@@ -2347,17 +2347,21 @@ pub fn sacrifice_session(conn: &Connection, session_id: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn latest_active_for_project(conn: &Connection, project_root: &str) -> Result<Option<String>> {
+pub fn latest_active_for_project(
+    conn: &Connection,
+    project_root: &str,
+    harness: &str,
+) -> Result<Option<String>> {
     conn.query_row(
         "SELECT id FROM sessions
-         WHERE project_root = ?1 AND archived_at IS NULL
+         WHERE project_root = ?1 AND harness = ?2 AND archived_at IS NULL
          ORDER BY created_at DESC
          LIMIT 1",
-        params![project_root],
+        params![project_root, harness],
         |row| row.get::<_, String>(0),
     )
     .optional()
-    .context("failed to query latest active session for project")
+    .context("failed to query latest active session for project and harness")
 }
 
 fn fts_literal_query(query: &str) -> Option<String> {
@@ -4788,7 +4792,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_active_returns_newest_non_archived_for_project() -> Result<()> {
+    fn latest_active_returns_newest_non_archived_for_project_and_harness() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let conn = open_store(&temp.path().join("test.sqlite3"))?;
         conn.execute_batch(
@@ -4799,8 +4803,8 @@ mod tests {
                       ('other_proj', '/other', 'claude', 't', 'created', '2026-01-04', '2026-01-04');
              UPDATE sessions SET archived_at='2026-01-03' WHERE id='archived';",
         )?;
-        let hit = latest_active_for_project(&conn, "/p")?;
-        assert_eq!(hit.as_deref(), Some("newer"));
+        let hit = latest_active_for_project(&conn, "/p", "codex")?;
+        assert_eq!(hit.as_deref(), Some("older"));
         Ok(())
     }
 

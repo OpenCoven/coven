@@ -26,12 +26,12 @@ coven run <harness> <prompt> [flags]
 | `--think` | Request deeper reasoning. Claude, Coven Code, and Copilot map this to `--effort high`; unsupported harnesses warn and continue. |
 | `--speed <level>` | Set a latency/reasoning hint: `fast`, `balanced`, or `thorough`. Claude, Coven Code, and Copilot map these to `--effort low`, `medium`, or `high`; unsupported harnesses warn and continue. |
 | `--detach` | Create the session record without launching the harness. |
-| `--continue [id]` | Resume a specific session, or the latest active session for this project when `id` is omitted. |
+| `--continue [id]` | Resume a specific session, or the latest non-archived session for this project and requested harness when `id` is omitted. An explicit id or conversation lookup from another harness is rejected. Continuation creates a fresh, unarchived sibling row in the same conversation group; the selected row and its terminal/archive evidence remain unchanged. |
 | `--labels <a,b>` | Attach comma-separated labels to a new session. |
 | `--visibility <private\|workspace\|shared>` | Set session visibility metadata. |
 | `--archive` | Archive the session after the run completes. |
 | `--familiar <id>` | Inject familiar identity context. |
-| `--stream-json` | Emit Coven JSONL events on stdout. Codex runs as `codex exec --json` over ordinary pipes and is normalized into `assistant` / `result` events; on Windows its npm `.cmd` shim receives the prompt on stdin rather than through ConPTY. Other external non-stream adapters have raw PTY output wrapped in `output` events. See `docs/STREAM-JSON.md`. |
+| `--stream-json` | Emit Coven JSONL events on stdout. Every top-level `session_id` identifies the current Coven ledger row, including native harness frames during continuation; native conversation identity is retained separately as `harness_session_id` when supplied. Malformed native JSONL fails the run. Codex runs as `codex exec --json` over ordinary pipes and is normalized into `assistant` / `result` events; on Windows its npm `.cmd` shim receives the prompt on stdin rather than through ConPTY. Other external non-stream adapters have raw PTY output wrapped in `output` events. See `docs/STREAM-JSON.md`. |
 | `--stream-json-input` | With `--stream-json`, read JSONL user messages from stdin for Claude stream mode. |
 
 Examples:

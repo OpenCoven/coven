@@ -1,7 +1,7 @@
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -417,32 +417,22 @@ const CODEX_JSON_ACTIVITY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CODEX_POST_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const CODEX_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const CODEX_STDERR_TAIL_BYTES: usize = 8 * 1024;
+const NATIVE_POST_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
-// `codex exec --json` runs in a separate Unix session so a timeout can clean
-// up an npm/Node/Codex tree in one operation. That also means a TERM sent to
-// coven itself would otherwise leave the child group behind. The scoped guard
-// below records the cancellation in an async-signal-safe handler; the runner
-// then performs ordinary cleanup and emits its terminal result.
+// Supervised streams run in separate Unix sessions so Coven can clean up an
+// entire harness tree in one operation. That also means a TERM sent to Coven
+// itself would otherwise leave the child group behind. The scoped guard below
+// records the signal atomically; the owning runner observes it on its bounded
+// polling interval, terminates through its stable process-tree handle, and
+// reaps the direct child.
 #[cfg(unix)]
-static CODEX_JSON_CANCELLATION_SIGNAL: AtomicI32 = AtomicI32::new(0);
+static SUPERVISED_STREAM_CANCELLATION_SIGNAL: AtomicI32 = AtomicI32::new(0);
 #[cfg(unix)]
-static CODEX_JSON_PROCESS_GROUP: AtomicI32 = AtomicI32::new(0);
-#[cfg(unix)]
-static CODEX_JSON_CANCELLATION_LOCK: Mutex<()> = Mutex::new(());
+static SUPERVISED_STREAM_CANCELLATION_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(unix)]
-extern "C" fn record_codex_json_cancellation(signal: libc::c_int) {
-    // Atomic operations and kill(2) are async-signal-safe. The supervisor
-    // turns the flag into a failed ledger/result update on its next <=50 ms
-    // poll; killing the group here prevents a detached Codex descendant from
-    // surviving if that poll is delayed.
-    let process_group = CODEX_JSON_PROCESS_GROUP.load(Ordering::Relaxed);
-    if process_group > 0 {
-        unsafe {
-            let _ = libc::kill(-process_group, libc::SIGKILL);
-        }
-    }
-    CODEX_JSON_CANCELLATION_SIGNAL.store(signal, Ordering::Relaxed);
+extern "C" fn cancel_supervised_stream(signal: libc::c_int) {
+    SUPERVISED_STREAM_CANCELLATION_SIGNAL.store(signal, Ordering::Relaxed);
 }
 
 /// Temporarily converts TERM/INT/HUP into a supervised bridge cancellation.
@@ -452,32 +442,115 @@ extern "C" fn record_codex_json_cancellation(signal: libc::c_int) {
 /// before releasing that lock, preserving normal signal behavior for other
 /// Coven commands and unit tests.
 #[cfg(unix)]
-struct CodexCancellationGuard {
+struct SupervisedStreamCancellationGuard {
     _lock: MutexGuard<'static, ()>,
     previous_handlers: Vec<(libc::c_int, libc::sigaction)>,
+    signal_mask: SupervisedSignalMask,
+    active: bool,
 }
 
 #[cfg(unix)]
-impl CodexCancellationGuard {
-    fn install() -> Result<Self> {
-        let lock = CODEX_JSON_CANCELLATION_LOCK
+struct SupervisedSignalMask {
+    previous: libc::sigset_t,
+    supervisor_unblocked: bool,
+}
+
+#[cfg(unix)]
+impl SupervisedSignalMask {
+    fn block() -> io::Result<Self> {
+        let signals = supervised_signal_set();
+        let mut previous = unsafe { std::mem::zeroed() };
+        let result = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &signals, &mut previous) };
+        if result != 0 {
+            return Err(io::Error::from_raw_os_error(result));
+        }
+        Ok(Self {
+            previous,
+            supervisor_unblocked: false,
+        })
+    }
+
+    fn unblock_supervisor(&mut self) -> io::Result<()> {
+        let result = unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut())
+        };
+        if result != 0 {
+            return Err(io::Error::from_raw_os_error(result));
+        }
+        self.supervisor_unblocked = true;
+        Ok(())
+    }
+
+    fn reblock(&mut self) -> io::Result<()> {
+        if !self.supervisor_unblocked {
+            return Ok(());
+        }
+        let signals = supervised_signal_set();
+        let result =
+            unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &signals, std::ptr::null_mut()) };
+        if result != 0 {
+            return Err(io::Error::from_raw_os_error(result));
+        }
+        self.supervisor_unblocked = false;
+        Ok(())
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        let result = unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut())
+        };
+        if result != 0 {
+            return Err(io::Error::from_raw_os_error(result));
+        }
+        self.supervisor_unblocked = true;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SupervisedSignalMask {
+    fn drop(&mut self) {
+        if !self.supervisor_unblocked {
+            let _ = self.restore();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn supervised_signal_set() -> libc::sigset_t {
+    let mut signals = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut signals);
+        for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            libc::sigaddset(&mut signals, signal);
+        }
+    }
+    signals
+}
+
+#[cfg(unix)]
+impl SupervisedStreamCancellationGuard {
+    fn install(context: &str) -> Result<Self> {
+        let lock = SUPERVISED_STREAM_CANCELLATION_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        CODEX_JSON_CANCELLATION_SIGNAL.store(0, Ordering::Relaxed);
-        CODEX_JSON_PROCESS_GROUP.store(0, Ordering::Relaxed);
+        let mut signal_mask = SupervisedSignalMask::block()
+            .context("failed to block supervised stream cancellation signals")?;
+        SUPERVISED_STREAM_CANCELLATION_SIGNAL.store(0, Ordering::Relaxed);
 
         let mut previous_handlers = Vec::with_capacity(3);
         for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
             // SAFETY: sigaction is the POSIX interface for installing a signal
-            // handler. The handler uses only atomics and kill(2), and each
+            // handler. The handler only records into an atomic, and each
             // successful installation retains the prior disposition for Drop.
             unsafe {
                 let mut action: libc::sigaction = std::mem::zeroed();
-                action.sa_sigaction = record_codex_json_cancellation as *const () as usize;
+                action.sa_sigaction = cancel_supervised_stream as *const () as usize;
                 libc::sigemptyset(&mut action.sa_mask);
                 action.sa_flags = 0;
                 let mut previous: libc::sigaction = std::mem::zeroed();
                 if libc::sigaction(signal, &action, &mut previous) != 0 {
+                    let error = std::io::Error::last_os_error();
                     for (installed_signal, installed_previous) in previous_handlers.iter().rev() {
                         let _ = libc::sigaction(
                             *installed_signal,
@@ -485,9 +558,12 @@ impl CodexCancellationGuard {
                             std::ptr::null_mut(),
                         );
                     }
-                    CODEX_JSON_CANCELLATION_SIGNAL.store(0, Ordering::Relaxed);
-                    return Err(std::io::Error::last_os_error()).with_context(|| {
-                        format!("failed to install Codex cancellation handler for signal {signal}")
+                    SUPERVISED_STREAM_CANCELLATION_SIGNAL.store(0, Ordering::Relaxed);
+                    let _ = signal_mask.restore();
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to install {context} cancellation handler for signal {signal}"
+                        )
                     });
                 }
                 previous_handlers.push((signal, previous));
@@ -497,27 +573,58 @@ impl CodexCancellationGuard {
         Ok(Self {
             _lock: lock,
             previous_handlers,
+            signal_mask,
+            active: true,
         })
     }
 
-    fn arm(&self, process_group: u32) {
-        CODEX_JSON_PROCESS_GROUP.store(process_group as i32, Ordering::Relaxed);
-    }
-
-    fn disarm(&self) {
-        CODEX_JSON_PROCESS_GROUP.store(0, Ordering::Relaxed);
-    }
-
     fn cancelled_signal(&self) -> Option<libc::c_int> {
-        let signal = CODEX_JSON_CANCELLATION_SIGNAL.load(Ordering::Relaxed);
+        let signal = SUPERVISED_STREAM_CANCELLATION_SIGNAL.load(Ordering::Relaxed);
         (signal != 0).then_some(signal)
+    }
+
+    fn activate(&mut self) -> Result<Option<libc::c_int>> {
+        self.signal_mask
+            .unblock_supervisor()
+            .context("failed to unblock supervised stream cancellation signals")?;
+        Ok(self.cancelled_signal())
+    }
+
+    fn finish(mut self) -> Result<Option<libc::c_int>> {
+        self.signal_mask
+            .reblock()
+            .context("failed to re-block supervised stream cancellation signals")?;
+        let cancelled_signal = self.cancelled_signal();
+        let mut restore_error = None;
+        unsafe {
+            for (signal, previous) in self.previous_handlers.iter().rev() {
+                if libc::sigaction(*signal, previous, std::ptr::null_mut()) != 0
+                    && restore_error.is_none()
+                {
+                    restore_error = Some(std::io::Error::last_os_error());
+                }
+            }
+        }
+        SUPERVISED_STREAM_CANCELLATION_SIGNAL.store(0, Ordering::Relaxed);
+        self.active = false;
+
+        self.signal_mask
+            .restore()
+            .context("failed to restore supervised stream signal mask")?;
+        if let Some(error) = restore_error {
+            return Err(error).context("failed to restore supervised stream cancellation handlers");
+        }
+        Ok(cancelled_signal)
     }
 }
 
 #[cfg(unix)]
-impl Drop for CodexCancellationGuard {
+impl Drop for SupervisedStreamCancellationGuard {
     fn drop(&mut self) {
-        CODEX_JSON_PROCESS_GROUP.store(0, Ordering::Relaxed);
+        if !self.active {
+            return;
+        }
+        let _ = self.signal_mask.reblock();
         // SAFETY: every entry was captured from a successful sigaction call
         // in install. Restoring it here makes the scope transparent once the
         // bridge has reaped its child tree.
@@ -526,40 +633,81 @@ impl Drop for CodexCancellationGuard {
                 let _ = libc::sigaction(*signal, previous, std::ptr::null_mut());
             }
         }
-        CODEX_JSON_CANCELLATION_SIGNAL.store(0, Ordering::Relaxed);
+        SUPERVISED_STREAM_CANCELLATION_SIGNAL.store(0, Ordering::Relaxed);
+        let _ = self.signal_mask.restore();
     }
 }
 
 #[cfg(not(unix))]
-struct CodexCancellationGuard;
+struct SupervisedStreamCancellationGuard;
 
 #[cfg(not(unix))]
-impl CodexCancellationGuard {
-    fn install() -> Result<Self> {
+impl SupervisedStreamCancellationGuard {
+    fn install(_context: &str) -> Result<Self> {
         Ok(Self)
     }
 
-    fn arm(&self, _process_group: u32) {}
+    fn cancelled_signal(&self) -> Option<i32> {
+        None
+    }
 
-    fn disarm(&self) {}
+    fn activate(&mut self) -> Result<Option<i32>> {
+        Ok(None)
+    }
+
+    fn finish(self) -> Result<Option<i32>> {
+        Ok(None)
+    }
+}
+
+fn wait_for_supervised_child(
+    child: &mut std::process::Child,
+    context: &str,
+) -> Result<std::process::ExitStatus> {
+    child.wait().with_context(|| context.to_string())
+}
+
+fn terminate_and_wait_for_supervised_child(
+    process_tree: &mut StrictChildProcessTree,
+    child: &mut std::process::Child,
+    context: &str,
+) -> Result<std::process::ExitStatus> {
+    process_tree.terminate(child);
+    wait_for_supervised_child(child, context)
 }
 
 #[cfg(unix)]
-fn codex_cancellation_error(guard: &CodexCancellationGuard) -> Option<String> {
-    guard.cancelled_signal().map(|signal| {
-        let name = match signal {
-            libc::SIGTERM => "SIGTERM",
-            libc::SIGINT => "SIGINT",
-            libc::SIGHUP => "SIGHUP",
-            _ => "a termination signal",
-        };
-        format!("Codex turn cancelled by {name}; the process tree was terminated")
-    })
+fn supervised_stream_cancellation_error(
+    guard: &SupervisedStreamCancellationGuard,
+    context: &str,
+) -> Option<String> {
+    guard
+        .cancelled_signal()
+        .map(|signal| supervised_stream_cancellation_error_for_signal(signal, context))
+}
+
+#[cfg(unix)]
+fn supervised_stream_cancellation_error_for_signal(signal: libc::c_int, context: &str) -> String {
+    let name = match signal {
+        libc::SIGTERM => "SIGTERM",
+        libc::SIGINT => "SIGINT",
+        libc::SIGHUP => "SIGHUP",
+        _ => "a termination signal",
+    };
+    format!("{context} cancelled by {name}; the process tree was terminated")
 }
 
 #[cfg(not(unix))]
-fn codex_cancellation_error(_guard: &CodexCancellationGuard) -> Option<String> {
+fn supervised_stream_cancellation_error(
+    _guard: &SupervisedStreamCancellationGuard,
+    _context: &str,
+) -> Option<String> {
     None
+}
+
+#[cfg(not(unix))]
+fn supervised_stream_cancellation_error_for_signal(_signal: i32, _context: &str) -> String {
+    unreachable!("non-Unix cancellation guards never report a signal")
 }
 
 fn codex_json_activity_timeout() -> Duration {
@@ -620,11 +768,7 @@ impl ChildProcessTree {
         }
     }
 
-    pub(crate) fn terminate(&mut self, child: &mut std::process::Child) {
-        self.terminate_impl(child, true);
-    }
-
-    fn terminate_impl(&mut self, child: &mut std::process::Child, _allow_taskkill_fallback: bool) {
+    fn terminate_impl(&mut self, child: &mut std::process::Child) {
         if self.terminated {
             return;
         }
@@ -635,29 +779,10 @@ impl ChildProcessTree {
         }
         #[cfg(windows)]
         {
-            let terminated_by_job = self
-                .job_handle
-                .take()
-                .map(|job| {
-                    let succeeded = unsafe {
-                        windows_sys::Win32::System::JobObjects::TerminateJobObject(job, 1) != 0
-                    };
-                    unsafe { windows_sys::Win32::Foundation::CloseHandle(job) };
-                    succeeded
-                })
-                .unwrap_or(false);
-            if !terminated_by_job && _allow_taskkill_fallback {
-                // A Job Object can be unavailable when a parent policy forbids
-                // assignment. Fall back to Windows' documented tree kill for
-                // npm's cmd.exe -> node.exe -> codex.exe chain.
-                if let Some(taskkill) = trusted_windows_taskkill_path() {
-                    let pid = self.pid.to_string();
-                    let _ = std::process::Command::new(taskkill)
-                        .args(["/PID", &pid, "/T", "/F"])
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status();
+            if let Some(job) = self.job_handle.take() {
+                unsafe {
+                    windows_sys::Win32::System::JobObjects::TerminateJobObject(job, 1);
+                    windows_sys::Win32::Foundation::CloseHandle(job);
                 }
             }
         }
@@ -666,8 +791,7 @@ impl ChildProcessTree {
 }
 
 /// A process tree whose descendants were contained before its first
-/// instruction ran. Its termination path deliberately cannot select the
-/// legacy `taskkill` fallback used by the Codex runner.
+/// instruction ran.
 pub(crate) struct StrictChildProcessTree(ChildProcessTree);
 
 impl StrictChildProcessTree {
@@ -699,7 +823,7 @@ impl StrictChildProcessTree {
     }
 
     pub(crate) fn terminate(&mut self, child: &mut std::process::Child) {
-        self.0.terminate_impl(child, false);
+        self.0.terminate_impl(child);
     }
 }
 
@@ -708,6 +832,53 @@ fn terminate_unix_process_group(pid: u32) {
     // The launch config puts the child at the head of a new session, so the
     // negative pid reaches its wrapper and every descendant.
     let _ = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+}
+
+#[cfg(unix)]
+fn poll_child_exit_without_reaping(child: &std::process::Child) -> io::Result<bool> {
+    loop {
+        // POSIX leaves siginfo contents unspecified when WNOHANG finds no
+        // waitable child, so initialize it for every call and trust si_pid
+        // only when waitid explicitly fills it.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id() as _,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            return Ok(unsafe { info.si_pid() } != 0);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(all(unix, test))]
+fn wait_for_child_exit_without_reaping(child: &std::process::Child) -> io::Result<()> {
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id() as _,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -731,34 +902,6 @@ impl Drop for ChildProcessTree {
             unsafe { windows_sys::Win32::Foundation::CloseHandle(job) };
         }
     }
-}
-
-#[cfg(windows)]
-fn trusted_windows_taskkill_path() -> Option<PathBuf> {
-    use std::os::windows::ffi::OsStringExt;
-    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
-
-    let mut buffer = vec![0u16; 260];
-    let len = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
-    if len == 0 {
-        return None;
-    }
-    let len = len as usize;
-    if len >= buffer.len() {
-        buffer.resize(len + 1, 0);
-        let len = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
-        if len == 0 || len as usize >= buffer.len() {
-            return None;
-        }
-        buffer.truncate(len as usize);
-    } else {
-        buffer.truncate(len);
-    }
-
-    let path = PathBuf::from(std::ffi::OsString::from_wide(&buffer)).join("taskkill.exe");
-    // A missing binary (or an unexpected system directory) must surface as
-    // "no trusted taskkill" rather than a silently ignored spawn failure.
-    path.is_file().then_some(path)
 }
 
 #[cfg(windows)]
@@ -974,33 +1117,49 @@ where
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    configure_child_process_tree_command(&mut child_command);
-    let cancellation = CodexCancellationGuard::install()?;
-    if let Some(error) = codex_cancellation_error(&cancellation) {
+    let mut cancellation = SupervisedStreamCancellationGuard::install("Codex")?;
+    if let Some(error) = supervised_stream_cancellation_error(&cancellation, "Codex turn") {
         anyhow::bail!(error);
     }
-    let mut child = child_command.spawn().with_context(|| {
-        format!(
-            "failed to spawn harness `{}` in Codex JSON mode",
-            command.program()
-        )
-    })?;
-    let mut process_tree = ChildProcessTree::attach(&child);
-    cancellation.arm(process_tree.pid);
+    let (mut child, mut process_tree) = spawn_strict_child_process_tree(&mut child_command)
+        .with_context(|| {
+            format!(
+                "failed to spawn harness `{}` in Codex JSON mode",
+                command.program()
+            )
+        })?;
+    if let Some(signal) = cancellation.cancelled_signal() {
+        let _ = terminate_and_wait_for_supervised_child(
+            &mut process_tree,
+            &mut child,
+            "failed waiting for cancelled Codex process",
+        );
+        let signal = cancellation.finish()?.unwrap_or(signal);
+        anyhow::bail!(supervised_stream_cancellation_error_for_signal(
+            signal,
+            "Codex turn"
+        ));
+    }
 
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
-            process_tree.terminate(&mut child);
-            let _ = child.wait();
+            let _ = terminate_and_wait_for_supervised_child(
+                &mut process_tree,
+                &mut child,
+                "failed waiting for Codex after missing stdout",
+            );
             anyhow::bail!("Codex JSON runner did not expose stdout");
         }
     };
     let stderr = match child.stderr.take() {
         Some(stderr) => stderr,
         None => {
-            process_tree.terminate(&mut child);
-            let _ = child.wait();
+            let _ = terminate_and_wait_for_supervised_child(
+                &mut process_tree,
+                &mut child,
+                "failed waiting for Codex after missing stderr",
+            );
             anyhow::bail!("Codex JSON runner did not expose stderr");
         }
     };
@@ -1010,8 +1169,11 @@ where
         let stdin = match child.stdin.take() {
             Some(stdin) => stdin,
             None => {
-                process_tree.terminate(&mut child);
-                let _ = child.wait();
+                let _ = terminate_and_wait_for_supervised_child(
+                    &mut process_tree,
+                    &mut child,
+                    "failed waiting for Codex after missing stdin",
+                );
                 anyhow::bail!("Codex JSON runner did not expose stdin for its prompt");
             }
         };
@@ -1064,35 +1226,84 @@ where
         let _ = stderr_sender.send(CodexRunnerMessage::StderrClosed(tail));
     });
     drop(sender);
+    let activation_signal = match cancellation.activate() {
+        Ok(signal) => signal,
+        Err(error) => {
+            let _ = terminate_and_wait_for_supervised_child(
+                &mut process_tree,
+                &mut child,
+                "failed waiting for Codex after cancellation activation error",
+            );
+            return Err(error);
+        }
+    };
 
     let mut state = CodexJsonState::default();
     let mut last_activity = Instant::now();
     let mut status = None;
+    let mut direct_child_exited = false;
     let mut post_exit_deadline = None;
     let mut stdout_closed = false;
     let mut stderr_tail = None;
     let mut stdin_complete = !stdin_pending;
 
     loop {
-        if let Some(error) = codex_cancellation_error(&cancellation) {
-            state.protocol_error.get_or_insert(error);
-            process_tree.terminate(&mut child);
-            status = Some(
-                child
-                    .wait()
-                    .context("failed waiting for cancelled Codex process")?,
-            );
+        if let Some(signal) = activation_signal {
+            state.protocol_error.get_or_insert_with(|| {
+                supervised_stream_cancellation_error_for_signal(signal, "Codex turn")
+            });
+            status = Some(terminate_and_wait_for_supervised_child(
+                &mut process_tree,
+                &mut child,
+                "failed waiting for cancelled Codex process",
+            )?);
             break;
         }
-        if status.is_none() {
-            status = child
+        if let Some(error) = supervised_stream_cancellation_error(&cancellation, "Codex turn") {
+            state.protocol_error.get_or_insert(error);
+            status = Some(terminate_and_wait_for_supervised_child(
+                &mut process_tree,
+                &mut child,
+                "failed waiting for cancelled Codex process",
+            )?);
+            break;
+        }
+        if !direct_child_exited {
+            #[cfg(unix)]
+            let observed_exit = match poll_child_exit_without_reaping(&child)
+                .context("failed polling Codex JSON process")
+            {
+                Ok(observed_exit) => observed_exit,
+                Err(error) => {
+                    let _ = terminate_and_wait_for_supervised_child(
+                        &mut process_tree,
+                        &mut child,
+                        "failed waiting for Codex after poll error",
+                    );
+                    return Err(error);
+                }
+            };
+            #[cfg(not(unix))]
+            let observed_exit = match child
                 .try_wait()
-                .context("failed polling Codex JSON process")?;
-            if status.is_some() {
+                .context("failed polling Codex JSON process")?
+            {
+                Some(exit_status) => {
+                    status = Some(exit_status);
+                    true
+                }
+                None => false,
+            };
+            if observed_exit {
+                direct_child_exited = true;
+                // Reserve the Unix pid with WNOWAIT until the whole process
+                // group has been terminated. Windows uses its stable Job
+                // Object handle after try_wait.
+                process_tree.terminate(&mut child);
                 post_exit_deadline = Some(Instant::now() + post_exit_drain_timeout);
             }
         }
-        if status.is_some() && stdout_closed && stderr_tail.is_some() && stdin_complete {
+        if direct_child_exited && stdout_closed && stderr_tail.is_some() && stdin_complete {
             break;
         }
 
@@ -1120,12 +1331,11 @@ where
                         activity_timeout.as_secs()
                     )
                 });
-                process_tree.terminate(&mut child);
-                status = Some(
-                    child
-                        .wait()
-                        .context("failed waiting for timed-out Codex process")?,
-                );
+                status = Some(terminate_and_wait_for_supervised_child(
+                    &mut process_tree,
+                    &mut child,
+                    "failed waiting for timed-out Codex process",
+                )?);
                 break;
             }
             remaining
@@ -1137,18 +1347,20 @@ where
                     Ok(true) => last_activity = Instant::now(),
                     Ok(false) => {}
                     Err(error) => {
-                        process_tree.terminate(&mut child);
-                        let _ = child.wait();
+                        let _ = terminate_and_wait_for_supervised_child(
+                            &mut process_tree,
+                            &mut child,
+                            "failed waiting for Codex after assistant callback error",
+                        );
                         return Err(error);
                     }
                 }
                 if state.protocol_error.is_some() {
-                    process_tree.terminate(&mut child);
-                    status = Some(
-                        child
-                            .wait()
-                            .context("failed waiting for failed Codex turn")?,
-                    );
+                    status = Some(terminate_and_wait_for_supervised_child(
+                        &mut process_tree,
+                        &mut child,
+                        "failed waiting for failed Codex turn",
+                    )?);
                     break;
                 }
             }
@@ -1156,12 +1368,11 @@ where
                 state
                     .protocol_error
                     .get_or_insert_with(|| format!("failed reading Codex JSON output: {error}"));
-                process_tree.terminate(&mut child);
-                status = Some(
-                    child
-                        .wait()
-                        .context("failed waiting for Codex after stdout error")?,
-                );
+                status = Some(terminate_and_wait_for_supervised_child(
+                    &mut process_tree,
+                    &mut child,
+                    "failed waiting for Codex after stdout error",
+                )?);
                 break;
             }
             Ok(CodexRunnerMessage::StdoutClosed) => stdout_closed = true,
@@ -1169,12 +1380,11 @@ where
             Ok(CodexRunnerMessage::StdinComplete(Ok(()))) => stdin_complete = true,
             Ok(CodexRunnerMessage::StdinComplete(Err(error))) => {
                 state.protocol_error.get_or_insert(error);
-                process_tree.terminate(&mut child);
-                status = Some(
-                    child
-                        .wait()
-                        .context("failed waiting for Codex after stdin write error")?,
-                );
+                status = Some(terminate_and_wait_for_supervised_child(
+                    &mut process_tree,
+                    &mut child,
+                    "failed waiting for Codex after stdin write error",
+                )?);
                 break;
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -1193,16 +1403,14 @@ where
     // A signal can arrive just after the final polling iteration. Honor it
     // before reporting a completed turn so cancellation always reaches the
     // ledger and terminal result when the runner still owns the child tree.
-    if let Some(error) = codex_cancellation_error(&cancellation) {
+    if let Some(error) = supervised_stream_cancellation_error(&cancellation, "Codex turn") {
         state.protocol_error.get_or_insert(error);
         process_tree.terminate(&mut child);
     }
 
     let status = match status {
         Some(status) => status,
-        None => child
-            .wait()
-            .context("failed waiting for Codex JSON process")?,
+        None => wait_for_supervised_child(&mut child, "failed waiting for Codex JSON process")?,
     };
     let stderr_tail = stderr_tail.unwrap_or_default();
 
@@ -1222,17 +1430,17 @@ where
     if !state.emitted_assistant && state.protocol_error.is_none() {
         state.protocol_error = Some("Codex completed without an assistant message".to_string());
     }
+    if let Some(signal) = cancellation.finish()? {
+        state.protocol_error.get_or_insert_with(|| {
+            supervised_stream_cancellation_error_for_signal(signal, "Codex turn")
+        });
+    }
     let failed = !status.success() || state.protocol_error.is_some();
     let exit_code = if failed {
         status.code().filter(|code| *code != 0).or(Some(1))
     } else {
         status.code()
     };
-    // The direct child has reached a terminal status. Do not leave its former
-    // pid armed in the async signal handler during the final return/drop
-    // window, where a recycled pid could otherwise be targeted.
-    cancellation.disarm();
-
     Ok(CodexJsonRunResult {
         process: PtyRunResult {
             status: if failed { "failed" } else { "completed" },
@@ -1556,11 +1764,12 @@ pub fn run_piped_attached_captured(
 /// emits Coven's own `system.init` / `result` around the call). The command's
 /// argv is built from the harness declaration (`stream_args`, continuity,
 /// model, sandbox, and identity handling); this runner only spawns it and
-/// forwards each non-empty JSONL line unchanged to `out`.
+/// normalizes each frame's top-level Coven session id before writing to `out`.
 pub fn stream_harness<W: Write>(
     command: &HarnessCommand,
     forward_stdin: bool,
     harness_id: &str,
+    ledger_session_id: &str,
     out: &mut W,
 ) -> Result<i32> {
     stream_harness_with_program(
@@ -1569,8 +1778,135 @@ pub fn stream_harness<W: Write>(
         command.args.clone(),
         forward_stdin,
         harness_id,
+        ledger_session_id,
         out,
     )
+}
+
+enum NativeStreamMessage {
+    Line(String),
+    ReadError(String),
+    Closed,
+}
+
+fn spawn_native_stdout_reader(
+    stdout: std::process::ChildStdout,
+    sender: mpsc::Sender<NativeStreamMessage>,
+) {
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let message = match line {
+                Ok(line) => NativeStreamMessage::Line(line),
+                Err(error) => {
+                    let _ = sender.send(NativeStreamMessage::ReadError(error.to_string()));
+                    let _ = sender.send(NativeStreamMessage::Closed);
+                    return;
+                }
+            };
+            if sender.send(message).is_err() {
+                return;
+            }
+        }
+        let _ = sender.send(NativeStreamMessage::Closed);
+    });
+}
+
+fn spawn_native_stdin_forwarder(child_stdin: std::process::ChildStdin, stopped: Arc<AtomicBool>) {
+    #[cfg(unix)]
+    thread::spawn(move || {
+        use std::os::fd::AsRawFd;
+
+        let stdin = io::stdin();
+        let fd = stdin.as_raw_fd();
+        let mut child_stdin = child_stdin;
+        let mut buffer = [0_u8; 4096];
+        while !stopped.load(Ordering::Relaxed) {
+            let mut poll_fd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut poll_fd, 1, 50) };
+            if ready == 0 {
+                continue;
+            }
+            if ready < 0 {
+                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+            let count = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+            if count <= 0 {
+                break;
+            }
+            if stopped.load(Ordering::Relaxed)
+                || child_stdin.write_all(&buffer[..count as usize]).is_err()
+                || child_stdin.flush().is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    #[cfg(not(unix))]
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut handle = stdin.lock();
+        let mut child_stdin = child_stdin;
+        let mut buffer = String::new();
+        while !stopped.load(Ordering::Relaxed) {
+            buffer.clear();
+            match handle.read_line(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    if stopped.load(Ordering::Relaxed)
+                        || child_stdin.write_all(buffer.as_bytes()).is_err()
+                        || child_stdin.flush().is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn normalize_native_stream_line<W: Write>(
+    line: &str,
+    harness_id: &str,
+    ledger_session_id: &str,
+    out: &mut W,
+) -> Result<()> {
+    if line.trim().is_empty() {
+        return Ok(());
+    }
+    let mut frame: serde_json::Value = serde_json::from_str(line)
+        .with_context(|| format!("invalid JSON from {harness_id} native stream"))?;
+    let object = frame
+        .as_object_mut()
+        .with_context(|| format!("invalid JSON object from {harness_id} native stream"))?;
+    if !object.contains_key("harness_session_id") {
+        if let Some(native_session_id) = object
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+        {
+            object.insert(
+                "harness_session_id".to_string(),
+                serde_json::Value::String(native_session_id),
+            );
+        }
+    }
+    object.insert(
+        "session_id".to_string(),
+        serde_json::Value::String(ledger_session_id.to_string()),
+    );
+    serde_json::to_writer(&mut *out, &frame)
+        .with_context(|| format!("forwarding {harness_id} stdout"))?;
+    writeln!(out).with_context(|| format!("forwarding {harness_id} stdout"))?;
+    out.flush()
+        .with_context(|| format!("flushing {harness_id} stdout"))
 }
 
 fn stream_harness_with_program<W: Write>(
@@ -1579,9 +1915,11 @@ fn stream_harness_with_program<W: Write>(
     args: Vec<String>,
     forward_stdin: bool,
     harness_id: &str,
+    ledger_session_id: &str,
     out: &mut W,
 ) -> Result<i32> {
-    let mut child = std::process::Command::new(program)
+    let mut command = std::process::Command::new(program);
+    command
         .args(&args)
         .current_dir(cwd)
         .stdin(if forward_stdin {
@@ -1590,50 +1928,179 @@ fn stream_harness_with_program<W: Write>(
             Stdio::null()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .with_context(|| format!("failed to spawn {harness_id} in stream-json mode"))?;
+        .stderr(Stdio::inherit());
+    let cancellation_context = format!("{harness_id} native stream");
+    let mut cancellation = SupervisedStreamCancellationGuard::install(&cancellation_context)?;
+    if let Some(signal) = cancellation.cancelled_signal() {
+        let signal = cancellation.finish()?.unwrap_or(signal);
+        anyhow::bail!(supervised_stream_cancellation_error_for_signal(
+            signal,
+            &cancellation_context
+        ));
+    }
+    let (mut child, mut process_tree) = match spawn_strict_child_process_tree(&mut command)
+        .with_context(|| format!("failed to spawn {harness_id} in stream-json mode"))
+    {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            let cancellation_signal = cancellation.finish()?;
+            if let Some(signal) = cancellation_signal {
+                anyhow::bail!(supervised_stream_cancellation_error_for_signal(
+                    signal,
+                    &cancellation_context
+                ));
+            }
+            return Err(error);
+        }
+    };
+    if let Some(signal) = cancellation.cancelled_signal() {
+        process_tree.terminate(&mut child);
+        let _ = child.wait();
+        let signal = cancellation.finish()?.unwrap_or(signal);
+        anyhow::bail!(supervised_stream_cancellation_error_for_signal(
+            signal,
+            &cancellation_context
+        ));
+    }
 
-    if forward_stdin {
-        let Some(mut child_stdin) = child.stdin.take() else {
-            anyhow::bail!("stdin requested but {harness_id} has no piped stdin");
-        };
-        thread::spawn(move || {
-            let stdin = io::stdin();
-            let mut handle = stdin.lock();
-            let mut buf = String::new();
-            loop {
-                buf.clear();
-                match handle.read_line(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        if child_stdin.write_all(buf.as_bytes()).is_err() {
-                            break;
-                        }
-                        let _ = child_stdin.flush();
+    let child_stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            process_tree.terminate(&mut child);
+            let _ = child.wait();
+            anyhow::bail!("stdout requested but {harness_id} has no piped stdout");
+        }
+    };
+    let stdin_stopped = Arc::new(AtomicBool::new(false));
+    let child_stdin = if forward_stdin {
+        match child.stdin.take() {
+            Some(stdin) => Some(stdin),
+            None => {
+                process_tree.terminate(&mut child);
+                let _ = child.wait();
+                anyhow::bail!("stdin requested but {harness_id} has no piped stdin");
+            }
+        }
+    } else {
+        None
+    };
+
+    let (sender, receiver) = mpsc::channel();
+    spawn_native_stdout_reader(child_stdout, sender);
+    if let Some(child_stdin) = child_stdin {
+        spawn_native_stdin_forwarder(child_stdin, Arc::clone(&stdin_stopped));
+    }
+
+    let activation_signal = match cancellation.activate() {
+        Ok(signal) => signal,
+        Err(error) => {
+            stdin_stopped.store(true, Ordering::Relaxed);
+            process_tree.terminate(&mut child);
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+
+    let mut direct_child_exited = false;
+    #[cfg(unix)]
+    let status = None;
+    #[cfg(not(unix))]
+    let mut status = None;
+    let mut stdout_closed = false;
+    let mut post_exit_deadline = None;
+    let result = (|| -> Result<()> {
+        if let Some(signal) = activation_signal {
+            anyhow::bail!(supervised_stream_cancellation_error_for_signal(
+                signal,
+                &cancellation_context
+            ));
+        }
+        loop {
+            if let Some(error) =
+                supervised_stream_cancellation_error(&cancellation, &cancellation_context)
+            {
+                anyhow::bail!(error);
+            }
+
+            if !direct_child_exited {
+                #[cfg(unix)]
+                let observed_exit = poll_child_exit_without_reaping(&child)
+                    .with_context(|| format!("polling {harness_id}"))?;
+                #[cfg(not(unix))]
+                let observed_exit = match child
+                    .try_wait()
+                    .with_context(|| format!("polling {harness_id}"))?
+                {
+                    Some(exit_status) => {
+                        status = Some(exit_status);
+                        true
                     }
+                    None => false,
+                };
+                if observed_exit {
+                    direct_child_exited = true;
+                    // Unix's WNOWAIT keeps the pid reserved until the group is
+                    // gone. On Windows the Job Object is a stable tree handle,
+                    // so terminating it after try_wait is safe.
+                    process_tree.terminate(&mut child);
+                    post_exit_deadline = Some(Instant::now() + NATIVE_POST_EXIT_DRAIN_TIMEOUT);
                 }
             }
-        });
-    }
 
-    let Some(child_stdout) = child.stdout.take() else {
-        anyhow::bail!("stdout requested but {harness_id} has no piped stdout");
-    };
-    let reader = BufReader::new(child_stdout);
-    for line in reader.lines() {
-        let line = line.with_context(|| format!("reading {harness_id} stdout"))?;
-        if line.trim().is_empty() {
-            continue;
+            if direct_child_exited && stdout_closed {
+                break;
+            }
+            let timeout = post_exit_deadline
+                .map(|deadline| {
+                    deadline
+                        .checked_duration_since(Instant::now())
+                        .unwrap_or_default()
+                })
+                .unwrap_or(CODEX_CHILD_POLL_INTERVAL);
+            if direct_child_exited && timeout.is_zero() {
+                break;
+            }
+            if stdout_closed {
+                thread::sleep(timeout.min(CODEX_CHILD_POLL_INTERVAL));
+                continue;
+            }
+
+            match receiver.recv_timeout(timeout.min(CODEX_CHILD_POLL_INTERVAL)) {
+                Ok(NativeStreamMessage::Line(line)) => {
+                    normalize_native_stream_line(&line, harness_id, ledger_session_id, out)?;
+                }
+                Ok(NativeStreamMessage::ReadError(error)) => {
+                    anyhow::bail!("reading {harness_id} stdout: {error}");
+                }
+                Ok(NativeStreamMessage::Closed) => stdout_closed = true,
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    stdout_closed = true;
+                }
+            }
         }
-        writeln!(out, "{line}").with_context(|| format!("forwarding {harness_id} stdout"))?;
-        out.flush()
-            .with_context(|| format!("flushing {harness_id} stdout"))?;
-    }
+        Ok(())
+    })();
 
-    let status = child
+    stdin_stopped.store(true, Ordering::Relaxed);
+    if result.is_err() {
+        process_tree.terminate(&mut child);
+    }
+    let waited_status = child
         .wait()
-        .with_context(|| format!("waiting on {harness_id}"))?;
+        .with_context(|| format!("waiting on {harness_id}"));
+    let cancellation_signal = cancellation.finish()?;
+    if let Some(signal) = cancellation_signal {
+        anyhow::bail!(supervised_stream_cancellation_error_for_signal(
+            signal,
+            &cancellation_context
+        ));
+    }
+    result?;
+    let status = match status {
+        Some(status) => status,
+        None => waited_status?,
+    };
     Ok(status.code().unwrap_or(1))
 }
 
@@ -1715,7 +2182,7 @@ fn stream_harness_with_claude_args_and_permission_bypass<W: Write>(
     }
     args.extend(["--".to_string(), prompt.to_string()]);
 
-    stream_harness_with_program(program, cwd, args, forward_stdin, "claude", out)
+    stream_harness_with_program(program, cwd, args, forward_stdin, "claude", session_id, out)
 }
 
 #[allow(dead_code)]
@@ -3381,7 +3848,7 @@ exit 0
         assert!(outcome
             .error
             .as_deref()
-            .is_some_and(|error| error.contains("pipes remained open")));
+            .is_some_and(|error| error.contains("without an assistant message")));
         let pid = std::fs::read_to_string(temp_dir.path().join("descendant.pid"))?;
         let pid = pid.trim();
         let mut alive = true;
@@ -3553,10 +4020,9 @@ exit 7
             std::fs::read_to_string(temp_dir.path().join("args.txt"))?,
             "-p\n--output-format\nstream-json\n--verbose\n--session-id\nsession-123\n--\nhello prompt\n"
         );
-        assert_eq!(
-            String::from_utf8(out)?,
-            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"hello\"}]},\"session_id\":\"session-123\",\"stop_reason\":\"end_turn\"}\n"
-        );
+        let frame: serde_json::Value = serde_json::from_slice(&out)?;
+        assert_eq!(frame["session_id"], "session-123");
+        assert_eq!(frame["harness_session_id"], "session-123");
         Ok(())
     }
 
@@ -3572,7 +4038,7 @@ exit 7
             &fake_harness,
             r#"#!/bin/sh
 printf '%s\n' "$@" > args.txt
-printf '%s\n' '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"streamy"}]},"session_id":"session-123","stop_reason":"end_turn"}'
+printf '%s\n' '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"streamy","session_id":"nested-unchanged"}]},"session_id":"native-old","harness_session_id":"native-old","stop_reason":"end_turn"}'
 exit 0
 "#,
         )?;
@@ -3593,6 +4059,7 @@ exit 0
             ],
             false,
             "streamy",
+            "ledger-current",
             &mut out,
         )?;
 
@@ -3601,10 +4068,336 @@ exit 0
             std::fs::read_to_string(temp_dir.path().join("args.txt"))?,
             "--jsonl\n--resume\nsession-123\n--\nhello prompt\n"
         );
+        let frame: serde_json::Value = serde_json::from_slice(&out)?;
+        assert_eq!(frame["session_id"], "ledger-current");
+        assert_eq!(frame["harness_session_id"], "native-old");
         assert_eq!(
-            String::from_utf8(out)?,
-            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"streamy\"}]},\"session_id\":\"session-123\",\"stop_reason\":\"end_turn\"}\n"
+            frame["message"]["content"][0]["session_id"],
+            "nested-unchanged"
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_recorded_before_spawn_is_returned_by_checks_and_finish() -> Result<()> {
+        let cancellation = SupervisedStreamCancellationGuard::install("test stream")?;
+        cancel_supervised_stream(libc::SIGTERM);
+
+        assert_eq!(cancellation.cancelled_signal(), Some(libc::SIGTERM));
+        assert_eq!(cancellation.finish()?, Some(libc::SIGTERM));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_handler_has_no_process_group_side_effect_by_construction() {
+        let source = include_str!("pty_runner.rs");
+        assert!(
+            !source.contains(concat!("SUPERVISED_STREAM_", "PROCESS_GROUP")),
+            "the signal handler design must not retain a numeric process-group target"
+        );
+        let handler = source
+            .split_once("extern \"C\" fn cancel_supervised_stream")
+            .expect("cancellation handler exists")
+            .1
+            .split_once("/// Temporarily converts")
+            .expect("cancellation handler is followed by its guard documentation")
+            .0;
+        assert!(
+            !handler.contains("libc::kill"),
+            "the async signal handler must only record cancellation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_without_reaping_keeps_child_pid_reserved() -> Result<()> {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.arg("-c").arg("exit 0");
+        configure_child_process_tree_command(&mut command);
+        let mut child = command.spawn()?;
+        let pid = child.id() as libc::pid_t;
+
+        wait_for_child_exit_without_reaping(&child)?;
+
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "wait helper reaped the child before process-tree cleanup"
+        );
+        assert!(child.wait()?.success());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonblocking_wait_without_reaping_does_not_report_live_child_exited() -> Result<()> {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.arg("-c").arg("sleep 1");
+        configure_child_process_tree_command(&mut command);
+        let mut child = command.spawn()?;
+
+        assert!(
+            !poll_child_exit_without_reaping(&child)?,
+            "WNOHANG reported a live direct child as exited"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_guard_blocks_supervised_signals_for_spawned_helpers() -> Result<()> {
+        let cancellation = SupervisedStreamCancellationGuard::install("test stream")?;
+        let inherited_mask = thread::spawn(|| {
+            let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+            let result =
+                unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut mask) };
+            assert_eq!(result, 0);
+            [libc::SIGINT, libc::SIGTERM, libc::SIGHUP]
+                .map(|signal| unsafe { libc::sigismember(&mask, signal) })
+        })
+        .join()
+        .expect("signal-mask probe thread panicked");
+
+        assert_eq!(inherited_mask, [1, 1, 1]);
+        assert_eq!(cancellation.finish()?, None);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_stream_does_not_wait_for_stdout_inheriting_descendant() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir()?;
+        let fake_harness = temp_dir.path().join("stdout-descendant-stream");
+        std::fs::write(
+            &fake_harness,
+            r#"#!/bin/sh
+printf '%s\n' '{"type":"assistant","session_id":"native","message":{"role":"assistant","content":[]}}'
+sleep 3 &
+exit 17
+"#,
+        )?;
+        let mut permissions = std::fs::metadata(&fake_harness)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_harness, permissions)?;
+
+        let started = Instant::now();
+        let code = stream_harness_with_program(
+            fake_harness.to_str().unwrap(),
+            temp_dir.path(),
+            Vec::new(),
+            false,
+            "streamy",
+            "ledger-current",
+            &mut Vec::new(),
+        )?;
+
+        assert_eq!(code, 17);
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "native stream waited for a descendant-held stdout pipe"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_native_stream_cleans_closed_output_descendant() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir()?;
+        let fake_harness = temp_dir.path().join("successful-stream");
+        let descendant_pid_file = temp_dir.path().join("descendant.pid");
+        std::fs::write(
+            &fake_harness,
+            r#"#!/bin/sh
+sleep 30 </dev/null >/dev/null 2>&1 &
+printf '%s\n' "$!" > descendant.pid
+printf '%s\n' '{"type":"assistant","session_id":"native","message":{"role":"assistant","content":[]}}'
+exit 0
+"#,
+        )?;
+        let mut permissions = std::fs::metadata(&fake_harness)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_harness, permissions)?;
+
+        let code = stream_harness_with_program(
+            fake_harness.to_str().unwrap(),
+            temp_dir.path(),
+            Vec::new(),
+            false,
+            "streamy",
+            "ledger-current",
+            &mut Vec::new(),
+        )?;
+
+        assert_eq!(code, 0);
+        let descendant_pid: libc::pid_t = std::fs::read_to_string(descendant_pid_file)?
+            .trim()
+            .parse()?;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while unsafe { libc::kill(descendant_pid, 0) } == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            unsafe { libc::kill(descendant_pid, 0) },
+            -1,
+            "successful native stream left detached descendant {descendant_pid} alive"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_stream_malformed_json_terminates_and_reaps_harness() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir()?;
+        let fake_harness = temp_dir.path().join("fake-stream");
+        let pid_file = temp_dir.path().join("harness.pid");
+        std::fs::write(
+            &fake_harness,
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" > harness.pid\nprintf '%s\\n' 'not-json'\nsleep 30\n",
+        )?;
+        let mut permissions = std::fs::metadata(&fake_harness)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_harness, permissions)?;
+
+        let error = stream_harness_with_program(
+            fake_harness.to_str().unwrap(),
+            temp_dir.path(),
+            Vec::new(),
+            false,
+            "streamy",
+            "ledger-current",
+            &mut Vec::new(),
+        )
+        .expect_err("malformed native JSONL must fail");
+        assert!(format!("{error:#}").contains("invalid JSON"));
+
+        let harness_pid: libc::pid_t = std::fs::read_to_string(pid_file)?.trim().parse()?;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut reaped = false;
+        while Instant::now() < deadline {
+            if unsafe { libc::kill(harness_pid, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                reaped = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !reaped {
+            unsafe {
+                libc::kill(harness_pid, libc::SIGKILL);
+                libc::waitpid(harness_pid, std::ptr::null_mut(), 0);
+            }
+        }
+        assert!(reaped, "malformed JSON left harness {harness_pid} alive");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_stream_sigterm_returns_promptly_and_reaps_process_tree() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir()?;
+        let fake_harness = temp_dir.path().join("long-lived-stream");
+        let harness_pid_file = temp_dir.path().join("harness.pid");
+        let descendant_pid_file = temp_dir.path().join("descendant.pid");
+        std::fs::write(
+            &fake_harness,
+            r#"#!/bin/sh
+printf '%s\n' "$$" > harness.pid
+sleep 30 &
+printf '%s\n' "$!" > descendant.pid
+while :; do sleep 1; done
+"#,
+        )?;
+        let mut permissions = std::fs::metadata(&fake_harness)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_harness, permissions)?;
+
+        let signal_dir = temp_dir.path().to_path_buf();
+        let signaler = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                if signal_dir.join("harness.pid").exists()
+                    && signal_dir.join("descendant.pid").exists()
+                {
+                    let sent = unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+                    assert_eq!(sent, 0, "failed to signal test process");
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            panic!("native stream fixture did not start before signal deadline");
+        });
+
+        let started = Instant::now();
+        let error = stream_harness_with_program(
+            fake_harness.to_str().unwrap(),
+            temp_dir.path(),
+            Vec::new(),
+            false,
+            "streamy",
+            "ledger-current",
+            &mut Vec::new(),
+        )
+        .expect_err("SIGTERM must cancel a native stream");
+        signaler.join().expect("signal thread panicked");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "native stream cancellation was not prompt"
+        );
+        assert!(
+            format!("{error:#}").contains("streamy native stream cancelled by SIGTERM"),
+            "unexpected cancellation error: {error:#}"
+        );
+
+        let _signal_lock = SUPERVISED_STREAM_CANCELLATION_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut restored: libc::sigaction = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::sigaction(libc::SIGTERM, std::ptr::null(), &mut restored) },
+            0
+        );
+        assert_ne!(
+            restored.sa_sigaction, cancel_supervised_stream as *const () as usize,
+            "native stream runner did not restore the previous SIGTERM handler"
+        );
+
+        for (label, path) in [
+            ("harness", harness_pid_file),
+            ("descendant", descendant_pid_file),
+        ] {
+            let pid: libc::pid_t = std::fs::read_to_string(path)?.trim().parse()?;
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(
+                unsafe { libc::kill(pid, 0) },
+                -1,
+                "cancelled native stream {label} {pid} survived"
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+        }
         Ok(())
     }
 

@@ -167,7 +167,7 @@ fn stream_json_stdout_stays_jsonl_when_harness_spews_pty_noise() {
 
 #[cfg(unix)]
 #[test]
-fn codex_json_stream_normalizes_assistant_and_thread_id() {
+fn codex_json_stream_resumes_with_a_sibling_and_preserves_terminal_evidence() {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
@@ -183,7 +183,11 @@ fn codex_json_stream_normalizes_assistant_and_thread_id() {
         &fake_codex,
         r#"#!/bin/sh
 printf '%s\n' "$@" > args.txt
-printf '%s\n' '{"type":"thread.started","thread_id":"thread-unix-123"}'
+        thread_id=thread-unix-123
+        case " $* " in
+          *" resume "*) thread_id=thread-unix-456 ;;
+        esac
+        printf '%s\n' "{\"type\":\"thread.started\",\"thread_id\":\"$thread_id\"}"
 printf '%s\n' '{"type":"turn.started"}'
 printf '%s\n' '{"type":"item.completed","item":{"id":"item-1","type":"agent_message","text":"reply for stream client"}}'
 printf '%s\n' '{"type":"turn.completed"}'
@@ -259,6 +263,120 @@ printf '%s\n' '{"type":"turn.completed"}'
         "--model\nexec\nexec\n--json\n--skip-git-repo-check\n--color\nnever\n--\n--json\n",
         "Codex must put its JSON option after the real exec subcommand"
     );
+
+    let old_id = frames[0]["session_id"]
+        .as_str()
+        .expect("system.init carries the old ledger id")
+        .to_string();
+    let conn = rusqlite::Connection::open(coven_home.join("coven.sqlite3"))
+        .expect("failed to open Coven session ledger");
+    conn.execute(
+        "UPDATE sessions SET archived_at = ?2, updated_at = ?2 WHERE id = ?1",
+        rusqlite::params![old_id, "2026-08-03T20:00:00Z"],
+    )
+    .expect("failed to archive old fixture row");
+    let read_evidence = |id: &str| {
+        conn.query_row(
+            "SELECT status, exit_code, archived_at, created_at, updated_at, conversation_id
+             FROM sessions WHERE id = ?1",
+            [id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i32>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            },
+        )
+        .expect("session evidence should be readable")
+    };
+    let old_evidence = read_evidence(&old_id);
+
+    let resumed = Command::new(env!("CARGO_BIN_EXE_coven"))
+        .args([
+            "run",
+            "codex",
+            "--stream-json",
+            "--continue",
+            &old_id,
+            "--",
+            "follow-up",
+        ])
+        .current_dir(&project_root)
+        .env("COVEN_HOME", &coven_home)
+        .env("PATH", &path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to spawn resumed coven binary");
+    assert!(
+        resumed.status.success(),
+        "resumed Coven run failed: status={:?} stdout={} stderr={}",
+        resumed.status,
+        String::from_utf8_lossy(&resumed.stdout),
+        String::from_utf8_lossy(&resumed.stderr),
+    );
+    let resumed_frames: Vec<serde_json::Value> = String::from_utf8(resumed.stdout)
+        .expect("stdout not utf-8")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("Coven stdout must remain JSONL"))
+        .collect();
+    let sibling_id = resumed_frames[0]["session_id"]
+        .as_str()
+        .expect("resumed system.init carries a ledger id");
+    assert_ne!(sibling_id, old_id, "continuation must use a fresh row");
+    assert_eq!(
+        resumed_frames.last().expect("result frame")["session_id"],
+        sibling_id,
+        "init and result must identify the sibling row"
+    );
+    assert_eq!(
+        read_evidence(&old_id),
+        old_evidence,
+        "continuation must not rewrite terminal or archive evidence"
+    );
+    let sibling_evidence = read_evidence(sibling_id);
+    assert_eq!(sibling_evidence.0, "completed");
+    assert_eq!(sibling_evidence.1, Some(0));
+    assert_eq!(sibling_evidence.2, None, "the sibling starts unarchived");
+    assert_eq!(
+        sibling_evidence.5.as_deref(),
+        Some("thread-unix-123"),
+        "the sibling shares the stable conversation group"
+    );
+    assert!(
+        fs::read_to_string(project_root.join("args.txt"))
+            .expect("fake codex should record resumed argv")
+            .contains("resume\nthread-unix-123\n"),
+        "Codex must resume its native thread id"
+    );
+
+    let missing = Command::new(env!("CARGO_BIN_EXE_coven"))
+        .args([
+            "run",
+            "codex",
+            "--stream-json",
+            "--continue",
+            "missing-session",
+            "--",
+            "follow-up",
+        ])
+        .current_dir(&project_root)
+        .env("COVEN_HOME", &coven_home)
+        .env("PATH", &path)
+        .output()
+        .expect("failed to run unknown-target check");
+    assert!(!missing.status.success(), "unknown continuation must fail");
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("not found in local store"),
+        "unexpected unknown-target error: {}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
 }
 
 /// A Codex protocol failure is a failed Coven run even when the Codex wrapper
@@ -297,6 +415,7 @@ exit 0
     if let Some(existing) = std::env::var_os("PATH") {
         paths.extend(std::env::split_paths(&existing));
     }
+
     let path = std::env::join_paths(paths).expect("test PATH should be joinable");
     let out = Command::new(env!("CARGO_BIN_EXE_coven"))
         .args(["run", "codex", "--stream-json", "--", "fail once"])
@@ -340,6 +459,239 @@ exit 0
         .expect("failed session should remain in the ledger");
     assert_eq!(status, "failed");
     assert_eq!(exit_code, Some(1));
+}
+
+#[cfg(unix)]
+#[test]
+fn continuation_selects_and_accepts_only_the_requested_harness() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let coven_home = temp_dir.path().join("coven-home");
+    fs::create_dir_all(&coven_home).expect("failed to create coven home");
+    let project_root = temp_dir.path().join("project");
+    fs::create_dir_all(&project_root).expect("failed to create project root");
+    let fake_bin = temp_dir.path().join("bin");
+    fs::create_dir_all(&fake_bin).expect("failed to create fake bin dir");
+    let fake_codex = fake_bin.join("codex");
+    fs::write(&fake_codex, "#!/bin/sh\nexit 0\n").expect("failed to write fake codex");
+    let mut permissions = fs::metadata(&fake_codex).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_codex, permissions).unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(fake_bin).chain(
+            std::env::var_os("PATH")
+                .iter()
+                .flat_map(std::env::split_paths),
+        ),
+    )
+    .unwrap();
+
+    let seed = Command::new(env!("CARGO_BIN_EXE_coven"))
+        .args(["run", "codex", "--detach", "--", "seed"])
+        .current_dir(&project_root)
+        .env("COVEN_HOME", &coven_home)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(seed.status.success());
+    let conn = rusqlite::Connection::open(coven_home.join("coven.sqlite3")).unwrap();
+    let source_id: String = conn
+        .query_row("SELECT id FROM sessions LIMIT 1", [], |row| row.get(0))
+        .unwrap();
+    conn.execute(
+        "INSERT INTO sessions (
+             id, project_root, harness, title, status, created_at, updated_at
+         ) VALUES (
+             'newer-claude', ?1, 'claude', 'newer', 'completed',
+             '9999-01-01T00:00:00Z', '9999-01-01T00:00:00Z'
+         )",
+        [project_root.to_string_lossy().as_ref()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let automatic = Command::new(env!("CARGO_BIN_EXE_coven"))
+        .args(["run", "codex", "--continue", "--", "automatic"])
+        .current_dir(&project_root)
+        .env("COVEN_HOME", &coven_home)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(
+        automatic.status.success(),
+        "automatic continuation failed: {}",
+        String::from_utf8_lossy(&automatic.stderr)
+    );
+    let conn = rusqlite::Connection::open(coven_home.join("coven.sqlite3")).unwrap();
+    let automatic_group: String = conn
+        .query_row(
+            "SELECT conversation_id FROM sessions
+             WHERE id NOT IN (?1, 'newer-claude')",
+            [&source_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        automatic_group, source_id,
+        "automatic continuation must skip the newer other-harness row"
+    );
+    drop(conn);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_coven"))
+        .args(["run", "codex", "--continue", "newer-claude", "--", "resume"])
+        .current_dir(&project_root)
+        .env("COVEN_HOME", &coven_home)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("uses harness `claude`") && stderr.contains("requested harness `codex`"),
+        "unexpected mismatch error: {stderr}"
+    );
+    let conn = rusqlite::Connection::open(coven_home.join("coven.sqlite3")).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 3, "mismatch must not create another sibling row");
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_native_stream_uses_the_current_coven_ledger_id() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let coven_home = temp_dir.path().join("coven-home");
+    fs::create_dir_all(&coven_home).unwrap();
+    let project_root = temp_dir.path().join("project");
+    fs::create_dir_all(&project_root).unwrap();
+    let fake_bin = temp_dir.path().join("bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let fake_claude = fake_bin.join("claude");
+    fs::write(
+        &fake_claude,
+        r#"#!/bin/sh
+printf '%s\n' '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"reply","session_id":"nested-native"}]},"session_id":"native-claude-id","stop_reason":"end_turn"}'
+"#,
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&fake_claude).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_claude, permissions).unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(fake_bin).chain(
+            std::env::var_os("PATH")
+                .iter()
+                .flat_map(std::env::split_paths),
+        ),
+    )
+    .unwrap();
+
+    let first = Command::new(env!("CARGO_BIN_EXE_coven"))
+        .args(["run", "claude", "--stream-json", "--", "first"])
+        .current_dir(&project_root)
+        .env("COVEN_HOME", &coven_home)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+    let first_frames: Vec<serde_json::Value> = String::from_utf8(first.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let source_id = first_frames[0]["session_id"].as_str().unwrap().to_string();
+
+    let resumed = Command::new(env!("CARGO_BIN_EXE_coven"))
+        .args([
+            "run",
+            "claude",
+            "--stream-json",
+            "--continue",
+            &source_id,
+            "--",
+            "again",
+        ])
+        .current_dir(&project_root)
+        .env("COVEN_HOME", &coven_home)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(resumed.status.success());
+    let frames: Vec<serde_json::Value> = String::from_utf8(resumed.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let sibling_id = frames[0]["session_id"].as_str().unwrap();
+    assert_ne!(sibling_id, source_id);
+    for frame in &frames {
+        assert_eq!(frame["session_id"], sibling_id);
+    }
+    let native = frames
+        .iter()
+        .find(|frame| frame["type"] == "assistant")
+        .unwrap();
+    assert_eq!(native["harness_session_id"], "native-claude-id");
+    assert_eq!(
+        native["message"]["content"][0]["session_id"],
+        "nested-native"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn command_construction_failure_marks_created_row_failed() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let coven_home = temp_dir.path().join("coven-home");
+    fs::create_dir_all(&coven_home).unwrap();
+    let project_root = temp_dir.path().join("project");
+    fs::create_dir_all(&project_root).unwrap();
+    let fake_bin = temp_dir.path().join("bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let fake_codex = fake_bin.join("codex");
+    fs::write(&fake_codex, "#!/bin/sh\nexit 0\n").unwrap();
+    let mut permissions = fs::metadata(&fake_codex).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_codex, permissions).unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(fake_bin).chain(
+            std::env::var_os("PATH")
+                .iter()
+                .flat_map(std::env::split_paths),
+        ),
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_coven"))
+        .args([
+            "run",
+            "codex",
+            "--model",
+            "openai/bad;model",
+            "--",
+            "prompt",
+        ])
+        .current_dir(&project_root)
+        .env("COVEN_HOME", &coven_home)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("model id is unsafe"));
+    let conn = rusqlite::Connection::open(coven_home.join("coven.sqlite3")).unwrap();
+    let status: String = conn
+        .query_row("SELECT status FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(status, "failed");
 }
 
 /// Cancelling Coven itself must also reap the separate Unix Codex session

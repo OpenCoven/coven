@@ -3783,6 +3783,30 @@ fn exit_with_session_code(exit_code: i32, stream_json: bool) -> ! {
     std::process::exit(exit_code);
 }
 
+fn continuation_sibling_record(
+    source: &store::SessionRecord,
+    id: String,
+    now: String,
+) -> store::SessionRecord {
+    session_launch::new_session_record(session_launch::NewSessionParams {
+        id,
+        project_root: source.project_root.clone(),
+        harness: source.harness.clone(),
+        title: source.title.clone(),
+        status: DEFAULT_SESSION_STATUS.to_string(),
+        now,
+        conversation_id: Some(
+            source
+                .conversation_id
+                .clone()
+                .unwrap_or_else(|| source.id.clone()),
+        ),
+        familiar_id: source.familiar_id.clone(),
+        labels: source.labels.clone(),
+        visibility: Some(source.visibility.clone()),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_session(
     harness_id: &str,
@@ -3813,6 +3837,9 @@ fn run_session(
 
     if prompt_args.is_empty() && continue_session.is_none() {
         anyhow::bail!("nothing to do; pass a prompt, or use --continue [ID] to resume a session");
+    }
+    if detach && continue_session.is_some() {
+        anyhow::bail!("--detach and --continue are mutually exclusive");
     }
 
     let selected_harness =
@@ -3942,8 +3969,11 @@ fn run_session(
     let resumed_id: Option<String> = match continue_session {
         None => None,
         Some("") => {
-            let latest =
-                store::latest_active_for_project(&conn, project_root.to_str().unwrap_or(""))?;
+            let latest = store::latest_active_for_project(
+                &conn,
+                project_root.to_str().unwrap_or(""),
+                &selected_harness.id,
+            )?;
             if latest.is_none() {
                 anyhow::bail!(
                     "no active session to continue in {}; pass an explicit --continue <ID> or omit the flag",
@@ -3955,17 +3985,24 @@ fn run_session(
         Some(id) => Some(id.to_string()),
     };
 
-    let (record, is_resume) = if let Some(ref id) = resumed_id {
-        // Verify the session exists; reuse its row.
+    let (record, resumed_from) = if let Some(ref id) = resumed_id {
         let existing = match store::get_session(&conn, id)? {
             Some(record) => Some(record),
             None => store::get_latest_session_by_conversation_id(&conn, id)?,
         };
         match existing {
-            Some(mut r) => {
-                // Mutate updated_at to now; keep labels/visibility/title from the original.
-                r.updated_at = now.clone();
-                (r, true)
+            Some(source) => {
+                if source.harness != selected_harness.id {
+                    anyhow::bail!(
+                        "session `{id}` uses harness `{}` but requested harness `{}`; continue it with the matching harness",
+                        source.harness,
+                        selected_harness.id,
+                    );
+                }
+                (
+                    continuation_sibling_record(&source, Uuid::new_v4().to_string(), now.clone()),
+                    Some(source),
+                )
             }
             None => anyhow::bail!(
                 "session `{}` not found in local store; run `coven sessions --all` to list session ids",
@@ -3985,12 +4022,17 @@ fn run_session(
             labels,
             visibility: visibility.map(str::to_string),
         });
-        (r, false)
+        (r, None)
     };
+    let is_resume = resumed_from.is_some();
+    let resume_group_id = resumed_from.as_ref().map(|source| {
+        source
+            .conversation_id
+            .clone()
+            .unwrap_or_else(|| source.id.clone())
+    });
 
-    if !is_resume {
-        store::insert_session(&conn, &record)?;
-    }
+    store::insert_session(&conn, &record)?;
 
     if !stream_json {
         println!(
@@ -4001,10 +4043,6 @@ fn run_session(
         println!("  harness: {}", record.harness);
         println!("  cwd:     {}", cwd.display());
         println!("  title:   {}", record.title);
-    }
-
-    if detach && is_resume {
-        anyhow::bail!("--detach and --continue are mutually exclusive");
     }
 
     let stream_started = std::time::Instant::now();
@@ -4083,7 +4121,10 @@ fn run_session(
         let mut handle = stdout.lock();
         let stream_conversation_hint = if is_resume {
             harness::ConversationHint::Resume {
-                id: record.id.clone(),
+                id: resume_group_id
+                    .as_ref()
+                    .expect("resume group exists")
+                    .clone(),
             }
         } else {
             harness::ConversationHint::Init {
@@ -4108,6 +4149,7 @@ fn run_session(
                 &command,
                 stream_json_input,
                 &selected_harness.id,
+                &record.id,
                 &mut handle,
             )
         });
@@ -4182,17 +4224,8 @@ fn run_session(
     let conversation_hint = if is_resume {
         // Cave historically resumes through Coven's stable ledger id. Codex
         // requires its own thread id, which we capture from `thread.started`
-        // and persist on the ledger row after the first turn. Accepting either
-        // form above keeps existing clients compatible while direct callers
-        // may pass the native thread id too.
-        let resume_id = if selected_harness.id == "codex" {
-            record
-                .conversation_id
-                .clone()
-                .unwrap_or_else(|| record.id.clone())
-        } else {
-            record.id.clone()
-        };
+        // and persist as the conversation group after the first turn.
+        let resume_id = resume_group_id.expect("resume group exists");
         Some(harness::ConversationHint::Resume { id: resume_id })
     } else {
         None
@@ -4220,7 +4253,7 @@ fn run_session(
             conversation_hint.as_ref(),
             familiar_for_args,
             launch_options,
-        )?
+        )
     } else {
         pty_runner::build_harness_command_with_conversation(
             &selected_harness.id,
@@ -4230,7 +4263,31 @@ fn run_session(
             conversation_hint.as_ref(),
             familiar_for_args,
             launch_options,
-        )?
+        )
+    };
+    let command = match command {
+        Ok(command) => command,
+        Err(error) => {
+            store::update_session_status(
+                &conn,
+                &record.id,
+                FAILED_SESSION_STATUS,
+                None,
+                &current_timestamp(),
+            )?;
+            if stream_json {
+                emit_stream_event(&stream_json::Event::Result(stream_json::RunResult {
+                    subtype: "error_during_execution".into(),
+                    duration_ms: stream_started.elapsed().as_millis() as u64,
+                    is_error: true,
+                    num_turns: 1,
+                    session_id: record.id.clone(),
+                    harness_session_id: None,
+                    error: Some(format!("{error:#}")),
+                }))?;
+            }
+            return Err(error);
+        }
     };
     if stream_json && selected_harness.id == "codex" {
         let output_session_id = record.id.clone();
@@ -4270,13 +4327,15 @@ fn run_session(
                 return Err(error);
             }
         };
-        if let Some(thread_id) = outcome.harness_session_id.as_deref() {
-            store::update_session_conversation_id(
-                &conn,
-                &record.id,
-                thread_id,
-                &current_timestamp(),
-            )?;
+        if !is_resume {
+            if let Some(thread_id) = outcome.harness_session_id.as_deref() {
+                store::update_session_conversation_id(
+                    &conn,
+                    &record.id,
+                    thread_id,
+                    &current_timestamp(),
+                )?;
+            }
         }
         let is_error =
             outcome.error.is_some() || outcome.process.exit_code.is_some_and(|code| code != 0);
@@ -5471,6 +5530,47 @@ mod tests {
         let missing = resolve_session_ref(&conn, "zzzz").unwrap_err();
         assert!(missing.to_string().contains("coven sessions --all"));
         Ok(())
+    }
+
+    #[test]
+    fn continuation_sibling_preserves_terminal_source_rows() {
+        for status in ["completed", "failed", "killed", "orphaned"] {
+            let old = store::SessionRecord {
+                id: format!("{status}-old"),
+                project_root: "/repo".to_string(),
+                harness: "claude".to_string(),
+                title: "Original title".to_string(),
+                status: status.to_string(),
+                exit_code: Some(17),
+                archived_at: Some("2026-08-01T00:00:00Z".to_string()),
+                created_at: "2026-07-31T00:00:00Z".to_string(),
+                updated_at: "2026-08-01T00:00:00Z".to_string(),
+                conversation_id: None,
+                familiar_id: Some("sage".to_string()),
+                labels: vec!["kept".to_string()],
+                visibility: "workspace".to_string(),
+                external: false,
+                transcript_path: Some("/repo/transcript.log".to_string()),
+            };
+            let snapshot = old.clone();
+
+            let sibling = continuation_sibling_record(
+                &old,
+                format!("{status}-new"),
+                "2026-08-03T00:00:00Z".to_string(),
+            );
+
+            assert_eq!(old, snapshot, "{status} source evidence changed");
+            assert_eq!(sibling.id, format!("{status}-new"));
+            assert_eq!(sibling.status, DEFAULT_SESSION_STATUS);
+            assert_eq!(sibling.exit_code, None);
+            assert_eq!(sibling.archived_at, None);
+            assert_eq!(sibling.conversation_id.as_deref(), Some(old.id.as_str()));
+            assert_eq!(sibling.title, old.title);
+            assert_eq!(sibling.familiar_id, old.familiar_id);
+            assert_eq!(sibling.labels, old.labels);
+            assert_eq!(sibling.visibility, old.visibility);
+        }
     }
 
     #[test]
