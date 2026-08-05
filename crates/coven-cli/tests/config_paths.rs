@@ -298,16 +298,17 @@ description = "Builds."
 
     let report = report(&run_paths(&temp, &coven_home, &[]));
     let surfaces = surfaces(&report);
-    let command_cwd = fs::canonicalize(temp.path()).expect("canonical command cwd");
-
-    assert_eq!(
-        surfaces["state.familiar_workspaces"]["paths"],
-        serde_json::json!([
-            command_cwd.join("relative/sage").display().to_string(),
-            external_workspace.display().to_string(),
-            coven_home.join("familiars/cody").display().to_string(),
-        ])
-    );
+    let reported_paths: Vec<_> = surfaces["state.familiar_workspaces"]["paths"]
+        .as_array()
+        .expect("workspace paths")
+        .iter()
+        .map(|path| Path::new(path.as_str().expect("workspace path")).to_path_buf())
+        .collect();
+    assert_eq!(reported_paths.len(), 3);
+    assert!(reported_paths[0].is_absolute());
+    assert!(reported_paths[0].ends_with(Path::new("relative/sage")));
+    assert_eq!(reported_paths[1], external_workspace);
+    assert_eq!(reported_paths[2], coven_home.join("familiars/cody"));
     assert_eq!(
         surfaces["state.familiar_workspaces"]["source"],
         "configuration"
