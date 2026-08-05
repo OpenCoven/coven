@@ -3518,7 +3518,12 @@ fn run_scheduled_maintenance_with_config_and_free_disk(
 
         // Convergence loop keeps startup backlog from stalling one minute behind
         // while still enforcing a predictable per-tick upper bound.
-        if raw_batch < MAINTENANCE_ARTIFACT_BATCH_SIZE && event_batch < MAINTENANCE_EVENT_BATCH_SIZE
+        // The prune helpers report rows deleted as `usize`; the batch bounds are
+        // `i64` because they are bound directly to SQL `LIMIT`. Compare in `i64`
+        // rather than widening the constants, so the value handed to SQLite and
+        // the value compared here stay the same type.
+        if (raw_batch as i64) < MAINTENANCE_ARTIFACT_BATCH_SIZE
+            && (event_batch as i64) < MAINTENANCE_EVENT_BATCH_SIZE
         {
             break;
         }
@@ -3565,7 +3570,9 @@ pub fn storage_health(coven_home: &Path) -> Result<StorageHealth> {
         .with_context(|| format!("failed to inspect free disk for {}", coven_home.display()))?;
     let config =
         privacy::load_with_settings(coven_home, crate::settings::cached()).unwrap_or_default();
-    let oldest_retained_event_at = conn
+    // `MIN(created_at)` is NULL on an empty ledger, so the column type has to be
+    // stated: `row.get` cannot infer `Option<String>` from the comparison below.
+    let oldest_retained_event_at: Option<String> = conn
         .query_row("SELECT MIN(created_at) FROM events", [], |row| row.get(0))
         .context("failed to read oldest retained event")?;
     let retention_cutoff = retention_cutoff(
