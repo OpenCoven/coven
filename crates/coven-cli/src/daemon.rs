@@ -2158,21 +2158,7 @@ fn start_store_maintenance_scheduler(coven_home: &Path) -> Result<()> {
             // The store helper owns the bounded convergence loop so one
             // scheduler tick cannot multiply the configured batch budget.
             match crate::store::run_scheduled_maintenance(&home, &now) {
-                Ok(_) => {
-                    let store_path = home.join("coven.sqlite3");
-                    match crate::store::open_initialized_store(&store_path).and_then(|conn| {
-                        crate::store::refresh_storage_health_snapshot_from_connection(
-                            &home, &conn, None,
-                        )
-                    }) {
-                        Ok(()) => {}
-                        Err(error) => {
-                            let details =
-                                format!("storage health snapshot refresh failed: {error:#}");
-                            record_store_maintenance_failure(&home, &details);
-                        }
-                    }
-                }
+                Ok(report) => refresh_storage_health_after_maintenance(&home, &report),
                 Err(error) => {
                     let details = format!("store maintenance pass failed: {error:#}");
                     record_store_maintenance_failure(&home, &details);
@@ -2181,6 +2167,26 @@ fn start_store_maintenance_scheduler(coven_home: &Path) -> Result<()> {
         })
         .context("failed to spawn store maintenance scheduler")?;
     Ok(())
+}
+
+fn refresh_storage_health_after_maintenance(
+    coven_home: &Path,
+    report: &crate::store::ScheduledMaintenanceReport,
+) {
+    if report.blocked_by_free_disk {
+        return;
+    }
+
+    let store_path = coven_home.join("coven.sqlite3");
+    match crate::store::open_initialized_store(&store_path).and_then(|conn| {
+        crate::store::refresh_storage_health_snapshot_from_connection(coven_home, &conn, None)
+    }) {
+        Ok(()) => {}
+        Err(error) => {
+            let details = format!("storage health snapshot refresh failed: {error:#}");
+            record_store_maintenance_failure(coven_home, &details);
+        }
+    }
 }
 
 fn record_store_maintenance_failure(coven_home: &Path, details: &str) {
@@ -5780,6 +5786,27 @@ mod tests {
             health.last_maintenance_error.as_deref(),
             Some("storage health unavailable")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn blocked_maintenance_report_skips_store_refresh() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let report = crate::store::ScheduledMaintenanceReport {
+            raw_artifacts_pruned: 0,
+            events_pruned: 0,
+            checkpoint_ran: false,
+            blocked_by_free_disk: true,
+        };
+
+        refresh_storage_health_after_maintenance(temp_dir.path(), &report);
+
+        for file_name in ["coven.sqlite3", "coven.sqlite3-wal", "coven.sqlite3-shm"] {
+            assert!(
+                !temp_dir.path().join(file_name).exists(),
+                "blocked maintenance must not create {file_name}"
+            );
+        }
         Ok(())
     }
 
