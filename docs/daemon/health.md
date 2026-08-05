@@ -52,7 +52,10 @@ keeping up. `"pressured"` means one or more raw PTY chunks were rejected after
 the bounded queue filled; inspect `droppedOutputEvents` and
 `droppedOutputBytes`. `"failed"` means the writer could not commit, and
 `lastError` carries the diagnostic. Lifecycle events are never dropped for
-queue pressure.
+queue pressure. The global `droppedOutputEvents` and `droppedOutputBytes`
+counters remain visible here. Each contiguous pressure episode later appears in
+the affected session as one ordered `output_truncated` event, inserted before
+the next accepted event.
 
 The same response includes `storage` health. Its `writerBacklogEvents` and
 `writerBacklogBytes` fields mirror the live `eventWriter` queue snapshot, while

@@ -83,9 +83,14 @@ If the daemon metadata is unavailable, `daemon` may be `null`. The `hub` block r
 `eventWriter` is present for the daemon-owned live-session runtime. Its
 `state` is `healthy`, `pressured`, or `failed`. A pressured writer reports raw
 output that could not enter the byte-bounded queue; lifecycle, tool, error, and
-exit events reserve capacity and are not dropped for pressure. A failed writer
-includes `lastError`; clients should surface it as degraded persistence rather
-than treating the daemon's liveness as successful event durability.
+exit events reserve capacity and are not dropped for pressure. Raw output is
+the only lossy class. Each contiguous pressure episode produces one ordered
+`output_truncated` event for the affected session, inserted immediately before
+that session's next accepted event; the marker's `created_at` is the first
+rejected chunk timestamp. Global writer counters remain in the health payload.
+A failed writer includes `lastError`; clients should surface it as degraded
+persistence rather than treating the daemon's liveness as successful event
+durability.
 
 ### Capability fields
 
@@ -573,7 +578,15 @@ Marks an externally-registered session finished. The daemon updates the session 
   "events": [
     {
       "seq": 42,
-      "id": "event-uuid",
+      "id": "event-uuid-a",
+      "session_id": "session-uuid",
+      "kind": "output_truncated",
+      "payload_json": "{\"droppedEvents\":3,\"droppedBytes\":128}",
+      "created_at": "2026-05-09T06:43:09Z"
+    },
+    {
+      "seq": 43,
+      "id": "event-uuid-b",
       "session_id": "session-uuid",
       "kind": "output",
       "payload_json": "{\"data\":\"hello\"}",
@@ -581,7 +594,7 @@ Marks an externally-registered session finished. The daemon updates the session 
     }
   ],
   "nextCursor": {
-    "afterSeq": 42
+    "afterSeq": 43
   },
   "hasMore": false
 }
@@ -589,7 +602,9 @@ Marks an externally-registered session finished. The daemon updates the session 
 
 `nextCursor` is `null` when there are no events. `hasMore` is `true` when a `limit` was applied and more events may exist.
 
-`payload_json` is the redacted preview payload used by clients. Raw sensitive artifacts are never included in this envelope.
+`payload_json` is the redacted preview payload used by clients. Raw sensitive artifacts are never included in this envelope. `output_truncated` is additive and ordered: it appears in the session event stream before the next accepted event for the same session, and it uses `{"droppedEvents": <u64>, "droppedBytes": <u64>}` with `droppedBytes` counting rejected UTF-8 payload bytes only.
+
+Adjacent accepted output callbacks for the same session may coalesce into one `output` event, and that event's `created_at` is the first accepted callback timestamp.
 
 ## Log preview shape (`v1`)
 

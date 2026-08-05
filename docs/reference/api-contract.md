@@ -84,7 +84,9 @@ GET /api/v1/health
 
 When present, `eventWriter.state` is `healthy`, `pressured`, or `failed`.
 Pressure reports explicitly rejected raw output; lifecycle and terminal events
-reserve queue capacity and are never discarded for queue pressure.
+reserve queue capacity and are never discarded for queue pressure. Each
+contiguous pressure episode yields one ordered `output_truncated` event in the
+affected session stream, inserted before the next accepted event.
 
 If a client requires a capability the daemon does not advertise, the client should fail loudly with a remediation hint (`upgrade Coven to >= N`).
 
