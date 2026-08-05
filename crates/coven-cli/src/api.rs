@@ -6806,6 +6806,25 @@ mod tests {
     }
 
     #[test]
+    fn health_does_not_create_store_files_in_writable_empty_home() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let writable_probe = temp_dir.path().join("writable-probe");
+        std::fs::write(&writable_probe, "probe")?;
+        std::fs::remove_file(writable_probe)?;
+
+        let response = handle_request("GET", "/health", temp_dir.path(), None)?;
+
+        assert_eq!(response.status, 200);
+        for file_name in ["coven.sqlite3", "coven.sqlite3-wal", "coven.sqlite3-shm"] {
+            assert!(
+                !temp_dir.path().join(file_name).exists(),
+                "{file_name} must not be created by health"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn health_uses_one_live_writer_snapshot_for_both_surfaces() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let response = handle_request_with_runtime(

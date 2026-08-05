@@ -173,12 +173,20 @@ pub(crate) fn apply_redispatch_outcome(
 }
 
 pub fn hub_health_summary(coven_home: &Path) -> Result<Value> {
-    let conn = store::open_store(&store_path(coven_home))?;
+    let conn = store::open_existing_store_read_only(&store_path(coven_home))?
+        .context("Coven store does not exist")?;
     let nodes = store::list_nodes(&conn)?;
     let available = nodes.iter().filter(|node| node.available).count();
+    let hub_id: String = conn
+        .query_row(
+            "SELECT value FROM store_meta WHERE key = ?1",
+            [HUB_ID_META_KEY],
+            |row| row.get(0),
+        )
+        .context("failed to read hub id")?;
     Ok(json!({
         "role": HUB_ROLE,
-        "hubId": hub_id(&conn)?,
+        "hubId": hub_id,
         "nodesTotal": nodes.len(),
         "nodesAvailable": available,
     }))
