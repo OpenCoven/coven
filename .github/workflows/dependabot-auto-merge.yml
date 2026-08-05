@@ -36,7 +36,7 @@ jobs:
         uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
         with:
           alert-lookup: true
-          github-token: ${{ secrets.DEPENDABOT_ALERTS_TOKEN }}
+          github-token: ${{ secrets.DEPENDABOT_ALERTS_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Enable auto-merge for security updates
         if: ${{ steps.meta.outputs.ghsa-id != '' && steps.meta.outputs.alert-state == 'OPEN' }}
