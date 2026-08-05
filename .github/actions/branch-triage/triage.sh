@@ -182,7 +182,10 @@ for branch in "${MERGED_LIST[@]}" "${SUPERSEDED_LIST[@]}"; do
 done
 
 # Prune gone tracking refs
-git remote prune origin -q
+# `git remote prune` has no `-q`; it exits 129 on the unknown switch and, under
+# `set -e`, takes the whole run with it. `git fetch --prune` does accept `-q`
+# and prunes the same refs.
+git fetch origin --prune -q
 git branch -v | grep '\[gone\]' | awk '{print $1}' | xargs -r git branch -D 2>/dev/null || true
 
 # ── Step 4 — REVIEW branches — report, do not touch ──────────────────────────
