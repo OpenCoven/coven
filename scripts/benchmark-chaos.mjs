@@ -464,9 +464,9 @@ export async function runConcurrencyScenario({ binary, root, concurrency, enviro
       observing = false;
       await observation;
     }
-    runtimeSamples.push(await fullRuntimeSnapshot({ binary, covenHome, env, socketPath }));
     const completedAt = process.hrtime.bigint();
     const elapsedMs = Number(completedAt - startedAt) / 1_000_000;
+    runtimeSamples.push(await fullRuntimeSnapshot({ binary, covenHome, env, socketPath }));
 
     const cancellationStartedAt = process.hrtime.bigint();
     await Promise.all(

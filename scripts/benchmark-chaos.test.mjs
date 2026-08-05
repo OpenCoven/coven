@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import {
@@ -249,5 +250,13 @@ test('scenario timeout messages redact fixture paths from the original error', a
       fixtureRoot: '/fixture/private'
     }),
     'sessions_32: connect ENOENT <fixture>/daemon.sock — status=running events=[none]'
+  );
+});
+
+test('closes the throughput timing window before diagnostic sampling', async () => {
+  const source = await readFile(new URL('./benchmark-chaos.mjs', import.meta.url), 'utf8');
+  assert.match(
+    source,
+    /const completedAt = process\.hrtime\.bigint\(\);\n\s+const elapsedMs = .*;\n\s+runtimeSamples\.push\(await fullRuntimeSnapshot/
   );
 });
