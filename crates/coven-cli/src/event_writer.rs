@@ -15,7 +15,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, ErrorCode};
 use serde::Serialize;
 use serde_json::json;
 use uuid::Uuid;
@@ -27,6 +27,8 @@ const RESERVED_CRITICAL_BYTES: usize = 128 * 1024;
 const EVENT_OVERHEAD_BYTES: usize = 512;
 const MAX_BATCH_EVENTS: usize = 64;
 const COALESCE_WINDOW: Duration = Duration::from_millis(12);
+const SQLITE_LOCK_COMMIT_ATTEMPTS: usize = 4;
+const SQLITE_LOCK_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -303,7 +305,11 @@ fn run_worker(
     loop {
         let batch = take_batch(&shared);
         let bytes: usize = batch.iter().map(|item| item.bytes).sum();
-        let result = commit_batch(&mut conn, &coven_home, &batch);
+        let result = retry_transient_sqlite_lock(
+            || commit_batch(&mut conn, &coven_home, &batch),
+            SQLITE_LOCK_COMMIT_ATTEMPTS,
+            SQLITE_LOCK_RETRY_DELAY,
+        );
         match result {
             Ok(committed) => {
                 release_capacity(&shared, batch.len(), bytes);
@@ -328,6 +334,33 @@ fn run_worker(
             }
         }
     }
+}
+
+fn retry_transient_sqlite_lock<T>(
+    mut operation: impl FnMut() -> Result<T>,
+    attempts: usize,
+    retry_delay: Duration,
+) -> Result<T> {
+    assert!(attempts > 0, "SQLite retry attempts must be non-zero");
+    for attempt in 0..attempts {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) if is_transient_sqlite_lock(&error) && attempt + 1 < attempts => {
+                thread::sleep(retry_delay);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("SQLite retry loop either succeeds or returns its final error")
+}
+
+fn is_transient_sqlite_lock(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<rusqlite::Error>()
+            .and_then(rusqlite::Error::sqlite_error_code)
+            .is_some_and(|code| matches!(code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked))
+    })
 }
 
 fn take_batch(shared: &Arc<Shared>) -> Vec<QueuedEvent> {
@@ -553,6 +586,91 @@ mod tests {
         }))?;
 
         assert_eq!(health.queued_events, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn transient_sqlite_lock_is_retried() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let path = home.path().join("retry.sqlite");
+        let locker = Connection::open(&path)?;
+        locker.execute_batch(
+            "CREATE TABLE events (id INTEGER PRIMARY KEY);
+             BEGIN IMMEDIATE;
+             INSERT INTO events DEFAULT VALUES;",
+        )?;
+        let contender = Connection::open(&path)?;
+        contender.busy_timeout(Duration::ZERO)?;
+        let mut attempts = 0;
+
+        let inserted = retry_transient_sqlite_lock(
+            || {
+                attempts += 1;
+                if attempts == 2 {
+                    locker.execute_batch("ROLLBACK")?;
+                }
+                contender
+                    .execute("INSERT INTO events DEFAULT VALUES", [])
+                    .map_err(Into::into)
+            },
+            3,
+            Duration::ZERO,
+        )?;
+
+        assert_eq!(inserted, 1);
+        assert_eq!(attempts, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn non_lock_sqlite_error_is_not_retried() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        let mut attempts = 0;
+
+        let error = retry_transient_sqlite_lock(
+            || {
+                attempts += 1;
+                conn.execute("INSERT INTO missing_table DEFAULT VALUES", [])
+                    .map_err(Into::into)
+            },
+            3,
+            Duration::ZERO,
+        )
+        .unwrap_err();
+
+        assert_eq!(attempts, 1);
+        assert!(format!("{error:#}").contains("no such table"));
+        Ok(())
+    }
+
+    #[test]
+    fn persistent_sqlite_lock_stops_after_attempt_limit() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let path = home.path().join("persistent-lock.sqlite");
+        let locker = Connection::open(&path)?;
+        locker.execute_batch(
+            "CREATE TABLE events (id INTEGER PRIMARY KEY);
+             BEGIN IMMEDIATE;
+             INSERT INTO events DEFAULT VALUES;",
+        )?;
+        let contender = Connection::open(&path)?;
+        contender.busy_timeout(Duration::ZERO)?;
+        let mut attempts = 0;
+
+        let error = retry_transient_sqlite_lock(
+            || {
+                attempts += 1;
+                contender
+                    .execute("INSERT INTO events DEFAULT VALUES", [])
+                    .map_err(Into::into)
+            },
+            3,
+            Duration::ZERO,
+        )
+        .unwrap_err();
+
+        assert_eq!(attempts, 3);
+        assert!(is_transient_sqlite_lock(&error));
         Ok(())
     }
 

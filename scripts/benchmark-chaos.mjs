@@ -1,6 +1,6 @@
-import { chmod, mkdtemp, mkdir, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -24,6 +24,18 @@ const POLL_DELAY_MS = 25;
 // budget exists only to bound a hang; it does not affect the reported metric,
 // which is measured from the clock, not from the number of polls.
 const LAUNCH_POLL_ATTEMPTS = 2400;
+const EVENT_WRITER_DIAGNOSTIC_FIELDS = [
+  'state',
+  'queuedEvents',
+  'queuedBytes',
+  'capacityBytes',
+  'droppedOutputEvents',
+  'droppedOutputBytes',
+  'connectionOpens',
+  'transactions',
+  'committedEvents',
+  'lastError'
+];
 
 function optionValue(args, index, option) {
   const arg = args[index];
@@ -133,11 +145,8 @@ async function fixtureEnvironment(root, environment) {
   const covenHome = join(root, 'home');
   await mkdir(join(covenHome, 'user-home'), { recursive: true });
   const harness = join(bin, 'codex');
-  await writeFile(
-    harness,
-    '#!/bin/sh\nprintf "COVEN_BENCHMARK_READY\\n"\ntrap "exit 0" INT TERM\nwhile :; do sleep 60; done\n',
-    { mode: 0o700 }
-  );
+  const markerPath = join(root, 'fixture-executions.log');
+  await writeFile(harness, fixtureHarnessScript(), { mode: 0o700 });
   // `writeFile`'s `mode` applies only when the file is created and is masked by
   // the process umask, so it cannot be relied on to leave the bit set.  A
   // harness without it spawns nothing, no output event is ever recorded, and
@@ -146,7 +155,19 @@ async function fixtureEnvironment(root, environment) {
   await chmod(harness, 0o700);
   await assertExecutable(harness);
   const env = isolatedEnvironment(covenHome, environment);
-  return { covenHome, env: { ...env, PATH: `${bin}:${env.PATH ?? ''}` } };
+  return {
+    covenHome,
+    markerPath,
+    env: {
+      ...env,
+      COVEN_BENCHMARK_MARKERS: markerPath,
+      PATH: `${bin}:${env.PATH ?? ''}`
+    }
+  };
+}
+
+export function fixtureHarnessScript() {
+  return '#!/bin/sh\nprintf "started\\n" >> "$COVEN_BENCHMARK_MARKERS"\nprintf "COVEN_BENCHMARK_READY\\n"\ntrap "exit 0" INT TERM\nwhile :; do sleep 60; done\n';
 }
 
 async function assertExecutable(path) {
@@ -156,23 +177,105 @@ async function assertExecutable(path) {
   }
 }
 
-/// Describe what the session actually produced, so a wait timeout distinguishes
-/// "the harness never started" from "the harness was slow".
-async function describeSession(socketPath, sessionId) {
+function redactedDiagnosticText(value, redactions) {
+  let text = String(value).replace(/[\u0000-\u001F\u007F]+/g, ' ').trim();
+  for (const path of [...redactions].sort((left, right) => right.length - left.length)) {
+    if (path) text = text.replaceAll(path, '<fixture>');
+  }
+  return text.slice(0, 240);
+}
+
+function boundedDiagnosticValue(value, redactions) {
+  if (value === null) return 'null';
+  if (value === undefined) return 'unavailable';
+  const text = redactedDiagnosticText(value, redactions);
+  return typeof value === 'string' ? JSON.stringify(text) : text;
+}
+
+export function formatEventWriterHealth(health, redactions = []) {
+  const writer = health?.eventWriter;
+  if (!writer || typeof writer !== 'object') return 'eventWriter=unavailable';
+  const fields = EVENT_WRITER_DIAGNOSTIC_FIELDS.map(
+    (field) => {
+      const value =
+        field === 'state' && /^[a-z_]+$/.test(writer[field] ?? '')
+          ? writer[field]
+          : boundedDiagnosticValue(writer[field], redactions);
+      return `${field}=${value}`;
+    }
+  );
+  return `eventWriter={${fields.join(' ')}}`;
+}
+
+async function fixtureExecutionSummary(markerPath, expectedExecutions, read) {
+  try {
+    const markers = await read(markerPath, 'utf8');
+    const count = markers.split('\n').filter((line) => line === 'started').length;
+    return `fixtureExecutions=${count}/${expectedExecutions}`;
+  } catch (error) {
+    if (error?.code === 'ENOENT') return `fixtureExecutions=0/${expectedExecutions}`;
+    return `fixtureExecutions=unavailable/${expectedExecutions}`;
+  }
+}
+
+/// Describe each boundary involved in first output, so a timeout distinguishes
+/// child execution, PTY/event ingestion, writer pressure, and read-path failure.
+export async function describeScenarioFailure({
+  socketPath,
+  sessionId,
+  markerPath,
+  expectedExecutions,
+  request = socketRequest,
+  read = readFile
+}) {
+  let sessionEvidence;
   try {
     const [session, events] = await Promise.all([
-      socketRequest(socketPath, { method: 'GET', path: `/api/v1/sessions/${sessionId}` }),
-      socketRequest(socketPath, { method: 'GET', path: `/api/v1/sessions/${sessionId}/events?limit=20` })
+      request(socketPath, { method: 'GET', path: `/api/v1/sessions/${sessionId}` }),
+      request(socketPath, { method: 'GET', path: `/api/v1/sessions/${sessionId}/events?limit=20` })
     ]);
     const status = session.statusCode === 200 ? JSON.parse(session.body).status : `HTTP ${session.statusCode}`;
     const kinds =
       events.statusCode === 200
         ? (JSON.parse(events.body).events ?? []).map((event) => event.kind)
         : [`HTTP ${events.statusCode}`];
-    return `status=${status} events=[${kinds.join(', ') || 'none'}]`;
+    sessionEvidence = `status=${status} events=[${kinds.join(', ') || 'none'}]`;
   } catch (error) {
-    return `session state unavailable: ${error.message}`;
+    sessionEvidence = `sessionState=unavailable(${boundedDiagnosticValue(
+      error instanceof Error ? error.message : error,
+      [dirname(markerPath)]
+    )})`;
   }
+
+  const fixtureEvidence = await fixtureExecutionSummary(markerPath, expectedExecutions, read);
+  let writerEvidence;
+  try {
+    const response = await request(socketPath, { method: 'GET', path: '/api/v1/health' });
+    writerEvidence =
+      response.statusCode === 200
+        ? formatEventWriterHealth(JSON.parse(response.body), [dirname(markerPath)])
+        : `eventWriter=HTTP_${response.statusCode}`;
+  } catch (error) {
+    writerEvidence = `eventWriter=unavailable(${boundedDiagnosticValue(
+      error instanceof Error ? error.message : error,
+      [dirname(markerPath)]
+    )})`;
+  }
+
+  return `${sessionEvidence} ${fixtureEvidence} ${writerEvidence}`;
+}
+
+export function formatScenarioTimeout({
+  concurrency,
+  error,
+  diagnostic,
+  fixtureRoot
+}) {
+  const message = redactedDiagnosticText(
+    error instanceof Error ? error.message : error,
+    [fixtureRoot]
+  );
+  return `sessions_${concurrency}: ${message} — ${diagnostic}`;
 }
 
 async function waitForSessionExit(socketPath, sessionId, request = socketRequest) {
@@ -217,7 +320,7 @@ export async function storeFootprint(covenHome) {
 }
 
 export async function runConcurrencyScenario({ binary, root, concurrency, environment = process.env }) {
-  const { covenHome, env } = await fixtureEnvironment(root, environment);
+  const { covenHome, env, markerPath } = await fixtureEnvironment(root, environment);
   const socketPath = await startDaemon({ binary, covenHome, env });
   const footprintBefore = await storeFootprint(covenHome);
   let ids = [];
@@ -237,9 +340,18 @@ export async function runConcurrencyScenario({ binary, root, concurrency, enviro
             delayMs: POLL_DELAY_MS
           });
         } catch (error) {
-          throw new Error(
-            `sessions_${concurrency}: ${error.message} — ${await describeSession(socketPath, id)}`
-          );
+          const diagnostic = await describeScenarioFailure({
+            socketPath,
+            sessionId: id,
+            markerPath,
+            expectedExecutions: concurrency
+          });
+          throw new Error(formatScenarioTimeout({
+            concurrency,
+            error,
+            diagnostic,
+            fixtureRoot: root
+          }));
         }
         return { id, firstOutputMs: Number(process.hrtime.bigint() - launchedAt) / 1_000_000 };
       })
