@@ -71,7 +71,7 @@ printf '%s\n' '{"type":"turn.completed"}'
 }
 ```
 
-- [ ] **Step 2: Add the failing all-status continuation test**
+- [ ] **Step 2: Add the all-status continuation regression test**
 
 Add this test after `codex_json_stream_resumes_with_a_sibling_and_preserves_terminal_evidence`:
 
