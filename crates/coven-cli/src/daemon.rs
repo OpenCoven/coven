@@ -2143,11 +2143,9 @@ fn start_store_maintenance_scheduler(coven_home: &Path) -> Result<()> {
                         }
                     }
                     Err(error) => {
-                        crate::store::record_maintenance_error(&home, "maintenance pass failed");
-                        append_daemon_recovery_log(
-                            &home,
-                            &format!("store maintenance pass failed: {error:#}"),
-                        );
+                        let details = format!("store maintenance pass failed: {error:#}");
+                        crate::store::record_maintenance_error(&home, &details);
+                        append_daemon_recovery_log(&home, &details);
                         break;
                     }
                 }

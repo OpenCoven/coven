@@ -3430,8 +3430,15 @@ fn prune_sensitive_artifacts_bounded(
         .execute(
             "DELETE FROM sensitive_artifacts
              WHERE rowid IN (
-                SELECT rowid FROM sensitive_artifacts
-                WHERE expires_at < ?1 OR created_at < ?2
+                SELECT rowid FROM (
+                    -- Split predicates so each can use a supporting index while
+                    -- keeping global ordering by artifact age for bounded passes.
+                    SELECT rowid, created_at FROM sensitive_artifacts
+                    WHERE expires_at < ?1
+                    UNION
+                    SELECT rowid, created_at FROM sensitive_artifacts
+                    WHERE created_at < ?2
+                ) AS candidates
                 ORDER BY created_at, rowid
                 LIMIT ?3
              )",
