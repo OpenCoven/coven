@@ -71,3 +71,77 @@ test('report contains no fixture paths or prompt content', () => {
   assert.equal(Object.hasOwn(report.environment, 'runner'), false);
   assert.equal(validateReport(report), report);
 });
+
+test('fixture harness records child execution before emitting output', async () => {
+  const module = await import('./benchmark-chaos.mjs');
+  assert.equal(typeof module.fixtureHarnessScript, 'function');
+  const script = module.fixtureHarnessScript();
+  assert.ok(script.indexOf('COVEN_BENCHMARK_MARKERS') < script.indexOf('COVEN_BENCHMARK_READY'));
+  assert.match(script, /printf "started\\n"/);
+});
+
+test('event writer diagnostics expose bounded operational fields and redact fixture paths', async () => {
+  const module = await import('./benchmark-chaos.mjs');
+  assert.equal(typeof module.formatEventWriterHealth, 'function');
+  assert.equal(
+    module.formatEventWriterHealth({
+      eventWriter: {
+        state: 'failed',
+        queuedEvents: 4,
+        queuedBytes: 8192,
+        capacityBytes: 16384,
+        droppedOutputEvents: 2,
+        droppedOutputBytes: 512,
+        connectionOpens: 1,
+        transactions: 7,
+        committedEvents: 21,
+        lastError: 'write failed at /fixture/root/coven.sqlite3\nretry stopped'
+      }
+    }, ['/fixture/root']),
+    'eventWriter={state=failed queuedEvents=4 queuedBytes=8192 capacityBytes=16384 droppedOutputEvents=2 droppedOutputBytes=512 connectionOpens=1 transactions=7 committedEvents=21 lastError="write failed at <fixture>/coven.sqlite3 retry stopped"}'
+  );
+});
+
+test('timeout diagnostics combine session, child execution, and writer evidence', async () => {
+  const module = await import('./benchmark-chaos.mjs');
+  assert.equal(typeof module.describeScenarioFailure, 'function');
+  const responses = new Map([
+    ['/api/v1/sessions/session-1', { statusCode: 200, body: '{"status":"running"}' }],
+    ['/api/v1/sessions/session-1/events?limit=20', {
+      statusCode: 200,
+      body: '{"events":[{"kind":"started"}]}'
+    }],
+    ['/api/v1/health', {
+      statusCode: 200,
+      body: '{"eventWriter":{"state":"healthy","queuedEvents":0,"queuedBytes":0,"capacityBytes":2097152,"droppedOutputEvents":0,"droppedOutputBytes":0,"connectionOpens":1,"transactions":8,"committedEvents":31,"lastError":null}}'
+    }]
+  ]);
+
+  const diagnostic = await module.describeScenarioFailure({
+    socketPath: '/fixture/socket',
+    sessionId: 'session-1',
+    markerPath: '/fixture/markers',
+    expectedExecutions: 32,
+    request: async (_socketPath, request) => responses.get(request.path),
+    read: async () => 'started\nstarted\n'
+  });
+
+  assert.equal(
+    diagnostic,
+    'status=running events=[started] fixtureExecutions=2/32 eventWriter={state=healthy queuedEvents=0 queuedBytes=0 capacityBytes=2097152 droppedOutputEvents=0 droppedOutputBytes=0 connectionOpens=1 transactions=8 committedEvents=31 lastError=null}'
+  );
+});
+
+test('scenario timeout messages redact fixture paths from the original error', async () => {
+  const module = await import('./benchmark-chaos.mjs');
+  assert.equal(typeof module.formatScenarioTimeout, 'function');
+  assert.equal(
+    module.formatScenarioTimeout({
+      concurrency: 32,
+      error: new Error('connect ENOENT /fixture/private/daemon.sock'),
+      diagnostic: 'status=running events=[none]',
+      fixtureRoot: '/fixture/private'
+    }),
+    'sessions_32: connect ENOENT <fixture>/daemon.sock — status=running events=[none]'
+  );
+});

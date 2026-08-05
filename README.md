@@ -688,9 +688,10 @@ entries, so a trend artifact cannot be mistaken for a passing chaos test.
 CI runs this step as `continue-on-error`, so it collects trend data without
 gating merges — matching how the rest of this section describes these
 baselines. The deterministic fixture tests (`benchmark-chaos.test.mjs`) still
-gate. The 32-session scenario is intermittently unable to run on a two-core
-runner, where a live session can record no events at all; see #615. Expect
-`coven-chaos.json` to be absent from the uploaded artifact on those runs.
+gate. On timeout, the collector reports fixture execution count, session/event
+state, and a bounded event-writer health snapshot. The event writer retries
+only transient SQLite busy/locked commit failures before latching a permanent
+failure; unrelated persistence errors remain fail-fast.
 
 ### Architecture rules for contributors
 
