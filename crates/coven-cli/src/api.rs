@@ -6766,7 +6766,7 @@ mod tests {
         assert!(response.body.contains(r#""scheduler":true"#));
         assert!(response.body.contains(r#""hub":true"#));
         assert!(response.body.contains(r#""executorDispatch":true"#));
-        assert!(response.body.contains(r#""role":"hub""#));
+        assert!(!response.body.contains(r#""role":"hub""#));
         assert!(response.body.contains(r#""structuredErrors":true"#));
         assert!(response.body.contains(r#""storage":{"status""#));
         assert!(response.body.contains(r#""writerBacklogEvents":0"#));

@@ -328,6 +328,7 @@ pub fn register_node(coven_home: &Path, body: Option<&str>) -> Result<ApiRespons
         updated_at: now,
     };
     store::upsert_node(&conn, &record)?;
+    hub_id(&conn)?;
     json_response(
         if existing.is_some() { 200 } else { 201 },
         &node_response(&record),
@@ -1112,6 +1113,35 @@ mod tests {
             ),
         )?;
         assert_eq!(status, 201);
+        Ok(())
+    }
+
+    #[test]
+    fn registering_node_initializes_hub_identity_for_health() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        register_gpu_node(&temp, "node_a")?;
+
+        let (status, health) = get(&temp, "/api/v1/health")?;
+        assert_eq!(status, 200);
+        assert_eq!(health["hub"]["role"], "hub");
+        assert_eq!(health["hub"]["nodesTotal"], 1);
+        assert_eq!(health["hub"]["nodesAvailable"], 1);
+        let hub_id = health["hub"]["hubId"]
+            .as_str()
+            .expect("registration should initialize the hub identity");
+        assert!(hub_id.starts_with("hub_"));
+
+        let (status, _) = post(
+            &temp,
+            "/api/v1/hub/nodes",
+            r#"{"nodeId":"node_a","role":"compute_executor","transport":"ssh","capabilities":["gpu","long-running-loop"]}"#,
+        )?;
+        assert_eq!(status, 200);
+        let (_, health_after_registration) = get(&temp, "/api/v1/health")?;
+        assert_eq!(health_after_registration["hub"]["hubId"], hub_id);
+
+        let (_, status) = get(&temp, "/api/v1/hub/status")?;
+        assert_eq!(status["hubId"], hub_id);
         Ok(())
     }
 
