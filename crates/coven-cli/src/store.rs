@@ -30,6 +30,22 @@ const MAINTENANCE_MAX_BATCHES_PER_TICK: i64 = 10;
 const MAINTENANCE_CHECKPOINT_WAL_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAINTENANCE_MIN_FREE_DISK_BYTES: u64 = 256 * 1024 * 1024;
 const MAINTENANCE_WARN_FREE_DISK_BYTES: u64 = 1024 * 1024 * 1024;
+const BOUNDED_PRUNE_SENSITIVE_ARTIFACTS_BY_EXPIRY_SQL: &str = "DELETE FROM sensitive_artifacts
+     WHERE rowid IN (
+        SELECT rowid FROM sensitive_artifacts
+        INDEXED BY idx_sensitive_artifacts_expires_at
+        WHERE expires_at < ?1
+        ORDER BY expires_at, rowid
+        LIMIT ?2
+     )";
+const BOUNDED_PRUNE_SENSITIVE_ARTIFACTS_BY_CREATED_AT_SQL: &str = "DELETE FROM sensitive_artifacts
+     WHERE rowid IN (
+        SELECT rowid FROM sensitive_artifacts
+        INDEXED BY idx_sensitive_artifacts_created_at
+        WHERE created_at < ?1
+        ORDER BY created_at, rowid
+        LIMIT ?2
+     )";
 pub const DEFAULT_SESSION_PAGE_LIMIT: usize = 100;
 pub const MAX_SESSION_PAGE_LIMIT: usize = 1_000;
 
@@ -3436,31 +3452,33 @@ fn prune_sensitive_artifacts_bounded(
     retention_cutoff: &str,
     limit: i64,
 ) -> Result<usize> {
+    let limit = limit.max(1);
     let tx = conn
         .unchecked_transaction()
         .context("failed to start bounded artifact-prune transaction")?;
-    let pruned = tx
+    let expired_pruned = tx
         .execute(
-            "DELETE FROM sensitive_artifacts
-             WHERE rowid IN (
-                SELECT rowid FROM (
-                    -- Split predicates so each can use a supporting index while
-                    -- keeping global ordering by artifact age for bounded passes.
-                    SELECT rowid, created_at FROM sensitive_artifacts
-                    WHERE expires_at < ?1
-                    UNION
-                    SELECT rowid, created_at FROM sensitive_artifacts
-                    WHERE created_at < ?2
-                ) AS candidates
-                ORDER BY created_at, rowid
-                LIMIT ?3
-             )",
-            params![now, retention_cutoff, limit.max(1)],
+            BOUNDED_PRUNE_SENSITIVE_ARTIFACTS_BY_EXPIRY_SQL,
+            params![now, limit],
         )
-        .context("failed to prune bounded sensitive-artifact batch")?;
+        .context("failed to prune bounded expired sensitive-artifact batch")?;
+    let remaining_capacity = limit.saturating_sub(
+        i64::try_from(expired_pruned).context("bounded artifact prune deleted too many rows")?,
+    );
+    let aged_pruned = if remaining_capacity > 0 {
+        tx.execute(
+            BOUNDED_PRUNE_SENSITIVE_ARTIFACTS_BY_CREATED_AT_SQL,
+            params![retention_cutoff, remaining_capacity],
+        )
+        .context("failed to prune bounded aged sensitive-artifact batch")?
+    } else {
+        0
+    };
     tx.commit()
         .context("failed to commit bounded artifact-prune transaction")?;
-    Ok(pruned)
+    expired_pruned
+        .checked_add(aged_pruned)
+        .context("bounded sensitive-artifact prune overflowed")
 }
 
 /// Run the daemon's bounded retention tick. It deliberately never invokes
@@ -3616,10 +3634,10 @@ fn storage_health_with_free_disk(
         });
     }
 
+    let config = privacy::load_with_settings(coven_home, crate::settings::cached())
+        .context("failed to load privacy settings for storage health")?;
     let conn = open_existing_store_read_only(&store_path)?
         .ok_or_else(|| anyhow::anyhow!("Coven store is unavailable"))?;
-    let config =
-        privacy::load_with_settings(coven_home, crate::settings::cached()).unwrap_or_default();
     // `MIN(created_at)` is NULL on an empty ledger, so the column type has to be
     // stated: `row.get` cannot infer `Option<String>` from the comparison below.
     let oldest_retained_event_at: Option<String> = conn
@@ -5154,6 +5172,10 @@ mod tests {
     ) -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let home = temp_dir.path();
+        std::fs::write(
+            home.join("privacy.toml"),
+            "log_retention_days = \"broken\"\n",
+        )?;
         let writer = crate::event_writer::EventWriterHealth {
             state: "pressured".to_string(),
             queued_events: 7,
@@ -5198,6 +5220,23 @@ mod tests {
 
         assert!(error.to_string().contains("store"));
         assert!(!home.join("coven.sqlite3").exists());
+    }
+
+    #[test]
+    fn storage_health_above_watermark_returns_err_for_malformed_privacy_config() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let home = temp_dir.path();
+        open_store(&home.join("coven.sqlite3"))?;
+        std::fs::write(
+            home.join("privacy.toml"),
+            "log_retention_days = \"broken\"\n",
+        )?;
+
+        let error = storage_health_with_free_disk(home, MAINTENANCE_MIN_FREE_DISK_BYTES, None)
+            .expect_err("malformed privacy config must fail closed above the watermark");
+
+        assert!(error.to_string().contains("privacy"));
+        Ok(())
     }
 
     #[test]
@@ -5424,6 +5463,156 @@ mod tests {
             2
         );
         assert_eq!(count_sensitive_artifacts(&conn)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_sensitive_artifact_pruning_respects_total_limit_and_converges() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+        insert_session(&conn, &session_record("session-1", "2026-04-27T06:00:00Z"))?;
+        insert_event(
+            &conn,
+            &EventRecord {
+                seq: 0,
+                id: "event-1".to_string(),
+                session_id: "session-1".to_string(),
+                kind: "output".to_string(),
+                payload_json: serde_json::json!({ "data": "raw payload" }).to_string(),
+                created_at: "2026-04-20T00:00:00Z".to_string(),
+            },
+        )?;
+
+        for record in [
+            SensitiveArtifactRecord {
+                id: "expired-only".to_string(),
+                session_id: "session-1".to_string(),
+                event_id: "event-1".to_string(),
+                kind: "output".to_string(),
+                nonce: vec![0; 24],
+                ciphertext: vec![1, 2, 3],
+                created_at: "2026-04-26T12:00:00Z".to_string(),
+                expires_at: "2026-04-26T18:00:00Z".to_string(),
+            },
+            SensitiveArtifactRecord {
+                id: "age-only".to_string(),
+                session_id: "session-1".to_string(),
+                event_id: "event-1".to_string(),
+                kind: "output".to_string(),
+                nonce: vec![0; 24],
+                ciphertext: vec![4, 5, 6],
+                created_at: "2026-04-20T00:00:00Z".to_string(),
+                expires_at: "2026-05-20T00:00:00Z".to_string(),
+            },
+            SensitiveArtifactRecord {
+                id: "expired-and-aged-1".to_string(),
+                session_id: "session-1".to_string(),
+                event_id: "event-1".to_string(),
+                kind: "output".to_string(),
+                nonce: vec![0; 24],
+                ciphertext: vec![7, 8, 9],
+                created_at: "2026-04-18T00:00:00Z".to_string(),
+                expires_at: "2026-04-19T00:00:00Z".to_string(),
+            },
+            SensitiveArtifactRecord {
+                id: "expired-and-aged-2".to_string(),
+                session_id: "session-1".to_string(),
+                event_id: "event-1".to_string(),
+                kind: "output".to_string(),
+                nonce: vec![0; 24],
+                ciphertext: vec![10, 11, 12],
+                created_at: "2026-04-17T00:00:00Z".to_string(),
+                expires_at: "2026-04-18T00:00:00Z".to_string(),
+            },
+            SensitiveArtifactRecord {
+                id: "fresh".to_string(),
+                session_id: "session-1".to_string(),
+                event_id: "event-1".to_string(),
+                kind: "output".to_string(),
+                nonce: vec![0; 24],
+                ciphertext: vec![13, 14, 15],
+                created_at: "2026-04-27T00:00:00Z".to_string(),
+                expires_at: "2026-05-27T00:00:00Z".to_string(),
+            },
+        ] {
+            insert_sensitive_artifact(&conn, &record)?;
+        }
+
+        let now = "2026-04-27T00:00:00Z";
+        let cutoff = retention_cutoff(now, 1);
+        assert_eq!(count_prunable_sensitive_artifacts(&conn, now, &cutoff)?, 4);
+
+        let first_pruned = prune_sensitive_artifacts_bounded(&conn, now, &cutoff, 2)?;
+        assert_eq!(first_pruned, 2);
+        assert_eq!(count_sensitive_artifacts(&conn)?, 3);
+        assert_eq!(count_prunable_sensitive_artifacts(&conn, now, &cutoff)?, 2);
+
+        let second_pruned = prune_sensitive_artifacts_bounded(&conn, now, &cutoff, 2)?;
+        assert_eq!(second_pruned, 2);
+        assert_eq!(count_sensitive_artifacts(&conn)?, 1);
+        assert_eq!(count_prunable_sensitive_artifacts(&conn, now, &cutoff)?, 0);
+
+        let third_pruned = prune_sensitive_artifacts_bounded(&conn, now, &cutoff, 2)?;
+        assert_eq!(third_pruned, 0);
+        assert!(get_sensitive_artifact(&conn, "session-1", "fresh")?.is_some());
+        assert_eq!(pragma_integrity_check(&conn)?, vec!["ok"]);
+        Ok(())
+    }
+
+    fn explain_query_plan<P: rusqlite::Params>(
+        conn: &Connection,
+        sql: &str,
+        params: P,
+    ) -> Result<Vec<String>> {
+        let explain_sql = format!("EXPLAIN QUERY PLAN {sql}");
+        let mut stmt = conn
+            .prepare(&explain_sql)
+            .with_context(|| format!("failed to prepare query plan for {sql}"))?;
+        let rows = stmt
+            .query_map(params, |row| row.get::<_, String>(3))
+            .context("failed to run query plan")?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .context("failed to read query plan")
+    }
+
+    #[test]
+    fn bounded_sensitive_artifact_prune_queries_use_supporting_indexes() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+
+        let expiry_plan = explain_query_plan(
+            &conn,
+            BOUNDED_PRUNE_SENSITIVE_ARTIFACTS_BY_EXPIRY_SQL,
+            params!["2026-04-27T00:00:00Z", 2],
+        )?;
+        let retention_plan = explain_query_plan(
+            &conn,
+            BOUNDED_PRUNE_SENSITIVE_ARTIFACTS_BY_CREATED_AT_SQL,
+            params!["2026-04-26T00:00:00Z", 2],
+        )?;
+
+        for (plan, expected_index) in [
+            (&expiry_plan, "idx_sensitive_artifacts_expires_at"),
+            (&retention_plan, "idx_sensitive_artifacts_created_at"),
+        ] {
+            assert!(
+                plan.iter().any(|detail| detail.contains(expected_index)),
+                "expected {expected_index} in query plan: {plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|detail| detail.contains("SCAN sensitive_artifacts")),
+                "unexpected full table scan: {plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|detail| detail.contains("USE TEMP B-TREE FOR ORDER BY")),
+                "unexpected temp b-tree sort: {plan:?}"
+            );
+        }
+
         Ok(())
     }
 
