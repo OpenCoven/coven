@@ -1732,9 +1732,20 @@ fn direct_insert_rejects_non_persistable_error_envelope() {
 #[test]
 fn direct_insert_rejects_acknowledged_cancellation_without_evidence() {
     let (mut store, _dir) = test_store();
-    let mut binding = fixture_execution_binding();
-    binding.cancellation_state = CancellationState::AcknowledgedTerminated;
+    let mut binding = fixture_acknowledged_execution_binding();
     binding.cancellation_acknowledgement = None;
+    assert!(matches!(
+        store.insert(&CanonicalDocument::ExecutionBinding(binding)),
+        Err(StoreError::Contract(ContractError::CancellationEvidenceMismatch { .. }))
+    ));
+    assert_eq!(store.total_record_count().unwrap(), 0);
+}
+
+#[test]
+fn direct_insert_rejects_acknowledged_state_without_termination_correlation() {
+    let (mut store, _dir) = test_store();
+    let mut binding = fixture_acknowledged_execution_binding();
+    binding.termination_request = None;
     assert!(matches!(
         store.insert(&CanonicalDocument::ExecutionBinding(binding)),
         Err(StoreError::Contract(ContractError::CancellationEvidenceMismatch { .. }))
@@ -1833,6 +1844,28 @@ fn direct_insert_rejects_unresolved_outside_termination_window() {
         .as_mut()
         .unwrap()
         .recorded_at = after_deadline;
+    assert!(matches!(
+        store.insert(&CanonicalDocument::ExecutionBinding(binding)),
+        Err(StoreError::Contract(ContractError::CancellationEvidenceMismatch { .. }))
+    ));
+    assert_eq!(store.total_record_count().unwrap(), 0);
+}
+
+#[test]
+fn direct_insert_rejects_unresolved_before_termination_window() {
+    let (mut store, _dir) = test_store();
+    let mut binding = fixture_unresolved_execution_binding();
+    let before_start = binding
+        .termination_request
+        .as_ref()
+        .unwrap()
+        .created_at
+        - time::Duration::nanoseconds(1);
+    binding
+        .cancellation_unresolved
+        .as_mut()
+        .unwrap()
+        .recorded_at = before_start;
     assert!(matches!(
         store.insert(&CanonicalDocument::ExecutionBinding(binding)),
         Err(StoreError::Contract(ContractError::CancellationEvidenceMismatch { .. }))
@@ -3574,11 +3607,13 @@ Use this complete manifest shape:
         "delivery_direct_insert_round_trips_canonically",
         "direct_insert_rejects_wrong_field_id_kind_without_writing",
         "direct_insert_rejects_acknowledged_cancellation_without_evidence",
+        "direct_insert_rejects_acknowledged_state_without_termination_correlation",
         "direct_insert_rejects_mismatched_cancellation_evidence",
         "direct_insert_rejects_wrong_termination_request_id",
         "direct_insert_rejects_acknowledgement_outside_termination_window",
         "direct_insert_rejects_acknowledgement_before_termination_window",
         "direct_insert_rejects_unresolved_outside_termination_window",
+        "direct_insert_rejects_unresolved_before_termination_window",
         "transition_versions_are_monotonic_and_append_only"
       ]
     },
@@ -3750,7 +3785,7 @@ including why `ExpectedUnsupported` is diagnostic rather than passed evidence.
 | Exhaustive registered decode | `cargo test -p psyche-core --test decode -- --exact recognized_error_envelope_decodes_exhaustively` | not run remotely | none |
 | Unknown kind/version/enum denial and quarantine | `cargo test -p psyche-core --test decode -- --exact unknown_typed_enum_is_a_quarantinable_decode_failure && cargo test -p psyche-store --test retention -- --exact unknown_enum_is_quarantined_without_dispatchable_record` | not run remotely | none |
 | Quarantine resolution | `cargo test -p psyche-store --test retention -- --exact quarantine_resolution_is_durable_and_idempotent` | not run remotely | none |
-| Direct typed insert validation | `cargo test -p psyche-store --test records -- --exact direct_insert_rejects_wrong_field_id_kind_without_writing && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_acknowledged_cancellation_without_evidence && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_mismatched_cancellation_evidence && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_wrong_termination_request_id && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_acknowledgement_outside_termination_window && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_acknowledgement_before_termination_window && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_unresolved_outside_termination_window` | not run remotely | none |
+| Direct typed insert validation | `cargo test -p psyche-store --test records -- --exact direct_insert_rejects_wrong_field_id_kind_without_writing && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_acknowledged_cancellation_without_evidence && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_acknowledged_state_without_termination_correlation && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_mismatched_cancellation_evidence && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_wrong_termination_request_id && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_acknowledgement_outside_termination_window && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_acknowledgement_before_termination_window && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_unresolved_outside_termination_window && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_unresolved_before_termination_window` | not run remotely | none |
 | Transition contract and append-only rules | `cargo test -p psyche-store --test records -- --exact transition_versions_are_monotonic_and_append_only` | not run remotely | none |
 | Checkpoint-failure shutdown | `cargo test -p psyche-runtime --lib -- --exact tests::checkpoint_failure_stops_and_releases_every_shutdown_waiter` | not run remotely | none |
 | Migrations | `cargo test -p psyche-store --test migrations -- --exact fresh_store_applies_v1_once_and_reopens` | not run remotely | none |
