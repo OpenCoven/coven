@@ -16,7 +16,9 @@ coven --version
 coven doctor
 ```
 
-The universal wrapper selects the native macOS package for Apple Silicon. On other macOS hosts, use the source install path unless the release matrix adds a matching native package.
+The universal wrapper selects `@opencoven/cli-macos` on Apple Silicon and
+`@opencoven/cli-macos-x64` on Intel macOS. Use the source install path only
+when developing Coven itself or when a release is unavailable for your target.
 
 ## Harness setup
 

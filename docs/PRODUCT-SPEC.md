@@ -36,7 +36,11 @@ Out of scope for MVP: marketplace plugins, cloud sync, multi-user collaboration,
 
 ## Built-in v0 harness direction
 
-Coven v0 should ship with bundled compatibility adapters for Codex and Claude Code. These adapters should detect local CLI availability, construct commands without shell interpolation where possible, run the harness inside a validated project `cwd`, and expose output/input through Coven-managed PTY sessions.
+Coven v0 ships with bundled compatibility adapters for Codex, Claude Code, and
+GitHub Copilot CLI. These adapters detect local CLI availability, construct
+commands without shell interpolation where possible, run the harness inside a
+validated project `cwd`, and expose output/input through Coven-managed PTY
+sessions.
 
 Terminal UX should stay centered on the lightweight `coven` command and a human session browser:
 
@@ -45,15 +49,20 @@ coven
 coven tui
 coven run codex "fix tests"
 coven run claude "polish this UI"
+coven run copilot "review this change"
 coven sessions
 coven sessions --plain
 ```
 
 In an interactive terminal, `coven sessions` opens a browser with readable actions such as **Rejoin**, **View Log**, **Summon**, **Archive**, and **Sacrifice** so users do not have to memorize session ids. Plain output remains available for scripts and pipes.
 
-## Future Hermes and adapter path
+## Adapter maturity and future path
 
-Hermes and other harnesses should arrive through the adapter manifest/registry contract after the bundled v0 compatibility path is stable. The adapter model should support future targets such as Hermes, Aider, Gemini, OpenCode, and custom command adapters without requiring Coven to become a full plugin marketplace in the MVP.
+Hermes 1.0.3 and OpenCode 0.1.1 are trusted opt-in recipes through the adapter
+manifest/registry contract; they are not bundled defaults. Grok Build 1.0.0 is
+an experimental opt-in recipe. The adapter model supports future targets such
+as Aider, Gemini, Cline, and custom command adapters without requiring Coven
+to become a full plugin marketplace in the MVP.
 
 ## Current architecture
 
@@ -67,7 +76,7 @@ flowchart LR
   OpenClaw[OpenClaw] --> Plugin[external OpenClaw bridge plugin]
   Plugin -.-> Daemon
   Daemon --> Store[(SQLite session ledger)]
-  Daemon --> Router[Codex / Claude adapter router]
+  Daemon --> Router[Codex / Claude / Copilot adapter router]
   Router --> PTY[Harness PTYs]
 ```
 

@@ -62,7 +62,12 @@ OpenCode keeps system prompts, tool registries, and permissions in its own proje
 
 ## Chat behavior
 
-`coven chat` lists OpenCode once the recipe is installed and the binary is on `PATH`. Because the adapter declares no continuity args, chat resume is off: each chat turn is an independent `opencode run` with no carried conversation. See [Chat conversation persistence](/chat-persistence) for the per-harness resume matrix.
+The legacy in-process chat fallback (`COVEN_LEGACY_TUI=1`) lists OpenCode once
+the recipe is installed and the binary is on `PATH`. Because the adapter
+declares no continuity args, legacy chat resume is off: each turn is an
+independent `opencode run` with no carried conversation. The managed
+`coven-code` UI owns its own chat behavior. See [Chat conversation
+persistence](/chat-persistence) for the legacy per-harness resume matrix.
 
 ## Troubleshooting
 

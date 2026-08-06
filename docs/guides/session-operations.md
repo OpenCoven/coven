@@ -57,11 +57,15 @@ coven summon session-1
 
 ## Stop or delete deliberately
 
-For a running session, preserve the event log while ending the managed process:
+On Unix-like hosts, preserve the event log while ending a running session's
+managed process:
 
 ```sh
 coven kill session-1
 ```
+
+On Windows, use a named-pipe-capable local integration to request
+`POST /api/v1/sessions/:id/kill` from the daemon that owns the session.
 
 For a non-running session you no longer need, permanently delete the record and event history only with explicit confirmation:
 

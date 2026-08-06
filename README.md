@@ -10,7 +10,7 @@ Run Codex, Claude Code, GitHub Copilot CLI, and future coding harnesses inside e
 Launch, observe, attach, and coordinate agent work through one neutral runtime substrate.
 
 [![MIT License](https://img.shields.io/badge/license-MIT-9A8ECD?style=flat-square)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-9A8ECD?style=flat-square)](#requirements)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows%20x64-9A8ECD?style=flat-square)](#requirements)
 [![npm](https://img.shields.io/badge/npm-%40opencoven%2Fcli-9A8ECD?style=flat-square)](https://www.npmjs.com/package/@opencoven/cli)
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-9A8ECD?style=flat-square)](https://www.rust-lang.org/)
 
@@ -22,7 +22,9 @@ Launch, observe, attach, and coordinate agent work through one neutral runtime s
 
 ---
 
-> **⚠️ Early MVP** — Coven is a local-first runtime in active development. It is usable by adventurous developers on macOS and Linux. The npm package is live. Expect rough edges.
+> **⚠️ Early MVP** — Coven is a local-first runtime in active development. It
+> is usable by adventurous developers on macOS, Linux, and Windows x64. The
+> npm package is live. Expect rough edges.
 >
 > **External PRs are open** — Start from an issue for larger changes, keep PRs scoped, and include the readiness packet requested by the PR template.
 

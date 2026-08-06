@@ -1,11 +1,14 @@
-# Chat Conversation Persistence
+# Legacy Chat Conversation Persistence
 
-How `coven chat` keeps follow-up messages in the same conversation, and how to
-extend the mechanism to additional harnesses.
+How the deprecated in-process chat fallback keeps follow-up messages in the
+same conversation, and how to extend that mechanism to additional harnesses.
+This page applies only when `COVEN_LEGACY_TUI=1` explicitly selects the legacy
+chat implementation. Default `coven chat` delegates to the managed
+`coven-code` UI and does not use the behavior documented here.
 
 ## Status
 
-| Harness | Resume support | Mechanism |
+| Harness | Resume support in the legacy fallback | Mechanism |
 | --- | --- | --- |
 | `claude` | ✅ stream-mode | Long-lived `claude --print --input-format stream-json --output-format stream-json --verbose` daemon process per chat, plus `--session-id <uuid>` on the first turn and `--resume <uuid>` for cross-restart continuation. Turn 1 spawns + sends initial user envelope; turns 2..N pipe a new user envelope into the same stdin (no cold-start). Unix kills the stream process tree with `setsid()` + `kill(-pid, SIGKILL)`; Windows uses a Job Object owned by the daemon. |
 | `codex` | ✅ per-turn | Chat runs plain `codex exec …`; it captures `session id: <uuid>` from output and feeds it back as `codex exec … resume <uuid> <prompt>` on later turns. `coven run codex --stream-json` separately uses Codex's one-shot `exec --json` protocol, but Codex has no long-lived stream mode, so each chat turn cold-starts. |
@@ -15,8 +18,8 @@ extend the mechanism to additional harnesses.
 | `hermes` (recipe) | ❌ | Hermes 1.0.3 declares no continuity args, so every chat turn is an independent native `hermes chat --source coven -Q --query=…` one-shot. |
 | `opencode` (recipe) | ❌ | The OpenCode adapter manifest declares no continuity args (`opencode run` one-shots; session state lives in OpenCode's own storage, not behind a resume flag surface), so every chat turn is independent. |
 
-Conversations persist across `coven chat` invocations on a per-project basis:
-on startup the chat seeds its in-memory map from
+Legacy-fallback conversations persist across `coven chat` invocations on a
+per-project basis: on startup the chat seeds its in-memory map from
 `$COVEN_HOME/chat-conversations/<project-key>.json`, so the next message
 sends `Resume` immediately. Different projects get different files (the key
 is a deterministic FNV-1a hash of the canonical project root path);

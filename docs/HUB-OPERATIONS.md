@@ -40,9 +40,11 @@ coven hub status
 ```
 
 and confirm `role`, `hubId`, node availability, and queue depths match
-expectations (`--json` gives the raw `GET /api/v1/hub/status` body; the raw
-route is also reachable with
+expectations (`--json` gives the raw `GET /api/v1/hub/status` body; on
+Unix-like hosts, the raw route is also reachable with
 `curl --unix-socket ~/.coven/coven.sock http://coven/api/v1/hub/status`).
+Windows clients need a named-pipe-capable local IPC client and the endpoint
+reported by `coven daemon status`.
 `GET /api/v1/health` includes the same summary in its `hub` block, and
 `coven hub nodes` / `coven hub jobs --state held` drill into the recovered
 registry and queues. For a single record, `coven hub nodes <id>`,

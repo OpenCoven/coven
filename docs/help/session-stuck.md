@@ -49,11 +49,15 @@ coven sessions --plain --all
 
 ## Safe cleanup choices
 
-Kill stops a running session's harness process while keeping its event log:
+On Unix-like hosts, kill stops a running session's harness process while
+keeping its event log:
 
 ```sh
 coven kill <session-id>
 ```
+
+On Windows, use a named-pipe-capable local integration to request
+`POST /api/v1/sessions/:id/kill` from the daemon that owns the session.
 
 If kill reports the session is not live even though `coven sessions` says
 `running`, the process died externally; `coven daemon restart` marks it

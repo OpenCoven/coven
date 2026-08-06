@@ -84,7 +84,8 @@ that stays a harness-side decision, exactly like
 
 ## Session continuity
 
-Copilot supports pre-assigned session ids: `coven chat` sends
+In the legacy in-process chat fallback (`COVEN_LEGACY_TUI=1`), Copilot supports
+pre-assigned session ids: `coven chat` sends
 `--session-id <uuid>` on the first turn and the same flag on later turns.
 `--session-id` both creates a fresh session under a chosen UUID and resumes
 an existing one, so stale ids self-heal into a new conversation instead of
@@ -95,10 +96,11 @@ Copilot CLI outside Coven.
 ## Output shape
 
 Copilot has no long-lived stream-json stdin mode, so Coven always launches it
-as a one-shot process under the PTY (the chat TUI uses its per-turn path, the
-same posture as Codex). Non-interactive launches pass `--no-color`, and each
-run closes with a columnar stats block (`Changes` / `Requests` / `Tokens` /
-`Resume`) that Coven's chat view hides from the transcript.
+as a one-shot process under the PTY. The legacy chat fallback uses its per-turn
+path, the same posture as Codex. Non-interactive launches pass `--no-color`,
+and each run closes with a columnar stats block (`Changes` / `Requests` /
+`Tokens` / `Resume`) that the legacy chat view hides from the transcript. The
+managed `coven-code` UI owns its own chat behavior.
 
 ## Troubleshooting
 

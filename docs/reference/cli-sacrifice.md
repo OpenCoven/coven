@@ -24,12 +24,14 @@ to rerun with confirmation.
 The command also refuses live sessions:
 
 ```text
-session `<session-id>` is still running; do not sacrifice live work — kill it first with `coven kill <session-id>`
+session `<session-id>` is still running; do not sacrifice live work — on Unix-like hosts, kill it first with `coven kill <session-id>`
 ```
 
 Use `coven attach <session-id>` or `coven daemon status` first if you are not
 sure whether the harness is still running. If the session really should stop,
-`coven kill <session-id>` ends its process while keeping the event log.
+`coven kill <session-id>` ends its process while keeping the event log on
+Unix-like hosts. On Windows, use a named-pipe-capable local integration to
+request `POST /api/v1/sessions/:id/kill` from the daemon that owns the session.
 
 ## What gets deleted
 
