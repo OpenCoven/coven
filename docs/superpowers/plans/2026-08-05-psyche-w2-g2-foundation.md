@@ -4,7 +4,7 @@
 
 **Goal:** Finish Psyche W2 and produce terminal G2 evidence for canonical versioned records, durable SQLite migrations, behavior-level fake boundaries, and migration/state-machine/property/crash tests.
 
-**Architecture:** Extend the merged four-crate bootstrap with the focused crates named by the canonical architecture. `psyche-core` owns policy-free identifiers, digests, schema names, and minimum record shapes; `psyche-store` owns SQLite, migrations, immutable records, append-only transitions, quarantine, retention, and its package-local crash helper; `psyche-coven` and `psyche-surfaces` own behavior-level traits for their respective boundaries; `psyche-test-support` owns deterministic scripted fakes and reusable conformance fixtures. `psyche-runtime` remains the only composition root. W3-W9 retain identity resolution, graph admission, orchestration policy, real Coven integration, Telegram behavior, verification, and add-on trust.
+**Architecture:** Extend the merged four-crate bootstrap with the focused crates named by the canonical architecture. `psyche-core` owns policy-free identifiers, digests, schema names, and minimum record shapes; `psyche-store` owns SQLite, migrations, immutable records, append-only execution-binding revisions and transitions, quarantine, retention, and its package-local crash helper; `psyche-coven` and `psyche-surfaces` own behavior-level traits for their respective boundaries; `psyche-test-support` owns deterministic scripted fakes and reusable conformance fixtures. `psyche-runtime` remains the only composition root. W3-W9 retain identity resolution, graph admission, orchestration policy, real Coven integration, Telegram behavior, verification, and add-on trust.
 
 **Tech Stack:** Rust 2024 on 1.85, serde/serde_json, RFC 8785 JSON canonicalization, SHA-256, ULID, rusqlite with bundled SQLite, Tokio, proptest, tempfile, assert_cmd, cargo-deny, gitleaks.
 
@@ -21,7 +21,7 @@ branch.
 | Stable schema identifiers and strict decoding | Identity-file resolution and principal mapping (W3) |
 | Minimum typed records frozen by W0 | Graph admission, dependency-cycle policy, budgets, and orchestration (W4) |
 | Canonical JSON and content digests | Real Coven endpoints, adoption, cancellation, and artifacts (W5/G4) |
-| SQLite migrations, immutable records, append-only transitions | Telegram normalization, routing, effects, and delivery (W6/G8) |
+| SQLite migrations, immutable records, append-only execution-binding revisions and transitions | Telegram normalization, routing, effects, and delivery (W6/G8) |
 | Quarantine, retention, reopen, and crash atomicity | Verdict policy and independent verification (W7/G5) |
 | Behavior-level ports and deterministic fakes | Production child dispatch (W8/G6) |
 | Reusable fake conformance fixtures | Add-on trust and execution (W9/G7) |
@@ -59,6 +59,8 @@ passes. It does not set any G4-G12 capability.
 
 ### New `psyche-store` files
 
+- `crates/psyche-store/src/execution_bindings.rs` - append-only,
+  digest-linked execution-binding revision ledger.
 - `crates/psyche-store/src/transitions.rs` - store-owned, validated
   `Transition` wire type and append-only persistence.
 
@@ -93,6 +95,8 @@ impl Store {
     pub fn schema_version(&self) -> Result<u32, StoreError>;
     pub fn ingest(&mut self, bytes: &[u8]) -> Result<IngestOutcome, StoreError>;
     pub fn insert(&mut self, document: &CanonicalDocument) -> Result<(), StoreError>;
+    pub fn execution_binding_revisions(&self, attempt_id: &RecordId)
+        -> Result<Vec<ExecutionBinding>, StoreError>;
     pub fn append_transition(&mut self, transition: &Transition) -> Result<(), StoreError>;
     pub fn load(&self, kind: SchemaKind, id: &RecordId)
         -> Result<Option<CanonicalDocument>, StoreError>;
@@ -160,19 +164,21 @@ Every item below has a named automated test:
 4. Record digests exclude no mutable field: changing any serialized field changes the digest.
 5. Typed direct inserts run the same schema and field-kind validation as decoded inserts.
 6. Immutable records reject same-ID/different-digest reinsertion.
-7. Transition rows validate their complete digest-bearing shape and append atomically; no API updates or deletes historical rows.
-8. Raw rejected payloads are not written to logs or error messages.
-9. Quarantine retains bounded bytes and a digest, not an unbounded diagnostic echo.
-10. SQLite enables foreign keys, WAL, secure delete, and a busy timeout on every connection.
-11. Unknown database schema versions fail before migrations or application reads.
-12. A crash before commit exposes no partial record or transition after reopen.
-13. Automated retention never deletes transition history, audit events, or unresolved quarantine.
-14. Fake services never advertise behavior that their script cannot execute.
-15. No fake result is described as current real-Coven conformance.
-16. Delivery keeps the canonical `del_` prefix; delegation cannot claim it.
-17. Quarantine resolution is validated, durable, idempotent, and conflict-safe.
-18. Checkpoint failure still publishes `Stopped`, wakes every waiter, and returns the preserved error.
-19. Every canonical v1 error code decodes strictly; unknown codes quarantine rather than aliasing a known code.
+7. Execution-binding revisions are immutable, monotonically versioned, and
+   digest-linked; the store appends them without overwriting prior state.
+8. Transition rows validate their complete digest-bearing shape and append atomically; no API updates or deletes historical rows.
+9. Raw rejected payloads are not written to logs or error messages.
+10. Quarantine retains bounded bytes and a digest, not an unbounded diagnostic echo.
+11. SQLite enables foreign keys, WAL, secure delete, and a busy timeout on every connection.
+12. Unknown database schema versions fail before migrations or application reads.
+13. A crash before commit exposes no partial record, binding revision, or transition after reopen.
+14. Automated retention never deletes execution-binding revisions, transition history, audit events, or unresolved quarantine.
+15. Fake services never advertise behavior that their script cannot execute.
+16. No fake result is described as current real-Coven conformance.
+17. Delivery keeps the canonical `del_` prefix; delegation cannot claim it.
+18. Quarantine resolution is validated, durable, idempotent, and conflict-safe.
+19. Checkpoint failure still publishes `Stopped`, wakes every waiter, and returns the preserved error.
+20. Every canonical v1 error code decodes strictly; unknown codes quarantine rather than aliasing a known code.
 20. Ambiguous Coven adoption is durably returned or fenced through the reconciliation operation; faults never authorize redispatch.
 21. Adoption request digests are recomputed from every canonical typed request field; callers cannot reuse a digest for changed work.
 22. Cancellation completion requires typed O5 acknowledgement evidence; raw `killed`, `orphaned`, or other ledger status never suffices.
@@ -897,6 +903,10 @@ the complete correlation required to validate a direct store insertion:
 ```rust
 pub schema_version: SchemaVersion,
 pub attempt_id: RecordId,
+pub revision: u64,
+pub previous_revision_digest: Option<Sha256Digest>,
+#[serde(with = "time::serde::rfc3339")]
+pub revision_created_at: time::OffsetDateTime,
 pub familiar_snapshot_id: RecordId,
 pub project_id: String,
 pub request_id: RequestId,
@@ -921,8 +931,13 @@ The canonical W0 field names remain `request_id` and `request_digest`.
 additive G2 fields needed to make the frozen correlation and cancellation
 invariants locally enforceable. `event_cursor` remains an opaque validated
 string; Psyche does not assume a numeric real-Coven cursor before W5.
+`revision`, `previous_revision_digest`, and `revision_created_at` make state
+changes append-only: revision 1 has no previous digest; every later revision
+names the canonical digest of its immediate predecessor.
 
 Validation first requires
+`revision >= 1`, `previous_revision_digest.is_none()` exactly when
+`revision == 1`, an RFC 3339 UTC `revision_created_at`, and
 `request_valid_until > request_created_at`. It then
 enforces an exact matrix:
 
@@ -1525,6 +1540,24 @@ CREATE TABLE canonical_records (
   PRIMARY KEY (kind, record_id),
   UNIQUE (kind, record_id, digest)
 ) STRICT;
+CREATE TABLE execution_binding_revisions (
+  attempt_id TEXT NOT NULL,
+  revision INTEGER NOT NULL CHECK (revision >= 1),
+  schema_version TEXT NOT NULL,
+  digest TEXT NOT NULL,
+  previous_revision_digest TEXT,
+  canonical_json BLOB NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (attempt_id, revision),
+  UNIQUE (attempt_id, digest),
+  CHECK (
+    (revision = 1 AND previous_revision_digest IS NULL)
+    OR
+    (revision > 1 AND previous_revision_digest IS NOT NULL)
+  ),
+  FOREIGN KEY (attempt_id, previous_revision_digest)
+    REFERENCES execution_binding_revisions(attempt_id, digest)
+) STRICT;
 CREATE TABLE transitions (
   sequence INTEGER PRIMARY KEY AUTOINCREMENT,
   kind TEXT NOT NULL,
@@ -1563,7 +1596,10 @@ CREATE TABLE audit_events (
 
 The generic tables are the W2 storage substrate, not a replacement for the
 domain indexes listed in `TECH.md`. W3-W9 add indexed projections in their own
-forward-only migrations.
+forward-only migrations. `canonical_records` stores records whose identity is
+immutable. `execution_binding_revisions` is the one G2 append-only revision
+ledger required because adoption, cursor, cancellation, and terminal
+correlation evolve while the attempt identity remains fixed.
 
 - [ ] **Step 4: Configure every connection**
 
@@ -1612,10 +1648,11 @@ git commit -m "feat(store): add forward-only foundation migration"
 
 ---
 
-### Task 6: Persist immutable records and append-only transitions
+### Task 6: Persist immutable records, binding revisions, and transitions
 
 **Files:**
 - Create: `crates/psyche-store/src/records.rs`
+- Create: `crates/psyche-store/src/execution_bindings.rs`
 - Create: `crates/psyche-store/src/transitions.rs`
 - Create: `crates/psyche-store/tests/records.rs`
 - Modify: `crates/psyche-store/src/lib.rs`
@@ -1874,6 +1911,86 @@ fn direct_insert_rejects_unresolved_before_termination_window() {
 }
 
 #[test]
+fn execution_binding_revision_appends_termination_outcomes_without_record_conflict() {
+    let (mut acknowledged_store, _acknowledged_dir) = test_store();
+    let initial = fixture_execution_binding_revision_1();
+    acknowledged_store
+        .insert(&CanonicalDocument::ExecutionBinding(initial.clone()))
+        .unwrap();
+    let requested = fixture_termination_requested_revision(&initial);
+    acknowledged_store
+        .insert(&CanonicalDocument::ExecutionBinding(requested.clone()))
+        .unwrap();
+    let acknowledged = fixture_acknowledged_revision(&requested);
+    acknowledged_store
+        .insert(&CanonicalDocument::ExecutionBinding(acknowledged.clone()))
+        .unwrap();
+    assert_eq!(
+        acknowledged_store
+            .execution_binding_revisions(&initial.attempt_id)
+            .unwrap(),
+        vec![initial, requested, acknowledged]
+    );
+
+    let (mut unresolved_store, _unresolved_dir) = test_store();
+    let initial = fixture_execution_binding_revision_1();
+    unresolved_store
+        .insert(&CanonicalDocument::ExecutionBinding(initial.clone()))
+        .unwrap();
+    let requested = fixture_termination_requested_revision(&initial);
+    unresolved_store
+        .insert(&CanonicalDocument::ExecutionBinding(requested.clone()))
+        .unwrap();
+    let unresolved = fixture_unresolved_revision(&requested);
+    unresolved_store
+        .insert(&CanonicalDocument::ExecutionBinding(unresolved.clone()))
+        .unwrap();
+    assert_eq!(
+        unresolved_store
+            .execution_binding_revisions(&initial.attempt_id)
+            .unwrap(),
+        vec![initial, requested, unresolved]
+    );
+}
+
+#[test]
+fn execution_binding_revision_rejects_forks_gaps_and_changed_correlation() {
+    let (mut store, _dir) = test_store();
+    let initial = fixture_execution_binding_revision_1();
+    store
+        .insert(&CanonicalDocument::ExecutionBinding(initial.clone()))
+        .unwrap();
+
+    let mut gap = fixture_termination_requested_revision(&initial);
+    gap.revision = 3;
+    assert!(matches!(
+        store.insert(&CanonicalDocument::ExecutionBinding(gap)),
+        Err(StoreError::ExecutionBindingRevisionConflict { .. })
+    ));
+
+    let mut wrong_previous = fixture_termination_requested_revision(&initial);
+    wrong_previous.previous_revision_digest = Some(fixture_other_digest());
+    assert!(matches!(
+        store.insert(&CanonicalDocument::ExecutionBinding(wrong_previous)),
+        Err(StoreError::ExecutionBindingRevisionConflict { .. })
+    ));
+
+    let mut changed_correlation = fixture_termination_requested_revision(&initial);
+    changed_correlation.request_digest = fixture_other_digest();
+    assert!(matches!(
+        store.insert(&CanonicalDocument::ExecutionBinding(changed_correlation)),
+        Err(StoreError::ExecutionBindingRevisionConflict { .. })
+    ));
+
+    assert_eq!(
+        store
+            .execution_binding_revisions(&initial.attempt_id)
+            .unwrap(),
+        vec![initial]
+    );
+}
+
+#[test]
 fn transition_versions_are_monotonic_and_append_only() {
     let (mut store, _dir) = test_store();
     store
@@ -1934,6 +2051,10 @@ The latter two include `termination_request: Some(...)` whose ID matches their
 evidence and whose window contains the baseline evidence timestamp. Every
 negative test mutates exactly one field from that valid baseline, so a generic
 missing-correlation failure cannot satisfy a mismatch or window test.
+The revision helpers derive each next revision from its predecessor, increment
+`revision`, set `previous_revision_digest` from the predecessor's canonical
+bytes, and advance `revision_created_at`. They never rebuild the immutable
+execution correlation independently.
 
 - [ ] **Step 2: Run and verify RED**
 
@@ -1952,9 +2073,9 @@ hashing, opening a transaction, or executing SQL. It then requires
 `persistable_record_id()`; `CanonicalDocument::Error` returns
 `StoreError::NonPersistableKind { kind: SchemaKind::Error }` and writes
 nothing. `ingest` returns the same explicit error for a recognized error
-envelope rather than quarantining it. For persistable records, `insert`
-canonicalizes and digests the typed document inside the method. Use `INSERT ...
-ON CONFLICT DO NOTHING`, then load the existing digest:
+envelope rather than quarantining it. For persistable records other than `ExecutionBinding`, `insert` canonicalizes
+and digests the typed document inside the method. Use `INSERT ... ON CONFLICT DO
+NOTHING`, then load the existing digest:
 
 Add `StoreError::Contract(ContractError)` for validation failures and
 `StoreError::NonPersistableKind { kind: SchemaKind }` for recognized boundary
@@ -1964,9 +2085,33 @@ envelopes that have no storage identity.
 - different digest: return `StoreError::RecordConflict`;
 - never update canonical bytes.
 
+For `CanonicalDocument::ExecutionBinding`, `insert` routes to the
+`execution_binding_revisions` ledger in one immediate transaction:
+
+- with no prior revision, require revision 1 and no previous digest;
+- otherwise require `revision == latest.revision + 1` and
+  `previous_revision_digest == digest(latest canonical bytes)`;
+- require `revision_created_at > latest.revision_created_at`;
+- require attempt ID, familiar snapshot, project, request ID/digest,
+  request creation/deadline, and Coven contract version to equal revision 1;
+- allow `coven_session_id` to change only from `None` to one non-empty value,
+  then freeze it;
+- once a termination correlation is present, require its exact ID and time
+  window in every later revision;
+- reject a reused `(attempt_id, revision)` with changed bytes, a skipped
+  revision, a forked previous digest, or changed immutable correlation as
+  `StoreError::ExecutionBindingRevisionConflict`;
+- accept exact replay of an existing revision idempotently;
+- append canonical bytes and never update or delete a prior revision.
+
+This is storage-shape enforcement, not W4/W5 transition policy. The store does
+not decide which adoption or cancellation state may follow another; it proves
+only linear history, stable authority bindings, and immutable evidence.
+
 `load` and `load_canonical_bytes` likewise reject `SchemaKind::Error` with
 `StoreError::NonPersistableKind` before querying because the envelope has no
-record ID.
+record ID. For `SchemaKind::ExecutionBinding` they return the latest revision;
+`execution_binding_revisions` returns the complete ordered history.
 
 `ingest` is the byte boundary: it calls `decode_document`, invokes `insert` for
 known records, and invokes `quarantine` for unknown kinds, unknown majors, or
@@ -2018,7 +2163,7 @@ Expected: all tests pass with no ignored cases.
 
 ```bash
 git add crates/psyche-store
-git commit -m "feat(store): enforce immutable records and transitions"
+git commit -m "feat(store): enforce immutable records and revisions"
 ```
 
 ---
@@ -2150,15 +2295,25 @@ fn quarantine_resolution_rejects_unknown_stale_or_conflicting_requests() {
 }
 
 #[test]
-fn pruning_preserves_unresolved_quarantine_and_all_transition_history() {
+fn pruning_preserves_unresolved_quarantine_binding_revisions_and_transitions() {
     let (mut store, _dir) = old_fixture_store();
+    let bindings_before = store
+        .execution_binding_revisions(&fixture_attempt_id())
+        .unwrap();
     let transitions_before = store.transitions(&fixture_graph_id()).unwrap();
     let audit_before = store.audit_events().unwrap();
     let report = store.prune(time::OffsetDateTime::now_utc()).unwrap();
     assert!(report.resolved_quarantine_deleted > 0);
     assert_eq!(report.unresolved_quarantine_deleted, 0);
+    assert_eq!(report.execution_binding_revisions_deleted, 0);
     assert_eq!(report.transitions_deleted, 0);
     assert_eq!(report.audit_events_deleted, 0);
+    assert_eq!(
+        store
+            .execution_binding_revisions(&fixture_attempt_id())
+            .unwrap(),
+        bindings_before
+    );
     assert_eq!(store.transitions(&fixture_graph_id()).unwrap(), transitions_before);
     assert_eq!(store.audit_events().unwrap(), audit_before);
 }
@@ -2220,16 +2375,19 @@ tests exercise the all-or-none resolution columns and digest.
 - quarantine rows whose `resolved_at` is older than the cutoff and whose
   `resolution_code` and `resolution_digest` are both present.
 
-Transition history is excluded from automated retention. `prune` executes no
-`DELETE` against `transitions`, and `PruneReport::transitions_deleted` is always
-zero. Audit events are also excluded because W2 stores public details as opaque
+Execution-binding revision and transition history are excluded from automated
+retention. `prune` executes no `DELETE` against
+`execution_binding_revisions` or `transitions`, and the corresponding
+`PruneReport` counts are always zero. Audit events are also excluded because W2
+stores public details as opaque
 JSON and defines no indexed reference projection capable of proving that a
 correlation is resolved. `prune` executes no `DELETE` against `audit_events`,
 and `PruneReport::audit_events_deleted` is always zero. A later workstream may
 add an explicit indexed reference table in a forward-only migration before
 automating audit deletion; parsing opaque JSON is never a retention authority.
-Any future transition or audit deletion requires that separately reviewed
-projection/export contract and explicit evidence; it is not part of W2/G2.
+Any future binding-revision, transition, or audit deletion requires that
+separately reviewed projection/export contract and explicit evidence; it is
+not part of W2/G2.
 Return counts in `PruneReport`; do not vacuum automatically.
 
 - [ ] **Step 6: Run retention tests**
@@ -2593,10 +2751,13 @@ bounds, and lifetime before returning any public typed value.
 `TerminationRequest::new` accepts the session, execution correlation,
 `TerminationRequestCorrelation`, and reason code. It validates the same
 termination ID/time rules as `ExecutionBinding`, then the caller persists an
-`ExecutionBinding` containing that exact termination correlation before calling
-`CovenPort::terminate`. The adapter accepts acknowledgement or unresolved
-evidence only when its termination request ID and timestamp match that persisted
-correlation. It never derives a deadline from response arrival time.
+append-only `ExecutionBinding` revision containing that exact termination
+correlation before calling `CovenPort::terminate`. The adapter accepts
+acknowledgement or unresolved evidence only when its termination request ID and
+timestamp match that persisted correlation. It then derives the next revision
+from the termination-requested revision, preserving its digest link and
+immutable execution correlation. It never derives a deadline from response
+arrival time.
 
 Add a strict canonical `tests/fixtures/result-bundle.json` containing one
 primary `application/json` result and one `text/plain` artifact. In
@@ -2703,8 +2864,8 @@ The core-owned `CancellationAcknowledgementEvidence` is the separate O5
 authority evidence required by C-S9. `psyche-coven` imports it from
 `psyche-core`; it does not define a parallel acknowledgement type.
 The adapter maps the O5 response into the canonical evidence only after exact
-session/request/correlation/digest validation, then persists the resulting
-`ExecutionBinding`. An unresolved O5 response maps to the core-owned
+session/request/correlation/digest validation, then appends the resulting
+`ExecutionBinding` revision. An unresolved O5 response maps to the core-owned
 `CancellationUnresolvedEvidence`. This dependency remains
 `psyche-coven -> psyche-core`; core/store never depend on the adapter.
 
@@ -2854,17 +3015,19 @@ Expected: compile failure because `FoundationOperation` and its model are absent
 - [ ] **Step 3: Implement a policy-free reference model**
 
 Define generated operations for insert, identical reinsert, conflicting
-reinsert, invalid direct insert (schema or field-ID kind), append-next-transition,
-append-duplicate-version, invalid transition digest/kind, quarantine,
-resolve-quarantine, prune, checkpoint, and reopen. The reference model tracks
-only durable keys, digests, transition versions, and quarantine resolution.
-Every invalid direct insert and invalid transition leaves the model and store
-unchanged.
+reinsert, invalid direct insert (schema or field-ID kind), append-next-binding-
+revision, replay-binding-revision, fork/gap/correlation-mismatch binding
+revision, append-next-transition, append-duplicate-version, invalid transition
+digest/kind, quarantine, resolve-quarantine, prune, checkpoint, and reopen. The
+reference model tracks durable keys, immutable-record digests, binding revision
+numbers/digest links, transition versions, and quarantine resolution. Every
+invalid direct insert, binding revision, and transition leaves the model and
+store unchanged.
 Generated `resolve-quarantine` operations call the public
 `Store::resolve_quarantine` API and model first resolution, identical replay,
 unknown ID, stale timestamp, and conflicting replay outcomes explicitly.
-Prune never removes transition versions or audit events from either model or
-store.
+Prune never removes execution-binding revisions, transition versions, or audit
+events from either model or store.
 It must not encode graph/node transition legality, admission, delegation,
 budget, verification, delivery, or recovery policy.
 
@@ -3242,6 +3405,7 @@ Expected: failure because `crash_writer` is absent.
 
 - `exit-before-commit`;
 - `exit-after-record-before-transition`;
+- `exit-after-binding-revision-before-commit`;
 - `exit-after-commit-before-checkpoint`;
 - `exit-during-migration`.
 
@@ -3282,10 +3446,13 @@ can fire. Production transaction code has no callback or selectable seam.
 
 The other modes open a real store, write the committed baseline, begin the
 named operation, then call `std::process::abort()` at the declared point. The
-helper is a `psyche-store` binary target, so `cargo_bin!("crash_writer")` in
-the `psyche-store` integration test resolves within the package Cargo is
-testing. Default builds do not compile the feature-gated module or binary, and
-the public production `Store` API contains no fault selector or test hook.
+binding-revision mode begins the same immediate transaction used by the
+production ledger, inserts the next canonical revision, and aborts before
+commit; reopen must expose only the predecessor. The helper is a `psyche-store`
+binary target, so `cargo_bin!("crash_writer")` in the `psyche-store`
+integration test resolves within the package Cargo is testing. Default builds
+do not compile the feature-gated module or binary, and the public production
+`Store` API contains no fault selector or test hook.
 
 - [ ] **Step 4: Add reopen assertions**
 
@@ -3294,8 +3461,10 @@ For every crash point, prove:
 - SQLite integrity check returns `ok`;
 - only committed rows are visible;
 - migration version is either wholly old or wholly new;
-- no same-ID/different-digest record exists;
-- quarantine and complete transition-history invariants hold;
+- no same-ID/different-digest immutable record or same-attempt/same-revision
+  binding conflict exists;
+- quarantine, complete execution-binding revision history, and complete
+  transition-history invariants hold;
 - reopening twice is idempotent.
 
 - [ ] **Step 5: Run crash and migration suites repeatedly**
@@ -3614,6 +3783,8 @@ Use this complete manifest shape:
         "direct_insert_rejects_acknowledgement_before_termination_window",
         "direct_insert_rejects_unresolved_outside_termination_window",
         "direct_insert_rejects_unresolved_before_termination_window",
+        "execution_binding_revision_appends_termination_outcomes_without_record_conflict",
+        "execution_binding_revision_rejects_forks_gaps_and_changed_correlation",
         "transition_versions_are_monotonic_and_append_only"
       ]
     },
@@ -3622,7 +3793,8 @@ Use this complete manifest shape:
       "tests": [
         "quarantine_id_constructor_parser_and_serde_round_trip",
         "unknown_enum_is_quarantined_without_dispatchable_record",
-        "quarantine_resolution_is_durable_and_idempotent"
+        "quarantine_resolution_is_durable_and_idempotent",
+        "pruning_preserves_unresolved_quarantine_binding_revisions_and_transitions"
       ]
     },
     "psyche-store/migrations": {
@@ -3786,6 +3958,7 @@ including why `ExpectedUnsupported` is diagnostic rather than passed evidence.
 | Unknown kind/version/enum denial and quarantine | `cargo test -p psyche-core --test decode -- --exact unknown_typed_enum_is_a_quarantinable_decode_failure && cargo test -p psyche-store --test retention -- --exact unknown_enum_is_quarantined_without_dispatchable_record` | not run remotely | none |
 | Quarantine resolution | `cargo test -p psyche-store --test retention -- --exact quarantine_resolution_is_durable_and_idempotent` | not run remotely | none |
 | Direct typed insert validation | `cargo test -p psyche-store --test records -- --exact direct_insert_rejects_wrong_field_id_kind_without_writing && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_acknowledged_cancellation_without_evidence && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_acknowledged_state_without_termination_correlation && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_mismatched_cancellation_evidence && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_wrong_termination_request_id && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_acknowledgement_outside_termination_window && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_acknowledgement_before_termination_window && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_unresolved_outside_termination_window && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_unresolved_before_termination_window` | not run remotely | none |
+| Append-only execution-binding revisions | `cargo test -p psyche-store --test records -- --exact execution_binding_revision_appends_termination_outcomes_without_record_conflict && cargo test -p psyche-store --test records -- --exact execution_binding_revision_rejects_forks_gaps_and_changed_correlation && cargo test -p psyche-store --test retention -- --exact pruning_preserves_unresolved_quarantine_binding_revisions_and_transitions` | not run remotely | none |
 | Transition contract and append-only rules | `cargo test -p psyche-store --test records -- --exact transition_versions_are_monotonic_and_append_only` | not run remotely | none |
 | Checkpoint-failure shutdown | `cargo test -p psyche-runtime --lib -- --exact tests::checkpoint_failure_stops_and_releases_every_shutdown_waiter` | not run remotely | none |
 | Migrations | `cargo test -p psyche-store --test migrations -- --exact fresh_store_applies_v1_once_and_reopens` | not run remotely | none |
@@ -4004,21 +4177,22 @@ The implementation is ready for G2 review only when:
 5. every persisted typed record is validated on both decode and direct insert;
 6. every unknown kind, major, or typed enum value becomes a bounded quarantine record;
 7. quarantine resolution is durable, idempotent, conflict-safe, and the only route that makes a row retention-eligible;
-8. same-ID/different-digest insertion fails without mutation;
-9. the store-owned `Transition` validates kind/ID/version/state/digest/time, appends monotonically, and has no update/delete API;
-10. automated retention excludes transition history and audit events;
-11. migrations and crash recovery are atomic, and unknown-future versions fail closed;
-12. clean or failed checkpointing publishes `Stopped`, wakes all shutdown callers, and returns one deterministic terminal outcome through `Runtime::state()`;
-13. C-S6 uses the executable correlation-bound reconciliation operation, persists return/fence dispositions across restart and faults, and proves no redispatch while unresolved or returned;
-14. adoption IDs/digests bind the full canonical launch/input request, are recomputed by both owners, and reject every changed field before mutation;
-15. C-S9 accepts only core-owned, fully correlated durable typed O5 acknowledgement evidence; the execution binding persists the authoritative termination request ID and creation/deadline window, direct inserts reject absent/mismatched/out-of-window evidence, and every raw ledger status, including `killed` and `orphaned`, remains insufficient;
-16. execution-request timestamps serialize as RFC 3339 strings and both golden canonical byte/digest fixtures match exactly;
-17. `CancellationState` uses the complete G2-owned local vocabulary and never claims nonexistent TECH or current Coven O5 authority;
-18. every fixture include path resolves from its Rust source and the nullable-binding fixtures exist at the declared package-local paths;
-19. fake and real-adapter fixtures expose the same adapter-neutral availability/fault/reset/observation controls, and reusable suites have no fake-only relaxed assertions;
-20. every C-S1 through C-S12 reusable function has an exact executable wrapper, manifest entry, and evidence row; expected-unsupported diagnostics cannot be counted as passed;
-21. passed evidence contains exact executable commands, `passed` results, one verified immutable run URL, immutable Coven plan/spec URLs and SHA-256 values, and no candidate placeholders;
-22. the C-S10 result and every artifact carry validated digest, media type, size, expiry, and the exact `AdoptionRequest::correlation()` derived from the launch golden, with strict fixture, mismatch, and retention-owner tests;
-23. every filtered evidence command uses an exact manifest-listed test that Cargo `--list` proves exists, so zero-match success is rejected;
-24. `RecordKind::Attempt` and `att_` are the sole execution-binding identity kind/prefix; there is no duplicate binding-named record-kind variant and every exhaustive mapping/test agrees;
-25. full local and remote gates pass for the attested source SHA, every later commit through the reviewed evidence head changes only `docs/G2-EVIDENCE.md`, and no W3-W9 policy or G4+ capability is enabled.
+8. same-ID/different-digest immutable-record insertion and same-attempt/same-revision binding conflicts fail without mutation;
+9. execution-binding state changes append as monotonically numbered, previous-digest-linked immutable revisions; a termination-requested revision can be followed by either authoritative acknowledgement or unresolved evidence without `RecordConflict`, fork, overwrite, or history loss;
+10. the store-owned `Transition` validates kind/ID/version/state/digest/time, appends monotonically, and has no update/delete API;
+11. automated retention excludes execution-binding revision history, transition history, and audit events;
+12. migrations and crash recovery are atomic, and unknown-future versions fail closed;
+13. clean or failed checkpointing publishes `Stopped`, wakes all shutdown callers, and returns one deterministic terminal outcome through `Runtime::state()`;
+14. C-S6 uses the executable correlation-bound reconciliation operation, persists return/fence dispositions across restart and faults, and proves no redispatch while unresolved or returned;
+15. adoption IDs/digests bind the full canonical launch/input request, are recomputed by both owners, and reject every changed field before mutation;
+16. C-S9 accepts only core-owned, fully correlated durable typed O5 acknowledgement evidence; the execution-binding revision ledger persists the authoritative termination request ID and creation/deadline window before the call, appends the response evidence afterward, rejects absent/mismatched/out-of-window evidence, and every raw ledger status, including `killed` and `orphaned`, remains insufficient;
+17. execution-request timestamps serialize as RFC 3339 strings and both golden canonical byte/digest fixtures match exactly;
+18. `CancellationState` uses the complete G2-owned local vocabulary and never claims nonexistent TECH or current Coven O5 authority;
+19. every fixture include path resolves from its Rust source and the nullable-binding fixtures exist at the declared package-local paths;
+20. fake and real-adapter fixtures expose the same adapter-neutral availability/fault/reset/observation controls, and reusable suites have no fake-only relaxed assertions;
+21. every C-S1 through C-S12 reusable function has an exact executable wrapper, manifest entry, and evidence row; expected-unsupported diagnostics cannot be counted as passed;
+22. passed evidence contains exact executable commands, `passed` results, one verified immutable run URL, immutable Coven plan/spec URLs and SHA-256 values, and no candidate placeholders;
+23. the C-S10 result and every artifact carry validated digest, media type, size, expiry, and the exact `AdoptionRequest::correlation()` derived from the launch golden, with strict fixture, mismatch, and retention-owner tests;
+24. every filtered evidence command uses an exact manifest-listed test that Cargo `--list` proves exists, so zero-match success is rejected;
+25. `RecordKind::Attempt` and `att_` are the sole execution-binding identity kind/prefix; there is no duplicate binding-named record-kind variant and every exhaustive mapping/test agrees;
+26. full local and remote gates pass for the attested source SHA, every later commit through the reviewed evidence head changes only `docs/G2-EVIDENCE.md`, and no W3-W9 policy or G4+ capability is enabled.
