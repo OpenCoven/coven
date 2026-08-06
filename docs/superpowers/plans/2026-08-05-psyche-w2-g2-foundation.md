@@ -857,6 +857,16 @@ pub struct CancellationUnresolvedEvidence {
     #[serde(with = "time::serde::rfc3339")]
     pub recorded_at: time::OffsetDateTime,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "TerminationRequestCorrelationWire")]
+pub struct TerminationRequestCorrelation {
+    pub termination_request_id: RequestId,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: time::OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub valid_until: time::OffsetDateTime,
+}
 ```
 
 `NotRequested` and `TerminationRequested` carry no terminal evidence.
@@ -878,44 +888,85 @@ kinds, and raw-ledger promotion. Add `ExecutionBinding` with the exact fields
 required by the W0 TECH description. Name the focused integration test
 `cancellation_state_vocabulary_requires_matching_o5_evidence`.
 
-`CancellationAcknowledgementEvidence`,
-`CancellationAcknowledgementKind`, and `CancellationUnresolvedEvidence` are
+`CancellationAcknowledgementEvidence`, `CancellationAcknowledgementKind`,
+`CancellationUnresolvedEvidence`, and `TerminationRequestCorrelation` are
 owned by `psyche-core/src/contracts/execution.rs` and re-exported by
-`psyche-core`; they do not import `psyche-coven`. `ExecutionBinding` contains:
+`psyche-core`; they do not import `psyche-coven`. `ExecutionBinding` contains
+the complete correlation required to validate a direct store insertion:
 
 ```rust
+pub schema_version: SchemaVersion,
+pub attempt_id: RecordId,
+pub familiar_snapshot_id: RecordId,
+pub project_id: String,
+pub request_id: RequestId,
+pub request_digest: Sha256Digest,
+#[serde(with = "time::serde::rfc3339")]
+pub request_created_at: time::OffsetDateTime,
+#[serde(with = "time::serde::rfc3339")]
+pub request_valid_until: time::OffsetDateTime,
+pub coven_contract_version: String,
+pub coven_session_id: Option<String>,
+pub adoption_state: AdoptionState,
+pub event_cursor: Option<String>,
 pub cancellation_state: CancellationState,
+pub termination_request: Option<TerminationRequestCorrelation>,
 pub cancellation_acknowledgement: Option<CancellationAcknowledgementEvidence>,
 pub cancellation_unresolved: Option<CancellationUnresolvedEvidence>,
+pub terminal_state: Option<String>,
 ```
 
-Validation enforces an exact one-of matrix: both evidence fields are absent for
-`NotRequested`/`TerminationRequested`; acknowledgement alone is present with
-the matching kind for either acknowledged state; unresolved alone is present
-for `TerminationUnknown`. Every evidence reference must match the binding's
-session ID, execution request ID/digest, and termination request ID, use
+The canonical W0 field names remain `request_id` and `request_digest`.
+`request_created_at`, `request_valid_until`, and `termination_request` are the
+additive G2 fields needed to make the frozen correlation and cancellation
+invariants locally enforceable. `event_cursor` remains an opaque validated
+string; Psyche does not assume a numeric real-Coven cursor before W5.
+
+Validation first requires
+`request_valid_until > request_created_at`. It then
+enforces an exact matrix:
+
+- `NotRequested`: termination correlation and both evidence fields are absent;
+- `TerminationRequested`: a termination correlation is present and both
+  evidence fields are absent;
+- either acknowledged state: the termination correlation and matching
+  acknowledgement alone are present;
+- `TerminationUnknown`: the termination correlation and unresolved evidence
+  alone are present.
+
+The termination correlation requires
+`valid_until > created_at >= request_created_at`; its
+`termination_request_id` must differ from the execution request ID. The
+termination window is independent of the execution-adoption deadline, so a
+long-running adopted session can be cancelled after
+`request_valid_until`; cancellation evidence is bounded by
+`termination_request.valid_until`, not the earlier adoption deadline.
+
+Every evidence reference must match the binding's session ID, execution request
+ID/digest, and authoritative `termination_request.termination_request_id`, use
 1..=255-byte UTF-8 acknowledgement/disposition/session IDs and a 1..=128-byte
 lowercase ASCII reason code, and carry a valid SHA-256 authority digest and
-RFC 3339 timestamp. The acknowledgement/unresolved timestamp cannot precede
-the binding/request creation time or exceed its validity window. The
-termination request ID must differ from the execution request ID. Constructors
-validate these rules; serde uses `TryFrom` validation rather than deriving an
-unchecked public wire path. This makes direct
-`CanonicalDocument::ExecutionBinding` inserts enforceable entirely in
-core/store without a reverse dependency.
+RFC 3339 timestamp. The acknowledgement or unresolved timestamp must fall in
+the closed interval from `termination_request.created_at` through
+`termination_request.valid_until`. Constructors validate these rules; serde
+uses `TryFrom` validation rather than deriving an unchecked public wire path.
+This makes direct `CanonicalDocument::ExecutionBinding` inserts enforceable
+entirely in core/store without a reverse dependency.
 
 The store tests mutate each evidence field independently: absent evidence,
 wrong kind, acknowledgement plus unresolved evidence, wrong session,
 termination/execution request ID or digest, reused request ID, invalid
-authority digest, empty/oversized ID or reason, and timestamps before creation
-or after lifetime. Every case must return
+authority digest, empty/oversized ID or reason, a missing or mismatched
+termination correlation, and timestamps before termination creation or after
+its deadline. Every case must return
 `ContractError::CancellationEvidenceMismatch` before a row or transition is
 written.
 
-The two private `*Wire` structs mirror the public fields and use
+The three private `*Wire` structs mirror their public fields and use
 `#[serde(deny_unknown_fields)]`; their `TryFrom` implementations call the same
 constructors/validators. They are module-private implementation details, so no
-unchecked evidence struct crosses the `psyche-core` boundary.
+unchecked evidence or termination correlation crosses the `psyche-core`
+boundary.
 
 Define the surface-neutral contracts in `contracts/surface.rs` with these exact
 owned wire fields:
@@ -1708,6 +1759,88 @@ fn direct_insert_rejects_mismatched_cancellation_evidence() {
 }
 
 #[test]
+fn direct_insert_rejects_wrong_termination_request_id() {
+    let (mut store, _dir) = test_store();
+    let mut binding = fixture_acknowledged_execution_binding();
+    binding
+        .cancellation_acknowledgement
+        .as_mut()
+        .unwrap()
+        .termination_request_id = fixture_other_request_id();
+    assert!(matches!(
+        store.insert(&CanonicalDocument::ExecutionBinding(binding)),
+        Err(StoreError::Contract(ContractError::CancellationEvidenceMismatch { .. }))
+    ));
+    assert_eq!(store.total_record_count().unwrap(), 0);
+}
+
+#[test]
+fn direct_insert_rejects_acknowledgement_outside_termination_window() {
+    let (mut store, _dir) = test_store();
+    let mut binding = fixture_acknowledged_execution_binding();
+    let after_deadline = binding
+        .termination_request
+        .as_ref()
+        .unwrap()
+        .valid_until
+        + time::Duration::nanoseconds(1);
+    binding
+        .cancellation_acknowledgement
+        .as_mut()
+        .unwrap()
+        .acknowledged_at = after_deadline;
+    assert!(matches!(
+        store.insert(&CanonicalDocument::ExecutionBinding(binding)),
+        Err(StoreError::Contract(ContractError::CancellationEvidenceMismatch { .. }))
+    ));
+    assert_eq!(store.total_record_count().unwrap(), 0);
+}
+
+#[test]
+fn direct_insert_rejects_acknowledgement_before_termination_window() {
+    let (mut store, _dir) = test_store();
+    let mut binding = fixture_acknowledged_execution_binding();
+    let before_start = binding
+        .termination_request
+        .as_ref()
+        .unwrap()
+        .created_at
+        - time::Duration::nanoseconds(1);
+    binding
+        .cancellation_acknowledgement
+        .as_mut()
+        .unwrap()
+        .acknowledged_at = before_start;
+    assert!(matches!(
+        store.insert(&CanonicalDocument::ExecutionBinding(binding)),
+        Err(StoreError::Contract(ContractError::CancellationEvidenceMismatch { .. }))
+    ));
+    assert_eq!(store.total_record_count().unwrap(), 0);
+}
+
+#[test]
+fn direct_insert_rejects_unresolved_outside_termination_window() {
+    let (mut store, _dir) = test_store();
+    let mut binding = fixture_unresolved_execution_binding();
+    let after_deadline = binding
+        .termination_request
+        .as_ref()
+        .unwrap()
+        .valid_until
+        + time::Duration::nanoseconds(1);
+    binding
+        .cancellation_unresolved
+        .as_mut()
+        .unwrap()
+        .recorded_at = after_deadline;
+    assert!(matches!(
+        store.insert(&CanonicalDocument::ExecutionBinding(binding)),
+        Err(StoreError::Contract(ContractError::CancellationEvidenceMismatch { .. }))
+    ));
+    assert_eq!(store.total_record_count().unwrap(), 0);
+}
+
+#[test]
 fn transition_versions_are_monotonic_and_append_only() {
     let (mut store, _dir) = test_store();
     store
@@ -1761,6 +1894,13 @@ fn transition_append_requires_exact_version_and_prior_state() {
 the complete Task 3 evidence mutation list, not only the digest example shown
 above. It also covers acknowledged states carrying unresolved evidence and
 `TerminationUnknown` carrying acknowledgement evidence.
+
+`fixture_execution_binding`, `fixture_acknowledged_execution_binding`, and
+`fixture_unresolved_execution_binding` each construct a fully valid binding.
+The latter two include `termination_request: Some(...)` whose ID matches their
+evidence and whose window contains the baseline evidence timestamp. Every
+negative test mutates exactly one field from that valid baseline, so a generic
+missing-correlation failure cannot satisfy a mismatch or window test.
 
 - [ ] **Step 2: Run and verify RED**
 
@@ -2219,7 +2359,8 @@ impl AdoptionRequest {
     pub fn recompute_digest(&self) -> Result<Sha256Digest, PortError>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "ExecutionCorrelationWire")]
 pub struct ExecutionCorrelation {
     pub request_id: RequestId,
     pub request_digest: Sha256Digest,
@@ -2228,7 +2369,9 @@ pub struct ExecutionCorrelation {
     pub graph_id: RecordId,
     pub node_id: RecordId,
     pub attempt_id: RecordId,
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: time::OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
     pub valid_until: time::OffsetDateTime,
 }
 
@@ -2315,11 +2458,10 @@ pub struct ArtifactReference {
 }
 
 pub struct TerminationRequest {
-    pub request_id: RequestId,
     pub session_id: String,
     pub correlation: ExecutionCorrelation,
+    pub termination: TerminationRequestCorrelation,
     pub reason_code: String,
-    pub requested_at: time::OffsetDateTime,
 }
 
 pub enum TerminationDisposition {
@@ -2379,6 +2521,10 @@ JSON contains RFC 3339 strings exactly as required by TECH, never the default
 `OffsetDateTime` tuple/object representation. If a later compatible field is
 nullable, it must use `time::serde::rfc3339::option`; nullable timestamps may
 not silently switch encodings.
+`ExecutionCorrelation` also deserializes through a private strict wire form
+whose `TryFrom` checks all field-specific IDs, the request digest, bounded
+project ID, and `valid_until > created_at`; nested result/artifact decoding
+therefore cannot bypass correlation validation.
 `SessionSnapshot`, `ResultBundle`, and every
 `ArtifactReference` must echo the exact adoption correlation. Result and
 artifact expiry may shorten but never extend `correlation.valid_until`; an
@@ -2406,31 +2552,49 @@ and no artifact expiry after `result.expires_at` or
 with `size_bytes` equal to the canonical empty representation's byte length;
 zero is never an “unknown size” sentinel.
 
-The three private `*Wire` forms mirror their public fields and deny unknown
-fields. Their `TryFrom` implementations recursively validate the content
-reference, full correlation, session/artifact association, uniqueness, bounds,
-and lifetime before returning any public typed value.
+The four private `*Wire` forms mirror their public fields and deny unknown
+fields. Their `TryFrom` implementations recursively validate the execution
+correlation, content reference, session/artifact association, uniqueness,
+bounds, and lifetime before returning any public typed value.
+
+`TerminationRequest::new` accepts the session, execution correlation,
+`TerminationRequestCorrelation`, and reason code. It validates the same
+termination ID/time rules as `ExecutionBinding`, then the caller persists an
+`ExecutionBinding` containing that exact termination correlation before calling
+`CovenPort::terminate`. The adapter accepts acknowledgement or unresolved
+evidence only when its termination request ID and timestamp match that persisted
+correlation. It never derives a deadline from response arrival time.
 
 Add a strict canonical `tests/fixtures/result-bundle.json` containing one
 primary `application/json` result and one `text/plain` artifact. In
 `tests/bindings.rs`, name the positive test
-`result_bundle_fixture_round_trips_complete_content_references`. Add negative
-tests for missing/unknown result fields, wrong result digest/media type/size,
-zero or oversized size, malformed media type, result expiry beyond correlation
-lifetime, duplicate artifact ID, artifact session/correlation mismatch, and
-artifact digest/media type/size/expiry disagreement. Collect the constructor,
-payload, bounds, and expiry cases in the exact test
+`result_bundle_fixture_round_trips_complete_content_references`. Add
+`result_bundle_fixture_uses_launch_request_correlation`, which loads
+`execution-request-launch.json`, constructs `AdoptionRequest` through its
+public constructor, and asserts its derived correlation equals the bundle and
+artifact correlations. Add negative tests for missing/unknown result fields,
+wrong result digest/media type/size, zero or oversized size, malformed media
+type, result expiry beyond correlation lifetime, duplicate artifact ID,
+artifact session/correlation mismatch, and artifact digest/media type/size/
+expiry disagreement. Collect the constructor, payload, bounds, and expiry
+cases in the exact test
 `content_reference_rejects_digest_size_media_type_and_lifetime_mismatch`.
 
 The fixture's exact decoded values are:
 
 ```json
-{"session_id":"session-1","correlation":{"execution_request_id":"req_01J00000000000000000000000","request_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","familiar_snapshot":"ids_01J00000000000000000000000","project_id":"project:sha256:abc","graph_id":"grf_01J00000000000000000000000","node_id":"nod_01J00000000000000000000000","attempt_id":"att_01J00000000000000000000000","valid_until":"2026-08-05T14:05:00Z"},"result":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","media_type":"application/json","size_bytes":2,"expires_at":"2026-08-05T14:04:00Z"},"artifacts":[{"artifact_id":"artifact-1","session_id":"session-1","correlation":{"execution_request_id":"req_01J00000000000000000000000","request_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","familiar_snapshot":"ids_01J00000000000000000000000","project_id":"project:sha256:abc","graph_id":"grf_01J00000000000000000000000","node_id":"nod_01J00000000000000000000000","attempt_id":"att_01J00000000000000000000000","valid_until":"2026-08-05T14:05:00Z"},"content":{"digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","media_type":"text/plain","size_bytes":5,"expires_at":"2026-08-05T14:03:00Z"}}]}
+{"artifacts":[{"artifact_id":"artifact-1","content":{"digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","expires_at":"2026-08-05T14:03:00Z","media_type":"text/plain","size_bytes":5},"correlation":{"attempt_id":"att_01J00000000000000000000000","created_at":"2026-08-05T14:00:00Z","familiar_snapshot_id":"ids_01J00000000000000000000000","graph_id":"grf_01J00000000000000000000000","node_id":"nod_01J00000000000000000000000","project_id":"project:sha256:abc","request_digest":"sha256:75d651c5eb7f6e3ccd65631fce08afdcb8ac2a800bc0d8db55eaf9cf43519d04","request_id":"req_01J00000000000000000000000","valid_until":"2026-08-05T14:05:00Z"},"session_id":"session-1"}],"correlation":{"attempt_id":"att_01J00000000000000000000000","created_at":"2026-08-05T14:00:00Z","familiar_snapshot_id":"ids_01J00000000000000000000000","graph_id":"grf_01J00000000000000000000000","node_id":"nod_01J00000000000000000000000","project_id":"project:sha256:abc","request_digest":"sha256:75d651c5eb7f6e3ccd65631fce08afdcb8ac2a800bc0d8db55eaf9cf43519d04","request_id":"req_01J00000000000000000000000","valid_until":"2026-08-05T14:05:00Z"},"result":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","expires_at":"2026-08-05T14:04:00Z","media_type":"application/json","size_bytes":2},"session_id":"session-1"}
 ```
 
 The physical fixture is this single RFC 8785-canonical line with no trailing
 newline; the test parses it, validates it, and requires reserialization to
 produce identical bytes.
+The fixture correlation must equal
+`AdoptionRequest::new(decoded_launch_golden).correlation()` field-for-field;
+the fixture test does not independently construct or overwrite it. In
+particular, `request_digest` is the launch golden digest
+`sha256:75d651c5eb7f6e3ccd65631fce08afdcb8ac2a800bc0d8db55eaf9cf43519d04`,
+and both `created_at` and `valid_until` come from the same launch request.
 
 The fake's durable result ledger retains the complete result/artifact
 references through the greater of their expiry, the graph recovery window, and
@@ -2515,11 +2679,12 @@ Acknowledgement evidence is not derived from `SessionSnapshot::terminal_state`,
 `CovenEvent::terminal_state`, process exit, disconnect, or a raw persisted
 session status. `Acknowledged` validates a non-empty opaque acknowledgement ID,
 the exact termination request/session/execution correlation, a non-zero
-authority-evidence digest, and an acknowledgement timestamp no earlier than
-the request. `AlreadyAuthoritativelyTerminal` still requires this O5 evidence;
-reading a terminal ledger string is insufficient. `Unresolved` is durable,
-correlation-bound, restart-stable, and maps only to Psyche
-`termination_unknown`.
+authority-evidence digest, and an acknowledgement timestamp within the
+persisted termination correlation's inclusive creation/deadline window.
+`AlreadyAuthoritativelyTerminal` still requires this O5 evidence; reading a
+terminal ledger string is insufficient. `Unresolved` is durable,
+correlation-bound, restart-stable, subject to the same termination window, and
+maps only to Psyche `termination_unknown`.
 
 The C-S9 suite must feed every raw O1 ledger status (`created`, `running`,
 `idle`, `completed`, `failed`, `killed`, and `orphaned`) through snapshots and
@@ -2903,7 +3068,9 @@ content size, malformed media type, result expiry beyond the
 correlation lifetime, artifact expiry beyond either result or correlation
 lifetime, duplicate artifact IDs, `artifact.content` disagreement, and
 artifacts omitted from the complete result association. It round-trips the
-strict `result-bundle.json` fixture before running each independent mutation.
+strict `result-bundle.json` fixture, proves its correlation is exactly
+`AdoptionRequest::correlation()` for the launch golden, then runs each
+independent mutation.
 
 `assert_c_s6_ambiguity_fence` must:
 
@@ -3397,6 +3564,7 @@ Use this complete manifest shape:
       "list_command": "cargo test -p psyche-coven --test bindings -- --list --format terse",
       "tests": [
         "result_bundle_fixture_round_trips_complete_content_references",
+        "result_bundle_fixture_uses_launch_request_correlation",
         "content_reference_rejects_digest_size_media_type_and_lifetime_mismatch"
       ]
     },
@@ -3407,6 +3575,10 @@ Use this complete manifest shape:
         "direct_insert_rejects_wrong_field_id_kind_without_writing",
         "direct_insert_rejects_acknowledged_cancellation_without_evidence",
         "direct_insert_rejects_mismatched_cancellation_evidence",
+        "direct_insert_rejects_wrong_termination_request_id",
+        "direct_insert_rejects_acknowledgement_outside_termination_window",
+        "direct_insert_rejects_acknowledgement_before_termination_window",
+        "direct_insert_rejects_unresolved_outside_termination_window",
         "transition_versions_are_monotonic_and_append_only"
       ]
     },
@@ -3578,7 +3750,7 @@ including why `ExpectedUnsupported` is diagnostic rather than passed evidence.
 | Exhaustive registered decode | `cargo test -p psyche-core --test decode -- --exact recognized_error_envelope_decodes_exhaustively` | not run remotely | none |
 | Unknown kind/version/enum denial and quarantine | `cargo test -p psyche-core --test decode -- --exact unknown_typed_enum_is_a_quarantinable_decode_failure && cargo test -p psyche-store --test retention -- --exact unknown_enum_is_quarantined_without_dispatchable_record` | not run remotely | none |
 | Quarantine resolution | `cargo test -p psyche-store --test retention -- --exact quarantine_resolution_is_durable_and_idempotent` | not run remotely | none |
-| Direct typed insert validation | `cargo test -p psyche-store --test records -- --exact direct_insert_rejects_wrong_field_id_kind_without_writing && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_acknowledged_cancellation_without_evidence && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_mismatched_cancellation_evidence` | not run remotely | none |
+| Direct typed insert validation | `cargo test -p psyche-store --test records -- --exact direct_insert_rejects_wrong_field_id_kind_without_writing && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_acknowledged_cancellation_without_evidence && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_mismatched_cancellation_evidence && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_wrong_termination_request_id && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_acknowledgement_outside_termination_window && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_acknowledgement_before_termination_window && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_unresolved_outside_termination_window` | not run remotely | none |
 | Transition contract and append-only rules | `cargo test -p psyche-store --test records -- --exact transition_versions_are_monotonic_and_append_only` | not run remotely | none |
 | Checkpoint-failure shutdown | `cargo test -p psyche-runtime --lib -- --exact tests::checkpoint_failure_stops_and_releases_every_shutdown_waiter` | not run remotely | none |
 | Migrations | `cargo test -p psyche-store --test migrations -- --exact fresh_store_applies_v1_once_and_reopens` | not run remotely | none |
@@ -3597,7 +3769,7 @@ including why `ExpectedUnsupported` is diagnostic rather than passed evidence.
 | C-S7 scripted ordered cursor | `cargo test -p psyche-test-support --test conformance -- --exact c_s7_ordered_cursor` | not run remotely | none |
 | C-S8 scripted terminal authority | `cargo test -p psyche-test-support --test conformance -- --exact c_s8_terminal_authority` | not run remotely | none |
 | C-S9 scripted O5 cancellation acknowledgement | `cargo test -p psyche-test-support --test conformance -- --exact c_s9_cancellation_acknowledgement` | not run remotely | none |
-| C-S10 scripted result/artifact binding | `cargo test -p psyche-coven --test bindings -- --exact result_bundle_fixture_round_trips_complete_content_references && cargo test -p psyche-coven --test bindings -- --exact content_reference_rejects_digest_size_media_type_and_lifetime_mismatch && cargo test -p psyche-test-support --test conformance -- --exact c_s10_result_artifact_binding` | not run remotely | none |
+| C-S10 scripted result/artifact binding | `cargo test -p psyche-coven --test bindings -- --exact result_bundle_fixture_round_trips_complete_content_references && cargo test -p psyche-coven --test bindings -- --exact result_bundle_fixture_uses_launch_request_correlation && cargo test -p psyche-coven --test bindings -- --exact content_reference_rejects_digest_size_media_type_and_lifetime_mismatch && cargo test -p psyche-test-support --test conformance -- --exact c_s10_result_artifact_binding` | not run remotely | none |
 | C-S11 scripted restart persistence | `cargo test -p psyche-test-support --test conformance -- --exact c_s11_restart_persistence` | not run remotely | none |
 | C-S12 scripted structured denial | `cargo test -p psyche-test-support --test conformance -- --exact c_s12_structured_denial` | not run remotely | none |
 ```
@@ -3804,14 +3976,14 @@ The implementation is ready for G2 review only when:
 12. clean or failed checkpointing publishes `Stopped`, wakes all shutdown callers, and returns one deterministic terminal outcome through `Runtime::state()`;
 13. C-S6 uses the executable correlation-bound reconciliation operation, persists return/fence dispositions across restart and faults, and proves no redispatch while unresolved or returned;
 14. adoption IDs/digests bind the full canonical launch/input request, are recomputed by both owners, and reject every changed field before mutation;
-15. C-S9 accepts only core-owned, fully correlated durable typed O5 acknowledgement evidence; direct inserts reject absent/mismatched evidence, and every raw ledger status, including `killed` and `orphaned`, remains insufficient;
+15. C-S9 accepts only core-owned, fully correlated durable typed O5 acknowledgement evidence; the execution binding persists the authoritative termination request ID and creation/deadline window, direct inserts reject absent/mismatched/out-of-window evidence, and every raw ledger status, including `killed` and `orphaned`, remains insufficient;
 16. execution-request timestamps serialize as RFC 3339 strings and both golden canonical byte/digest fixtures match exactly;
 17. `CancellationState` uses the complete G2-owned local vocabulary and never claims nonexistent TECH or current Coven O5 authority;
 18. every fixture include path resolves from its Rust source and the nullable-binding fixtures exist at the declared package-local paths;
 19. fake and real-adapter fixtures expose the same adapter-neutral availability/fault/reset/observation controls, and reusable suites have no fake-only relaxed assertions;
 20. every C-S1 through C-S12 reusable function has an exact executable wrapper, manifest entry, and evidence row; expected-unsupported diagnostics cannot be counted as passed;
 21. passed evidence contains exact executable commands, `passed` results, one verified immutable run URL, immutable Coven plan/spec URLs and SHA-256 values, and no candidate placeholders;
-22. the C-S10 result and every artifact carry validated digest, media type, size, expiry, and full correlation, with strict fixture, mismatch, and retention-owner tests;
+22. the C-S10 result and every artifact carry validated digest, media type, size, expiry, and the exact `AdoptionRequest::correlation()` derived from the launch golden, with strict fixture, mismatch, and retention-owner tests;
 23. every filtered evidence command uses an exact manifest-listed test that Cargo `--list` proves exists, so zero-match success is rejected;
 24. `RecordKind::Attempt` and `att_` are the sole execution-binding identity kind/prefix; there is no duplicate binding-named record-kind variant and every exhaustive mapping/test agrees;
 25. full local and remote gates pass for the attested source SHA, every later commit through the reviewed evidence head changes only `docs/G2-EVIDENCE.md`, and no W3-W9 policy or G4+ capability is enabled.
