@@ -83,16 +83,17 @@ Shipped:
 
 - Public `OpenCoven/coven` repo.
 - Rust CLI command named `coven`.
-- Beginner-friendly `coven` / `coven tui` entrypoint.
+- Managed `coven-code` UI for bare `coven`, `coven chat`, and `coven tui`; the prompt-first in-process TUI remains a deprecated `COVEN_LEGACY_TUI=1` compatibility fallback.
 - `coven doctor` setup checks.
 - Local daemon lifecycle: `coven daemon start/status/restart/stop`.
 - Project-root and cwd boundary guard.
 - Built-in Codex, Claude Code, and GitHub Copilot CLI harness adapters.
+- Trusted opt-in recipes for Hermes 1.0.3 and OpenCode 0.1.1; experimental opt-in recipe for Grok Build 1.0.0.
 - PTY-backed `coven run codex|claude|copilot <prompt>` sessions.
 - SQLite-backed session metadata and event log.
 - Session browser and rituals: **Rejoin**, **View Log**, **Summon**, **Archive**, **Sacrifice**.
 - Scriptable and human session output: `coven sessions`, `--plain`, and `--all`.
-- Local HTTP-over-Unix-socket API for CastCodes and advanced local clients.
+- Same-user local IPC API for CastCodes and advanced local clients: `$COVEN_HOME/coven.sock` on Unix-like platforms and an owner-only per-profile named pipe on Windows.
 - Versioned `coven.daemon.v1` API contract with named apiVersion, machine-readable capabilities, structured errors, and monotonic event cursors. See [`docs/API-CONTRACT.md`](/API-CONTRACT).
 - Compatibility tests for the external OpenClaw bridge against versioned daemon responses.
 - First-run recovery hints for missing Codex, Claude Code, or GitHub Copilot CLIs.
@@ -103,6 +104,7 @@ Shipped:
   - `@opencoven/cli-macos`
   - `@opencoven/cli-macos-x64`
   - `@opencoven/cli-linux-x64`
+  - `@opencoven/cli-windows`
 - External OpenClaw bridge package kept outside OpenClaw core as an advanced compatibility path.
 - Architecture, operational model, product spec, brand docs, and MVP plan.
 
@@ -119,7 +121,7 @@ Next:
 Later:
 
 - Generic command adapter after enough real usage.
-- Additional harness adapters such as Hermes, Aider, Gemini, OpenCode, or user-defined local harnesses.
+- Additional harness adapters such as Aider, Gemini, Cline, or user-defined local harnesses.
 - Policy/approval hooks for sensitive actions.
 - Richer session artifacts and attachments.
 - **Multi-harness orchestration** (Phase 1-4, no committed timeline):

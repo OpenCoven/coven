@@ -128,7 +128,10 @@ Pseudoterminal. Coven uses PTYs so harnesses behave like terminal-native tools w
 
 ## Prompt-first TUI
 
-The default `coven` and `coven tui` interface. Accepts free-form task text or slash commands like `/run codex <task>` as input, alongside arrow-key menu navigation.
+The deprecated in-process compatibility interface, enabled explicitly with
+`COVEN_LEGACY_TUI=1`. It accepts free-form task text or slash commands like
+`/run codex <task>` alongside arrow-key menu navigation. The managed
+`coven-code` UI is the default for bare `coven`, `coven chat`, and `coven tui`.
 
 ## Relief
 
@@ -150,7 +153,9 @@ A Coven-owned record of one harness run.
 
 ## Socket API
 
-The local HTTP-over-Unix-socket API exposed by the daemon.
+The local HTTP API exposed by the daemon through a same-user local IPC endpoint:
+`$COVEN_HOME/coven.sock` on Unix-like platforms or an owner-only per-profile
+named pipe on Windows.
 
 ## Spell
 

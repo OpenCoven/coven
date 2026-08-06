@@ -3,15 +3,15 @@ summary: "Install Coven, run doctor, start the daemon, and launch your first har
 read_when:
   - First time setting up Coven on a workstation
 title: "Getting started"
-description: "Install Coven, run coven doctor, and launch your first Codex or Claude Code harness session in about five minutes from one local Rust daemon."
+description: "Install Coven, run coven doctor, and launch your first Codex, Claude Code, or GitHub Copilot CLI harness session in about five minutes from one local Rust daemon."
 ---
 
-Install Coven, run `coven doctor`, and launch your first harness session in about five minutes. By the end you will have a running daemon, a project-rooted session record, and a working PTY attached to Codex or Claude Code.
+Install Coven, run `coven doctor`, and launch your first harness session in about five minutes. By the end you will have a running daemon, a project-rooted session record, and a working PTY attached to Codex, Claude Code, or GitHub Copilot CLI.
 
 ## What you need
 
-- **Rust stable** — only if you build from source. The published `@opencoven/cli` wrapper bundles binaries for macOS and Linux.
-- **At least one harness CLI on `PATH`** — Codex or Claude Code today. `coven doctor` will report what is missing and how to install it.
+- **Rust stable** — only if you build from source. The published `@opencoven/cli` wrapper includes macOS, Linux x64, and Windows x64 packages.
+- **At least one harness CLI on `PATH`** — Codex, Claude Code, or GitHub Copilot CLI. `coven doctor` will report what is missing and how to install it.
 
 <Tip>
 Coven does not store provider credentials. Each harness keeps using its own local auth flow (`codex login`, `claude doctor`).
@@ -50,7 +50,9 @@ Coven does not store provider credentials. Each harness keeps using its own loca
     coven daemon start
     coven daemon status
     ```
-    The daemon binds a Unix socket under `$COVEN_HOME`. Default: `~/.coven/coven.sock`.
+    On Unix-like systems, the daemon binds `$COVEN_HOME/coven.sock` (default:
+    `~/.coven/coven.sock`); the path in this guide is Unix-specific. On Windows,
+    the same API uses a per-profile owner-only named pipe.
   </Step>
   <Step title="Launch your first session">
     ```bash
