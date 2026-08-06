@@ -984,8 +984,9 @@ validation. The public evidence and correlation fields remain directly
 constructible so store tests can perform one-field mutation checks, so callers
 must not treat construction alone as proof of validity:
 `CanonicalDocument::validate()` revalidates every `ExecutionBinding` before
-persistence, and the private-field `TerminationRequest` below revalidates its
-correlation before it can cross `CovenPort::terminate`.
+persistence, and the private-field `TerminationRequest` below can be created
+only by the persist-then-invoke coordinator after the exact session-bound
+revision commits.
 
 Define the surface-neutral contracts in `contracts/surface.rs` with these exact
 owned wire fields:
@@ -2975,37 +2976,63 @@ pub struct ArtifactReference {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminationRequest {
-    session_id: String,
-    correlation: ExecutionCorrelation,
-    termination: TerminationRequestCorrelation,
+    persisted_binding: ExecutionBinding,
     reason_code: String,
 }
 
 impl TerminationRequest {
-    pub fn new(
-        session_id: String,
-        correlation: ExecutionCorrelation,
-        termination: TerminationRequestCorrelation,
+    fn from_persisted_binding(
+        persisted_binding: ExecutionBinding,
         reason_code: String,
     ) -> Result<Self, ContractError> {
-        validate_termination_request(
-            &session_id,
-            &correlation,
-            &termination,
-            &reason_code,
-        )?;
+        validate_persisted_termination_binding(&persisted_binding, &reason_code)?;
         Ok(Self {
-            session_id,
-            correlation,
-            termination,
+            persisted_binding,
             reason_code,
         })
     }
 
-    pub fn session_id(&self) -> &str { &self.session_id }
-    pub fn correlation(&self) -> &ExecutionCorrelation { &self.correlation }
-    pub fn termination(&self) -> &TerminationRequestCorrelation { &self.termination }
+    pub fn binding(&self) -> &ExecutionBinding { &self.persisted_binding }
     pub fn reason_code(&self) -> &str { &self.reason_code }
+}
+
+pub trait TerminationPersistence {
+    type Error;
+
+    /// Returns only after the exact revision is durable and its digest-linked
+    /// predecessor was already bound to the same non-empty session.
+    fn persist_requested(
+        &mut self,
+        requested: ExecutionBinding,
+    ) -> Result<ExecutionBinding, Self::Error>;
+}
+
+pub enum TerminationDispatchError<E> {
+    Contract(ContractError),
+    Persistence(E),
+    PersistedBindingMismatch,
+    Port(PortError),
+}
+
+pub async fn persist_then_terminate<S: TerminationPersistence>(
+    persistence: &mut S,
+    port: &impl CovenPort,
+    requested: ExecutionBinding,
+    reason_code: String,
+) -> Result<TerminationDisposition, TerminationDispatchError<S::Error>> {
+    validate_termination_requested_candidate(&requested, &reason_code)
+        .map_err(TerminationDispatchError::Contract)?;
+    let persisted = persistence
+        .persist_requested(requested.clone())
+        .map_err(TerminationDispatchError::Persistence)?;
+    if persisted != requested {
+        return Err(TerminationDispatchError::PersistedBindingMismatch);
+    }
+    let request = TerminationRequest::from_persisted_binding(persisted, reason_code)
+        .map_err(TerminationDispatchError::Contract)?;
+    port.terminate(request)
+        .await
+        .map_err(TerminationDispatchError::Port)
 }
 
 pub enum TerminationDisposition {
@@ -3101,27 +3128,64 @@ fields. Their `TryFrom` implementations recursively validate the execution
 correlation, content reference, session/artifact association, uniqueness,
 bounds, and lifetime before returning any public typed value.
 
-`TerminationRequest::new` is the only construction path: all fields are
-private, the type has no unchecked serde implementation or mutation API, and
-its getters are read-only. It accepts the session, execution correlation,
-`TerminationRequestCorrelation`, and reason code; validates the same session,
-reason, termination-ID, and lifetime rules as `ExecutionBinding`; and requires
-the termination ID to differ from the execution request ID and
-`termination.created_at >= correlation.created_at`. The caller then persists
-an append-only `ExecutionBinding` revision containing that exact termination
-correlation before calling `CovenPort::terminate`. Because the trait accepts
-only this construction-closed type, individual adapters do not become the
-validation authority. The adapter accepts
+`persist_then_terminate` is the only public construction path to
+`TerminationRequest`: all request fields and
+`TerminationRequest::from_persisted_binding` are private, the type has no
+unchecked serde implementation or mutation API, and its getters are read-only.
+The public coordinator first rejects anything other than a valid revision 2+
+`TerminationRequested` binding with one frozen non-empty `coven_session_id`,
+validates the reason plus termination ID/lifetime, and requires the termination
+ID to differ from the execution request ID and
+`termination.created_at >= request_created_at`. It then calls
+`TerminationPersistence::persist_requested`; that trait's success contract is
+to require the digest-linked predecessor already carry the same non-empty
+session and to return only after the exact candidate revision has committed
+durably. Mismatched returned bytes fail closed. Only after that success does the
+private constructor wrap the returned binding and permit
+`CovenPort::terminate`.
+
+The W2 real-store test wrapper implements `TerminationPersistence` by calling
+`execution_binding_revisions` to load the candidate's exact digest-linked
+predecessor, rejecting an absent session or any session mismatch, then calling
+`Store::insert`. It returns the unchanged candidate only after the immediate
+insert transaction commits and propagates every `StoreError`; the predecessor
+digest makes a concurrent intervening revision fail as a fork/gap rather than
+turning the precheck into a TOCTOU bypass. It never returns a success-shaped
+fallback. This preserves the dependency direction
+`psyche-coven -> psyche-core`: the boundary defines the narrow persistence
+behavior, while `psyche-test-support` owns the local real-store wrapper for G2
+proof and the later W5 composition root owns the production wrapper. Every
+wrapper must run the same conformance assertion. First-time session binding in
+the termination revision, session rebind, unknown attempt/revision, write
+failure, or persisted-byte mismatch returns before the port call. Because the
+trait accepts only the construction-closed request,
+individual adapters do not become the validation authority. The adapter accepts
 acknowledgement or unresolved evidence only when its termination request ID and
 timestamp match that persisted correlation. It then derives the next revision
 from the termination-requested revision, preserving its digest link and
 immutable execution correlation. It never derives a deadline from response
-arrival time. Name the table-driven constructor test
-`termination_request_requires_validated_construction`; it accepts a valid
-request at exact execution-creation equality and a valid late-termination
+arrival time.
+
+Name the table-driven public-coordinator test
+`termination_dispatch_rejects_invalid_request_before_persistence`; it accepts a
+valid request at exact execution-creation equality and a valid late-termination
 request, then independently rejects an empty/oversized session,
 empty/oversized or non-lowercase reason, reused execution request ID, reversed
-termination lifetime, and termination creation before execution creation.
+termination lifetime, termination creation before execution creation, revision
+1, and any cancellation state other than `TerminationRequested`. Every rejected
+case records zero persistence and zero port calls.
+
+Name the real-store/fake-port ordering test
+`termination_dispatch_requires_durable_session_bound_revision`. Its successful
+case seeds a session-bound revision 1, calls the public coordinator with the
+derived revision 2, and makes `FakeCoven::terminate` reopen the SQLite file and
+assert that the exact `TerminationRequested` revision is already durable before
+recording its call. Its negative cases independently use a changed session, a
+termination revision that attempts to bind a previously absent session, a
+revision 2 for an unknown attempt, injected persistence failure, and a
+persistence implementation returning different bytes; every case requires zero
+port calls and no new binding revision. The reusable assertion is part of the
+fake/real conformance contract that W5 must run unchanged.
 
 Add a strict canonical `tests/fixtures/result-bundle.json` containing one
 primary `application/json` result and one `text/plain` artifact. In
@@ -4132,7 +4196,7 @@ Use this complete manifest shape:
         "result_bundle_fixture_round_trips_complete_content_references",
         "result_bundle_fixture_uses_launch_request_correlation",
         "content_reference_rejects_digest_size_media_type_and_lifetime_mismatch",
-        "termination_request_requires_validated_construction"
+        "termination_dispatch_rejects_invalid_request_before_persistence"
       ]
     },
     "psyche-store/records": {
@@ -4187,7 +4251,10 @@ Use this complete manifest shape:
     },
     "psyche-test-support/fakes": {
       "list_command": "cargo test -p psyche-test-support --test fakes -- --list --format terse",
-      "tests": ["advertised_adoption_requires_a_scripted_adoption_step"]
+      "tests": [
+        "advertised_adoption_requires_a_scripted_adoption_step",
+        "termination_dispatch_requires_durable_session_bound_revision"
+      ]
     },
     "psyche-test-support/state_machine": {
       "list_command": "cargo test -p psyche-test-support --test state_machine -- --list --format terse",
@@ -4340,9 +4407,9 @@ including why `ExpectedUnsupported` is diagnostic rather than passed evidence.
 | Migrations | `cargo test -p psyche-store --test migrations -- --exact fresh_store_applies_v1_once_and_reopens` | not run remotely | none |
 | State-machine/property | `cargo test -p psyche-test-support --test state_machine -- --exact model_and_store_agree_after_any_foundation_operation_sequence` | not run remotely | none |
 | Crash/restart | `cargo test -p psyche-store --features test-fault-injection --test crash -- --exact killed_writer_exposes_only_committed_state_after_reopen` | not run remotely | none |
-| Fake boundaries | `cargo test -p psyche-test-support --test fakes -- --exact advertised_adoption_requires_a_scripted_adoption_step` | not run remotely | none |
+| Fake boundaries and durable termination ordering | `cargo test -p psyche-test-support --test fakes -- --exact advertised_adoption_requires_a_scripted_adoption_step && cargo test -p psyche-test-support --test fakes -- --exact termination_dispatch_requires_durable_session_bound_revision` | not run remotely | none |
 | Execution request RFC3339 golden bytes | `cargo test -p psyche-coven --test request_digest -- --exact execution_request_launch_matches_golden_bytes_and_digest && cargo test -p psyche-coven --test request_digest -- --exact execution_request_input_matches_golden_bytes_and_digest` | not run remotely | none |
-| Validated termination request construction | `cargo test -p psyche-coven --test bindings -- --exact termination_request_requires_validated_construction` | not run remotely | none |
+| Validated termination dispatch | `cargo test -p psyche-coven --test bindings -- --exact termination_dispatch_rejects_invalid_request_before_persistence` | not run remotely | none |
 | G2 cancellation-state vocabulary | `cargo test -p psyche-core --test contracts -- --exact cancellation_state_vocabulary_requires_matching_o5_evidence` | not run remotely | none |
 | Full execution-request digest binding | `cargo test -p psyche-test-support --test state_machine -- --exact request_digest_binds_every_typed_field` | not run remotely | none |
 | C-S1 scripted contract negotiation | `cargo test -p psyche-test-support --test conformance -- --exact c_s1_contract_negotiation` | not run remotely | none |
@@ -4562,7 +4629,7 @@ The implementation is ready for G2 review only when:
 13. clean or failed checkpointing publishes `Stopped`, wakes all shutdown callers, and returns one deterministic terminal outcome through `Runtime::state()`;
 14. C-S6 uses the executable correlation-bound reconciliation operation, persists return/fence dispositions across restart and faults, and proves no redispatch while unresolved or returned;
 15. adoption IDs/digests bind the full canonical launch/input request, are recomputed by both owners, and reject every changed field before mutation;
-16. C-S9 accepts only core-owned, fully correlated durable typed O5 acknowledgement evidence; `TerminationRequest` is construction-closed and validates identity/lifetime before the trait call; the execution-binding revision ledger persists the authoritative termination request ID and creation/deadline window before the call, appends the response evidence afterward, accepts termination creation equal to execution creation, both closed evidence-window endpoints, and post-adoption-deadline termination, rejects absent/mismatched/out-of-window evidence, and every raw ledger status, including `killed` and `orphaned`, remains insufficient;
+16. C-S9 accepts only core-owned, fully correlated durable typed O5 acknowledgement evidence; `TerminationRequest` is construction-closed and can reach the trait only through a conformance-tested persist-then-invoke coordinator; the execution-binding revision ledger requires an already session-bound digest-linked predecessor and commits the exact authoritative termination request revision before the port call, appends the response evidence afterward, accepts termination creation equal to execution creation, both closed evidence-window endpoints, and post-adoption-deadline termination, rejects unpersisted attempts, first-time session binding, session rebinding, persistence failure, returned-byte mismatch, and absent/mismatched/out-of-window evidence without a port call, and every raw ledger status, including `killed` and `orphaned`, remains insufficient;
 17. execution-request timestamps serialize as RFC 3339 strings and both golden canonical byte/digest fixtures match exactly;
 18. `CancellationState` uses the complete G2-owned local vocabulary and never claims nonexistent TECH or current Coven O5 authority;
 19. every fixture include path resolves from its Rust source and the nullable-binding fixtures exist at the declared package-local paths;
