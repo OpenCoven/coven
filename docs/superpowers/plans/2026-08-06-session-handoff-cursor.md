@@ -4,7 +4,7 @@
 
 **Goal:** Make live-session handoffs scalable and claimable after append-only source transcript growth.
 
-**Architecture:** The SQLite store owns the current event cursor through a scalar `MAX(rowid)` query. API claim and acknowledgement treat the offered cursor as a transcript prefix: later events are safe, while a cursor lower than the offer remains a divergence. The transactional store acknowledgement repeats that lower-bound guard.
+**Architecture:** The SQLite store owns the current event cursor through a scalar `MAX(rowid)` query. Retention pins each unresolved handoff's source events through its offered cursor. The store reads and validates that cursor inside the existing `IMMEDIATE` transaction for claim and acknowledgement, so a successful state transition cannot race a pruning transaction.
 
 **Tech Stack:** Rust, rusqlite, existing `coven-cli` API and store unit tests.
 
@@ -78,89 +78,89 @@ git add crates/coven-cli/src/store.rs
 git commit -s -m "fix: query handoff event cursors directly"
 ```
 
-### Task 2: Permit append-only handoff transcript growth
+### Task 2: Pin and transactionally validate handoff transcript prefixes
 
 **Files:**
-- Modify: `crates/coven-cli/src/api.rs:2038-2049, 2119-2135, 2183-2199, 9332-9358`
-- Modify: `crates/coven-cli/src/store.rs:3108-3125`
+- Modify: `crates/coven-cli/src/api.rs:2038-2049, 2104-2145, 2168-2210, 9250-9390`
+- Modify: `crates/coven-cli/src/store.rs:3040-3145, 3441-3472, 6246-6328`
 
-- [ ] **Step 1: Replace the failing API expectation**
+- [ ] **Step 1: Write failing retention and transactional-guard tests**
 
-In `handoff_claim_fails_closed_when_transcript_or_workspace_diverges`, replace
-the `transcript_conflict` assertion after the accepted input with a successful
-claim and acknowledgement:
+Keep the append-only API assertion added by the prior task: input appended
+after an offer must permit claim and acknowledgement. Add store tests with
+real event rows, not synthetic cursor values:
 
 ```rust
-assert_eq!(claimed.status, 200);
-let acknowledged = handle_request_with_body(
-    "POST",
-    &format!("/sessions/session-1/handoffs/{handoff_id}/ack"),
-    temp.path(),
-    None,
-    Some(r#"{"claimant":"device:phone-1"}"#),
-)?;
-assert_eq!(acknowledged.status, 200);
+let cursor = latest_event_seq(&conn, "session-1")?;
+let offered = create_handoff(&mut conn, "handoff-1", "session-1", "{}", cursor, "{}", now)?;
+assert_eq!(prune_events_older_than(&conn, cutoff)?, 0);
+claim_handoff(&mut conn, &offered.id, offered.generation, "device:phone-1", "claim-1", now)?;
+assert_eq!(prune_events_older_than_bounded(&conn, cutoff, 10)?, 0);
+let acknowledged = acknowledge_handoff(&mut conn, &offered.id, "device:phone-1", now)?;
+assert_eq!(acknowledged.state, "acknowledged");
+assert_eq!(prune_events_older_than(&conn, cutoff)?, 1);
 ```
 
-Keep the later wrong-workspace assertion, but emit a new handoff only after
-the first handoff is acknowledged.
+Create a second offered handoff with an `event_cursor` greater than the actual
+latest sequence. Assert `claim_handoff` returns `transcript_diverged` without
+changing state. Claim a valid handoff, delete its cursor event directly in the
+test transaction, and assert `acknowledge_handoff` returns
+`transcript_diverged`. These tests prove the store—not an API preflight—is the
+transition authority.
 
-- [ ] **Step 2: Add a lower-cursor store guard test**
+- [ ] **Step 2: Run the new tests and verify current behavior fails**
 
-Add a store test that creates a handoff with `event_cursor: 3`, claims it, then
-calls `acknowledge_handoff(..., 2, ...)` and asserts the error string is
-`transcript_diverged`. Call it again with `4` and assert the record reaches
-`acknowledged`.
-
-- [ ] **Step 3: Run the altered tests and verify current behavior fails**
-
-Run:
+Run the exact new store test names and:
 
 ```bash
 cargo test -p coven-cli handoff_claim_fails_closed_when_transcript_or_workspace_diverges --locked
-cargo test -p coven-cli acknowledge_handoff --locked
+cargo test -p coven-cli unresolved_handoff_events_are_not_pruned --locked
+cargo test -p coven-cli handoff_transition_rejects_missing_cursor --locked
 ```
 
-Expected: the API test fails with HTTP 409 after the appended input and the
-store test fails with `transcript_diverged` for cursor `4`.
+Expected: the append-only API test already passes; the new retention and
+transactional-guard tests fail because both pruning paths ignore handoffs and
+the store accepts a stale caller-derived cursor.
 
-- [ ] **Step 4: Implement prefix semantics and direct cursor reads**
+- [ ] **Step 3: Make retention respect unresolved handoff pins**
 
-Replace all three `store::list_events(&conn, session_id)?.last()` expressions
-in `emit_handoff`, `claim_session_handoff`, and
-`acknowledge_session_handoff` with:
+In both `prune_events_older_than` and `prune_events_older_than_bounded`, only
+delete an expired event when no `offered` or `claimed` handoff for its session
+pins that row:
 
-```rust
-let event_cursor = store::latest_event_seq(&conn, session_id)?;
+```sql
+AND NOT EXISTS (
+    SELECT 1
+    FROM session_handoffs AS handoff
+    WHERE handoff.session_id = event.session_id
+      AND handoff.state IN ('offered', 'claimed')
+      AND event.rowid <= handoff.event_cursor
+)
 ```
 
-In both API checks, reject only a truncated cursor:
+Use an `events AS event` alias inside each pruning subquery. Keep the current
+cutoff ordering, bounded batch limit, FTS trigger behavior, and transaction
+shape intact.
+
+- [ ] **Step 4: Move cursor validation into handoff transactions**
+
+Remove the API-side `latest_event_seq` preflight checks from claim and
+acknowledgement; retain the helper in `emit_handoff`. In `claim_handoff`, after
+loading the record in its `IMMEDIATE` transaction, read the current sequence
+from the same transaction and reject `actual_cursor < current.event_cursor`
+with `bail!("transcript_diverged")`.
 
 ```rust
-if current_cursor < handoff.event_cursor {
-    return api_error(
-        409,
-        "transcript_diverged",
-        "Source transcript no longer contains the handoff snapshot.",
-        Some(json!({
-            "handoffId": handoff_id,
-            "expectedCursor": handoff.event_cursor,
-            "actualCursor": current_cursor,
-        })),
-    );
-}
-```
-
-In `store::acknowledge_handoff`, replace the equality guard with:
-
-```rust
-if event_cursor < current.event_cursor {
+let actual_cursor = latest_event_seq(&transaction, &current.session_id)?;
+if actual_cursor < current.event_cursor {
     bail!("transcript_diverged");
 }
 ```
 
-Do not weaken workspace compatibility, generation, claimant, state, or input
-lease checks.
+Change `acknowledge_handoff` to derive and validate that same transaction-local
+cursor itself; remove its caller-provided `event_cursor` parameter. Update its
+API caller and direct store tests. Do not weaken workspace compatibility,
+generation, claimant, state, or input-lease checks.
 
 - [ ] **Step 5: Run focused regression coverage**
 
@@ -169,17 +169,19 @@ Run:
 ```bash
 cargo test -p coven-cli handoff_claim_fails_closed_when_transcript_or_workspace_diverges --locked
 cargo test -p coven-cli handoff_claim_acknowledgement_import_fences_source_and_is_idempotent --locked
-cargo test -p coven-cli acknowledge_handoff --locked
+cargo test -p coven-cli unresolved_handoff_events_are_not_pruned --locked
+cargo test -p coven-cli handoff_transition_rejects_missing_cursor --locked
 ```
 
-Expected: PASS; a later source event permits claim and acknowledgement, while
-a lower cursor and the existing workspace conflict still fail closed.
+Expected: PASS; a later source event permits claim and acknowledgement,
+retention cannot remove an unresolved handoff prefix, acknowledged handoffs
+release their pin, and missing cursors still fail closed.
 
-- [ ] **Step 6: Commit handoff semantics**
+- [ ] **Step 6: Commit pinned handoff semantics**
 
 ```bash
 git add crates/coven-cli/src/api.rs crates/coven-cli/src/store.rs
-git commit -s -m "fix: preserve append-only handoff cursors"
+git commit -s -m "fix: pin handoff transcript prefixes"
 ```
 
 ### Task 3: Run the issue acceptance gates
