@@ -901,33 +901,39 @@ owned by `psyche-core/src/contracts/execution.rs` and re-exported by
 the complete correlation required to validate a direct store insertion:
 
 ```rust
-pub schema_version: SchemaVersion,
-pub attempt_id: RecordId,
-pub revision: u64,
-pub previous_revision_digest: Option<Sha256Digest>,
-#[serde(with = "time::serde::rfc3339")]
-pub revision_created_at: time::OffsetDateTime,
-pub familiar_snapshot_id: RecordId,
-pub project_id: String,
-pub request_id: RequestId,
-pub request_digest: Sha256Digest,
-#[serde(with = "time::serde::rfc3339")]
-pub request_created_at: time::OffsetDateTime,
-#[serde(with = "time::serde::rfc3339")]
-pub request_valid_until: time::OffsetDateTime,
-pub coven_contract_version: String,
-pub coven_session_id: Option<String>,
-pub adoption_state: AdoptionState,
-pub event_cursor: Option<String>,
-pub cancellation_state: CancellationState,
-pub termination_request: Option<TerminationRequestCorrelation>,
-pub termination_reason_code: Option<String>,
-pub cancellation_acknowledgement: Option<CancellationAcknowledgementEvidence>,
-pub cancellation_unresolved: Option<CancellationUnresolvedEvidence>,
-pub terminal_state: Option<String>,
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ExecutionBinding {
+    pub schema_version: SchemaVersion,
+    pub attempt_id: RecordId,
+    pub revision: u64,
+    pub previous_revision_digest: Option<Sha256Digest>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub revision_created_at: time::OffsetDateTime,
+    pub familiar_snapshot_id: RecordId,
+    pub project_id: String,
+    pub request_id: RequestId,
+    pub request_digest: Sha256Digest,
+    #[serde(with = "time::serde::rfc3339")]
+    pub request_created_at: time::OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub request_valid_until: time::OffsetDateTime,
+    pub coven_contract_version: String,
+    pub coven_session_id: Option<String>,
+    pub adoption_state: AdoptionState,
+    pub event_cursor: Option<String>,
+    pub cancellation_state: CancellationState,
+    pub termination_request: Option<TerminationRequestCorrelation>,
+    pub termination_reason_code: Option<String>,
+    pub cancellation_acknowledgement: Option<CancellationAcknowledgementEvidence>,
+    pub cancellation_unresolved: Option<CancellationUnresolvedEvidence>,
+    pub terminal_state: Option<String>,
+}
 ```
 
 The canonical W0 field names remain `request_id` and `request_digest`.
+The private `ExecutionBindingWire` mirrors these fields, denies unknown fields,
+and reaches the public type only through `TryFrom` validation; the public struct
+does not derive an unchecked `Deserialize`.
 `request_created_at`, `request_valid_until`, `termination_request`, and
 `termination_reason_code` are the additive G2 fields needed to make the frozen
 correlation and cancellation invariants locally enforceable. `event_cursor` remains an opaque validated
