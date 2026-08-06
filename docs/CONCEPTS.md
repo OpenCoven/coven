@@ -63,6 +63,7 @@ Current v0 harnesses:
 
 - Codex, with harness id `codex`.
 - Claude Code, with harness id `claude`.
+- GitHub Copilot CLI, with harness id `copilot`.
 
 Coven does not store provider credentials. Each harness keeps using its own local authentication flow.
 
