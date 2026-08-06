@@ -3240,6 +3240,15 @@ pub fn list_events(conn: &Connection, session_id: &str) -> Result<Vec<EventRecor
     list_events_with_options(conn, session_id, &EventsQueryOptions::default())
 }
 
+pub fn latest_event_seq(conn: &Connection, session_id: &str) -> Result<i64> {
+    conn.query_row(
+        "SELECT COALESCE(MAX(rowid), 0) FROM events WHERE session_id = ?1",
+        [session_id],
+        |row| row.get(0),
+    )
+    .context("failed to read latest event sequence")
+}
+
 pub fn event_kind_exists(conn: &Connection, session_id: &str, kind: &str) -> Result<bool> {
     use rusqlite::OptionalExtension;
 
@@ -6263,6 +6272,31 @@ mod tests {
         assert!(events[0].seq > 0);
         assert!(events[1].seq > events[0].seq);
         assert!(events[2].seq > events[1].seq);
+        Ok(())
+    }
+
+    #[test]
+    fn latest_event_seq_returns_zero_for_empty_and_last_rowid_for_session() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+        insert_session(&conn, &session_record("session-1", "2026-04-27T06:00:00Z"))?;
+
+        assert_eq!(latest_event_seq(&conn, "session-1")?, 0);
+
+        for i in 1..=3 {
+            insert_json_event(
+                &conn,
+                "session-1",
+                "output",
+                &serde_json::json!({ "data": format!("line {i}") }),
+                "2026-04-27T06:01:00Z",
+            )?;
+        }
+
+        assert_eq!(
+            latest_event_seq(&conn, "session-1")?,
+            list_events(&conn, "session-1")?[2].seq
+        );
         Ok(())
     }
 
