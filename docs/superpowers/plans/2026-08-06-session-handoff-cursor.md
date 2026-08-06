@@ -4,7 +4,7 @@
 
 **Goal:** Make live-session handoffs scalable and claimable after append-only source transcript growth.
 
-**Architecture:** The SQLite store owns the current event cursor through a scalar `MAX(rowid)` query. Retention pins each unresolved handoff's source events through its offered cursor. The store reads and validates that cursor inside the existing `IMMEDIATE` transaction for claim and acknowledgement, so a successful state transition cannot race a pruning transaction.
+**Architecture:** The SQLite store owns the current event cursor through a scalar `MAX(rowid)` query. Offer creation reads that cursor and inserts its pin in one `IMMEDIATE` transaction. Retention and dry-run counting share one unresolved-handoff predicate, while claim and acknowledgement revalidate the cursor inside their own `IMMEDIATE` transaction.
 
 **Tech Stack:** Rust, rusqlite, existing `coven-cli` API and store unit tests.
 
@@ -91,8 +91,9 @@ after an offer must permit claim and acknowledgement. Add store tests with
 real event rows, not synthetic cursor values:
 
 ```rust
-let cursor = latest_event_seq(&conn, "session-1")?;
-let offered = create_handoff(&mut conn, "handoff-1", "session-1", "{}", cursor, "{}", now)?;
+let offered = create_handoff(&mut conn, "handoff-1", "session-1", "{}", "{}", now)?;
+assert_eq!(offered.event_cursor, latest_event_seq(&conn, "session-1")?);
+assert_eq!(count_events_older_than(&conn, cutoff)?, 0);
 assert_eq!(prune_events_older_than(&conn, cutoff)?, 0);
 claim_handoff(&mut conn, &offered.id, offered.generation, "device:phone-1", "claim-1", now)?;
 assert_eq!(prune_events_older_than_bounded(&conn, cutoff, 10)?, 0);
@@ -101,10 +102,11 @@ assert_eq!(acknowledged.state, "acknowledged");
 assert_eq!(prune_events_older_than(&conn, cutoff)?, 1);
 ```
 
-Create a second offered handoff with an `event_cursor` greater than the actual
-latest sequence. Assert `claim_handoff` returns `transcript_diverged` without
-changing state. Claim a valid handoff, delete its cursor event directly in the
-test transaction, and assert `acknowledge_handoff` returns
+Create a second offered handoff, then set its stored `event_cursor` to one
+greater than the actual latest sequence with a direct test-only SQL update.
+Assert `claim_handoff` returns `transcript_diverged` without changing state.
+Claim a valid handoff, delete its cursor event directly in the test
+transaction, and assert `acknowledge_handoff` returns
 `transcript_diverged`. These tests prove the store—not an API preflight—is the
 transition authority.
 
@@ -119,17 +121,15 @@ cargo test -p coven-cli handoff_transition_rejects_missing_cursor --locked
 ```
 
 Expected: the append-only API test already passes; the new retention and
-transactional-guard tests fail because both pruning paths ignore handoffs and
-the store accepts a stale caller-derived cursor.
+transactional-guard tests fail because both pruning paths and dry-run counting
+ignore handoffs, and offer creation still accepts a caller-derived cursor.
 
-- [ ] **Step 3: Make retention respect unresolved handoff pins**
+- [ ] **Step 3: Centralize the unresolved-handoff pin predicate**
 
-In both `prune_events_older_than` and `prune_events_older_than_bounded`, only
-delete an expired event when no `offered` or `claimed` handoff for its session
-pins that row:
+Define one private SQL constant for an `events AS event` alias:
 
 ```sql
-AND NOT EXISTS (
+NOT EXISTS (
     SELECT 1
     FROM session_handoffs AS handoff
     WHERE handoff.session_id = event.session_id
@@ -138,17 +138,38 @@ AND NOT EXISTS (
 )
 ```
 
-Use an `events AS event` alias inside each pruning subquery. Keep the current
+Use this exact constant in `count_events_older_than`,
+`prune_events_older_than`, and the bounded prune subquery. Keep the current
 cutoff ordering, bounded batch limit, FTS trigger behavior, and transaction
-shape intact.
+shape intact. The count query must report zero for an expired event pinned by
+an `offered` or `claimed` handoff, then one after acknowledgement.
 
-- [ ] **Step 4: Move cursor validation into handoff transactions**
+- [ ] **Step 4: Atomically create and validate handoff cursors**
+
+Remove the `event_cursor` parameter from `create_handoff`. After it starts its
+existing `IMMEDIATE` transaction, query:
+
+```rust
+let event_cursor = transaction.query_row(
+    "SELECT COALESCE(MAX(rowid), 0) FROM events WHERE session_id = ?1",
+    [session_id],
+    |row| row.get(0),
+)?;
+```
+
+Use that value in the `session_handoffs` insert. Update `emit_handoff` to stop
+calling `latest_event_seq` before `create_handoff`, and return
+`record.event_cursor` in its JSON response. Update every direct store test to
+use the new signature.
+
+Keep the claim and acknowledgement validation inside their `IMMEDIATE`
+transactions:
 
 Remove the API-side `latest_event_seq` preflight checks from claim and
-acknowledgement; retain the helper in `emit_handoff`. In `claim_handoff`, after
-loading the record in its `IMMEDIATE` transaction, read the current sequence
-from the same transaction and reject `actual_cursor < current.event_cursor`
-with `bail!("transcript_diverged")`.
+acknowledgement. In `claim_handoff`, after loading the record in its
+`IMMEDIATE` transaction, read the current sequence from the same transaction
+and reject `actual_cursor < current.event_cursor` with
+`bail!("transcript_diverged")`.
 
 ```rust
 let actual_cursor = latest_event_seq(&transaction, &current.session_id)?;
