@@ -40,8 +40,9 @@ flowchart LR
 
   Daemon --> Store[(SQLite session ledger)]
   Daemon --> Events[(append-only event log)]
-  Codex --> Events
-  Claude --> Events
+  Bundled --> Events
+  Trusted --> Events
+  Experimental --> Events
 ```
 
 ## Session lifecycle
