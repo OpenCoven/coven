@@ -1,0 +1,17 @@
+[package]
+name = "coven-afs"
+version = "0.1.0"
+description = "Native OpenCoven agent filesystem: AgentFS SPEC v0.4-compatible SQLite storage with copy-on-write overlay"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
