@@ -3121,7 +3121,7 @@ pub fn acknowledge_handoff(
     if current.claimant.as_deref() != Some(claimant) {
         bail!("claimant_mismatch");
     }
-    if current.event_cursor != event_cursor {
+    if event_cursor < current.event_cursor {
         bail!("transcript_diverged");
     }
     match current.state.as_str() {
@@ -6297,6 +6297,33 @@ mod tests {
             latest_event_seq(&conn, "session-1")?,
             list_events(&conn, "session-1")?[2].seq
         );
+        Ok(())
+    }
+
+    #[test]
+    fn acknowledge_handoff_rejects_cursor_before_snapshot_and_accepts_append_only_cursor(
+    ) -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let mut conn = open_store(&temp_dir.path().join("coven.db"))?;
+        let now = "2026-04-27T06:00:00Z";
+        insert_session(&conn, &session_record("session-1", now))?;
+
+        let offered = create_handoff(&mut conn, "handoff-1", "session-1", "{}", 3, "{}", now)?;
+        claim_handoff(
+            &mut conn,
+            &offered.id,
+            offered.generation,
+            "device:phone-1",
+            "claim-1",
+            now,
+        )?;
+
+        let error = acknowledge_handoff(&mut conn, &offered.id, "device:phone-1", 2, now)
+            .expect_err("cursor before handoff snapshot must be rejected");
+        assert_eq!(error.to_string(), "transcript_diverged");
+
+        let acknowledged = acknowledge_handoff(&mut conn, &offered.id, "device:phone-1", 4, now)?;
+        assert_eq!(acknowledged.state, "acknowledged");
         Ok(())
     }
 
