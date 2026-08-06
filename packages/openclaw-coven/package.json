@@ -39,6 +39,12 @@
       "optional": true
     }
   },
+  "pnpm": {
+    "overrides": {
+      "@hono/node-server": "2.0.10",
+      "undici": "8.9.0"
+    }
+  },
   "openclaw": {
     "extensions": [
       "./index.ts"
