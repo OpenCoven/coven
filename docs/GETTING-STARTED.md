@@ -50,8 +50,10 @@ Coven needs:
 
 - Rust stable, if building from source.
 - Git.
-- A supported local runtime: macOS, Linux, or Windows x64.
-- At least one bundled harness CLI on `PATH`: `codex`, `claude`, or `copilot`.
+- A supported npm runtime: macOS arm64/x64, glibc-based Linux x64, or Windows
+  x64. Build from source on musl/Alpine Linux.
+- At least one externally installed harness CLI with a Coven built-in adapter
+  on `PATH`: `codex`, `claude`, or `copilot`.
 
 Supported v0 harnesses:
 

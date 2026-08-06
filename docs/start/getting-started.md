@@ -10,7 +10,9 @@ Install Coven, run `coven doctor`, and launch your first harness session in abou
 
 ## What you need
 
-- **Rust stable** — only if you build from source. The published `@opencoven/cli` wrapper includes macOS, Linux x64, and Windows x64 packages.
+- **Rust stable** — only if you build from source. The published
+  `@opencoven/cli` wrapper includes macOS arm64/x64, glibc-based Linux x64,
+  and Windows x64 packages; build from source on musl/Alpine Linux.
 - **At least one harness CLI on `PATH`** — Codex, Claude Code, or GitHub Copilot CLI. `coven doctor` will report what is missing and how to install it.
 
 <Tip>

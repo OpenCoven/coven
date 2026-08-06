@@ -241,7 +241,7 @@ Full hub request/response shapes live in the [API contract](/API-CONTRACT).
 GET /api/v1/health
 ```
 
-The response provides the active named `apiVersion`, all eight health
+The response provides the active named `apiVersion`, all nine health
 `capabilities` fields, and optional daemon metadata (`pid`, `startedAt`, and
 `socket`) plus the optional hub summary. Treat a dependent operation as
 unavailable until its required capability fields have been checked.

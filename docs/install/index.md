@@ -52,8 +52,8 @@ coven run claude "describe this repo"
 - Node.js 18+ for the npm wrapper path.
 - Git for source checkouts and project-root detection.
 - Rust stable only when building from source or with cargo.
-- At least one bundled harness CLI on `PATH`: Codex, Claude Code, or GitHub
-  Copilot CLI.
+- At least one externally installed harness CLI with a Coven built-in adapter
+  on `PATH`: Codex, Claude Code, or GitHub Copilot CLI.
 
 Install and authenticate a harness before expecting `coven run` to launch work:
 

@@ -10,11 +10,12 @@ description: "Reference for coven status, familiars, skills, memory, research, c
 # Observability commands
 
 Everything the CovenCave dashboard reads is also visible from the terminal.
-The commands in the table below are **read-only**, work **without a running
-daemon** (they read the same `~/.coven` files and SQLite store the daemon
-serves), and each takes `--json` for machine-readable output that carries the
-same body as the corresponding daemon API route. `coven memory open` is a
-separate local-dashboard launcher described after the table.
+The commands in the table below are **read-only** and each takes `--json` for
+machine-readable output that carries the same body as the corresponding daemon
+API route. Most read persisted `~/.coven` files and SQLite state without a
+running daemon; `coven hub status` requires the daemon's live hub snapshot.
+`coven memory open` is a separate local-dashboard launcher described after the
+table.
 
 | Command | Human view | `--json` body |
 |---|---|---|
@@ -24,7 +25,7 @@ separate local-dashboard launcher described after the table.
 | `coven memory` | Memory file table | `GET /api/v1/memory` |
 | `coven research` | Research loop log | `GET /api/v1/research` |
 | `coven calls [<id>]` | Delegation ledger (list or detail) | `GET /api/v1/coven-calls[/:id]` |
-| `coven hub status` | Hub role, nodes, queue depth | `GET /api/v1/hub/status` |
+| `coven hub status` | Hub role, nodes, queue depth (requires a running daemon) | `GET /api/v1/hub/status` |
 | `coven hub nodes` | Executor node table | `GET /api/v1/hub/nodes` |
 | `coven hub jobs [--state <s>]` | Job table | `GET /api/v1/hub/jobs[?state=s]` |
 | `coven hub routing` | Routing decisions | `GET /api/v1/hub/routing` |

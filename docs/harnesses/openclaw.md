@@ -51,7 +51,7 @@ Coven owns:
 Install the external plugin:
 
 ```bash
-openclaw plugins install clawhub:OpenClaw bridge
+openclaw plugins install clawhub:@opencoven/coven
 ```
 
 The current external OpenClaw plugin is Unix-only: its trust-anchor validation
