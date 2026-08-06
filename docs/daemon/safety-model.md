@@ -46,7 +46,7 @@ See [Authority boundary](/concepts/authority-boundary).
 
 ## Remote access
 
-Coven does **not** bind a TCP port by default. On Unix-like hosts, remote access can tunnel the Unix socket — see [Remote access](/daemon/remote-access). Tailscale and SSH local-forwards both work there.
+Coven does **not** bind a TCP port by default. On Unix-like hosts, remote access requires explicitly starting the unauthenticated, loopback-only TCP listener with `coven daemon serve --tcp 127.0.0.1:3000`, then forwarding it with SSH or Tailscale; never bind it publicly. See [Remote access](/daemon/remote-access).
 
 ## Automation approvals
 
