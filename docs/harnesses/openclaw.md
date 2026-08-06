@@ -54,7 +54,10 @@ Install the external plugin:
 openclaw plugins install clawhub:OpenClaw bridge
 ```
 
-Then opt into the Coven ACP backend in OpenClaw config:
+The current external OpenClaw plugin is Unix-only: its trust-anchor validation
+requires `<covenHome>/coven.sock` and does not support the Windows named-pipe
+transport. On a Unix-like host, opt into the Coven ACP backend in OpenClaw
+config:
 
 ```json5
 {

@@ -171,7 +171,7 @@ dashboard requires Node.js 24 or newer; on an older runtime, only
 | `@opencoven/cli`           | Universal wrapper — auto-selects your platform |
 | `@opencoven/cli-macos`     | macOS Apple Silicon                            |
 | `@opencoven/cli-macos-x64` | macOS Intel x64                                |
-| `@opencoven/cli-linux-x64` | Linux x64                                      |
+| `@opencoven/cli-linux-x64` | glibc-based Linux x64 (Alpine unsupported)    |
 | `@opencoven/cli-windows`   | Windows x64                                    |
 | `@opencoven/coven-memory-dashboard` | Optional loopback memory dashboard companion |
 
@@ -254,7 +254,8 @@ The full command surface — every subcommand, flag, and JSON output shape — l
 | `coven run <harness> <prompt>` | Launch a project-scoped harness session (`--cwd`, `--title`, `--model`, `--continue`, `--stream-json`, …) | [`cli-run.md`](docs/reference/cli-run.md) |
 | `coven sessions` | Browse, search, and inspect sessions (`--plain`, `--json`, `--all`, `search`, `show`, `events`, `log`) | [`cli-sessions.md`](docs/reference/cli-sessions.md) |
 | `coven attach <id>` | Replay/follow session output and forward input | [`cli-attach.md`](docs/reference/cli-attach.md) |
-| `coven archive` / `summon` / `sacrifice` / `kill` | Session rituals (see below) | [`cli-archive.md`](docs/reference/cli-archive.md), [`cli-summon.md`](docs/reference/cli-summon.md), [`cli-sacrifice.md`](docs/reference/cli-sacrifice.md), [`cli-kill.md`](docs/reference/cli-kill.md) |
+| `coven archive` / `summon` / `sacrifice` | Session rituals (see below) | [`cli-archive.md`](docs/reference/cli-archive.md), [`cli-summon.md`](docs/reference/cli-summon.md), [`cli-sacrifice.md`](docs/reference/cli-sacrifice.md) |
+| `coven kill` | Stop a live session on Unix-like hosts; Windows-capable integrations request `POST /api/v1/sessions/:id/kill` through daemon local IPC | [`cli-kill.md`](docs/reference/cli-kill.md) |
 | `coven adapter list/doctor/install` | Inspect harness adapters; opt into trusted adapter recipes (e.g. `coven adapter install grok`) | [`docs/HARNESS-ADAPTERS.md`](docs/HARNESS-ADAPTERS.md) |
 | `coven status` / `familiars` / `skills` / `research` / `calls` / `hub` | Read-only observability with `--json`, mirroring the daemon API routes | [`cli-observe.md`](docs/reference/cli-observe.md) |
 | `coven memory` / `coven memory --json` / `coven memory open` | Preserve the memory list output or launch the private loopback dashboard | [`cli-observe.md`](docs/reference/cli-observe.md) |
