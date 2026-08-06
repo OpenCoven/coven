@@ -2043,23 +2043,21 @@ fn emit_handoff(coven_home: &Path, session_id: &str, body: Option<&str>) -> Resu
         return session_not_live_response(session_id);
     }
     let workspace = WorkspaceSnapshot::capture(Path::new(&session.project_root));
-    let event_cursor = store::latest_event_seq(&conn, session_id)?;
     let now = current_timestamp();
     let record = store::create_handoff(
         &mut conn,
         &format!("handoff_{}", Uuid::new_v4()),
         session_id,
         &serde_json::to_string(&packet)?,
-        event_cursor,
         &serde_json::to_string(&workspace)?,
         &now,
     )?;
     json_response(
         201,
         &json!({
+            "eventCursor": record.event_cursor,
             "handoff": record,
             "packet": packet,
-            "eventCursor": event_cursor,
             "workspace": workspace,
         }),
     )
