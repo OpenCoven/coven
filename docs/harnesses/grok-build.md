@@ -4,13 +4,13 @@ read_when:
   - Installing the Grok Build adapter
   - Reviewing Grok Build launch, permission, and session behavior
 title: "Grok Build (experimental)"
-description: "Install and use Coven's trusted Grok Build adapter recipe without promoting Grok to a bundled default harness."
+description: "Install and use Coven's experimental opt-in Grok Build adapter recipe without promoting Grok to a bundled default harness."
 ---
 
-Grok Build is available through trusted recipe 1.0.0. It is **not** a bundled
-default harness yet: users opt in with `coven adapter install grok`, and the
-recipe stays experimental until the promotion checklist below is complete.
-Its bytes match `coven-runtimes/registry/runtimes/grok/1.0.0.json`.
+Grok Build 1.0.0 is an **experimental opt-in recipe**, not a bundled default
+harness. Users opt in with `coven adapter install grok`; the recipe remains
+experimental until the promotion checklist below is complete. Its reviewed
+canonical bytes match `coven-runtimes/registry/runtimes/grok/1.0.0.json`.
 
 Coven does not embed or fork Grok Build; it launches the installed CLI and reads its plain-text headless output like any other one-shot coding-agent CLI (Codex, Hermes) — no custom protocol or event translation is involved.
 
@@ -35,7 +35,7 @@ The Coven harness id is `grok`; the executable is `grok`.
 
     Grok also supports `XAI_API_KEY` for headless automation. Coven does not read, store, or inject that credential; Grok resolves it from its own inherited environment.
   </Step>
-  <Step title="Install the trusted Coven recipe">
+  <Step title="Install the experimental Coven recipe">
     ```bash
     coven adapter install grok
     coven adapter doctor grok
@@ -43,7 +43,7 @@ The Coven harness id is `grok`; the executable is `grok`.
 
     The first command writes the versioned recipe to
     `COVEN_HOME/adapters/grok.json`. Coven loads only exact current or
-    recognized historical trusted recipe bytes; historical bytes execute the
+    recognized historical canonical recipe bytes; historical bytes execute the
     current recipe in memory.
   </Step>
   <Step title="Run a project-scoped session">

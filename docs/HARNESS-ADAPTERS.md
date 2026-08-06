@@ -266,12 +266,18 @@ claude doctor
 OpenClaw is the first external integration boundary for Coven, but it is not a daemon-launched harness id. The external OpenClaw bridge plugin is an external OpenClaw ACP runtime bridge:
 
 - OpenClaw registers ACP backend id `coven`.
-- The bridge talks to the local Coven daemon over the configured Unix socket.
+- Generic bridge clients use the daemon-reported, platform-appropriate
+  same-user local IPC endpoint (a Unix socket on Unix-like systems or an
+  owner-only named pipe on Windows).
 - OpenClaw chooses an ACP agent id, maps it to a Coven harness id, and launches a project-scoped Coven session.
 - Coven validates the project root, harness id, session id, input, and kill requests.
 - OpenClaw keeps responsibility for its own UI, chat/session routing, plugin lifecycle, and ACP bindings.
 
-This is the integration shape future clients should follow: consume Coven's socket API and adapter discovery, do not import daemon internals or require Coven to know OpenClaw internals.
+The current external OpenClaw plugin is a Unix-specific exception: its
+trust-anchor validation requires a Unix socket, so this guidance does not claim
+that plugin supports Windows. Future clients should consume the daemon's
+platform-appropriate endpoint and adapter discovery, not import daemon
+internals or require Coven to know OpenClaw internals.
 
 ## Adapter requirements
 

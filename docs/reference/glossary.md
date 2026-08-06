@@ -19,7 +19,10 @@ The compatibility version exposed by the daemon socket API. Current stable value
 
 ## Adapter
 
-The PTY-facing component that maps the daemon's harness contract onto a specific CLI (Codex, Claude Code, future Hermes/Aider/Gemini). See [Harness adapters](/reference/harness-adapters).
+The PTY-facing component that maps the daemon's harness contract onto a
+specific CLI. Hermes 1.0.3 is a current trusted opt-in recipe.
+
+Aider, Cline, and Gemini remain future adapter directions. See [Harness adapters](/reference/harness-adapters).
 
 ## Affinity (future)
 
@@ -131,7 +134,8 @@ A Coven-owned record of one harness run.
 
 ## Socket API
 
-The local HTTP-over-Unix-socket API exposed by the daemon.
+The local HTTP API exposed by the daemon through a same-user local IPC endpoint:
+a Unix socket on Unix-like platforms or an owner-only named pipe on Windows.
 
 ## Store
 

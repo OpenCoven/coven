@@ -16,12 +16,13 @@ OpenClaw is Coven's first external integration boundary. It should not be modele
 ```mermaid
 flowchart LR
   OpenClaw[OpenClaw ACP runtime] --> Bridge["OpenClaw bridge plugin"]
-  Bridge --> Socket["Coven local socket API"]
+  Bridge --> Socket["Coven local IPC API"]
   Socket --> Daemon["Coven daemon"]
   Daemon --> Adapter["Harness adapter router"]
   Adapter --> Codex["codex"]
   Adapter --> Claude["claude"]
-  Adapter -. future .-> Hermes["hermes"]
+  Adapter --> Hermes["hermes (trusted opt-in recipe)"]
+  Adapter -. future .-> Future["Aider / Gemini / Cline / custom"]
 ```
 
 The bridge is a client of the daemon. It does not make OpenClaw a privileged Coven harness and it does not move OpenClaw code into Coven core.
@@ -75,10 +76,14 @@ Then opt into the Coven ACP backend in OpenClaw config:
 }
 ```
 
-The plugin maps OpenClaw ACP agent ids to Coven harness ids. Future harnesses such as Hermes should be enabled through explicit adapter support and plugin mapping, not by hardcoding a special OpenClaw path in the daemon.
+The plugin maps OpenClaw ACP agent ids to Coven harness ids. Hermes is a
+trusted opt-in recipe, but it still requires explicit adapter support and
+plugin mapping; it is not enabled automatically. Future harnesses (Aider,
+Gemini, Cline, and custom adapters) likewise require explicit support and
+mapping, not a special OpenClaw path in the daemon.
 
 ## Boundary
 
-Do not add Coven code into OpenClaw core, and do not add OpenClaw internals into the Coven daemon. The compatibility contract is the Coven socket API plus adapter discovery.
+Do not add Coven code into OpenClaw core, and do not add OpenClaw internals into the Coven daemon. The compatibility contract is the daemon's platform-appropriate same-user local IPC endpoint plus adapter discovery. The current external OpenClaw plugin integration is Unix-specific: its trust-anchor validation requires a Unix socket. That plugin constraint does not imply Windows support.
 
 Provider credentials stay with the target harness CLI. The OpenClaw bridge does not receive Codex, Claude, Hermes, OpenAI, Anthropic, GitHub, or other provider credentials from Coven.
