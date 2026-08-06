@@ -112,7 +112,7 @@ The plugin should:
 
 - register an optional Coven backend;
 - validate config for UX;
-- connect to the local socket;
+- connect to the current Unix-socket integration endpoint;
 - launch sessions through `POST /api/v1/sessions`;
 - map Coven events into OpenClaw runtime events;
 - preserve fallback behavior only when explicitly configured; and
@@ -125,6 +125,11 @@ The plugin should not:
 - store provider credentials;
 - assume unversioned routes are stable; or
 - widen project-root permissions.
+
+The current external OpenClaw plugin is Unix-only: its trust-anchor validation
+requires `<covenHome>/coven.sock` and does not support the Windows named-pipe
+transport. A future Windows-capable client must use the daemon-reported
+same-user local IPC endpoint rather than constructing a socket path.
 
 ## Intake surfaces
 

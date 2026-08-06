@@ -41,9 +41,13 @@ Plain `delete` would invite muscle-memory mistakes. Plain `hide` would lose the 
 | Archive | yes, refuses live | yes, via summon | no |
 | Summon | n/a | n/a | no |
 | Sacrifice | yes, refuses live | **no** | requires `--yes` |
-| Kill | only acts on live | events preserved | no |
+| Kill | only acts on live | events preserved | no (Unix-like CLI only) |
 
-The session browser surfaces every ritual as a labeled action. The CLI exposes them as explicit verbs (`coven archive <id>`, `coven summon <id>`, `coven sacrifice <id> --yes`, `coven kill <id>`).
+The session browser surfaces every ritual as a labeled action. On Unix-like
+hosts, the CLI exposes them as explicit verbs (`coven archive <id>`, `coven
+summon <id>`, `coven sacrifice <id> --yes`, `coven kill <id>`). On Windows, a
+named-pipe-capable local integration requests
+`POST /api/v1/sessions/:id/kill` from the daemon that owns a live session.
 
 ## Related
 

@@ -106,7 +106,7 @@ The Rust daemon is the authority boundary. All clients — including the CLI its
 | ---------------------------- | --------------------------------------------------------------------------- |
 | **Rust stable toolchain**    | Required only when building from source                                     |
 | **Git**                      | Required                                                                    |
-| **macOS, Linux, or Windows x64** | Native npm packages are available for all three platforms                  |
+| **macOS arm64/x64, glibc-based Linux x64, or Windows x64** | Native npm packages are available for these targets |
 | **Node.js 18+**              | Required for the npm wrapper; `coven memory open` requires Node.js 24+      |
 | **At least one harness CLI** | Codex, Claude Code, and/or GitHub Copilot CLI (see below)                    |
 
