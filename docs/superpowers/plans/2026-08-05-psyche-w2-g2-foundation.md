@@ -1827,6 +1827,24 @@ fn direct_insert_rejects_wrong_termination_request_id() {
 }
 
 #[test]
+fn direct_insert_rejects_termination_before_execution_request() {
+    let (mut store, _dir) = test_store();
+    let mut binding = fixture_acknowledged_execution_binding();
+    let before_execution = binding.request_created_at - time::Duration::nanoseconds(1);
+    binding
+        .termination_request
+        .as_mut()
+        .unwrap()
+        .created_at = before_execution;
+    let attempt_id = binding.attempt_id.clone();
+    assert!(matches!(
+        store.insert(&CanonicalDocument::ExecutionBinding(binding)),
+        Err(StoreError::Contract(ContractError::CancellationEvidenceMismatch { .. }))
+    ));
+    assert!(store.execution_binding_revisions(&attempt_id).unwrap().is_empty());
+}
+
+#[test]
 fn direct_insert_rejects_acknowledgement_outside_termination_window() {
     let (mut store, _dir) = test_store();
     let mut binding = fixture_acknowledged_execution_binding();
@@ -1990,6 +2008,27 @@ fn execution_binding_revision_rejects_forks_gaps_and_changed_correlation() {
         Err(StoreError::ExecutionBindingRevisionConflict { .. })
     ));
 
+    assert_eq!(
+        store
+            .execution_binding_revisions(&initial.attempt_id)
+            .unwrap(),
+        vec![initial]
+    );
+}
+
+#[test]
+fn execution_binding_revision_rejects_timestamp_regression() {
+    let (mut store, _dir) = test_store();
+    let initial = fixture_execution_binding_revision_1();
+    store
+        .insert(&CanonicalDocument::ExecutionBinding(initial.clone()))
+        .unwrap();
+    let mut regressed = fixture_termination_requested_revision(&initial);
+    regressed.revision_created_at = initial.revision_created_at;
+    assert!(matches!(
+        store.insert(&CanonicalDocument::ExecutionBinding(regressed)),
+        Err(StoreError::ExecutionBindingRevisionConflict { .. })
+    ));
     assert_eq!(
         store
             .execution_binding_revisions(&initial.attempt_id)
@@ -3787,12 +3826,14 @@ Use this complete manifest shape:
         "direct_insert_rejects_acknowledged_state_without_termination_correlation",
         "direct_insert_rejects_mismatched_cancellation_evidence",
         "direct_insert_rejects_wrong_termination_request_id",
+        "direct_insert_rejects_termination_before_execution_request",
         "direct_insert_rejects_acknowledgement_outside_termination_window",
         "direct_insert_rejects_acknowledgement_before_termination_window",
         "direct_insert_rejects_unresolved_outside_termination_window",
         "direct_insert_rejects_unresolved_before_termination_window",
         "execution_binding_revision_appends_termination_outcomes_without_record_conflict",
         "execution_binding_revision_rejects_forks_gaps_and_changed_correlation",
+        "execution_binding_revision_rejects_timestamp_regression",
         "transition_versions_are_monotonic_and_append_only"
       ]
     },
@@ -3802,6 +3843,7 @@ Use this complete manifest shape:
         "quarantine_id_constructor_parser_and_serde_round_trip",
         "unknown_enum_is_quarantined_without_dispatchable_record",
         "quarantine_resolution_is_durable_and_idempotent",
+        "concurrent_quarantine_resolution_has_one_durable_winner",
         "pruning_preserves_unresolved_quarantine_binding_revisions_and_transitions"
       ]
     },
@@ -3964,9 +4006,9 @@ including why `ExpectedUnsupported` is diagnostic rather than passed evidence.
 | Package-local nullable-binding fixtures | `cargo test -p psyche-core --test contracts -- --exact graph_and_node_accept_only_the_two_frozen_nullable_bindings` | not run remotely | none |
 | Exhaustive registered decode | `cargo test -p psyche-core --test decode -- --exact recognized_error_envelope_decodes_exhaustively` | not run remotely | none |
 | Unknown kind/version/enum denial and quarantine | `cargo test -p psyche-core --test decode -- --exact unknown_typed_enum_is_a_quarantinable_decode_failure && cargo test -p psyche-store --test retention -- --exact unknown_enum_is_quarantined_without_dispatchable_record` | not run remotely | none |
-| Quarantine resolution | `cargo test -p psyche-store --test retention -- --exact quarantine_resolution_is_durable_and_idempotent` | not run remotely | none |
-| Direct typed insert validation | `cargo test -p psyche-store --test records -- --exact direct_insert_rejects_wrong_field_id_kind_without_writing && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_acknowledged_cancellation_without_evidence && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_acknowledged_state_without_termination_correlation && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_mismatched_cancellation_evidence && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_wrong_termination_request_id && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_acknowledgement_outside_termination_window && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_acknowledgement_before_termination_window && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_unresolved_outside_termination_window && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_unresolved_before_termination_window` | not run remotely | none |
-| Append-only execution-binding revisions | `cargo test -p psyche-store --test records -- --exact execution_binding_revision_appends_termination_outcomes_without_record_conflict && cargo test -p psyche-store --test records -- --exact execution_binding_revision_rejects_forks_gaps_and_changed_correlation && cargo test -p psyche-store --test retention -- --exact pruning_preserves_unresolved_quarantine_binding_revisions_and_transitions` | not run remotely | none |
+| Quarantine resolution | `cargo test -p psyche-store --test retention -- --exact quarantine_resolution_is_durable_and_idempotent && cargo test -p psyche-store --test retention -- --exact concurrent_quarantine_resolution_has_one_durable_winner` | not run remotely | none |
+| Direct typed insert validation | `cargo test -p psyche-store --test records -- --exact direct_insert_rejects_wrong_field_id_kind_without_writing && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_acknowledged_cancellation_without_evidence && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_acknowledged_state_without_termination_correlation && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_mismatched_cancellation_evidence && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_wrong_termination_request_id && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_termination_before_execution_request && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_acknowledgement_outside_termination_window && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_acknowledgement_before_termination_window && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_unresolved_outside_termination_window && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_unresolved_before_termination_window` | not run remotely | none |
+| Append-only execution-binding revisions | `cargo test -p psyche-store --test records -- --exact execution_binding_revision_appends_termination_outcomes_without_record_conflict && cargo test -p psyche-store --test records -- --exact execution_binding_revision_rejects_forks_gaps_and_changed_correlation && cargo test -p psyche-store --test records -- --exact execution_binding_revision_rejects_timestamp_regression && cargo test -p psyche-store --test retention -- --exact pruning_preserves_unresolved_quarantine_binding_revisions_and_transitions` | not run remotely | none |
 | Transition contract and append-only rules | `cargo test -p psyche-store --test records -- --exact transition_versions_are_monotonic_and_append_only` | not run remotely | none |
 | Checkpoint-failure shutdown | `cargo test -p psyche-runtime --lib -- --exact tests::checkpoint_failure_stops_and_releases_every_shutdown_waiter` | not run remotely | none |
 | Migrations | `cargo test -p psyche-store --test migrations -- --exact fresh_store_applies_v1_once_and_reopens` | not run remotely | none |
