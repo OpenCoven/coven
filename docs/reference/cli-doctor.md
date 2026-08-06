@@ -124,11 +124,13 @@ status:
 coven daemon status --json
 ```
 
-Typical human output from `coven daemon status`:
+Typical Unix-like human output from `coven daemon status`:
 
 ```text
 Coven daemon: running (pid 12345, socket /path/to/coven-home/coven.sock)
 ```
+
+On Windows, `socket` reports the daemon's owner-only named-pipe endpoint.
 
 `not running` means no background daemon is running yet. Start it with:
 

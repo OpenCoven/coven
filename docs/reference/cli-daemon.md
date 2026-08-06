@@ -3,11 +3,11 @@ summary: "Daemon lifecycle subcommands."
 read_when:
   - Looking up daemon subcommands
 title: "coven daemon"
-description: "Reference for coven daemon: start, stop, restart, and status subcommands for the Rust daemon process that owns sessions and the local socket API."
+description: "Reference for coven daemon: start, stop, restart, and status subcommands for the Rust daemon process that owns sessions and the local IPC API."
 ---
 
 `coven daemon` manages the local background process that owns session runtime,
-socket API state, and health reporting.
+local IPC API state, and health reporting.
 
 ```sh
 coven daemon status
@@ -18,7 +18,7 @@ coven daemon status
 | Command | Action |
 | --- | --- |
 | `coven daemon start` | Start the daemon if it is not already running. Reuses a verified live daemon. |
-| `coven daemon status` | Print stopped/running/stale status, pid, socket path, and health flag. `--json` prints the same fields as one JSON document (`status`, `ok`, `pid`, `socket`, `started_at`). |
+| `coven daemon status` | Print stopped/running/stale status, pid, local IPC endpoint, and health flag. `--json` prints the same fields as one JSON document (`status`, `ok`, `pid`, `socket`, `started_at`); `socket` contains a Unix socket path on Unix-like hosts or the daemon-reported named pipe on Windows. |
 | `coven daemon restart` | Stop the current daemon if present, then start a daemon with the current binary. |
 | `coven daemon stop` | Stop the daemon for the active `COVEN_HOME`. |
 | `coven daemon serve` | Hidden foreground server entrypoint used by the background launcher and supervisors. |
@@ -31,15 +31,15 @@ coven daemon start
 coven daemon status
 ```
 
-Expected running output:
+Expected Unix-like running output:
 
 ```text
-Coven daemon: running (pid 12345, socket /home/alex/.coven/coven.sock)
+Coven daemon: running (pid 12345, socket <covenHome>/coven.sock)
 ```
 
 For scripts, `coven daemon status --json` prints the same state as JSON with an
 `ok` field that reports whether the daemon health endpoint responded through
-the local socket.
+same-user local IPC.
 
 ## Restart after upgrades
 
@@ -58,7 +58,9 @@ behind.
 
 ## State directory
 
-Daemon metadata and the socket live under the active `COVEN_HOME`.
+Daemon metadata lives under the active `COVEN_HOME`. Unix-like hosts also keep
+the socket there; Windows reports its owner-only named-pipe endpoint through
+daemon status.
 
 macOS/Linux/WSL2:
 

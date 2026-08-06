@@ -45,7 +45,7 @@ commands continue to support Node.js 18 or newer.
 ## coven status
 
 The "what is my coven doing" front door. Complements `coven doctor`
-(is my *setup* healthy?) with runtime state:
+(is my *setup* healthy?) with runtime state. This is a Unix-like example:
 
 ```text
 Coven status
@@ -60,6 +60,9 @@ Coven status
 
 Next: coven sessions · coven familiars · coven run <harness> "<task>"
 ```
+
+On Windows, the daemon line reports the owner-only named-pipe endpoint instead
+of a `.sock` path.
 
 - The `familiars` line counts a familiar as **active** when it has an open
   session; the roster comes from `~/.coven/familiars.toml`.

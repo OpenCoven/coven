@@ -113,14 +113,18 @@ Use `--all --json` when archived sessions should remain visible.
 
 ## Daemon discovery
 
-Daemon clients should use the versioned socket API:
+Daemon clients should use the versioned local IPC API:
 
 1. `GET /api/v1/health`
 2. Verify `apiVersion === "coven.daemon.v1"` and `capabilities.sessions === true`.
 3. `GET /api/v1/sessions`
 4. Filter sessions by verified project root before showing them in a project-scoped UI.
 
-The daemon socket defaults to `~/.coven/coven.sock`. The daemon remains the authority for project roots, cwd, harness ids, live-session checks, input, kill requests, archive state, and destructive deletion rules.
+On Unix-like hosts, the daemon socket defaults to `~/.coven/coven.sock`; on
+Windows, use the owner-only named-pipe endpoint reported by `coven daemon
+status`. The daemon remains the authority for project roots, cwd, harness ids,
+live-session checks, input, kill requests, archive state, and destructive
+deletion rules.
 
 ## Unavailable states
 

@@ -14,12 +14,16 @@ You have already run `coven doctor`, started the daemon, and launched a first se
 coven daemon status
 ```
 
-Then inspect the versioned local API. The socket defaults to `~/.coven/coven.sock`:
+Then inspect the versioned local API. On Unix-like hosts, the socket defaults
+to `~/.coven/coven.sock`:
 
 ```bash
 curl --unix-socket ~/.coven/coven.sock http://coven/api/v1/health
 curl --unix-socket ~/.coven/coven.sock http://coven/api/v1/capabilities
 ```
+
+On Windows, use a named-pipe-capable local IPC client and the endpoint reported
+by `coven daemon status`; do not construct a `.sock` path.
 
 You should see `apiVersion: "coven.daemon.v1"` before building client assumptions.
 
@@ -43,7 +47,8 @@ Use `--json` for clients and scripts. Use the TUI/browser for human review.
 
 ## 3. Inspect the event log
 
-Copy a session id from `coven sessions --json`, then read its events:
+Copy a session id from `coven sessions --json`, then read its events on a
+Unix-like host:
 
 ```bash
 curl --unix-socket ~/.coven/coven.sock "http://coven/api/v1/events?sessionId=<session-id>"

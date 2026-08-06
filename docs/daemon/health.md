@@ -3,11 +3,11 @@ summary: "GET /api/v1/health and what every field means."
 read_when:
   - Building a health probe
 title: "Health"
-description: "Reference for GET /api/v1/health, the Coven daemon liveness endpoint clients call first to confirm the socket is up and the API contract is negotiated."
+description: "Reference for GET /api/v1/health, the Coven daemon liveness endpoint clients call first to confirm local IPC is up and the API contract is negotiated."
 ---
 
-Daemon health is the signal that the background process is reachable and using
-the expected socket for the active `COVEN_HOME`.
+Daemon health is the signal that the background process is reachable over the
+expected same-user local IPC endpoint for the active `COVEN_HOME`.
 
 ## Storage health and retention
 
@@ -36,13 +36,17 @@ Use:
 coven daemon status
 ```
 
-Typical healthy output:
+Typical Unix-like healthy output:
 
 ```text
 Coven daemon: running (pid 12345, socket <covenHome>/coven.sock)
 ```
 
-`running` means Coven found daemon metadata and verified the process/socket.
+On Windows, the `socket` field reports the daemon's owner-only named-pipe
+endpoint instead of `<covenHome>/coven.sock`.
+
+`running` means Coven found daemon metadata and verified the process/local IPC
+endpoint.
 For scripts, `coven daemon status --json` adds an `ok` field that reports
 whether the daemon health response succeeded.
 

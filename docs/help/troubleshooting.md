@@ -21,8 +21,11 @@ Start with `coven doctor`. Everything below assumes you have already done that.
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `daemon: not running` | Daemon stopped | `coven daemon start`. |
-| `socket already in use` | Stale socket file | `coven daemon stop`, then remove `<covenHome>/coven.sock`. |
+| Unix `socket already in use` | Stale Unix socket file | `coven daemon stop`, then remove `<covenHome>/coven.sock`. |
 | `daemon ipc timeout` | Slow first boot | Retry after a few seconds; check `coven daemon status`. |
+
+On Windows, use `coven daemon status` to inspect the owner-only named-pipe
+endpoint, then restart the daemon instead of removing a `.sock` path.
 
 See [Daemon will not start](/help/daemon-wont-start) for deeper triage.
 
