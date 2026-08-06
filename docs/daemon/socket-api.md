@@ -1,15 +1,23 @@
 ---
-summary: "HTTP-over-Unix-socket contract under /api/v1. Versioned, capability-discovered, structured-error."
+summary: "HTTP-over-local-IPC contract under /api/v1. Versioned, capability-discovered, structured-error."
 read_when:
   - Building a client for the Coven daemon
   - Auditing what the socket exposes
 title: "Socket API"
-description: "The Coven daemon exposes a small versioned HTTP API over a Unix socket. Reference for the coven.daemon.v1 contract under the /api/v1 prefix."
+description: "The Coven daemon exposes a small versioned HTTP API over same-user local IPC. Reference for the coven.daemon.v1 contract under the /api/v1 prefix."
 ---
 
-Coven exposes a small versioned HTTP API over a Unix socket. The current public contract is **`coven.daemon.v1`** served under the `/api/v1` prefix.
+Coven exposes a small versioned HTTP API over same-user local IPC. On Unix-like
+hosts, this is `<COVEN_HOME>/coven.sock`; on Windows, it is an owner-only named
+pipe selected by `COVEN_HOME`. Health and `coven daemon status` report the
+active endpoint, so clients must not construct a Windows pipe name from the
+Unix convention. The current public contract is **`coven.daemon.v1`** served
+under the `/api/v1` prefix.
 
-The daemon does not use OAuth, JWTs, bearer tokens, API keys, or browser cookies. Trust is **same-user local access** to the Unix socket at `<covenHome>/coven.sock`. See [Auth posture](/daemon/auth-posture) before adding a new client, dashboard, remote bridge, or browser-facing transport.
+The daemon does not use OAuth, JWTs, bearer tokens, API keys, or browser
+cookies. Trust is **same-user local access** to this IPC endpoint. See [Auth
+posture](/daemon/auth-posture) before adding a new client, dashboard, remote
+bridge, or browser-facing transport.
 
 ## Handshake
 
@@ -39,13 +47,14 @@ GET /api/v1/health
   "daemon": {
     "pid": 31415,
     "startedAt": "2026-05-15T19:31:02Z",
-    "socket": "<covenHome>/coven.sock"
+    "socket": "<local IPC endpoint>"
   }
 }
 ```
 
-`daemon` is `null` when daemon metadata is unavailable. A `hub` summary may
-also be present when the store-backed health summary is available.
+`daemon` is `null` when daemon metadata is unavailable. When present,
+`daemon.socket` reports the active local IPC endpoint. A `hub` summary may also
+be present when the store-backed health summary is available.
 
 Negotiate the named `coven.daemon.v1` contract against this health
 `apiVersion`, then check every capability required by the operation before
@@ -122,6 +131,11 @@ See [Error envelope](/daemon/error-envelope) for the full code list.
 The health response's `apiVersion` field is the named contract clients pin against. Coven follows additive compatibility: new fields and new capabilities are added under existing versions; breaking changes require a new version. See [API versioning](/daemon/api-versioning).
 
 ## Calling the socket
+
+The following curl, Node `socketPath`, and Rust `UnixStream` examples apply
+only on Unix-like hosts. On Windows, use a named-pipe-capable local IPC client
+against the daemon-reported endpoint; do not derive a pipe name from
+`<COVEN_HOME>/coven.sock`.
 
 <Tabs>
   <Tab title="curl">

@@ -4,7 +4,7 @@ read_when:
   - Configuring a Coven install
   - Relocating COVEN_HOME
 title: "Configuration"
-description: "Daemon configuration surface for Coven: COVEN_HOME, socket location, log paths, and the minimal knobs the Rust process reads on start and restart."
+description: "Daemon configuration surface for Coven: COVEN_HOME, local IPC endpoint, log paths, and the minimal knobs the Rust process reads on start and restart."
 ---
 
 Coven's current daemon configuration surface is intentionally small.
@@ -18,9 +18,14 @@ export COVEN_HOME="$HOME/.local/share/coven"
 coven daemon restart
 ```
 
-When `COVEN_HOME` is set, the daemon uses:
+When `COVEN_HOME` is set, the daemon uses same-user local IPC: a Unix socket
+at `<COVEN_HOME>/coven.sock` on Unix-like hosts, or an owner-only named pipe
+selected by `COVEN_HOME` on Windows. Health and `coven daemon status` report
+the active endpoint; clients must not construct a Windows pipe name from the
+Unix convention.
 
-- `<COVEN_HOME>/coven.sock` for the Unix socket.
+It also uses:
+
 - `<COVEN_HOME>/coven.sqlite3` for the session ledger and event log.
 - `<COVEN_HOME>/daemon.json` for background daemon metadata.
 - `<COVEN_HOME>/privacy.toml` for local log privacy settings when present.
@@ -63,7 +68,7 @@ Restart after changing `COVEN_HOME`:
 coven daemon restart
 ```
 
-`restart` rebinds the socket under the selected state directory.
+`restart` rebinds the local IPC endpoint for the selected state directory.
 
 Prune retained log data:
 

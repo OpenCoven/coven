@@ -279,7 +279,12 @@ The full command surface — every subcommand, flag, and JSON output shape — l
 
 ## Local API
 
-The daemon exposes a versioned HTTP API over a Unix socket. The current public contract is `coven.daemon.v1` (prefix: `/api/v1`).
+The daemon exposes a versioned HTTP API over same-user local IPC. On Unix-like
+hosts, this is `<COVEN_HOME>/coven.sock`; on Windows, it is an owner-only named
+pipe selected by `COVEN_HOME`. Health and `coven daemon status` report the
+active endpoint, so clients must not construct a Windows pipe name from the
+Unix convention. The current public contract is `coven.daemon.v1` (prefix:
+`/api/v1`).
 
 The complete endpoint index — contract discovery, sessions and events, observability reads, travel, scheduler, and the hub control plane — lives in [`docs/reference/api.md`](docs/reference/api.md). [`docs/API.md`](docs/API.md) covers the architecture and auth posture, and [`docs/API-CONTRACT.md`](docs/API-CONTRACT.md) is the full versioned contract: shapes, error codes, cursor pagination, and compatibility rules.
 
@@ -288,7 +293,7 @@ The complete endpoint index — contract discovery, sessions and events, observa
 All API clients should start with a health negotiation:
 
 ```bash
-# Example: health check via Unix socket
+# Unix-like example: health check via Unix socket
 curl --unix-socket ~/.coven/coven.sock http://localhost/api/v1/health
 ```
 
@@ -328,8 +333,8 @@ Coven is a local-first harness substrate. The Rust daemon is the authority bound
 Developer
   │
   ├── CastCodes workspace ─────────────────────┐
-  ├── coven CLI / TUI ─────────────────────────┤ HTTP over Unix socket
-  ├── comux (legacy/reference) ────────────────┤ ~/.coven/coven.sock
+  ├── coven CLI / TUI ─────────────────────────┤ HTTP over local IPC
+  ├── comux (legacy/reference) ────────────────┤ daemon-reported endpoint
   └── @opencoven/coven (OpenClaw plugin) ───────┘
                                                 │
                                 ┌───────────────▼──────────────────┐

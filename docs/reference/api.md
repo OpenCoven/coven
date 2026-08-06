@@ -1,5 +1,5 @@
 ---
-summary: "Complete endpoint reference for the Coven local socket API."
+summary: "Complete endpoint reference for the Coven local IPC API."
 read_when:
   - Looking up an endpoint
   - Building a client against `/api/v1`
@@ -8,7 +8,13 @@ description: "Endpoint reference for every route the Coven daemon serves under /
 ---
 
 
-The Coven daemon exposes its public API as HTTP over a Unix socket under `<covenHome>/coven.sock`. The active contract is **`coven.daemon.v1`** served under `/api/v1`. This page is the canonical endpoint index — every route the daemon serves is listed here.
+The Coven daemon exposes its public API as HTTP over same-user local IPC. On
+Unix-like hosts, this is `<COVEN_HOME>/coven.sock`; on Windows, it is an
+owner-only named pipe selected by `COVEN_HOME`. Health and `coven daemon status`
+report the active endpoint, so clients must not construct a Windows pipe name
+from the Unix convention. The active contract is **`coven.daemon.v1`** served
+under `/api/v1`. This page is the canonical endpoint index — every route the
+daemon serves is listed here.
 
 ```mermaid
 flowchart LR
@@ -39,7 +45,8 @@ The health `capabilities` object currently contains all nine fields:
 `sessions`, `events`, `travel`, `scheduler`, `hub`, `executorDispatch`,
 `eventCursor`, `structuredErrors`, and `sessionHandoff`. `daemon` is either `null` or
 `{ pid, startedAt, socket }`, where the socket is under
-`<covenHome>/coven.sock`; the optional `hub` field is a control-plane summary.
+the active local IPC endpoint; the optional `hub` field is a control-plane
+summary.
 The optional `eventWriter` field reports the daemon-owned persistence queue,
 including its state, exact queued events/bytes, capacity, dropped output,
 connection, transaction, commit, and last-error counters.
@@ -75,7 +82,7 @@ snapshot reported by `eventWriter`.
 
 Event payloads are redacted by default; the raw artifact route requires explicit local raw-artifact persistence. See [STREAM-JSON](/STREAM-JSON) for event payload shapes.
 
-Handoff routes are local-socket-only and require the `sessionHandoff`
+Handoff routes are local-IPC-only and require the `sessionHandoff`
 capability. They do not authenticate remote callers; a companion needs a
 separately paired authenticated transport. See
 [Session handoff](/daemon/session-handoff).

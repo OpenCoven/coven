@@ -11,7 +11,12 @@ description: "The versioned coven.daemon.v1 contract under /api/v1: health negot
 
 > **See also:** the condensed [API contract reference](reference/api-contract.md), which summarizes versioning and links per-topic pages under `docs/daemon/`. This page is the fuller single-page contract.
 
-The Coven daemon socket API is a public compatibility boundary for comux and external clients such as external OpenClaw bridge plugin.
+The Coven daemon API is a public compatibility boundary for comux and external
+clients such as external OpenClaw bridge plugin. It travels over same-user local
+IPC: `<COVEN_HOME>/coven.sock` on Unix-like hosts, or an owner-only named pipe
+selected by `COVEN_HOME` on Windows. Health and `coven daemon status` report
+the active endpoint; clients must not construct a Windows pipe name from the
+Unix convention.
 
 ## Current stable version
 
@@ -57,7 +62,7 @@ proof of `coven.daemon.v1` support.
   "daemon": {
     "pid": 12345,
     "startedAt": "2026-05-09T06:43:00Z",
-    "socket": "/var/lib/coven/coven.sock"
+    "socket": "<local IPC endpoint>"
   },
   "eventWriter": {
     "state": "healthy",
@@ -78,7 +83,10 @@ proof of `coven.daemon.v1` support.
 }
 ```
 
-If the daemon metadata is unavailable, `daemon` may be `null`. The `hub` block reports the daemon's control-plane role and node availability summary; full node detail lives at `GET /api/v1/hub/status`.
+If the daemon metadata is unavailable, `daemon` may be `null`. When present,
+`daemon.socket` reports the active local IPC endpoint. The `hub` block reports
+the daemon's control-plane role and node availability summary; full node detail
+lives at `GET /api/v1/hub/status`.
 
 `eventWriter` is present for the daemon-owned live-session runtime. Its
 `state` is `healthy`, `pressured`, or `failed`. A pressured writer reports raw

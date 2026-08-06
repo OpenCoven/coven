@@ -25,7 +25,8 @@ contain:
 | Path | Purpose |
 | --- | --- |
 | `coven.sqlite3` | Local session/event store. |
-| `coven.sock` | Local daemon socket on Unix-like hosts. |
+| `$COVEN_HOME/coven.sock` | Same-user Unix socket on Unix-like hosts. |
+| daemon-reported named pipe | Owner-only local IPC endpoint on Windows. |
 | `daemon.json` | Daemon pid/socket metadata. |
 | `state.lock` | Shared/exclusive coordination between normal commands and reset. |
 | `reset-transaction.json` | Durable marker used to roll back an interrupted reset before normal commands resume. |

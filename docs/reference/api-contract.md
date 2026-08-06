@@ -11,6 +11,11 @@ description: "Reference for the coven.daemon.v1 local API contract: how Coven ad
 
 Coven's local API is versioned as a **named contract**. The current value is `coven.daemon.v1`.
 
+It travels over same-user local IPC: `<COVEN_HOME>/coven.sock` on Unix-like
+hosts, or an owner-only named pipe selected by `COVEN_HOME` on Windows. Health
+and `coven daemon status` report the active endpoint; clients must not
+construct a Windows pipe name from the Unix convention.
+
 ## Compatibility rules
 
 - New fields can be added inside an existing contract version. Clients must ignore unknown fields.
@@ -68,7 +73,7 @@ GET /api/v1/health
     "structuredErrors": true,
     "sessionHandoff": true
   },
-  "daemon": { "pid": 12345, "startedAt": "2026-07-14T12:00:00Z", "socket": "<covenHome>/coven.sock" },
+  "daemon": { "pid": 12345, "startedAt": "2026-07-14T12:00:00Z", "socket": "<local IPC endpoint>" },
   "eventWriter": {
     "state": "healthy",
     "queuedBytes": 0,

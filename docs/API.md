@@ -1,22 +1,28 @@
 ---
-title: "Coven local socket API"
-summary: "The Coven local HTTP API served over a Unix socket: health, capabilities, actions, sessions, events, and input forwarding under /api/v1."
+title: "Coven local IPC API"
+summary: "The Coven local HTTP API served over same-user local IPC: health, capabilities, actions, sessions, events, and input forwarding under /api/v1."
 read_when:
   - Building a local Coven client
   - Looking up /api/v1 endpoint behavior
-description: "The Coven local HTTP API served over a Unix socket: health, capabilities, actions, sessions, events, and input forwarding under /api/v1."
+description: "The Coven local HTTP API served over same-user local IPC: health, capabilities, actions, sessions, events, and input forwarding under /api/v1."
 ---
 
 # Coven Local API
 
 _Last updated: 2026-07-14_
 
-Coven exposes a small HTTP API over the local Unix socket at `<covenHome>/coven.sock`. The Rust daemon is the authority boundary: clients may validate for UX, but the daemon still validates project roots, cwd, harness ids, session ids, input, and live-session state before acting.
+Coven exposes a small HTTP API over same-user local IPC. On Unix-like hosts,
+this is `<COVEN_HOME>/coven.sock`; on Windows, it is an owner-only named pipe
+selected by `COVEN_HOME`. Health and `coven daemon status` report the active
+endpoint, so clients must not construct a Windows pipe name from the Unix
+convention. The Rust daemon is the authority boundary: clients may validate for
+UX, but the daemon still validates project roots, cwd, harness ids, session
+ids, input, and live-session state before acting.
 
 ```mermaid
 flowchart LR
-  Client[Local client] -->|connect| Sock["<covenHome>/coven.sock"]
-  Sock -->|HTTP/1.1| Router["/api/v1 router"]
+  Client[Local client] -->|connect| IPC["local IPC"]
+  IPC -->|HTTP/1.1| Router["/api/v1 router"]
   Router --> Health["/health"]
   Router --> Capabilities["/capabilities"]
   Router --> Actions["/actions"]
@@ -29,7 +35,11 @@ flowchart LR
 
 Every route returns either a documented success shape or the structured error envelope. Unknown routes, unknown action ids, and unknown API versions all fail closed with `invalid_request` or `not_found`.
 
-See [Authentication and local access](/AUTH) for the current auth posture. In short: the daemon API does not use OAuth, JWTs, bearer tokens, API keys, or cookies today. Access is local Unix-socket based, provider credentials stay with the harness CLIs, and any remote, browser, or TCP exposure needs a separate auth design.
+See [Authentication and local access](/AUTH) for the current auth posture. In
+short: the daemon API does not use OAuth, JWTs, bearer tokens, API keys, or
+cookies today. Access is same-user local IPC, provider credentials stay with
+the harness CLIs, and any remote, browser, or TCP exposure needs a separate
+auth design.
 
 ## Versioning
 
@@ -76,7 +86,7 @@ Event payloads returned by `/events`, `/sessions/:id/events`, and `/sessions/:id
   "daemon": {
     "pid": 12345,
     "startedAt": "2026-05-09T12:00:00Z",
-    "socket": "<covenHome>/coven.sock"
+    "socket": "<local IPC endpoint>"
   },
   "hub": {
     "role": "hub",
@@ -87,7 +97,10 @@ Event payloads returned by `/events`, `/sessions/:id/events`, and `/sessions/:id
 }
 ```
 
-When no daemon metadata is available, `daemon` is `null`. The `hub` block summarizes the daemon's control-plane role and node availability; full node and queue detail lives at `GET /api/v1/hub/status`.
+When no daemon metadata is available, `daemon` is `null`. When present,
+`daemon.socket` reports the active local IPC endpoint. The `hub` block
+summarizes the daemon's control-plane role and node availability; full node and
+queue detail lives at `GET /api/v1/hub/status`.
 
 ## Control-plane capabilities
 
