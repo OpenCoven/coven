@@ -22,8 +22,9 @@ curl --unix-socket ~/.coven/coven.sock http://coven/api/v1/health
 curl --unix-socket ~/.coven/coven.sock http://coven/api/v1/capabilities
 ```
 
-On Windows, use a named-pipe-capable local IPC client and the endpoint reported
-by `coven daemon status`; do not construct a `.sock` path.
+On Windows, use a named-pipe-capable local IPC client and the fully qualified
+`state.daemon_ipc` path from `coven config paths --json`; do not construct a
+`.sock` path.
 
 You should see `apiVersion: "coven.daemon.v1"` before building client assumptions.
 

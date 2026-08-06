@@ -42,8 +42,9 @@ Typical Unix-like healthy output:
 Coven daemon: running (pid 12345, socket <covenHome>/coven.sock)
 ```
 
-On Windows, the `socket` field reports the daemon's owner-only named-pipe
-endpoint instead of `<covenHome>/coven.sock`.
+On Windows, the `socket` field is diagnostic transport metadata. Clients use
+`state.daemon_ipc` from `coven config paths --json` for the fully qualified
+owner-only named-pipe path instead of `<covenHome>/coven.sock`.
 
 `running` means Coven found daemon metadata and verified the process/local IPC
 endpoint.

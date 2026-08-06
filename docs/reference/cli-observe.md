@@ -62,8 +62,9 @@ Coven status
 Next: coven sessions · coven familiars · coven run <harness> "<task>"
 ```
 
-On Windows, the daemon line reports the owner-only named-pipe endpoint instead
-of a `.sock` path.
+On Windows, the daemon line reports diagnostic named-pipe metadata instead of
+a `.sock` path. Clients needing a connection path use `state.daemon_ipc` from
+`coven config paths --json`.
 
 - The `familiars` line counts a familiar as **active** when it has an open
   session; the roster comes from `~/.coven/familiars.toml`.

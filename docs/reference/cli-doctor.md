@@ -130,7 +130,8 @@ Typical Unix-like human output from `coven daemon status`:
 Coven daemon: running (pid 12345, socket /path/to/coven-home/coven.sock)
 ```
 
-On Windows, `socket` reports the daemon's owner-only named-pipe endpoint.
+On Windows, `socket` is diagnostic pipe metadata. Clients needing a connection
+path use `state.daemon_ipc` from `coven config paths --json`.
 
 `not running` means no background daemon is running yet. Start it with:
 

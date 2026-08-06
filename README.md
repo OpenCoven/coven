@@ -284,10 +284,11 @@ The full command surface — every subcommand, flag, and JSON output shape — l
 
 The daemon exposes a versioned HTTP API over same-user local IPC. On Unix-like
 hosts, this is `<COVEN_HOME>/coven.sock`; on Windows, it is an owner-only named
-pipe selected by `COVEN_HOME`. Health and `coven daemon status` report the
-active endpoint, so clients must not construct a Windows pipe name from the
-Unix convention. The current public contract is `coven.daemon.v1` (prefix:
-`/api/v1`).
+pipe selected by `COVEN_HOME`. Windows clients discover the fully qualified
+pipe path as `state.daemon_ipc` from `coven config paths --json`; they must not
+construct a pipe name from the Unix convention or use health/status transport
+metadata as a named-pipe path. The current public contract is
+`coven.daemon.v1` (prefix: `/api/v1`).
 
 The complete endpoint index — contract discovery, sessions and events, observability reads, travel, scheduler, and the hub control plane — lives in [`docs/reference/api.md`](docs/reference/api.md). [`docs/API.md`](docs/API.md) covers the architecture and auth posture, and [`docs/API-CONTRACT.md`](docs/API-CONTRACT.md) is the full versioned contract: shapes, error codes, cursor pagination, and compatibility rules.
 
@@ -337,7 +338,7 @@ Developer
   │
   ├── CastCodes workspace ─────────────────────┐
   ├── coven CLI / TUI ─────────────────────────┤ HTTP over local IPC
-  ├── comux (legacy/reference) ────────────────┤ daemon-reported endpoint
+  ├── comux (legacy/reference) ────────────────┤ local IPC API
   └── @opencoven/coven (OpenClaw plugin) ───────┘
                                                 │
                                 ┌───────────────▼──────────────────┐
@@ -476,7 +477,11 @@ Never commit runtime state: `.coven/`, `*.sqlite*`, `*.db`, `*.sock`, `.env*`, a
 
 ## OpenCoven Integrations
 
-Coven is the runtime layer. Other surfaces in the OpenCoven ecosystem sit above it and connect through same-user local IPC: a Unix socket at `COVEN_HOME/coven.sock` on Unix-like hosts or a daemon-reported owner-only named pipe on Windows.
+Coven is the runtime layer. Other surfaces in the OpenCoven ecosystem sit above
+it and connect through same-user local IPC: a Unix socket at
+`COVEN_HOME/coven.sock` on Unix-like hosts or an owner-only named pipe on
+Windows, whose fully qualified client path is `state.daemon_ipc` from
+`coven config paths --json`.
 
 | Integration                                              | Role                                                                       | How it connects                          |
 | -------------------------------------------------------- | -------------------------------------------------------------------------- | ---------------------------------------- |
@@ -538,7 +543,11 @@ comux is a standalone terminal cockpit that proved the tmux-cockpit model for pa
 
 **Q: What is Coven, exactly?**
 
-Coven is a local Rust daemon and CLI that supervises coding-agent CLI sessions (like Codex or Claude Code) inside explicit project boundaries, records everything to SQLite, and exposes it through a versioned HTTP API over same-user local IPC: a Unix socket at `COVEN_HOME/coven.sock` on Unix-like hosts or a daemon-reported owner-only named pipe on Windows.
+Coven is a local Rust daemon and CLI that supervises coding-agent CLI sessions
+(like Codex or Claude Code) inside explicit project boundaries, records
+everything to SQLite, and exposes it through a versioned HTTP API over
+same-user local IPC: a Unix socket at `COVEN_HOME/coven.sock` on Unix-like
+hosts or an owner-only named pipe on Windows.
 
 **Q: Does Coven replace Codex or Claude Code?**
 
@@ -562,7 +571,11 @@ Sacrifice is Coven's intentionally explicit verb for permanently deleting a sess
 
 **Q: What is `COVEN_HOME`?**
 
-The directory where Coven stores all local state: SQLite database, same-user local IPC, logs, and encryption keys. On Unix-like hosts, IPC uses `COVEN_HOME/coven.sock`; on Windows, it uses a daemon-reported owner-only named pipe. Defaults to `~/.coven`. To isolate environments (e.g., in CI), set `COVEN_HOME` to a separate path for each environment.
+The directory where Coven stores all local state: SQLite database, same-user
+local IPC, logs, and encryption keys. On Unix-like hosts, IPC uses
+`COVEN_HOME/coven.sock`; on Windows, it uses an owner-only named pipe.
+Defaults to `~/.coven`. To isolate environments (e.g., in CI), set
+`COVEN_HOME` to a separate path for each environment.
 
 **Q: Is CastCodes the same as Coven?**
 
@@ -574,7 +587,13 @@ OpenClaw is an external coding agent that can optionally integrate with Coven th
 
 **Q: Can I build my own client on top of Coven?**
 
-Yes. The daemon exposes a stable `coven.daemon.v1` HTTP API over same-user local IPC: a Unix socket at `COVEN_HOME/coven.sock` on Unix-like hosts or a daemon-reported owner-only named pipe on Windows. All clients are untrusted for enforcement, but the API surface is stable and versioned. See [`docs/API-CONTRACT.md`](docs/API-CONTRACT.md) and [`docs/CLIENT-INTEGRATION.md`](docs/CLIENT-INTEGRATION.md).
+Yes. The daemon exposes a stable `coven.daemon.v1` HTTP API over same-user
+local IPC: a Unix socket at `COVEN_HOME/coven.sock` on Unix-like hosts or an
+owner-only named pipe on Windows. Windows clients discover the fully qualified
+pipe path as `state.daemon_ipc` from `coven config paths --json`. All clients
+are untrusted for enforcement, but the API surface is stable and versioned.
+See [`docs/API-CONTRACT.md`](docs/API-CONTRACT.md) and
+[`docs/CLIENT-INTEGRATION.md`](docs/CLIENT-INTEGRATION.md).
 
 **Q: What if I want to add a new harness (like Aider or Gemini)?**
 

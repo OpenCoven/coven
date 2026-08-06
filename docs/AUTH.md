@@ -55,7 +55,10 @@ The boundary is OS-enforced local IPC permissions plus same-user process localit
 
 ### Same-user local IPC locality
 
-The API is not exposed as TCP by default. On Unix-like hosts, clients connect to the Unix socket owned by the user's Coven state directory; on Windows, they connect through the owner-only named pipe.
+The API is not exposed as TCP by default. On Unix-like hosts, clients connect
+to the Unix socket owned by the user's Coven state directory; on Windows, they
+discover the fully qualified owner-only named-pipe path as `state.daemon_ipc`
+from `coven config paths --json`.
 
 New clients should treat the platform-appropriate local IPC endpoint as the trust anchor and should connect only to the versioned API under `/api/v1/...`.
 
