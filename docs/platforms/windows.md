@@ -3,7 +3,7 @@ summary: "Coven on Windows — caveats and supported flows."
 read_when:
   - Operating on Windows
 title: "Windows"
-description: "Coven on Windows: native wrapper plus Linux daemon under WSL2, and how COVEN_HOME and the local socket connect Windows clients to harnesses."
+description: "Coven on Windows: native and WSL2 environments, COVEN_HOME isolation, and owner-only local IPC for harness sessions."
 ---
 
 ## Install path
