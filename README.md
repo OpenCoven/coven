@@ -64,7 +64,7 @@ Coven doesn't replace your coding agent, your UI, or other clients. It acts as a
 
 - **You choose the harness** — Codex, Claude Code, GitHub Copilot CLI, or future adapters.
 - **Coven owns the session** — project-scoped boundaries, PTY execution, event logging, SQLite persistence.
-- **Clients present the work** — CastCodes, the CLI/TUI, comux, or your own integration over the local socket API.
+- **Clients present the work** — CastCodes, the CLI/TUI, comux, or your own integration over the same-user local IPC API.
 
 The Rust daemon is the authority boundary. All clients — including the CLI itself — are convenience layers. Security decisions flow inward to the daemon, never outward to clients.
 
@@ -78,7 +78,7 @@ The Rust daemon is the authority boundary. All clients — including the CLI its
 | No project boundary enforcement                     | Agent is locked to an explicit project root; cannot escape  |
 | Lose track of agent work when the terminal closes   | Sessions persist across daemon restarts via SQLite          |
 | Manually juggle multiple harness CLIs               | One unified `coven run` entry point for all harnesses       |
-| No API for clients to consume agent sessions        | Versioned `coven.daemon.v1` socket API for all clients      |
+| No API for clients to consume agent sessions        | Versioned `coven.daemon.v1` same-user local IPC API for all clients |
 | No standard way to observe or replay past work      | `coven sessions` browser with Rejoin, View Log, and Archive |
 
 ---
@@ -89,7 +89,7 @@ The Rust daemon is the authority boundary. All clients — including the CLI its
 - **🔌 Harness-neutral runtime** — bundled support stays focused on Codex, Claude Code, and GitHub Copilot CLI; trusted opt-in recipes cover Grok Build, Hermes, and OpenCode through the same adapter path used by future harnesses.
 - **🖥️ Interactive session browser** — Live and completed work can be selected, rejoined, viewed, archived, restored, or sacrificed without memorizing IDs.
 - **📡 Attachable PTY sessions** — Live sessions can be replayed or followed from explicit CLI verbs.
-- **🔌 Local daemon API** — CastCodes, comux, and the OpenClaw plugin coordinate through one versioned socket contract (`coven.daemon.v1`).
+- **🔌 Local daemon API** — CastCodes, comux, and the OpenClaw plugin coordinate through one versioned local IPC contract (`coven.daemon.v1`).
 - **🗄️ SQLite-backed history** — Session metadata and event logs survive daemon restarts.
 - **🦀 Rust authority layer** — Launch, cwd, input, kill, and path-sensitive requests are revalidated in Rust. Clients are never the trust boundary.
 - **🔒 External OpenClaw bridge** — `@opencoven/coven` is an opt-in plugin; OpenClaw core does not include Coven code.
@@ -319,7 +319,7 @@ Direct native binary installs can place `coven-memory-dashboard` on `PATH` or
 install the package globally. The dashboard requires Node.js 24 or newer; the
 rest of the npm-wrapped CLI remains available on Node.js 18 or newer.
 
-Treat the socket API as the product contract. Clients may validate for better UX, but the Rust daemon remains the authority boundary.
+Treat the local IPC API as the product contract. Clients may validate for better UX, but the Rust daemon remains the authority boundary.
 
 ---
 
@@ -434,7 +434,7 @@ coven/
 
 **Key directories:**
 
-- **`crates/coven-cli`** — Everything that becomes the `coven` binary. This is where daemon, PTY adapter, session store, socket API, and CLI surface live in Rust.
+- **`crates/coven-cli`** — Everything that becomes the `coven` binary. This is where daemon, PTY adapter, session store, local IPC API, and CLI surface live in Rust.
 - **`packages/openclaw-coven`** — The opt-in bridge between OpenClaw and Coven. Lives here (not in OpenClaw core) to keep the trust boundary clean. Published as `@opencoven/coven`.
 - **`scripts/check-secrets.py`** — Required pre-release and pre-PR scan. Run it before pushing to avoid leaking credentials into git history.
 - **`docs/`** — The canonical documentation suite. All product docs, architecture, API contract, safety model, and roadmap live here.
@@ -516,7 +516,7 @@ comux is a standalone terminal cockpit that proved the tmux-cockpit model for pa
 | [Session lifecycle](docs/SESSION-LIFECYCLE.md)          | Detailed state machine for sessions                                   |
 | [Safety model](docs/SAFETY-MODEL.md)                    | Trust boundary, local access model, data rules                        |
 | [Operational model](docs/OPERATIONAL-MODEL.md)          | Day-to-day operation and daemon management                            |
-| [Client integration guide](docs/CLIENT-INTEGRATION.md)  | How to build a client against the socket API                          |
+| [Client integration guide](docs/CLIENT-INTEGRATION.md)  | How to build a client against the same-user local IPC API              |
 | [Harness adapter guide](docs/HARNESS-ADAPTERS.md)       | How to implement a new harness adapter                                |
 | [Troubleshooting](docs/TROUBLESHOOTING.md)              | Diagnose and resolve common issues                                    |
 | [Public roadmap](docs/ROADMAP.md)                       | Shipped, now, next, and later milestones                              |
@@ -663,7 +663,7 @@ cargo test -p coven-cli --bin coven tui::chat::events::tests::benchmark_schedule
 ```
 
 The runner uses disposable `COVEN_HOME` directories, a fixture-only fake Codex
-executable, and the local socket API. It records command startup, cold daemon
+executable, and the same-user local IPC API. It records command startup, cold daemon
 start-to-health, daemon session-listing, event-tail, and harness-first-output
 timings without reading real configuration, prompts, or session logs. Each cold
 start sample gets a fresh home and a matching daemon stop. The ignored Rust test
@@ -710,11 +710,11 @@ failure; unrelated persistence errors remain fail-fast.
 
 ### Architecture rules for contributors
 
-- **Rust is the authority layer.** Process launch, cwd/project-root validation, PTY lifecycle, session persistence, and socket request enforcement are all Rust's responsibility. TypeScript clients improve UX but are never the trust boundary.
+- **Rust is the authority layer.** Process launch, cwd/project-root validation, PTY lifecycle, session persistence, and local IPC request enforcement are all Rust's responsibility. TypeScript clients improve UX but are never the trust boundary.
 - **All clients are untrusted for enforcement** — this includes comux and the OpenClaw plugin.
 - **Keep harness support focused.** Supported harnesses are Codex, Claude Code, and GitHub Copilot CLI only until adapter contracts are stable.
 - **OpenClaw separation.** Do not place Coven code in OpenClaw core. The integration belongs in `packages/openclaw-coven` as `@opencoven/coven`.
-- **No future orchestration commands as user-facing** until they exist in the CLI and socket API.
+- **No future orchestration commands as user-facing** until they exist in the CLI and local IPC API.
 
 ### Documentation rules
 

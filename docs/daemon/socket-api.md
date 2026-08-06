@@ -88,9 +88,9 @@ diagnostic whose literal `v1` values are not proof of named-contract support.
 
 Detailed shapes live in the [API reference](/reference/api).
 
-Session handoff is a **local-socket** operation. A companion must use a
+Session handoff is a **same-user local IPC** operation. A companion must use a
 separately paired authenticated transport; exposing these endpoints directly
-to a remote listener would bypass this socket's same-user trust boundary. See
+to a remote listener would bypass this IPC endpoint's same-user trust boundary. See
 [Session handoff](/daemon/session-handoff).
 
 Memory path entries must be UTF-8 regular `.md` files; invalid names,
