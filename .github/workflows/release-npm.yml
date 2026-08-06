@@ -378,8 +378,11 @@ jobs:
           elif [ "$NATIVE_PACKAGE_SET" = "post-intel" ]; then
           require_package @opencoven/cli-macos-x64
           require_package @opencoven/cli-macos
-          else
+          elif [ "$NATIVE_PACKAGE_SET" = "pre-intel" ]; then
           require_package @opencoven/cli-macos
+          else
+          echo "::error::Unsupported recovery native package set $NATIVE_PACKAGE_SET."
+          exit 1
           fi
       - run: node scripts/publish-npm.mjs --target=linux-x64 --skip-build --publish --skip-wrapper
         if: needs.verify-tag.outputs.release_mode == 'normal'

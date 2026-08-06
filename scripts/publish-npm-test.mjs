@@ -911,16 +911,26 @@ test('release workflow preflights selected native package availability before pu
     );
   }
 
-  const preIntelElseBranchMatch = preflight.match(
+  const preIntelBranchMatch = preflight.match(
+    /^          elif \[ "\$NATIVE_PACKAGE_SET" = "pre-intel" \]; then[\s\S]*?(?=^          (?:elif|else|fi)\b)/m
+  );
+  assert.ok(preIntelBranchMatch, 'preflight must contain the pre-intel package-check branch');
+  const preIntelBranch = preIntelBranchMatch[0];
+  assert.match(
+    preIntelBranch,
+    /^          require_package\b[^\n]*@opencoven\/cli-macos(?:\s|$)/m,
+    'pre-intel branch must require @opencoven/cli-macos'
+  );
+  const unsupportedBranchMatch = preflight.match(
     /^          else\b[\s\S]*?(?=^          fi\b)/m
   );
-  assert.ok(preIntelElseBranchMatch, 'preflight must contain the top-level pre-Intel else branch');
-  const preIntelElseBranch = preIntelElseBranchMatch[0];
+  assert.ok(unsupportedBranchMatch, 'preflight must fail closed for unsupported package sets');
+  const unsupportedBranch = unsupportedBranchMatch[0];
   assert.match(
-    preIntelElseBranch,
-    /^          require_package\b[^\n]*@opencoven\/cli-macos(?:\s|$)/m,
-    'pre-Intel else branch must require @opencoven/cli-macos'
+    unsupportedBranch,
+    /^          echo "::error::Unsupported recovery native package set \$NATIVE_PACKAGE_SET\."$/m
   );
+  assert.match(unsupportedBranch, /^          exit 1$/m);
 });
 
 test('release workflow publishes only missing packages during recovery', () => {
