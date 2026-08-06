@@ -9,7 +9,14 @@ description: "How Coven harness adapters work, how external adapters graduate, a
 
 # Harness adapter guide
 
-Coven should treat every harness as an adapter. The daemon ships a small bundled compatibility adapter set for Codex, Claude Code, and GitHub Copilot CLI, but no harness should become privileged runtime logic. OpenClaw, Hermes, Aider, Gemini, and future agents should enter through the same adapter contract and maturity checklist.
+Coven should treat every harness as an adapter. The daemon ships a small bundled compatibility adapter set, but no harness should become privileged runtime logic. Adapters outside that set enter through the same adapter contract and maturity checklist.
+
+| Maturity | Members | Install direction |
+| --- | --- | --- |
+| Bundled compatibility default | Codex, Claude Code, GitHub Copilot CLI | Install the harness; no Coven recipe. |
+| Trusted opt-in recipe | Hermes 1.0.3, OpenCode 0.1.1 | Install the upstream CLI, then its named Coven recipe (for example, `coven adapter install hermes`). |
+| Experimental opt-in recipe | Grok Build 1.0.0 | Install the upstream CLI and recipe; the promotion checklist remains open. |
+| Future adapter direction | Aider, Gemini, Cline, custom | No bundled or trusted-recipe claim. |
 
 The goal is a harness-neutral runtime:
 

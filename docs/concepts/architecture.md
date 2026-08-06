@@ -33,9 +33,10 @@ flowchart LR
 
   Daemon --> Boundary[Project-root + cwd guard]
   Boundary --> Adapter[Harness adapter router]
-  Adapter --> Codex[Codex PTY]
-  Adapter --> Claude[Claude Code PTY]
-  Adapter -. future .-> Future[Hermes / Aider / Gemini / custom adapters]
+  Adapter --> Bundled[Bundled compatibility defaults: Codex / Claude Code / GitHub Copilot CLI]
+  Adapter -. opt-in recipe .-> Trusted[Trusted recipes: Hermes 1.0.3 / OpenCode 0.1.1]
+  Adapter -. experimental recipe .-> Experimental[Experimental recipe: Grok Build 1.0.0]
+  Adapter -. future direction .-> Future[Aider / Gemini / Cline / custom]
 
   Daemon --> Store[(SQLite session ledger)]
   Daemon --> Events[(append-only event log)]

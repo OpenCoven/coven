@@ -40,10 +40,11 @@ flowchart LR
   end
 
   subgraph Adapters["Harness adapters"]
-    Codex["Codex PTY"]
-    Claude["Claude Code PTY"]
+    Bundled["Bundled compatibility defaults\nCodex / Claude Code / GitHub Copilot CLI"]
+    Trusted["Trusted opt-in recipes\nHermes 1.0.3 / OpenCode 0.1.1"]
+    Experimental["Experimental opt-in recipe\nGrok Build 1.0.0"]
+    Future["Future direction\nAider / Gemini / Cline / custom"]
     DesktopUse["desktop-use adapters"]
-    Future["Hermes / Aider / Gemini\n(future adapters)"]
   end
 
   subgraph Storage["Persistent storage"]
@@ -58,10 +59,10 @@ flowchart LR
   Rust --> Events
 
   User --> SocketClients
-  SocketClients -->|"HTTP over Unix socket"| Daemon
-  Comux -->|"HTTP over Unix socket"| Daemon
+  SocketClients -->|"HTTP over same-user local IPC"| Daemon
+  Comux -->|"HTTP over same-user local IPC"| Daemon
   OpenClaw --> Plugin
-  Plugin -->|"HTTP over Unix socket"| Daemon
+  Plugin -->|"HTTP over same-user local IPC"| Daemon
 
   Daemon --> Control
   Control --> Policy
@@ -70,14 +71,16 @@ flowchart LR
 
   Daemon --> Boundary
   Boundary --> HarnessRouter
-  HarnessRouter --> Codex
-  HarnessRouter --> Claude
-  HarnessRouter -.->|future| Future
+  HarnessRouter --> Bundled
+  HarnessRouter -.->|opt-in recipe| Trusted
+  HarnessRouter -.->|experimental recipe| Experimental
+  HarnessRouter -.->|future direction| Future
 
   Daemon --> Store
   Daemon --> Events
-  Codex --> Events
-  Claude --> Events
+  Bundled --> Events
+  Trusted --> Events
+  Experimental --> Events
 ```
 
 ## Session lifecycle

@@ -12,6 +12,14 @@ description: "Reference for coven kill: stop a running session's harness process
 coven kill <session-id>
 ```
 
+## Platform support
+
+`coven kill` is available only on Unix-like systems because its direct CLI
+request uses a Unix socket. On Windows, do not expect `coven kill` to cancel a
+session. A Windows-capable local integration asks the daemon session owner to
+cancel through `POST /api/v1/sessions/:id/kill` over the daemon's owner-only
+named pipe.
+
 Kill stops a running session's harness process. The daemon (which owns the
 process) performs the kill, marks the session `killed`, and records a kill
 event. The session record and its append-only event log are kept.
