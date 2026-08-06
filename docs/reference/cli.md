@@ -8,11 +8,12 @@ description: "Reference for the coven CLI commands: doctor, status, reset, daemo
 ---
 
 
-The user-facing command is always `coven`. Wrapper packages like `@opencoven/cli`, `@opencoven/cli-macos`, `@opencoven/cli-macos-x64`, and `@opencoven/cli-linux-x64` install the same binary.
+The user-facing command is always `coven`. Wrapper packages like `@opencoven/cli`, `@opencoven/cli-macos`, `@opencoven/cli-macos-x64`, `@opencoven/cli-linux-x64`, and `@opencoven/cli-windows` install the same binary.
 
 ```mermaid
 flowchart TB
-  Root["coven"] --> TUI["tui (default)"]
+  Root["coven"] --> Interactive["interactive UI (default: coven-code)"]
+  Interactive -. "COVEN_LEGACY_TUI=1" .-> LegacyTui["legacy in-process TUI"]
   Root --> Doctor["doctor"]
   Root --> Daemon["daemon"]
   Root --> Run["run"]
@@ -48,6 +49,7 @@ flowchart TB
 
   Run --> RCodex["codex &lt;prompt&gt;"]
   Run --> RClaude["claude &lt;prompt&gt;"]
+  Run --> RCopilot["copilot &lt;prompt&gt;"]
 
   Sessions --> SPlain["--plain"]
   Sessions --> SJson["--json"]
@@ -91,8 +93,8 @@ flowchart TB
 
 | Command | Action |
 |---|---|
-| `coven` | Open the beginner-friendly interactive menu. |
-| `coven tui` | Explicitly open the slash-command TUI. |
+| `coven` | Open the managed interactive UI powered by `coven-code`. |
+| `coven tui` | Explicitly open the managed interactive UI. Set `COVEN_LEGACY_TUI=1` only to use the deprecated in-process TUI fallback. |
 | `coven doctor` | Check local setup; exits 1 when a blocking problem is found. `--json` emits a `{ ok, blocking, checks, nextSteps }` envelope. |
 | `coven status` | Ecosystem overview: daemon, sessions, familiars, skills, research, hub. Alias: `coven overview`. |
 | `coven daemon start/status/restart/stop` | Manage the local daemon. |
@@ -104,7 +106,7 @@ flowchart TB
 | `coven summon <session-id>` | Restore an archived session, then replay/follow it. |
 | `coven archive <session-id>` | Hide a non-running session while preserving events. |
 | `coven sacrifice <session-id> --yes` | Permanently delete a non-running session. |
-| `coven kill <session-id>` | Kill a running session's process; keeps the event log. |
+| `coven kill <session-id>` | On Unix-like hosts, kill a running session's process and keep its event log. Windows integrations must request daemon cancellation through the local IPC API; see [cli-kill](cli-kill.md). |
 | `coven patch openclaw <prompt>` | Local OpenClaw rescue loop. Does not commit or push. |
 | `coven logs prune` | Prune expired encrypted raw artifacts and old redacted event logs; see [cli-logs](cli-logs.md). |
 | `coven vacuum` | Rebuild the session event FTS index, compact the SQLite store, and print integrity status; see [cli-vacuum](cli-vacuum.md). |

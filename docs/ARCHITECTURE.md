@@ -198,7 +198,7 @@ desktop/apps -> Coven -> chat/intake client UI updates
   in-process TUI compatibility fallback. It will be removed.
 - `coven doctor` checks store/project/harness readiness and prints next steps.
 - `coven daemon start/status/restart/stop` manages the local daemon.
-- `coven run codex|claude <prompt>` launches a project-scoped PTY session.
+- `coven run codex|claude|copilot <prompt>` launches a project-scoped PTY session.
 - `coven sessions` opens the human session browser in a terminal; `--plain` keeps scriptable output.
 - Session browser actions surface readable choices: **Rejoin**, **View Log**, **Summon**, **Archive**, and **Sacrifice**.
 - `coven attach|summon|archive|sacrifice <session-id>` remain explicit lower-level verbs for scripts and copy/paste workflows.

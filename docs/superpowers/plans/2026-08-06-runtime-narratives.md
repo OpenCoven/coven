@@ -352,5 +352,9 @@
      Windows pathname;
   3. distinguishes Windows source capability, published platform package, and
      unsupported direct commands;
-  4. classifies Hermes 1.0.3 as a trusted opt-in recipe; and
+  4. classifies Codex, Claude Code, and Copilot as bundled; Hermes 1.0.3 and
+     OpenCode 0.1.1 as trusted opt-in recipes; Grok Build 1.0.0 as
+     experimental; and Aider, Gemini, Cline, and custom adapters as future
+     direction, while retaining the OpenClaw plugin's explicit Unix-only
+     trust-anchor constraint; and
   5. states the Windows direct-kill limitation and daemon cancellation route.

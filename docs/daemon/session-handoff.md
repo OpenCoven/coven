@@ -49,12 +49,13 @@ does not exactly match the snapshot captured at offer time.
 
 ## Transport and trust boundary
 
-These routes are local Unix-socket API routes. A mobile companion must reach
-them only through a separately paired, mutually authenticated transport. Do
-not expose this API directly to a LAN, browser, relay, or Tailscale listener:
-the local socket's same-user trust boundary does not authenticate a remote
-caller. The handoff protocol provides durable ownership fencing; it does not
-replace remote transport authentication or repository authorization.
+These routes are same-user local IPC API routes: a Unix socket on Unix-like
+hosts or the daemon's owner-only named pipe on Windows. A mobile companion
+must reach them only through a separately paired, mutually authenticated
+transport. Do not expose this API directly to a LAN, browser, relay, or
+Tailscale listener: the local IPC trust boundary does not authenticate a
+remote caller. The handoff protocol provides durable ownership fencing; it
+does not replace remote transport authentication or repository authorization.
 
 ## Failure recovery
 
