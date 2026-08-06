@@ -1,10 +1,10 @@
 ---
 title: "Get started with Coven"
-summary: "Install Coven, launch your first project-scoped Codex or Claude Code session, and verify the daemon, store, and harnesses with coven doctor."
+summary: "Install Coven, open the managed interactive UI, launch a project-scoped harness session, and verify the daemon, store, and harnesses with coven doctor."
 read_when:
   - Installing Coven for the first time
   - Verifying a local Coven daemon and harness setup
-description: "Install Coven, launch your first project-scoped Codex or Claude Code session, and verify the daemon, store, and harnesses with coven doctor."
+description: "Install Coven, open the managed interactive UI, launch a project-scoped harness session, and verify the daemon, store, and harnesses with coven doctor."
 ---
 
 # Getting started with Coven
@@ -50,13 +50,14 @@ Coven needs:
 
 - Rust stable, if building from source.
 - Git.
-- A Unix-like local runtime for the current daemon socket and PTY path.
-- At least one supported harness CLI on `PATH`.
+- A supported local runtime: macOS, Linux, or Windows x64.
+- At least one bundled harness CLI on `PATH`: `codex`, `claude`, or `copilot`.
 
 Supported v0 harnesses:
 
 - `codex`
 - `claude`
+- `copilot`
 
 Install and authenticate a harness before expecting `coven run` to work:
 
@@ -76,12 +77,12 @@ From a project directory:
 coven
 ```
 
-The default command opens the prompt-first TUI. You can either:
+Bare `coven`, `coven chat`, and `coven tui` open the managed Coven interactive
+UI powered by `coven-code`. On the first interactive run, Coven offers to
+install the pinned engine when it is missing.
 
-- type a task directly and press Enter (e.g. `fix the failing tests` or a slash command like `/run codex fix the failing tests`);
-- select a menu item with arrow keys or its single-key shortcut and press Enter;
-- press `h` or type `/help` to see natural-language and slash-command examples;
-- press `Ctrl+C` or `Esc` to quit.
+The older in-process TUI is a temporary compatibility fallback. Enable it
+explicitly with `COVEN_LEGACY_TUI=1`; it is deprecated and will be removed.
 
 If you prefer to run the explicit setup checks:
 

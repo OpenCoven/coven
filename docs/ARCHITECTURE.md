@@ -188,7 +188,11 @@ desktop/apps -> Coven -> chat/intake client UI updates
 
 ## Current user-facing surface
 
-- `coven` and `coven tui` open the beginner-friendly slash-command palette.
+- `coven`, `coven chat`, and `coven tui` open the managed interactive UI
+  powered by `coven-code`. The first interactive run offers to install the
+  pinned engine if it is missing.
+- `COVEN_LEGACY_TUI=1` explicitly enables the deprecated, temporary
+  in-process TUI compatibility fallback. It will be removed.
 - `coven doctor` checks store/project/harness readiness and prints next steps.
 - `coven daemon start/status/restart/stop` manages the local daemon.
 - `coven run codex|claude <prompt>` launches a project-scoped PTY session.
@@ -214,6 +218,9 @@ The npm wrapper packages are live for early adopters:
 - `@opencoven/cli-macos`
 - `@opencoven/cli-macos-x64`
 - `@opencoven/cli-linux-x64`
-- `@opencoven/cli-windows` once the next Windows-enabled release is published
+- `@opencoven/cli-windows` (published Windows x64 platform package)
 
-The source package versions stay template-like in the repo; release workflow dispatch supplies the published version and builds platform packages. As of the current documentation pass, npm latest is `0.0.10` for the wrapper plus macOS/Linux packages; Windows x64 release wiring is staged for the next package release.
+Source supports native Windows, including owner-only named-pipe daemon
+transport. The wrapper installs the platform package version declared by that
+wrapper release. Publication of `@opencoven/cli-windows` therefore does not
+establish that every direct CLI operation is portable on Windows.

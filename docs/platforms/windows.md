@@ -39,6 +39,21 @@ coven doctor
 
 Keep the directory on a local path owned by your Windows user.
 
+## Daemon transport
+
+Native Windows runs the daemon on an owner-only named pipe scoped to the
+selected `COVEN_HOME`. It does not create `<COVEN_HOME>/coven.sock`; run
+`coven daemon status` to inspect the active endpoint. WSL2 remains a separate
+Unix environment and uses its own Unix socket.
+
+## Interactive UI
+
+Bare `coven`, `coven chat`, and `coven tui` open the managed Coven interactive
+UI powered by `coven-code`. On the first interactive run, Coven offers to
+install the pinned engine if it is missing. The older in-process TUI is a
+deprecated temporary compatibility fallback, enabled only with
+`COVEN_LEGACY_TUI=1`, and will be removed.
+
 ## Verify
 
 ```powershell

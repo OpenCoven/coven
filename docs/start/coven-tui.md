@@ -1,34 +1,47 @@
 ---
-summary: "The prompt-first interactive menu launched by `coven` or `coven tui`."
+summary: "Legacy compatibility reference for the deprecated in-process prompt-first TUI."
 read_when:
-  - Browsing what the interactive Coven menu can do
+  - Maintaining a workflow that temporarily requires the legacy in-process TUI
   - Learning slash commands and shortcuts
   - Deciding whether to use the TUI or the lower-level CLI verbs
 title: "Coven TUI"
-description: "Use the prompt-first Coven TUI to launch harness sessions, browse running work, attach to sessions, and trigger rituals from one menu."
+description: "Use the deprecated legacy in-process Coven TUI compatibility surface."
 ---
 
-`coven` (or the explicit `coven tui`) opens the **prompt-first TUI** — the launcher surface internally branded **Cast**. You can type free-form tasks, dispatch slash commands, or pick one from the visible **Commands rail**. It is the recommended starting point for new users and works over SSH or in a local terminal.
+This page describes the older in-process **prompt-first TUI**, internally
+branded **Cast**. It is a deprecated, temporary compatibility surface, not the
+current recommended interactive UI.
 
-Typed input flows through Cast's spell parser: every spell is classified, surfaced as a plan card, and run through the safety gate before any side effect. Plain text is treated as a task for the default harness; `/run <harness> "<task>"`, `/codex …`, and `/claude …` route directly to a named harness.
+By default, `coven`, `coven chat`, and `coven tui` open the managed Coven
+interactive UI powered by `coven-code`. On its first interactive run, Coven
+offers to install the pinned engine if it is missing. To use the legacy TUI
+described below, explicitly set `COVEN_LEGACY_TUI=1`. This fallback will be
+removed.
 
-## When to use it
+With that compatibility setting enabled, typed input flows through Cast's spell
+parser: every spell is classified, surfaced as a plan card, and run through the
+safety gate before any side effect. Plain text is treated as a task for the
+default harness; `/run <harness> "<task>"`, `/codex ...`, and `/claude ...`
+route directly to a named harness.
+
+## Legacy behavior
 
 | Situation | Best surface |
 |---|---|
-| Brand-new install, exploring what Coven can do | **TUI** (`coven`) |
-| One-off task in a known project | **TUI** or `coven run <harness> "<task>"` |
+| Maintaining a temporary legacy workflow | Legacy TUI (`COVEN_LEGACY_TUI=1 coven`) |
+| One-off task in a known project | `coven run <harness> "<task>"` |
 | Scripting, piping, machine-readable output | `coven sessions --json`, `--plain` |
 | Long-running attach/replay | TUI's session browser, or `coven attach <id>` |
 | Quick health check | `coven doctor` |
 
-The TUI is a thin presentation layer. Every action it offers maps to an underlying CLI verb or socket API call — the Rust daemon remains the authority.
+The legacy TUI is a thin presentation layer. Every action it offers maps to an
+underlying CLI verb or socket API call — the Rust daemon remains the authority.
 
 ## Anatomy
 
 ```mermaid
 flowchart TB
-  subgraph TUI["coven TUI"]
+  subgraph TUI["legacy coven TUI"]
     Input["Prompt-first input bar\n(free text + slash commands)"]
     Browser["Session browser pane"]
     Help["Help / shortcuts overlay"]
@@ -49,7 +62,7 @@ flowchart TB
 
 The TUI never bypasses the daemon. Project root, cwd, and harness id are revalidated server-side on every launch.
 
-## Input modes
+## Legacy input modes
 
 The prompt bar accepts three input shapes interchangeably:
 
@@ -72,7 +85,7 @@ The prompt bar accepts three input shapes interchangeably:
 
 3. **Arrow-key navigation** — `↑` / `↓` cycle through the **Commands rail** on the launcher (a windowed list of slash commands, 6 visible at a time with a `N of 14` scroll hint). Pressing `Enter` with an **empty** prompt dispatches the selected slash command; pressing `Enter` with text dispatches the typed spell through Cast.
 
-## Slash command reference
+## Legacy slash command reference
 
 The launcher exposes 14 slash commands in the Commands rail. The Cast parser additionally accepts harness-direct verbs (`/codex`, `/claude`) and natural-language equivalents (e.g. `sessions`, `doctor`, `help`, `quit`).
 
@@ -93,7 +106,7 @@ The launcher exposes 14 slash commands in the Commands rail. The Cast parser add
 | `/sacrifice <session-id>` | Permanently delete a non-running session. Asks you to type `sacrifice` to confirm. |
 | `/quit` (alias `/exit`) | Close the TUI cleanly. Equivalent to `Ctrl+C` or `Esc` at the root. |
 
-## Keyboard shortcuts
+## Legacy keyboard shortcuts
 
 The launcher footer renders the same hint inline:
 
@@ -110,7 +123,7 @@ The launcher footer renders the same hint inline:
 
 The TUI resizes safely. Terminals as small as 80×24 remain usable; the launcher renders inside a normalized inner width (clamped to 18–96 columns) so single-rule prompts and the two-lane Commands + Snapshot body stay aligned at any size.
 
-## Session browser actions
+## Legacy session browser actions
 
 Selecting a session and pressing `Enter` shows contextual actions. Each one is gated by session state — actions that are not safe for the current state are hidden, not greyed out, so the menu never offers a destructive verb you cannot run.
 
@@ -124,7 +137,7 @@ Selecting a session and pressing `Enter` shows contextual actions. Each one is g
 
 The map between actions and CLI verbs is documented in [Session lifecycle](/SESSION-LIFECYCLE).
 
-## SSH and remote use
+## Legacy SSH and remote use
 
 The TUI survives the usual hostile environments:
 
@@ -134,9 +147,10 @@ The TUI survives the usual hostile environments:
 
 It does **not** require a graphical terminal, a clipboard backend, or `tmux`. Inside `tmux` or `screen`, the launcher and session browser render cleanly — pane splits and detach still work.
 
-## Plain-text fallback
+## Plain-text alternative
 
-If you prefer a non-interactive flow (CI, scripting, audit logs), skip the TUI entirely:
+If you prefer a non-interactive flow (CI, scripting, audit logs), skip the
+legacy TUI entirely:
 
 ```bash
 coven run codex "fix the failing tests"

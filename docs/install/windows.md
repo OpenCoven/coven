@@ -15,7 +15,11 @@ npm install -g @opencoven/cli
 coven doctor
 ```
 
-The wrapper exposes the `coven` command and launches the native Windows binary when the release package includes one for your platform. `coven doctor` is the first verification step: it checks local state and reports whether supported harness CLIs such as Codex or Claude Code are available on `PATH`.
+The wrapper exposes the `coven` command and launches the native Windows binary
+when the release package includes one for your platform. `coven doctor` is the
+first verification step: it checks local state and reports whether supported
+harness CLIs such as Codex, Claude Code, or GitHub Copilot CLI are available on
+`PATH`.
 
 Use native Windows and WSL2 as separate Coven environments. If you install Coven in PowerShell, install the harness CLIs in PowerShell too. If you install Coven inside WSL2, follow [WSL2 install](/install/wsl2) and keep the daemon state inside WSL.
 
@@ -27,7 +31,13 @@ From a project directory:
 coven
 ```
 
-The default command opens the prompt-first TUI. You can also use the explicit CLI flow:
+Bare `coven`, `coven chat`, and `coven tui` open the managed Coven interactive
+UI powered by `coven-code`. On the first interactive run, Coven offers to
+install the pinned engine if it is missing. The older in-process TUI is a
+temporary compatibility fallback: explicitly set `COVEN_LEGACY_TUI=1` to use
+it. It is deprecated and will be removed.
+
+You can also use the explicit CLI flow:
 
 ```powershell
 coven doctor
@@ -65,7 +75,9 @@ coven doctor
 ```
 
 - Run Coven and your harness CLI from the same environment. A harness installed only inside WSL2 is not available to native Windows PowerShell unless you expose it separately.
-- If terminal input behaves oddly, update the wrapper and run `coven tui` again. The Windows TUI filters key-press events so typed characters, arrows, and Enter should be handled once.
+- The legacy in-process TUI is only for temporary compatibility. Set
+  `COVEN_LEGACY_TUI=1` explicitly if a legacy workflow requires it; do not use
+  it as the default Windows interactive UI.
 
 ## Verification loop
 
