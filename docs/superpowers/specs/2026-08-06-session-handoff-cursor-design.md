@@ -26,6 +26,12 @@ retention cannot delete the required prefix after a successful preflight check
 and before the handoff state commits. The retention pin ends when the handoff
 is acknowledged or otherwise leaves those unresolved states.
 
+Offer creation reads the latest cursor and inserts the `offered` handoff in one
+`IMMEDIATE` transaction, so retention cannot prune the prefix between cursor
+selection and pin creation. Dry-run event-prune counts use the same unresolved
+handoff exclusion as mutating prune queries, ensuring operator previews match
+what deletion can actually remove.
+
 ## Alternatives rejected
 
 Limiting the event-list query still loads an event record and obscures that the
@@ -40,3 +46,5 @@ acknowledgement, while a lower cursor still returns `transcript_diverged`.
 Test both unbounded and bounded retention paths to prove unresolved handoffs
 pin their prefix and acknowledged handoffs no longer do. Retain existing
 workspace, claimant, and generation conflict tests.
+Test that an offer records its cursor atomically and that dry-run counts exclude
+pinned events.
