@@ -28,7 +28,7 @@ between the Rust runner and each harness integration.
     External ACP runtime bridge through external OpenClaw bridge plugin.
   </Card>
   <Card title="Grok Build (experimental)" href="/harnesses/grok-build" icon="terminal">
-    Trusted xAI Grok Build 1.0.0 recipe. Installable harness id `grok`.
+    Experimental xAI Grok Build 1.0.0 opt-in recipe. Installable harness id `grok`.
   </Card>
   <Card title="Hermes (recipe)" href="/harnesses/hermes" icon="terminal">
     Trusted native Hermes 1.0.3 recipe. Installable harness id `hermes`.
