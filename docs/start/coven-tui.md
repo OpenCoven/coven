@@ -35,7 +35,7 @@ route directly to a named harness.
 | Quick health check | `coven doctor` |
 
 The legacy TUI is a thin presentation layer. Every action it offers maps to an
-underlying CLI verb or socket API call — the Rust daemon remains the authority.
+underlying CLI verb or local IPC API call — the Rust daemon remains the authority.
 
 ## Anatomy
 
