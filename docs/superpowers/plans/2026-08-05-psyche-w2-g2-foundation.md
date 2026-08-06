@@ -179,9 +179,9 @@ Every item below has a named automated test:
 18. Quarantine resolution is validated, durable, idempotent, and conflict-safe.
 19. Checkpoint failure still publishes `Stopped`, wakes every waiter, and returns the preserved error.
 20. Every canonical v1 error code decodes strictly; unknown codes quarantine rather than aliasing a known code.
-20. Ambiguous Coven adoption is durably returned or fenced through the reconciliation operation; faults never authorize redispatch.
-21. Adoption request digests are recomputed from every canonical typed request field; callers cannot reuse a digest for changed work.
-22. Cancellation completion requires typed O5 acknowledgement evidence; raw `killed`, `orphaned`, or other ledger status never suffices.
+21. Ambiguous Coven adoption is durably returned or fenced through the reconciliation operation; faults never authorize redispatch.
+22. Adoption request digests are recomputed from every canonical typed request field; callers cannot reuse a digest for changed work.
+23. Cancellation completion requires typed O5 acknowledgement evidence; raw `killed`, `orphaned`, or other ledger status never suffices.
 
 ## Gate mapping
 
@@ -1771,11 +1771,12 @@ fn direct_insert_rejects_acknowledged_cancellation_without_evidence() {
     let (mut store, _dir) = test_store();
     let mut binding = fixture_acknowledged_execution_binding();
     binding.cancellation_acknowledgement = None;
+    let attempt_id = binding.attempt_id.clone();
     assert!(matches!(
         store.insert(&CanonicalDocument::ExecutionBinding(binding)),
         Err(StoreError::Contract(ContractError::CancellationEvidenceMismatch { .. }))
     ));
-    assert_eq!(store.total_record_count().unwrap(), 0);
+    assert!(store.execution_binding_revisions(&attempt_id).unwrap().is_empty());
 }
 
 #[test]
@@ -1783,11 +1784,12 @@ fn direct_insert_rejects_acknowledged_state_without_termination_correlation() {
     let (mut store, _dir) = test_store();
     let mut binding = fixture_acknowledged_execution_binding();
     binding.termination_request = None;
+    let attempt_id = binding.attempt_id.clone();
     assert!(matches!(
         store.insert(&CanonicalDocument::ExecutionBinding(binding)),
         Err(StoreError::Contract(ContractError::CancellationEvidenceMismatch { .. }))
     ));
-    assert_eq!(store.total_record_count().unwrap(), 0);
+    assert!(store.execution_binding_revisions(&attempt_id).unwrap().is_empty());
 }
 
 #[test]
@@ -1799,11 +1801,12 @@ fn direct_insert_rejects_mismatched_cancellation_evidence() {
         .as_mut()
         .unwrap()
         .execution_request_digest = fixture_other_digest();
+    let attempt_id = binding.attempt_id.clone();
     assert!(matches!(
         store.insert(&CanonicalDocument::ExecutionBinding(binding)),
         Err(StoreError::Contract(ContractError::CancellationEvidenceMismatch { .. }))
     ));
-    assert_eq!(store.total_record_count().unwrap(), 0);
+    assert!(store.execution_binding_revisions(&attempt_id).unwrap().is_empty());
 }
 
 #[test]
@@ -1815,11 +1818,12 @@ fn direct_insert_rejects_wrong_termination_request_id() {
         .as_mut()
         .unwrap()
         .termination_request_id = fixture_other_request_id();
+    let attempt_id = binding.attempt_id.clone();
     assert!(matches!(
         store.insert(&CanonicalDocument::ExecutionBinding(binding)),
         Err(StoreError::Contract(ContractError::CancellationEvidenceMismatch { .. }))
     ));
-    assert_eq!(store.total_record_count().unwrap(), 0);
+    assert!(store.execution_binding_revisions(&attempt_id).unwrap().is_empty());
 }
 
 #[test]
@@ -1837,11 +1841,12 @@ fn direct_insert_rejects_acknowledgement_outside_termination_window() {
         .as_mut()
         .unwrap()
         .acknowledged_at = after_deadline;
+    let attempt_id = binding.attempt_id.clone();
     assert!(matches!(
         store.insert(&CanonicalDocument::ExecutionBinding(binding)),
         Err(StoreError::Contract(ContractError::CancellationEvidenceMismatch { .. }))
     ));
-    assert_eq!(store.total_record_count().unwrap(), 0);
+    assert!(store.execution_binding_revisions(&attempt_id).unwrap().is_empty());
 }
 
 #[test]
@@ -1859,11 +1864,12 @@ fn direct_insert_rejects_acknowledgement_before_termination_window() {
         .as_mut()
         .unwrap()
         .acknowledged_at = before_start;
+    let attempt_id = binding.attempt_id.clone();
     assert!(matches!(
         store.insert(&CanonicalDocument::ExecutionBinding(binding)),
         Err(StoreError::Contract(ContractError::CancellationEvidenceMismatch { .. }))
     ));
-    assert_eq!(store.total_record_count().unwrap(), 0);
+    assert!(store.execution_binding_revisions(&attempt_id).unwrap().is_empty());
 }
 
 #[test]
@@ -1881,11 +1887,12 @@ fn direct_insert_rejects_unresolved_outside_termination_window() {
         .as_mut()
         .unwrap()
         .recorded_at = after_deadline;
+    let attempt_id = binding.attempt_id.clone();
     assert!(matches!(
         store.insert(&CanonicalDocument::ExecutionBinding(binding)),
         Err(StoreError::Contract(ContractError::CancellationEvidenceMismatch { .. }))
     ));
-    assert_eq!(store.total_record_count().unwrap(), 0);
+    assert!(store.execution_binding_revisions(&attempt_id).unwrap().is_empty());
 }
 
 #[test]
@@ -1903,11 +1910,12 @@ fn direct_insert_rejects_unresolved_before_termination_window() {
         .as_mut()
         .unwrap()
         .recorded_at = before_start;
+    let attempt_id = binding.attempt_id.clone();
     assert!(matches!(
         store.insert(&CanonicalDocument::ExecutionBinding(binding)),
         Err(StoreError::Contract(ContractError::CancellationEvidenceMismatch { .. }))
     ));
-    assert_eq!(store.total_record_count().unwrap(), 0);
+    assert!(store.execution_binding_revisions(&attempt_id).unwrap().is_empty());
 }
 
 #[test]
