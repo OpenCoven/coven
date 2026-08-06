@@ -7,13 +7,16 @@
 // `cargo build`, the bin inside an extracted npm tarball, etc.).
 //
 // Resolution order:
-//   1. `git describe --tags --always --dirty` against the working tree.
+//   1. `$COVEN_BUILD_VERSION` when a release build explicitly supplies it.
+//      Recovery tags use the stable package version here so native binaries
+//      do not expose the recovery tag suffix.
+//   2. `git describe --tags --always --dirty` against the working tree.
 //      Local source builds and any CI that does a full fetch see this.
-//   2. `$GITHUB_REF_NAME` if it looks like a tag (starts with `v`). Our
+//   3. `$GITHUB_REF_NAME` if it looks like a tag (starts with `v`). Our
 //      release workflow is tag-triggered, and `actions/checkout` defaults
-//      to a shallow fetch with no tags, so step 1 fails in CI and we land
+//      to a shallow fetch with no tags, so step 2 fails in CI and we land
 //      here with `v0.0.17` (or whatever the release tag is).
-//   3. `<CARGO_PKG_VERSION> (unknown source)` — git unavailable AND not
+//   4. `<CARGO_PKG_VERSION> (unknown source)` — git unavailable AND not
 //      running under a tag-triggered GitHub Actions build (e.g. downloaded
 //      source tarball without `.git`).
 
@@ -29,13 +32,22 @@ fn main() {
     // Cargo only re-runs the build script when a tracked env var changes;
     // declaring it here lets a CI re-run with a different tag re-stamp the
     // binary without `cargo clean`.
+    println!("cargo:rerun-if-env-changed=COVEN_BUILD_VERSION");
     println!("cargo:rerun-if-env-changed=GITHUB_REF_NAME");
 
-    let describe = describe_from_git()
+    let describe = explicit_build_version()
+        .or_else(describe_from_git)
         .or_else(github_ref_name_if_tag)
         .unwrap_or_else(|| format!("{} (unknown source)", env!("CARGO_PKG_VERSION")));
 
     println!("cargo:rustc-env=COVEN_VERSION_DESC={}", describe);
+}
+
+fn explicit_build_version() -> Option<String> {
+    std::env::var("COVEN_BUILD_VERSION")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 fn describe_from_git() -> Option<String> {

@@ -207,6 +207,8 @@ jobs:
         if: matrix.npm-target == 'linux-x64'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
       - run: cargo build --release --package coven-cli --target ${{ matrix.rust-target }}
+        env:
+          COVEN_BUILD_VERSION: v${{ needs.verify-tag.outputs.npm_version }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.0
         with:
           name: coven-${{ matrix.npm-target }}

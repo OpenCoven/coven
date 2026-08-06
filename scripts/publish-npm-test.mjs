@@ -572,6 +572,29 @@ test('release workflow builds and publishes Intel macOS as a separate target', (
   assert.match(workflow, /node scripts\/publish-npm\.mjs --target=macos-x64 --skip-build --publish --skip-wrapper/);
 });
 
+test('release builds report the stable package version during recovery', () => {
+  const workflow = readFileSync(
+    new URL(['..', '.github', 'workflows', 'release-npm.yml'].join('/'), import.meta.url),
+    'utf8'
+  );
+  const buildJob = workflow.match(/^  build-platform:[\s\S]*?(?=^  [A-Za-z0-9_-]+:)/m)?.[0];
+  assert.ok(buildJob, 'release workflow must contain the platform build job');
+  assert.match(
+    buildJob,
+    /^          COVEN_BUILD_VERSION: v\$\{\{ needs\.verify-tag\.outputs\.npm_version \}\}$/m,
+    'recovery binaries must report the stable npm version, not the recovery tag name'
+  );
+  const buildScript = readFileSync(
+    new URL(['..', 'crates', 'coven-cli', 'build.rs'].join('/'), import.meta.url),
+    'utf8'
+  );
+  assert.match(
+    buildScript,
+    /let describe = explicit_build_version\(\)\s*\.or_else\(describe_from_git\)/,
+    'the explicit release version must take precedence over git describe'
+  );
+});
+
 test('CI smoke-tests the Intel macOS wrapper on its native runner', () => {
   const workflowPath = new URL(['..', '.github', 'workflows', 'ci.yml'].join('/'), import.meta.url);
   const workflow = readFileSync(workflowPath, 'utf8');
