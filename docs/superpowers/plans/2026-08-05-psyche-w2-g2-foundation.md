@@ -2278,6 +2278,30 @@ fn execution_binding_revision_rejects_session_and_termination_rebinding() {
 }
 
 #[test]
+fn execution_binding_revision_rejects_termination_correlation_removal() {
+    let (mut store, _dir) = test_store();
+    let initial = fixture_execution_binding_revision_1();
+    let requested = fixture_termination_requested_revision(&initial);
+    store
+        .insert(&CanonicalDocument::ExecutionBinding(initial.clone()))
+        .unwrap();
+    store
+        .insert(&CanonicalDocument::ExecutionBinding(requested.clone()))
+        .unwrap();
+    let cleared = fixture_not_requested_revision_after(&requested);
+    assert!(matches!(
+        store.insert(&CanonicalDocument::ExecutionBinding(cleared)),
+        Err(StoreError::ExecutionBindingRevisionConflict { .. })
+    ));
+    assert_eq!(
+        store
+            .execution_binding_revisions(&initial.attempt_id)
+            .unwrap(),
+        vec![initial, requested]
+    );
+}
+
+#[test]
 fn execution_binding_revision_rejects_timestamp_regression() {
     let (mut store, _dir) = test_store();
     let initial = fixture_execution_binding_revision_1();
@@ -2381,6 +2405,11 @@ the execution and original termination IDs, and the one-nanosecond time
 mutations stay within an intrinsically valid termination lifetime. Core
 validation therefore passes and the frozen ledger correlation—not an unrelated
 evidence mismatch—rejects each case.
+`fixture_not_requested_revision_after` derives a valid next revision whose
+`NotRequested` state requires clearing the termination correlation and both
+evidence fields. This is the minimum structurally valid removal candidate; the
+ledger must reject it because a previously established termination correlation
+can never disappear.
 
 - [ ] **Step 2: Run and verify RED**
 
@@ -2570,9 +2599,14 @@ fn unknown_enum_is_quarantined_without_dispatchable_record() {
 fn quarantine_resolution_is_durable_and_idempotent() {
     let (mut store, dir) = test_store();
     let id = quarantined_fixture(&mut store);
+    let discovered_at = store
+        .quarantine_record(&id)
+        .unwrap()
+        .unwrap()
+        .discovered_at;
     let resolution = resolution(
         QuarantineResolutionCode::ConfirmedInvalid,
-        "2026-08-05T00:01:00Z",
+        discovered_at + time::Duration::seconds(1),
     );
     let first = store.resolve_quarantine(&id, &resolution).unwrap();
     let ResolveQuarantineOutcome::Resolved { resolution_digest } = first else {
@@ -2688,6 +2722,9 @@ second update or audit event. Any different resolution returns
 `StoreError::QuarantineResolutionConflict` and preserves the first resolution.
 Concurrent resolvers use the same compare-and-set plus reload rule, so exactly
 one resolution wins. Resolution never deletes or redispatches payload bytes.
+The `resolution` test helper accepts an `OffsetDateTime`; positive tests derive
+it from the persisted `discovered_at` (or an injected deterministic clock) and
+never use a wall-clock-stale literal.
 All resolution errors are stable and redacted; they may include the typed
 quarantine ID and resolution digest, but never bounded payload bytes.
 `old_fixture_store()` must create resolved rows through
@@ -3004,7 +3041,7 @@ pub trait TerminationPersistence {
     fn persist_requested(
         &mut self,
         requested: ExecutionBinding,
-    ) -> Result<ExecutionBinding, Self::Error>;
+    ) -> Result<Vec<u8>, Self::Error>;
 }
 
 pub enum TerminationDispatchError<E> {
@@ -3014,21 +3051,27 @@ pub enum TerminationDispatchError<E> {
     Port(PortError),
 }
 
-pub async fn persist_then_terminate<S: TerminationPersistence>(
+pub async fn persist_then_terminate<S, P>(
     persistence: &mut S,
-    port: &impl CovenPort,
+    port: &P,
     requested: ExecutionBinding,
     reason_code: String,
-) -> Result<TerminationDisposition, TerminationDispatchError<S::Error>> {
+) -> Result<TerminationDisposition, TerminationDispatchError<S::Error>>
+where
+    S: TerminationPersistence,
+    P: CovenPort + ?Sized,
+{
     validate_termination_requested_candidate(&requested, &reason_code)
         .map_err(TerminationDispatchError::Contract)?;
-    let persisted = persistence
+    let expected_bytes = canonical_bytes(&requested)
+        .map_err(TerminationDispatchError::Contract)?;
+    let persisted_bytes = persistence
         .persist_requested(requested.clone())
         .map_err(TerminationDispatchError::Persistence)?;
-    if persisted != requested {
+    if persisted_bytes != expected_bytes {
         return Err(TerminationDispatchError::PersistedBindingMismatch);
     }
-    let request = TerminationRequest::from_persisted_binding(persisted, reason_code)
+    let request = TerminationRequest::from_persisted_binding(requested, reason_code)
         .map_err(TerminationDispatchError::Contract)?;
     port.terminate(request)
         .await
@@ -3140,18 +3183,23 @@ ID to differ from the execution request ID and
 `TerminationPersistence::persist_requested`; that trait's success contract is
 to require the digest-linked predecessor already carry the same non-empty
 session and to return only after the exact candidate revision has committed
-durably. Mismatched returned bytes fail closed. Only after that success does the
-private constructor wrap the returned binding and permit
+durably. The return value is the committed RFC 8785 canonical byte vector, not a
+parsed `ExecutionBinding`; the coordinator compares it byte-for-byte with
+`canonical_bytes(&requested)`, so equal Rust values with distinct timestamp
+offset spellings cannot satisfy the proof. Mismatched returned bytes fail
+closed. Only after that success does the private constructor wrap the validated
+requested binding and permit
 `CovenPort::terminate`.
 
 The W2 real-store test wrapper implements `TerminationPersistence` by calling
 `execution_binding_revisions` to load the candidate's exact digest-linked
 predecessor, rejecting an absent session or any session mismatch, then calling
-`Store::insert`. It returns the unchanged candidate only after the immediate
-insert transaction commits and propagates every `StoreError`; the predecessor
-digest makes a concurrent intervening revision fail as a fork/gap rather than
-turning the precheck into a TOCTOU bypass. It never returns a success-shaped
-fallback. This preserves the dependency direction
+`Store::insert`. It computes the candidate's canonical bytes before insertion
+and returns that byte vector only after `insert` has either committed those
+exact bytes or proved an exact idempotent replay; every `StoreError` propagates.
+The predecessor digest makes a concurrent intervening revision fail as a
+fork/gap rather than turning the precheck into a TOCTOU bypass. It never returns
+a success-shaped fallback. This preserves the dependency direction
 `psyche-coven -> psyche-core`: the boundary defines the narrow persistence
 behavior, while `psyche-test-support` owns the local real-store wrapper for G2
 proof and the later W5 composition root owns the production wrapper. Every
@@ -3183,9 +3231,10 @@ assert that the exact `TerminationRequested` revision is already durable before
 recording its call. Its negative cases independently use a changed session, a
 termination revision that attempts to bind a previously absent session, a
 revision 2 for an unknown attempt, injected persistence failure, and a
-persistence implementation returning different bytes; every case requires zero
-port calls and no new binding revision. The reusable assertion is part of the
-fake/real conformance contract that W5 must run unchanged.
+persistence implementation returning different bytes for a structurally equal
+timestamp instant; every case requires zero port calls and no new binding
+revision. The reusable assertion is part of the fake/real conformance contract
+that W5 must run unchanged.
 
 Add a strict canonical `tests/fixtures/result-bundle.json` containing one
 primary `application/json` result and one `text/plain` artifact. In
@@ -4223,6 +4272,7 @@ Use this complete manifest shape:
         "execution_binding_revision_rejects_same_revision_changed_bytes",
         "execution_binding_revision_rejects_every_frozen_execution_field_change",
         "execution_binding_revision_rejects_session_and_termination_rebinding",
+        "execution_binding_revision_rejects_termination_correlation_removal",
         "execution_binding_revision_rejects_timestamp_regression",
         "transition_versions_are_monotonic_and_append_only"
       ]
@@ -4401,7 +4451,7 @@ including why `ExpectedUnsupported` is diagnostic rather than passed evidence.
 | Unknown kind/version/enum denial and quarantine | `cargo test -p psyche-core --test decode -- --exact unknown_typed_enum_is_a_quarantinable_decode_failure && cargo test -p psyche-store --test retention -- --exact unknown_enum_is_quarantined_without_dispatchable_record` | not run remotely | none |
 | Quarantine resolution | `cargo test -p psyche-store --test retention -- --exact quarantine_resolution_is_durable_and_idempotent && cargo test -p psyche-store --test retention -- --exact concurrent_quarantine_resolution_has_one_durable_winner` | not run remotely | none |
 | Direct typed insert validation | `cargo test -p psyche-store --test records -- --exact direct_insert_rejects_wrong_field_id_kind_without_writing && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_acknowledged_cancellation_without_evidence && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_acknowledged_state_without_termination_correlation && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_mismatched_cancellation_evidence && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_wrong_termination_request_id && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_termination_before_execution_request && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_acknowledgement_outside_termination_window && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_acknowledgement_before_termination_window && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_unresolved_outside_termination_window && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_unresolved_before_termination_window && cargo test -p psyche-store --test records -- --exact direct_insert_accepts_acknowledgement_at_termination_window_boundaries && cargo test -p psyche-store --test records -- --exact direct_insert_accepts_unresolved_at_termination_window_boundaries && cargo test -p psyche-store --test records -- --exact direct_insert_accepts_termination_window_after_execution_deadline && cargo test -p psyche-store --test records -- --exact direct_insert_accepts_termination_at_execution_creation_boundary` | not run remotely | none |
-| Append-only execution-binding revisions | `cargo test -p psyche-store --test records -- --exact execution_binding_revision_appends_termination_outcomes_without_record_conflict && cargo test -p psyche-store --test records -- --exact execution_binding_revision_rejects_forks_gaps_and_changed_correlation && cargo test -p psyche-store --test records -- --exact execution_binding_revision_replay_is_idempotent && cargo test -p psyche-store --test records -- --exact execution_binding_revision_rejects_same_revision_changed_bytes && cargo test -p psyche-store --test records -- --exact execution_binding_revision_rejects_every_frozen_execution_field_change && cargo test -p psyche-store --test records -- --exact execution_binding_revision_rejects_session_and_termination_rebinding && cargo test -p psyche-store --test records -- --exact execution_binding_revision_rejects_timestamp_regression && cargo test -p psyche-store --test retention -- --exact pruning_preserves_unresolved_quarantine_binding_revisions_and_transitions` | not run remotely | none |
+| Append-only execution-binding revisions | `cargo test -p psyche-store --test records -- --exact execution_binding_revision_appends_termination_outcomes_without_record_conflict && cargo test -p psyche-store --test records -- --exact execution_binding_revision_rejects_forks_gaps_and_changed_correlation && cargo test -p psyche-store --test records -- --exact execution_binding_revision_replay_is_idempotent && cargo test -p psyche-store --test records -- --exact execution_binding_revision_rejects_same_revision_changed_bytes && cargo test -p psyche-store --test records -- --exact execution_binding_revision_rejects_every_frozen_execution_field_change && cargo test -p psyche-store --test records -- --exact execution_binding_revision_rejects_session_and_termination_rebinding && cargo test -p psyche-store --test records -- --exact execution_binding_revision_rejects_termination_correlation_removal && cargo test -p psyche-store --test records -- --exact execution_binding_revision_rejects_timestamp_regression && cargo test -p psyche-store --test retention -- --exact pruning_preserves_unresolved_quarantine_binding_revisions_and_transitions` | not run remotely | none |
 | Transition contract and append-only rules | `cargo test -p psyche-store --test records -- --exact transition_versions_are_monotonic_and_append_only` | not run remotely | none |
 | Checkpoint-failure shutdown | `cargo test -p psyche-runtime --lib -- --exact tests::checkpoint_failure_stops_and_releases_every_shutdown_waiter` | not run remotely | none |
 | Migrations | `cargo test -p psyche-store --test migrations -- --exact fresh_store_applies_v1_once_and_reopens` | not run remotely | none |
@@ -4622,14 +4672,14 @@ The implementation is ready for G2 review only when:
 6. every unknown kind, major, or typed enum value becomes a bounded quarantine record;
 7. quarantine resolution is durable, idempotent, conflict-safe, and the only route that makes a row retention-eligible;
 8. same-ID/different-digest immutable-record insertion and same-attempt/same-revision binding conflicts fail without mutation;
-9. execution-binding state changes append as strictly time-increasing, monotonically numbered, previous-digest-linked immutable revisions; exact replay of the latest or any historical revision is idempotent, while latest or historical same-revision changed bytes, gaps, forks, every frozen execution-field change, session clearing/rebinding, and each independent termination-ID/window rebind fail without mutation; a termination-requested revision can be followed by either authoritative acknowledgement or unresolved evidence without `RecordConflict`, overwrite, or history loss;
+9. execution-binding state changes append as strictly time-increasing, monotonically numbered, previous-digest-linked immutable revisions; exact replay of the latest or any historical revision is idempotent, while latest or historical same-revision changed bytes, gaps, forks, every frozen execution-field change, session clearing/rebinding, each independent termination-ID/window rebind, and termination-correlation removal fail without mutation; a termination-requested revision can be followed by either authoritative acknowledgement or unresolved evidence without `RecordConflict`, overwrite, or history loss;
 10. the store-owned `Transition` validates kind/ID/version/state/digest/time, appends monotonically, and has no update/delete API;
 11. automated retention excludes execution-binding revision history, transition history, and audit events;
 12. migrations and crash recovery are atomic, and unknown-future versions fail closed;
 13. clean or failed checkpointing publishes `Stopped`, wakes all shutdown callers, and returns one deterministic terminal outcome through `Runtime::state()`;
 14. C-S6 uses the executable correlation-bound reconciliation operation, persists return/fence dispositions across restart and faults, and proves no redispatch while unresolved or returned;
 15. adoption IDs/digests bind the full canonical launch/input request, are recomputed by both owners, and reject every changed field before mutation;
-16. C-S9 accepts only core-owned, fully correlated durable typed O5 acknowledgement evidence; `TerminationRequest` is construction-closed and can reach the trait only through a conformance-tested persist-then-invoke coordinator; the execution-binding revision ledger requires an already session-bound digest-linked predecessor and commits the exact authoritative termination request revision before the port call, appends the response evidence afterward, accepts termination creation equal to execution creation, both closed evidence-window endpoints, and post-adoption-deadline termination, rejects unpersisted attempts, first-time session binding, session rebinding, persistence failure, returned-byte mismatch, and absent/mismatched/out-of-window evidence without a port call, and every raw ledger status, including `killed` and `orphaned`, remains insufficient;
+16. C-S9 accepts only core-owned, fully correlated durable typed O5 acknowledgement evidence; `TerminationRequest` is construction-closed and can reach the trait only through a conformance-tested persist-then-invoke coordinator accepting both concrete and `dyn CovenPort` fixtures; the execution-binding revision ledger requires an already session-bound digest-linked predecessor and commits the exact authoritative termination request revision before the port call, with the persistence proof compared as RFC 8785 canonical bytes rather than structural equality; it appends the response evidence afterward, accepts termination creation equal to execution creation, both closed evidence-window endpoints, and post-adoption-deadline termination, rejects unpersisted attempts, first-time session binding, session rebinding, persistence failure, returned-byte mismatch, and absent/mismatched/out-of-window evidence without a port call, and every raw ledger status, including `killed` and `orphaned`, remains insufficient;
 17. execution-request timestamps serialize as RFC 3339 strings and both golden canonical byte/digest fixtures match exactly;
 18. `CancellationState` uses the complete G2-owned local vocabulary and never claims nonexistent TECH or current Coven O5 authority;
 19. every fixture include path resolves from its Rust source and the nullable-binding fixtures exist at the declared package-local paths;
