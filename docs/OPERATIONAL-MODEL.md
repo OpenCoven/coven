@@ -11,18 +11,18 @@ description: "How the Coven Rust daemon stays the authority boundary for project
 
 ## Core boundary
 
-Coven's Rust layer is the local authority boundary. It owns process launch, project-root validation, PTY lifecycle, daemon state, session/event persistence, and the local socket API.
+Coven's Rust layer is the local authority boundary. It owns process launch, project-root validation, PTY lifecycle, daemon state, session/event persistence, and the local IPC API.
 
 CastCodes and other clients are integration layers. They may validate inputs for better UX, but Rust must revalidate every launch, input, kill, and path-sensitive request before acting.
 
 ```mermaid
 flowchart LR
-  CastCodes[CastCodes workspace] --> Socket[HTTP over Unix socket]
+  CastCodes[CastCodes workspace] --> IPC[HTTP over same-user local IPC]
   CLI[coven CLI / TUI] --> Rust[local Rust CLI/daemon]
-  Comux[comux legacy/reference] -.-> Socket
+  Comux[comux legacy/reference] -.-> IPC
   OpenClaw[OpenClaw] --> Plugin[external OpenClaw bridge plugin]
-  Plugin -.-> Socket
-  Socket --> Rust
+  Plugin -.-> IPC
+  IPC --> Rust
   Rust --> Guard[project-root + cwd guard]
   Guard --> Router[harness adapter router]
   Router --> Codex[Codex PTY]
@@ -34,7 +34,7 @@ See [Architecture diagrams](/ARCHITECTURE) for the fuller runtime topology and l
 
 OpenClaw core does not include OpenCoven or Coven. The OpenClaw integration lives outside the OpenClaw repo as the ClawHub package external OpenClaw bridge plugin, sourced from `packages/openclaw-coven` in this repo. That package is an opt-in compatibility adapter, not part of the Coven trust root.
 
-The current auth posture is documented in [Authentication and local access](/AUTH). Coven uses a same-user local Unix-socket access model today. It does not provide OAuth, JWT, bearer-token, API-key, cookie, RBAC, or remote network auth for the daemon API.
+The current auth posture is documented in [Authentication and local access](/AUTH). Coven uses same-user local IPC today: a filesystem-permission-protected Unix socket on Unix-like hosts or an owner-only named pipe on Windows. It does not bind TCP by default or provide OAuth, JWT, bearer-token, API-key, cookie, RBAC, or remote network auth for the daemon API.
 
 ## Trust rules
 
@@ -58,14 +58,14 @@ The Rust CLI/daemon should stay narrow and boring:
 - `coven attach` replays and follows Coven-managed event output.
 - `coven archive`, `coven summon`, and `coven sacrifice --yes` manage completed session history without making users memorize ids in the TUI path.
 - `coven daemon start/status/restart/stop` manages one local daemon state directory.
-- The daemon exposes a small local API over `<covenHome>/coven.sock`.
+- The daemon exposes a small local API over same-user local IPC.
 - SQLite stores session metadata, archive state, and append-only event history.
 
 The local API should remain stable and intentionally small. The current named
 public contract is `coven.daemon.v1`, served under `/api/v1/...` routes. New
 clients negotiate it through `GET /api/v1/health`; the route prefix alone is
 not proof of named-contract support. Archive/summon/sacrifice are currently
-CLI/store rituals; live runtime control remains on the socket API:
+CLI/store rituals; live runtime control remains on the local IPC API:
 
 - `GET /api/v1/api-version`
 - `GET /api/v1/health`
@@ -96,7 +96,7 @@ OpenClaw integration is externalized through external OpenClaw bridge plugin.
 The plugin:
 
 - registers an optional ACP backend named `coven`;
-- validates plugin configuration and the local socket trust anchor;
+- validates plugin configuration and the Unix-socket trust anchor for its current Unix integration;
 - launches sessions through `POST /api/v1/sessions`;
 - polls Coven events and maps them into ACP runtime events;
 - maps only Codex and Claude Code agent ids by default for v0;
@@ -106,11 +106,11 @@ OpenClaw remains responsible for chat/session routing, ACP bindings, task state,
 
 ### npm CLI wrapper
 
-The npm wrapper should only resolve and execute the native `coven` binary. It should not implement launch policy, path policy, or socket trust decisions that Rust does not also enforce.
+The npm wrapper should only resolve and execute the native `coven` binary. It should not implement launch policy, path policy, or local IPC trust decisions that Rust does not also enforce.
 
 ## Compatibility policy
 
-Externalization makes the socket API a product contract. Clients negotiate
+Externalization makes the local IPC API a product contract. Clients negotiate
 compatibility with `GET /api/v1/health`, verify its named `apiVersion`, and
 check every capability required by the operation before a dependent request.
 Capabilities advertise availability and never grant permission.
@@ -154,7 +154,7 @@ Plugin package release gates:
 
 - OpenClaw SDK compatibility tests.
 - Config validation tests.
-- Socket trust-anchor tests.
+- Unix-socket trust-anchor tests for the plugin's current Unix integration.
 - Fallback behavior tests.
 - ClawHub package dry run or publish validation.
 

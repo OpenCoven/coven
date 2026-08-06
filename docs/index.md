@@ -1,10 +1,10 @@
 ---
-summary: "Coven is the local runtime that powers CastCodes with project-scoped harness sessions, append-only events, and a typed local socket API."
+summary: "Coven is the local runtime that powers CastCodes with project-scoped harness sessions, append-only events, and a typed local IPC API."
 read_when:
   - Introducing OpenCoven and Coven to newcomers
   - Choosing whether to install Coven for local agent work
 title: "Coven: the runtime that powers CastCodes"
-description: "Coven powers CastCodes with local-first project-scoped harness sessions, append-only events, and a local socket API."
+description: "Coven powers CastCodes with local-first project-scoped harness sessions, append-only events, and a local IPC API."
 ---
 
 
@@ -28,7 +28,7 @@ description: "Coven powers CastCodes with local-first project-scoped harness ses
     Install Coven, run `coven doctor`, and launch a project-scoped harness session.
   </Card>
   <Card title="Runtime model" href="/ARCHITECTURE" icon="compass">
-    Daemon, PTY supervision, project-root validation, sessions, events, and local socket authority.
+    Daemon, PTY supervision, project-root validation, sessions, events, and local IPC authority.
   </Card>
   <Card title="CLI reference" href="/reference/cli" icon="terminal">
     Core verbs — doctor, daemon, run, sessions, attach — plus the archive, summon, and sacrifice rituals and the rest of the command surface.
@@ -86,8 +86,8 @@ The daemon is the single source of truth for sessions, PTY lifecycle, and capabi
   <Card title="Rituals" icon="moon" href="/SESSION-LIFECYCLE">
     Archive, summon, and sacrifice — explicit, beginner-safe verbs around destructive operations.
   </Card>
-  <Card title="Local socket API" icon="plug" href="/API">
-    `GET /api/v1/health` first; then sessions, events, capabilities, and actions over Unix socket.
+  <Card title="Same-user local IPC API" icon="plug" href="/API">
+    `GET /api/v1/health` first; then sessions, events, capabilities, and actions over same-user local IPC.
   </Card>
   <Card title="CastCodes integration" icon="plug-zap" href="/CASTCODES-INTEGRATION">
     CastCodes is the public workspace; Coven remains the runtime authority underneath.
@@ -144,7 +144,7 @@ Pipe-friendly variants exist too: `coven sessions --plain` for tables, `coven se
 
 ## Configuration (optional)
 
-Coven state lives under `$COVEN_HOME` (defaulting to `~/.coven` on macOS/Linux). The daemon binds a Unix socket at `<covenHome>/coven.sock` and refuses TCP by default.
+Coven state lives under `$COVEN_HOME` (defaulting to `~/.coven` on macOS/Linux). The daemon accepts same-user local IPC: a filesystem-permission-protected Unix socket on Unix-like hosts or an owner-only named pipe on Windows. It refuses TCP by default.
 
 - If you **do nothing**, Coven uses your existing local harness logins.
 - If you want to lock it down, scope `$COVEN_HOME` per project root or per familiar.
@@ -166,7 +166,7 @@ coven daemon restart
     Per-harness setup, provider auth boundary, and adapter expectations.
   </Card>
   <Card title="Local API" href="/API" icon="plug">
-    Versioned socket API for CastCodes and advanced local clients.
+    Versioned local IPC API for CastCodes and advanced local clients.
   </Card>
   <Card title="Sessions" href="/SESSION-LIFECYCLE" icon="moon">
     Archive, summon, and sacrifice — the beginner-safe verbs around session state.

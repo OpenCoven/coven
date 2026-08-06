@@ -19,8 +19,8 @@ description: "Feature reference for the Coven runtime: project-rooted launches, 
   <Card title="Rituals" icon="moon">
     Archive, summon, sacrifice — explicit, beginner-safe verbs around destructive operations.
   </Card>
-  <Card title="Local socket API" icon="plug">
-    Versioned HTTP-over-Unix-socket contract under `/api/v1`.
+  <Card title="Same-user local IPC API" icon="plug">
+    Versioned HTTP-over-same-user-local-IPC contract under `/api/v1`.
   </Card>
   <Card title="Control plane" icon="compass">
     Capability discovery + action routing for CastCodes and advanced clients.

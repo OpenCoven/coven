@@ -22,10 +22,10 @@ flowchart TB
   Daemon --> Session[Session]
   Session --> Event[Event]
   Daemon --> Store[Store / SQLite]
-  Daemon --> Socket[Socket API /api/v1]
-  Socket --> ControlPlane[Control plane]
+  Daemon --> IPC[Local IPC /api/v1]
+  IPC --> ControlPlane[Control plane]
   ControlPlane --> Capability[Capability]
-  Socket --> Client[Client]
+  IPC --> Client[Client]
   Session --> Ritual["Rituals: archive / summon / sacrifice"]
 ```
 
@@ -45,7 +45,7 @@ Use **CastCodes** for the product users open: terminal/editor substrate, visible
 
 ## Coven
 
-Coven is the local runtime substrate. It owns project-scoped harness sessions, PTYs, logs, local daemon state, and the socket API.
+Coven is the local runtime substrate. It owns project-scoped harness sessions, PTYs, logs, local daemon state, and the local IPC API.
 
 Use **Coven** for the CLI, daemon, Rust crate, npm wrapper, and local session runtime.
 
@@ -110,7 +110,10 @@ Events include output, exit, and metadata records. They let clients replay or in
 
 ## Daemon
 
-The daemon is the local Rust process that owns live session state and exposes the HTTP-over-Unix-socket API.
+The daemon is the local Rust process that owns live session state and exposes
+the HTTP-over-same-user-local-IPC API. It uses a
+filesystem-permission-protected Unix socket on Unix-like hosts or an owner-only
+named pipe on Windows, and does not bind TCP by default.
 
 The daemon is the authority boundary. It validates:
 
@@ -171,9 +174,9 @@ Rituals are Coven's human-friendly session-management verbs:
 
 Ritual names are product language. The safety behavior underneath them should stay precise and conservative.
 
-## Socket API
+## Local IPC API
 
-The socket API is the public compatibility boundary for local clients.
+The local IPC API is the public compatibility boundary for local clients.
 
 Current stable prefix:
 

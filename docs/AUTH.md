@@ -1,10 +1,10 @@
 ---
 title: "Authentication and local access"
-summary: "Coven uses a same-user local Unix socket access model rather than OAuth or API keys. Learn what protects /api/v1 and what remote access requires."
+summary: "Coven uses a same-user local IPC access model rather than OAuth or API keys. Learn what protects /api/v1 and what remote access requires."
 read_when:
   - Checking Coven's daemon auth posture
   - Designing remote access or browser-facing transport
-description: "Coven uses a same-user local Unix socket access model rather than OAuth or API keys. Learn what protects /api/v1 and what remote access requires."
+description: "Coven uses a same-user local IPC access model rather than OAuth or API keys. Learn what protects /api/v1 and what remote access requires."
 ---
 
 # Authentication and local access
@@ -15,8 +15,8 @@ Coven does not currently have daemon-level user authentication in the OAuth, JWT
 
 The current solution is a **same-user local access model**:
 
-- The daemon exposes HTTP only over the local Unix socket at `<covenHome>/coven.sock`.
-- The default socket path is `~/.coven/coven.sock`.
+- The daemon exposes HTTP only through same-user local IPC: a filesystem-permission-protected Unix socket on Unix-like hosts or an owner-only named pipe on Windows.
+- The daemon does not bind TCP by default.
 - Clients may validate requests for UX, but the Rust daemon is the enforcement boundary.
 - Harness provider credentials stay in the harness provider's normal local auth flow.
 - Coven should not read, proxy, persist, or mint Codex, Claude Code, OpenAI, Anthropic, GitHub, or OpenClaw credentials.
@@ -34,13 +34,13 @@ flowchart LR
     Other[Other same-user clients]
   end
 
-  CastCodes -->|Unix socket| Socket
-  CLI -->|Unix socket| Socket["<covenHome>/coven.sock"]
-  Comux -->|Unix socket| Socket
-  Plugin -->|Unix socket + trust-anchor checks| Socket
-  Other -->|Unix socket| Socket
+  CastCodes -->|HTTP over same-user local IPC| IPC["Local IPC"]
+  CLI -->|HTTP over same-user local IPC| IPC
+  Comux -->|HTTP over same-user local IPC| IPC
+  Plugin -->|"Current Unix integration: socket + trust-anchor checks"| IPC
+  Other -->|HTTP over same-user local IPC| IPC
 
-  Socket --> Daemon["Rust daemon\n(authority boundary)"]
+  IPC --> Daemon["Rust daemon\n(authority boundary)"]
   Daemon --> Store[("SQLite store + event log")]
   Daemon --> PTY[Harness PTYs]
 
@@ -49,15 +49,15 @@ flowchart LR
   OtherUser((Another OS user)) -.-x|"REJECTED: socket permissions"| Daemon
 ```
 
-The boundary is filesystem permissions plus same-user process locality. Anything outside the dashed zone is rejected by design; introducing a remote, browser, or cross-user surface requires a separate auth design (not a tunnel of the existing socket).
+The boundary is OS-enforced local IPC permissions plus same-user process locality. Anything outside the dashed zone is rejected by design; introducing a remote, browser, or cross-user surface requires a separate auth design (not a tunnel of the existing endpoint).
 
 ## What protects the API today
 
-### Unix socket locality
+### Same-user local IPC locality
 
-The API is not exposed as TCP by default. Clients connect to the local Unix socket owned by the user's Coven state directory.
+The API is not exposed as TCP by default. On Unix-like hosts, clients connect to the Unix socket owned by the user's Coven state directory; on Windows, they connect through the owner-only named pipe.
 
-New clients should treat the socket path as the trust anchor and should connect only to the versioned API under `/api/v1/...`.
+New clients should treat the platform-appropriate local IPC endpoint as the trust anchor and should connect only to the versioned API under `/api/v1/...`.
 
 ### Rust authority checks
 
@@ -90,7 +90,7 @@ Examples:
 
 OpenClaw integration is externalized through external OpenClaw bridge plugin. OpenClaw core is not a Coven trust root.
 
-The plugin is disabled by default and must be explicitly selected as the ACP backend. It validates the local socket trust anchor before connecting:
+The plugin is disabled by default and must be explicitly selected as the ACP backend. The following is its **current Unix integration contract**, not a description of the Windows daemon transport. It validates the local Unix-socket trust anchor before connecting:
 
 - `covenHome` must be an absolute, non-symlink directory.
 - `socketPath` is restricted to `<covenHome>/coven.sock`.
@@ -116,10 +116,10 @@ The current auth solution is not:
 - multi-user authorization;
 - a CSRF/origin policy;
 - a cloud account boundary; or
-- permission to expose the socket API on localhost TCP, a remote network, or a browser page.
+- permission to expose the local IPC API on localhost TCP, a remote network, or a browser page.
 
 If a future dashboard, mobile app, remote bridge, or browser-exposed service needs to talk to Coven,
-it needs an explicit additional auth and pairing design. Do not tunnel or proxy the raw daemon socket
+it needs an explicit additional auth and pairing design. Do not tunnel or proxy the raw daemon endpoint
 into a network service and call that authenticated. That design is drafted in
 [Authenticated remote listener](/design/remote-listener-auth) (#463); until it ships, the tunnel
 patterns in [Remote access](/daemon/remote-access) are the only supported remote paths.
@@ -128,7 +128,7 @@ patterns in [Remote access](/daemon/remote-access) are the only supported remote
 
 The TypeScript OpenClaw plugin client already performs strict socket trust-anchor validation.
 
-The Rust daemon currently owns request enforcement and socket API behavior, but Rust-side private `COVEN_HOME` ownership and permission checks before creating, binding, or removing daemon state are still a hardening priority. Until that is implemented, client-side socket validation should be treated as defense in depth for cooperating clients, not as a complete daemon-side auth boundary.
+The Rust daemon currently owns request enforcement and local IPC API behavior, but Rust-side private `COVEN_HOME` ownership and permission checks before creating, binding, or removing daemon state are still a hardening priority. Until that is implemented, client-side socket validation should be treated as defense in depth for cooperating clients, not as a complete daemon-side auth boundary.
 
 Before broad distribution, Rust should fail closed when:
 
@@ -148,6 +148,6 @@ New Coven clients must:
 - treat the Rust daemon as the authority boundary;
 - keep provider credentials in the provider or harness auth flow;
 - avoid storing repository secrets, environment dumps, private URLs, or token-bearing logs;
-- reject configurable socket paths that do not resolve to `<covenHome>/coven.sock`;
+- use the platform-appropriate same-user local IPC endpoint rather than assuming a Unix socket path;
 - fail closed on unknown harness ids or unsupported API versions; and
 - avoid adding any network, browser, or remote transport without a separate auth design.

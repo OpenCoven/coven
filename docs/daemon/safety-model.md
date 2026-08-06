@@ -4,13 +4,13 @@ read_when:
   - Auditing Coven before adding a new client or remote bridge
   - Writing a security review for an integration
 title: "Safety model"
-description: "Four invariants of the Coven safety model: daemon as sole authority, same-user local socket trust, no stored credentials, and explicit destructive rituals."
+description: "Four invariants of the Coven safety model: daemon as sole authority, same-user local IPC trust, no stored credentials, and explicit destructive rituals."
 ---
 
 Coven's safety model rests on four invariants:
 
 1. **The Rust daemon is the only authority.** Clients can ask; only the daemon decides whether to spawn a PTY, canonicalize a path, or mutate the ledger.
-2. **The socket is same-user local trust.** No daemon OAuth, JWTs, bearer tokens, API keys, or browser cookies.
+2. **Local IPC is same-user local trust.** The daemon uses a filesystem-permission-protected Unix socket on Unix-like hosts or an owner-only named pipe on Windows, never TCP by default. No daemon OAuth, JWTs, bearer tokens, API keys, or browser cookies.
 3. **Coven never stores provider credentials.** Each harness keeps using its own login.
 4. **Destructive operations are explicit.** Sacrifice refuses live sessions and requires `--yes`. Relief verbs in `coven pc` require `--confirm`.
 
@@ -18,13 +18,13 @@ Coven's safety model rests on four invariants:
 
 ```mermaid
 flowchart LR
-  Client[Same-user client] --> Socket[/api/v1 on Unix socket/]
-  Socket --> Daemon[Rust daemon]
+  Client[Same-user client] --> IPC[/api/v1 over Local IPC/]
+  IPC --> Daemon[Rust daemon]
   Daemon --> Harness[Harness PTY]
   Daemon --> Store[(SQLite)]
 ```
 
-Anyone able to read/write `<covenHome>/coven.sock` has full local access. Coven assumes filesystem permissions enforce that boundary.
+The same OS user able to connect to the local IPC endpoint has full local access. Coven relies on Unix socket filesystem permissions on Unix-like hosts and owner-only named-pipe access on Windows.
 
 ## What Coven validates
 
@@ -46,7 +46,7 @@ See [Authority boundary](/concepts/authority-boundary).
 
 ## Remote access
 
-Coven does **not** bind a TCP port by default. If you need a remote daemon, tunnel the Unix socket — see [Remote access](/daemon/remote-access). Tailscale and SSH local-forwards both work.
+Coven does **not** bind a TCP port by default. On Unix-like hosts, remote access can tunnel the Unix socket — see [Remote access](/daemon/remote-access). Tailscale and SSH local-forwards both work there.
 
 ## Automation approvals
 

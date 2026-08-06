@@ -37,7 +37,7 @@ flowchart TB
     Scripts[Scripts / other clients]
   end
 
-  UntrustedZone -->|HTTP over Unix socket| Boundary{{Daemon authority boundary}}
+  UntrustedZone -->|HTTP over same-user local IPC| Boundary{{Daemon authority boundary}}
 
   subgraph TrustedZone["Trusted for enforcement"]
     direction TB
@@ -57,12 +57,12 @@ Anything in **UntrustedZone** can lie, drift, or be replaced. Anything in **Trus
 
 Coven's current auth solution is a same-user local access model, not a network authentication protocol.
 
-- The daemon API runs over `<covenHome>/coven.sock`, not TCP.
+- The daemon API runs over same-user local IPC: a filesystem-permission-protected Unix socket on Unix-like hosts or an owner-only named pipe on Windows. It does not bind TCP by default.
 - There is no daemon OAuth, JWT, bearer token, API key, browser cookie, RBAC, or hosted account session in v0.
 - Provider credentials stay in the harness/provider local auth flow, such as Codex or Claude Code.
 - Clients are untrusted for enforcement; the Rust daemon must still revalidate every sensitive request.
-- The external OpenClaw plugin performs socket trust-anchor validation before connecting, but Rust-side private `COVEN_HOME` ownership and permission checks remain a hardening priority.
-- Do not expose the raw socket API through localhost TCP, a browser page, a remote bridge, or a mobile pairing flow without a separate explicit auth design.
+- The external OpenClaw plugin performs Unix-socket trust-anchor validation for its current Unix integration before connecting, but Rust-side private `COVEN_HOME` ownership and permission checks remain a hardening priority.
+- Do not expose the raw local IPC API through localhost TCP, a browser page, a remote bridge, or a mobile pairing flow without a separate explicit auth design.
 
 The detailed contract lives in [Authentication and local access](/AUTH).
 
@@ -75,7 +75,7 @@ The detailed contract lives in [Authentication and local access](/AUTH).
 - Build harness commands with argv APIs.
 - Do not execute prompts through `sh -c`.
 - Keep provider credentials in the provider or harness authentication flow.
-- Treat the socket API as a local product contract, not a private implementation detail.
+- Treat the local IPC API as a local product contract, not a private implementation detail.
 - Fail closed on unknown API versions, unknown action ids, unsupported harnesses, and invalid session ids.
 
 ## Data and secrets
@@ -108,9 +108,9 @@ Recommended user guidance:
 - Use throwaway projects for demos and smoke tests.
 - Run `python scripts/check-secrets.py` before publishing docs, fixtures, or release artifacts.
 
-## Local socket posture
+## Local IPC posture
 
-The daemon API runs over a local Unix socket. It is intended for same-user local clients.
+The daemon API runs over same-user local IPC: a filesystem-permission-protected Unix socket on Unix-like hosts or an owner-only named pipe on Windows. It is intended for same-user local clients and does not bind TCP by default.
 
 Hardening priorities:
 
