@@ -550,14 +550,23 @@ def is_opencoven_repo_relative_path_token(
 
 
 _OPENCOVEN_NPM_PACKAGE_SPEC_TOKEN = re.compile(
-    r"(?:@)?opencoven/(?P<package>[A-Za-z0-9_.-]+)"
+    r"opencoven/(?P<package>[A-Za-z0-9_.-]+)"
     r"@(?P<version>[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?)"
 )
 
 
 def is_opencoven_npm_package_spec_token(
-    token: str, *, strict: bool = False
+    line: str,
+    token_match: re.Match[str],
+    *,
+    strict: bool = False,
 ) -> bool:
+    if (
+        token_match.start() == 0
+        or line[token_match.start() - 1] != "@"
+    ):
+        return False
+    token = token_match.group(0)
     match = _OPENCOVEN_NPM_PACKAGE_SPEC_TOKEN.fullmatch(token)
     if not match:
         return False
@@ -905,7 +914,9 @@ def is_known_safe_entropy_token(
         or is_local_path_like_token(token)
         or is_public_repo_url_like_token(token)
         or is_opencoven_repo_relative_path_token(token)
-        or is_opencoven_npm_package_spec_token(token)
+        or is_opencoven_npm_package_spec_token(
+            line, token_match
+        )
         or is_github_advisory_url_like_token(token)
         or is_github_commit_url_like_token(token)
         or is_github_action_sha_ref_token(token)
