@@ -4151,6 +4151,23 @@ exit 0
     #[cfg(unix)]
     #[test]
     fn cancellation_guard_blocks_supervised_signals_for_spawned_helpers() -> Result<()> {
+        // Snapshot the CALLING thread's supervised-signal membership BEFORE the
+        // guard is installed. `finish()` restores the calling thread's mask via
+        // SIG_SETMASK to whatever it saved at install time, so the post-finish
+        // membership must equal this pre-install snapshot exactly. Gap (3) of
+        // the Psyche O1.1 conformance plan (#641) is this deterministic
+        // round-trip assertion — previously only the mid-install BLOCKED state
+        // (on a freshly spawned helper thread) was checked.
+        let probe_calling_mask = || {
+            let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+            let result =
+                unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut mask) };
+            assert_eq!(result, 0, "failed to read calling thread signal mask");
+            [libc::SIGTERM, libc::SIGINT, libc::SIGHUP]
+                .map(|signal| unsafe { libc::sigismember(&mask, signal) })
+        };
+        let pre_install_mask = probe_calling_mask();
+
         let cancellation = SupervisedStreamCancellationGuard::install("test stream")?;
         let inherited_mask = thread::spawn(|| {
             let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
@@ -4165,6 +4182,14 @@ exit 0
 
         assert_eq!(inherited_mask, [1, 1, 1]);
         assert_eq!(cancellation.finish()?, None);
+
+        // Post-finish: the calling thread's supervised-signal membership must be
+        // exactly what it was before install — SIGTERM/SIGINT/SIGHUP unchanged.
+        assert_eq!(
+            probe_calling_mask(),
+            pre_install_mask,
+            "finish() did not restore the calling thread's signal mask to its pre-install value"
+        );
         Ok(())
     }
 
@@ -4265,9 +4290,22 @@ exit 0
         let temp_dir = tempfile::tempdir()?;
         let fake_harness = temp_dir.path().join("fake-stream");
         let pid_file = temp_dir.path().join("harness.pid");
+        let descendant_pid_file = temp_dir.path().join("descendant.pid");
+        // The malformed-stream fixture spawns a long-lived DESCENDANT (a
+        // detached `sleep`) before emitting invalid JSON. Gap (2) of the
+        // Psyche O1.1 conformance plan (#641): a protocol/JSON failure must
+        // reap the entire process tree, not merely the direct child. We record
+        // both the direct child's pid ($$) and the descendant's pid ($!) so the
+        // assertions below can confirm both are gone (kill(pid,0) == ESRCH).
         std::fs::write(
             &fake_harness,
-            "#!/bin/sh\nprintf '%s\\n' \"$$\" > harness.pid\nprintf '%s\\n' 'not-json'\nsleep 30\n",
+            r#"#!/bin/sh
+printf '%s\n' "$$" > harness.pid
+sleep 30 </dev/null >/dev/null 2>&1 &
+printf '%s\n' "$!" > descendant.pid
+printf '%s\n' 'not-json'
+while :; do sleep 1; done
+"#,
         )?;
         let mut permissions = std::fs::metadata(&fake_harness)?.permissions();
         permissions.set_mode(0o755);
@@ -4285,25 +4323,27 @@ exit 0
         .expect_err("malformed native JSONL must fail");
         assert!(format!("{error:#}").contains("invalid JSON"));
 
-        let harness_pid: libc::pid_t = std::fs::read_to_string(pid_file)?.trim().parse()?;
-        let deadline = Instant::now() + Duration::from_secs(1);
-        let mut reaped = false;
-        while Instant::now() < deadline {
-            if unsafe { libc::kill(harness_pid, 0) } == -1
-                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-            {
-                reaped = true;
-                break;
+        for (label, path) in [("harness", pid_file), ("descendant", descendant_pid_file)] {
+            let pid: libc::pid_t = std::fs::read_to_string(path)?.trim().parse()?;
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let mut reaped = false;
+            while Instant::now() < deadline {
+                if unsafe { libc::kill(pid, 0) } == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    reaped = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
             }
-            thread::sleep(Duration::from_millis(10));
-        }
-        if !reaped {
-            unsafe {
-                libc::kill(harness_pid, libc::SIGKILL);
-                libc::waitpid(harness_pid, std::ptr::null_mut(), 0);
+            if !reaped {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                    libc::waitpid(pid, std::ptr::null_mut(), 0);
+                }
             }
+            assert!(reaped, "malformed JSON left {label} {pid} alive");
         }
-        assert!(reaped, "malformed JSON left harness {harness_pid} alive");
         Ok(())
     }
 

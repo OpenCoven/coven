@@ -379,6 +379,202 @@ printf '%s\n' '{"type":"turn.completed"}'
     );
 }
 
+/// Gap (1) from the Psyche O1.1 conformance plan (#641): the existing
+/// continuation e2e above resumes by passing the LEDGER row id to `--continue`.
+/// That path resolves through `store::get_session`. But `coven run --continue`
+/// also accepts the STABLE conversation key (the harness `conversation_id`,
+/// e.g. the Codex `thread_id`) and falls back to
+/// `store::get_latest_session_by_conversation_id` when the argument is not a
+/// ledger row id. This test drives that second, previously-uncovered e2e
+/// branch: it seeds a first turn, then resumes using the conversation key
+/// `thread-unix-123` (never a `sessions.id`). It asserts sibling correlation
+/// (fresh row, shared `conversation_id`) plus the native harness resume argv
+/// (`resume\n<thread>`), matching the ledger-id case.
+#[cfg(unix)]
+#[test]
+fn codex_json_stream_continues_by_stable_conversation_key() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let coven_home = temp_dir.path().join("coven-home");
+    fs::create_dir_all(&coven_home).expect("failed to create coven home");
+    let project_root = temp_dir.path().join("project");
+    fs::create_dir_all(&project_root).expect("failed to create project root");
+    let fake_bin = temp_dir.path().join("bin");
+    fs::create_dir_all(&fake_bin).expect("failed to create fake bin dir");
+    let fake_codex = fake_bin.join("codex");
+    fs::write(
+        &fake_codex,
+        r#"#!/bin/sh
+printf '%s\n' "$@" > args.txt
+        thread_id=thread-unix-123
+        case " $* " in
+          *" resume "*) thread_id=thread-unix-456 ;;
+        esac
+        printf '%s\n' "{\"type\":\"thread.started\",\"thread_id\":\"$thread_id\"}"
+printf '%s\n' '{"type":"turn.started"}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item-1","type":"agent_message","text":"reply for stream client"}}'
+printf '%s\n' '{"type":"turn.completed"}'
+"#,
+    )
+    .expect("failed to write fake codex");
+    let mut permissions = fs::metadata(&fake_codex)
+        .expect("failed to stat fake codex")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_codex, permissions).expect("failed to chmod fake codex");
+
+    let mut paths = vec![fake_bin.clone()];
+    if let Some(existing) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    let path = std::env::join_paths(paths).expect("test PATH should be joinable");
+
+    // First turn: establishes a ledger row whose stable conversation key is the
+    // Codex thread id `thread-unix-123`.
+    let out = Command::new(env!("CARGO_BIN_EXE_coven"))
+        .args(["run", "codex", "--stream-json", "--", "first"])
+        .current_dir(&project_root)
+        .env("COVEN_HOME", &coven_home)
+        .env("PATH", &path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to spawn coven binary");
+    assert!(
+        out.status.success(),
+        "initial coven run failed: status={:?} stdout={} stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let first_frames: Vec<serde_json::Value> = String::from_utf8(out.stdout)
+        .expect("stdout not utf-8")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("Coven stdout must remain JSONL"))
+        .collect();
+    let old_id = first_frames[0]["session_id"]
+        .as_str()
+        .expect("system.init carries the old ledger id")
+        .to_string();
+
+    // Sanity: the seeded row's stable conversation key is the Codex thread id,
+    // and it is a *different* value than the ledger row id. Resuming by the
+    // conversation key therefore cannot resolve via `store::get_session`.
+    let conn = rusqlite::Connection::open(coven_home.join("coven.sqlite3"))
+        .expect("failed to open Coven session ledger");
+    let seeded_conversation_id: Option<String> = conn
+        .query_row(
+            "SELECT conversation_id FROM sessions WHERE id = ?1",
+            [&old_id],
+            |row| row.get(0),
+        )
+        .expect("seeded session must be readable");
+    assert_eq!(
+        seeded_conversation_id.as_deref(),
+        Some("thread-unix-123"),
+        "the first turn must persist the stable conversation key"
+    );
+    assert_ne!(
+        old_id, "thread-unix-123",
+        "the stable conversation key must not collide with the ledger row id"
+    );
+
+    let read_evidence = |id: &str| {
+        conn.query_row(
+            "SELECT status, exit_code, archived_at, conversation_id
+             FROM sessions WHERE id = ?1",
+            [id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i32>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .expect("session evidence should be readable")
+    };
+    let old_evidence = read_evidence(&old_id);
+
+    // Resume by STABLE CONVERSATION KEY (not the ledger id). This drives the
+    // `get_latest_session_by_conversation_id` fallback branch end-to-end.
+    let resumed = Command::new(env!("CARGO_BIN_EXE_coven"))
+        .args([
+            "run",
+            "codex",
+            "--stream-json",
+            "--continue",
+            "thread-unix-123",
+            "--",
+            "follow-up",
+        ])
+        .current_dir(&project_root)
+        .env("COVEN_HOME", &coven_home)
+        .env("PATH", &path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to spawn resumed coven binary");
+    assert!(
+        resumed.status.success(),
+        "conversation-key continuation failed: status={:?} stdout={} stderr={}",
+        resumed.status,
+        String::from_utf8_lossy(&resumed.stdout),
+        String::from_utf8_lossy(&resumed.stderr),
+    );
+    let resumed_frames: Vec<serde_json::Value> = String::from_utf8(resumed.stdout)
+        .expect("stdout not utf-8")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("Coven stdout must remain JSONL"))
+        .collect();
+    let sibling_id = resumed_frames[0]["session_id"]
+        .as_str()
+        .expect("resumed system.init carries a ledger id");
+    assert_ne!(
+        sibling_id, old_id,
+        "conversation-key continuation must use a fresh row"
+    );
+    assert_eq!(
+        resumed_frames.last().expect("result frame")["session_id"],
+        sibling_id,
+        "init and result must identify the sibling row"
+    );
+
+    // The prior turn's terminal/archive evidence must be untouched.
+    assert_eq!(
+        read_evidence(&old_id),
+        old_evidence,
+        "conversation-key continuation must not rewrite the source row"
+    );
+
+    // Sibling correlation: fresh row sharing the same stable conversation group.
+    let sibling_evidence = read_evidence(sibling_id);
+    assert_eq!(sibling_evidence.0, "completed");
+    assert_eq!(sibling_evidence.1, Some(0));
+    assert_eq!(sibling_evidence.2, None, "the sibling starts unarchived");
+    assert_eq!(
+        sibling_evidence.3.as_deref(),
+        Some("thread-unix-123"),
+        "the sibling shares the stable conversation group"
+    );
+
+    // Native harness resume argv: Codex must be told to resume its native
+    // thread id, proving the fallback resolved the same conversation group.
+    assert!(
+        fs::read_to_string(project_root.join("args.txt"))
+            .expect("fake codex should record resumed argv")
+            .contains("resume\nthread-unix-123\n"),
+        "Codex must resume its native thread id via the conversation-key path"
+    );
+}
+
 /// A Codex protocol failure is a failed Coven run even when the Codex wrapper
 /// exits 0. The terminal CLI status and persisted ledger must agree so clients
 /// never see a failed turn recorded as a successful process exit.
