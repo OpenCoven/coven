@@ -2898,6 +2898,32 @@ async fn termination_dispatch_persists_acknowledged_outcome_before_success() {
         canonical_bytes(&derive_termination_outcome_revision(&requested, &disposition).unwrap()).unwrap(),
     );
 }
+
+#[tokio::test]
+async fn termination_dispatch_persists_unresolved_outcome_before_success() {
+    // Seed revision 1 (session-bound) and the derived TerminationRequested
+    // revision 2, then dispatch. `persist_then_terminate` must validate the
+    // port's unresolved evidence, derive revision 3, and durably append it
+    // before it returns Ok.
+    let (mut persistence, dir) = real_store_termination_persistence();
+    let requested = seed_session_bound_then_requested(&mut persistence);
+    let port = FakeCoven::builder()
+        .unresolved_termination(unresolved_for(&requested))
+        .build()
+        .unwrap();
+
+    let disposition = persist_then_terminate(&mut persistence, &port, requested.clone())
+        .await
+        .expect("validated unresolved outcome must be durable before Ok");
+
+    // Reopen the store: revision 3 must be byte-exact and digest-linked.
+    let revisions = reopen(&dir).execution_binding_revisions(&requested.attempt_id).unwrap();
+    assert_eq!(revisions.len(), 3);
+    assert_eq!(
+        canonical_bytes(&revisions[2]).unwrap(),
+        canonical_bytes(&derive_termination_outcome_revision(&requested, &disposition).unwrap()).unwrap(),
+    );
+}
 ```
 
 - [ ] **Step 2: Run and verify RED**
@@ -2908,7 +2934,7 @@ cargo test -p psyche-test-support --test fakes
 
 Expected: compile failure because port and fake types (including
 `persist_outcome`, `derive_termination_outcome_revision`, and the
-acknowledged-outcome fake control) are absent.
+acknowledged-outcome and unresolved-outcome fake controls) are absent.
 
 - [ ] **Step 3: Implement behavior-level port types**
 
@@ -3198,7 +3224,11 @@ where
     // persisted `TerminationRequested` revision, derive the next digest-linked
     // outcome revision, and durably append it before returning.
     let outcome = derive_termination_outcome_revision(&requested, &disposition)
-        .map_err(|_| TerminationDispatchError::OutcomeEvidenceMismatch)?;
+        .map_err(|e| match e {
+            ContractError::CancellationEvidenceMismatch { .. } =>
+                TerminationDispatchError::OutcomeEvidenceMismatch,
+            other => TerminationDispatchError::Contract(other),
+        })?;
     let expected_outcome_bytes = canonical_bytes(&outcome)
         .map_err(TerminationDispatchError::Contract)?;
     let persisted_outcome_bytes = persistence
