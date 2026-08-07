@@ -36,10 +36,11 @@ The following invariants are mandatory:
    `termination-requested` revision.
 3. An acknowledged or unresolved revision can only be derived from the exact
    durable `termination-requested` predecessor.
-4. Exact replay is idempotent. A changed response for the same termination
-   identity is a revision conflict.
-5. A gap, fork, historical rewrite, rebinding, authority removal, or intervening
-   revision fails without mutation.
+4. Exact replay is idempotent, including when a concurrent writer committed
+   the same byte-identical successor first. A changed response for the same
+   termination identity is a revision conflict.
+5. A gap, fork, historical rewrite, rebinding, authority removal, or divergent
+   intervening successor fails without mutation.
 6. `Ok(TerminationDisposition)` implies the matching terminal revision is
    durable and byte-exact after reopening storage.
 
@@ -78,8 +79,9 @@ may bypass the coordinator with an unchecked request or outcome constructor.
 the port disposition. It validates the termination request ID, Coven session,
 immutable execution correlation, authority-evidence digest, and persisted
 termination window. Acknowledgement timestamps must fall within the inclusive
-window. Unresolved evidence is bound to the same authority and may not derive a
-new deadline from response arrival time.
+window. Unresolved `recorded_at` timestamps must independently fall within that
+same inclusive window. Unresolved evidence is bound to the same authority and
+may not derive a new deadline from response arrival time.
 
 The function preserves all frozen fields, increments the revision once, and
 sets `previous_revision_digest` to the canonical digest of the requested
@@ -92,9 +94,10 @@ operations. Both operations:
 
 - validate the exact durable predecessor;
 - append transactionally;
-- treat an exact historical replay as idempotent;
-- reject every changed same-revision replay, fork, gap, or intervening
-  successor as a conflict; and
+- treat an exact historical replay or concurrently committed byte-identical
+  successor as idempotent;
+- reject every changed same-revision replay, fork, gap, or divergent
+  intervening successor as a conflict; and
 - return the committed RFC 8785 canonical bytes only after durable commit or
   proof of exact replay.
 
@@ -117,9 +120,11 @@ The important crash windows are:
 | After port response, before outcome append | Termination requested | Replay the same idempotency identity and append the stable response |
 | After outcome append, before caller observes success | Terminal outcome | Exact replay proves the same revision; no duplicate is appended |
 
-A different replay response, a changed authority field, or an intervening
-revision produces an explicit conflict. Recovery never invents a successful
-outcome and never replaces ambiguity with a success-shaped fallback.
+A different replay response, a changed authority field, or a divergent
+intervening revision produces an explicit conflict. A byte-identical
+intervening outcome is exact replay and returns the already-durable result.
+Recovery never invents a successful outcome and never replaces ambiguity with
+a success-shaped fallback.
 
 ## Error Contract
 
@@ -143,9 +148,11 @@ must not infer that Coven did nothing.
 ## Concurrency and Replay
 
 The requested revision's digest is the compare-and-append authority for the
-outcome. If another writer commits any successor first, an outcome append based
-on the old tip fails as a conflict. The coordinator does not reload and
-silently rebase.
+outcome. If another writer commits the same byte-identical successor first, the
+append proves exact replay and succeeds idempotently with the committed bytes.
+If another writer commits a different successor, the append fails as a
+revision conflict. The coordinator does not reload and silently rebase a
+divergent outcome.
 
 An exact repeated request and stable disposition return the already-durable
 outcome. A different disposition under the same termination request ID cannot
@@ -164,20 +171,30 @@ The G2 exact-test manifest and evidence matrix must name executable tests for:
 - restart recovery from the durable requested revision;
 - conflicting replay response;
 - mismatched or invalid evidence;
+- unresolved evidence recorded outside the persisted termination window;
 - outcome-write failure;
-- concurrent intervening revision; and
+- concurrent byte-identical successor replay;
+- concurrent divergent successor conflict; and
 - requested- and outcome-byte attestation mismatches.
 
 Every success test reopens the SQLite store and proves that the terminal
 revision is durable, byte-exact, digest-linked to the requested revision, and
-preserves all frozen correlation fields. The crash/restart test uses a
-deterministic test-support fault point immediately after the validated port
-response and before the outcome append, then creates a fresh coordinator over
-the reopened store and stable fake port.
+preserves all frozen correlation fields. The concurrent exact-replay test
+commits the byte-identical outcome through a second writer before the
+coordinator's append and proves success returns the already-durable bytes
+without a duplicate. The crash/restart test uses a deterministic test-support
+fault point immediately after the validated port response and before the
+outcome append, then creates a fresh coordinator over the reopened store and
+stable fake port.
 
 Negative tests prove no illegal terminal revision was appended and no
-success-shaped result escaped. Manifest/listing validation must reject a
-missing exact test, an unused manifest entry, or a zero-test filter.
+success-shaped result escaped. The unresolved-window test independently places
+`recorded_at` before and after the closed termination window, expects
+`OutcomeEvidenceMismatch`, and proves no outcome append. The divergent
+concurrency test commits different successor bytes first, expects
+`RevisionConflict`, and preserves that existing chain. Manifest/listing
+validation must reject a missing exact test, an unused manifest entry, or a
+zero-test filter.
 
 ## Non-goals
 
@@ -193,7 +210,8 @@ Issue #652 is design-complete when the G2 plan:
 1. makes the validate-derive-append sequence part of the public coordinator
    contract;
 2. makes successful outcome durability byte-attested and reopen-verifiable;
-3. specifies same-identity replay and conflicting-response behavior;
+3. specifies same-identity replay, concurrent exact-successor idempotency, and
+   divergent-successor conflict behavior;
 4. specifies restart reconciliation for every crash window;
 5. preserves phase-specific errors, including indeterminate outcome
    persistence and explicit revision conflict; and
