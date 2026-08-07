@@ -3080,16 +3080,6 @@ pub fn claim_handoff(
         [handoff_id],
         handoff_record_from_row,
     )?;
-    let actual_cursor: i64 = transaction
-        .query_row(
-            "SELECT COALESCE(MAX(rowid), 0) FROM events WHERE session_id = ?1",
-            [&current.session_id],
-            |row| row.get(0),
-        )
-        .context("failed to read latest event sequence")?;
-    if actual_cursor < current.event_cursor {
-        bail!("transcript_diverged");
-    }
     if current.generation != expected_generation {
         bail!("stale_generation");
     }
@@ -3101,6 +3091,16 @@ pub fn claim_handoff(
             return Ok(current);
         }
         bail!("handoff_already_claimed");
+    }
+    let actual_cursor: i64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(rowid), 0) FROM events WHERE session_id = ?1",
+            [&current.session_id],
+            |row| row.get(0),
+        )
+        .context("failed to read latest event sequence")?;
+    if actual_cursor < current.event_cursor {
+        bail!("transcript_diverged");
     }
     let input_in_flight: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM session_input_leases WHERE session_id = ?1)",
@@ -3137,16 +3137,6 @@ pub fn acknowledge_handoff(
         [handoff_id],
         handoff_record_from_row,
     )?;
-    let actual_cursor: i64 = transaction
-        .query_row(
-            "SELECT COALESCE(MAX(rowid), 0) FROM events WHERE session_id = ?1",
-            [&current.session_id],
-            |row| row.get(0),
-        )
-        .context("failed to read latest event sequence")?;
-    if actual_cursor < current.event_cursor {
-        bail!("transcript_diverged");
-    }
     if current.claimant.as_deref() != Some(claimant) {
         bail!("claimant_mismatch");
     }
@@ -3157,6 +3147,16 @@ pub fn acknowledge_handoff(
         }
         "claimed" => {}
         _ => bail!("handoff_not_claimed"),
+    }
+    let actual_cursor: i64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(rowid), 0) FROM events WHERE session_id = ?1",
+            [&current.session_id],
+            |row| row.get(0),
+        )
+        .context("failed to read latest event sequence")?;
+    if actual_cursor < current.event_cursor {
+        bail!("transcript_diverged");
     }
     transaction.execute(
         "UPDATE session_handoffs SET state = 'acknowledged', updated_at = ?2 WHERE id = ?1",
@@ -6373,10 +6373,26 @@ mod tests {
         assert_eq!(prune_events_older_than(&conn, cutoff)?, 0);
         assert_eq!(prune_events_older_than_bounded(&conn, cutoff, 1)?, 0);
 
-        acknowledge_handoff(&mut conn, &offered.id, "device:phone-1", now)?;
+        let acknowledged = acknowledge_handoff(&mut conn, &offered.id, "device:phone-1", now)?;
         assert_eq!(count_events_older_than(&conn, cutoff)?, 1);
         assert_eq!(prune_events_older_than(&conn, cutoff)?, 1);
         assert!(list_events(&conn, "session-1")?.is_empty());
+
+        assert_eq!(
+            acknowledge_handoff(&mut conn, &offered.id, "device:phone-1", now)?,
+            acknowledged
+        );
+        assert_eq!(
+            claim_handoff(
+                &mut conn,
+                &offered.id,
+                offered.generation,
+                "device:phone-1",
+                "claim-1",
+                now,
+            )?,
+            acknowledged
+        );
         Ok(())
     }
 
