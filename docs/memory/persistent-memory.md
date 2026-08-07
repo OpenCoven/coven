@@ -6,4 +6,5 @@ title: "Persistent memory"
 description: "Persistent memory for OpenCoven familiars: durable facts each agent remembers about a project, the user, and its own role across sessions."
 ---
 
-Stub — fill in. See [Memory overview](/memory).
+Canonical documentation:
+[Persistent memory](https://docs.opencoven.ai/docs/memory-models/persistent-memory).

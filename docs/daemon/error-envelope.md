@@ -6,4 +6,5 @@ title: "Error envelope"
 description: "Every Coven daemon error response uses the structured envelope { error: { code, message, details } }. Reference for codes and how clients should handle them."
 ---
 
-Stub — fill in. See [Daemon overview](/daemon/index).
+Canonical documentation:
+[Local API errors](https://docs.opencoven.ai/docs/reference/api).

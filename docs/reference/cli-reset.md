@@ -163,5 +163,5 @@ contains secret values, tokens, or credential contents.
 | `5` | One or more selected categories could not be backed up/reset; inspect the report and local backup. |
 | `6` | Coven refused an unsafe path or symlinked reset target. |
 
-Related: [COVEN_HOME](/daemon/coven-home), [Troubleshooting](/TROUBLESHOOTING),
+Related: [COVEN_HOME](https://docs.opencoven.ai/docs/daemon/configuration), [Troubleshooting](https://docs.opencoven.ai/docs/reference/troubleshooting),
 and the [CLI reference](cli.md).

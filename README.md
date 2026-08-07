@@ -244,26 +244,28 @@ Choose a repo, choose a harness, get a verified patch.
 
 ## Commands Reference
 
-The full command surface — every subcommand, flag, and JSON output shape — lives in [`docs/reference/cli.md`](docs/reference/cli.md), with dedicated per-command pages under [`docs/reference/`](docs/reference/). The core verbs:
+The canonical command reference lives at
+[docs.opencoven.ai/docs/cli](https://docs.opencoven.ai/docs/cli). The core
+verbs:
 
 | Command | Action | Details |
 | --- | --- | --- |
-| `coven` / `coven chat` | Open the interactive Coven UI (engine auto-installed on first run); `coven "<task>"` plans and runs a free-text task | [`cli-coven.md`](docs/reference/cli-coven.md) |
-| `coven doctor` | Detect supported harness CLIs and print install hints | [`cli-doctor.md`](docs/reference/cli-doctor.md) |
-| `coven daemon start/status/restart/stop` | Manage the local daemon | [`cli-daemon.md`](docs/reference/cli-daemon.md) |
-| `coven run <harness> <prompt>` | Launch a project-scoped harness session (`--cwd`, `--title`, `--model`, `--continue`, `--stream-json`, …) | [`cli-run.md`](docs/reference/cli-run.md) |
-| `coven sessions` | Browse, search, and inspect sessions (`--plain`, `--json`, `--all`, `search`, `show`, `events`, `log`) | [`cli-sessions.md`](docs/reference/cli-sessions.md) |
-| `coven attach <id>` | Replay/follow session output and forward input | [`cli-attach.md`](docs/reference/cli-attach.md) |
-| `coven archive` / `summon` / `sacrifice` | Session rituals (see below) | [`cli-archive.md`](docs/reference/cli-archive.md), [`cli-summon.md`](docs/reference/cli-summon.md), [`cli-sacrifice.md`](docs/reference/cli-sacrifice.md) |
-| `coven kill` | Stop a live session on Unix-like hosts; Windows-capable integrations request `POST /api/v1/sessions/:id/kill` through daemon local IPC | [`cli-kill.md`](docs/reference/cli-kill.md) |
-| `coven adapter list/doctor/install` | Inspect harness adapters; opt into trusted adapter recipes (e.g. `coven adapter install grok`) | [`docs/HARNESS-ADAPTERS.md`](docs/HARNESS-ADAPTERS.md) |
-| `coven status` / `familiars` / `skills` / `research` / `calls` / `hub` | Read-only observability with `--json`, mirroring the daemon API routes | [`cli-observe.md`](docs/reference/cli-observe.md) |
-| `coven memory` / `coven memory --json` / `coven memory open` | Preserve the memory list output or launch the private loopback dashboard | [`cli-observe.md`](docs/reference/cli-observe.md) |
-| `coven memory import` / `coven memory restore` | Preview, apply, verify, and logically restore one familiar's memory migration | [`memory-import.md`](docs/help/memory-import.md) |
-| `coven wt` / `claim` / `hooks` | Parallel work protocol: worktrees, TTL-bounded claims, git hooks | [`cli-wt.md`](docs/reference/cli-wt.md), [`cli-claim.md`](docs/reference/cli-claim.md) |
-| `coven pc` | macOS-first system diagnostics; write operations require `--confirm` | [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) |
-| `coven patch openclaw` / `logs prune` / `vacuum` | OpenClaw rescue loop, log-retention pruning, store repair | [`cli-patch.md`](docs/reference/cli-patch.md), [`cli-logs.md`](docs/reference/cli-logs.md), [`cli-vacuum.md`](docs/reference/cli-vacuum.md) |
-| `coven completions <shell>` | Generate shell completions (bash, zsh, fish, elvish, powershell) | [`docs/reference/cli.md`](docs/reference/cli.md) |
+| `coven` / `coven chat` | Open the interactive Coven UI (engine auto-installed on first run); `coven "<task>"` plans and runs a free-text task | [Interactive UI](https://docs.opencoven.ai/docs/cli/interactive) |
+| `coven doctor` | Detect supported harness CLIs and print install hints | [Doctor](https://docs.opencoven.ai/docs/cli/doctor) |
+| `coven daemon start/status/restart/stop` | Manage the local daemon | [Daemon commands](https://docs.opencoven.ai/docs/cli/daemon) |
+| `coven run <harness> <prompt>` | Launch a project-scoped harness session (`--cwd`, `--title`, `--model`, `--continue`, `--stream-json`, …) | [Run](https://docs.opencoven.ai/docs/cli/run) |
+| `coven sessions` | Browse, search, and inspect sessions (`--plain`, `--json`, `--all`, `search`, `show`, `events`, `log`) | [Sessions](https://docs.opencoven.ai/docs/cli/sessions) |
+| `coven attach <id>` | Replay/follow session output and forward input | [Sessions](https://docs.opencoven.ai/docs/cli/sessions#attach) |
+| `coven archive` / `summon` / `sacrifice` | Session rituals (see below) | [Sessions](https://docs.opencoven.ai/docs/cli/sessions) |
+| `coven kill` | Stop a live session on Unix-like hosts; Windows-capable integrations request `POST /api/v1/sessions/:id/kill` through daemon local IPC | [CLI reference](https://docs.opencoven.ai/docs/cli) |
+| `coven adapter list/doctor/install` | Inspect harness adapters; opt into trusted adapter recipes (e.g. `coven adapter install grok`) | [Repository workflow](https://docs.opencoven.ai/docs/cli/repo-workflow) |
+| `coven status` / `familiars` / `skills` / `research` / `calls` / `hub` | Read-only observability with `--json`, mirroring the daemon API routes | [Observability](https://docs.opencoven.ai/docs/cli/observe) |
+| `coven memory` / `coven memory --json` / `coven memory open` | Preserve the memory list output or launch the private loopback dashboard | [Memory](https://docs.opencoven.ai/docs/memory-models) |
+| `coven memory import` / `coven memory restore` | Preview, apply, verify, and logically restore one familiar's memory migration | [Memory](https://docs.opencoven.ai/docs/memory-models) |
+| `coven wt` / `claim` / `hooks` | Parallel work protocol: worktrees, TTL-bounded claims, git hooks | [Repository workflow](https://docs.opencoven.ai/docs/cli/repo-workflow) |
+| `coven pc` | macOS-first system diagnostics; write operations require `--confirm` | [PC diagnostics](https://docs.opencoven.ai/docs/cli/pc) |
+| `coven patch openclaw` / `logs prune` / `vacuum` | OpenClaw rescue loop, log-retention pruning, store repair | [CLI reference](https://docs.opencoven.ai/docs/cli) |
+| `coven completions <shell>` | Generate shell completions (bash, zsh, fish, elvish, powershell) | [CLI reference](https://docs.opencoven.ai/docs/cli) |
 
 > Session-id arguments (`attach`, `summon`, `archive`, `sacrifice`, `kill`, and
 > the `sessions show/events/log` subcommands) accept a unique prefix of the id
@@ -290,7 +292,11 @@ construct a pipe name from the Unix convention or use health/status transport
 metadata as a named-pipe path. The current public contract is
 `coven.daemon.v1` (prefix: `/api/v1`).
 
-The complete endpoint index — contract discovery, sessions and events, observability reads, travel, scheduler, and the hub control plane — lives in [`docs/reference/api.md`](docs/reference/api.md). [`docs/API.md`](docs/API.md) covers the architecture and auth posture, and [`docs/API-CONTRACT.md`](docs/API-CONTRACT.md) is the full versioned contract: shapes, error codes, cursor pagination, and compatibility rules.
+The public API guide and interactive endpoint reference live at
+[docs.opencoven.ai/docs/reference/api](https://docs.opencoven.ai/docs/reference/api).
+[`docs/API-CONTRACT.md`](docs/API-CONTRACT.md) remains beside the code as the
+normative versioned source contract: shapes, error codes, cursor pagination,
+and compatibility rules.
 
 ### Recommended client handshake
 
@@ -419,7 +425,7 @@ coven/
 ├── crates/
 │   ├── coven-cli/              # Main Rust binary — the `coven` command
 │   └── coven-relay/            # Internal relay crate
-├── docs/                       # Full documentation suite (see Documentation section)
+├── docs/                       # Source-adjacent contracts, maintainer docs, plans, and historical records
 ├── npm/                        # npm wrapper package source for @opencoven/cli
 ├── packages/
 │   └── openclaw-coven/         # External OpenClaw bridge plugin (@opencoven/coven)
@@ -441,7 +447,9 @@ coven/
 - **`crates/coven-cli`** — Everything that becomes the `coven` binary. This is where daemon, PTY adapter, session store, local IPC API, and CLI surface live in Rust.
 - **`packages/openclaw-coven`** — The opt-in bridge between OpenClaw and Coven. Lives here (not in OpenClaw core) to keep the trust boundary clean. Published as `@opencoven/coven`.
 - **`scripts/check-secrets.py`** — Required pre-release and pre-PR scan. Run it before pushing to avoid leaking credentials into git history.
-- **`docs/`** — The canonical documentation suite. All product docs, architecture, API contract, safety model, and roadmap live here.
+- **`docs/`** — Source-adjacent contracts, maintainer/development guidance,
+  implementation plans, and historical records. Public user documentation is
+  canonical at [docs.opencoven.ai](https://docs.opencoven.ai/).
 
 ---
 
@@ -510,32 +518,20 @@ comux is a standalone terminal cockpit that proved the tmux-cockpit model for pa
 
 ## Documentation
 
-| Document                                                | What it covers                                                        |
-| ------------------------------------------------------- | --------------------------------------------------------------------- |
-| [CLI core functionality for developers](docs/development/cli-core-functionality.md) | Command ownership, core-access contract, source map, and maintainer verification loop |
-| [Workflow guides](docs/guides/index.md)                | Runnable examples for core access, session operations, JSON automation, worktrees, and troubleshooting |
-| [Familiar memory import](docs/help/memory-import.md)   | Preview-first migration, private bundles, logical restore, and recovery |
-| [Top-level `coven` command](docs/reference/cli-coven.md) | Interactive entry point, free-text task routing, global flags, and command discovery |
-| [Getting started](docs/GETTING-STARTED.md)              | Full install → first session walkthrough                              |
-| [Concepts](docs/CONCEPTS.md)                            | Definitions: harness, session, project, ritual, daemon, store, client |
-| [Glossary](docs/GLOSSARY.md)                            | Term definitions for the full OpenCoven ecosystem                     |
-| [Architecture](docs/ARCHITECTURE.md)                    | Runtime topology, session lifecycle, authority boundary diagrams      |
-| [API contract](docs/API-CONTRACT.md)                    | Full `coven.daemon.v1` contract: shapes, cursors, error codes         |
-| [Session lifecycle](docs/SESSION-LIFECYCLE.md)          | Detailed state machine for sessions                                   |
-| [Safety model](docs/SAFETY-MODEL.md)                    | Trust boundary, local access model, data rules                        |
-| [Operational model](docs/OPERATIONAL-MODEL.md)          | Day-to-day operation and daemon management                            |
-| [Client integration guide](docs/CLIENT-INTEGRATION.md)  | How to build a client against the same-user local IPC API              |
-| [Harness adapter guide](docs/HARNESS-ADAPTERS.md)       | How to implement a new harness adapter                                |
-| [Troubleshooting](docs/TROUBLESHOOTING.md)              | Diagnose and resolve common issues                                    |
-| [Public roadmap](docs/ROADMAP.md)                       | Shipped, now, next, and later milestones                              |
-| [Product spec](docs/PRODUCT-SPEC.md)                    | Product requirements and design decisions                             |
-| [MVP plan](docs/MVP-PLAN.md)                            | Current MVP scope and checklist                                       |
-| [Future harnesses](docs/reference/future-harnesses.md)  | Research notes for upcoming adapter work                              |
-| [Brand assets](docs/BRAND.md)                           | Logo, colors, and usage guidance                                      |
-| [Design system](DESIGN.md)                              | Full brand reference: palette, typography, iconography                |
-| [Brand adherence checklist](docs/BRANDING-ADHERENCE.md) | Checklist for brand-compliant contributions                           |
-| [Documentation maintenance](docs/DOCS-MAINTENANCE.md)   | How docs are organized and kept up to date                            |
-| [Security policy](SECURITY.md)                          | Vulnerability reporting and data handling                             |
+Public installation, CLI, daemon, harness, API, memory, and troubleshooting
+documentation is canonical at **[docs.opencoven.ai](https://docs.opencoven.ai/)**.
+
+This repository keeps only documentation that must evolve with the source:
+
+| Local document | Why it remains here |
+| --- | --- |
+| [API contract](docs/API-CONTRACT.md) | Normative `coven.daemon.v1` request, response, error, and compatibility contract |
+| [Architecture](docs/ARCHITECTURE.md) | Source-adjacent crate ownership, authority boundaries, and dependency direction |
+| [Session lifecycle](docs/SESSION-LIFECYCLE.md) | Normative state-machine and persistence behavior |
+| [Harness adapter contract](docs/HARNESS-ADAPTERS.md) | Maintainer and adapter-author implementation contract |
+| [CLI core functionality](docs/development/cli-core-functionality.md) | Maintainer source map and verification loop |
+| [Documentation maintenance](docs/DOCS-MAINTENANCE.md) | Ownership rules for public docs versus repository contracts |
+| [Security policy](SECURITY.md) | Vulnerability reporting and repository security policy |
 
 ---
 
@@ -627,7 +623,8 @@ coven doctor
 | Local familiar/project/integration state is broken | Preview `coven reset --list-features`, then reset only the affected local category with `--apply` |
 | API version mismatch                        | Update Coven to match the client's expected contract, or update the client             |
 
-For the full diagnostic flowchart and detailed resolution steps, see [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md).
+For the full diagnostic flowchart and detailed resolution steps, see
+[Troubleshooting](https://docs.opencoven.ai/docs/reference/troubleshooting).
 
 ---
 
@@ -809,7 +806,9 @@ Coven is pre-1.0 software. Treat it accordingly:
 
 **Reporting vulnerabilities:** Please use [GitHub Security Advisories](https://github.com/OpenCoven/coven/security/advisories) for this repository. If advisories are unavailable, contact the maintainer privately. Do not post exploit details in public issues.
 
-See [SECURITY.md](SECURITY.md) for the full security policy and [`docs/SAFETY-MODEL.md`](docs/SAFETY-MODEL.md) for the trust boundary and local access model.
+See [SECURITY.md](SECURITY.md) for vulnerability reporting and
+[Safety](https://docs.opencoven.ai/docs/reference/safety) for the public trust
+boundary and local access model.
 
 ---
 
@@ -828,7 +827,7 @@ MIT © Valentina Alexander and the OpenCoven contributors — see [LICENSE](LICE
 | 💬 Discord              | [discord.gg/opencoven](https://discord.gg/opencoven)       |
 | 🐦 X / Twitter          | [@OpenCvn](https://x.com/OpenCvn)                          |
 | 🐛 Issues & Bug Reports | [GitHub Issues](https://github.com/OpenCoven/coven/issues) |
-| 📖 Documentation        | [`docs/` directory](docs/)                                 |
+| 📖 Documentation        | [docs.opencoven.ai](https://docs.opencoven.ai/)             |
 | 🗺️ Public Roadmap       | [docs/ROADMAP.md](docs/ROADMAP.md)                         |
 
 ---

@@ -11,6 +11,10 @@ description: "Coven uses a same-user local IPC access model rather than OAuth or
 
 _Last updated: 2026-05-26_
 
+> The canonical public overview is
+> [Authentication](https://docs.opencoven.ai/docs/reference/auth). This file
+> remains beside the code for detailed threat-model and implementation notes.
+
 Coven does not currently have daemon-level user authentication in the OAuth, JWT, bearer-token, API-key, browser-cookie, or hosted-account sense.
 
 The current solution is a **same-user local access model**:

@@ -6,4 +6,5 @@ title: "Archive"
 description: "The archive ritual hides a non-running Coven session from the active list while preserving its record and events. Reversible. Refuses live sessions."
 ---
 
-Stub — fill in. Rituals refuse live sessions; sacrifice requires `--yes`.
+Canonical documentation:
+[Archive](https://docs.opencoven.ai/docs/cli/sessions#archive).

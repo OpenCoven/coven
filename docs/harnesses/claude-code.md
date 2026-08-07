@@ -95,4 +95,4 @@ Claude Code's tool calls run inside the Claude process — Coven does not arbitr
 
 - [Installing harness CLIs](/harnesses/installing)
 - [Provider auth boundary](/harnesses/provider-auth)
-- [Troubleshooting](/TROUBLESHOOTING#harness-missing)
+- [Troubleshooting](https://docs.opencoven.ai/docs/harnesses/troubleshooting)

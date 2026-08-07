@@ -6,4 +6,5 @@ title: "Handoff (Phase 1)"
 description: "Phase 1 handoff between familiars in OpenCoven: how one named agent passes session state, memory, and intent to another familiar in the same workflow."
 ---
 
-Stub — fill in. See [Familiars overview](/familiars).
+See the source
+[`coven-handoff-packet` product contract](../../specs/coven-handoff-packet/PRODUCT.md).

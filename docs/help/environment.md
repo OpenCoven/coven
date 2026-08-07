@@ -50,5 +50,5 @@ TERM=xterm-256color coven tui
 | `XDG_CONFIG_HOME` | Overrides the root containing `coven/settings.json`. This is separate from `COVEN_HOME`; without it, settings use `$HOME/.config/coven/settings.json`. |
 
 Use `coven config paths --json` to audit the paths selected for the current
-process without creating profile state. See [Getting started](/GETTING-STARTED)
+process without creating profile state. See [Getting started](https://docs.opencoven.ai/docs/guide/getting-started)
 for the default setup flow and daemon checks.

@@ -246,11 +246,11 @@ The response provides the active named `apiVersion`, all nine health
 `socket`) plus the optional hub summary. Treat a dependent operation as
 unavailable until its required capability fields have been checked.
 
-See [Coven Local API](/API) for response examples and architecture notes, and the [API contract](/API-CONTRACT) for stable shapes, versioning, and failure envelopes.
+See the [public API guide](https://docs.opencoven.ai/docs/reference/api) for response examples and architecture notes, and the [API contract](/API-CONTRACT) for stable shapes, versioning, and failure envelopes.
 
 ## Related
 
-- [Coven Local API](/API)
+- [Public API guide](https://docs.opencoven.ai/docs/reference/api)
 - [API contract](/API-CONTRACT)
 - [Authentication and local access](/AUTH)
 - [Client integration](/CLIENT-INTEGRATION)

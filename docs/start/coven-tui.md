@@ -162,7 +162,7 @@ These verbs produce stable, scriptable output and are the same ones the TUI ulti
 
 ## Related
 
-- [Get started with Coven](/GETTING-STARTED)
+- [Get started with Coven](https://docs.opencoven.ai/docs/guide/getting-started)
 - [Session lifecycle](/SESSION-LIFECYCLE)
 - [CLI reference](/reference/cli)
-- [Troubleshooting](/TROUBLESHOOTING)
+- [Troubleshooting](https://docs.opencoven.ai/docs/reference/troubleshooting)

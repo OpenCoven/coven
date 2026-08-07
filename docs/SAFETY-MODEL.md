@@ -9,6 +9,10 @@ description: "Coven's local-first safety boundary: trust the Rust daemon, treat 
 
 # Coven safety model
 
+> The canonical public overview is
+> [Safety](https://docs.opencoven.ai/docs/reference/safety). This file remains
+> beside the code as the detailed source-adjacent safety contract.
+
 Coven is local-first, but local does not mean harmless. It can launch agent harnesses in real repositories, forward input to live processes, and preserve logs. This document states the safety boundaries that docs, clients, and code should preserve.
 
 ## Trust boundary

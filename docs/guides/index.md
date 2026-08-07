@@ -28,6 +28,6 @@ Use these guides when you want a verified task flow rather than a list of flags.
 
 ## Related
 
-- [Getting started](/GETTING-STARTED)
+- [Getting started](https://docs.opencoven.ai/docs/guide/getting-started)
 - [CLI reference](/reference/cli)
 - [Developer core-functionality guide](/development/cli-core-functionality)

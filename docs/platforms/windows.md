@@ -73,4 +73,4 @@ terminal and run it again so `PATH` is refreshed.
 
 - [Windows install](/install/windows)
 - [WSL2](/platforms/wsl2)
-- [Troubleshooting](/TROUBLESHOOTING)
+- [Troubleshooting](https://docs.opencoven.ai/docs/reference/troubleshooting)

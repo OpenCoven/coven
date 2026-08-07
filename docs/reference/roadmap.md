@@ -8,4 +8,4 @@ description: "Roadmap reference for OpenCoven: CastCodes as the primary public w
 
 > Canonical content currently lives in the [public roadmap](/ROADMAP) (`docs/ROADMAP.md`). This reference page will be filled in as milestone detail stabilizes.
 
-Stub — fill in.
+The source-adjacent roadmap remains in [`../ROADMAP.md`](../ROADMAP.md).

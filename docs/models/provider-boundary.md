@@ -6,4 +6,5 @@ title: "Provider boundary"
 description: "Where the credential boundary sits for OpenCoven: at the harness CLI, not the Coven daemon. Each harness owns its own login and token storage."
 ---
 
-Stub — fill in.
+Canonical documentation:
+[Provider boundary](https://docs.opencoven.ai/docs/memory-models/provider-boundary).

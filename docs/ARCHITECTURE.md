@@ -9,6 +9,11 @@ description: "Coven runtime topology: the Rust daemon, CLI, TUI, comux, and Open
 
 # Coven Architecture
 
+> The canonical public overview is
+> [Architecture](https://docs.opencoven.ai/docs/guide/architecture). This file
+> remains beside the code for crate ownership, dependency direction, and
+> source-adjacent authority details.
+
 Coven is a local-first harness substrate. The Rust CLI/daemon is the authority layer; clients such as the CLI TUI, comux, and the optional OpenClaw plugin are presentation/integration layers.
 
 The versioned local socket API contract lives in [`docs/API-CONTRACT.md`](API-CONTRACT.md). Clients should use `GET /api/v1/health` and its named `apiVersion` plus the

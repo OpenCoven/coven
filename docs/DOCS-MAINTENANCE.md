@@ -5,16 +5,46 @@ description: "Maintenance rules for the public Coven docs: safe examples, canoni
 
 # Documentation Maintenance
 
-These rules keep the public docs useful, accurate, and free of private material.
+These rules keep repository documentation accurate and define the boundary
+between this source repository and the canonical public documentation site.
 
-## Public docs stance
+## Documentation ownership
 
-Docs in this repository are public product docs. They should describe OpenCoven and Coven without depending on private workspaces, private chats, private infrastructure, or unreleased assumptions.
+Public user documentation is canonical in
+[`OpenCoven/coven-docs`](https://github.com/OpenCoven/coven-docs) and published
+at [docs.opencoven.ai](https://docs.opencoven.ai/).
+
+Keep documentation in this repository only when it must evolve with the code:
+
+- normative API, adapter, lifecycle, or authority-boundary contracts;
+- contributor, security, release, and repository policy;
+- maintainer/development source maps and verification procedures;
+- implementation specs, plans, design records, and historical notes;
+- package- or crate-specific READMEs.
+
+Installation, onboarding, CLI usage, daemon operation, harness setup, public API
+guides, memory guides, and troubleshooting belong in `coven-docs`. Repository
+entry points should link to the canonical page instead of copying its content.
+
+When moving a topic:
+
+1. Add any missing current behavior to `coven-docs`.
+2. Verify the canonical page and stable URL.
+3. Replace the repository copy with a short pointer or remove it after updating
+   inbound links.
+4. Keep normative details here only when the public page links back to the
+   source contract.
+
+## Public content stance
+
+All committed documentation is public. It should describe OpenCoven and Coven
+without depending on private workspaces, private chats, private
+infrastructure, or unreleased assumptions.
 
 Use examples that are safe to publish:
 
 - `/path/to/project`
-- `/Users/example/.coven/coven.sock`
+- `~/.coven/coven.sock`
 - `session-1`
 - `intent-1`
 - `https://github.com/OpenCoven/coven`
@@ -88,7 +118,7 @@ Avoid claiming a package is "latest" unless you have just verified the registry 
 Prefer relative repo links for internal docs:
 
 ```md
-[Local API](API.md)
+[API contract](API-CONTRACT.md)
 ```
 
 Use full URLs only for external resources and public community links.

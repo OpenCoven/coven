@@ -6,4 +6,5 @@ title: "Capability discovery"
 description: "How clients call GET /api/v1/capabilities to discover Coven daemon features, supported harnesses, and action ids before depending on response shapes."
 ---
 
-Stub — fill in.
+Canonical documentation:
+[API capability discovery](https://docs.opencoven.ai/docs/reference/api).

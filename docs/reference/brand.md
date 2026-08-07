@@ -6,4 +6,7 @@ title: "Brand"
 description: "Brand reference for OpenCoven and Coven: naming, logo files, color palette, voice, and how to use the marks in docs, sites, and integrations."
 ---
 
-Stub — fill in.
+Canonical source-adjacent references:
+
+- [`../../DESIGN.md`](../../DESIGN.md)
+- [`../../brand/docs/BRAND-USAGE.md`](../../brand/docs/BRAND-USAGE.md)

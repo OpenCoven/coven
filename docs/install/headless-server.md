@@ -96,4 +96,4 @@ Make sure the supervisor has the same `PATH` that exposes `coven`, `codex`, and 
 - [Linux install](/install/linux)
 - [COVEN_HOME layout](/daemon/coven-home)
 - [Daemon lifecycle](/daemon/lifecycle)
-- [Troubleshooting](/TROUBLESHOOTING)
+- [Troubleshooting](https://docs.opencoven.ai/docs/reference/troubleshooting)

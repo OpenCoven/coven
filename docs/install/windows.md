@@ -93,8 +93,8 @@ coven sessions
 
 ## Related
 
-- [Get started with Coven](/GETTING-STARTED)
+- [Get started with Coven](https://docs.opencoven.ai/docs/guide/getting-started)
 - [Install overview](/install/index)
 - [Coven TUI](/start/coven-tui)
-- [Troubleshooting](/TROUBLESHOOTING)
+- [Troubleshooting](https://docs.opencoven.ai/docs/reference/troubleshooting)
 - [CLI reference](/reference/cli)

@@ -47,7 +47,9 @@ A healthy first pass means the workspace builds, `doctor` prints the local store
 
 The smoke test is safe for first-time contributors because it uses an isolated temporary `COVEN_HOME` and injects a fake `codex` executable into `PATH`. It does not require private Codex or Claude credentials.
 
-After this first pass, use the fuller local loop below. For product context, start with the [README](README.md) and [Getting started](docs/GETTING-STARTED.md) guide.
+After this first pass, use the fuller local loop below. For product context,
+start with the [README](README.md) and the canonical
+[Getting started](https://docs.opencoven.ai/docs/guide/getting-started) guide.
 
 ## Local Development
 
