@@ -67,7 +67,10 @@ The same response includes `storage` health. Its `writerBacklogEvents` and
 the remaining fields report SQLite/WAL size, retention and checkpoint age, free
 disk, and maintenance errors. `critical` means the free-disk safety watermark
 has paused scheduled maintenance; `degraded` means storage health could not be
-collected.
+collected. Live free-disk state takes precedence: while disk is below the
+watermark the status is `critical` even if a prior collection failure left the
+snapshot degraded, and `lastMaintenanceError` still reports that earlier
+failure. The status returns to `degraded` once free disk recovers.
 
 ## Status values
 

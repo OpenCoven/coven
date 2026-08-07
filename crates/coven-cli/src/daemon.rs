@@ -5777,7 +5777,10 @@ mod tests {
             crate::store::MAINTENANCE_MIN_FREE_DISK_BYTES - 1,
             None,
         )?;
-        assert_eq!(health.status, "degraded");
+        // Live low disk outranks the degraded snapshot, and the degraded
+        // reason is still reported alongside the critical status.
+        assert_eq!(health.status, "critical");
+        assert!(health.maintenance_blocked);
         assert_eq!(
             health.free_disk_bytes,
             crate::store::MAINTENANCE_MIN_FREE_DISK_BYTES - 1

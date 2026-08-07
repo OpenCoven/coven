@@ -3709,10 +3709,14 @@ pub(crate) fn cached_storage_health_with_free_disk(
     }
     health.prune_age_seconds = maintenance_age_seconds(health.last_prune_at.as_deref());
     health.checkpoint_age_seconds = maintenance_age_seconds(health.last_checkpoint_at.as_deref());
-    if snapshot.degraded {
-        health.status = "degraded".to_string();
-    } else if health.maintenance_blocked {
+    // Live free-disk state outranks a stale degraded snapshot: a maintenance
+    // failure recorded earlier must not mask the store being unwritable now.
+    // `last_maintenance_error` is carried over from the snapshot either way, so
+    // the degraded reason survives the promotion to critical.
+    if health.maintenance_blocked {
         health.status = "critical".to_string();
+    } else if snapshot.degraded {
+        health.status = "degraded".to_string();
     } else if snapshot.retention_lagging
         || health.free_disk_bytes < MAINTENANCE_WARN_FREE_DISK_BYTES
         || health.wal_bytes >= MAINTENANCE_CHECKPOINT_WAL_BYTES
@@ -5805,6 +5809,52 @@ mod tests {
         assert_eq!(health.wal_bytes, 0);
         assert!(!health.maintenance_blocked);
         assert_eq!(health.status, "ok");
+        Ok(())
+    }
+
+    #[test]
+    fn critical_low_disk_outranks_a_degraded_snapshot_until_disk_recovers() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let home = temp_dir.path();
+        let conn = open_store(&home.join("coven.sqlite3"))?;
+        refresh_storage_health_snapshot_from_connection_with_free_disk(
+            home,
+            &conn,
+            MAINTENANCE_WARN_FREE_DISK_BYTES,
+            None,
+        )?;
+        mark_storage_health_snapshot_maintenance_failure(
+            home,
+            Some(MAINTENANCE_WARN_FREE_DISK_BYTES),
+            None,
+        )?;
+
+        let degraded =
+            cached_storage_health_with_free_disk(home, MAINTENANCE_WARN_FREE_DISK_BYTES, None)?;
+        assert_eq!(degraded.status, "degraded");
+        assert!(!degraded.maintenance_blocked);
+        assert_eq!(
+            degraded.last_maintenance_error.as_deref(),
+            Some(MAINTENANCE_LAST_ERROR_PUBLIC_MESSAGE)
+        );
+
+        let critical =
+            cached_storage_health_with_free_disk(home, MAINTENANCE_MIN_FREE_DISK_BYTES - 1, None)?;
+        assert_eq!(critical.status, "critical");
+        assert!(critical.maintenance_blocked);
+        assert_eq!(
+            critical.last_maintenance_error.as_deref(),
+            Some(MAINTENANCE_LAST_ERROR_PUBLIC_MESSAGE)
+        );
+
+        let recovered =
+            cached_storage_health_with_free_disk(home, MAINTENANCE_WARN_FREE_DISK_BYTES, None)?;
+        assert_eq!(recovered.status, "degraded");
+        assert!(!recovered.maintenance_blocked);
+        assert_eq!(
+            recovered.last_maintenance_error.as_deref(),
+            Some(MAINTENANCE_LAST_ERROR_PUBLIC_MESSAGE)
+        );
         Ok(())
     }
 
