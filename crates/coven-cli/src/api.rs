@@ -2043,26 +2043,21 @@ fn emit_handoff(coven_home: &Path, session_id: &str, body: Option<&str>) -> Resu
         return session_not_live_response(session_id);
     }
     let workspace = WorkspaceSnapshot::capture(Path::new(&session.project_root));
-    let event_cursor = store::list_events(&conn, session_id)?
-        .last()
-        .map(|event| event.seq)
-        .unwrap_or(0);
     let now = current_timestamp();
     let record = store::create_handoff(
         &mut conn,
         &format!("handoff_{}", Uuid::new_v4()),
         session_id,
         &serde_json::to_string(&packet)?,
-        event_cursor,
         &serde_json::to_string(&workspace)?,
         &now,
     )?;
     json_response(
         201,
         &json!({
+            "eventCursor": record.event_cursor,
             "handoff": record,
             "packet": packet,
-            "eventCursor": event_cursor,
             "workspace": workspace,
         }),
     )
@@ -2118,20 +2113,6 @@ fn claim_session_handoff(coven_home: &Path, path: &str, body: Option<&str>) -> R
     let source_workspace: WorkspaceSnapshot = serde_json::from_str(&handoff.workspace_json)
         .context("stored handoff workspace snapshot is invalid")?;
     let current_workspace = WorkspaceSnapshot::capture(Path::new(&session.project_root));
-    let current_cursor = store::list_events(&conn, session_id)?
-        .last()
-        .map(|event| event.seq)
-        .unwrap_or(0);
-    if current_cursor != handoff.event_cursor {
-        return api_error(
-            409,
-            "transcript_diverged",
-            "Source transcript changed after the handoff snapshot.",
-            Some(
-                json!({ "handoffId": handoff_id, "expectedCursor": handoff.event_cursor, "actualCursor": current_cursor }),
-            ),
-        );
-    }
     if !source_workspace.compatible_with(&current_workspace)
         || !source_workspace.compatible_with(&request.destination_workspace)
     {
@@ -2182,25 +2163,10 @@ fn acknowledge_session_handoff(
     if handoff.session_id != session_id {
         return api_error(404, "handoff_not_found", "Handoff was not found.", None);
     }
-    let current_cursor = store::list_events(&conn, session_id)?
-        .last()
-        .map(|event| event.seq)
-        .unwrap_or(0);
-    if current_cursor != handoff.event_cursor {
-        return api_error(
-            409,
-            "transcript_diverged",
-            "Source transcript changed after the handoff snapshot.",
-            Some(
-                json!({ "handoffId": handoff_id, "expectedCursor": handoff.event_cursor, "actualCursor": current_cursor }),
-            ),
-        );
-    }
     let acknowledged = match store::acknowledge_handoff(
         &mut conn,
         handoff_id,
         &request.claimant,
-        current_cursor,
         &current_timestamp(),
     ) {
         Ok(record) => record,
@@ -9341,6 +9307,14 @@ mod tests {
         let offered: Value = serde_json::from_str(&offered.body)?;
         let handoff_id = offered["handoff"]["id"].as_str().unwrap();
         let generation = offered["handoff"]["generation"].as_i64().unwrap();
+        let conn = crate::store::open_store(&temp.path().join("coven.sqlite3"))?;
+        crate::store::insert_json_event(
+            &conn,
+            "session-1",
+            "output",
+            &json!({ "data": "new source output" }),
+            "2026-08-04T00:00:01Z",
+        )?;
         let input = handle_request_with_body(
             "POST",
             "/sessions/session-1/input",
@@ -9349,13 +9323,19 @@ mod tests {
             Some(r#"{"data":"new source input"}"#),
         )?;
         assert_eq!(input.status, 202);
-        let transcript_conflict = handle_request_with_body(
+        let claimed = handle_request_with_body(
             "POST", &format!("/sessions/session-1/handoffs/{handoff_id}/claim"), temp.path(), None,
             Some(&json!({ "expectedGeneration": generation, "claimant": "device:phone-1", "idempotencyKey": "claim-1", "destinationWorkspace": workspace }).to_string()),
         )?;
-        assert_eq!(transcript_conflict.status, 409);
-        let body: Value = serde_json::from_str(&transcript_conflict.body)?;
-        assert_eq!(body["error"]["code"], "transcript_diverged");
+        assert_eq!(claimed.status, 200);
+        let acknowledged = handle_request_with_body(
+            "POST",
+            &format!("/sessions/session-1/handoffs/{handoff_id}/ack"),
+            temp.path(),
+            None,
+            Some(r#"{"claimant":"device:phone-1"}"#),
+        )?;
+        assert_eq!(acknowledged.status, 200);
 
         let fresh = handle_request_with_body(
             "POST",

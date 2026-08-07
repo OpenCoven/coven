@@ -46,6 +46,12 @@ const BOUNDED_PRUNE_SENSITIVE_ARTIFACTS_BY_CREATED_AT_SQL: &str = "DELETE FROM s
         ORDER BY created_at, rowid
         LIMIT ?2
      )";
+const EVENT_NOT_PINNED_BY_UNRESOLVED_HANDOFF_SQL: &str = "NOT EXISTS (
+  SELECT 1 FROM session_handoffs AS handoff
+  WHERE handoff.session_id = event.session_id
+    AND handoff.state IN ('offered', 'claimed')
+    AND event.rowid <= handoff.event_cursor
+)";
 pub const DEFAULT_SESSION_PAGE_LIMIT: usize = 100;
 pub const MAX_SESSION_PAGE_LIMIT: usize = 1_000;
 
@@ -2999,13 +3005,17 @@ pub fn create_handoff(
     id: &str,
     session_id: &str,
     packet_json: &str,
-    event_cursor: i64,
     workspace_json: &str,
     now: &str,
 ) -> Result<HandoffRecord> {
     let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let generation: i64 = transaction.query_row(
         "SELECT COALESCE(MAX(generation), 0) + 1 FROM session_handoffs WHERE session_id = ?1",
+        [session_id],
+        |row| row.get(0),
+    )?;
+    let event_cursor: i64 = transaction.query_row(
+        "SELECT COALESCE(MAX(rowid), 0) FROM events WHERE session_id = ?1",
         [session_id],
         |row| row.get(0),
     )?;
@@ -3082,6 +3092,16 @@ pub fn claim_handoff(
         }
         bail!("handoff_already_claimed");
     }
+    let actual_cursor: i64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(rowid), 0) FROM events WHERE session_id = ?1",
+            [&current.session_id],
+            |row| row.get(0),
+        )
+        .context("failed to read latest event sequence")?;
+    if actual_cursor < current.event_cursor {
+        bail!("transcript_diverged");
+    }
     let input_in_flight: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM session_input_leases WHERE session_id = ?1)",
         [&current.session_id],
@@ -3109,7 +3129,6 @@ pub fn acknowledge_handoff(
     conn: &mut Connection,
     handoff_id: &str,
     claimant: &str,
-    event_cursor: i64,
     now: &str,
 ) -> Result<HandoffRecord> {
     let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -3121,9 +3140,6 @@ pub fn acknowledge_handoff(
     if current.claimant.as_deref() != Some(claimant) {
         bail!("claimant_mismatch");
     }
-    if current.event_cursor != event_cursor {
-        bail!("transcript_diverged");
-    }
     match current.state.as_str() {
         "acknowledged" => {
             transaction.commit()?;
@@ -3131,6 +3147,16 @@ pub fn acknowledge_handoff(
         }
         "claimed" => {}
         _ => bail!("handoff_not_claimed"),
+    }
+    let actual_cursor: i64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(rowid), 0) FROM events WHERE session_id = ?1",
+            [&current.session_id],
+            |row| row.get(0),
+        )
+        .context("failed to read latest event sequence")?;
+    if actual_cursor < current.event_cursor {
+        bail!("transcript_diverged");
     }
     transaction.execute(
         "UPDATE session_handoffs SET state = 'acknowledged', updated_at = ?2 WHERE id = ?1",
@@ -3238,6 +3264,16 @@ pub fn release_session_input_lease(conn: &Connection, lease_id: &str) -> Result<
 
 pub fn list_events(conn: &Connection, session_id: &str) -> Result<Vec<EventRecord>> {
     list_events_with_options(conn, session_id, &EventsQueryOptions::default())
+}
+
+#[cfg(test)]
+pub fn latest_event_seq(conn: &Connection, session_id: &str) -> Result<i64> {
+    conn.query_row(
+        "SELECT COALESCE(MAX(rowid), 0) FROM events WHERE session_id = ?1",
+        [session_id],
+        |row| row.get(0),
+    )
+    .context("failed to read latest event sequence")
 }
 
 pub fn event_kind_exists(conn: &Connection, session_id: &str, kind: &str) -> Result<bool> {
@@ -3410,7 +3446,11 @@ pub fn count_prunable_sensitive_artifacts(
 
 pub fn count_events_older_than(conn: &Connection, cutoff: &str) -> Result<i64> {
     conn.query_row(
-        "SELECT COUNT(*) FROM events WHERE created_at < ?1",
+        &format!(
+            "SELECT COUNT(*) FROM events AS event
+             WHERE event.created_at < ?1
+               AND {EVENT_NOT_PINNED_BY_UNRESOLVED_HANDOFF_SQL}"
+        ),
         params![cutoff],
         |row| row.get(0),
     )
@@ -3430,8 +3470,15 @@ pub fn prune_sensitive_artifacts(
 }
 
 pub fn prune_events_older_than(conn: &Connection, cutoff: &str) -> Result<usize> {
-    conn.execute("DELETE FROM events WHERE created_at < ?1", params![cutoff])
-        .context("failed to prune events")
+    conn.execute(
+        &format!(
+            "DELETE FROM events AS event
+             WHERE event.created_at < ?1
+               AND {EVENT_NOT_PINNED_BY_UNRESOLVED_HANDOFF_SQL}"
+        ),
+        params![cutoff],
+    )
+    .context("failed to prune events")
 }
 
 /// Delete at most one maintenance batch of expired events in a single
@@ -3448,13 +3495,16 @@ pub fn prune_events_older_than_bounded(
         .context("failed to start bounded event-prune transaction")?;
     let pruned = tx
         .execute(
-            "DELETE FROM events
-             WHERE rowid IN (
-                SELECT rowid FROM events
-                WHERE created_at < ?1
-                ORDER BY created_at, rowid
-                LIMIT ?2
-             )",
+            &format!(
+                "DELETE FROM events AS event
+                 WHERE event.rowid IN (
+                    SELECT event.rowid FROM events AS event
+                    WHERE event.created_at < ?1
+                      AND {EVENT_NOT_PINNED_BY_UNRESOLVED_HANDOFF_SQL}
+                    ORDER BY event.created_at, event.rowid
+                    LIMIT ?2
+                 )"
+            ),
             params![cutoff, limit.max(1)],
         )
         .context("failed to prune bounded event batch")?;
@@ -6263,6 +6313,146 @@ mod tests {
         assert!(events[0].seq > 0);
         assert!(events[1].seq > events[0].seq);
         assert!(events[2].seq > events[1].seq);
+        Ok(())
+    }
+
+    #[test]
+    fn latest_event_seq_returns_zero_for_empty_and_last_rowid_for_session() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+        insert_session(&conn, &session_record("session-1", "2026-04-27T06:00:00Z"))?;
+
+        assert_eq!(latest_event_seq(&conn, "session-1")?, 0);
+
+        for i in 1..=3 {
+            insert_json_event(
+                &conn,
+                "session-1",
+                "output",
+                &serde_json::json!({ "data": format!("line {i}") }),
+                "2026-04-27T06:01:00Z",
+            )?;
+        }
+
+        assert_eq!(
+            latest_event_seq(&conn, "session-1")?,
+            list_events(&conn, "session-1")?[2].seq
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unresolved_handoff_events_are_not_pruned() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let mut conn = open_store(&temp_dir.path().join("coven.db"))?;
+        let now = "2026-04-27T06:00:00Z";
+        let cutoff = "2026-04-15T00:00:00Z";
+        insert_session(&conn, &session_record("session-1", now))?;
+        insert_json_event(
+            &conn,
+            "session-1",
+            "output",
+            &serde_json::json!({ "data": "old handoff event" }),
+            "2026-04-01T00:00:00Z",
+        )?;
+        let offered = create_handoff(&mut conn, "handoff-1", "session-1", "{}", "{}", now)?;
+        assert_eq!(offered.event_cursor, latest_event_seq(&conn, "session-1")?);
+        assert_eq!(count_events_older_than(&conn, cutoff)?, 0);
+        assert_eq!(prune_events_older_than(&conn, cutoff)?, 0);
+        assert_eq!(prune_events_older_than_bounded(&conn, cutoff, 1)?, 0);
+
+        claim_handoff(
+            &mut conn,
+            &offered.id,
+            offered.generation,
+            "device:phone-1",
+            "claim-1",
+            now,
+        )?;
+        assert_eq!(count_events_older_than(&conn, cutoff)?, 0);
+        assert_eq!(prune_events_older_than(&conn, cutoff)?, 0);
+        assert_eq!(prune_events_older_than_bounded(&conn, cutoff, 1)?, 0);
+
+        let acknowledged = acknowledge_handoff(&mut conn, &offered.id, "device:phone-1", now)?;
+        assert_eq!(count_events_older_than(&conn, cutoff)?, 1);
+        assert_eq!(prune_events_older_than(&conn, cutoff)?, 1);
+        assert!(list_events(&conn, "session-1")?.is_empty());
+
+        assert_eq!(
+            acknowledge_handoff(&mut conn, &offered.id, "device:phone-1", now)?,
+            acknowledged
+        );
+        assert_eq!(
+            claim_handoff(
+                &mut conn,
+                &offered.id,
+                offered.generation,
+                "device:phone-1",
+                "claim-1",
+                now,
+            )?,
+            acknowledged
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn handoff_transition_rejects_missing_cursor() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let mut conn = open_store(&temp_dir.path().join("coven.db"))?;
+        let now = "2026-04-27T06:00:00Z";
+        insert_session(&conn, &session_record("session-1", now))?;
+        insert_json_event(
+            &conn,
+            "session-1",
+            "output",
+            &serde_json::json!({ "data": "handoff event" }),
+            now,
+        )?;
+        let invalid_offered =
+            create_handoff(&mut conn, "handoff-missing", "session-1", "{}", "{}", now)?;
+        let latest_cursor = latest_event_seq(&conn, "session-1")?;
+        conn.execute(
+            "UPDATE session_handoffs SET event_cursor = ?2 WHERE id = ?1",
+            params![invalid_offered.id, latest_cursor + 1],
+        )?;
+        let error = claim_handoff(
+            &mut conn,
+            &invalid_offered.id,
+            invalid_offered.generation,
+            "device:phone-1",
+            "claim-1",
+            now,
+        )
+        .expect_err("claim must reject a missing handoff cursor");
+        assert_eq!(error.to_string(), "transcript_diverged");
+        assert_eq!(
+            get_handoff(&conn, &invalid_offered.id)?.unwrap().state,
+            "offered"
+        );
+
+        let claimed_offered =
+            create_handoff(&mut conn, "handoff-claimed", "session-1", "{}", "{}", now)?;
+        claim_handoff(
+            &mut conn,
+            &claimed_offered.id,
+            claimed_offered.generation,
+            "device:phone-1",
+            "claim-2",
+            now,
+        )?;
+        conn.execute(
+            "DELETE FROM events WHERE rowid = ?1",
+            [claimed_offered.event_cursor],
+        )?;
+
+        let error = acknowledge_handoff(&mut conn, &claimed_offered.id, "device:phone-1", now)
+            .expect_err("acknowledgement must reject a removed handoff cursor");
+        assert_eq!(error.to_string(), "transcript_diverged");
+        assert_eq!(
+            get_handoff(&conn, &claimed_offered.id)?.unwrap().state,
+            "claimed"
+        );
         Ok(())
     }
 
