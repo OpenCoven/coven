@@ -411,7 +411,7 @@ fn apply_ward_audit_schema_state(conn: &Connection, schema_state: &str) -> Resul
         WARD_AUDIT_SCHEMA_STATE_UNKNOWN => {
             anyhow::bail!("unsupported ward_audit schema fingerprint")
         }
-        _ => anyhow::bail!("unsupported ward_audit schema fingerprint state"),
+        _ => anyhow::bail!("unsupported ward_audit schema fingerprint state: {schema_state}"),
     }
 }
 
@@ -4451,6 +4451,19 @@ END;
         )?;
         assert_eq!(unexpected_column_count, 1);
         Ok(())
+    }
+
+    #[test]
+    fn ward_audit_unrecognized_fingerprint_state_names_the_value() {
+        let conn = Connection::open_in_memory().expect("in-memory database should open");
+
+        let error = apply_ward_audit_schema_state(&conn, "future_v999")
+            .expect_err("unrecognized fingerprint state must fail closed");
+
+        assert!(
+            error.to_string().contains("future_v999"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]
