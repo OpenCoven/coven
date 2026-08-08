@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -158,6 +158,26 @@ impl PairingManager {
         pending.retain(|_, pairing| pairing.expires_at > now || retain_expired(pairing));
     }
 
+    /// Take the pending map, dropping every expired pairing except `addressed`.
+    ///
+    /// Completed pairings are held until their invitation expires so either
+    /// confirmer can retry, so nothing else would evict them once both sides
+    /// stop calling; sweeping on each operation bounds the map without a timer.
+    /// The addressed pairing survives the sweep so the caller still reports its
+    /// own expiry as `PairingExpired` rather than `PairingConsumed`.
+    fn lock_pending(
+        &self,
+        now: DateTime<Utc>,
+        addressed: Uuid,
+    ) -> Result<MutexGuard<'_, HashMap<Uuid, PendingPairing>>, PairingError> {
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| PairingError::InvalidRequest)?;
+        Self::prune_expired(&mut pending, now, |pairing| pairing.id == addressed);
+        Ok(pending)
+    }
+
     pub fn enroll(
         &self,
         pairing_id: Uuid,
@@ -166,10 +186,7 @@ impl PairingManager {
         host_fingerprint: [u8; 32],
         now: DateTime<Utc>,
     ) -> Result<EnrolledPairing, PairingError> {
-        let mut pending = self
-            .pending
-            .lock()
-            .map_err(|_| PairingError::InvalidRequest)?;
+        let mut pending = self.lock_pending(now, pairing_id)?;
         let pairing = pending
             .get_mut(&pairing_id)
             .ok_or(PairingError::PairingConsumed)?;
@@ -258,10 +275,7 @@ impl PairingManager {
         pairing_id: Uuid,
         now: DateTime<Utc>,
     ) -> Result<Option<[String; 6]>, PairingError> {
-        let mut pending = self
-            .pending
-            .lock()
-            .map_err(|_| PairingError::InvalidRequest)?;
+        let mut pending = self.lock_pending(now, pairing_id)?;
         let pairing = pending
             .get(&pairing_id)
             .ok_or(PairingError::PairingConsumed)?;
@@ -279,10 +293,7 @@ impl PairingManager {
         now: DateTime<Utc>,
         host: bool,
     ) -> Result<PairingProgress, PairingError> {
-        let mut pending = self
-            .pending
-            .lock()
-            .map_err(|_| PairingError::InvalidRequest)?;
+        let mut pending = self.lock_pending(now, pairing_id)?;
         let pairing = pending
             .get_mut(&pairing_id)
             .ok_or(PairingError::PairingConsumed)?;
@@ -759,6 +770,59 @@ mod tests {
         assert!(manager.pending.lock().unwrap().contains_key(&next.id));
         assert!(!manager.pending.lock().unwrap().contains_key(&pairing_id));
         assert_eq!(manager.registry.list_status().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn any_pairing_operation_prunes_other_expired_entries() {
+        for prune_via in ["phrase", "confirm", "enroll"] {
+            let harness = PairingHarness::new();
+            let pending = harness.enroll();
+            harness.confirm_host(&pending.phrase);
+            assert_complete(harness.confirm_device(&pending.phrase), false);
+
+            let live_id = Uuid::from_u128(2);
+            let live_nonce = [11; 32];
+            harness
+                .manager
+                .begin_pairing_with_id(live_id, live_nonce, harness.now + Duration::minutes(30))
+                .unwrap();
+            assert_eq!(harness.manager.pending.lock().unwrap().len(), 2);
+
+            let after_first_expiry = harness.now + Duration::minutes(6);
+            match prune_via {
+                "phrase" => assert_eq!(
+                    harness.manager.phrase(live_id, after_first_expiry).unwrap(),
+                    None
+                ),
+                "confirm" => assert_eq!(
+                    harness
+                        .manager
+                        .confirm_host(live_id, &pending.phrase, after_first_expiry)
+                        .unwrap_err(),
+                    PairingError::PairingConfirmationRequired
+                ),
+                _ => {
+                    harness
+                        .manager
+                        .enroll(
+                            live_id,
+                            live_nonce,
+                            harness.request.clone(),
+                            [3; 32],
+                            after_first_expiry,
+                        )
+                        .unwrap();
+                }
+            }
+
+            let remaining = harness.manager.pending.lock().unwrap();
+            assert_eq!(
+                remaining.len(),
+                1,
+                "{prune_via} left the expired completed pairing behind"
+            );
+            assert!(remaining.contains_key(&live_id));
+        }
     }
 
     #[test]
