@@ -6,6 +6,74 @@ read_when:
 title: "Coven changelog and release notes"
 ---
 
+## Week of August 8, 2026
+
+### New features
+
+- **AgentFS-compatible storage foundation.** The experimental `coven-afs`
+  crate implements an AgentFS SPEC v0.4-compatible SQLite filesystem, JSON
+  key/value storage, an insert-only tool-call audit log, and copy-on-write
+  base/delta overlays. This release provides the storage engine only—there is
+  no FUSE/NFS mount or daemon/Cave surface yet. See
+  [PR #658](https://github.com/OpenCoven/coven/pull/658) and
+  [PR #678](https://github.com/OpenCoven/coven/pull/678).
+
+### Updates
+
+- **Canonical public documentation and Windows IPC discovery.** Public guides
+  now point to `docs.opencoven.ai` as the single source of truth. Native
+  Windows clients should obtain the fully qualified named-pipe endpoint from
+  `state.daemon_ipc` in `coven config paths --json`; health and daemon status
+  remain diagnostic transport metadata. See
+  [PR #657](https://github.com/OpenCoven/coven/pull/657) and
+  [PR #668](https://github.com/OpenCoven/coven/pull/668).
+
+### Bug fixes
+
+- **Explicit, resilient event persistence.** Event commits retry transient
+  SQLite busy/locked failures. When queue pressure drops raw output, each
+  affected session receives an ordered `output_truncated` marker with
+  `droppedEvents` and `droppedBytes`; lifecycle, tool, error, and exit events
+  retain reserved capacity. Direct input, kill, and targeted cast events close
+  pending truncation episodes at their exact event boundary, while oversized
+  writer-backed input and targeted casts are rejected before side effects.
+  Disk-full failures are classified and covered by atomic rollback and
+  clean-writer recovery regressions. See
+  [PR #632](https://github.com/OpenCoven/coven/pull/632),
+  [PR #638](https://github.com/OpenCoven/coven/pull/638),
+  [PR #676](https://github.com/OpenCoven/coven/pull/676), and
+  [PR #679](https://github.com/OpenCoven/coven/pull/679).
+- **Bounded, side-effect-free storage health.** Scheduled retention prunes
+  events and sensitive artifacts in small indexed transactions without
+  automatic `VACUUM`, fails closed on invalid retention settings, and reports
+  database, WAL, checkpoint, backlog, and free-disk state. `/health` and
+  `/hub/status` now use daemon-owned snapshots without opening or mutating
+  SQLite, and critical low-disk blocks outrank degraded snapshots. See
+  [PR #637](https://github.com/OpenCoven/coven/pull/637),
+  [PR #646](https://github.com/OpenCoven/coven/pull/646), and
+  [PR #660](https://github.com/OpenCoven/coven/pull/660).
+- **Live handoffs preserve their transcript prefix.** Handoff creation captures
+  its event cursor atomically, forward transcript growth no longer blocks claim
+  or acknowledgement, unresolved prefixes survive retention, and a current
+  cursor below the offered cursor still fails closed as `transcript_diverged`. See
+  [PR #667](https://github.com/OpenCoven/coven/pull/667).
+- **Mobile pairing completion is audited exactly once.** Expired completed
+  pairings are swept opportunistically, and whichever side confirms second
+  emits the single `pairing_completed` audit record—including device-side
+  completion—without changing the wire contract. See
+  [PR #677](https://github.com/OpenCoven/coven/pull/677).
+- **Ward audit migrations fail closed on schema drift.** Exact four-state
+  fingerprints replace substring/version heuristics; unknown schemas are
+  preserved, guarded failures roll back, and concurrent legacy migrations
+  converge safely. See [PR #675](https://github.com/OpenCoven/coven/pull/675)
+  and OpenCoven/coven-threads#23.
+
+### Security
+
+- **OpenClaw bridge dependencies patched.** The bridge source pins `undici`
+  8.9.0 and `@hono/node-server` 2.0.10, resolving Dependabot alerts 141 and
+  143–147. See [PR #653](https://github.com/OpenCoven/coven/pull/653).
+
 ## Week of July 26, 2026
 
 ### New features
