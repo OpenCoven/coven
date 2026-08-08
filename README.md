@@ -459,8 +459,8 @@ Coven works with zero configuration. State lives under `COVEN_HOME` (default `~/
 
 | Surface                              | What it controls                                                                          | Reference                                                        |
 | ------------------------------------ | ------------------------------------------------------------------------------------------ | ---------------------------------------------------------------- |
-| `COVEN_HOME`                         | Root directory for daemon state: SQLite database, same-user local IPC, logs, encryption keys | [`docs/daemon/coven-home.md`](docs/daemon/coven-home.md)         |
-| Daemon environment and `privacy.toml` | Raw-artifact persistence (`COVEN_PERSIST_RAW_ARTIFACTS`), retention windows, redaction     | [`docs/daemon/configuration.md`](docs/daemon/configuration.md)   |
+| `COVEN_HOME`                         | Root directory for daemon state: SQLite database, same-user local IPC, logs, encryption keys | [Daemon configuration](https://docs.opencoven.ai/docs/daemon/configuration) |
+| Daemon environment and `privacy.toml` | Raw-artifact persistence (`COVEN_PERSIST_RAW_ARTIFACTS`), retention windows, redaction     | [Daemon configuration](https://docs.opencoven.ai/docs/daemon/configuration) |
 | `~/.config/coven/settings.json`      | CLI settings under `covenCli.*`: repo registry, privacy keys, fuzzy paths                  | [`docs/SETTINGS.md`](docs/SETTINGS.md)                           |
 
 > **Tip:** If you run Coven in CI or need isolated environments, set `COVEN_HOME` to a unique path per environment. Coven will create the directory if it doesn't exist.

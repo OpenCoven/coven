@@ -12,4 +12,6 @@ Coven is the canonical shared local runtime for reusable automation. The chat/in
 user -> chat/intake client -> Coven -> adapters -> desktop/apps
 ```
 
-See [Automation](/automation) for the full surface.
+Use the canonical [CLI reference](https://docs.opencoven.ai/docs/cli) for
+scriptable commands and the [local API guide](https://docs.opencoven.ai/docs/reference/api)
+for programmatic clients.
