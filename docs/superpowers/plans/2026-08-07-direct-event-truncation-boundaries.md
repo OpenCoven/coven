@@ -5,11 +5,12 @@
 **Goal:** Ensure accepted live-session input, kill, and targeted cast events
 close pending raw-output truncation episodes at their exact event boundary.
 
-**Architecture:** Extend `SessionRuntime` with an optional writer-backed event
-operation. `LiveSessionRuntime` delegates it to the daemon-owned
-`EventWriter`, while writerless runtimes preserve the direct store insert.
-The API calls one helper after a successful live action; that helper never
-falls back after a writer failure.
+**Architecture:** Extend `EventWriter` with a cancellable per-session boundary
+reservation and extend `SessionRuntime` with an object-safe action wrapper.
+Input reserves before transport I/O and commits or restores its truncation
+episode afterward. Kill remains immediately issuable while a per-session guard
+orders its durable event before process exit. Writerless runtimes preserve the
+direct store path, and no writer failure falls back.
 
 **Tech Stack:** Rust, SQLite via rusqlite, serde_json, existing `EventWriter`,
 Rust unit/integration tests.
@@ -19,13 +20,14 @@ Rust unit/integration tests.
 ## File Structure
 
 - `crates/coven-cli/src/event_writer.rs` owns byte-bounded queueing,
-  per-session truncation episodes, and critical-event ordering. Expose only
-  test-visible capacity controls and prove generic direct records split
-  episodes.
+  per-session truncation episodes, critical-event ordering, and the new
+  reservation token that commits or restores one detached episode.
 - `crates/coven-cli/src/api.rs` owns `SessionRuntime`, HTTP action handlers,
-  direct-store fallback, and endpoint-level regressions.
+  phase-specific action/persistence errors, direct-store fallback, and
+  endpoint-level regressions.
 - `crates/coven-cli/src/daemon.rs` owns the live runtime implementation that
-  has access to the shared daemon `EventWriter`.
+  has access to the shared daemon `EventWriter` and the per-registration
+  kill/exit ordering guard.
 
 ### Task 1: Lock generic critical-record boundary behavior
 
@@ -436,3 +438,617 @@ git diff origin/main...HEAD -- crates/coven-cli/src/api.rs crates/coven-cli/src/
 Expected: only #642’s writer-routing, test-support visibility, and regression
 coverage are present; no handoff cursor changes from superseded PR #661 are
 reintroduced.
+
+### Task 4: Reserve and restore input boundaries
+
+**Files:**
+- Modify: `crates/coven-cli/src/event_writer.rs:63-80`
+- Modify: `crates/coven-cli/src/event_writer.rs:184-217`
+- Modify: `crates/coven-cli/src/event_writer.rs:284-376`
+- Modify: `crates/coven-cli/src/event_writer.rs:630-665`
+- Test: `crates/coven-cli/src/event_writer.rs:970-1110`
+
+- [ ] **Step 1: Add failing reservation concurrency tests**
+
+Add these tests beside
+`critical_boundary_prevents_same_session_output_from_overtaking_marker`:
+
+```rust
+#[test]
+fn reserved_record_splits_output_arriving_before_action_completion() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let conn = store::open_store(&home.path().join(STORE_FILE_NAME))?;
+    store::insert_session(&conn, &session("s-1"))?;
+    let writer = EventWriter::start_with_capacity(
+        home.path().to_path_buf(),
+        RESERVED_CRITICAL_BYTES + 1024,
+    )?;
+
+    assert!(!writer.record_output("s-1", "a".repeat(2048))?);
+    let reservation = writer.reserve_record("s-1", "input", json!({ "data": "ls\n" }))?;
+    assert!(!writer.record_output("s-1", "b".repeat(3072))?);
+    reservation.commit()?;
+    assert!(writer.record_output("s-1", "recovered".to_string())?);
+    writer.record_exit(
+        "s-1",
+        PtyRunResult { status: "completed", exit_code: Some(0) },
+    )?;
+
+    let events = store::list_events(&conn, "s-1")?;
+    assert_eq!(
+        events.iter().map(|event| event.kind.as_str()).collect::<Vec<_>>(),
+        ["output_truncated", "input", "output_truncated", "output", "exit"],
+    );
+    assert_truncation(&events[0], 1, 2048)?;
+    assert_truncation(&events[2], 1, 3072)?;
+    Ok(())
+}
+
+#[test]
+fn cancelled_record_restores_one_contiguous_output_episode() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let conn = store::open_store(&home.path().join(STORE_FILE_NAME))?;
+    store::insert_session(&conn, &session("s-1"))?;
+    let writer = EventWriter::start_with_capacity(
+        home.path().to_path_buf(),
+        RESERVED_CRITICAL_BYTES + 1024,
+    )?;
+
+    assert!(!writer.record_output("s-1", "a".repeat(2048))?);
+    let reservation = writer.reserve_record("s-1", "input", json!({ "data": "ls\n" }))?;
+    assert!(!writer.record_output("s-1", "b".repeat(3072))?);
+    reservation.cancel();
+    assert!(writer.record_output("s-1", "recovered".to_string())?);
+    writer.record_exit(
+        "s-1",
+        PtyRunResult { status: "completed", exit_code: Some(0) },
+    )?;
+
+    let events = store::list_events(&conn, "s-1")?;
+    assert_eq!(
+        events.iter().map(|event| event.kind.as_str()).collect::<Vec<_>>(),
+        ["output_truncated", "output", "exit"],
+    );
+    assert_truncation(&events[0], 2, 5120)?;
+    Ok(())
+}
+```
+
+Add the focused helper in the test module:
+
+```rust
+fn assert_truncation(
+    event: &store::EventRecord,
+    dropped_events: u64,
+    dropped_bytes: u64,
+) -> Result<()> {
+    let payload: serde_json::Value = serde_json::from_str(&event.payload_json)?;
+    assert_eq!(payload["droppedEvents"], dropped_events);
+    assert_eq!(payload["droppedBytes"], dropped_bytes);
+    Ok(())
+}
+```
+
+- [ ] **Step 2: Run the tests to verify the reservation API is absent**
+
+Run:
+
+```bash
+cargo test -p coven-cli event_writer::tests::reserved_record_
+cargo test -p coven-cli event_writer::tests::cancelled_record_
+```
+
+Expected: compile failure because `reserve_record` and its token do not exist.
+
+- [ ] **Step 3: Add the consuming reservation token**
+
+Add this type after `QueuedEvent`:
+
+```rust
+pub(crate) struct EventBoundaryReservation {
+    writer: EventWriter,
+    session_id: String,
+    event: Option<PendingEvent>,
+    bytes: usize,
+    detached: Option<OutputTruncation>,
+}
+
+impl EventBoundaryReservation {
+    pub(crate) fn commit(mut self) -> Result<()> {
+        let event = self.event.take().expect("reservation event is present");
+        let marker = self
+            .detached
+            .take()
+            .map(|truncation| truncation_marker(&self.session_id, truncation));
+        let result = self.writer.enqueue_closed_critical(event, self.bytes, marker);
+        self.writer.release_boundary(&self.session_id);
+        result
+    }
+
+    pub(crate) fn cancel(mut self) {
+        self.restore();
+    }
+
+    fn restore(&mut self) {
+        let mut queue = self.writer.lock_queue();
+        if let Some(detached) = self.detached.take() {
+            restore_truncation(&mut queue, &self.session_id, detached);
+        }
+        queue.closing_sessions.remove(&self.session_id);
+        self.writer.shared.available.notify_all();
+        self.event.take();
+    }
+}
+
+impl Drop for EventBoundaryReservation {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+```
+
+Add the release helper inside `impl EventWriter`:
+
+```rust
+fn release_boundary(&self, session_id: &str) {
+    let mut queue = self.lock_queue();
+    queue.closing_sessions.remove(session_id);
+    self.shared.available.notify_all();
+}
+```
+
+- [ ] **Step 4: Add reservation construction and reuse it from `record`**
+
+Replace `EventWriter::record` with:
+
+```rust
+pub fn record(&self, session_id: &str, kind: &str, payload: serde_json::Value) -> Result<()> {
+    self.reserve_record(session_id, kind, payload)?.commit()
+}
+
+pub(crate) fn reserve_record(
+    &self,
+    session_id: &str,
+    kind: &str,
+    payload: serde_json::Value,
+) -> Result<EventBoundaryReservation> {
+    let record = store::EventRecord {
+        seq: 0,
+        id: Uuid::new_v4().to_string(),
+        session_id: session_id.to_string(),
+        kind: kind.to_string(),
+        payload_json: serde_json::to_string(&payload)
+            .context("failed to serialize event writer payload")?,
+        created_at: crate::api::current_timestamp(),
+    };
+    let bytes = record.payload_json.len().saturating_add(EVENT_OVERHEAD_BYTES);
+    anyhow::ensure!(
+        bytes <= self.shared.capacity_bytes,
+        "critical event exceeds event writer capacity"
+    );
+    let event = PendingEvent::Record(record);
+    let mut queue = self.lock_queue();
+    loop {
+        if let Some(error) = &queue.failed {
+            return Err(anyhow!(error.clone()));
+        }
+        if queue.closing_sessions.insert(session_id.to_string()) {
+            let detached = queue.truncations.remove(session_id);
+            return Ok(EventBoundaryReservation {
+                writer: self.clone(),
+                session_id: session_id.to_string(),
+                event: Some(event),
+                bytes,
+                detached,
+            });
+        }
+        queue = self
+            .shared
+            .available
+            .wait(queue)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+}
+```
+
+Keep `record_exit` on `enqueue_critical`; it must wait behind an outstanding
+input reservation.
+
+- [ ] **Step 5: Refactor marker construction and cancellation merge**
+
+Replace `take_truncation_marker` with:
+
+```rust
+fn truncation_marker(session_id: &str, truncation: OutputTruncation) -> QueuedEvent {
+    let payload_json = serde_json::to_string(&json!({
+        "droppedEvents": truncation.dropped_events,
+        "droppedBytes": truncation.dropped_bytes,
+    }))
+    .expect("truncation marker payload is always serializable");
+    let bytes = payload_json.len().saturating_add(EVENT_OVERHEAD_BYTES);
+    QueuedEvent {
+        event: PendingEvent::Record(store::EventRecord {
+            seq: 0,
+            id: Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            kind: "output_truncated".to_string(),
+            payload_json,
+            created_at: truncation.created_at,
+        }),
+        bytes,
+        completion: None,
+    }
+}
+
+fn take_truncation_marker(queue: &mut Queue, session_id: &str) -> Option<QueuedEvent> {
+    queue
+        .truncations
+        .remove(session_id)
+        .map(|truncation| truncation_marker(session_id, truncation))
+}
+
+fn restore_truncation(
+    queue: &mut Queue,
+    session_id: &str,
+    detached: OutputTruncation,
+) {
+    match queue.truncations.entry(session_id.to_string()) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(detached);
+        }
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            let current = entry.get_mut();
+            current.dropped_events = detached
+                .dropped_events
+                .saturating_add(current.dropped_events);
+            current.dropped_bytes = detached
+                .dropped_bytes
+                .saturating_add(current.dropped_bytes);
+            current.created_at = detached.created_at;
+        }
+    }
+}
+```
+
+- [ ] **Step 6: Run all event-writer tests**
+
+Run:
+
+```bash
+cargo test -p coven-cli event_writer::tests::
+```
+
+Expected: PASS, including reservation commit, cancellation merge, existing
+critical ordering, capacity, failure, and exit tests.
+
+- [ ] **Step 7: Commit the reservation primitive**
+
+```bash
+git add crates/coven-cli/src/event_writer.rs
+git commit -s -m "fix: reserve direct event truncation boundaries"
+```
+
+### Task 5: Coordinate input actions and kill/exit ordering
+
+**Files:**
+- Modify: `crates/coven-cli/src/api.rs:225-260`
+- Modify: `crates/coven-cli/src/api.rs:2490-2630`
+- Modify: `crates/coven-cli/src/api.rs:3100-3130`
+- Modify: `crates/coven-cli/src/daemon.rs:85-175`
+- Modify: `crates/coven-cli/src/daemon.rs:384-425`
+- Modify: `crates/coven-cli/src/daemon.rs:800-850`
+- Test: `crates/coven-cli/src/api.rs:9100-9500`
+- Test: `crates/coven-cli/src/daemon.rs:3980-4160`
+
+- [ ] **Step 1: Add the phase-specific boundary result**
+
+Add beside `SessionRuntime`:
+
+```rust
+pub enum SessionEventBoundaryError {
+    Runtime(anyhow::Error),
+    Coordination(anyhow::Error),
+    Persistence(anyhow::Error),
+}
+
+pub type SessionEventBoundaryResult =
+    std::result::Result<(), SessionEventBoundaryError>;
+```
+
+Add this object-safe default method to `SessionRuntime`:
+
+```rust
+fn with_session_event_boundary(
+    &self,
+    _session_id: &str,
+    _kind: &str,
+    _payload: &Value,
+    _action: &mut dyn FnMut() -> SessionEventBoundaryResult,
+) -> Option<SessionEventBoundaryResult> {
+    None
+}
+```
+
+- [ ] **Step 2: Centralize writer-backed and writerless action execution**
+
+Add below `record_direct_session_event`:
+
+```rust
+fn perform_direct_session_event(
+    runtime: &dyn SessionRuntime,
+    conn: &rusqlite::Connection,
+    coven_home: &Path,
+    session_id: &str,
+    kind: &str,
+    payload: Value,
+    action: &mut dyn FnMut() -> SessionEventBoundaryResult,
+) -> SessionEventBoundaryResult {
+    match runtime.with_session_event_boundary(
+        session_id,
+        kind,
+        &payload,
+        action,
+    ) {
+        Some(result) => result,
+        None => {
+            action()?;
+            insert_event(conn, coven_home, session_id, kind, payload)
+                .map_err(SessionEventBoundaryError::Persistence)
+        }
+    }
+}
+```
+
+The `Some(result)` branch must never run the action or persistence again.
+
+- [ ] **Step 3: Move input and kill through the action boundary**
+
+For input, replace the separate `send_input` and event calls with:
+
+```rust
+let mut action = || {
+    runtime
+        .send_input(session_id, &payload)
+        .map_err(SessionEventBoundaryError::Runtime)
+};
+let result = perform_direct_session_event(
+    runtime,
+    &conn,
+    coven_home,
+    session_id,
+    "input",
+    payload,
+    &mut action,
+);
+```
+
+Map `SessionEventBoundaryError::Runtime(error)` through the existing
+`NotLiveError`/`send_input_failed` response logic. Return
+`Coordination(error)` and `Persistence(error)` as internal errors without a
+success-shaped response.
+
+For kill, make the action own both the runtime effect and status update:
+
+```rust
+let kill_payload = json!({ "status": "killed" });
+let mut action = || {
+    runtime
+        .kill_session(session_id)
+        .map_err(SessionEventBoundaryError::Runtime)?;
+    let now = current_timestamp();
+    store::update_session_status(&conn, session_id, "killed", None, &now)
+        .map_err(SessionEventBoundaryError::Coordination)
+};
+let result = perform_direct_session_event(
+    runtime,
+    &conn,
+    coven_home,
+    session_id,
+    "kill",
+    kill_payload,
+    &mut action,
+);
+```
+
+Map runtime failures through the existing `NotLiveError`/`kill_failed`
+responses. Propagate coordination and persistence errors.
+
+- [ ] **Step 4: Add the daemon input reservation and kill guard**
+
+Add `event_order` to `LiveSessionRegistration`:
+
+```rust
+struct LiveSessionRegistration {
+    exited: AtomicBool,
+    writer: Mutex<Option<crate::maintenance_gate::WriterLease>>,
+    event_order: Mutex<()>,
+}
+```
+
+Initialize it with `Mutex::new(())`.
+
+Implement the new trait method:
+
+```rust
+fn with_session_event_boundary(
+    &self,
+    session_id: &str,
+    kind: &str,
+    payload: &Value,
+    action: &mut dyn FnMut() -> crate::api::SessionEventBoundaryResult,
+) -> Option<crate::api::SessionEventBoundaryResult> {
+    let writer = self.event_writer.as_ref()?;
+    Some((|| -> crate::api::SessionEventBoundaryResult {
+        match kind {
+            "input" => {
+                let reservation = writer
+                    .reserve_record(session_id, kind, payload.clone())
+                    .map_err(crate::api::SessionEventBoundaryError::Persistence)?;
+                match action() {
+                    Ok(()) => reservation
+                        .commit()
+                        .map_err(crate::api::SessionEventBoundaryError::Persistence),
+                    Err(error) => {
+                        reservation.cancel();
+                        Err(error)
+                    }
+                }
+            }
+            "kill" => {
+                let registration = {
+                    let sessions = self.sessions.lock().map_err(|_| {
+                        crate::api::SessionEventBoundaryError::Coordination(anyhow::anyhow!(
+                            "live session registry lock poisoned"
+                        ))
+                    })?;
+                    sessions
+                        .get(session_id)
+                        .map(|handle| Arc::clone(&handle.registration))
+                        .ok_or_else(|| {
+                            crate::api::SessionEventBoundaryError::Runtime(anyhow::Error::new(
+                                NotLiveError { session_id: session_id.to_string() },
+                            ))
+                        })?
+                };
+                let _event_order = registration.event_order.lock().map_err(|_| {
+                    crate::api::SessionEventBoundaryError::Coordination(anyhow::anyhow!(
+                        "live session event-order lock poisoned"
+                    ))
+                })?;
+                action()?;
+                writer
+                    .record(session_id, kind, payload.clone())
+                    .map_err(crate::api::SessionEventBoundaryError::Persistence)
+            }
+            _ => {
+                action()?;
+                writer
+                    .record(session_id, kind, payload.clone())
+                    .map_err(crate::api::SessionEventBoundaryError::Persistence)
+            }
+        }
+    })())
+}
+```
+
+Keep `record_session_event` for targeted cast.
+
+- [ ] **Step 5: Make exit take the same registration guard**
+
+At the start of `on_exit`, before `cleanup.mark_exited()` and
+`writer.record_exit`, acquire the registration guard:
+
+```rust
+let registration = cleanup
+    .as_ref()
+    .map(|cleanup| Arc::clone(&cleanup.registration));
+let _event_order = registration.as_ref().map(|registration| {
+    registration
+        .event_order
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+});
+```
+
+Keep the guard alive until after `record_exit` returns. This ordering must not
+reuse the output `event_closed` mutex because the input/output drain path has
+different blocking requirements.
+
+- [ ] **Step 6: Add deterministic blocked-input and exit-race regressions**
+
+Extend the existing `BlockingWriter` test support with an `entered` flag so the
+test waits for the write to block instead of sleeping:
+
+```rust
+struct BlockingWriter {
+    entered: Arc<(StdMutex<bool>, Condvar)>,
+    unblock: Arc<(StdMutex<bool>, Condvar)>,
+}
+```
+
+In `write`, set `entered` to true and notify before waiting on `unblock`.
+
+Replace the sleep in
+`kill_session_succeeds_even_while_send_input_is_blocked_on_a_hung_child` with
+a wait on `entered`. Exercise input through
+`SessionRuntime::with_session_event_boundary`, then exercise kill through the
+same boundary. Assert the killer flag becomes true before `unblock` is set.
+
+Add `kill_event_commits_before_concurrent_exit` using
+`observer_for_session`, a killer that launches `on_exit` on a separate thread,
+and a writer-backed `LiveSessionRuntime`. After the kill boundary returns, join
+the exit thread and assert the durable kinds end in:
+
+```rust
+["kill", "exit"]
+```
+
+Add an API test whose writer-backed runtime fails its input action after a
+reservation. Inject dropped output before and during the action, recover output,
+and assert one combined marker followed by `output`, with no `input` event.
+
+- [ ] **Step 7: Run focused concurrency tests**
+
+Run:
+
+```bash
+cargo test -p coven-cli event_writer::tests::reserved_record_
+cargo test -p coven-cli event_writer::tests::cancelled_record_
+cargo test -p coven-cli daemon::tests::kill_session_succeeds_even_while_send_input_is_blocked_on_a_hung_child
+cargo test -p coven-cli daemon::tests::kill_event_commits_before_concurrent_exit
+cargo test -p coven-cli api::tests::failed_input_boundary_restores_truncation_episode
+cargo test -p coven-cli truncation_episodes
+```
+
+Expected: PASS. The kill flag is set before blocked input is released, durable
+kill precedes exit, and failed input restores one episode.
+
+- [ ] **Step 8: Commit runtime coordination**
+
+```bash
+git add crates/coven-cli/src/api.rs crates/coven-cli/src/daemon.rs
+git commit -s -m "fix: order direct actions at writer boundaries"
+```
+
+### Task 6: Validate the corrected pull request
+
+**Files:**
+- Verify: `crates/coven-cli/src/api.rs`
+- Verify: `crates/coven-cli/src/daemon.rs`
+- Verify: `crates/coven-cli/src/event_writer.rs`
+- Verify: `docs/superpowers/specs/2026-08-07-direct-event-truncation-boundaries-design.md`
+- Verify: `docs/superpowers/plans/2026-08-07-direct-event-truncation-boundaries.md`
+
+- [ ] **Step 1: Run focused direct-event tests**
+
+```bash
+cargo test -p coven-cli event_writer::tests::
+cargo test -p coven-cli truncation_episodes
+cargo test -p coven-cli oversized_writer_backed
+cargo test -p coven-cli writer_failure
+```
+
+Expected: PASS with no zero-test filter.
+
+- [ ] **Step 2: Run repository gates**
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --locked
+python scripts/check-secrets.py
+git add crates/coven-cli/src/api.rs crates/coven-cli/src/daemon.rs crates/coven-cli/src/event_writer.rs docs/superpowers/specs/2026-08-07-direct-event-truncation-boundaries-design.md docs/superpowers/plans/2026-08-07-direct-event-truncation-boundaries.md
+python3 scripts/check-coven-privacy.py --staged
+```
+
+Expected: every command succeeds.
+
+- [ ] **Step 3: Review the final branch diff**
+
+```bash
+git diff origin/main...HEAD --check
+git diff origin/main...HEAD -- crates/coven-cli/src/api.rs crates/coven-cli/src/daemon.rs crates/coven-cli/src/event_writer.rs docs/superpowers/specs/2026-08-07-direct-event-truncation-boundaries-design.md docs/superpowers/plans/2026-08-07-direct-event-truncation-boundaries.md
+```
+
+Expected: the branch contains the approved spec, implementation correction,
+tests, and plan update with no unrelated changes.
