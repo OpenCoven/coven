@@ -2843,14 +2843,20 @@ fn submit_cast(
             Some(json!({ "sessionId": session_id })),
         );
     }
-    record_direct_session_event(
-        runtime,
-        &conn,
-        coven_home,
-        session_id,
-        "cast",
-        json!({ "cast_id": cast_id, "code": code, "target": target }),
-    )?;
+    let cast_event = json!({ "cast_id": cast_id, "code": code, "target": target });
+    match runtime.can_record_session_event(session_id, "cast", &cast_event) {
+        Some(Ok(true)) | None => {}
+        Some(Ok(false)) => {
+            return api_error(
+                413,
+                "cast_too_large",
+                "Cast payload exceeds the daemon event writer capacity.",
+                Some(json!({ "sessionId": session_id })),
+            );
+        }
+        Some(Err(error)) => return Err(error.context("failed to preflight cast event")),
+    }
+    record_direct_session_event(runtime, &conn, coven_home, session_id, "cast", cast_event)?;
     json_response(
         202,
         &CastResultDto {
@@ -9360,6 +9366,41 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(lease_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_writer_backed_targeted_cast_is_rejected_without_event_or_writer_side_effect(
+    ) -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "session-1")?;
+        let runtime = WriterBackedRuntime {
+            writer: crate::event_writer::EventWriter::start(temp_dir.path().to_path_buf())?,
+            inputs: std::cell::RefCell::new(Vec::new()),
+        };
+        let body = serde_json::to_string(&json!({
+            "code": "x".repeat(3 * 1024 * 1024),
+            "target": "session-1",
+        }))?;
+        assert!(body.len() < crate::daemon::MAX_SOCKET_BODY_BYTES);
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/cast",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 413);
+        let response_body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(response_body["error"]["code"], "cast_too_large");
+        let conn = crate::store::open_store(&temp_dir.path().join("coven.sqlite3"))?;
+        assert!(crate::store::list_events(&conn, "session-1")?.is_empty());
+        let health = runtime.writer.health();
+        assert_eq!(health.queued_events, 0);
+        assert_eq!(health.committed_events, 0);
         Ok(())
     }
 
