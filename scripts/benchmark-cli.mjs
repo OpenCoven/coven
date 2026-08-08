@@ -535,12 +535,15 @@ export async function startDaemonMeasuringReadiness({
   now = () => process.hrtime.bigint()
 }) {
   const startedAt = now();
-  const { completion } = launch({
+  const { child, completion } = launch({
     command: binary,
     args: ['daemon', 'start'],
     allowedExitCodes: [0],
     env
   });
+  // Observe early command failures while readiness polling is still active.
+  // The original promise remains available for the caller to await on success.
+  completion.catch(() => {});
 
   try {
     const socketPath = await resolveSocket(covenHome, { attempts: 400, delayMs: 25 });
@@ -548,8 +551,7 @@ export async function startDaemonMeasuringReadiness({
     const readyElapsedMs = Number(now() - startedAt) / 1_000_000;
     return { socketPath, readyElapsedMs, completion };
   } catch (error) {
-    // Never leave the launch promise unhandled when readiness fails.
-    completion.catch(() => {});
+    child?.kill('SIGKILL');
     throw error;
   }
 }

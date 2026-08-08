@@ -494,6 +494,51 @@ test('startDaemonMeasuringReadiness stops the clock at the first healthy respons
   assert.equal(result.readyElapsedMs, 10);
 });
 
+test('startDaemonMeasuringReadiness observes launch completion before polling readiness', async () => {
+  const order = [];
+  const completion = {
+    catch() {
+      order.push('observe-completion');
+      return Promise.resolve();
+    }
+  };
+
+  await startDaemonMeasuringReadiness({
+    binary: '/tmp/coven',
+    covenHome: '/fixture/coven-home',
+    env: { COVEN_HOME: '/fixture/coven-home' },
+    launch: () => ({ child: null, completion }),
+    resolveSocket: async () => {
+      assert.deepEqual(order, ['observe-completion']);
+      return '/fixture/coven.sock';
+    },
+    wait: async () => {}
+  });
+});
+
+test('startDaemonMeasuringReadiness kills the launch child when readiness fails', async () => {
+  const signals = [];
+
+  await assert.rejects(
+    startDaemonMeasuringReadiness({
+      binary: '/tmp/coven',
+      covenHome: '/fixture/coven-home',
+      env: { COVEN_HOME: '/fixture/coven-home' },
+      launch: () => ({
+        child: { kill: (signal) => signals.push(signal) },
+        completion: Promise.resolve({ status: 0 })
+      }),
+      resolveSocket: async () => {
+        throw new Error('daemon metadata did not appear');
+      },
+      wait: async () => {}
+    }),
+    /daemon metadata did not appear/
+  );
+
+  assert.deepEqual(signals, ['SIGKILL']);
+});
+
 test('measureColdDaemonStarts excludes post-readiness command work from samples', async () => {
   const order = [];
   const report = await measureColdDaemonStarts({
