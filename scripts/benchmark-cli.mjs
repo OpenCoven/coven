@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { request as requestHttp } from 'node:http';
 import { fileURLToPath } from 'node:url';
@@ -123,6 +123,48 @@ export function runCommand({
     throw new Error(`command exited with ${result.status}${stderr ? `: ${stderr}` : ''}`);
   }
   return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+}
+
+export function startCommand({
+  command,
+  args,
+  allowedExitCodes = [0],
+  env,
+  timeoutMs = COMMAND_TIMEOUT_MS
+}) {
+  const child = spawn(command, args, { env });
+  let stdout = '';
+  let stderr = '';
+  child.stdout?.setEncoding('utf8').on('data', (chunk) => {
+    stdout += chunk;
+  });
+  child.stderr?.setEncoding('utf8').on('data', (chunk) => {
+    stderr += chunk;
+  });
+
+  const completion = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error(`command timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    timer.unref?.();
+
+    child.once('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once('close', (status) => {
+      clearTimeout(timer);
+      if (!Number.isInteger(status) || !allowedExitCodes.includes(status)) {
+        const detail = stderr.trim();
+        reject(new Error(`command exited with ${status}${detail ? `: ${detail}` : ''}`));
+        return;
+      }
+      resolve({ status, stdout, stderr });
+    });
+  });
+
+  return { child, completion };
 }
 
 export function externalSessionRequest({ id, projectRoot }) {
@@ -454,6 +496,64 @@ export async function startDaemon({
   return socketPath;
 }
 
+export async function waitForDaemonSocketPath(
+  covenHome,
+  { attempts, delayMs, readSocket = daemonSocketPath }
+) {
+  let lastError;
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await readSocket(covenHome);
+    } catch (error) {
+      lastError = error;
+    }
+
+    if (attempt + 1 < attempts && delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+
+  throw new Error(
+    `daemon metadata did not appear: ${lastError?.message ?? 'unknown error'}`
+  );
+}
+
+// `coven daemon start` keeps working after the daemon answers health: on unix it
+// runs a duplicate-daemon sweep that builds a full process table. Timing the
+// blocking command therefore charges cold startup for unrelated runner state.
+// Launch without blocking, stop the clock at the first valid health response,
+// and hand the still-running command back so the caller can await it — and any
+// post-readiness cleanup — outside the measured interval.
+export async function startDaemonMeasuringReadiness({
+  binary,
+  covenHome,
+  env,
+  launch = startCommand,
+  resolveSocket = waitForDaemonSocketPath,
+  wait = waitForHealth,
+  now = () => process.hrtime.bigint()
+}) {
+  const startedAt = now();
+  const { completion } = launch({
+    command: binary,
+    args: ['daemon', 'start'],
+    allowedExitCodes: [0],
+    env
+  });
+
+  try {
+    const socketPath = await resolveSocket(covenHome, { attempts: 400, delayMs: 25 });
+    await wait(socketPath, { attempts: 400, delayMs: 25 });
+    const readyElapsedMs = Number(now() - startedAt) / 1_000_000;
+    return { socketPath, readyElapsedMs, completion };
+  } catch (error) {
+    // Never leave the launch promise unhandled when readiness fails.
+    completion.catch(() => {});
+    throw error;
+  }
+}
+
 export function stopDaemon({ binary, env, run = runCommand }) {
   run({ command: binary, args: ['daemon', 'stop'], allowedExitCodes: [0], env });
 }
@@ -464,9 +564,8 @@ export async function measureColdDaemonStarts({
   environment,
   iterations,
   makeDirectory = (path) => mkdir(path, { recursive: true }),
-  start = startDaemon,
-  stop = stopDaemon,
-  now = () => process.hrtime.bigint()
+  start = startDaemonMeasuringReadiness,
+  stop = stopDaemon
 }) {
   const samplesMs = [];
 
@@ -474,12 +573,13 @@ export async function measureColdDaemonStarts({
     const covenHome = join(fixtureRoot, `d-${iteration}`);
     const env = isolatedEnvironment(covenHome, environment);
     await makeDirectory(join(covenHome, 'user-home'));
-    const startedAt = now();
 
     try {
-      await start({ binary, covenHome, env });
-      const elapsedMs = Number(now() - startedAt) / 1_000_000;
-      samplesMs.push(Number(elapsedMs.toFixed(3)));
+      const { readyElapsedMs, completion } = await start({ binary, covenHome, env });
+      samplesMs.push(Number(readyElapsedMs.toFixed(3)));
+      // Command completion and its post-readiness cleanup are deliberately
+      // awaited after the sample is recorded, outside the timed interval.
+      await completion;
     } finally {
       await stop({ binary, covenHome, env });
     }
