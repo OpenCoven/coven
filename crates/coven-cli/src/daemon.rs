@@ -25,7 +25,7 @@ use std::os::unix::{
 };
 
 use crate::{
-    api::{SessionLaunch, SessionRuntime},
+    api::{SessionEventBoundaryError, SessionEventBoundaryResult, SessionLaunch, SessionRuntime},
     pty_runner,
 };
 
@@ -116,6 +116,7 @@ struct LiveSessionHandle {
 struct LiveSessionRegistration {
     exited: AtomicBool,
     writer: Mutex<Option<crate::maintenance_gate::WriterLease>>,
+    event_order: Mutex<()>,
 }
 
 impl LiveSessionRegistration {
@@ -123,6 +124,7 @@ impl LiveSessionRegistration {
         Self {
             exited: AtomicBool::new(false),
             writer: Mutex::new(writer),
+            event_order: Mutex::new(()),
         }
     }
 
@@ -400,6 +402,68 @@ impl SessionRuntime for LiveSessionRuntime {
 
     fn kill_session(&self, session_id: &str) -> Result<()> {
         LiveSessionRuntime::kill_session(self, session_id)
+    }
+
+    fn with_session_event_boundary(
+        &self,
+        session_id: &str,
+        kind: &str,
+        payload: &Value,
+        action: &mut dyn FnMut() -> SessionEventBoundaryResult,
+    ) -> Option<SessionEventBoundaryResult> {
+        let writer = self.event_writer.as_ref()?;
+        Some((|| -> SessionEventBoundaryResult {
+            match kind {
+                "input" => {
+                    let reservation = writer
+                        .reserve_record(session_id, kind, payload.clone())
+                        .map_err(SessionEventBoundaryError::Persistence)?;
+                    match action() {
+                        Ok(()) => reservation
+                            .commit()
+                            .map_err(SessionEventBoundaryError::Persistence),
+                        Err(error) => {
+                            reservation.cancel();
+                            Err(error)
+                        }
+                    }
+                }
+                "kill" => {
+                    let registration = {
+                        let sessions = self.sessions.lock().map_err(|_| {
+                            SessionEventBoundaryError::Coordination(anyhow::anyhow!(
+                                "live session registry lock poisoned"
+                            ))
+                        })?;
+                        sessions
+                            .get(session_id)
+                            .map(|handle| Arc::clone(&handle.registration))
+                            .ok_or_else(|| {
+                                SessionEventBoundaryError::Runtime(anyhow::Error::new(
+                                    NotLiveError {
+                                        session_id: session_id.to_string(),
+                                    },
+                                ))
+                            })?
+                    };
+                    let _event_order = registration.event_order.lock().map_err(|_| {
+                        SessionEventBoundaryError::Coordination(anyhow::anyhow!(
+                            "live session event-order lock poisoned"
+                        ))
+                    })?;
+                    action()?;
+                    writer
+                        .record(session_id, kind, payload.clone())
+                        .map_err(SessionEventBoundaryError::Persistence)
+                }
+                _ => {
+                    action()?;
+                    writer
+                        .record(session_id, kind, payload.clone())
+                        .map_err(SessionEventBoundaryError::Persistence)
+                }
+            }
+        })())
     }
 
     fn record_session_event(
@@ -836,6 +900,15 @@ fn output_observer_with_cleanup(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             *closed = true;
+            let registration = cleanup
+                .as_ref()
+                .map(|cleanup| Arc::clone(&cleanup.registration));
+            let _event_order = registration.as_ref().map(|registration| {
+                registration
+                    .event_order
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            });
             if let Some(cleanup) = cleanup {
                 cleanup.mark_exited();
             }
@@ -4052,6 +4125,50 @@ mod tests {
         }
     }
 
+    struct SignalingKiller {
+        killed: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl RuntimeKiller for SignalingKiller {
+        fn kill(&mut self) -> Result<()> {
+            let (lock, cvar) = &*self.killed;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+            Ok(())
+        }
+    }
+
+    struct ExitTriggeringKiller {
+        on_exit: Option<Box<dyn FnOnce(pty_runner::PtyRunResult) + Send>>,
+        started: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        exit_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+    }
+
+    impl RuntimeKiller for ExitTriggeringKiller {
+        fn kill(&mut self) -> Result<()> {
+            let on_exit = self.on_exit.take().expect("exit callback is present");
+            let started = Arc::clone(&self.started);
+            let handle = std::thread::spawn(move || {
+                let (lock, cvar) = &*started;
+                *lock.lock().unwrap() = true;
+                cvar.notify_all();
+                on_exit(pty_runner::PtyRunResult {
+                    status: "killed",
+                    exit_code: None,
+                });
+            });
+            let (lock, cvar) = &*self.started;
+            let mut guard = lock.lock().unwrap();
+            while !*guard {
+                guard = cvar.wait(guard).unwrap();
+            }
+            drop(guard);
+            std::thread::yield_now();
+            *self.exit_thread.lock().unwrap() = Some(handle);
+            Ok(())
+        }
+    }
+
     struct RegistryLockCheckingKiller {
         sessions: Weak<Mutex<HashMap<String, LiveSessionHandle>>>,
         dropped_after_unlock: Arc<AtomicBool>,
@@ -4080,11 +4197,15 @@ mod tests {
     /// `send_input` is mid-write to that exact session.
     #[derive(Clone)]
     struct BlockingWriter {
+        entered: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
         unblock: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     }
 
     impl Write for BlockingWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let (entered_lock, entered_cvar) = &*self.entered;
+            *entered_lock.lock().unwrap() = true;
+            entered_cvar.notify_all();
             let (lock, cvar) = &*self.unblock;
             let mut guard = lock.lock().unwrap();
             while !*guard {
@@ -4103,48 +4224,138 @@ mod tests {
         use std::sync::{Arc, Condvar, Mutex as StdMutex};
         use std::thread;
 
-        let runtime = Arc::new(LiveSessionRuntime::default());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let conn = crate::store::open_store(&temp_dir.path().join(crate::STORE_FILE_NAME)).unwrap();
+        crate::store::insert_session(&conn, &session_record("wedged-session")).unwrap();
+        drop(conn);
+
+        let runtime = Arc::new(LiveSessionRuntime::with_coven_home(
+            temp_dir.path().to_path_buf(),
+        ));
+        let entered = Arc::new((StdMutex::new(false), Condvar::new()));
         let unblock = Arc::new((StdMutex::new(false), Condvar::new()));
         let writer = BlockingWriter {
+            entered: Arc::clone(&entered),
             unblock: Arc::clone(&unblock),
         };
-        let killed = Arc::new(StdMutex::new(false));
+        let killed = Arc::new((StdMutex::new(false), Condvar::new()));
         runtime
             .register(
                 "wedged-session".to_string(),
                 Box::new(writer),
-                Box::new(RecordingKiller {
-                    killed: killed.clone(),
+                Box::new(SignalingKiller {
+                    killed: Arc::clone(&killed),
                 }),
             )
             .unwrap();
 
-        // Kick off a send that will block on the writer.
         let sender_runtime = Arc::clone(&runtime);
         let sender = thread::spawn(move || {
-            SessionRuntime::send_input(
+            let payload = serde_json::json!({ "data": "wedge" });
+            let mut action = || {
+                SessionRuntime::send_input(&*sender_runtime, "wedged-session", &payload)
+                    .map_err(crate::api::SessionEventBoundaryError::Runtime)
+            };
+            SessionRuntime::with_session_event_boundary(
                 &*sender_runtime,
                 "wedged-session",
-                &serde_json::json!({ "data": "wedge" }),
+                "input",
+                &payload,
+                &mut action,
             )
+            .expect("writer-backed runtime handles input boundaries")
         });
 
-        // Give the sender a moment to take the input lock + block.
-        thread::sleep(std::time::Duration::from_millis(50));
+        {
+            let (lock, cvar) = &*entered;
+            let mut guard = lock.lock().unwrap();
+            while !*guard {
+                guard = cvar.wait(guard).unwrap();
+            }
+        }
 
-        // Kill must succeed regardless of the wedged send.
-        SessionRuntime::kill_session(&*runtime, "wedged-session")
-            .expect("kill_session must not be blocked by a hung send_input on the same session");
-        assert!(*killed.lock().unwrap());
+        let killer_runtime = Arc::clone(&runtime);
+        let killer = thread::spawn(move || {
+            let payload = serde_json::json!({ "status": "killed" });
+            let mut action = || {
+                SessionRuntime::kill_session(&*killer_runtime, "wedged-session")
+                    .map_err(crate::api::SessionEventBoundaryError::Runtime)
+            };
+            SessionRuntime::with_session_event_boundary(
+                &*killer_runtime,
+                "wedged-session",
+                "kill",
+                &payload,
+                &mut action,
+            )
+            .expect("writer-backed runtime handles kill boundaries")
+        });
 
-        // Let the writer unblock so the sender thread can finish (its
-        // post-kill state isn't what we're testing).
+        {
+            let (lock, cvar) = &*killed;
+            let mut guard = lock.lock().unwrap();
+            while !*guard {
+                guard = cvar.wait(guard).unwrap();
+            }
+        }
         {
             let (lock, cvar) = &*unblock;
             *lock.lock().unwrap() = true;
             cvar.notify_all();
         }
-        let _ = sender.join();
+        sender.join().unwrap().unwrap();
+        killer.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn kill_event_commits_before_concurrent_exit() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = crate::store::open_store(&temp_dir.path().join(crate::STORE_FILE_NAME))?;
+        crate::store::insert_session(&conn, &session_record("kill-exit-session"))?;
+        drop(conn);
+
+        let runtime = LiveSessionRuntime::with_coven_home(temp_dir.path().to_path_buf());
+        let (observer, registration) =
+            runtime.observer_for_session("kill-exit-session".to_string());
+        let pty_runner::DetachedPtyObserver { on_exit, .. } = observer;
+        let started = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let exit_thread = Arc::new(Mutex::new(None));
+        runtime.register_kind_with_registration(
+            "kill-exit-session".to_string(),
+            LiveSessionKind::Pty,
+            Box::new(SharedBuffer::default()),
+            Box::new(ExitTriggeringKiller {
+                on_exit: Some(on_exit),
+                started,
+                exit_thread: Arc::clone(&exit_thread),
+            }),
+            registration,
+        )?;
+
+        let response = crate::api::handle_request_with_runtime(
+            "POST",
+            "/sessions/kill-exit-session/kill",
+            temp_dir.path(),
+            None,
+            None,
+            &runtime,
+        )?;
+        assert_eq!(response.status, 202);
+        exit_thread
+            .lock()
+            .unwrap()
+            .take()
+            .expect("exit thread was started")
+            .join()
+            .unwrap();
+
+        let conn = crate::store::open_store(&temp_dir.path().join(crate::STORE_FILE_NAME))?;
+        let kinds = crate::store::list_events(&conn, "kill-exit-session")?
+            .into_iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, ["kill", "exit"]);
+        Ok(())
     }
 
     #[test]
