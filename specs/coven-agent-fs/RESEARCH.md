@@ -68,8 +68,8 @@ From the surveyed products (high, per-source): (a) POSIX view so git/grep/existi
 
 1. Bead: spike `coven-afs` — SPEC v0.4 schema in rusqlite + read/write/overlay ops + unit tests (no mount yet).
 2. Bead: mount spike — `nfsserve` on macOS against the spike DB; benchmark a real repo checkout + build.
-3. Design doc in the coven repo: daemon API surface + provenance extension tables + Cave diff/timeline UI.
-4. Decide interop stance: freeze on "SPEC-compatible, coven-extended" and document the extension tables.
+3. Design doc in the coven repo: daemon API surface + provenance extension tables + Cave diff/timeline UI. **Delivered:** [DESIGN.md](./DESIGN.md).
+4. Decide interop stance: freeze on "SPEC-compatible, coven-extended" and document the extension tables. **Frozen:** [DESIGN.md §1](./DESIGN.md).
 
 ## Source ledger
 
