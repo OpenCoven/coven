@@ -172,6 +172,15 @@ impl EventWriter {
         self.enqueue_output(event, bytes)
     }
 
+    /// Check whether a critical record with this payload can fit in this
+    /// writer. This lets request handlers reject known-oversized input before
+    /// its transport side effect occurs.
+    pub(crate) fn can_record_critical_payload(&self, payload: &serde_json::Value) -> Result<bool> {
+        let payload_json =
+            serde_json::to_string(payload).context("failed to serialize event writer payload")?;
+        Ok(payload_json.len().saturating_add(EVENT_OVERHEAD_BYTES) <= self.shared.capacity_bytes)
+    }
+
     /// Persist a non-output event on the critical path for accepted direct
     /// live-session input, kill, and cast events. Pending truncation markers
     /// commit before the boundary event, and the caller waits for the writer's

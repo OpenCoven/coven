@@ -244,6 +244,16 @@ pub trait SessionRuntime {
         None
     }
 
+    /// `None` keeps writerless runtimes on the direct-insertion path.
+    fn can_record_session_event(
+        &self,
+        _session_id: &str,
+        _kind: &str,
+        _payload: &Value,
+    ) -> Option<Result<bool>> {
+        None
+    }
+
     fn event_writer_health(&self) -> Option<crate::event_writer::EventWriterHealth> {
         None
     }
@@ -2501,6 +2511,18 @@ fn record_input(
             Some(json!({ "sessionId": session_id })),
         );
     }
+    match runtime.can_record_session_event(session_id, "input", &payload) {
+        Some(Ok(true)) | None => {}
+        Some(Ok(false)) => {
+            return api_error(
+                413,
+                "input_too_large",
+                "Input payload exceeds the daemon event writer capacity.",
+                Some(json!({ "sessionId": session_id })),
+            );
+        }
+        Some(Err(error)) => return Err(error.context("failed to preflight input event")),
+    }
     let lease_id = Uuid::new_v4().to_string();
     if !store::acquire_session_input_lease(&mut conn, &lease_id, session_id, &current_timestamp())?
     {
@@ -2530,11 +2552,18 @@ fn record_input(
             )
         }
     } else {
-        record_direct_session_event(runtime, &conn, coven_home, session_id, "input", payload)?;
-        json_response(202, &json!({ "ok": true, "accepted": true }))
+        record_direct_session_event(runtime, &conn, coven_home, session_id, "input", payload)
+            .and_then(|()| json_response(202, &json!({ "ok": true, "accepted": true })))
     };
-    store::release_session_input_lease(&conn, &lease_id)?;
-    result
+    let release = store::release_session_input_lease(&conn, &lease_id);
+    match (result, release) {
+        (Ok(response), Ok(())) => Ok(response),
+        (Ok(_), Err(error)) => Err(error.context("failed to release session input lease")),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(release_error)) => Err(error.context(format!(
+            "failed to release session input lease: {release_error:#}"
+        ))),
+    }
 }
 
 fn kill_session(
@@ -9067,6 +9096,7 @@ mod tests {
 
     struct WriterBackedRuntime {
         writer: crate::event_writer::EventWriter,
+        inputs: std::cell::RefCell<Vec<String>>,
     }
 
     impl SessionRuntime for RecordingRuntime {
@@ -9097,7 +9127,14 @@ mod tests {
             Ok(())
         }
 
-        fn send_input(&self, _session_id: &str, _payload: &Value) -> Result<()> {
+        fn send_input(&self, session_id: &str, payload: &Value) -> Result<()> {
+            let data = payload
+                .get("data")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            self.inputs
+                .borrow_mut()
+                .push(format!("{session_id}:{data}"));
             Ok(())
         }
 
@@ -9112,6 +9149,15 @@ mod tests {
             payload: &Value,
         ) -> Option<Result<()>> {
             Some(self.writer.record(session_id, kind, payload.clone()))
+        }
+
+        fn can_record_session_event(
+            &self,
+            _session_id: &str,
+            _kind: &str,
+            payload: &Value,
+        ) -> Option<Result<bool>> {
+            Some(self.writer.can_record_critical_payload(payload))
         }
     }
 
@@ -9194,6 +9240,7 @@ mod tests {
                 coven_home.to_path_buf(),
                 crate::event_writer::RESERVED_CRITICAL_BYTES + 1024,
             )?,
+            inputs: std::cell::RefCell::new(Vec::new()),
         };
 
         assert!(!runtime.writer.record_output(session_id, "x".repeat(2048))?);
@@ -9277,6 +9324,84 @@ mod tests {
                 runtime,
             )
         })
+    }
+
+    #[test]
+    fn oversized_writer_backed_input_is_rejected_before_send_without_lease_or_event() -> Result<()>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "session-1")?;
+        let runtime = WriterBackedRuntime {
+            writer: crate::event_writer::EventWriter::start_with_capacity(
+                temp_dir.path().to_path_buf(),
+                crate::event_writer::RESERVED_CRITICAL_BYTES + 1024,
+            )?,
+            inputs: std::cell::RefCell::new(Vec::new()),
+        };
+        let body = serde_json::to_string(&json!({ "data": "x".repeat(256 * 1024) }))?;
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions/session-1/input",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 413);
+        assert!(response.body.contains(r#""code":"input_too_large""#));
+        assert!(runtime.inputs.borrow().is_empty());
+        let conn = crate::store::open_store(&temp_dir.path().join("coven.sqlite3"))?;
+        assert!(crate::store::list_events(&conn, "session-1")?.is_empty());
+        let lease_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM session_input_leases WHERE session_id = ?1",
+            ["session-1"],
+            |row| row.get(0),
+        )?;
+        assert_eq!(lease_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn writer_persistence_error_after_send_releases_input_lease_without_fallback_event(
+    ) -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "session-1")?;
+        let runtime = WriterBackedRuntime {
+            writer: crate::event_writer::EventWriter::start(temp_dir.path().to_path_buf())?,
+            inputs: std::cell::RefCell::new(Vec::new()),
+        };
+        let conn = crate::store::open_store(&temp_dir.path().join("coven.sqlite3"))?;
+        conn.execute_batch(
+            "CREATE TRIGGER reject_input_event
+             BEFORE INSERT ON events
+             WHEN NEW.kind = 'input'
+             BEGIN
+                 SELECT RAISE(ABORT, 'simulated event writer failure');
+             END;",
+        )?;
+
+        let error = handle_request_with_runtime(
+            "POST",
+            "/sessions/session-1/input",
+            temp_dir.path(),
+            None,
+            Some(r#"{"data":"hello"}"#),
+            &runtime,
+        )
+        .expect_err("writer failure must surface without a fallback insertion");
+
+        assert!(error.to_string().contains("event writer commit failed"));
+        assert_eq!(runtime.inputs.borrow().as_slice(), ["session-1:hello"]);
+        assert!(crate::store::list_events(&conn, "session-1")?.is_empty());
+        let lease_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM session_input_leases WHERE session_id = ?1",
+            ["session-1"],
+            |row| row.get(0),
+        )?;
+        assert_eq!(lease_count, 0);
+        Ok(())
     }
 
     fn portable_handoff_fixture() -> anyhow::Result<(tempfile::TempDir, WorkspaceSnapshot)> {
