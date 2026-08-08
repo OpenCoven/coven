@@ -235,6 +235,15 @@ pub trait SessionRuntime {
     fn send_input(&self, session_id: &str, payload: &Value) -> Result<()>;
     fn kill_session(&self, session_id: &str) -> Result<()>;
 
+    fn record_session_event(
+        &self,
+        _session_id: &str,
+        _kind: &str,
+        _payload: &Value,
+    ) -> Option<Result<()>> {
+        None
+    }
+
     fn event_writer_health(&self) -> Option<crate::event_writer::EventWriterHealth> {
         None
     }
@@ -377,7 +386,7 @@ pub fn handle_request_with_runtime(
             let (status, response) = control_plane::route_action(payload);
             json_response(status, &response)
         }
-        ("POST", "/cast") => submit_cast(coven_home, body),
+        ("POST", "/cast") => submit_cast(coven_home, body, runtime),
         ("GET", "/cast-codes") => cast_codes_response(),
         // Filesystem-backed reads under ~/.coven/. Missing files return [].
         ("GET", "/familiars") => {
@@ -2521,7 +2530,7 @@ fn record_input(
             )
         }
     } else {
-        insert_event(&conn, coven_home, session_id, "input", payload)?;
+        record_direct_session_event(runtime, &conn, coven_home, session_id, "input", payload)?;
         json_response(202, &json!({ "ok": true, "accepted": true }))
     };
     store::release_session_input_lease(&conn, &lease_id)?;
@@ -2573,7 +2582,8 @@ fn kill_session(
     }
     let now = current_timestamp();
     store::update_session_status(&conn, session_id, "killed", None, &now)?;
-    insert_event(
+    record_direct_session_event(
+        runtime,
         &conn,
         coven_home,
         session_id,
@@ -2764,7 +2774,11 @@ fn cast_codes_response() -> Result<ApiResponse> {
     json_response(200, &codes)
 }
 
-fn submit_cast(coven_home: &Path, body: Option<&str>) -> Result<ApiResponse> {
+fn submit_cast(
+    coven_home: &Path,
+    body: Option<&str>,
+    runtime: &dyn SessionRuntime,
+) -> Result<ApiResponse> {
     let payload = match parse_body(body) {
         Ok(payload) => payload,
         Err(error) => {
@@ -2800,7 +2814,8 @@ fn submit_cast(coven_home: &Path, body: Option<&str>) -> Result<ApiResponse> {
             Some(json!({ "sessionId": session_id })),
         );
     }
-    insert_event(
+    record_direct_session_event(
+        runtime,
         &conn,
         coven_home,
         session_id,
@@ -3052,6 +3067,20 @@ fn insert_event(
             created_at: current_timestamp(),
         },
     )
+}
+
+fn record_direct_session_event(
+    runtime: &dyn SessionRuntime,
+    conn: &rusqlite::Connection,
+    coven_home: &Path,
+    session_id: &str,
+    kind: &str,
+    payload: Value,
+) -> Result<()> {
+    match runtime.record_session_event(session_id, kind, &payload) {
+        Some(result) => result,
+        None => insert_event(conn, coven_home, session_id, kind, payload),
+    }
 }
 
 fn update_familiar_icon(
@@ -9036,6 +9065,10 @@ mod tests {
         kills: std::cell::RefCell<Vec<String>>,
     }
 
+    struct WriterBackedRuntime {
+        writer: crate::event_writer::EventWriter,
+    }
+
     impl SessionRuntime for RecordingRuntime {
         fn launch_session(&self, launch: &SessionLaunch) -> Result<()> {
             self.launches.borrow_mut().push(launch.clone());
@@ -9056,6 +9089,29 @@ mod tests {
         fn kill_session(&self, session_id: &str) -> Result<()> {
             self.kills.borrow_mut().push(session_id.to_string());
             Ok(())
+        }
+    }
+
+    impl SessionRuntime for WriterBackedRuntime {
+        fn launch_session(&self, _launch: &SessionLaunch) -> Result<()> {
+            Ok(())
+        }
+
+        fn send_input(&self, _session_id: &str, _payload: &Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn record_session_event(
+            &self,
+            session_id: &str,
+            kind: &str,
+            payload: &Value,
+        ) -> Option<Result<()>> {
+            Some(self.writer.record(session_id, kind, payload.clone()))
         }
     }
 
@@ -9124,6 +9180,103 @@ mod tests {
         };
         crate::store::insert_session(&conn, &session)?;
         Ok(())
+    }
+
+    fn assert_direct_event_truncation_episodes(
+        coven_home: &std::path::Path,
+        session_id: &str,
+        boundary_kind: &str,
+        request: impl FnOnce(&WriterBackedRuntime) -> Result<ApiResponse>,
+    ) -> Result<()> {
+        insert_test_session(coven_home, session_id)?;
+        let runtime = WriterBackedRuntime {
+            writer: crate::event_writer::EventWriter::start_with_capacity(
+                coven_home.to_path_buf(),
+                crate::event_writer::RESERVED_CRITICAL_BYTES + 1024,
+            )?,
+        };
+
+        assert!(!runtime.writer.record_output(session_id, "x".repeat(2048))?);
+        let response = request(&runtime)?;
+        assert_eq!(response.status, 202);
+        assert!(!runtime.writer.record_output(session_id, "x".repeat(3072))?);
+        assert!(runtime
+            .writer
+            .record_output(session_id, "recovered".to_string())?);
+        runtime.writer.record_exit(
+            session_id,
+            crate::pty_runner::PtyRunResult {
+                status: "completed",
+                exit_code: Some(0),
+            },
+        )?;
+
+        let conn = crate::store::open_store(&coven_home.join("coven.sqlite3"))?;
+        let events = crate::store::list_events(&conn, session_id)?;
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "output_truncated",
+                boundary_kind,
+                "output_truncated",
+                "output",
+                "exit"
+            ]
+        );
+        for (event, dropped_bytes) in [(&events[0], 2048), (&events[2], 3072)] {
+            let payload: Value = serde_json::from_str(&event.payload_json)?;
+            assert_eq!(payload["droppedEvents"], 1);
+            assert_eq!(payload["droppedBytes"], dropped_bytes);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn input_truncation_episodes_close_at_direct_event() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        assert_direct_event_truncation_episodes(temp_dir.path(), "sess-input", "input", |runtime| {
+            handle_request_with_runtime(
+                "POST",
+                "/sessions/sess-input/input",
+                temp_dir.path(),
+                None,
+                Some(r#"{ "data": "ls\n" }"#),
+                runtime,
+            )
+        })
+    }
+
+    #[test]
+    fn kill_truncation_episodes_close_at_direct_event() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        assert_direct_event_truncation_episodes(temp_dir.path(), "sess-kill", "kill", |runtime| {
+            handle_request_with_runtime(
+                "POST",
+                "/sessions/sess-kill/kill",
+                temp_dir.path(),
+                None,
+                None,
+                runtime,
+            )
+        })
+    }
+
+    #[test]
+    fn targeted_cast_truncation_episodes_close_at_direct_event() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        assert_direct_event_truncation_episodes(temp_dir.path(), "sess-cast", "cast", |runtime| {
+            handle_request_with_runtime(
+                "POST",
+                "/cast",
+                temp_dir.path(),
+                None,
+                Some(r#"{ "code": "/handoff", "target": "sess-cast" }"#),
+                runtime,
+            )
+        })
     }
 
     fn portable_handoff_fixture() -> anyhow::Result<(tempfile::TempDir, WorkspaceSnapshot)> {

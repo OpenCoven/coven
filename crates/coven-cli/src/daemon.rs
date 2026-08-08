@@ -402,6 +402,17 @@ impl SessionRuntime for LiveSessionRuntime {
         LiveSessionRuntime::kill_session(self, session_id)
     }
 
+    fn record_session_event(
+        &self,
+        session_id: &str,
+        kind: &str,
+        payload: &Value,
+    ) -> Option<Result<()>> {
+        self.event_writer
+            .as_ref()
+            .map(|writer| writer.record(session_id, kind, payload.clone()))
+    }
+
     /// Must stay in this trait impl: `api::handle_request_with_runtime` reaches
     /// the runtime through `&dyn SessionRuntime`, so an inherent method of the
     /// same name is unreachable and `GET /health` silently falls back to the
