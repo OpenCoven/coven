@@ -648,6 +648,17 @@ fn handle_pairing_confirmation(
             error_response(409, MobileErrorCode::PairingConfirmationRequired)
         }
         Ok(PairingProgress::Complete { device, replayed }) => {
+            // The completing confirmation is whichever side confirms second, so
+            // the device path audits completion too; `replayed` keeps cached
+            // retries from emitting a second event for the same transition.
+            if !replayed {
+                let _ = append_event(
+                    &state.coven_home,
+                    Utc::now(),
+                    MobileAuditEvent::PairingCompleted,
+                    Some(device.id),
+                );
+            }
             success_response(if replayed { 200 } else { 201 }, device)
         }
         Err(error) => {
@@ -1364,5 +1375,74 @@ mod tests {
 
         let audit = std::fs::read_to_string(temp.path().join("mobile/audit.jsonl")).unwrap();
         assert_eq!(audit.matches("\"event\":\"pairing_completed\"").count(), 1);
+    }
+
+    #[test]
+    fn device_completion_audits_once_when_the_host_confirmed_first() {
+        let _guard = TEST_GATEWAY_LOCK.lock().unwrap();
+        let Some((temp, config, _)) = test_listener_config() else {
+            return;
+        };
+        let _gateway = start_mobile_gateway_with_config(temp.path(), &config).unwrap();
+        let state = active_gateway().unwrap();
+        let now = Utc::now();
+        let invitation = state
+            .pairing
+            .begin_pairing([11; 32], now + PAIRING_LIFETIME)
+            .unwrap();
+        let enrolled = state
+            .pairing
+            .enroll(
+                invitation.id,
+                invitation.nonce,
+                sample_pairing_request(invitation.nonce),
+                state.host_fingerprint,
+                now,
+            )
+            .unwrap();
+        let host_path = format!("/api/v1/internal/mobile/pairings/{}/confirm", invitation.id);
+        let host_body = serde_json::json!({ "phrase": enrolled.phrase }).to_string();
+        assert_eq!(
+            handle_local_control("POST", &host_path, Some(&host_body))
+                .unwrap()
+                .unwrap()
+                .status,
+            409
+        );
+
+        let device_path = format!("/api/v1/mobile/pairings/{}/confirm", invitation.id);
+        let device_body = serde_json::json!({ "phrase": enrolled.phrase })
+            .to_string()
+            .into_bytes();
+        let device_request = || MobileHttpRequest {
+            method: "POST".to_owned(),
+            target: device_path.clone(),
+            headers: HashMap::new(),
+            body: device_body.clone(),
+        };
+
+        let completion = handle_pairing_confirmation(&state, &device_path, device_request());
+        assert_eq!(completion.status, 201);
+        let audit_path = temp.path().join("mobile/audit.jsonl");
+        let completions = |label: &str| {
+            std::fs::read_to_string(&audit_path)
+                .unwrap_or_else(|error| panic!("{label}: {error}"))
+                .matches("\"event\":\"pairing_completed\"")
+                .count()
+        };
+        assert_eq!(completions("device completion"), 1);
+
+        assert_eq!(
+            handle_pairing_confirmation(&state, &device_path, device_request()).status,
+            200
+        );
+        assert_eq!(
+            handle_local_control("POST", &host_path, Some(&host_body))
+                .unwrap()
+                .unwrap()
+                .status,
+            200
+        );
+        assert_eq!(completions("replays"), 1);
     }
 }
