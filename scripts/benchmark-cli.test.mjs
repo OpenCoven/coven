@@ -32,8 +32,10 @@ import {
   stopLiveSession,
   socketRequest,
   startDaemon,
+  startDaemonMeasuringReadiness,
   stopDaemon,
   summarizeSamples,
+  waitForDaemonSocketPath,
   waitForOutputEvent,
   waitForHealth
 } from './benchmark-cli.mjs';
@@ -427,7 +429,7 @@ test('stopDaemon shuts down through the same isolated command boundary', () => {
 
 test('measureColdDaemonStarts uses a fresh home per sample and always stops it', async () => {
   const calls = [];
-  const ticks = [0n, 1_250_000n, 2_000_000n, 5_500_000n];
+  const readyTimings = [1.25, 3.5];
   const report = await measureColdDaemonStarts({
     binary: '/tmp/coven',
     fixtureRoot: '/fixture/root',
@@ -436,10 +438,13 @@ test('measureColdDaemonStarts uses a fresh home per sample and always stops it',
     makeDirectory: async (path) => calls.push(['mkdir', path]),
     start: async ({ covenHome, env }) => {
       calls.push(['start', covenHome, env.COVEN_HOME]);
-      return `${covenHome}/coven.sock`;
+      return {
+        socketPath: `${covenHome}/coven.sock`,
+        readyElapsedMs: readyTimings.shift(),
+        completion: Promise.resolve({ status: 0 })
+      };
     },
-    stop: ({ covenHome, env }) => calls.push(['stop', covenHome, env.COVEN_HOME]),
-    now: () => ticks.shift()
+    stop: ({ covenHome, env }) => calls.push(['stop', covenHome, env.COVEN_HOME])
   });
 
   assert.deepEqual(report, {
@@ -459,6 +464,170 @@ test('measureColdDaemonStarts uses a fresh home per sample and always stops it',
     ['start', '/fixture/root/d-1', '/fixture/root/d-1'],
     ['stop', '/fixture/root/d-1', '/fixture/root/d-1']
   ]);
+});
+
+test('startDaemonMeasuringReadiness stops the clock at the first healthy response', async () => {
+  const order = [];
+  let clock = 0n;
+  const tick = (ms) => {
+    clock += BigInt(ms) * 1_000_000n;
+  };
+  let finishCommand;
+  const completion = new Promise((resolve) => {
+    finishCommand = resolve;
+  });
+
+  const result = await startDaemonMeasuringReadiness({
+    binary: '/tmp/coven',
+    covenHome: '/fixture/coven-home',
+    env: { COVEN_HOME: '/fixture/coven-home' },
+    launch: (command) => {
+      order.push(['launch', command.args.join(' ')]);
+      // The real command keeps running (duplicate-daemon sweep) after health.
+      return { child: null, completion };
+    },
+    resolveSocket: async (home) => {
+      order.push(['resolveSocket', home]);
+      tick(4);
+      return '/fixture/coven.sock';
+    },
+    wait: async (path) => {
+      order.push(['wait', path]);
+      tick(6);
+    },
+    now: () => clock
+  });
+
+  assert.equal(result.socketPath, '/fixture/coven.sock');
+  // 4ms resolving metadata + 6ms waiting for health, and nothing after.
+  assert.equal(result.readyElapsedMs, 10);
+  assert.deepEqual(order, [
+    ['launch', 'daemon start'],
+    ['resolveSocket', '/fixture/coven-home'],
+    ['wait', '/fixture/coven.sock']
+  ]);
+
+  // Post-readiness command work is charged to nobody: it lands after the sample.
+  tick(500);
+  finishCommand({ status: 0 });
+  await result.completion;
+  assert.equal(result.readyElapsedMs, 10);
+});
+
+test('startDaemonMeasuringReadiness observes launch completion before polling readiness', async () => {
+  const order = [];
+  const completion = {
+    catch() {
+      order.push('observe-completion');
+      return Promise.resolve();
+    }
+  };
+
+  await startDaemonMeasuringReadiness({
+    binary: '/tmp/coven',
+    covenHome: '/fixture/coven-home',
+    env: { COVEN_HOME: '/fixture/coven-home' },
+    launch: () => ({ child: null, completion }),
+    resolveSocket: async () => {
+      assert.deepEqual(order, ['observe-completion']);
+      return '/fixture/coven.sock';
+    },
+    wait: async () => {}
+  });
+});
+
+test('startDaemonMeasuringReadiness kills the launch child when readiness fails', async () => {
+  const signals = [];
+
+  await assert.rejects(
+    startDaemonMeasuringReadiness({
+      binary: '/tmp/coven',
+      covenHome: '/fixture/coven-home',
+      env: { COVEN_HOME: '/fixture/coven-home' },
+      launch: () => ({
+        child: { kill: (signal) => signals.push(signal) },
+        completion: Promise.resolve({ status: 0 })
+      }),
+      resolveSocket: async () => {
+        throw new Error('daemon metadata did not appear');
+      },
+      wait: async () => {}
+    }),
+    /daemon metadata did not appear/
+  );
+
+  assert.deepEqual(signals, ['SIGKILL']);
+});
+
+test('measureColdDaemonStarts excludes post-readiness command work from samples', async () => {
+  const order = [];
+  const report = await measureColdDaemonStarts({
+    binary: '/tmp/coven',
+    fixtureRoot: '/fixture/root',
+    environment: { PATH: '/fixture/bin' },
+    iterations: 1,
+    makeDirectory: async () => {},
+    start: async () => ({
+      socketPath: '/fixture/coven.sock',
+      readyElapsedMs: 12.5,
+      completion: Promise.resolve().then(() => order.push('command-completed'))
+    }),
+    stop: () => order.push('stop')
+  });
+
+  assert.deepEqual(report.samplesMs, [12.5]);
+  // Completion is awaited, but only after the readiness sample is recorded,
+  // and always before the daemon is stopped.
+  assert.deepEqual(order, ['command-completed', 'stop']);
+});
+
+test('measureColdDaemonStarts still stops the daemon when readiness fails', async () => {
+  const order = [];
+  await assert.rejects(
+    measureColdDaemonStarts({
+      binary: '/tmp/coven',
+      fixtureRoot: '/fixture/root',
+      environment: { PATH: '/fixture/bin' },
+      iterations: 1,
+      makeDirectory: async () => {},
+      start: async () => {
+        throw new Error('daemon health did not become ready');
+      },
+      stop: () => order.push('stop')
+    }),
+    /daemon health did not become ready/
+  );
+  assert.deepEqual(order, ['stop']);
+});
+
+test('waitForDaemonSocketPath retries until daemon metadata is written', async () => {
+  let attempts = 0;
+
+  const socketPath = await waitForDaemonSocketPath('/fixture/coven-home', {
+    attempts: 5,
+    delayMs: 0,
+    readSocket: async () => {
+      attempts += 1;
+      if (attempts < 3) throw new Error('ENOENT: no such file');
+      return '/fixture/coven.sock';
+    }
+  });
+
+  assert.equal(socketPath, '/fixture/coven.sock');
+  assert.equal(attempts, 3);
+});
+
+test('waitForDaemonSocketPath reports the last failure after exhausting attempts', async () => {
+  await assert.rejects(
+    waitForDaemonSocketPath('/fixture/coven-home', {
+      attempts: 2,
+      delayMs: 0,
+      readSocket: async () => {
+        throw new Error('ENOENT: no such file');
+      }
+    }),
+    /daemon metadata did not appear: ENOENT: no such file/
+  );
 });
 
 test('registerExternalSessions seeds deterministic rows through the socket API', async () => {
