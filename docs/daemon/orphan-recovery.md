@@ -6,4 +6,5 @@ title: "Orphan recovery"
 description: "How the Coven daemon recovers orphaned PTYs and stale session records after a crash, restart, or unexpected supervisor exit on the host."
 ---
 
-Stub — fill in. See [Daemon overview](/daemon/index).
+Canonical documentation:
+[Recovery and upgrades](https://docs.opencoven.ai/docs/daemon/recovery-upgrades).

@@ -6,4 +6,5 @@ title: "What is a harness?"
 description: "The harness concept in Coven: a PTY-driven adapter for a specific coding-agent CLI that the daemon spawns, supervises, and records as a session."
 ---
 
-Stub — fill in. See [Harness adapters](/reference/harness-adapters) for the spec.
+Canonical documentation:
+[What is a harness?](https://docs.opencoven.ai/docs/harnesses/what-is-a-harness).

@@ -12,14 +12,13 @@ Today, for keys in the `covenCli.*` namespace:
 1. `~/.config/coven/settings.json` (highest)
 2. `~/.coven/repos.toml` (legacy)
 
-The only environment variable that affects settings discovery today is
-`COVEN_HOME`, which controls the local data dir (`~/.coven/...`) — it does not
-override any `covenCli.*` value.
+`COVEN_HOME` controls the local data directory (`~/.coven/...`) and the legacy
+TOML files beneath it. It does not change where `settings.json` is discovered.
 
-Forward-looking: once the security branch lands and privacy gains
-`load_with_settings`, env vars (`COVEN_PERSIST_RAW_ARTIFACTS`,
-`COVEN_RAW_ARTIFACT_RETENTION_DAYS`, `COVEN_LOG_RETENTION_DAYS`) will trump
-both files for the `covenCli.privacy.*` keys only.
+For privacy retention calculations, environment variables
+(`COVEN_PERSIST_RAW_ARTIFACTS`, `COVEN_RAW_ARTIFACT_RETENTION_DAYS`,
+`COVEN_LOG_RETENTION_DAYS`) override both `privacy.toml` and
+`covenCli.privacy.*`.
 
 When a key is set in both the JSONC file and a legacy TOML file, the JSONC
 value wins and `coven` can print a one-time stderr warning naming the
@@ -40,10 +39,8 @@ points will start emitting this warning in a follow-up commit).
       "openclaw": { "path": "~/dev/openclaw" }
     },
 
-    // Forward-looking. Not honored on main yet; will start working when
-    // the upstream security/private-session-logs branch lands and ships
-    // privacy.rs with load_with_settings(). Until then these keys parse
-    // without error but do not affect runtime retention or redaction.
+    // Used by scheduled maintenance, storage-health reporting, and manual
+    // log pruning. See the note below for event-ingestion behavior.
     "privacy": {
       "persistRawArtifacts": false,
       "rawArtifactRetentionDays": 7,
@@ -60,8 +57,23 @@ points will start emitting this warning in a follow-up commit).
 }
 ```
 
+## Privacy settings boundary
+
+The JSONC privacy keys currently affect scheduled maintenance,
+storage-health reporting, and `coven logs prune`. Event redaction, raw artifact
+creation, and raw artifact retrieval still read `$COVEN_HOME/privacy.toml`
+plus the privacy environment variables directly.
+
+For security-sensitive behavior, configure `privacy.toml` or the environment
+variables until every ingestion path uses the merged JSONC settings surface.
+
 ## Migration
 
-The legacy TOML files (`~/.coven/repos.toml`, `~/.coven/privacy.toml`) are still read. To migrate,
-copy values into the JSONC schema above and delete the corresponding lines from the TOML file. A
-`coven config migrate` command is on the roadmap.
+The legacy repository registry at `~/.coven/repos.toml` is still read. You may
+move repository entries and `defaultRepo` into the JSONC schema above; JSONC
+values win when both files define the same repository.
+
+Do **not** remove privacy values or custom redaction patterns from
+`$COVEN_HOME/privacy.toml` yet. Event ingestion and raw artifact access still
+read that file directly, so migrating those values only to JSONC can weaken
+redaction or disable the intended raw-artifact policy.

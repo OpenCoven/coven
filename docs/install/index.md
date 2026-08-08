@@ -117,7 +117,7 @@ If `doctor` reports a missing harness after installation, open a new terminal so
 
 ## Related
 
-- [Getting started](/GETTING-STARTED)
+- [Getting started](https://docs.opencoven.ai/docs/guide/getting-started)
 - [Quickstart](/start/quickstart)
-- [Troubleshooting](/TROUBLESHOOTING)
+- [Troubleshooting](https://docs.opencoven.ai/docs/reference/troubleshooting)
 - [CLI reference](/reference/cli)

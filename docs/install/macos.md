@@ -92,4 +92,4 @@ Use [Install from source](/install/from-source) for the full contributor path.
 
 - [Install via npm](/install/npm)
 - [Updating Coven](/install/updating)
-- [Troubleshooting](/TROUBLESHOOTING)
+- [Troubleshooting](https://docs.opencoven.ai/docs/reference/troubleshooting)

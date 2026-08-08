@@ -6,4 +6,5 @@ title: "Logs"
 description: "Where the Coven daemon writes structured logs, how to tail them, and which fields to grep when debugging harness sessions or socket API requests."
 ---
 
-Stub — fill in. See [Daemon overview](/daemon/index).
+Canonical documentation:
+[Daemon observability](https://docs.opencoven.ai/docs/daemon/observability).

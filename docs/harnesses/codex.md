@@ -117,4 +117,4 @@ available; otherwise Coven's timeout/error cleanup uses `taskkill /T /F`.
 
 - [Installing harness CLIs](/harnesses/installing)
 - [Provider auth boundary](/harnesses/provider-auth)
-- [Troubleshooting](/TROUBLESHOOTING#harness-missing)
+- [Troubleshooting](https://docs.opencoven.ai/docs/harnesses/troubleshooting)

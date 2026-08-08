@@ -6,4 +6,5 @@ title: "Upgrades"
 description: "How to upgrade the Coven daemon safely, including draining live sessions, migrating the SQLite store, and verifying the new contract version on restart."
 ---
 
-Stub — fill in. See [Daemon overview](/daemon/index).
+Canonical documentation:
+[Recovery and upgrades](https://docs.opencoven.ai/docs/daemon/recovery-upgrades).

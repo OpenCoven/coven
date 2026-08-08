@@ -69,7 +69,9 @@ coven doctor
 
 ## Development checks
 
-Before changing daemon, session, attach, or ritual behavior, run the workspace checks described in [Getting started](/GETTING-STARTED) and [Documentation maintenance](/DOCS-MAINTENANCE).
+Before changing daemon, session, attach, or ritual behavior, run the workspace
+checks described in [CONTRIBUTING.md](../../CONTRIBUTING.md) and
+[Documentation maintenance](/DOCS-MAINTENANCE).
 
 For docs-only install work:
 

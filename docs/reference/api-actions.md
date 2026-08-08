@@ -6,4 +6,5 @@ title: "Actions endpoint"
 description: "Reference for POST /api/v1/actions: how clients send typed action intents to the Coven daemon and how unknown action ids fail closed."
 ---
 
-Stub — fill in.
+Canonical documentation:
+[Local API](https://docs.opencoven.ai/docs/reference/api).

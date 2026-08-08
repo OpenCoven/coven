@@ -108,5 +108,5 @@ Get-Command claude
 ## Related
 
 - [Install overview](/install/index)
-- [Troubleshooting](/TROUBLESHOOTING)
+- [Troubleshooting](https://docs.opencoven.ai/docs/reference/troubleshooting)
 - [Daemon lifecycle](/daemon/lifecycle)

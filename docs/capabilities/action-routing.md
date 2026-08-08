@@ -6,4 +6,5 @@ title: "Action routing"
 description: "How the Coven daemon routes typed action intents from clients to the right adapter, with capability negotiation, validation, and fail-closed unknown ids."
 ---
 
-Stub — fill in.
+Canonical documentation:
+[API action routing](https://docs.opencoven.ai/docs/reference/api).

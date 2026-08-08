@@ -123,4 +123,4 @@ Coven never reads, proxies, or stores those credentials — see the
 - [Installing harness CLIs](/harnesses/installing)
 - [Provider auth boundary](/harnesses/provider-auth)
 - [Harness adapter guide](/HARNESS-ADAPTERS)
-- [Troubleshooting](/TROUBLESHOOTING#harness-missing)
+- [Troubleshooting](https://docs.opencoven.ai/docs/harnesses/troubleshooting)

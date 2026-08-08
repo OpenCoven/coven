@@ -6,4 +6,5 @@ title: "Sessions endpoints"
 description: "Reference for the sessions endpoints: how clients launch, list, attach, archive, and sacrifice Coven harness sessions through the local socket API."
 ---
 
-Stub — fill in.
+Canonical documentation:
+[Session endpoints](https://docs.opencoven.ai/docs/openapi).

@@ -96,4 +96,4 @@ systemctl --user daemon-reload
 
 - [COVEN_HOME layout](/daemon/coven-home)
 - [Install overview](/install/index)
-- [Troubleshooting](/TROUBLESHOOTING)
+- [Troubleshooting](https://docs.opencoven.ai/docs/reference/troubleshooting)

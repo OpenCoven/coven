@@ -6,4 +6,5 @@ title: "Sacrifice"
 description: "The sacrifice ritual permanently removes a Coven session record and its events. Refuses live sessions and requires explicit --yes confirmation."
 ---
 
-Stub — fill in. Rituals refuse live sessions; sacrifice requires `--yes`.
+Canonical documentation:
+[Sacrifice](https://docs.opencoven.ai/docs/cli/sessions#sacrifice).

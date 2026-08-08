@@ -62,5 +62,5 @@ Coven exposes finished sessions as stable JSON records that CastCodes and advanc
 
 ## Related
 
-- [Coven local API](/API)
+- [Coven local API](https://docs.opencoven.ai/docs/reference/api)
 - [API contract](/API-CONTRACT)

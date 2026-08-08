@@ -51,11 +51,11 @@ test('CLI docs guard rejects ASCII and em-dash stub markers', () => {
   }
 });
 
-test('run permission policy is listed in both CLI references', () => {
+test('run permission policy remains local while the CLI index points canonical', () => {
   const commandReference = readRepoFile('docs/reference/cli.md');
   const runReference = readRepoFile('docs/reference/cli-run.md');
 
-  assert.match(commandReference, /--permission <full\\\|read-only>/);
+  assert.match(commandReference, /https:\/\/docs\.opencoven\.ai\/docs\/cli\b/);
   assert.match(runReference, /--permission <full\\\|read-only>/);
 });
 
@@ -102,11 +102,11 @@ test('prepublish smoke runs the CLI docs discovery guard', () => {
   assert.match(prepublish, /scripts\/cli-docs-test\.mjs/);
 });
 
-test('core CLI docs are discoverable from the README and guide index', () => {
+test('canonical CLI docs are discoverable and local guide contracts remain concrete', () => {
   const readme = readRepoFile('README.md');
   assert.match(readme, /docs\/development\/cli-core-functionality\.md/);
-  assert.match(readme, /docs\/guides\/index\.md/);
-  assert.match(readme, /docs\/reference\/cli-coven\.md/);
+  assert.match(readme, /https:\/\/docs\.opencoven\.ai\/docs\/cli\b/);
+  assert.match(readme, /https:\/\/docs\.opencoven\.ai\/docs\/cli\/interactive\b/);
 
   const topLevelCli = readRepoFile('docs/reference/cli-coven.md');
   assertNotStub(topLevelCli, 'docs/reference/cli-coven.md');
