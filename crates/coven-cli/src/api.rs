@@ -222,6 +222,15 @@ pub struct SessionLaunch {
     pub caller_familiar_id: Option<String>,
 }
 
+#[derive(Debug)]
+pub enum SessionEventBoundaryError {
+    Runtime(anyhow::Error),
+    Coordination(anyhow::Error),
+    Persistence(anyhow::Error),
+}
+
+pub type SessionEventBoundaryResult = std::result::Result<(), SessionEventBoundaryError>;
+
 pub trait SessionRuntime {
     fn launch_session(&self, launch: &SessionLaunch) -> Result<()>;
     fn launch_session_with_writer(
@@ -234,6 +243,35 @@ pub trait SessionRuntime {
     }
     fn send_input(&self, session_id: &str, payload: &Value) -> Result<()>;
     fn kill_session(&self, session_id: &str) -> Result<()>;
+
+    fn with_session_event_boundary(
+        &self,
+        _session_id: &str,
+        _kind: &str,
+        _payload: &Value,
+        _action: &mut dyn FnMut() -> SessionEventBoundaryResult,
+    ) -> Option<SessionEventBoundaryResult> {
+        None
+    }
+
+    fn record_session_event(
+        &self,
+        _session_id: &str,
+        _kind: &str,
+        _payload: &Value,
+    ) -> Option<Result<()>> {
+        None
+    }
+
+    /// `None` keeps writerless runtimes on the direct-insertion path.
+    fn can_record_session_event(
+        &self,
+        _session_id: &str,
+        _kind: &str,
+        _payload: &Value,
+    ) -> Option<Result<bool>> {
+        None
+    }
 
     fn event_writer_health(&self) -> Option<crate::event_writer::EventWriterHealth> {
         None
@@ -377,7 +415,7 @@ pub fn handle_request_with_runtime(
             let (status, response) = control_plane::route_action(payload);
             json_response(status, &response)
         }
-        ("POST", "/cast") => submit_cast(coven_home, body),
+        ("POST", "/cast") => submit_cast(coven_home, body, runtime),
         ("GET", "/cast-codes") => cast_codes_response(),
         // Filesystem-backed reads under ~/.coven/. Missing files return [].
         ("GET", "/familiars") => {
@@ -2492,6 +2530,18 @@ fn record_input(
             Some(json!({ "sessionId": session_id })),
         );
     }
+    match runtime.can_record_session_event(session_id, "input", &payload) {
+        Some(Ok(true)) | None => {}
+        Some(Ok(false)) => {
+            return api_error(
+                413,
+                "input_too_large",
+                "Input payload exceeds the daemon event writer capacity.",
+                Some(json!({ "sessionId": session_id })),
+            );
+        }
+        Some(Err(error)) => return Err(error.context("failed to preflight input event")),
+    }
     let lease_id = Uuid::new_v4().to_string();
     if !store::acquire_session_input_lease(&mut conn, &lease_id, session_id, &current_timestamp())?
     {
@@ -2502,30 +2552,53 @@ fn record_input(
             Some(json!({ "sessionId": session_id })),
         );
     }
-    let result = if let Err(error) = runtime.send_input(session_id, &payload) {
-        // Match the typed sentinel from the daemon runtime instead of
-        // substring-matching the error message — refactoring the prose
-        // later can't accidentally route the not-live case to the
-        // generic 500 path.
-        if error
-            .downcast_ref::<crate::daemon::NotLiveError>()
-            .is_some()
-        {
-            session_not_live_response(session_id)
-        } else {
-            api_error(
-                500,
-                "send_input_failed",
-                &error.to_string(),
-                Some(json!({ "sessionId": session_id })),
-            )
-        }
-    } else {
-        insert_event(&conn, coven_home, session_id, "input", payload)?;
-        json_response(202, &json!({ "ok": true, "accepted": true }))
+    let action_payload = payload.clone();
+    let mut action = || {
+        runtime
+            .send_input(session_id, &action_payload)
+            .map_err(SessionEventBoundaryError::Runtime)
     };
-    store::release_session_input_lease(&conn, &lease_id)?;
-    result
+    let result = match perform_direct_session_event(
+        runtime,
+        &conn,
+        coven_home,
+        session_id,
+        "input",
+        payload,
+        &mut action,
+    ) {
+        Ok(()) => json_response(202, &json!({ "ok": true, "accepted": true })),
+        Err(SessionEventBoundaryError::Runtime(error)) => {
+            // Match the typed sentinel from the daemon runtime instead of
+            // substring-matching the error message — refactoring the prose
+            // later can't accidentally route the not-live case to the
+            // generic 500 path.
+            if error
+                .downcast_ref::<crate::daemon::NotLiveError>()
+                .is_some()
+            {
+                session_not_live_response(session_id)
+            } else {
+                api_error(
+                    500,
+                    "send_input_failed",
+                    &error.to_string(),
+                    Some(json!({ "sessionId": session_id })),
+                )
+            }
+        }
+        Err(SessionEventBoundaryError::Coordination(error))
+        | Err(SessionEventBoundaryError::Persistence(error)) => Err(error),
+    };
+    let release = store::release_session_input_lease(&conn, &lease_id);
+    match (result, release) {
+        (Ok(response), Ok(())) => Ok(response),
+        (Ok(_), Err(error)) => Err(error.context("failed to release session input lease")),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(release_error)) => Err(error.context(format!(
+            "failed to release session input lease: {release_error:#}"
+        ))),
+    }
 }
 
 fn kill_session(
@@ -2554,33 +2627,46 @@ fn kill_session(
         );
     }
 
-    // Same structured-error pattern as the launch + input handlers: a
-    // runtime kill failure (libc::kill returning EPERM, etc.) must
-    // become a 500 response, not an Err that brings down the daemon.
-    if let Err(error) = runtime.kill_session(session_id) {
-        if error
-            .downcast_ref::<crate::daemon::NotLiveError>()
-            .is_some()
-        {
-            return session_not_live_response(session_id);
-        }
-        return api_error(
-            500,
-            "kill_failed",
-            &error.to_string(),
-            Some(json!({ "sessionId": session_id })),
-        );
-    }
-    let now = current_timestamp();
-    store::update_session_status(&conn, session_id, "killed", None, &now)?;
-    insert_event(
+    let kill_payload = json!({ "status": "killed" });
+    let mut action = || {
+        runtime
+            .kill_session(session_id)
+            .map_err(SessionEventBoundaryError::Runtime)?;
+        let now = current_timestamp();
+        store::update_session_status(&conn, session_id, "killed", None, &now)
+            .map_err(SessionEventBoundaryError::Coordination)
+    };
+    match perform_direct_session_event(
+        runtime,
         &conn,
         coven_home,
         session_id,
         "kill",
-        json!({ "status": "killed" }),
-    )?;
-    json_response(202, &json!({ "ok": true, "accepted": true }))
+        kill_payload,
+        &mut action,
+    ) {
+        Ok(()) => json_response(202, &json!({ "ok": true, "accepted": true })),
+        // Same structured-error pattern as the launch + input handlers: a
+        // runtime kill failure (libc::kill returning EPERM, etc.) must
+        // become a 500 response, not an Err that brings down the daemon.
+        Err(SessionEventBoundaryError::Runtime(error)) => {
+            if error
+                .downcast_ref::<crate::daemon::NotLiveError>()
+                .is_some()
+            {
+                session_not_live_response(session_id)
+            } else {
+                api_error(
+                    500,
+                    "kill_failed",
+                    &error.to_string(),
+                    Some(json!({ "sessionId": session_id })),
+                )
+            }
+        }
+        Err(SessionEventBoundaryError::Coordination(error))
+        | Err(SessionEventBoundaryError::Persistence(error)) => Err(error),
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2764,7 +2850,11 @@ fn cast_codes_response() -> Result<ApiResponse> {
     json_response(200, &codes)
 }
 
-fn submit_cast(coven_home: &Path, body: Option<&str>) -> Result<ApiResponse> {
+fn submit_cast(
+    coven_home: &Path,
+    body: Option<&str>,
+    runtime: &dyn SessionRuntime,
+) -> Result<ApiResponse> {
     let payload = match parse_body(body) {
         Ok(payload) => payload,
         Err(error) => {
@@ -2800,13 +2890,24 @@ fn submit_cast(coven_home: &Path, body: Option<&str>) -> Result<ApiResponse> {
             Some(json!({ "sessionId": session_id })),
         );
     }
-    insert_event(
-        &conn,
-        coven_home,
-        session_id,
-        "cast",
-        json!({ "cast_id": cast_id, "code": code, "target": target }),
-    )?;
+    let cast_event = json!({ "cast_id": cast_id, "code": code, "target": target });
+    if target.is_some() {
+        match runtime.can_record_session_event(session_id, "cast", &cast_event) {
+            Some(Ok(true)) | None => {}
+            Some(Ok(false)) => {
+                return api_error(
+                    413,
+                    "cast_too_large",
+                    "Cast payload exceeds the daemon event writer capacity.",
+                    Some(json!({ "sessionId": session_id })),
+                );
+            }
+            Some(Err(error)) => return Err(error.context("failed to preflight cast event")),
+        }
+        record_direct_session_event(runtime, &conn, coven_home, session_id, "cast", cast_event)?;
+    } else {
+        insert_event(&conn, coven_home, session_id, "cast", cast_event)?;
+    }
     json_response(
         202,
         &CastResultDto {
@@ -3052,6 +3153,39 @@ fn insert_event(
             created_at: current_timestamp(),
         },
     )
+}
+
+fn record_direct_session_event(
+    runtime: &dyn SessionRuntime,
+    conn: &rusqlite::Connection,
+    coven_home: &Path,
+    session_id: &str,
+    kind: &str,
+    payload: Value,
+) -> Result<()> {
+    match runtime.record_session_event(session_id, kind, &payload) {
+        Some(result) => result,
+        None => insert_event(conn, coven_home, session_id, kind, payload),
+    }
+}
+
+fn perform_direct_session_event(
+    runtime: &dyn SessionRuntime,
+    conn: &rusqlite::Connection,
+    coven_home: &Path,
+    session_id: &str,
+    kind: &str,
+    payload: Value,
+    action: &mut dyn FnMut() -> SessionEventBoundaryResult,
+) -> SessionEventBoundaryResult {
+    match runtime.with_session_event_boundary(session_id, kind, &payload, action) {
+        Some(result) => result,
+        None => {
+            action()?;
+            insert_event(conn, coven_home, session_id, kind, payload)
+                .map_err(SessionEventBoundaryError::Persistence)
+        }
+    }
 }
 
 fn update_familiar_icon(
@@ -9036,6 +9170,24 @@ mod tests {
         kills: std::cell::RefCell<Vec<String>>,
     }
 
+    struct WriterBackedRuntime {
+        writer: crate::event_writer::EventWriter,
+        inputs: std::cell::RefCell<Vec<String>>,
+        input_output: Option<String>,
+        input_error: Option<&'static str>,
+    }
+
+    impl WriterBackedRuntime {
+        fn new(writer: crate::event_writer::EventWriter) -> Self {
+            Self {
+                writer,
+                inputs: std::cell::RefCell::new(Vec::new()),
+                input_output: None,
+                input_error: None,
+            }
+        }
+    }
+
     impl SessionRuntime for RecordingRuntime {
         fn launch_session(&self, launch: &SessionLaunch) -> Result<()> {
             self.launches.borrow_mut().push(launch.clone());
@@ -9056,6 +9208,88 @@ mod tests {
         fn kill_session(&self, session_id: &str) -> Result<()> {
             self.kills.borrow_mut().push(session_id.to_string());
             Ok(())
+        }
+    }
+
+    impl SessionRuntime for WriterBackedRuntime {
+        fn launch_session(&self, _launch: &SessionLaunch) -> Result<()> {
+            Ok(())
+        }
+
+        fn send_input(&self, session_id: &str, payload: &Value) -> Result<()> {
+            let data = payload
+                .get("data")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            self.inputs
+                .borrow_mut()
+                .push(format!("{session_id}:{data}"));
+            if let Some(output) = self.input_output.as_ref() {
+                assert!(!self.writer.record_output(session_id, output.clone())?);
+            }
+            if let Some(error) = self.input_error {
+                anyhow::bail!(error);
+            }
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn record_session_event(
+            &self,
+            session_id: &str,
+            kind: &str,
+            payload: &Value,
+        ) -> Option<Result<()>> {
+            Some(self.writer.record(session_id, kind, payload.clone()))
+        }
+
+        fn with_session_event_boundary(
+            &self,
+            session_id: &str,
+            kind: &str,
+            payload: &Value,
+            action: &mut dyn FnMut() -> SessionEventBoundaryResult,
+        ) -> Option<SessionEventBoundaryResult> {
+            Some(match kind {
+                "input" => {
+                    let reservation =
+                        match self
+                            .writer
+                            .reserve_record(session_id, kind, payload.clone())
+                        {
+                            Ok(reservation) => reservation,
+                            Err(error) => {
+                                return Some(Err(SessionEventBoundaryError::Persistence(error)));
+                            }
+                        };
+                    match action() {
+                        Ok(()) => reservation
+                            .commit()
+                            .map_err(SessionEventBoundaryError::Persistence),
+                        Err(error) => {
+                            reservation.cancel();
+                            Err(error)
+                        }
+                    }
+                }
+                _ => action().and_then(|()| {
+                    self.writer
+                        .record(session_id, kind, payload.clone())
+                        .map_err(SessionEventBoundaryError::Persistence)
+                }),
+            })
+        }
+
+        fn can_record_session_event(
+            &self,
+            _session_id: &str,
+            _kind: &str,
+            payload: &Value,
+        ) -> Option<Result<bool>> {
+            Some(self.writer.can_record_critical_payload(payload))
         }
     }
 
@@ -9123,6 +9357,297 @@ mod tests {
             transcript_path: None,
         };
         crate::store::insert_session(&conn, &session)?;
+        Ok(())
+    }
+
+    fn assert_direct_event_truncation_episodes(
+        coven_home: &std::path::Path,
+        session_id: &str,
+        boundary_kind: &str,
+        request: impl FnOnce(&WriterBackedRuntime) -> Result<ApiResponse>,
+    ) -> Result<()> {
+        insert_test_session(coven_home, session_id)?;
+        let runtime =
+            WriterBackedRuntime::new(crate::event_writer::EventWriter::start_with_capacity(
+                coven_home.to_path_buf(),
+                crate::event_writer::RESERVED_CRITICAL_BYTES + 1024,
+            )?);
+
+        assert!(!runtime.writer.record_output(session_id, "x".repeat(2048))?);
+        let response = request(&runtime)?;
+        assert_eq!(response.status, 202);
+        assert!(!runtime.writer.record_output(session_id, "x".repeat(3072))?);
+        assert!(runtime
+            .writer
+            .record_output(session_id, "recovered".to_string())?);
+        runtime.writer.record_exit(
+            session_id,
+            crate::pty_runner::PtyRunResult {
+                status: "completed",
+                exit_code: Some(0),
+            },
+        )?;
+
+        let conn = crate::store::open_store(&coven_home.join("coven.sqlite3"))?;
+        let events = crate::store::list_events(&conn, session_id)?;
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "output_truncated",
+                boundary_kind,
+                "output_truncated",
+                "output",
+                "exit"
+            ]
+        );
+        for (event, dropped_bytes) in [(&events[0], 2048), (&events[2], 3072)] {
+            let payload: Value = serde_json::from_str(&event.payload_json)?;
+            assert_eq!(payload["droppedEvents"], 1);
+            assert_eq!(payload["droppedBytes"], dropped_bytes);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn input_truncation_episodes_close_at_direct_event() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        assert_direct_event_truncation_episodes(temp_dir.path(), "sess-input", "input", |runtime| {
+            handle_request_with_runtime(
+                "POST",
+                "/sessions/sess-input/input",
+                temp_dir.path(),
+                None,
+                Some(r#"{ "data": "ls\n" }"#),
+                runtime,
+            )
+        })
+    }
+
+    #[test]
+    fn kill_truncation_episodes_close_at_direct_event() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        assert_direct_event_truncation_episodes(temp_dir.path(), "sess-kill", "kill", |runtime| {
+            handle_request_with_runtime(
+                "POST",
+                "/sessions/sess-kill/kill",
+                temp_dir.path(),
+                None,
+                None,
+                runtime,
+            )
+        })
+    }
+
+    #[test]
+    fn targeted_cast_truncation_episodes_close_at_direct_event() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        assert_direct_event_truncation_episodes(temp_dir.path(), "sess-cast", "cast", |runtime| {
+            handle_request_with_runtime(
+                "POST",
+                "/cast",
+                temp_dir.path(),
+                None,
+                Some(r#"{ "code": "/handoff", "target": "sess-cast" }"#),
+                runtime,
+            )
+        })
+    }
+
+    #[test]
+    fn oversized_writer_backed_input_is_rejected_before_send_without_lease_or_event() -> Result<()>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "session-1")?;
+        let runtime =
+            WriterBackedRuntime::new(crate::event_writer::EventWriter::start_with_capacity(
+                temp_dir.path().to_path_buf(),
+                crate::event_writer::RESERVED_CRITICAL_BYTES + 1024,
+            )?);
+        let body = serde_json::to_string(&json!({ "data": "x".repeat(256 * 1024) }))?;
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions/session-1/input",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 413);
+        assert!(response.body.contains(r#""code":"input_too_large""#));
+        assert!(runtime.inputs.borrow().is_empty());
+        let conn = crate::store::open_store(&temp_dir.path().join("coven.sqlite3"))?;
+        assert!(crate::store::list_events(&conn, "session-1")?.is_empty());
+        let lease_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM session_input_leases WHERE session_id = ?1",
+            ["session-1"],
+            |row| row.get(0),
+        )?;
+        assert_eq!(lease_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_writer_backed_targeted_cast_is_rejected_without_event_or_writer_side_effect(
+    ) -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "session-1")?;
+        let runtime = WriterBackedRuntime::new(crate::event_writer::EventWriter::start(
+            temp_dir.path().to_path_buf(),
+        )?);
+        let body = serde_json::to_string(&json!({
+            "code": "x".repeat(3 * 1024 * 1024),
+            "target": "session-1",
+        }))?;
+        assert!(body.len() < crate::daemon::MAX_SOCKET_BODY_BYTES);
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/cast",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 413);
+        let response_body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(response_body["error"]["code"], "cast_too_large");
+        let conn = crate::store::open_store(&temp_dir.path().join("coven.sqlite3"))?;
+        assert!(crate::store::list_events(&conn, "session-1")?.is_empty());
+        let health = runtime.writer.health();
+        assert_eq!(health.queued_events, 0);
+        assert_eq!(health.committed_events, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn writer_backed_untargeted_cast_bypasses_writer_capacity_and_persists_to_cockpit() -> Result<()>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let runtime = WriterBackedRuntime::new(crate::event_writer::EventWriter::start(
+            temp_dir.path().to_path_buf(),
+        )?);
+        let code = "x".repeat(3 * 1024 * 1024);
+        let body = serde_json::to_string(&json!({ "code": code }))?;
+        assert!(body.len() < crate::daemon::MAX_SOCKET_BODY_BYTES);
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/cast",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 202);
+        let conn = crate::store::open_store(&temp_dir.path().join("coven.sqlite3"))?;
+        let events = crate::store::list_events(&conn, "__cockpit__")?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "cast");
+        let payload: Value = serde_json::from_str(&events[0].payload_json)?;
+        assert_eq!(payload["code"].as_str(), Some(code.as_str()));
+        let health = runtime.writer.health();
+        assert_eq!(health.queued_events, 0);
+        assert_eq!(health.committed_events, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn writer_persistence_error_after_send_releases_input_lease_without_fallback_event(
+    ) -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "session-1")?;
+        let runtime = WriterBackedRuntime::new(crate::event_writer::EventWriter::start(
+            temp_dir.path().to_path_buf(),
+        )?);
+        let conn = crate::store::open_store(&temp_dir.path().join("coven.sqlite3"))?;
+        conn.execute_batch(
+            "CREATE TRIGGER reject_input_event
+             BEFORE INSERT ON events
+             WHEN NEW.kind = 'input'
+             BEGIN
+                 SELECT RAISE(ABORT, 'simulated event writer failure');
+             END;",
+        )?;
+
+        let error = handle_request_with_runtime(
+            "POST",
+            "/sessions/session-1/input",
+            temp_dir.path(),
+            None,
+            Some(r#"{"data":"hello"}"#),
+            &runtime,
+        )
+        .expect_err("writer failure must surface without a fallback insertion");
+
+        assert!(error.to_string().contains("event writer commit failed"));
+        assert_eq!(runtime.inputs.borrow().as_slice(), ["session-1:hello"]);
+        assert!(crate::store::list_events(&conn, "session-1")?.is_empty());
+        let lease_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM session_input_leases WHERE session_id = ?1",
+            ["session-1"],
+            |row| row.get(0),
+        )?;
+        assert_eq!(lease_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_input_boundary_restores_truncation_episode() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "session-1")?;
+        let mut runtime =
+            WriterBackedRuntime::new(crate::event_writer::EventWriter::start_with_capacity(
+                temp_dir.path().to_path_buf(),
+                crate::event_writer::RESERVED_CRITICAL_BYTES + 1024,
+            )?);
+        runtime.input_output = Some("b".repeat(3072));
+        runtime.input_error = Some("simulated input transport failure");
+
+        assert!(!runtime
+            .writer
+            .record_output("session-1", "a".repeat(2048))?);
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions/session-1/input",
+            temp_dir.path(),
+            None,
+            Some(r#"{"data":"hello"}"#),
+            &runtime,
+        )?;
+        assert_eq!(response.status, 500);
+        assert!(response.body.contains(r#""code":"send_input_failed""#));
+
+        assert!(runtime
+            .writer
+            .record_output("session-1", "recovered".to_string())?);
+        runtime.writer.record_exit(
+            "session-1",
+            crate::pty_runner::PtyRunResult {
+                status: "completed",
+                exit_code: Some(0),
+            },
+        )?;
+
+        let conn = crate::store::open_store(&temp_dir.path().join("coven.sqlite3"))?;
+        let events = crate::store::list_events(&conn, "session-1")?;
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["output_truncated", "output", "exit"]
+        );
+        let marker: Value = serde_json::from_str(&events[0].payload_json)?;
+        assert_eq!(marker["droppedEvents"], 2);
+        assert_eq!(marker["droppedBytes"], 5120);
+        assert!(!events.iter().any(|event| event.kind == "input"));
         Ok(())
     }
 
