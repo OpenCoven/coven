@@ -6,7 +6,7 @@
 use rusqlite::{params, OptionalExtension};
 
 use crate::fs::{AgentFs, Metadata};
-use crate::path::{normalize, parent};
+use crate::path::{components, normalize, parent};
 use crate::{now_parts, Error, Result};
 
 /// A copy-on-write overlay filesystem.
@@ -23,6 +23,11 @@ impl OverlayFs {
     pub fn new(delta: AgentFs, base: AgentFs) -> Result<Self> {
         if delta.is_read_only() {
             return Err(Error::ReadOnly);
+        }
+        if !base.is_read_only() {
+            return Err(Error::InvalidArgument(
+                "overlay base must be read-only".into(),
+            ));
         }
         Ok(Self { delta, base })
     }
@@ -117,6 +122,32 @@ impl OverlayFs {
         Ok(())
     }
 
+    /// Whether the base layer can contribute an entry at `npath`.
+    ///
+    /// A whiteout hides its entire base subtree. Likewise, a non-directory
+    /// delta ancestor replaces the corresponding base directory, so lookup
+    /// must not resume in the base at a descendant path.
+    fn base_visible_at(&self, npath: &str) -> Result<bool> {
+        let mut current = String::new();
+        for component in components(npath) {
+            current.push('/');
+            current.push_str(component);
+
+            if self.has_whiteout(&current)? {
+                return Ok(false);
+            }
+
+            if current != npath {
+                if let Some(ino) = self.delta.resolve(&current)? {
+                    if !self.delta.stat_ino(ino)?.is_dir() {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
     // ---- overlay operations ------------------------------------------------
 
     /// Overlay existence check following delta → whiteout → base.
@@ -125,7 +156,7 @@ impl OverlayFs {
         if self.delta.exists(&npath)? {
             return Ok(true);
         }
-        if self.has_whiteout(&npath)? {
+        if !self.base_visible_at(&npath)? {
             return Ok(false);
         }
         self.base.exists(&npath)
@@ -143,7 +174,7 @@ impl OverlayFs {
             }
             return Ok(meta);
         }
-        if self.has_whiteout(&npath)? {
+        if !self.base_visible_at(&npath)? {
             return Err(Error::NotFound(npath));
         }
         self.base.stat(&npath)
@@ -155,7 +186,7 @@ impl OverlayFs {
         if self.delta.exists(&npath)? {
             return self.delta.read_file(&npath);
         }
-        if self.has_whiteout(&npath)? {
+        if !self.base_visible_at(&npath)? {
             return Err(Error::NotFound(npath));
         }
         self.base.read_file(&npath)
@@ -166,14 +197,15 @@ impl OverlayFs {
     /// base file, the base inode is recorded in `fs_origin`.
     pub fn write_file(&mut self, path: &str, data: &[u8]) -> Result<i64> {
         let npath = normalize(path);
-        let shadowed_base_ino = if self.delta.resolve(&npath)?.is_none() {
-            match self.base.resolve(&npath)? {
-                Some(ino) if self.base.stat_ino(ino)?.is_file() => Some(ino),
-                _ => None,
-            }
-        } else {
-            None
-        };
+        let shadowed_base_ino =
+            if self.delta.resolve(&npath)?.is_none() && self.base_visible_at(&npath)? {
+                match self.base.resolve(&npath)? {
+                    Some(ino) if self.base.stat_ino(ino)?.is_file() => Some(ino),
+                    _ => None,
+                }
+            } else {
+                None
+            };
         self.remove_whiteout(&npath)?;
         // Ancestor directories being re-created must also lose their whiteouts.
         let mut anc = parent(&npath);
@@ -196,7 +228,7 @@ impl OverlayFs {
         if let Some(ino) = self.delta.resolve(&npath)? {
             return Ok(ino);
         }
-        if self.has_whiteout(&npath)? {
+        if !self.base_visible_at(&npath)? {
             return Err(Error::NotFound(npath));
         }
         let base_meta = self.base.stat(&npath)?;
@@ -233,8 +265,8 @@ impl OverlayFs {
     pub fn remove_file(&mut self, path: &str) -> Result<()> {
         let npath = normalize(path);
         let in_delta = self.delta.resolve(&npath)?.is_some();
-        let in_base = self.base.exists(&npath)?;
-        if !in_delta && (self.has_whiteout(&npath)? || !in_base) {
+        let in_base = self.base_visible_at(&npath)? && self.base.exists(&npath)?;
+        if !in_delta && !in_base {
             return Err(Error::NotFound(npath));
         }
         if in_delta {
@@ -250,10 +282,12 @@ impl OverlayFs {
     /// whiteouts, deduplicated, sorted ascending.
     pub fn readdir(&self, path: &str) -> Result<Vec<String>> {
         let npath = normalize(path);
-        let delta_dir =
-            matches!(self.delta.resolve(&npath)?, Some(ino) if self.delta.stat_ino(ino)?.is_dir());
-        let whited_out = self.has_whiteout(&npath)?;
-        let base_dir = !whited_out
+        let delta_dir = match self.delta.resolve(&npath)? {
+            Some(ino) if self.delta.stat_ino(ino)?.is_dir() => true,
+            Some(_) => return Err(Error::NotADirectory(npath)),
+            None => false,
+        };
+        let base_dir = self.base_visible_at(&npath)?
             && matches!(self.base.resolve(&npath)?, Some(ino) if self.base.stat_ino(ino)?.is_dir());
         if !delta_dir && !base_dir {
             return Err(Error::NotFound(npath));

@@ -253,6 +253,38 @@ fn overlay_readdir_merges_and_hides_whiteouts() {
 }
 
 #[test]
+fn delta_file_hides_base_descendants() {
+    let (_dir, mut ov) = overlay_fixture();
+    ov.write_file("/docs", b"delta file").unwrap();
+
+    assert_eq!(ov.read_file("/docs").unwrap(), b"delta file");
+    assert!(!ov.exists("/docs/readme.md").unwrap());
+    assert!(matches!(
+        ov.stat("/docs/readme.md"),
+        Err(coven_afs::Error::NotFound(_))
+    ));
+    assert!(matches!(
+        ov.read_file("/docs/readme.md"),
+        Err(coven_afs::Error::NotFound(_))
+    ));
+    assert!(matches!(
+        ov.readdir("/docs"),
+        Err(coven_afs::Error::NotADirectory(_))
+    ));
+}
+
+#[test]
+fn overlay_requires_read_only_base() {
+    let delta = AgentFs::in_memory().unwrap();
+    let writable_base = AgentFs::in_memory().unwrap();
+
+    assert!(matches!(
+        OverlayFs::new(delta, writable_base),
+        Err(coven_afs::Error::InvalidArgument(_))
+    ));
+}
+
+#[test]
 fn overlay_layers_stay_spec_consistent() {
     let (_dir, mut ov) = overlay_fixture();
     ov.write_file("/shared.txt", b"delta").unwrap();
