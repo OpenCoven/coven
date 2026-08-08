@@ -38,15 +38,37 @@ import {
   waitForHealth
 } from './benchmark-cli.mjs';
 
-test('summarizeSamples reports deterministic p50, p95, and p99', () => {
+test('summarizeSamples omits tail percentiles that collapse onto the maximum', () => {
+  // With only 5 samples the nearest-rank p95 and p99 both land on the last
+  // (maximum) element, so reporting them as tail percentiles is misleading: they
+  // are indistinguishable from maxMs.  They must be omitted below the support
+  // threshold rather than echoing the max.
   assert.deepEqual(summarizeSamples([9, 1, 5, 3, 7]), {
     minMs: 1,
     medianMs: 5,
     p50Ms: 5,
-    p95Ms: 9,
-    p99Ms: 9,
     maxMs: 9
   });
+});
+
+test('summarizeSamples reports p95 only once enough samples support it', () => {
+  const samples = Array.from({ length: 20 }, (_value, index) => index + 1);
+  const summary = summarizeSamples(samples);
+  // Nearest-rank p95 of 20 ascending samples is index ceil(20*0.95)-1 = 18 -> 19,
+  // strictly below the maximum of 20, so it is now statistically distinguishable.
+  assert.equal(summary.p95Ms, 19);
+  assert.equal(summary.maxMs, 20);
+  // 20 samples still cannot support p99 (its nearest rank is the max), so omit it.
+  assert.equal(Object.hasOwn(summary, 'p99Ms'), false);
+});
+
+test('summarizeSamples reports p99 only when its rank clears the maximum', () => {
+  const samples = Array.from({ length: 100 }, (_value, index) => index + 1);
+  const summary = summarizeSamples(samples);
+  // ceil(100*0.99)-1 = 98 -> 99, strictly below the maximum of 100.
+  assert.equal(summary.p95Ms, 95);
+  assert.equal(summary.p99Ms, 99);
+  assert.equal(summary.maxMs, 100);
 });
 
 test('parseOptions requires a binary path', () => {
@@ -426,8 +448,6 @@ test('measureColdDaemonStarts uses a fresh home per sample and always stops it',
       minMs: 1.25,
       medianMs: 2.375,
       p50Ms: 1.25,
-      p95Ms: 3.5,
-      p99Ms: 3.5,
       maxMs: 3.5
     }
   });

@@ -55,9 +55,22 @@ test('summarizes p50, p95, and p99 using nearest rank', () => {
 test('describes live writer metrics and deterministic fault equivalents', () => {
   assert.equal(storageMetricStatus().sqliteConnectionOpens.status, 'measured');
   assert.equal(storageMetricStatus().eventQueueDepth.status, 'measured');
-  assert.equal(chaosCoverage().diskFull.status, 'covered_by_storage_regressions');
-  assert.match(
-    chaosCoverage().diskFull.evidence,
+});
+
+test('marks diskFull chaos coverage as unproven until a write-fault seam is tested', () => {
+  // scheduled_maintenance_below_watermark_does_not_open_or_write_the_store only
+  // proves low-disk gating: it asserts the store is never opened when free disk
+  // is below the maintenance watermark.  It never triggers SQLITE_FULL, a write
+  // fault, or recovery, so it cannot back a "covered" claim for diskFull chaos.
+  const diskFull = chaosCoverage().diskFull;
+  assert.equal(diskFull.status, 'blocked');
+  assert.equal(
+    Object.hasOwn(diskFull, 'evidence'),
+    false,
+    'a blocked status must not cite a test as proving the fault path'
+  );
+  assert.doesNotMatch(
+    JSON.stringify(diskFull),
     /scheduled_maintenance_below_watermark_does_not_open_or_write_the_store/
   );
 });
@@ -253,10 +266,38 @@ test('scenario timeout messages redact fixture paths from the original error', a
   );
 });
 
-test('closes the throughput timing window before diagnostic sampling', async () => {
+test('closes the throughput timing window the instant launches resolve', async () => {
+  // The throughput denominator must be captured the moment every launch
+  // resolves, before any observer teardown or diagnostic sampling adds latency.
   const source = await readFile(new URL('./benchmark-chaos.mjs', import.meta.url), 'utf8');
   assert.match(
     source,
-    /completedAt = process\.hrtime\.bigint\(\);\n\s+} finally \{\n\s+observing = false;\n\s+await observation;\n\s+}\n\s+const elapsedMs = .*;\n\s+runtimeSamples\.push\(await fullRuntimeSnapshot/
+    /completedAt = process\.hrtime\.bigint\(\);\n\s+elapsedMs = Number\(completedAt - startedAt\) \/ 1_000_000;/
+  );
+});
+
+test('samples writer health across the full measured interval through cancellation', async () => {
+  // The periodic 25ms observer must keep running until cancellation completes,
+  // so sampled queue/RSS maxima cover launch AND teardown, not just launch.
+  // Stopping it before the cancellation loop (the previous behaviour) left the
+  // cancellation interval sampled only by the two manual bracket snapshots.
+  const source = await readFile(new URL('./benchmark-chaos.mjs', import.meta.url), 'utf8');
+  const observerTeardown = source.indexOf('observing = false;');
+  const cancellationStart = source.indexOf('const cancellationStartedAt = process.hrtime.bigint();');
+  const cancellationMeasured = source.indexOf(
+    'cancellationMs = Number(process.hrtime.bigint() - cancellationStartedAt) / 1_000_000;'
+  );
+  assert.ok(observerTeardown !== -1, 'observer teardown must exist');
+  assert.ok(cancellationStart !== -1, 'cancellation timer must exist');
+  assert.ok(cancellationMeasured !== -1, 'cancellation interval must be measured');
+  // The observer must still be running when cancellation begins and completes:
+  // its teardown has to come after the cancellation interval is measured.
+  assert.ok(
+    observerTeardown > cancellationStart,
+    'observer must not stop before the cancellation loop starts'
+  );
+  assert.ok(
+    observerTeardown > cancellationMeasured,
+    'observer must stop only after the cancellation interval is measured'
   );
 });
