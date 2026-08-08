@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/coven-cli", "crates/coven-memory", "crates/coven-relay"]
+members = ["crates/coven-afs", "crates/coven-cli", "crates/coven-memory", "crates/coven-relay"]
 resolver = "2"
 
 [workspace.package]
