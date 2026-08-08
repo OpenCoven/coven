@@ -112,6 +112,14 @@ impl EventWriter {
     }
 
     fn start_with_capacity(coven_home: PathBuf, capacity_bytes: usize) -> Result<Self> {
+        Self::start_with_capacity_and_setup(coven_home, capacity_bytes, |_| Ok(()))
+    }
+
+    fn start_with_capacity_and_setup(
+        coven_home: PathBuf,
+        capacity_bytes: usize,
+        setup: impl FnOnce(&Connection) -> Result<()> + Send + 'static,
+    ) -> Result<Self> {
         anyhow::ensure!(
             capacity_bytes > RESERVED_CRITICAL_BYTES,
             "event writer capacity must reserve room for critical events"
@@ -145,7 +153,7 @@ impl EventWriter {
         let worker_shared = Arc::clone(&shared);
         thread::Builder::new()
             .name("coven-event-writer".to_string())
-            .spawn(move || run_worker(worker_shared, coven_home, ready_tx))
+            .spawn(move || run_worker(worker_shared, coven_home, ready_tx, setup))
             .context("failed to spawn Coven event writer")?;
         match ready_rx
             .recv()
@@ -437,15 +445,11 @@ fn run_worker(
     shared: Arc<Shared>,
     coven_home: PathBuf,
     ready: mpsc::SyncSender<std::result::Result<(), String>>,
+    setup: impl FnOnce(&Connection) -> Result<()>,
 ) {
     let path = coven_home.join(STORE_FILE_NAME);
     let mut conn = match store::open_initialized_store(&path) {
-        Ok(conn) => {
-            let mut health = lock_health(&shared);
-            health.connection_opens = 1;
-            let _ = ready.send(Ok(()));
-            conn
-        }
+        Ok(conn) => conn,
         Err(error) => {
             let message = format!("failed to open daemon event writer: {error:#}");
             let _ = fail_writer(&shared, message.clone());
@@ -453,6 +457,16 @@ fn run_worker(
             return;
         }
     };
+    if let Err(error) = setup(&conn) {
+        let message = format!("failed to configure daemon event writer: {error:#}");
+        let _ = fail_writer(&shared, message.clone());
+        let _ = ready.send(Err(message));
+        return;
+    }
+    let mut health = lock_health(&shared);
+    health.connection_opens = 1;
+    drop(health);
+    let _ = ready.send(Ok(()));
 
     loop {
         let batch = take_batch(&shared);
@@ -472,7 +486,12 @@ fn run_worker(
                 complete(&batch, Ok(()));
             }
             Err(error) => {
-                let message = format!("event writer commit failed: {error:#}");
+                let classification = if is_sqlite_full(&error) {
+                    " [SQLITE_FULL]"
+                } else {
+                    ""
+                };
+                let message = format!("event writer commit failed{classification}: {error:#}");
                 // Latch failure before releasing capacity. Otherwise a producer
                 // can enqueue a critical event in the release/failure window and
                 // wait forever after this worker exits.
@@ -512,6 +531,15 @@ fn is_transient_sqlite_lock(error: &anyhow::Error) -> bool {
             .downcast_ref::<rusqlite::Error>()
             .and_then(rusqlite::Error::sqlite_error_code)
             .is_some_and(|code| matches!(code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked))
+    })
+}
+
+fn is_sqlite_full(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<rusqlite::Error>()
+            .and_then(rusqlite::Error::sqlite_error_code)
+            == Some(ErrorCode::DiskFull)
     })
 }
 
@@ -1390,6 +1418,62 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["output", "exit"]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_full_latches_failure_and_recovers_after_restart() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let path = home.path().join(STORE_FILE_NAME);
+        let setup = store::open_store(&path)?;
+        store::insert_session(&setup, &session("s-1"))?;
+        setup.execute_batch(
+            "PRAGMA wal_checkpoint(TRUNCATE);
+             VACUUM;
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )?;
+        let page_count: i64 = setup.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        let freelist_count: i64 = setup.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+        assert_eq!(freelist_count, 0, "fixture must have no reusable pages");
+        drop(setup);
+
+        let writer = EventWriter::start_with_capacity_and_setup(
+            home.path().to_path_buf(),
+            DEFAULT_CAPACITY_BYTES,
+            move |conn| {
+                conn.pragma_update(None, "max_page_count", page_count)?;
+                let capped: i64 = conn.query_row("PRAGMA max_page_count", [], |row| row.get(0))?;
+                anyhow::ensure!(capped == page_count, "SQLite refused the test page cap");
+                Ok(())
+            },
+        )?;
+        let error = writer
+            .record("s-1", "output", json!({ "data": "x".repeat(512 * 1024) }))
+            .expect_err("a capped database must reject a growing transaction");
+        assert!(format!("{error:#}").contains("SQLITE_FULL"), "{error:#}");
+
+        let failed = writer.health();
+        assert_eq!(failed.state, "failed");
+        assert_eq!(failed.queued_events, 0);
+        assert_eq!(failed.queued_bytes, 0);
+        assert!(
+            failed
+                .last_error
+                .as_deref()
+                .is_some_and(|message| message.contains("SQLITE_FULL")),
+            "{failed:?}"
+        );
+        let latched = writer
+            .record("s-1", "output", json!({ "data": "still blocked" }))
+            .expect_err("the failed writer must remain latched");
+        assert!(format!("{latched:#}").contains("SQLITE_FULL"));
+
+        let recovered = EventWriter::start(home.path().to_path_buf())?;
+        recovered.record("s-1", "output", json!({ "data": "recovered" }))?;
+        let events = store::list_events(&store::open_store(&path)?, "s-1")?;
+        assert_eq!(events.len(), 1, "failed transaction must remain atomic");
+        assert!(events[0].payload_json.contains("recovered"));
+        assert_eq!(recovered.health().state, "healthy");
         Ok(())
     }
 

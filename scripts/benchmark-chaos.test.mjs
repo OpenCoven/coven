@@ -57,21 +57,12 @@ test('describes live writer metrics and deterministic fault equivalents', () => 
   assert.equal(storageMetricStatus().eventQueueDepth.status, 'measured');
 });
 
-test('marks diskFull chaos coverage as unproven until a write-fault seam is tested', () => {
-  // scheduled_maintenance_below_watermark_does_not_open_or_write_the_store only
-  // proves low-disk gating: it asserts the store is never opened when free disk
-  // is below the maintenance watermark.  It never triggers SQLITE_FULL, a write
-  // fault, or recovery, so it cannot back a "covered" claim for diskFull chaos.
+test('links diskFull chaos coverage to the real SQLite write-fault regression', () => {
   const diskFull = chaosCoverage().diskFull;
-  assert.equal(diskFull.status, 'blocked');
+  assert.equal(diskFull.status, 'covered_by_event_writer_regressions');
   assert.equal(
-    Object.hasOwn(diskFull, 'evidence'),
-    false,
-    'a blocked status must not cite a test as proving the fault path'
-  );
-  assert.doesNotMatch(
-    JSON.stringify(diskFull),
-    /scheduled_maintenance_below_watermark_does_not_open_or_write_the_store/
+    diskFull.evidence,
+    'event_writer::tests::sqlite_full_latches_failure_and_recovers_after_restart'
   );
 });
 

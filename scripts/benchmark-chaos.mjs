@@ -128,12 +128,11 @@ export function chaosCoverage() {
       reason: 'Cave owns WebSocket consumer buffering and replay (#4317).'
     },
     diskFull: {
-      status: 'blocked',
+      status: 'covered_by_event_writer_regressions',
       reason:
-        'No regression yet exercises a real SQLITE_FULL / write-fault / recovery seam. ' +
-        'The scheduled-maintenance watermark test only proves low-disk gating (the store ' +
-        'is never opened below the free-disk watermark); it never fills a store or forces a ' +
-        'write to fail, so it cannot back a diskFull chaos-coverage claim.'
+        'The writer suite caps its live SQLite connection, verifies an actual SQLITE_FULL ' +
+        'commit failure is latched and drained atomically, then restarts after removing the cap.',
+      evidence: 'event_writer::tests::sqlite_full_latches_failure_and_recovers_after_restart'
     },
     lockedDatabase: {
       status: 'covered_by_event_writer_regressions',
