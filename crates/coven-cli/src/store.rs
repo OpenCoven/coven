@@ -356,89 +356,68 @@ pub struct EventsQueryOptions {
     pub limit: Option<i64>,
 }
 
-fn load_ward_audit_schema_sql(conn: &Connection) -> Result<Option<String>> {
-    conn.query_row(
-        "SELECT group_concat(sql, char(10))
-         FROM (
-             SELECT sql
-             FROM sqlite_master
-             WHERE sql IS NOT NULL
-               AND (
-                   (type = 'table' AND name = 'ward_audit')
-                   OR (type = 'trigger' AND tbl_name = 'ward_audit')
-               )
-             ORDER BY type, name
-         )",
-        [],
-        |row| row.get(0),
-    )
-    .context("failed to inspect ward_audit schema")
+fn load_ward_audit_schema_state(conn: &Connection) -> Result<String> {
+    use coven_threads_core::WARD_AUDIT_SCHEMA_STATE_SQL;
+
+    conn.query_row(WARD_AUDIT_SCHEMA_STATE_SQL, [], |row| row.get(0))
+        .context("failed to fingerprint ward_audit schema")
 }
 
-fn load_ward_audit_component_version(conn: &Connection) -> Result<Option<i64>> {
-    let metadata_exists = conn
-        .query_row(
-            "SELECT 1
-             FROM sqlite_master
-             WHERE type = 'table' AND name = 'ward_schema_meta'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()
-        .context("failed to inspect ward_schema_meta")?
-        .is_some();
-    if !metadata_exists {
-        return Ok(None);
+fn execute_guarded_ward_audit_batch(conn: &Connection, sql: &str, operation: &str) -> Result<()> {
+    if let Err(error) = conn.execute_batch(sql) {
+        if !conn.is_autocommit() {
+            if let Err(rollback_error) = conn.execute_batch("ROLLBACK") {
+                anyhow::bail!("{operation}: {error}; rollback failed: {rollback_error}");
+            }
+        }
+        return Err(error).with_context(|| operation.to_string());
     }
+    Ok(())
+}
 
-    conn.query_row(
-        "SELECT version
-         FROM ward_schema_meta
-         WHERE component = 'ward_audit'",
-        [],
-        |row| row.get(0),
-    )
-    .optional()
-    .context("failed to read ward_audit component version")
+fn apply_ward_audit_schema_state(conn: &Connection, schema_state: &str) -> Result<()> {
+    use coven_threads_core::{
+        WARD_AUDIT_MIGRATION_V020_SQL, WARD_AUDIT_SCHEMA_SQL, WARD_AUDIT_SCHEMA_STATE_CURRENT_V020,
+        WARD_AUDIT_SCHEMA_STATE_LEGACY_V013, WARD_AUDIT_SCHEMA_STATE_MISSING,
+        WARD_AUDIT_SCHEMA_STATE_UNKNOWN,
+    };
+
+    match schema_state {
+        WARD_AUDIT_SCHEMA_STATE_MISSING => execute_guarded_ward_audit_batch(
+            conn,
+            WARD_AUDIT_SCHEMA_SQL,
+            "failed to initialize ward_audit schema",
+        ),
+        WARD_AUDIT_SCHEMA_STATE_LEGACY_V013 => {
+            match execute_guarded_ward_audit_batch(
+                conn,
+                WARD_AUDIT_MIGRATION_V020_SQL,
+                "failed to migrate legacy ward_audit schema",
+            ) {
+                Ok(()) => Ok(()),
+                Err(migration_error) => match load_ward_audit_schema_state(conn) {
+                    Ok(state) if state == WARD_AUDIT_SCHEMA_STATE_CURRENT_V020 => Ok(()),
+                    Ok(_) => Err(migration_error),
+                    Err(reclassification_error) => Err(migration_error).with_context(|| {
+                        format!(
+                            "failed to reclassify ward_audit after migration error: \
+                             {reclassification_error}"
+                        )
+                    }),
+                },
+            }
+        }
+        WARD_AUDIT_SCHEMA_STATE_CURRENT_V020 => Ok(()),
+        WARD_AUDIT_SCHEMA_STATE_UNKNOWN => {
+            anyhow::bail!("unsupported ward_audit schema fingerprint")
+        }
+        _ => anyhow::bail!("unsupported ward_audit schema fingerprint state: {schema_state}"),
+    }
 }
 
 fn ensure_ward_audit_schema(conn: &Connection) -> Result<()> {
-    use coven_threads_core::{
-        ward_audit_migration_sql, ward_audit_schema_action, WardAuditSchemaAction,
-        WARD_AUDIT_SCHEMA_SQL, WARD_AUDIT_SCHEMA_VERSION, WARD_AUDIT_STAMP_V020_SQL,
-    };
-
-    let schema_sql = load_ward_audit_schema_sql(conn)?;
-    let component_version = load_ward_audit_component_version(conn)?;
-    match ward_audit_schema_action(schema_sql.as_deref(), component_version) {
-        WardAuditSchemaAction::InitializeFresh => {
-            conn.execute_batch(WARD_AUDIT_SCHEMA_SQL)
-                .context("failed to initialize ward_audit schema")?;
-            conn.execute_batch(WARD_AUDIT_STAMP_V020_SQL)
-                .context("failed to stamp ward_audit schema version")?;
-        }
-        WardAuditSchemaAction::MigrateLegacyWithoutDetail => {
-            conn.execute_batch(&ward_audit_migration_sql(false))
-                .context("failed to migrate pre-detail ward_audit schema")?;
-        }
-        WardAuditSchemaAction::MigrateLegacyWithDetail => {
-            conn.execute_batch(&ward_audit_migration_sql(true))
-                .context("failed to migrate ward_audit schema with detail")?;
-        }
-        WardAuditSchemaAction::StampCurrent => {
-            conn.execute_batch(WARD_AUDIT_STAMP_V020_SQL)
-                .context("failed to stamp current ward_audit schema")?;
-        }
-        WardAuditSchemaAction::UnsupportedNewerVersion => {
-            anyhow::bail!(
-                "unsupported ward_audit schema version {}; daemon supports at most {}",
-                component_version.unwrap_or_default(),
-                WARD_AUDIT_SCHEMA_VERSION
-            );
-        }
-        WardAuditSchemaAction::None => {}
-    }
-    Ok(())
+    let schema_state = load_ward_audit_schema_state(conn)?;
+    apply_ward_audit_schema_state(conn, &schema_state)
 }
 
 fn initialized_store_paths() -> &'static RwLock<HashSet<PathBuf>> {
@@ -4125,28 +4104,46 @@ pub fn artifact_payload(record: &SensitiveArtifactRecord) -> EncryptedPayload {
 mod tests {
     use super::*;
 
-    const LEGACY_WARD_AUDIT_WITHOUT_DETAIL_SQL: &str = r#"
-        CREATE TABLE ward_audit (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            event_type    TEXT    NOT NULL,
-            proposal_id   TEXT,
-            familiar_id   TEXT    NOT NULL,
-            ward_version  TEXT,
-            ward_hash     BLOB    NOT NULL,
-            tier          TEXT,
-            decision      TEXT    NOT NULL,
-            approver      TEXT,
-            diff_hash     BLOB,
-            files_touched TEXT    NOT NULL,
-            channel       TEXT,
-            thread_id     TEXT,
-            submitted_at  TEXT    NOT NULL,
-            decided_at    TEXT    NOT NULL,
-            recorded_at   TEXT    NOT NULL
-        );
+    const LEGACY_WARD_AUDIT_V013_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS ward_audit (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type    TEXT    NOT NULL CHECK (event_type IN (
+                      'proposal_submitted','proposal_approved','proposal_rejected',
+                      'proposal_vetoed','ward_updated','validation_verdict',
+                      'compaction_ledger')),
+    proposal_id   TEXT,
+    familiar_id   TEXT    NOT NULL,
+    ward_version  TEXT,
+    ward_hash     BLOB    NOT NULL,
+    tier          TEXT,
+    decision      TEXT    NOT NULL,
+    approver      TEXT,
+    diff_hash     BLOB,
+    files_touched TEXT    NOT NULL, -- JSON array of surface ids
+    channel       TEXT,
+    thread_id     TEXT,
+    submitted_at  TEXT    NOT NULL, -- RFC 3339
+    decided_at    TEXT    NOT NULL, -- RFC 3339
+    recorded_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE INDEX IF NOT EXISTS ward_audit_familiar_idx ON ward_audit (familiar_id, recorded_at);
+CREATE INDEX IF NOT EXISTS ward_audit_event_idx    ON ward_audit (event_type, recorded_at);
+
+CREATE TRIGGER IF NOT EXISTS ward_audit_append_only_update
+BEFORE UPDATE ON ward_audit
+BEGIN
+    SELECT RAISE(ABORT, 'ward_audit is append-only (RFC-0001 §5.6)');
+END;
+
+CREATE TRIGGER IF NOT EXISTS ward_audit_append_only_delete
+BEFORE DELETE ON ward_audit
+BEGIN
+    SELECT RAISE(ABORT, 'ward_audit is append-only (RFC-0001 §5.6)');
+END;
     "#;
 
-    const LEGACY_WARD_AUDIT_WITH_DETAIL_SQL: &str = r#"
+    const UNKNOWN_WARD_AUDIT_WITH_DETAIL_SQL: &str = r#"
         CREATE TABLE ward_audit (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
             event_type    TEXT    NOT NULL,
@@ -4189,13 +4186,9 @@ mod tests {
         recorded_at: String,
     }
 
-    fn ward_audit_component_version(conn: &Connection) -> Result<i64> {
-        conn.query_row(
-            "SELECT version FROM ward_schema_meta WHERE component = 'ward_audit'",
-            [],
-            |row| row.get(0),
-        )
-        .context("ward_audit component version is missing")
+    fn assert_ward_audit_schema_state(conn: &Connection, expected: &str) -> Result<()> {
+        assert_eq!(load_ward_audit_schema_state(conn)?, expected);
+        Ok(())
     }
 
     fn insert_legacy_ward_audit_row(conn: &Connection, detail: Option<&str>) -> Result<()> {
@@ -4294,98 +4287,109 @@ mod tests {
     }
 
     #[test]
-    fn ward_audit_fresh_store_is_stamped_at_current_component_version() -> Result<()> {
+    fn ward_audit_fresh_store_has_exact_current_fingerprint() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let conn = open_store(&temp.path().join("coven.db"))?;
 
-        assert_eq!(
-            ward_audit_component_version(&conn)?,
-            coven_threads_core::WARD_AUDIT_SCHEMA_VERSION
-        );
+        assert_ward_audit_schema_state(
+            &conn,
+            coven_threads_core::WARD_AUDIT_SCHEMA_STATE_CURRENT_V020,
+        )?;
         Ok(())
     }
 
     #[test]
-    fn ward_audit_legacy_schema_without_detail_migrates_without_losing_history() -> Result<()> {
+    fn ward_audit_exact_legacy_schema_migrates_without_losing_history() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let path = temp.path().join("coven.db");
         let conn = Connection::open(&path)?;
-        conn.execute_batch(LEGACY_WARD_AUDIT_WITHOUT_DETAIL_SQL)?;
+        conn.execute_batch(LEGACY_WARD_AUDIT_V013_SQL)?;
         insert_legacy_ward_audit_row(&conn, None)?;
         drop(conn);
 
         let conn = open_store(&path)?;
 
         assert_legacy_ward_audit_row(&conn, None)?;
-        assert_eq!(
-            ward_audit_component_version(&conn)?,
-            coven_threads_core::WARD_AUDIT_SCHEMA_VERSION
-        );
+        assert_ward_audit_schema_state(
+            &conn,
+            coven_threads_core::WARD_AUDIT_SCHEMA_STATE_CURRENT_V020,
+        )?;
         Ok(())
     }
 
     #[test]
-    fn ward_audit_legacy_schema_with_detail_preserves_detail_payload() -> Result<()> {
+    fn ward_audit_concurrent_legacy_migrators_converge_on_current() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("coven.db");
+        let setup = Connection::open(&path)?;
+        setup.execute_batch(LEGACY_WARD_AUDIT_V013_SQL)?;
+        insert_legacy_ward_audit_row(&setup, None)?;
+        drop(setup);
+
+        let connections = (0..2)
+            .map(|_| {
+                let conn = Connection::open(&path)?;
+                configure_initializing_connection(&conn)?;
+                let state = load_ward_audit_schema_state(&conn)?;
+                assert_eq!(
+                    state,
+                    coven_threads_core::WARD_AUDIT_SCHEMA_STATE_LEGACY_V013
+                );
+                Ok((conn, state))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles = connections
+            .into_iter()
+            .map(|(conn, state)| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    apply_ward_audit_schema_state(&conn, &state)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.join().expect("migrator thread panicked")?;
+        }
+        let conn = Connection::open(&path)?;
+        assert_legacy_ward_audit_row(&conn, None)?;
+        assert_ward_audit_schema_state(
+            &conn,
+            coven_threads_core::WARD_AUDIT_SCHEMA_STATE_CURRENT_V020,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn ward_audit_unknown_schema_with_detail_fails_closed_and_preserves_history() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let path = temp.path().join("coven.db");
         let conn = Connection::open(&path)?;
-        conn.execute_batch(LEGACY_WARD_AUDIT_WITH_DETAIL_SQL)?;
+        conn.execute_batch(UNKNOWN_WARD_AUDIT_WITH_DETAIL_SQL)?;
         let detail = r#"{"legacy":true}"#;
         insert_legacy_ward_audit_row(&conn, Some(detail))?;
         drop(conn);
 
-        let conn = open_store(&path)?;
+        let error = initialize_store(&path).expect_err("unknown schema must fail closed");
 
-        assert_legacy_ward_audit_row(&conn, Some(detail))?;
-        assert_eq!(
-            ward_audit_component_version(&conn)?,
-            coven_threads_core::WARD_AUDIT_SCHEMA_VERSION
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported ward_audit schema fingerprint"),
+            "unexpected error: {error:#}"
         );
-        Ok(())
-    }
-
-    #[test]
-    fn ward_audit_current_unversioned_schema_is_stamped_without_rebuild() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let path = temp.path().join("coven.db");
-        let conn = open_store(&path)?;
-        conn.execute(
-            "DELETE FROM ward_schema_meta WHERE component = 'ward_audit'",
-            [],
-        )?;
-        drop(conn);
-
-        initialize_store(&path)?;
-        let conn = open_initialized_store(&path)?;
-
-        assert_eq!(
-            ward_audit_component_version(&conn)?,
-            coven_threads_core::WARD_AUDIT_SCHEMA_VERSION
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn ward_audit_current_version_is_idempotent_across_reopen() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let path = temp.path().join("coven.db");
-        drop(open_store(&path)?);
-
-        let conn = open_store(&path)?;
-
-        assert_eq!(
-            ward_audit_component_version(&conn)?,
-            coven_threads_core::WARD_AUDIT_SCHEMA_VERSION
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn ward_audit_newer_component_version_fails_closed() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let path = temp.path().join("coven.db");
         let conn = Connection::open(&path)?;
-        conn.execute_batch(LEGACY_WARD_AUDIT_WITH_DETAIL_SQL)?;
+        assert_legacy_ward_audit_row(&conn, Some(detail))?;
+        Ok(())
+    }
+
+    #[test]
+    fn ward_audit_current_schema_ignores_obsolete_component_metadata() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("coven.db");
+        let conn = open_store(&path)?;
         conn.execute_batch(
             "CREATE TABLE ward_schema_meta (
                 component TEXT PRIMARY KEY NOT NULL,
@@ -4396,15 +4400,70 @@ mod tests {
         )?;
         drop(conn);
 
-        let error = open_store(&path).expect_err("newer Ward schema must fail closed");
+        initialize_store(&path)?;
+        let conn = open_initialized_store(&path)?;
+
+        assert_ward_audit_schema_state(
+            &conn,
+            coven_threads_core::WARD_AUDIT_SCHEMA_STATE_CURRENT_V020,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn ward_audit_current_fingerprint_is_idempotent_across_reopen() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("coven.db");
+        drop(open_store(&path)?);
+
+        let conn = open_store(&path)?;
+
+        assert_ward_audit_schema_state(
+            &conn,
+            coven_threads_core::WARD_AUDIT_SCHEMA_STATE_CURRENT_V020,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn ward_audit_unknown_schema_fails_closed_without_rebuild() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("coven.db");
+        let conn = Connection::open(&path)?;
+        conn.execute_batch(coven_threads_core::WARD_AUDIT_SCHEMA_SQL)?;
+        conn.execute_batch("ALTER TABLE ward_audit ADD COLUMN unexpected TEXT")?;
+        drop(conn);
+
+        let error = initialize_store(&path).expect_err("schema drift must fail closed");
 
         assert!(
             error
                 .to_string()
-                .contains("unsupported ward_audit schema version"),
+                .contains("unsupported ward_audit schema fingerprint"),
             "unexpected error: {error:#}"
         );
+        let conn = Connection::open(&path)?;
+        let unexpected_column_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('ward_audit', 'main')
+             WHERE name = 'unexpected'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(unexpected_column_count, 1);
         Ok(())
+    }
+
+    #[test]
+    fn ward_audit_unrecognized_fingerprint_state_names_the_value() {
+        let conn = Connection::open_in_memory().expect("in-memory database should open");
+
+        let error = apply_ward_audit_schema_state(&conn, "future_v999")
+            .expect_err("unrecognized fingerprint state must fail closed");
+
+        assert!(
+            error.to_string().contains("future_v999"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]
@@ -4640,10 +4699,10 @@ mod tests {
         }
         let conn = open_initialized_store(&path)?;
         assert!(list_sessions(&conn)?.is_empty());
-        assert_eq!(
-            ward_audit_component_version(&conn)?,
-            coven_threads_core::WARD_AUDIT_SCHEMA_VERSION
-        );
+        assert_ward_audit_schema_state(
+            &conn,
+            coven_threads_core::WARD_AUDIT_SCHEMA_STATE_CURRENT_V020,
+        )?;
         Ok(())
     }
 
