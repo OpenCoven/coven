@@ -428,11 +428,11 @@ mount is separate work and is not claimed by this design.
 
 | Step | Bead | State |
 |---|---|---|
-| Storage engine + overlay | `coven-d4p` | PR #658 open |
-| macOS mount + benchmark | `coven-110` | blocked on `coven-d4p` |
+| Storage engine + overlay | `coven-d4p` | merged — PR #658, `e2da654` |
+| macOS mount + benchmark | `coven-110` | unblocked |
 | This design | `coven-vhw` | — |
-| Daemon API + extension tables | not yet filed | needs `coven-d4p` merged |
+| Daemon API + extension tables | not yet filed | ready to file |
 | Cave surfaces | not yet filed | needs the daemon API |
 
-Nothing in §3–§6 is implementable before `coven-d4p` merges; this document is
-the contract those follow-ups are held to, not a claim that any of it exists.
+The storage engine exists; nothing in §3–§6 does. This document is the contract
+those follow-ups are held to, not a claim that any of them are built.
