@@ -23,7 +23,7 @@ use uuid::Uuid;
 use crate::{pty_runner::PtyRunResult, store, STORE_FILE_NAME};
 
 const DEFAULT_CAPACITY_BYTES: usize = 2 * 1024 * 1024;
-const RESERVED_CRITICAL_BYTES: usize = 128 * 1024;
+pub(crate) const RESERVED_CRITICAL_BYTES: usize = 128 * 1024;
 const EVENT_OVERHEAD_BYTES: usize = 512;
 const MAX_BATCH_EVENTS: usize = 64;
 const COALESCE_WINDOW: Duration = Duration::from_millis(12);
@@ -83,6 +83,58 @@ struct QueuedEvent {
     completion: Option<mpsc::SyncSender<std::result::Result<(), String>>>,
 }
 
+pub(crate) struct EventBoundaryReservation {
+    writer: EventWriter,
+    session_id: String,
+    event: Option<PendingEvent>,
+    bytes: usize,
+    detached: Option<OutputTruncation>,
+    active: bool,
+}
+
+impl EventBoundaryReservation {
+    pub(crate) fn commit(mut self) -> Result<()> {
+        let event = self.event.take().expect("reservation event is present");
+        let marker = self
+            .detached
+            .take()
+            .map(|truncation| truncation_marker(&self.session_id, truncation));
+        let result = self
+            .writer
+            .enqueue_closed_critical(event, self.bytes, marker);
+        self.writer.release_boundary(&self.session_id);
+        self.active = false;
+        result
+    }
+
+    /// Restore the detached episode when the reserved action is rejected.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn cancel(mut self) {
+        self.restore();
+    }
+
+    fn restore(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut queue = self.writer.lock_queue();
+        if let Some(detached) = self.detached.take() {
+            restore_truncation(&mut queue, &self.session_id, detached);
+        }
+        queue.closing_sessions.remove(&self.session_id);
+        self.writer.shared.available.notify_all();
+        self.event.take();
+        drop(queue);
+        self.active = false;
+    }
+}
+
+impl Drop for EventBoundaryReservation {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
 enum PendingEvent {
     Output {
         session_id: String,
@@ -111,7 +163,7 @@ impl EventWriter {
         Self::start_with_capacity(coven_home, DEFAULT_CAPACITY_BYTES)
     }
 
-    fn start_with_capacity(coven_home: PathBuf, capacity_bytes: usize) -> Result<Self> {
+    pub(crate) fn start_with_capacity(coven_home: PathBuf, capacity_bytes: usize) -> Result<Self> {
         Self::start_with_capacity_and_setup(coven_home, capacity_bytes, |_| Ok(()))
     }
 
@@ -180,10 +232,29 @@ impl EventWriter {
         self.enqueue_output(event, bytes)
     }
 
-    /// Persist a non-output event.  These events reserve capacity and wait for
-    /// the writer's commit acknowledgement instead of being silently dropped.
-    #[allow(dead_code)]
+    /// Check whether a critical record with this payload can fit in this
+    /// writer. This lets request handlers reject known-oversized input before
+    /// its transport side effect occurs.
+    pub(crate) fn can_record_critical_payload(&self, payload: &serde_json::Value) -> Result<bool> {
+        let payload_json =
+            serde_json::to_string(payload).context("failed to serialize event writer payload")?;
+        Ok(payload_json.len().saturating_add(EVENT_OVERHEAD_BYTES) <= self.shared.capacity_bytes)
+    }
+
+    /// Persist a non-output event on the critical path for accepted direct
+    /// live-session input, kill, and cast events. Pending truncation markers
+    /// commit before the boundary event, and the caller waits for the writer's
+    /// commit acknowledgement instead of silently dropping the event.
     pub fn record(&self, session_id: &str, kind: &str, payload: serde_json::Value) -> Result<()> {
+        self.reserve_record(session_id, kind, payload)?.commit()
+    }
+
+    pub(crate) fn reserve_record(
+        &self,
+        session_id: &str,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> Result<EventBoundaryReservation> {
         let record = store::EventRecord {
             seq: 0,
             id: Uuid::new_v4().to_string(),
@@ -197,7 +268,33 @@ impl EventWriter {
             .payload_json
             .len()
             .saturating_add(EVENT_OVERHEAD_BYTES);
-        self.enqueue_critical(PendingEvent::Record(record), bytes)
+        anyhow::ensure!(
+            bytes <= self.shared.capacity_bytes,
+            "critical event exceeds event writer capacity"
+        );
+        let event = PendingEvent::Record(record);
+        let mut queue = self.lock_queue();
+        loop {
+            if let Some(error) = &queue.failed {
+                return Err(anyhow!(error.clone()));
+            }
+            if queue.closing_sessions.insert(session_id.to_string()) {
+                let detached = queue.truncations.remove(session_id);
+                return Ok(EventBoundaryReservation {
+                    writer: self.clone(),
+                    session_id: session_id.to_string(),
+                    event: Some(event),
+                    bytes,
+                    detached,
+                    active: true,
+                });
+            }
+            queue = self
+                .shared
+                .available
+                .wait(queue)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
     }
 
     /// Insert the terminal event only after every prior accepted event has
@@ -299,10 +396,14 @@ impl EventWriter {
         };
 
         let result = self.enqueue_closed_critical(event, bytes, marker);
-        let mut queue = self.lock_queue();
-        queue.closing_sessions.remove(&session_id);
-        self.shared.available.notify_all();
+        self.release_boundary(&session_id);
         result
+    }
+
+    fn release_boundary(&self, session_id: &str) {
+        let mut queue = self.lock_queue();
+        queue.closing_sessions.remove(session_id);
+        self.shared.available.notify_all();
     }
 
     fn enqueue_closed_critical(
@@ -660,15 +761,14 @@ fn record_output_drop(queue: &mut Queue, session_id: &str, dropped_bytes: usize,
         .saturating_add(dropped_bytes as u64);
 }
 
-fn take_truncation_marker(queue: &mut Queue, session_id: &str) -> Option<QueuedEvent> {
-    let truncation = queue.truncations.remove(session_id)?;
+fn truncation_marker(session_id: &str, truncation: OutputTruncation) -> QueuedEvent {
     let payload_json = serde_json::to_string(&json!({
         "droppedEvents": truncation.dropped_events,
         "droppedBytes": truncation.dropped_bytes,
     }))
     .expect("truncation marker payload is always serializable");
     let bytes = payload_json.len().saturating_add(EVENT_OVERHEAD_BYTES);
-    Some(QueuedEvent {
+    QueuedEvent {
         event: PendingEvent::Record(store::EventRecord {
             seq: 0,
             id: Uuid::new_v4().to_string(),
@@ -679,7 +779,30 @@ fn take_truncation_marker(queue: &mut Queue, session_id: &str) -> Option<QueuedE
         }),
         bytes,
         completion: None,
-    })
+    }
+}
+
+fn take_truncation_marker(queue: &mut Queue, session_id: &str) -> Option<QueuedEvent> {
+    queue
+        .truncations
+        .remove(session_id)
+        .map(|truncation| truncation_marker(session_id, truncation))
+}
+
+fn restore_truncation(queue: &mut Queue, session_id: &str, detached: OutputTruncation) {
+    match queue.truncations.entry(session_id.to_string()) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(detached);
+        }
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            let current = entry.get_mut();
+            current.dropped_events = detached
+                .dropped_events
+                .saturating_add(current.dropped_events);
+            current.dropped_bytes = detached.dropped_bytes.saturating_add(current.dropped_bytes);
+            current.created_at = detached.created_at;
+        }
+    }
 }
 
 fn flush_output(
@@ -1128,6 +1251,94 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn reserved_record_splits_output_arriving_before_action_completion() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let conn = store::open_store(&home.path().join(STORE_FILE_NAME))?;
+        store::insert_session(&conn, &session("s-1"))?;
+        let writer = EventWriter::start_with_capacity(
+            home.path().to_path_buf(),
+            RESERVED_CRITICAL_BYTES + 1024,
+        )?;
+
+        assert!(!writer.record_output("s-1", "a".repeat(2048))?);
+        let reservation = writer.reserve_record("s-1", "input", json!({ "data": "ls\n" }))?;
+        assert!(!writer.record_output("s-1", "b".repeat(3072))?);
+        reservation.commit()?;
+        assert!(writer.record_output("s-1", "recovered".to_string())?);
+        writer.record_exit(
+            "s-1",
+            PtyRunResult {
+                status: "completed",
+                exit_code: Some(0),
+            },
+        )?;
+
+        let events = store::list_events(&conn, "s-1")?;
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "output_truncated",
+                "input",
+                "output_truncated",
+                "output",
+                "exit",
+            ],
+        );
+        assert_truncation(&events[0], 1, 2048)?;
+        assert_truncation(&events[2], 1, 3072)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_record_restores_one_contiguous_output_episode() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let conn = store::open_store(&home.path().join(STORE_FILE_NAME))?;
+        store::insert_session(&conn, &session("s-1"))?;
+        let writer = EventWriter::start_with_capacity(
+            home.path().to_path_buf(),
+            RESERVED_CRITICAL_BYTES + 1024,
+        )?;
+
+        assert!(!writer.record_output("s-1", "a".repeat(2048))?);
+        let reservation = writer.reserve_record("s-1", "input", json!({ "data": "ls\n" }))?;
+        assert!(!writer.record_output("s-1", "b".repeat(3072))?);
+        reservation.cancel();
+        assert!(writer.record_output("s-1", "recovered".to_string())?);
+        writer.record_exit(
+            "s-1",
+            PtyRunResult {
+                status: "completed",
+                exit_code: Some(0),
+            },
+        )?;
+
+        let events = store::list_events(&conn, "s-1")?;
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["output_truncated", "output", "exit"],
+        );
+        assert_truncation(&events[0], 2, 5120)?;
+        Ok(())
+    }
+
+    fn assert_truncation(
+        event: &store::EventRecord,
+        dropped_events: u64,
+        dropped_bytes: u64,
+    ) -> Result<()> {
+        let payload: serde_json::Value = serde_json::from_str(&event.payload_json)?;
+        assert_eq!(payload["droppedEvents"], dropped_events);
+        assert_eq!(payload["droppedBytes"], dropped_bytes);
+        Ok(())
+    }
+
     fn session(id: &str) -> store::SessionRecord {
         store::SessionRecord {
             id: id.to_string(),
@@ -1321,6 +1532,66 @@ mod tests {
             assert_eq!(marker_payload["droppedEvents"], 1);
             assert_eq!(marker_payload["droppedBytes"], dropped_bytes);
             assert_eq!(events[1].kind, "exit");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn direct_session_records_split_truncation_episodes() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let conn = store::open_store(&home.path().join(STORE_FILE_NAME))?;
+        store::insert_session(&conn, &session("s-1"))?;
+        let writer = EventWriter::start_with_capacity(
+            home.path().to_path_buf(),
+            RESERVED_CRITICAL_BYTES + 1024,
+        )?;
+
+        assert!(!writer.record_output("s-1", "x".repeat(2048))?);
+        writer.record("s-1", "input", json!({ "value": "input" }))?;
+
+        assert!(!writer.record_output("s-1", "x".repeat(2048))?);
+        assert!(!writer.record_output("s-1", "x".repeat(3072))?);
+        writer.record("s-1", "kill", json!({ "signal": "SIGTERM" }))?;
+
+        assert!(!writer.record_output("s-1", "x".repeat(2048))?);
+        writer.record("s-1", "cast", json!({ "spell": "cast" }))?;
+
+        assert!(!writer.record_output("s-1", "x".repeat(2048))?);
+        assert!(writer.record_output("s-1", "recovered".to_string())?);
+        writer.record_exit(
+            "s-1",
+            PtyRunResult {
+                status: "completed",
+                exit_code: Some(0),
+            },
+        )?;
+
+        let events = store::list_events(&conn, "s-1")?;
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "output_truncated",
+                "input",
+                "output_truncated",
+                "kill",
+                "output_truncated",
+                "cast",
+                "output_truncated",
+                "output",
+                "exit",
+            ]
+        );
+
+        for (event_index, dropped_events, dropped_bytes) in
+            [(0, 1, 2048), (2, 2, 5120), (4, 1, 2048), (6, 1, 2048)]
+        {
+            let marker_payload: serde_json::Value =
+                serde_json::from_str(&events[event_index].payload_json)?;
+            assert_eq!(marker_payload["droppedEvents"], dropped_events);
+            assert_eq!(marker_payload["droppedBytes"], dropped_bytes);
         }
         Ok(())
     }
