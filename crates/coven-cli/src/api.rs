@@ -2844,19 +2844,23 @@ fn submit_cast(
         );
     }
     let cast_event = json!({ "cast_id": cast_id, "code": code, "target": target });
-    match runtime.can_record_session_event(session_id, "cast", &cast_event) {
-        Some(Ok(true)) | None => {}
-        Some(Ok(false)) => {
-            return api_error(
-                413,
-                "cast_too_large",
-                "Cast payload exceeds the daemon event writer capacity.",
-                Some(json!({ "sessionId": session_id })),
-            );
+    if target.is_some() {
+        match runtime.can_record_session_event(session_id, "cast", &cast_event) {
+            Some(Ok(true)) | None => {}
+            Some(Ok(false)) => {
+                return api_error(
+                    413,
+                    "cast_too_large",
+                    "Cast payload exceeds the daemon event writer capacity.",
+                    Some(json!({ "sessionId": session_id })),
+                );
+            }
+            Some(Err(error)) => return Err(error.context("failed to preflight cast event")),
         }
-        Some(Err(error)) => return Err(error.context("failed to preflight cast event")),
+        record_direct_session_event(runtime, &conn, coven_home, session_id, "cast", cast_event)?;
+    } else {
+        insert_event(&conn, coven_home, session_id, "cast", cast_event)?;
     }
-    record_direct_session_event(runtime, &conn, coven_home, session_id, "cast", cast_event)?;
     json_response(
         202,
         &CastResultDto {
@@ -9398,6 +9402,40 @@ mod tests {
         assert_eq!(response_body["error"]["code"], "cast_too_large");
         let conn = crate::store::open_store(&temp_dir.path().join("coven.sqlite3"))?;
         assert!(crate::store::list_events(&conn, "session-1")?.is_empty());
+        let health = runtime.writer.health();
+        assert_eq!(health.queued_events, 0);
+        assert_eq!(health.committed_events, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn writer_backed_untargeted_cast_bypasses_writer_capacity_and_persists_to_cockpit() -> Result<()>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let runtime = WriterBackedRuntime {
+            writer: crate::event_writer::EventWriter::start(temp_dir.path().to_path_buf())?,
+            inputs: std::cell::RefCell::new(Vec::new()),
+        };
+        let code = "x".repeat(3 * 1024 * 1024);
+        let body = serde_json::to_string(&json!({ "code": code }))?;
+        assert!(body.len() < crate::daemon::MAX_SOCKET_BODY_BYTES);
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/cast",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 202);
+        let conn = crate::store::open_store(&temp_dir.path().join("coven.sqlite3"))?;
+        let events = crate::store::list_events(&conn, "__cockpit__")?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "cast");
+        let payload: Value = serde_json::from_str(&events[0].payload_json)?;
+        assert_eq!(payload["code"].as_str(), Some(code.as_str()));
         let health = runtime.writer.health();
         assert_eq!(health.queued_events, 0);
         assert_eq!(health.committed_events, 0);
