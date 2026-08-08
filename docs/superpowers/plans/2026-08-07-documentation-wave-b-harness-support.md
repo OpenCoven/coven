@@ -54,12 +54,12 @@ Add these exact source-backed requirements:
 
 ```js
 const builtInHarnesses = ['codex', 'claude', 'coven-code', 'copilot'];
-const optInRecipes = ['grok', 'hermes'];
+const optInRecipes = ['grok', 'hermes', 'opencode'];
 ```
 
-Require all built-ins in the main support table, require `grok` and `hermes`
-to be described as installable recipes, and reject wording that calls either
-one bundled.
+Require all built-ins in the main support table, require `grok`, `hermes`, and
+`opencode` to be described as installable recipes, and reject wording that
+calls any of them bundled.
 
 - [ ] **Step 3: Require memory import**
 
@@ -121,8 +121,8 @@ Use this exact distinction:
 
 ## Trusted installable recipes
 
-`grok` and `hermes` are opt-in recipes installed through `coven adapter
-install`; they are not bundled defaults.
+`grok`, `hermes`, and `opencode` are opt-in recipes installed through
+`coven adapter install`; they are not bundled defaults.
 ```
 
 Keep OpenClaw documented as an external bridge rather than a built-in harness.
@@ -139,6 +139,7 @@ copilot login
 coven engine install
 coven adapter install grok
 coven adapter install hermes
+coven adapter install opencode
 ```
 
 Explain same-shell PATH/auth checks, project-root refusal, working-directory
