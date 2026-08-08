@@ -10,18 +10,34 @@ const COMMAND_TIMEOUT_MS = 120_000;
 export function summarizeSamples(samples) {
   const sorted = [...samples].sort((left, right) => left - right);
   const middle = Math.floor(sorted.length / 2);
+  const lastIndex = sorted.length - 1;
 
-  return {
+  const summary = {
     minMs: sorted[0],
     medianMs:
       sorted.length % 2 === 1
         ? sorted[middle]
         : (sorted[middle - 1] + sorted[middle]) / 2,
-    p50Ms: sorted[Math.ceil(sorted.length * 0.5) - 1],
-    p95Ms: sorted[Math.ceil(sorted.length * 0.95) - 1],
-    p99Ms: sorted[Math.ceil(sorted.length * 0.99) - 1],
-    maxMs: sorted.at(-1)
+    p50Ms: sorted[Math.ceil(sorted.length * 0.5) - 1]
   };
+
+  // A nearest-rank tail percentile is only meaningful when its rank is strictly
+  // below the maximum sample; otherwise it collapses onto maxMs and reports the
+  // extreme as if it were a stable tail.  With the handful of samples CI takes
+  // for cold-start timings, p95 (n < 20) and p99 (n < 100) both land on the max,
+  // so omit any percentile that cannot be distinguished from it rather than
+  // echoing an unsupported number.
+  const tailPercentile = (fraction) => {
+    const rank = Math.ceil(sorted.length * fraction) - 1;
+    return rank < lastIndex ? sorted[rank] : undefined;
+  };
+  const p95Ms = tailPercentile(0.95);
+  if (p95Ms !== undefined) summary.p95Ms = p95Ms;
+  const p99Ms = tailPercentile(0.99);
+  if (p99Ms !== undefined) summary.p99Ms = p99Ms;
+
+  summary.maxMs = sorted.at(-1);
+  return summary;
 }
 
 export function parseOptions(args) {

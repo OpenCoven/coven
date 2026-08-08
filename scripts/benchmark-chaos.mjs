@@ -110,7 +110,9 @@ export function storageMetricStatus() {
     },
     eventQueueDepth: {
       status: 'measured',
-      source: 'maxima of periodic eventWriter.queuedEvents/eventWriter.queuedBytes samples'
+      source:
+        'sampled maxima of periodic eventWriter.queuedEvents/eventWriter.queuedBytes samples ' +
+        'taken across the full measured interval, through session cancellation'
     },
     rss: {
       status: 'measured',
@@ -126,9 +128,12 @@ export function chaosCoverage() {
       reason: 'Cave owns WebSocket consumer buffering and replay (#4317).'
     },
     diskFull: {
-      status: 'covered_by_storage_regressions',
-      reason: 'A deterministic free-space seam exercises the fail-closed path without filling a host disk.',
-      evidence: 'store::tests::scheduled_maintenance_below_watermark_does_not_open_or_write_the_store'
+      status: 'blocked',
+      reason:
+        'No regression yet exercises a real SQLITE_FULL / write-fault / recovery seam. ' +
+        'The scheduled-maintenance watermark test only proves low-disk gating (the store ' +
+        'is never opened below the free-disk watermark); it never fills a store or forces a ' +
+        'write to fail, so it cannot back a diskFull chaos-coverage claim.'
     },
     lockedDatabase: {
       status: 'covered_by_event_writer_regressions',
@@ -428,8 +433,9 @@ export async function runConcurrencyScenario({ binary, root, concurrency, enviro
     const startedAt = process.hrtime.bigint();
     let observing = true;
     const observation = observeWriterHealth(socketPath, runtimeSamples, () => observing);
+    let elapsedMs;
+    let cancellationMs;
     let launches;
-    let completedAt;
     try {
       launches = await Promise.all(
         Array.from({ length: concurrency }, async () => {
@@ -461,23 +467,28 @@ export async function runConcurrencyScenario({ binary, root, concurrency, enviro
           return { id, firstOutputMs: Number(process.hrtime.bigint() - launchedAt) / 1_000_000 };
         })
       );
-      completedAt = process.hrtime.bigint();
+      // Close the throughput window the instant every launch resolves, before
+      // any snapshot or cancellation work can inflate the denominator.
+      const completedAt = process.hrtime.bigint();
+      elapsedMs = Number(completedAt - startedAt) / 1_000_000;
+      runtimeSamples.push(await fullRuntimeSnapshot({ binary, covenHome, env, socketPath }));
+
+      const cancellationStartedAt = process.hrtime.bigint();
+      await Promise.all(
+        ids.map(async (id) => {
+          const response = await socketRequest(socketPath, { method: 'POST', path: `/api/v1/sessions/${id}/kill` });
+          if (response.statusCode !== 202) throw new Error(`cancel returned ${response.statusCode}`);
+          await waitForSessionExit(socketPath, id);
+        })
+      );
+      cancellationMs = Number(process.hrtime.bigint() - cancellationStartedAt) / 1_000_000;
     } finally {
+      // Keep the periodic 25ms observer sampling through launch AND cancellation
+      // so the sampled queue/RSS maxima cover the full measured interval; only
+      // tear it down once cancellation timing has been captured.
       observing = false;
       await observation;
     }
-    const elapsedMs = Number(completedAt - startedAt) / 1_000_000;
-    runtimeSamples.push(await fullRuntimeSnapshot({ binary, covenHome, env, socketPath }));
-
-    const cancellationStartedAt = process.hrtime.bigint();
-    await Promise.all(
-      ids.map(async (id) => {
-        const response = await socketRequest(socketPath, { method: 'POST', path: `/api/v1/sessions/${id}/kill` });
-        if (response.statusCode !== 202) throw new Error(`cancel returned ${response.statusCode}`);
-        await waitForSessionExit(socketPath, id);
-      })
-    );
-    const cancellationMs = Number(process.hrtime.bigint() - cancellationStartedAt) / 1_000_000;
     ids = [];
     const footprintAfter = await storeFootprint(covenHome);
     runtimeSamples.push(await fullRuntimeSnapshot({ binary, covenHome, env, socketPath }));
