@@ -25,13 +25,19 @@
 
 mod audit;
 mod fs;
+mod ino;
 mod kv;
+#[cfg(feature = "mount")]
+mod nfs;
 mod overlay;
 mod path;
 mod schema;
 
 pub use audit::ToolCall;
 pub use fs::{AgentFs, Metadata, ROOT_INO, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
+pub use ino::DirEntry;
+#[cfg(feature = "mount")]
+pub use nfs::AfsNfs;
 pub use overlay::OverlayFs;
 pub use path::{basename, components, normalize, parent};
 
