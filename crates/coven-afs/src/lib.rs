@@ -18,8 +18,9 @@
 //! readable by upstream `agentfs` tooling and vice versa. See
 //! `specs/coven-agent-fs/RESEARCH.md` for the design rationale.
 //!
-//! This spike intentionally excludes any mount layer (FUSE/NFS); it is the
-//! storage engine only.
+//! The optional `mount` feature adds an experimental NFSv3 export for
+//! engineering validation. The bundled example binds only to loopback, but no
+//! mount workflow is exposed by the Coven CLI or daemon yet.
 //!
 //! [AgentFS SPEC v0.4]: https://github.com/tursodatabase/agentfs/blob/main/SPEC.md
 
