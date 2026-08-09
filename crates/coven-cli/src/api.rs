@@ -7309,6 +7309,38 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn afs_diff_query_path_directory_returns_structured_client_error() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = afs_project(temp.path());
+        let created = handle_request_with_body(
+            "POST",
+            "/api/v1/afs/sessions",
+            temp.path(),
+            None,
+            Some(&json!({ "projectRoot": root }).to_string()),
+        )?;
+        let session: serde_json::Value = serde_json::from_str(&created.body)?;
+        let id = session["id"].as_str().unwrap().to_string();
+        let mut delta =
+            coven_afs::AgentFs::create(temp.path().join("afs/sessions").join(format!("{id}.db")))?;
+        delta.mkdir_p("/fresh")?;
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("path", "/fresh")
+            .finish();
+
+        let response = handle_request(
+            "GET",
+            &format!("/api/v1/afs/sessions/{id}/diff?{query}"),
+            temp.path(),
+            None,
+        )?;
+        assert_eq!(response.status, 400);
+        assert!(response.body.contains(r#""code":"afs.path_not_file""#));
+        assert!(response.body.contains("/fresh"));
+        Ok(())
+    }
+
     use crate::project;
 
     #[test]

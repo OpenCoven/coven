@@ -16,6 +16,7 @@
 //! overlay handles across requests would buy contention rather than speed.
 
 use std::collections::HashSet;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -56,6 +57,7 @@ pub const UNIFIED_DIFF_MAX_BYTES: usize = 256 * 1024;
 pub enum AfsError {
     SessionNotFound(String),
     PathNotFound(String),
+    PathNotFile(String),
     SessionNotOpen {
         id: String,
         state: String,
@@ -100,6 +102,11 @@ impl AfsError {
                 format!("No AFS session {id}."),
             ),
             Self::PathNotFound(path) => (404, "afs.path_not_found", format!("No AFS path {path}.")),
+            Self::PathNotFile(path) => (
+                400,
+                "afs.path_not_file",
+                format!("AFS path {path} is not a regular file."),
+            ),
             Self::SessionNotOpen { id, state } => (
                 409,
                 "afs.session_not_open",
@@ -646,50 +653,33 @@ impl AfsStore {
         let overlay = self.open_overlay(id, &binding)?;
         let path = normalize(path);
 
-        let base = read_optional_agent_file(overlay.base(), &path)?;
-        let merged = read_optional_overlay_file(&overlay, &path)?;
-        if base.is_none() && merged.is_none() {
+        let base_meta = optional_agent_metadata(overlay.base(), &path)?;
+        let merged_meta = optional_overlay_metadata(&overlay, &path)?;
+        if base_meta.is_none() && merged_meta.is_none() {
             return Err(AfsError::PathNotFound(path));
         }
+        if base_meta.as_ref().is_some_and(|meta| !meta.is_file())
+            || merged_meta.as_ref().is_some_and(|meta| !meta.is_file())
+        {
+            return Err(AfsError::PathNotFile(path));
+        }
 
-        let patch = if let (Some(base), Some(merged)) = (&base, &merged) {
-            match (std::str::from_utf8(base), std::str::from_utf8(merged)) {
-                (Ok(base), Ok(merged)) => {
-                    let patch = TextDiff::from_lines(base, merged)
-                        .unified_diff()
-                        .context_radius(3)
-                        .header(&path, &path)
-                        .to_string();
-                    truncate_utf8(patch, UNIFIED_DIFF_MAX_BYTES)
-                }
-                _ => ("Binary files differ\n".to_string(), false),
-            }
-        } else if let Some(base) = &base {
-            match std::str::from_utf8(base) {
-                Ok(base) => {
-                    let patch = TextDiff::from_lines(base, "")
-                        .unified_diff()
-                        .context_radius(3)
-                        .header(&path, &path)
-                        .to_string();
-                    truncate_utf8(patch, UNIFIED_DIFF_MAX_BYTES)
-                }
-                Err(_) => ("Binary files differ\n".to_string(), false),
-            }
-        } else if let Some(merged) = &merged {
-            match std::str::from_utf8(merged) {
-                Ok(merged) => {
-                    let patch = TextDiff::from_lines("", merged)
-                        .unified_diff()
-                        .context_radius(3)
-                        .header(&path, &path)
-                        .to_string();
-                    truncate_utf8(patch, UNIFIED_DIFF_MAX_BYTES)
-                }
-                Err(_) => ("Binary files differ\n".to_string(), false),
-            }
+        let base = if base_meta.is_some() {
+            Some(overlay.base().read_file(&path).map_err(AfsError::from)?)
         } else {
-            unreachable!("missing path handled above");
+            None
+        };
+        let merged = if merged_meta.is_some() {
+            Some(overlay.read_file(&path).map_err(AfsError::from)?)
+        } else {
+            None
+        };
+        let patch = match (
+            std::str::from_utf8(base.as_deref().unwrap_or(&[])),
+            std::str::from_utf8(merged.as_deref().unwrap_or(&[])),
+        ) {
+            (Ok(base), Ok(merged)) => bounded_unified_diff(base, merged, &path)?,
+            _ => ("Binary files differ\n".to_string(), false),
         };
         let binary = patch.0 == "Binary files differ\n";
 
@@ -1441,31 +1431,105 @@ fn cleanup_failed_materialization(project_root: &Path, worktree_path: &Path, bra
         .output();
 }
 
-fn read_optional_agent_file(fs: &AgentFs, path: &str) -> AfsResult<Option<Vec<u8>>> {
-    match fs.read_file(path) {
-        Ok(data) => Ok(Some(data)),
+fn optional_agent_metadata(fs: &AgentFs, path: &str) -> AfsResult<Option<coven_afs::Metadata>> {
+    match fs.stat(path) {
+        Ok(metadata) => Ok(Some(metadata)),
         Err(coven_afs::Error::NotFound(_)) => Ok(None),
         Err(error) => Err(AfsError::from(error)),
     }
 }
 
-fn read_optional_overlay_file(overlay: &OverlayFs, path: &str) -> AfsResult<Option<Vec<u8>>> {
-    match overlay.read_file(path) {
-        Ok(data) => Ok(Some(data)),
+fn optional_overlay_metadata(
+    overlay: &OverlayFs,
+    path: &str,
+) -> AfsResult<Option<coven_afs::Metadata>> {
+    match overlay.stat(path) {
+        Ok(metadata) => Ok(Some(metadata)),
         Err(coven_afs::Error::NotFound(_)) => Ok(None),
         Err(error) => Err(AfsError::from(error)),
     }
 }
 
-fn truncate_utf8(value: String, max_bytes: usize) -> (String, bool) {
-    if value.len() <= max_bytes {
-        return (value, false);
+fn bounded_unified_diff(base: &str, merged: &str, path: &str) -> AfsResult<(String, bool)> {
+    let diff = TextDiff::from_lines(base, merged);
+    let mut unified = diff.unified_diff();
+    unified.context_radius(3).header(path, path);
+
+    let mut output = CappedDiffWriter::new(UNIFIED_DIFF_MAX_BYTES);
+    if let Err(error) = unified.to_writer(&mut output) {
+        if !output.truncated {
+            return Err(AfsError::Internal(anyhow::anyhow!(
+                "failed to render unified diff for {path}: {error}"
+            )));
+        }
     }
-    let mut end = max_bytes;
-    while !value.is_char_boundary(end) {
-        end -= 1;
+
+    let truncated = output.truncated;
+    let patch = String::from_utf8(output.bytes).map_err(|error| {
+        AfsError::Internal(anyhow::anyhow!(
+            "unified diff for {path} was not valid UTF-8: {error}"
+        ))
+    })?;
+    Ok((patch, truncated))
+}
+
+struct CappedDiffWriter {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+    truncated: bool,
+}
+
+impl CappedDiffWriter {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(max_bytes),
+            max_bytes,
+            truncated: false,
+        }
     }
-    (value[..end].to_string(), true)
+}
+
+impl Write for CappedDiffWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.bytes.len() == self.max_bytes {
+            self.truncated = true;
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "unified diff output limit reached",
+            ));
+        }
+
+        let remaining = self.max_bytes - self.bytes.len();
+        if buf.len() <= remaining {
+            self.bytes.extend_from_slice(buf);
+            return Ok(buf.len());
+        }
+
+        let text = std::str::from_utf8(buf)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let mut end = remaining;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == 0 {
+            self.truncated = true;
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "unified diff output limit reached",
+            ));
+        }
+
+        self.bytes.extend_from_slice(&buf[..end]);
+        self.truncated = true;
+        Ok(end)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 // ---- base ingest --------------------------------------------------------
@@ -2281,6 +2345,26 @@ mod tests {
     }
 
     #[test]
+    fn file_diff_rejects_non_regular_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path());
+        let store = store(dir.path());
+        let view = create(&store, &root);
+
+        let mut delta = store.open_delta(&view.id).unwrap();
+        delta.mkdir_p("/fresh").unwrap();
+        delta_symlink(&store, &view.id, "/README.md", "/readme-link");
+
+        for path in ["/fresh", "/readme-link"] {
+            let error = store.file_diff(&view.id, path).unwrap_err();
+            let (status, code, message) = error.parts();
+            assert_eq!(status, 400);
+            assert_eq!(code, "afs.path_not_file");
+            assert!(message.contains(path));
+        }
+    }
+
+    #[test]
     fn file_diff_truncates_oversized_patches() {
         let dir = tempfile::tempdir().unwrap();
         let root = project(dir.path());
@@ -2294,7 +2378,8 @@ mod tests {
         assert_eq!(diff.path, "/src/large.txt");
         assert!(!diff.binary);
         assert!(diff.truncated);
-        assert_eq!(diff.patch.len(), UNIFIED_DIFF_MAX_BYTES);
+        assert!(diff.patch.len() <= UNIFIED_DIFF_MAX_BYTES);
+        assert!(std::str::from_utf8(diff.patch.as_bytes()).is_ok());
         assert!(diff.patch.contains("--- /src/large.txt"));
         assert!(diff.patch.starts_with("--- /src/large.txt"));
     }
