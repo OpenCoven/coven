@@ -5,7 +5,7 @@
 
 ## Problem
 
-`native_stream_sigterm_returns_promptly_and_reaps_process_tree` currently
+`native_stream_sigterm_cancels_and_reaps_process_tree` currently
 asserts that cancellation completes in under two seconds. Under heavy machine
 load, SIGTERM delivery and process scheduling can legitimately exceed that
 wall-clock budget even when the stream runner returns the required cancellation
