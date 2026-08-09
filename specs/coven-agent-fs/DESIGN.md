@@ -406,6 +406,15 @@ sufficient on a shared macOS host must be settled — with an explicit decision
 recorded here — before `afsMount` defaults to on. Until then it ships
 opt-in.
 
+On 2026-08-09, a human-operated consent-enabled Terminal mounted the
+experimental loopback NFS export and completed mounted create/write/read-back.
+The earlier automated-agent EPERM remains meaningful process-level macOS
+privacy/TCC behavior. Access and consent must be assessed for each
+client/harness or deployment; this does not claim universal requirement, and
+it does not say Full Disk Access guarantees access. This result does not
+change default-off status or resolve loopback NFS access control, sandboxing,
+recovery, concurrency, or Linux/FUSE gates.
+
 **Enforcement is not free.** As RESEARCH.md notes, the mount alone does not stop
 an agent writing to an absolute path outside it. AFS bounds the blast radius of
 writes that go *through* it; the OS sandbox that forces all writes through the
