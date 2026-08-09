@@ -15,7 +15,7 @@ Scope boundaries:
 
 - **In scope:** `coven.daemon.v1` API additions, extension schema, commit
   materialization, Cave read surfaces, interop freeze.
-- **Out of scope:** mount implementation details (spike `coven-110`), sandbox
+- **Out of scope:** productionizing the experimental mount spike, sandbox
   enforcement design, Windows mounts, cloud sync.
 
 ---
@@ -419,20 +419,24 @@ mount is separate work and is not claimed by this design.
   macOS needs a validated strategy. Unscoped here.
 - **Windows**: no mount backend upstream or here. SDK-only; ProjFS is the
   plausible native route and remains unscoped.
-- **Copy-up cap default**: pending `coven-110` benchmark numbers.
+- **Copy-up cap default**: the mount spike supports a cap in the low tens of
+  MiB, but the configurable cap is not implemented yet.
 - **Loopback NFS access control**: see §7; blocks mount-on-by-default.
-- **Base ingest filters**: the default exclude set needs to be validated against
-  a real repository checkout plus a `pnpm install`-scale write workload.
+- **Base ingest filters**: the mount spike validates the workload shape, but
+  the default exclude set still needs an implementation and broader validation.
 
 ## 9. Delivery sequencing
 
 | Step | Bead | State |
 |---|---|---|
 | Storage engine + overlay | `coven-d4p` | merged — PR #658, `e2da654` |
-| macOS mount + benchmark | `coven-110` | unblocked |
+| macOS mount + benchmark | `coven-110` | merged experimental spike — PR #680, conditional on the Full Disk Access confirmation |
 | This design | `coven-vhw` | — |
 | Daemon API + extension tables | not yet filed | ready to file |
 | Cave surfaces | not yet filed | needs the daemon API |
 
-The storage engine exists; nothing in §3–§6 does. This document is the contract
-those follow-ups are held to, not a claim that any of them are built.
+The storage engine and an experimental feature-gated NFSv3 backend exist.
+Nothing in §3–§6 does: daemon API routes, provenance extensions, commit
+materialization, and Cave surfaces remain this document's contract, not a
+claim that they are built. Linux/FUSE remains unstarted, and loopback NFS
+access control still blocks mount-on-by-default.

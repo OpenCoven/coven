@@ -59,15 +59,23 @@ From the surveyed products (high, per-source): (a) POSIX view so git/grep/existi
 
 ## Open questions & conflicts
 
-- **C1**: overlay guide (`fs_block`, whiteout column) vs SPEC (`fs_data`, whiteout table) — resolved in favor of SPEC, but confirm against CLI source before freezing our schema.
+- **C1**: overlay guide (`fs_block`, whiteout column) vs SPEC (`fs_data`, whiteout table) — resolved and confirmed against the AgentFS CLI and SDK sources in favor of `fs_data`.
 - Turso cloud-sync semantics (conflict resolution, audit preservation) unfetched — irrelevant if we build native, relevant if we ever interop.
 - Windows mount story: nothing exists upstream; ProjFS is the plausible native route, unscoped.
-- Performance of NFS-localhost vs FUSE for big `pnpm install`-scale writes: unmeasured anywhere; needs a spike benchmark.
+- Linux/FUSE performance remains unmeasured. The macOS NFS spike is
+  protocol-correct but needs an agent-process Full Disk Access confirmation
+  before mount-dependent work can proceed.
 
 ## Recommended next steps
 
-1. Bead: spike `coven-afs` — SPEC v0.4 schema in rusqlite + read/write/overlay ops + unit tests (no mount yet).
-2. Bead: mount spike — `nfsserve` on macOS against the spike DB; benchmark a real repo checkout + build.
+1. **Delivered:** `coven-afs` now implements the SPEC v0.4 schema, core
+   operations, copy-on-write overlays, and consistency tests. See
+   [PR #658](https://github.com/OpenCoven/coven/pull/658).
+2. **Delivered as an experimental spike:** a feature-gated `nfsserve` NFSv3
+   export, inode-addressed operations, and the macOS benchmark. The storage
+   verdict is GO with WAL; the mount remains blocked on the Full Disk Access
+   confirmation, loopback access control, and a Linux/FUSE evaluation. See
+   [MOUNT-SPIKE.md](./MOUNT-SPIKE.md).
 3. Design doc in the coven repo: daemon API surface + provenance extension tables + Cave diff/timeline UI. **Delivered:** [DESIGN.md](./DESIGN.md).
 4. Decide interop stance: freeze on "SPEC-compatible, coven-extended" and document the extension tables. **Frozen:** [DESIGN.md §1](./DESIGN.md).
 
