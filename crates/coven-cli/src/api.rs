@@ -337,10 +337,7 @@ pub fn health_response(daemon: Option<DaemonStatus>) -> HealthResponse {
             session_handoff: true,
             afs: true,
             afs_mount: MountCapability::unavailable(),
-            // Commit materialization is specified in DESIGN.md section 5 but
-            // not implemented yet; the capability says so rather than letting
-            // a client discover it from a 404.
-            afs_commit: false,
+            afs_commit: true,
         },
         daemon,
         hub: None,
@@ -6845,12 +6842,23 @@ fn afs_write(coven_home: &Path, path: &str, body: Option<&str>) -> Result<ApiRes
                 Err(error) => afs_failure(error),
             }
         }
-        "commit" => api_error(
-            501,
-            "afs.commit_unsupported",
-            "Commit materialization is not implemented; health advertises afsCommit:false.",
-            None,
-        ),
+        "commit" => {
+            let request: crate::afs::CommitRequest = match serde_json::from_value(payload) {
+                Ok(request) => request,
+                Err(error) => {
+                    return api_error(
+                        400,
+                        "invalid_request",
+                        &format!("Invalid AFS commit request: {error}"),
+                        None,
+                    )
+                }
+            };
+            match store.commit(&id, &request) {
+                Ok(view) => json_response(200, &view),
+                Err(error) => afs_failure(error),
+            }
+        }
         "mount" => api_error(
             501,
             "afs.mount_unsupported",
@@ -6963,10 +6971,11 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let response = handle_request("GET", "/api/v1/health", temp.path(), None)?;
         assert!(response.body.contains(r#""afs":true"#));
-        // A client must be able to see that mounting and committing are not
-        // available rather than discovering it from a failed request.
+        // A client must be able to see that mounting is unavailable rather
+        // than discovering it from a failed request. Commit materialized in
+        // coven-fty, so it now advertises true.
         assert!(response.body.contains(r#""afsMount":false"#));
-        assert!(response.body.contains(r#""afsCommit":false"#));
+        assert!(response.body.contains(r#""afsCommit":true"#));
         Ok(())
     }
 
@@ -7031,8 +7040,21 @@ mod tests {
         )?;
         assert_eq!(unconfirmed.status, 400);
 
-        // Unimplemented operations say so through the same envelope the
-        // capability flags predict.
+        // Mount is still unimplemented and says so through the same envelope
+        // the capability flags predict.
+        let mount = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/afs/sessions/{id}/mount"),
+            temp.path(),
+            None,
+            Some("{}"),
+        )?;
+        assert_eq!(mount.status, 501);
+        assert!(mount.body.contains("afs.mount_unsupported"));
+
+        // Commit is wired and reports its refusals through the same envelope.
+        // This project root is not a git repository, so it has no base commit
+        // to materialize against.
         let commit = handle_request_with_body(
             "POST",
             &format!("/api/v1/afs/sessions/{id}/commit"),
@@ -7040,8 +7062,8 @@ mod tests {
             None,
             Some("{}"),
         )?;
-        assert_eq!(commit.status, 501);
-        assert!(commit.body.contains("afs.commit_unsupported"));
+        assert_eq!(commit.status, 409);
+        assert!(commit.body.contains("afs.base_diverged"));
 
         let confirmed = handle_request_with_body(
             "POST",
