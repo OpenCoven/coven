@@ -419,8 +419,9 @@ mount is separate work and is not claimed by this design.
   macOS needs a validated strategy. Unscoped here.
 - **Windows**: no mount backend upstream or here. SDK-only; ProjFS is the
   plausible native route and remains unscoped.
-- **Copy-up cap default**: the mount spike supports a cap in the low tens of
-  MiB, but the configurable cap is not implemented yet.
+- **Copy-up cap default**: the mount spike establishes a cap in the low tens
+  of MiB as the policy target, but the configurable cap is not implemented
+  yet.
 - **Loopback NFS access control**: see §7; blocks mount-on-by-default.
 - **Base ingest filters**: the mount spike validates the workload shape, but
   the default exclude set still needs an implementation and broader validation.

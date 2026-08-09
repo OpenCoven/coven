@@ -59,7 +59,7 @@ From the surveyed products (high, per-source): (a) POSIX view so git/grep/existi
 
 ## Open questions & conflicts
 
-- **C1**: overlay guide (`fs_block`, whiteout column) vs SPEC (`fs_data`, whiteout table) — resolved and confirmed against the AgentFS CLI and SDK sources in favor of `fs_data`.
+- **C1**: overlay guide (`fs_block`, whiteout column) vs SPEC (`fs_data`, whiteout table) — resolved in favor of `fs_data`, consistent with the SPEC and the `coven-afs` schema.
 - Turso cloud-sync semantics (conflict resolution, audit preservation) unfetched — irrelevant if we build native, relevant if we ever interop.
 - Windows mount story: nothing exists upstream; ProjFS is the plausible native route, unscoped.
 - Linux/FUSE performance remains unmeasured. The macOS NFS spike is
