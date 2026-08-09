@@ -353,9 +353,11 @@ impl AfsStore {
 
     /// `afs.session.create`.
     pub fn create(&self, request: &CreateRequest) -> AfsResult<SessionView> {
-        let project_root = std::fs::canonicalize(&request.project_root)
-            .with_context(|| format!("project root {} is unreadable", request.project_root))
-            .map_err(AfsError::from)?;
+        let project_root = strip_verbatim_prefix(
+            std::fs::canonicalize(&request.project_root)
+                .with_context(|| format!("project root {} is unreadable", request.project_root))
+                .map_err(AfsError::from)?,
+        );
 
         if let Some(name) = &request.name {
             for existing in self.list()? {
@@ -620,10 +622,13 @@ impl AfsStore {
         let binding = self.binding(id)?;
         self.require_open(&binding)?;
 
+        // Sessions bound before the prefix fix still carry a verbatim root, so
+        // strip here too rather than trusting what was stored.
         let project_root = binding
             .project_root
             .as_deref()
             .map(PathBuf::from)
+            .map(strip_verbatim_prefix)
             .ok_or_else(|| {
                 AfsError::Internal(anyhow::anyhow!(
                     "AFS session {id} has no bound project root"
@@ -876,6 +881,30 @@ fn symlink_escapes(link_path: &str, target: &str) -> bool {
         }
     }
     false
+}
+
+/// Drop Windows' extended-length path prefix.
+///
+/// `std::fs::canonicalize` returns verbatim paths (`\\?\C:\...`) on Windows.
+/// git accepts one for `-C`, but cannot *create* directories under it:
+/// `git worktree add` fails with "could not create leading directories ...
+/// Invalid argument". Since the bound project root feeds every git invocation
+/// and the worktree path is derived from it, the prefix is stripped at the
+/// source instead of at each call site.
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    match strip_verbatim_str(&path.to_string_lossy()) {
+        Some(stripped) => PathBuf::from(stripped),
+        None => path,
+    }
+}
+
+/// The string half of [`strip_verbatim_prefix`], split out so the rule is
+/// testable on every platform rather than only where it fires.
+fn strip_verbatim_str(path: &str) -> Option<String> {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        return Some(format!(r"\\{rest}"));
+    }
+    path.strip_prefix(r"\\?\").map(str::to_string)
 }
 
 /// `afs/my-session` → `afs-my-session`, so the worktree directory is flat.
@@ -1682,6 +1711,27 @@ mod tests {
         assert!(!symlink_escapes("/a/link", "sibling"));
         assert!(!symlink_escapes("/a/b/link", "../c"));
         assert!(!symlink_escapes("/a/b/link", "../../a/c"));
+    }
+
+    #[test]
+    fn verbatim_prefixes_are_stripped_for_git() {
+        // What canonicalize hands back on Windows, and what git can actually
+        // create directories under.
+        assert_eq!(
+            strip_verbatim_str(r"\\?\C:\work\repo").as_deref(),
+            Some(r"C:\work\repo")
+        );
+        assert_eq!(
+            strip_verbatim_str(r"\\?\UNC\server\share\repo").as_deref(),
+            Some(r"\\server\share\repo")
+        );
+        // Everything else is left exactly as it was.
+        assert_eq!(strip_verbatim_str(r"C:\work\repo"), None);
+        assert_eq!(strip_verbatim_str("/srv/repo"), None);
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from("/srv/repo")),
+            PathBuf::from("/srv/repo")
+        );
     }
 
     #[test]
