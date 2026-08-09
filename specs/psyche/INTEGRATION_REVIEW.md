@@ -70,6 +70,7 @@ This review does not request:
 | 2 | [Technical architecture](./TECH.md) | Process model, schemas, persistence, errors, observability, testing, migration, and distribution. |
 | 2 | [Threat model](./THREAT_MODEL.md) | Trust assumptions, threats, controls, residual risks, and security acceptance. |
 | 2 | [Coven prerequisites](./COVEN_PREREQUISITES.md) | Required execution behavior and W1 evidence classifications; not a claim about current Coven. |
+| 2 | [O2 contract design](./O2_CONTRACT_DESIGN.md) | Proposed immutable opaque binding and mismatch-correlation contract; O3-O7 remain planned companion work. |
 | 2 | [Telegram parity ledger](./TELEGRAM_PARITY.md) | Adapter feature scope and required evidence. |
 | 2 | [Program plan](./PLAN.md) | W0-W11 dependency graph, G0-G12 gates, and delivery discipline. |
 | 3 | This dossier | Integrated summary and maintainer checklist only. |
@@ -415,7 +416,7 @@ runtime and technical specifications.
 | `psyche.delegation.v1` | Immutable non-widening child authority | Parent/child, project, action, budget, evidence, surface limits |
 | `psyche.budget.v1` | Reservation, consumption, release, and evidence | Graph/node/attempt, resource class, enforcement strength, idempotency |
 | `psyche.approval.v1` | Domain-specific approval decision | Owning authority, principal, actor, action digest, expiry, decision |
-| `psyche.execution_binding.v1` | Psyche attempt to Coven session correlation | Graph, node, attempt, session, identity, project, request digest, cursor |
+| `psyche.execution_binding.v1` | Proposed O2 immutable attempt/session correlation | O3-O7 own adoption, lookup/fencing, cancellation, artifact, and recovery state |
 | `psyche.evidence.v1` | Sealed content-addressed evidence set | Producer, graph/node/attempt/session, artifacts, digests, policy |
 | `psyche.verdict.v1` | Verification result and provenance | Evidence set, reviewer, policy, decision, confidence/escalation |
 | `psyche.recovery.v1` | Durable reconciliation or operator recovery | Subject, prior state, authority evidence, action, outcome, actor |
