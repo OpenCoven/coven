@@ -146,12 +146,20 @@ pub enum MountCapability {
 }
 
 impl MountCapability {
-    /// No mount backend is exposed yet. The NFS export from coven-110 is
-    /// protocol-correct but an agent process could not write through it on
-    /// macOS (bead coven-x77), so advertising a backend would promise
-    /// something the daemon cannot currently deliver.
-    pub fn unavailable() -> Self {
-        Self::Unavailable(false)
+    /// What this daemon can actually mount.
+    ///
+    /// `false` on every platform and build without a backend, and `false` by
+    /// default even where one exists: the NFS export serves a single delta
+    /// rather than the merged base+delta view DESIGN.md §3.2 specifies (bead
+    /// `coven-vlw`), and an agent process could not write through the mount on
+    /// macOS (bead `coven-x77`). Advertising a backend before those close
+    /// would promise something the daemon cannot deliver, so the opt-in in
+    /// `afs_mount` gates it.
+    pub fn detect() -> Self {
+        match crate::afs_mount::backend() {
+            Some(backend) => Self::Backend(backend.to_string()),
+            None => Self::Unavailable(false),
+        }
     }
 }
 
@@ -336,7 +344,7 @@ pub fn health_response(daemon: Option<DaemonStatus>) -> HealthResponse {
             structured_errors: true,
             session_handoff: true,
             afs: true,
-            afs_mount: MountCapability::unavailable(),
+            afs_mount: MountCapability::detect(),
             afs_commit: true,
         },
         daemon,
@@ -434,6 +442,7 @@ pub fn handle_request_with_runtime(
         ("GET", "/afs/sessions") => afs_list(coven_home),
         ("GET", p) if p.starts_with("/afs/sessions/") => afs_read(coven_home, p, query),
         ("POST", p) if p.starts_with("/afs/sessions/") => afs_write(coven_home, p, body),
+        ("DELETE", p) if p.starts_with("/afs/sessions/") => afs_delete(coven_home, p),
         ("GET", "/overview") => overview_response(coven_home),
         ("POST", "/actions") => {
             let payload = match parse_body(body) {
@@ -6868,13 +6877,32 @@ fn afs_write(coven_home: &Path, path: &str, body: Option<&str>) -> Result<ApiRes
                 Err(error) => afs_failure(error),
             }
         }
-        "mount" => api_error(
-            501,
-            "afs.mount_unsupported",
-            "No mount backend is available; health advertises afsMount:false.",
-            None,
-        ),
+        "mount" => match store.mount(&id) {
+            Ok(view) => json_response(200, &view),
+            Err(error) => afs_failure(error),
+        },
         _ => api_error(404, "not_found", "Route not found.", None),
+    }
+}
+
+/// `DELETE /afs/sessions/:id/mount` — unmount.
+///
+/// Only `mount` accepts DELETE. `discard` is a POST even though it destroys a
+/// delta (DESIGN.md §3.2), so there is no other destructive verb to route here.
+fn afs_delete(coven_home: &Path, path: &str) -> Result<ApiResponse> {
+    let Some((id, Some(action))) = afs_target(path) else {
+        return api_error(404, "not_found", "Route not found.", None);
+    };
+    if action != "mount" {
+        return api_error(404, "not_found", "Route not found.", None);
+    }
+    let store = crate::afs::AfsStore::new(coven_home);
+    match store.unmount(&id) {
+        Ok(was_mounted) => json_response(
+            200,
+            &json!({ "id": id, "mounted": false, "unmounted": was_mounted }),
+        ),
+        Err(error) => afs_failure(error),
     }
 }
 
@@ -7049,8 +7077,10 @@ mod tests {
         )?;
         assert_eq!(unconfirmed.status, 400);
 
-        // Mount is still unimplemented and says so through the same envelope
-        // the capability flags predict.
+        // The mount lifecycle is wired, but no backend is advertised by
+        // default (bead coven-vlw: the export serves a single delta, not the
+        // merged view), so the route refuses through the same envelope the
+        // capability flags predict.
         let mount = handle_request_with_body(
             "POST",
             &format!("/api/v1/afs/sessions/{id}/mount"),
@@ -7060,6 +7090,39 @@ mod tests {
         )?;
         assert_eq!(mount.status, 501);
         assert!(mount.body.contains("afs.mount_unsupported"));
+
+        // Unmount is idempotent: asking an unmounted session to unmount is the
+        // state the caller wanted, so it succeeds rather than inventing an
+        // error code the §3.4 table does not have. It answers even where mount
+        // itself is unsupported — a daemon that lost its backend still has to
+        // be able to take down a mount an earlier build made.
+        let unmount = handle_request(
+            "DELETE",
+            &format!("/api/v1/afs/sessions/{id}/mount"),
+            temp.path(),
+            None,
+        )?;
+        assert_eq!(unmount.status, 200);
+        assert!(unmount.body.contains(r#""unmounted":false"#));
+
+        // An unknown session is not found rather than a cheerful no-op.
+        let ghost = handle_request(
+            "DELETE",
+            "/api/v1/afs/sessions/afs-nope/mount",
+            temp.path(),
+            None,
+        )?;
+        assert_eq!(ghost.status, 404);
+        assert!(ghost.body.contains("afs.session_not_found"));
+
+        // DELETE is routed for mount alone; discard stays a POST (§3.2).
+        let wrong_verb = handle_request(
+            "DELETE",
+            &format!("/api/v1/afs/sessions/{id}/discard"),
+            temp.path(),
+            None,
+        )?;
+        assert_eq!(wrong_verb.status, 404);
 
         // Commit is wired and reports its refusals through the same envelope.
         // This project root is not a git repository, so it has no base commit

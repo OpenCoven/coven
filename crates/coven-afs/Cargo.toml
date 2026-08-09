@@ -18,6 +18,7 @@ mount = [
     "dep:hmac",
     "dep:sha2",
     "dep:getrandom",
+    "dep:tracing-subscriber",
 ]
 
 [dependencies]
@@ -32,6 +33,9 @@ libc = { version = "0.2", optional = true }
 hmac = { version = "0.12", optional = true }
 sha2 = { version = "0.10", optional = true }
 getrandom = { version = "0.2", optional = true }
+# Only the out-of-process export binary initializes a subscriber; the library
+# stays subscriber-agnostic and merely emits `tracing` events.
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -43,4 +47,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [[example]]
 name = "afs_serve"
+required-features = ["mount"]
+
+# The export process the daemon spawns per mount. Behind the same feature as
+# the backend it serves, so a build without `mount` produces no binary that
+# could be run by mistake.
+[[bin]]
+name = "coven-afs-serve"
+path = "src/bin/coven-afs-serve.rs"
 required-features = ["mount"]

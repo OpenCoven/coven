@@ -1265,6 +1265,22 @@ pub fn recover_orphaned_sessions(coven_home: &Path, updated_at: &str) -> Result<
     crate::store::mark_running_sessions_orphaned(&conn, updated_at)
 }
 
+/// Unmount AFS mounts whose owning daemon is gone (DESIGN.md §7).
+///
+/// Never fatal to startup. A mount we cannot reclaim is a stale mount point,
+/// which is untidy; refusing to boot over it would take the whole daemon down
+/// for a session nobody asked about. Deltas are left alone either way —
+/// unreviewed work is not garbage.
+fn recover_orphaned_afs_mounts(coven_home: &Path) {
+    let reclaimed = crate::afs_mount::sweep_orphans(coven_home);
+    if !reclaimed.is_empty() {
+        append_daemon_recovery_log(
+            coven_home,
+            &format!("unmounted orphaned afs sessions: {}", reclaimed.join(", ")),
+        );
+    }
+}
+
 /// TTL before a `created` row with no live owner is declared dead (#342).
 /// Generous on purpose: `coven run` writes the store directly, so a launch
 /// can be legitimately mid-registration while the daemon boots or serves —
@@ -2673,6 +2689,7 @@ pub fn serve_forever(
     );
     recover_orphaned_sessions(coven_home, &started_at)?;
     recover_stale_created_sessions(coven_home, &started_at)?;
+    recover_orphaned_afs_mounts(coven_home);
     let runtime = Arc::new(LiveSessionRuntime::try_with_coven_home(
         coven_home.to_path_buf(),
     )?);
@@ -3208,6 +3225,7 @@ pub fn serve_forever(
     initialize_daemon_store(coven_home)?;
     write_status(coven_home, &status)?;
     recover_orphaned_sessions(coven_home, &started_at)?;
+    recover_orphaned_afs_mounts(coven_home);
 
     let runtime = Arc::new(LiveSessionRuntime::try_with_coven_home(
         coven_home.to_path_buf(),
