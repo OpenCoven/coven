@@ -18,13 +18,18 @@ title: "Coven changelog and release notes"
   [PR #678](https://github.com/OpenCoven/coven/pull/678).
 - **Experimental NFSv3 mount backend for `coven-afs`.** Behind the crate's
   off-by-default `mount` feature, an AgentFS database can be exported over
-  loopback NFSv3 and mounted without root on macOS. There is still no daemon
-  or Cave surface, and mounts are not enabled by default: an agent process
-  could not yet write through the mount on macOS, which is being tracked
-  before the path is recommended. The same change measured the storage
-  engine's throughput and added opt-in write-ahead logging, which takes
-  checkout-shaped writes from 8.84x the host filesystem to 1.29x. See
-  [PR #680](https://github.com/OpenCoven/coven/pull/680).
+  loopback NFSv3 and mounted without root on macOS. The same change measured
+  the storage engine's throughput and added opt-in write-ahead logging, which
+  puts agent-shaped writes at 0.81–1.29x the host filesystem: 1.29x for
+  checkout-shaped trees, and 0.81x for `node_modules`-shaped trees, where the
+  database is faster than the host. The export is protocol-correct but remains
+  an engineering spike, and three unresolved gates keep it off by default — an
+  agent process still needs a Full Disk Access / Network Volumes confirmation
+  on macOS (if that fails, the macOS backend has to change), loopback NFS
+  access control is unsettled, and Linux/FUSE is unevaluated. No CLI, daemon,
+  API, or Cave workflow exposes it. See
+  [PR #680](https://github.com/OpenCoven/coven/pull/680) and
+  `specs/coven-agent-fs/MOUNT-SPIKE.md`.
 
 ### Updates
 
