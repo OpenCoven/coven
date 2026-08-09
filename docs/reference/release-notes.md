@@ -13,10 +13,18 @@ title: "Coven changelog and release notes"
 - **AgentFS-compatible storage foundation.** The experimental `coven-afs`
   crate implements an AgentFS SPEC v0.4-compatible SQLite filesystem, JSON
   key/value storage, an insert-only tool-call audit log, and copy-on-write
-  base/delta overlays. This release provides the storage engine only—there is
-  no FUSE/NFS mount or daemon/Cave surface yet. See
+  base/delta overlays. See
   [PR #658](https://github.com/OpenCoven/coven/pull/658) and
   [PR #678](https://github.com/OpenCoven/coven/pull/678).
+- **Experimental NFSv3 mount backend for `coven-afs`.** Behind the crate's
+  off-by-default `mount` feature, an AgentFS database can be exported over
+  loopback NFSv3 and mounted without root on macOS. There is still no daemon
+  or Cave surface, and mounts are not enabled by default: an agent process
+  could not yet write through the mount on macOS, which is being tracked
+  before the path is recommended. The same change measured the storage
+  engine's throughput and added opt-in write-ahead logging, which takes
+  checkout-shaped writes from 8.84x the host filesystem to 1.29x. See
+  [PR #680](https://github.com/OpenCoven/coven/pull/680).
 
 ### Updates
 
@@ -29,6 +37,12 @@ title: "Coven changelog and release notes"
   [PR #668](https://github.com/OpenCoven/coven/pull/668).
 
 ### Bug fixes
+
+- **Faster session launch.** Session launches no longer spawn `git` to locate
+  the repository maintenance gate when the project root is not inside a
+  repository, restoring launch-to-first-output to its pre-gate baseline
+  (median 117.8 ms to 38.8 ms on a loaded machine). See
+  [PR #682](https://github.com/OpenCoven/coven/pull/682).
 
 - **Explicit, resilient event persistence.** Event commits retry transient
   SQLite busy/locked failures. When queue pressure drops raw output, each
