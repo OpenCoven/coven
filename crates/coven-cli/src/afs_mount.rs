@@ -169,12 +169,18 @@ pub fn mount(coven_home: &Path, id: &str, delta: &Path, read_only: bool) -> AfsR
             )));
         }
         // A record whose owner died is debris, not a conflict. Clear it the
-        // same way the startup sweep would rather than refusing forever.
-        reclaim(coven_home, &existing);
+        // same way the startup sweep would rather than refusing forever — but
+        // a mount that will not come down is a genuine conflict.
+        reclaim(coven_home, &existing).map_err(|error| {
+            AfsError::MountBusy(format!(
+                "AFS session {id} has a stale mount at {} that will not come down: {error}",
+                existing.mount_point
+            ))
+        })?;
     }
 
     let point = mount_point(coven_home, id);
-    prepare_mount_point(&point).map_err(AfsError::Internal)?;
+    prepare_mount_point(&point)?;
 
     let view = MountView {
         mount_point: point.to_string_lossy().into_owned(),
@@ -190,35 +196,44 @@ pub fn mount(coven_home: &Path, id: &str, delta: &Path, read_only: bool) -> AfsR
         mounted_at: now_seconds(),
     };
 
-    spawn_and_mount(coven_home, id, delta, &point, &record).map_err(AfsError::Internal)?;
+    // Written before anything is mounted, so the crash window is covered in
+    // the direction that matters. A record without a mount is debris the sweep
+    // clears harmlessly; a mount without a record is an untracked mount point
+    // no future daemon knows to take down.
+    write_record(coven_home, &record).map_err(AfsError::Internal)?;
+
+    if let Err(error) = spawn_and_mount(id, delta, &point) {
+        let _ = reclaim(coven_home, &record);
+        return Err(AfsError::Internal(error));
+    }
     Ok(view)
 }
 
 /// The mount point must exist and be empty. A non-empty directory is
 /// `afs.mount_busy` per §3.4 — mounting over occupied storage hides whatever
 /// was there until unmount, which is a data-loss shape, not an inconvenience.
-fn prepare_mount_point(point: &Path) -> Result<()> {
-    std::fs::create_dir_all(point).with_context(|| format!("create {}", point.display()))?;
+fn prepare_mount_point(point: &Path) -> AfsResult<()> {
+    std::fs::create_dir_all(point)
+        .with_context(|| format!("create {}", point.display()))
+        .map_err(AfsError::Internal)?;
     let mut entries = std::fs::read_dir(point)
-        .with_context(|| format!("read {}", point.display()))?
+        .with_context(|| format!("read {}", point.display()))
+        .map_err(AfsError::Internal)?
         .peekable();
     if entries.peek().is_some() {
-        return Err(anyhow!("mount point {} is not empty", point.display()));
+        return Err(AfsError::MountBusy(format!(
+            "Mount point {} is not empty.",
+            point.display()
+        )));
     }
     Ok(())
 }
 
-/// Spawn the export, mount it, rotate the token, and record the result.
+/// Spawn the export, mount it, and rotate the token.
 ///
 /// Every failure path tears the export back down. A half-mounted session that
 /// left an NFS server listening would be exactly the orphan §7 is about.
-fn spawn_and_mount(
-    coven_home: &Path,
-    id: &str,
-    delta: &Path,
-    point: &Path,
-    record: &MountRecord,
-) -> Result<()> {
+fn spawn_and_mount(id: &str, delta: &Path, point: &Path) -> Result<()> {
     let helper = helper_path().ok_or_else(|| anyhow!("{HELPER} is not installed"))?;
     let mut child = Command::new(&helper)
         .arg(delta)
@@ -240,14 +255,6 @@ fn spawn_and_mount(
             export.shutdown();
             return Err(error);
         }
-    }
-
-    if let Err(error) = write_record(coven_home, record) {
-        // The mount succeeded but nothing would remember it. Undo rather than
-        // leak an untracked mount.
-        let _ = unmount_path(point);
-        export.shutdown();
-        return Err(error);
     }
 
     exports()
@@ -346,25 +353,66 @@ pub fn unmount(coven_home: &Path, id: &str) -> AfsResult<bool> {
         return Ok(false);
     };
     let mounted = pid_alive(record.owner_pid);
-    reclaim(coven_home, &record);
     if let Ok(mut guard) = exports().lock() {
         if let Some(export) = guard.remove(id) {
             export.shutdown();
         }
     }
+    // Report a mount we could not take down rather than claiming success: the
+    // caller asked for it to be gone, and something is holding it.
+    reclaim(coven_home, &record).map_err(|error| {
+        AfsError::MountBusy(format!(
+            "AFS session {id} could not be unmounted from {}: {error}",
+            record.mount_point
+        ))
+    })?;
     Ok(mounted)
 }
 
-/// Drop a mount's operating-system and on-disk footprint, ignoring failures.
+/// Drop a mount's operating-system and on-disk footprint.
 ///
-/// Used by both unmount and orphan recovery. Neither can do anything useful
-/// with a failure: the record must go regardless, or the session is wedged as
-/// permanently mounted.
-fn reclaim(coven_home: &Path, record: &MountRecord) {
+/// Used by both unmount and orphan recovery. The record is removed only once
+/// nothing is mounted at the point: it is the sole hint a later sweep has, so
+/// discarding it while a stuck mount is still live would strand that mount
+/// permanently — no future daemon would know to retry. A `umount` that fails
+/// on a point which is *not* mounted is not a failure at all, and its record
+/// goes.
+fn reclaim(coven_home: &Path, record: &MountRecord) -> Result<()> {
     let point = PathBuf::from(&record.mount_point);
-    let _ = unmount_path(&point);
+    let unmounted = unmount_path(&point);
+    if still_mounted(&point) {
+        return unmounted
+            .and_then(|()| Err(anyhow!("{} is still mounted after umount", point.display())));
+    }
+    // Best-effort from here: an empty directory left behind is untidy, not
+    // stranding, and the next mount recreates it.
     let _ = std::fs::remove_dir(&point);
-    let _ = std::fs::remove_file(record_path(coven_home, &record.session_id));
+    std::fs::remove_file(record_path(coven_home, &record.session_id))
+        .with_context(|| format!("remove the mount record for {}", record.session_id))
+}
+
+/// Whether something is still mounted at `point`.
+///
+/// A mount point sits on a different device from its parent, which is the
+/// portable-enough test on Unix and the reason this is checked rather than
+/// trusting `umount`'s exit code: `umount` also fails when there was nothing
+/// mounted, and those two cases need opposite handling.
+#[cfg(unix)]
+fn still_mounted(point: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let Some(parent) = point.parent() else {
+        return false;
+    };
+    match (std::fs::metadata(point), std::fs::metadata(parent)) {
+        (Ok(here), Ok(above)) => here.dev() != above.dev(),
+        // A mount point we cannot stat is not one we can prove is mounted.
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn still_mounted(_point: &Path) -> bool {
+    false
 }
 
 /// Startup sweep (DESIGN.md §7, orphan recovery).
@@ -397,8 +445,12 @@ pub fn sweep_orphans(coven_home: &Path) -> Vec<String> {
         if pid_alive(record.owner_pid) {
             continue;
         }
-        reclaim(coven_home, &record);
-        reclaimed.push(record.session_id);
+        // A record that cannot be reclaimed stays put. Retrying next start is
+        // the only path back for a stuck mount, and dropping the record would
+        // remove it.
+        if reclaim(coven_home, &record).is_ok() {
+            reclaimed.push(record.session_id);
+        }
     }
     reclaimed.sort();
     reclaimed
@@ -509,6 +561,32 @@ mod tests {
     }
 
     #[test]
+    fn a_plain_directory_does_not_read_as_mounted() -> anyhow::Result<()> {
+        // The distinction the sweep depends on: `umount` fails both when a
+        // mount is stuck and when there was never a mount, and only the first
+        // may keep its record.
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path().join("plain");
+        std::fs::create_dir_all(&dir)?;
+        assert!(!still_mounted(&dir));
+        Ok(())
+    }
+
+    #[test]
+    fn reclaim_removes_the_record_when_nothing_is_mounted() -> anyhow::Result<()> {
+        // `umount` will fail here — nothing is mounted — and the record must
+        // still go, or a session would read as mounted forever.
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let stale = record("afs-r", &mounts_dir(home), DEAD_PID);
+        write_record(home, &stale)?;
+        std::fs::create_dir_all(&stale.mount_point)?;
+        reclaim(home, &stale).expect("an unmounted point reclaims cleanly");
+        assert!(!record_path(home, "afs-r").exists());
+        Ok(())
+    }
+
+    #[test]
     fn unmounting_an_unmounted_session_is_not_an_error() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         assert!(!unmount(temp.path(), "afs-never").expect("idempotent unmount"));
@@ -532,8 +610,11 @@ mod tests {
         std::fs::create_dir_all(&point)?;
         std::fs::write(point.join("occupant.txt"), b"already here")?;
         // Mounting over this would hide the file until unmount, which is a
-        // data-loss shape rather than an inconvenience.
-        assert!(prepare_mount_point(&point).is_err());
+        // data-loss shape rather than an inconvenience. §3.4 gives it a code:
+        // it must not surface as a 500.
+        let error = prepare_mount_point(&point).expect_err("a non-empty point is refused");
+        assert!(matches!(error, AfsError::MountBusy(_)));
+        assert_eq!(error.parts().0, 409);
         Ok(())
     }
 
@@ -541,7 +622,7 @@ mod tests {
     fn an_empty_mount_point_is_accepted_and_created_on_demand() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         let point = temp.path().join("nested").join("point");
-        prepare_mount_point(&point)?;
+        prepare_mount_point(&point).expect("empty mount point is accepted");
         assert!(point.is_dir());
         Ok(())
     }
