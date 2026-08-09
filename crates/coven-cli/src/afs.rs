@@ -667,7 +667,16 @@ impl AfsStore {
                 binding.name.clone().unwrap_or_else(|| id.to_string())
             ),
         };
-        let worktree_path = project_root.join(".worktrees").join(worktree_slug(&branch));
+        let worktrees_dir = project_root.join(".worktrees");
+        if let Ok(meta) = std::fs::symlink_metadata(&worktrees_dir) {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(AfsError::PathOutsideRoot {
+                    path: "/.worktrees".to_string(),
+                    reason: "the .worktrees path must be a real directory (not a symlink)".into(),
+                });
+            }
+        }
+        let worktree_path = worktrees_dir.join(worktree_slug(&branch));
         if git_branch_exists(&project_root, &branch) {
             return Err(AfsError::CommitConflict(format!(
                 "Branch {branch} already exists; pass an explicit branch."
