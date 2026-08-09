@@ -667,16 +667,8 @@ impl AfsStore {
                 binding.name.clone().unwrap_or_else(|| id.to_string())
             ),
         };
-        let worktrees_dir = project_root.join(".worktrees");
-        if let Ok(meta) = std::fs::symlink_metadata(&worktrees_dir) {
-            if meta.file_type().is_symlink() || !meta.is_dir() {
-                return Err(AfsError::PathOutsideRoot {
-                    path: "/.worktrees".to_string(),
-                    reason: "the .worktrees path must be a real directory (not a symlink)".into(),
-                });
-            }
-        }
-        let worktree_path = worktrees_dir.join(worktree_slug(&branch));
+        let worktrees_root = validate_worktrees_root(&project_root)?;
+        let worktree_path = worktrees_root.join(worktree_slug(&branch));
         if git_branch_exists(&project_root, &branch) {
             return Err(AfsError::CommitConflict(format!(
                 "Branch {branch} already exists; pass an explicit branch."
@@ -988,7 +980,9 @@ fn apply_plan(worktree_path: &Path, plan: &[Planned]) -> AfsResult<()> {
     for item in plan {
         // Paths are already normalized and escape-checked; strip the leading
         // slash so they join relative to the worktree.
-        let relative = item.path().trim_start_matches('/');
+        let item_path = item.path().to_string();
+        let relative = item_path.trim_start_matches('/');
+        ensure_real_parent_dirs(worktree_path, &item_path, relative)?;
         let host = worktree_path.join(relative);
         match item {
             Planned::Removal { .. } => {
@@ -1001,10 +995,16 @@ fn apply_plan(worktree_path: &Path, plan: &[Planned]) -> AfsResult<()> {
             Planned::File {
                 data, executable, ..
             } => {
-                if let Some(parent) = host.parent() {
-                    std::fs::create_dir_all(parent)
-                        .with_context(|| format!("failed to create {}", parent.display()))
-                        .map_err(AfsError::from)?;
+                if let Ok(meta) = std::fs::symlink_metadata(&host) {
+                    if meta.file_type().is_symlink() {
+                        std::fs::remove_file(&host)
+                            .with_context(|| format!("failed to remove {}", host.display()))
+                            .map_err(AfsError::from)?;
+                    } else if meta.is_dir() {
+                        return Err(AfsError::CommitConflict(format!(
+                            "Refusing to materialize {item_path}: an existing directory blocks the file."
+                        )));
+                    }
                 }
                 std::fs::write(&host, data)
                     .with_context(|| format!("failed to write {}", host.display()))
@@ -1012,12 +1012,82 @@ fn apply_plan(worktree_path: &Path, plan: &[Planned]) -> AfsResult<()> {
                 set_executable(&host, *executable)?;
             }
             Planned::Symlink { target, .. } => {
-                if let Some(parent) = host.parent() {
-                    std::fs::create_dir_all(parent)
-                        .with_context(|| format!("failed to create {}", parent.display()))
-                        .map_err(AfsError::from)?;
+                if let Ok(meta) = std::fs::symlink_metadata(&host) {
+                    if meta.file_type().is_symlink() || meta.is_file() {
+                        std::fs::remove_file(&host)
+                            .with_context(|| format!("failed to remove {}", host.display()))
+                            .map_err(AfsError::from)?;
+                    } else if meta.is_dir() {
+                        return Err(AfsError::CommitConflict(format!(
+                            "Refusing to materialize {item_path}: an existing directory blocks the symlink."
+                        )));
+                    }
                 }
                 create_symlink(target, &host)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_worktrees_root(project_root: &Path) -> AfsResult<PathBuf> {
+    let root = project_root.join(".worktrees");
+    match std::fs::symlink_metadata(&root) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(AfsError::CommitConflict(format!(
+            "Refusing to materialize under {}: .worktrees must be a real directory, not a symlink.",
+            project_root.display()
+        ))),
+        Ok(meta) if !meta.is_dir() => Err(AfsError::CommitConflict(format!(
+            "Refusing to materialize under {}: .worktrees exists but is not a directory.",
+            project_root.display()
+        ))),
+        Ok(_) => Ok(root),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(root),
+        Err(error) => Err(AfsError::Internal(anyhow::anyhow!(
+            "failed to inspect {}: {error}",
+            root.display()
+        ))),
+    }
+}
+
+fn ensure_real_parent_dirs(worktree_path: &Path, item_path: &str, relative: &str) -> AfsResult<()> {
+    let mut parent = worktree_path.to_path_buf();
+    let mut parts = relative
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .peekable();
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            break;
+        }
+        parent.push(part);
+        match std::fs::symlink_metadata(&parent) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(AfsError::PathOutsideRoot {
+                    path: item_path.to_string(),
+                    reason: format!(
+                        "its parent {} is a symlink that could escape the worktree",
+                        parent.display()
+                    ),
+                });
+            }
+            Ok(meta) if !meta.is_dir() => {
+                return Err(AfsError::CommitConflict(format!(
+                    "Refusing to materialize {item_path}: parent {} is not a directory.",
+                    parent.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))
+                    .map_err(AfsError::from)?;
+            }
+            Err(error) => {
+                return Err(AfsError::Internal(anyhow::anyhow!(
+                    "failed to inspect {}: {error}",
+                    parent.display()
+                )));
             }
         }
     }
@@ -1133,7 +1203,7 @@ fn cleanup_failed_materialization(project_root: &Path, worktree_path: &Path, bra
     let _ = std::process::Command::new("git")
         .arg("-C")
         .arg(project_root)
-        .args(["branch", "-D", branch])
+        .args(["branch", "-D", "--", branch])
         .output();
 }
 
@@ -1461,6 +1531,62 @@ mod tests {
         assert_eq!(code, "afs.path_outside_root");
         assert!(message.contains("symlink target"), "{message}");
         assert!(!git_branch_exists(&root, &format!("afs/{}", view.id)));
+    }
+
+    #[test]
+    fn commit_refuses_a_symlinked_worktrees_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = signing_key(dir.path());
+        let root = git_project(dir.path(), &key);
+        let store = store(dir.path());
+        let view = create(&store, &root);
+        delta_write(&store, &view.id, "/src/added.rs", b"// new");
+
+        let outside = dir.path().join("outside-worktrees");
+        std::fs::create_dir_all(&outside).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, root.join(".worktrees")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&outside, root.join(".worktrees")).unwrap();
+
+        let error = commit_err(&store, &view.id);
+        let (status, code, message) = error.parts();
+        assert_eq!(status, 409);
+        assert_eq!(code, "afs.commit_conflict");
+        assert!(message.contains(".worktrees"));
+    }
+
+    #[test]
+    fn commit_refuses_materializing_through_a_parent_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = signing_key(dir.path());
+        let root = git_project(dir.path(), &key);
+        git_ok(
+            &root,
+            &["rm", "--quiet", "--cached", "--force", "--", "src/main.rs"],
+        );
+        std::fs::remove_file(root.join("src/main.rs")).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, root.join("src/main.rs")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&outside, root.join("src/main.rs")).unwrap();
+        git_ok(&root, &["add", "--all"]);
+        git_ok(
+            &root,
+            &["commit", "--no-gpg-sign", "-q", "-m", "add escape symlink"],
+        );
+
+        let store = store(dir.path());
+        let view = create(&store, &root);
+        delta_write(&store, &view.id, "/src/main.rs/escape.txt", b"must fail");
+
+        let error = commit_err(&store, &view.id);
+        let (status, code, message) = error.parts();
+        assert_eq!(status, 400);
+        assert_eq!(code, "afs.path_outside_root");
+        assert!(message.contains("parent"));
     }
 
     #[test]
