@@ -11,7 +11,7 @@ name = "coven"
 path = "src/main.rs"
 
 [dependencies]
-coven-afs = { path = "../coven-afs" }
+coven-afs = { path = "../coven-afs", version = "0.1.0" }
 anyhow = "1"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
