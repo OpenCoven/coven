@@ -30,6 +30,19 @@ The test will assert behavior, not host scheduling speed:
   and its seconds/microseconds start timestamp. A later missing PID is reaped
   only when it was first captured under that identity; a different start
   identity is reported as reuse, never as fixture reaping.
+- The durable cleanup coordinator is test-owned rather than a background
+  process in the harness session. It opens the FIFO read-only and nonblocking
+  before the fixture starts; the request side subsequently opens it write-only
+  and nonblocking. It records the exact token in the acknowledgement file and
+  exits. This keeps the acknowledgement available after the production runner
+  correctly kills the harness session/process group—a lifecycle that otherwise
+  kills an in-fixture FIFO reader on Linux. Cleanup always requests this
+  acknowledgement before evaluating reaping; on an error the coordinator is
+  stopped, so its test thread remains bounded. The coordinator never signals a
+  fixture PID or process group. A separate fixture-local emergency FIFO retains
+  the existing `kill -KILL 0` fallback: only a surviving member of the
+  fixture's own process group can consume that command, so it cannot target a
+  recycled PID or an unrelated group.
 
 If PID readiness appears before activation, the signaler keeps bounded polling
 outside lifecycle locks. If the runner finishes first, it records a non-signal

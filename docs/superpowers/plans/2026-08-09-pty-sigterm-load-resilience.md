@@ -18,7 +18,15 @@ identity-safe cleanup plus aggregated assertions run. This containment path is
 not normal cancellation or a performance assertion, and it never signals under
 the restored/default handler or changes async handler semantics. Linux
 identities use `/proc/<pid>/stat` start ticks; macOS identities use
-`proc_pidinfo(PROC_PIDTBSDINFO)` start timestamps.
+`proc_pidinfo(PROC_PIDTBSDINFO)` start timestamps. The test-owned FIFO reader
+opens read-only before the fixture starts; its write-only request receives an
+exact-token acknowledgement outside the harness session. That keeps the
+acknowledgement available after correct process-group termination kills every
+fixture child on Linux. Cleanup requests the acknowledgement before checking
+identities and stops the coordinator on a command or acknowledgement failure.
+The coordinator never signals fixture PIDs or process groups. A separate
+fixture-local emergency FIFO preserves the safe `kill -KILL 0` containment
+fallback: only a surviving fixture-group member can consume it.
 
 **Tech Stack:** Rust, `libc`, Cargo test runner, POSIX shell test fixture.
 
@@ -62,14 +70,15 @@ fn native_stream_sigterm_cancels_and_reaps_process_tree() -> Result<()> {
 
     let watchdog = Duration::from_secs(30);
     // Keep the expected cancellation error and restoration assertion. Capture
-    // fixture start identities before signalling, and retain a tokenized FIFO
-    // cleanup sentinel created before the shell fixture starts.
+    // fixture start identities before signalling, and start a tokenized
+    // test-owned FIFO cleanup sentinel before the shell fixture starts.
 ```
 
 The signaler repeatedly captures both fixture identities and calls
 `send_sigterm_if_active` only when capture succeeds. A `false` result means
 the lifecycle is not yet active, not that the test should fail; it releases the
-lock and retries until the watchdog. Do not poll
+lock and retries until the watchdog. After the runner returns, request and
+verify the durable FIFO acknowledgement before checking fixture identities. Do not poll
 `SUPERVISED_STREAM_CANCELLATION_SIGNAL` after `pthread_kill`: guard finish may
 clear it. The final expected cancellation error is the consumption assertion.
 

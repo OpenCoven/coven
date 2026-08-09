@@ -4700,16 +4700,32 @@ while :; do sleep 1; done
     struct NativeStreamSigtermCleanupHandle {
         command_path: PathBuf,
         acknowledgement_path: PathBuf,
-        sentinel_readiness_path: PathBuf,
         token: String,
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    struct NativeStreamSigtermFixtureCleanup {
+        command: std::fs::File,
+        readiness_path: PathBuf,
+        token: String,
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    struct NativeStreamSigtermCleanupSentinel {
+        shutdown: Arc<AtomicBool>,
+        result: mpsc::Receiver<Result<()>>,
     }
 
     #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
     fn create_native_stream_sigterm_cleanup_handle(
         fixture_dir: &Path,
-    ) -> Result<NativeStreamSigtermCleanupHandle> {
+    ) -> Result<(
+        NativeStreamSigtermCleanupHandle,
+        NativeStreamSigtermFixtureCleanup,
+    )> {
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
 
         let command_path = fixture_dir.join("cleanup.fifo");
         let command_path_c = CString::new(command_path.as_os_str().as_bytes())
@@ -4720,108 +4736,256 @@ while :; do sleep 1; done
             return Err(io::Error::last_os_error())
                 .context("creating native stream fixture cleanup FIFO");
         }
-        Ok(NativeStreamSigtermCleanupHandle {
-            command_path,
-            acknowledgement_path: fixture_dir.join("cleanup.ack"),
-            sentinel_readiness_path: fixture_dir.join("cleanup.ready"),
-            token: format!("coven-native-stream-sigterm-{}", uuid::Uuid::new_v4()),
-        })
+        let marker = format!("coven-native-stream-sigterm-{}", uuid::Uuid::new_v4());
+        let fixture_command_path = fixture_dir.join("fixture-cleanup.fifo");
+        let fixture_command_path_c = CString::new(fixture_command_path.as_os_str().as_bytes())
+            .context("encoding native stream fixture cleanup FIFO path")?;
+        // SAFETY: the temporary fixture directory is unique and the C string
+        // is NUL-terminated for mkfifo.
+        if unsafe { libc::mkfifo(fixture_command_path_c.as_ptr(), 0o600) } != 0 {
+            return Err(io::Error::last_os_error())
+                .context("creating native stream fixture-group cleanup FIFO");
+        }
+        // Retain both ends so the fixture's read-only open cannot deadlock
+        // before the signaler observes its readiness marker. This endpoint
+        // never reads, so only the in-fixture sentinel can consume a command.
+        let fixture_command = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fixture_command_path)
+            .context("opening native stream fixture-group cleanup FIFO")?;
+        Ok((
+            NativeStreamSigtermCleanupHandle {
+                command_path,
+                acknowledgement_path: fixture_dir.join("cleanup.ack"),
+                token: format!("coven-native-stream-sigterm-{}", uuid::Uuid::new_v4()),
+            },
+            NativeStreamSigtermFixtureCleanup {
+                command: fixture_command,
+                readiness_path: fixture_dir.join("fixture-cleanup.ready"),
+                token: marker,
+            },
+        ))
     }
 
     #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
     fn native_stream_sigterm_fixture_sentinel_is_ready(
-        cleanup: &NativeStreamSigtermCleanupHandle,
+        readiness_path: &Path,
+        token: &str,
     ) -> Result<bool> {
-        match std::fs::read_to_string(&cleanup.sentinel_readiness_path) {
-            Ok(readiness) if readiness.trim() == cleanup.token => Ok(true),
+        match std::fs::read_to_string(readiness_path) {
+            Ok(readiness) if readiness.trim() == token => Ok(true),
             Ok(readiness) if readiness.trim().is_empty() => Ok(false),
             Ok(_) => anyhow::bail!(
-                "native stream fixture cleanup sentinel readiness did not match its token"
+                "native stream fixture-group cleanup sentinel readiness did not match its token"
             ),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error).with_context(|| {
                 format!(
-                    "reading native stream fixture cleanup sentinel readiness {}",
-                    cleanup.sentinel_readiness_path.display()
+                    "reading native stream fixture-group cleanup sentinel readiness {}",
+                    readiness_path.display()
                 )
             }),
         }
     }
 
     #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-    fn request_native_stream_sigterm_fixture_cleanup(
-        cleanup: &NativeStreamSigtermCleanupHandle,
-        deadline: Instant,
+    fn request_native_stream_sigterm_fixture_group_cleanup(
+        fixture_cleanup: &mut NativeStreamSigtermFixtureCleanup,
     ) -> Result<()> {
+        // This command is consumed only by the fixture's own process-group
+        // member, which uses `kill -KILL 0`; no numeric PID is ever signalled.
+        writeln!(fixture_cleanup.command, "{}", fixture_cleanup.token)
+            .context("writing native stream fixture-group cleanup command")?;
+        fixture_cleanup
+            .command
+            .flush()
+            .context("flushing native stream fixture-group cleanup command")
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    fn start_native_stream_sigterm_cleanup_sentinel(
+        cleanup: &NativeStreamSigtermCleanupHandle,
+    ) -> Result<NativeStreamSigtermCleanupSentinel> {
         use std::os::unix::fs::OpenOptionsExt;
 
-        // Open both ends so writing before the fixture sentinel has opened
-        // its read end is safe; retain this descriptor until the sentinel
-        // acknowledges the exact, per-test token.
-        let mut command = std::fs::OpenOptions::new()
+        // Keep this reader in the test process, outside the harness session
+        // which `stream_harness_with_program` intentionally kills. Opening a
+        // read-only nonblocking endpoint here also guarantees the command
+        // writer below never relies on a FIFO self-reader.
+        let command = std::fs::OpenOptions::new()
             .read(true)
-            .write(true)
             .custom_flags(libc::O_NONBLOCK)
             .open(&cleanup.command_path)
             .with_context(|| {
                 format!(
-                    "opening native stream fixture cleanup FIFO {}",
+                    "opening native stream cleanup sentinel FIFO {}",
                     cleanup.command_path.display()
                 )
             })?;
-        writeln!(command, "{}", cleanup.token)
-            .context("writing native stream fixture cleanup command")?;
-        command
-            .flush()
-            .context("flushing native stream fixture cleanup command")?;
+        let acknowledgement_path = cleanup.acknowledgement_path.clone();
+        let expected_marker = cleanup.token.clone();
+        let (result_sender, result_receiver) = mpsc::sync_channel(1);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let sentinel_shutdown = Arc::clone(&shutdown);
+        thread::spawn(move || {
+            let result = (|| -> Result<()> {
+                let mut command = command;
+                let mut buffer = Vec::new();
+                let mut chunk = [0_u8; 256];
+                loop {
+                    if sentinel_shutdown.load(Ordering::Relaxed) {
+                        anyhow::bail!(
+                            "native stream cleanup sentinel was stopped before acknowledging its command"
+                        );
+                    }
+                    match command.read(&mut chunk) {
+                        Ok(0) => thread::sleep(Duration::from_millis(10)),
+                        Ok(read) => {
+                            buffer.extend_from_slice(&chunk[..read]);
+                            if let Some(line_end) = buffer.iter().position(|byte| *byte == b'\n') {
+                                let line: Vec<u8> = buffer.drain(..=line_end).collect();
+                                if line[..line.len() - 1] != *expected_marker.as_bytes() {
+                                    anyhow::bail!(
+                                        "native stream cleanup sentinel received an unexpected command"
+                                    );
+                                }
+                                std::fs::write(
+                                    &acknowledgement_path,
+                                    format!("{expected_marker}\n"),
+                                )
+                                .with_context(|| {
+                                    format!(
+                                        "writing native stream fixture cleanup acknowledgement {}",
+                                        acknowledgement_path.display()
+                                    )
+                                })?;
+                                return Ok(());
+                            }
+                            if buffer.len() > expected_marker.len() {
+                                anyhow::bail!(
+                                    "native stream cleanup sentinel received an unterminated command"
+                                );
+                            }
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => {
+                            return Err(error)
+                                .context("reading native stream cleanup sentinel FIFO");
+                        }
+                    }
+                }
+            })();
+            let _ = result_sender.send(result);
+        });
+        Ok(NativeStreamSigtermCleanupSentinel {
+            shutdown,
+            result: result_receiver,
+        })
+    }
 
-        loop {
-            match std::fs::read_to_string(&cleanup.acknowledgement_path) {
-                Ok(acknowledgement) if acknowledgement.trim() == cleanup.token => return Ok(()),
-                Ok(acknowledgement) if !acknowledgement.trim().is_empty() => anyhow::bail!(
-                    "native stream fixture cleanup acknowledgement did not match its token"
-                ),
-                Ok(_) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "reading native stream fixture cleanup acknowledgement {}",
-                            cleanup.acknowledgement_path.display()
-                        )
-                    });
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    fn request_native_stream_sigterm_fixture_cleanup(
+        cleanup: &NativeStreamSigtermCleanupHandle,
+        sentinel: &NativeStreamSigtermCleanupSentinel,
+        deadline: Instant,
+    ) -> Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        // The test-owned sentinel opens its read endpoint before the fixture
+        // launches. A write-only descriptor therefore makes delivery
+        // unambiguous: this caller can never consume its own command.
+        let result = (|| -> Result<()> {
+            let mut command = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&cleanup.command_path)
+                .with_context(|| {
+                    format!(
+                        "opening native stream fixture cleanup FIFO {}",
+                        cleanup.command_path.display()
+                    )
+                })?;
+            writeln!(command, "{}", cleanup.token)
+                .context("writing native stream fixture cleanup command")?;
+            command
+                .flush()
+                .context("flushing native stream fixture cleanup command")?;
+
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or_default();
+            match sentinel.result.recv_timeout(remaining) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    return Err(error).context("native stream cleanup sentinel failed");
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    anyhow::bail!(
+                        "native stream cleanup sentinel did not acknowledge its durable command before the watchdog expired"
+                    );
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    anyhow::bail!(
+                        "native stream cleanup sentinel stopped before acknowledging its command"
+                    );
                 }
             }
-            if Instant::now() >= deadline {
-                anyhow::bail!(
-                    "native stream fixture did not acknowledge its durable cleanup command before the watchdog expired"
-                );
+
+            match std::fs::read_to_string(&cleanup.acknowledgement_path) {
+                Ok(acknowledgement) if acknowledgement.trim() == cleanup.token => Ok(()),
+                Ok(_) => anyhow::bail!(
+                    "native stream fixture cleanup acknowledgement did not match its token"
+                ),
+                Err(error) => Err(error).with_context(|| {
+                    format!(
+                        "reading native stream fixture cleanup acknowledgement {}",
+                        cleanup.acknowledgement_path.display()
+                    )
+                }),
             }
-            thread::sleep(Duration::from_millis(10));
+        })();
+        if result.is_err() {
+            sentinel.shutdown.store(true, Ordering::Relaxed);
         }
+        result
     }
 
     #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
     fn cleanup_native_stream_sigterm_fixtures(
         cleanup: &NativeStreamSigtermCleanupHandle,
+        sentinel: &NativeStreamSigtermCleanupSentinel,
+        fixture_cleanup: &mut NativeStreamSigtermFixtureCleanup,
         identities: Option<&[NativeStreamSigtermFixtureIdentity; 2]>,
     ) -> Vec<String> {
+        let mut failures = Vec::new();
+        if let Err(error) = request_native_stream_sigterm_fixture_cleanup(
+            cleanup,
+            sentinel,
+            Instant::now() + NATIVE_STREAM_SIGTERM_TEST_WATCHDOG,
+        ) {
+            failures.push(format!(
+                "failed to request durable native stream fixture cleanup: {error:#}"
+            ));
+        }
+
         let Some(identities) = identities else {
-            return match request_native_stream_sigterm_fixture_cleanup(
-                cleanup,
-                Instant::now() + NATIVE_STREAM_SIGTERM_TEST_WATCHDOG,
-            ) {
-                Ok(()) => vec![
-                    "cancelled native stream cleanup was acknowledged, but fixture identities were never captured; refusing to report PID-file absence as reaping"
-                        .into(),
-                ],
-                Err(error) => vec![format!(
-                    "cancelled native stream did not capture durable fixture identities and its cleanup sentinel was unavailable: {error:#}"
-                )],
-            };
+            if let Err(error) = request_native_stream_sigterm_fixture_group_cleanup(fixture_cleanup)
+            {
+                failures.push(format!(
+                    "failed to request fixture-local native stream process-group cleanup: {error:#}"
+                ));
+            }
+            failures.push(
+                "cancelled native stream cleanup was acknowledged, but fixture identities were never captured; refusing to report PID-file absence as reaping"
+                    .into(),
+            );
+            return failures;
         };
 
-        let mut failures = Vec::new();
         match native_stream_sigterm_fixture_states(identities) {
             Ok(states)
                 if states
@@ -4838,12 +5002,9 @@ while :; do sleep 1; done
             }
         }
 
-        if let Err(error) = request_native_stream_sigterm_fixture_cleanup(
-            cleanup,
-            Instant::now() + NATIVE_STREAM_SIGTERM_TEST_WATCHDOG,
-        ) {
+        if let Err(error) = request_native_stream_sigterm_fixture_group_cleanup(fixture_cleanup) {
             failures.push(format!(
-                "failed to request durable native stream fixture cleanup: {error:#}"
+                "failed to request fixture-local native stream process-group cleanup: {error:#}"
             ));
         }
 
@@ -4904,17 +5065,17 @@ while :; do sleep 1; done
 
         let temp_dir = tempfile::tempdir()?;
         let fake_harness = temp_dir.path().join("long-lived-stream");
-        let cleanup = create_native_stream_sigterm_cleanup_handle(temp_dir.path())?;
+        let (cleanup, mut fixture_cleanup) =
+            create_native_stream_sigterm_cleanup_handle(temp_dir.path())?;
         std::fs::write(
             &fake_harness,
             format!(
                 r#"#!/bin/sh
 (
-  exec 3<> cleanup.fifo
-  printf '%s\n' "{cleanup_token}" > cleanup.ready
+  exec 3< fixture-cleanup.fifo
+  printf '%s\n' "{cleanup_token}" > fixture-cleanup.ready
   while IFS= read -r cleanup_command <&3; do
     if [ "$cleanup_command" = "{cleanup_token}" ]; then
-      printf '%s\n' "$cleanup_command" > cleanup.ack
       kill -KILL 0
     fi
   done
@@ -4924,7 +5085,7 @@ sleep 120 </dev/null >/dev/null 2>&1 &
 printf '%s\n' "$!" > descendant.pid
 while :; do sleep 1; done
 "#,
-                cleanup_token = cleanup.token
+                cleanup_token = fixture_cleanup.token
             ),
         )?;
         let mut permissions = std::fs::metadata(&fake_harness)?.permissions();
@@ -4932,6 +5093,7 @@ while :; do sleep 1; done
         std::fs::set_permissions(&fake_harness, permissions)?;
 
         let lifecycle = Arc::new(SupervisedStreamCancellationTestObserver::arm()?);
+        let cleanup_sentinel = start_native_stream_sigterm_cleanup_sentinel(&cleanup)?;
         let signal_lifecycle = Arc::clone(&lifecycle);
         let runner_thread = unsafe { libc::pthread_self() } as usize;
         let signal_dir = temp_dir.path().to_path_buf();
@@ -4939,7 +5101,8 @@ while :; do sleep 1; done
         let signal_stream_finished = Arc::clone(&stream_finished);
         let fixture_identities = Arc::new(Mutex::new(None));
         let signal_fixture_identities = Arc::clone(&fixture_identities);
-        let signal_cleanup = cleanup.clone();
+        let signal_fixture_cleanup = fixture_cleanup.readiness_path.clone();
+        let signal_cleanup_token = fixture_cleanup.token.clone();
         let signaler = thread::spawn(move || -> Result<()> {
             let startup_deadline = Instant::now() + NATIVE_STREAM_SIGTERM_TEST_WATCHDOG;
             let mut last_readiness_error = None;
@@ -4966,20 +5129,26 @@ while :; do sleep 1; done
                             false
                         }
                     };
-                match native_stream_sigterm_fixture_sentinel_is_ready(&signal_cleanup) {
-                    Ok(true) if fixture_identities_ready => {
-                        match signal_lifecycle.send_sigterm_if_active(runner_thread) {
-                            // `send_sigterm_if_active` holds the lifecycle
-                            // lock across pthread_kill, excluding restoration.
-                            // The final runner error below proves consumption.
-                            Ok(true) => return Ok(()),
-                            Ok(false) => {}
-                            Err(error) => last_delivery_error = Some(format!("{error:#}")),
-                        }
-                    }
-                    Ok(_) => {}
+
+                let fixture_sentinel_ready = match native_stream_sigterm_fixture_sentinel_is_ready(
+                    &signal_fixture_cleanup,
+                    &signal_cleanup_token,
+                ) {
+                    Ok(ready) => ready,
                     Err(error) => {
                         last_readiness_error = Some(format!("{error:#}"));
+                        false
+                    }
+                };
+
+                if fixture_identities_ready && fixture_sentinel_ready {
+                    match signal_lifecycle.send_sigterm_if_active(runner_thread) {
+                        // `send_sigterm_if_active` holds the lifecycle lock
+                        // across pthread_kill, excluding restoration. The
+                        // final runner error below proves consumption.
+                        Ok(true) => return Ok(()),
+                        Ok(false) => {}
+                        Err(error) => last_delivery_error = Some(format!("{error:#}")),
                     }
                 }
                 if signal_stream_finished.load(Ordering::Relaxed) {
@@ -5044,8 +5213,12 @@ while :; do sleep 1; done
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        let mut failures =
-            cleanup_native_stream_sigterm_fixtures(&cleanup, captured_fixture_identities.as_ref());
+        let mut failures = cleanup_native_stream_sigterm_fixtures(
+            &cleanup,
+            &cleanup_sentinel,
+            &mut fixture_cleanup,
+            captured_fixture_identities.as_ref(),
+        );
         if let Err(error) = signal_result {
             failures.push(format!("native stream signal thread failed: {error:#}"));
         }
