@@ -45,7 +45,7 @@ GET /api/v1/health
     "sessionHandoff": true,
     "afs": true,
     "afsMount": false,
-    "afsCommit": false
+    "afsCommit": true
   },
   "daemon": {
     "pid": 31415,
@@ -94,16 +94,28 @@ diagnostic whose literal `v1` values are not proof of named-contract support.
 | `POST /api/v1/afs/sessions/:id/join` | Attach another actor to an existing session. |
 | `GET /api/v1/afs/sessions/:id/diff` | Read the session's change set against its base. |
 | `GET /api/v1/afs/sessions/:id/timeline` | Read recorded file operations, cursor-paginated. |
+| `POST /api/v1/afs/sessions/:id/commit` | Materialize the session's delta into a signed git branch. |
 | `POST /api/v1/afs/sessions/:id/discard` | Discard a session (requires `"confirm": true`). |
 
 Detailed shapes live in the [API reference](/reference/api).
 
 Agent-filesystem routes are gated by the `afs` capability, and are **same-user
 local IPC** operations for the same reason session handoff is: they expose a
-session's working tree. `afsMount` reports the mount backend or `false`, and
-`afsCommit` reports whether the daemon can materialize a delta into a git
-branch; both are `false` today, and `POST .../mount` and `POST .../commit`
-return `501` with `afs.mount_unsupported` / `afs.commit_unsupported` to match.
+session's working tree. `afsMount` reports the mount backend or `false` and is
+`false` today, so `POST .../mount` returns `501` with `afs.mount_unsupported`
+to match. `afsCommit` reports whether the daemon can materialize a delta into a
+git branch and is now `true`.
+
+Commit creates a git worktree at the session's `base_commit`, applies the
+change set, and produces a **signed** commit carrying `Coven-Session`,
+`Coven-Familiar`, `Coven-Bead`, and `Coven-Afs-Session` trailers. It does not
+push, open a PR, or run CI. Materialization is all-or-nothing: if the project
+root has moved off `base_commit` (`afs.base_diverged`), a path would escape the
+repository or write under `.git/` (`afs.path_outside_root`), a file exceeds the
+copy-up cap (`afs.copy_up_too_large`), the branch or worktree is taken
+(`afs.commit_conflict`), or signing is unavailable (`afs.commit_unsigned`), the
+attempt is rolled back and the delta is preserved unchanged. The delta survives
+a successful commit too — it is the audit record until an explicit discard.
 Design: [`specs/coven-agent-fs/DESIGN.md`](https://github.com/OpenCoven/coven/blob/main/specs/coven-agent-fs/DESIGN.md).
 
 Session handoff is a **same-user local IPC** operation. A companion must use a

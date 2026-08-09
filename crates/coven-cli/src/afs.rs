@@ -22,7 +22,10 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use coven_afs::{Actor, AgentFs, Change, OverlayFs, SessionBinding, STATE_DISCARDED, STATE_OPEN};
+use coven_afs::{
+    Actor, AgentFs, Change, ChangeSet, OverlayFs, SessionBinding, STATE_COMMITTED,
+    STATE_COMMITTING, STATE_DISCARDED, STATE_OPEN,
+};
 
 /// Bumped when the ingest filter changes, so bases built under the old rules
 /// are not silently reused for sessions expecting the new ones.
@@ -44,17 +47,39 @@ pub const COPY_UP_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Failures that map onto DESIGN.md §3.4's dotted error codes.
 ///
-/// Only the codes the implemented operations can actually raise live here.
-/// `afs.copy_up_too_large`, `afs.path_outside_root`, `afs.base_diverged`, and
-/// `afs.commit_conflict` arrive with commit materialization; defining them
-/// before anything can return them would advertise a contract the daemon does
-/// not yet honour.
+/// Only the codes the implemented operations can actually raise live here, so
+/// the enum never advertises a contract the daemon does not honour. The commit
+/// codes arrived with materialization (`coven-fty`).
 #[derive(Debug)]
 pub enum AfsError {
     SessionNotFound(String),
-    SessionNotOpen { id: String, state: String },
+    SessionNotOpen {
+        id: String,
+        state: String,
+    },
     NameInUse(String),
     ConfirmationRequired,
+    /// The project root moved off `base_commit` while the delta was open.
+    BaseDiverged {
+        expected: String,
+        found: String,
+    },
+    /// A delta path would materialize outside the repository root, under
+    /// `.git/`, or through a symlink whose target escapes.
+    PathOutsideRoot {
+        path: String,
+        reason: String,
+    },
+    /// A single file exceeds the configured copy-up cap.
+    CopyUpTooLarge {
+        path: String,
+        bytes: i64,
+    },
+    /// The target branch or worktree path is already taken.
+    CommitConflict(String),
+    /// Signing is required and unavailable; Coven never falls back to an
+    /// unsigned commit to make materialization land.
+    CommitUnsigned(String),
     Internal(anyhow::Error),
 }
 
@@ -81,6 +106,30 @@ impl AfsError {
                 400,
                 "invalid_request",
                 "Discard requires \"confirm\": true.".to_string(),
+            ),
+            Self::BaseDiverged { expected, found } => (
+                409,
+                "afs.base_diverged",
+                format!(
+                    "The project root is at {found}, not the delta's base {expected}. \
+                     The delta is preserved; rebase the base or commit onto a fresh worktree."
+                ),
+            ),
+            Self::PathOutsideRoot { path, reason } => (
+                400,
+                "afs.path_outside_root",
+                format!("Refusing to materialize {path}: {reason}."),
+            ),
+            Self::CopyUpTooLarge { path, bytes } => (
+                413,
+                "afs.copy_up_too_large",
+                format!("{path} is {bytes} bytes, over the {COPY_UP_MAX_BYTES}-byte copy-up cap."),
+            ),
+            Self::CommitConflict(message) => (409, "afs.commit_conflict", message.clone()),
+            Self::CommitUnsigned(message) => (
+                500,
+                "afs.commit_unsigned",
+                format!("Commit signing is required but unavailable: {message}"),
             ),
             Self::Internal(error) => (500, "afs.unavailable", error.to_string()),
         }
@@ -115,6 +164,32 @@ pub struct CreateRequest {
     pub bead_id: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitRequest {
+    /// Defaults to `afs/<session-name-or-id>` (DESIGN.md §5 step 3).
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+    /// Extra `Co-authored-by:` trailers, expected in the numeric-id no-reply
+    /// form `AGENTS.md` requires.
+    #[serde(default)]
+    pub co_authors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitView {
+    pub id: String,
+    pub branch: String,
+    pub commit: String,
+    pub worktree_path: String,
+    pub provenance_high_water: i64,
+    pub state: String,
+    pub counts: ChangeCounts,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -533,6 +608,524 @@ impl AfsStore {
         }
         Ok(())
     }
+
+    /// `afs.session.commit` — materialize the delta into a git branch
+    /// (DESIGN.md §5).
+    ///
+    /// Every check that can refuse the commit runs *before* the worktree is
+    /// created, so a refusal leaves no branch, no worktree, and no partially
+    /// applied delta. The delta itself survives materialization — it is the
+    /// audit record — until an explicit discard.
+    pub fn commit(&self, id: &str, request: &CommitRequest) -> AfsResult<CommitView> {
+        let binding = self.binding(id)?;
+        self.require_open(&binding)?;
+
+        let project_root = binding
+            .project_root
+            .as_deref()
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                AfsError::Internal(anyhow::anyhow!(
+                    "AFS session {id} has no bound project root"
+                ))
+            })?;
+
+        // §5.2 — verify the base first. Divergence preserves the delta.
+        let expected = binding.base_commit.clone().unwrap_or_default();
+        let found = git_head(&project_root).unwrap_or_default();
+        if expected.is_empty() || expected != found {
+            return Err(AfsError::BaseDiverged {
+                expected: if expected.is_empty() {
+                    "<unrecorded>".to_string()
+                } else {
+                    expected
+                },
+                found: if found.is_empty() {
+                    "<no HEAD>".to_string()
+                } else {
+                    found
+                },
+            });
+        }
+
+        // §5.4/§5.5 — resolve and validate the whole change set up front.
+        let overlay = self.open_overlay(id, &binding)?;
+        let set = overlay.change_set().map_err(AfsError::from)?;
+        let counts = ChangeCounts {
+            added: set.added,
+            modified: set.modified,
+            deleted: set.deleted,
+            bytes: set.bytes,
+        };
+        let plan = plan_materialization(&overlay, &set)?;
+        drop(overlay);
+
+        let branch = match &request.branch {
+            Some(branch) if !branch.trim().is_empty() => branch.trim().to_string(),
+            _ => format!(
+                "afs/{}",
+                binding.name.clone().unwrap_or_else(|| id.to_string())
+            ),
+        };
+        let worktree_path = project_root.join(".worktrees").join(worktree_slug(&branch));
+        if git_branch_exists(&project_root, &branch) {
+            return Err(AfsError::CommitConflict(format!(
+                "Branch {branch} already exists; pass an explicit branch."
+            )));
+        }
+        if worktree_path.exists() {
+            return Err(AfsError::CommitConflict(format!(
+                "Worktree path {} already exists.",
+                worktree_path.display()
+            )));
+        }
+
+        // §5.1 — quiesce only once nothing can still refuse.
+        let delta = self.open_delta(id)?;
+        let high_water = delta.provenance_high_water().map_err(AfsError::from)?;
+        delta
+            .set_session_state(&binding.id, STATE_COMMITTING)
+            .map_err(AfsError::from)?;
+        drop(delta);
+
+        let outcome = materialize(
+            &project_root,
+            &worktree_path,
+            &branch,
+            &plan,
+            &binding,
+            request,
+        );
+
+        let delta = self.open_delta(id)?;
+        match outcome {
+            Ok(sha) => {
+                delta
+                    .record_commit(
+                        &branch,
+                        Some(&sha),
+                        Some(&worktree_path.to_string_lossy()),
+                        STATE_COMMITTED,
+                    )
+                    .map_err(AfsError::from)?;
+                delta
+                    .set_session_state(&binding.id, STATE_COMMITTED)
+                    .map_err(AfsError::from)?;
+                Ok(CommitView {
+                    id: id.to_string(),
+                    branch,
+                    commit: sha,
+                    worktree_path: worktree_path.to_string_lossy().into_owned(),
+                    provenance_high_water: high_water,
+                    state: STATE_COMMITTED.to_string(),
+                    counts,
+                })
+            }
+            Err(error) => {
+                // Materialization is all-or-nothing: tear the attempt down and
+                // hand the session back in the state the caller found it.
+                cleanup_failed_materialization(&project_root, &worktree_path, &branch);
+                let _ = delta.record_commit(
+                    &branch,
+                    None,
+                    Some(&worktree_path.to_string_lossy()),
+                    "failed",
+                );
+                delta
+                    .set_session_state(&binding.id, STATE_OPEN)
+                    .map_err(AfsError::from)?;
+                Err(error)
+            }
+        }
+    }
+}
+
+// ---- commit materialization ---------------------------------------------
+
+/// One validated change, resolved to bytes before any host mutation happens.
+#[derive(Debug)]
+enum Planned {
+    File {
+        path: String,
+        data: Vec<u8>,
+        executable: bool,
+    },
+    Symlink {
+        path: String,
+        target: String,
+    },
+    Removal {
+        path: String,
+    },
+}
+
+impl Planned {
+    fn path(&self) -> &str {
+        match self {
+            Self::File { path, .. } | Self::Symlink { path, .. } | Self::Removal { path } => path,
+        }
+    }
+}
+
+/// Resolve the change set into a fully validated plan.
+///
+/// Reads content eagerly so a mid-apply read failure cannot leave a partially
+/// written branch, and refuses every escape DESIGN.md §5.5 names before the
+/// caller has created anything.
+fn plan_materialization(overlay: &OverlayFs, set: &ChangeSet) -> AfsResult<Vec<Planned>> {
+    let mut plan = Vec::with_capacity(set.entries.len());
+    for entry in &set.entries {
+        let path = coven_afs::normalize(&entry.path);
+        reject_escape(&path)?;
+
+        if matches!(entry.change, Change::Deleted) {
+            plan.push(Planned::Removal { path });
+            continue;
+        }
+
+        let meta = overlay.stat(&path).map_err(AfsError::from)?;
+        if meta.is_symlink() {
+            let target = overlay
+                .delta()
+                .read_link(&path)
+                .map_err(AfsError::from)
+                .or_else(|_| overlay.base().read_link(&path).map_err(AfsError::from))?;
+            if symlink_escapes(&path, &target) {
+                return Err(AfsError::PathOutsideRoot {
+                    path,
+                    reason: format!("its symlink target {target} resolves outside the root"),
+                });
+            }
+            plan.push(Planned::Symlink { path, target });
+            continue;
+        }
+        if meta.is_dir() {
+            // Directories materialize implicitly from their files; git does
+            // not track empty ones.
+            continue;
+        }
+
+        if entry.bytes > COPY_UP_MAX_BYTES as i64 {
+            return Err(AfsError::CopyUpTooLarge {
+                path,
+                bytes: entry.bytes,
+            });
+        }
+        let data = overlay.read_file(&path).map_err(AfsError::from)?;
+        if data.len() as u64 > COPY_UP_MAX_BYTES {
+            return Err(AfsError::CopyUpTooLarge {
+                path,
+                bytes: data.len() as i64,
+            });
+        }
+        plan.push(Planned::File {
+            path,
+            data,
+            executable: entry.mode.is_some_and(|mode| mode & 0o111 != 0),
+        });
+    }
+    Ok(plan)
+}
+
+/// Refuse anything that would leave the repository or touch git's own state.
+fn reject_escape(normalized: &str) -> AfsResult<()> {
+    if normalized == "/" {
+        return Err(AfsError::PathOutsideRoot {
+            path: normalized.to_string(),
+            reason: "the root itself is not a materializable path".to_string(),
+        });
+    }
+    let mut components = normalized.split('/').filter(|c| !c.is_empty());
+    if components.clone().any(|c| c == ".." || c == ".") {
+        return Err(AfsError::PathOutsideRoot {
+            path: normalized.to_string(),
+            reason: "it contains a relative component after normalization".to_string(),
+        });
+    }
+    if components.next() == Some(".git") {
+        return Err(AfsError::PathOutsideRoot {
+            path: normalized.to_string(),
+            reason: "writes under .git/ are never materialized".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Whether a symlink target leaves the root.
+///
+/// `path::normalize` clamps `..` at the root, so escape cannot be detected by
+/// normalizing — this walks the target without clamping instead. An absolute
+/// target escapes by construction: on the host it would point outside the
+/// worktree entirely.
+fn symlink_escapes(link_path: &str, target: &str) -> bool {
+    if target.starts_with('/') {
+        return true;
+    }
+    let mut depth = link_path.split('/').filter(|c| !c.is_empty()).count() as i64 - 1;
+    for component in target.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                depth -= 1;
+                if depth < 0 {
+                    return true;
+                }
+            }
+            _ => depth += 1,
+        }
+    }
+    false
+}
+
+/// `afs/my-session` → `afs-my-session`, so the worktree directory is flat.
+fn worktree_slug(branch: &str) -> String {
+    branch
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+fn git_branch_exists(project_root: &Path, branch: &str) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(format!("refs/heads/{branch}"))
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+/// Create the worktree, apply the plan, and produce a signed commit.
+fn materialize(
+    project_root: &Path,
+    worktree_path: &Path,
+    branch: &str,
+    plan: &[Planned],
+    binding: &SessionBinding,
+    request: &CommitRequest,
+) -> AfsResult<String> {
+    let base = binding.base_commit.clone().unwrap_or_default();
+    let add = std::process::Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["worktree", "add", "-b", branch])
+        .arg(worktree_path)
+        .arg(&base)
+        .output()
+        .context("failed to run git worktree add")
+        .map_err(AfsError::from)?;
+    if !add.status.success() {
+        return Err(AfsError::Internal(anyhow::anyhow!(
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&add.stderr).trim()
+        )));
+    }
+
+    apply_plan(worktree_path, plan)?;
+
+    let stage = std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["add", "--all"])
+        .output()
+        .context("failed to stage materialized changes")
+        .map_err(AfsError::from)?;
+    if !stage.status.success() {
+        return Err(AfsError::Internal(anyhow::anyhow!(
+            "git add failed: {}",
+            String::from_utf8_lossy(&stage.stderr).trim()
+        )));
+    }
+
+    // §5.6 — signed, always. A signing failure is surfaced, never worked
+    // around by dropping -S.
+    let commit = std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args([
+            "commit",
+            "-S",
+            "-s",
+            "-m",
+            &commit_message(binding, request),
+        ])
+        .output()
+        .context("failed to run git commit")
+        .map_err(AfsError::from)?;
+    if !commit.status.success() {
+        let stderr = String::from_utf8_lossy(&commit.stderr).to_string();
+        let combined = format!("{stderr}{}", String::from_utf8_lossy(&commit.stdout));
+        if looks_like_signing_failure(&combined) {
+            return Err(AfsError::CommitUnsigned(stderr.trim().to_string()));
+        }
+        return Err(AfsError::Internal(anyhow::anyhow!(
+            "git commit failed: {}",
+            stderr.trim()
+        )));
+    }
+
+    let sha = std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .context("failed to read the materialized commit")
+        .map_err(AfsError::from)?;
+    Ok(String::from_utf8_lossy(&sha.stdout).trim().to_string())
+}
+
+fn apply_plan(worktree_path: &Path, plan: &[Planned]) -> AfsResult<()> {
+    for item in plan {
+        // Paths are already normalized and escape-checked; strip the leading
+        // slash so they join relative to the worktree.
+        let relative = item.path().trim_start_matches('/');
+        let host = worktree_path.join(relative);
+        match item {
+            Planned::Removal { .. } => {
+                if host.exists() {
+                    std::fs::remove_file(&host)
+                        .with_context(|| format!("failed to remove {}", host.display()))
+                        .map_err(AfsError::from)?;
+                }
+            }
+            Planned::File {
+                data, executable, ..
+            } => {
+                if let Some(parent) = host.parent() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("failed to create {}", parent.display()))
+                        .map_err(AfsError::from)?;
+                }
+                std::fs::write(&host, data)
+                    .with_context(|| format!("failed to write {}", host.display()))
+                    .map_err(AfsError::from)?;
+                set_executable(&host, *executable)?;
+            }
+            Planned::Symlink { target, .. } => {
+                if let Some(parent) = host.parent() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("failed to create {}", parent.display()))
+                        .map_err(AfsError::from)?;
+                }
+                create_symlink(target, &host)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Only the executable bit crosses over; AFS mode bits are not a git concept.
+#[cfg(unix)]
+fn set_executable(path: &Path, executable: bool) -> AfsResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)
+        .with_context(|| format!("failed to stat {}", path.display()))
+        .map_err(AfsError::from)?
+        .permissions();
+    let mode = perms.mode();
+    perms.set_mode(if executable {
+        mode | 0o111
+    } else {
+        mode & !0o111
+    });
+    std::fs::set_permissions(path, perms)
+        .with_context(|| format!("failed to set permissions on {}", path.display()))
+        .map_err(AfsError::from)
+}
+
+#[cfg(not(unix))]
+fn set_executable(_path: &Path, _executable: bool) -> AfsResult<()> {
+    // Windows has no executable bit; git records mode 100644 there anyway.
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_symlink(target: &str, host: &Path) -> AfsResult<()> {
+    std::os::unix::fs::symlink(target, host)
+        .with_context(|| format!("failed to create symlink {}", host.display()))
+        .map_err(AfsError::from)
+}
+
+#[cfg(not(unix))]
+fn create_symlink(_target: &str, host: &Path) -> AfsResult<()> {
+    Err(AfsError::Internal(anyhow::anyhow!(
+        "cannot materialize the symlink {} on this platform",
+        host.display()
+    )))
+}
+
+/// git reports signing trouble on stderr with no distinguishing exit code.
+fn looks_like_signing_failure(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    [
+        "gpg failed to sign",
+        "failed to write commit object",
+        "secret key not available",
+        "no secret key",
+        "signing failed",
+        "unable to sign",
+        "user.signingkey",
+        "no openpgp signing key",
+        "cannot run gpg",
+        "gpg: skipped",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+/// §5.7 — trailers carry the provenance a plain branch would lose.
+fn commit_message(binding: &SessionBinding, request: &CommitRequest) -> String {
+    let subject = match &request.message {
+        Some(message) if !message.trim().is_empty() => message.trim().to_string(),
+        _ => format!(
+            "afs: materialize {}",
+            binding.name.clone().unwrap_or_else(|| binding.id.clone())
+        ),
+    };
+    let mut message = subject;
+    message.push_str("\n\n");
+    if let Some(session) = &binding.coven_session_id {
+        message.push_str(&format!("Coven-Session: {session}\n"));
+    }
+    if let Some(familiar) = &binding.familiar_id {
+        message.push_str(&format!("Coven-Familiar: {familiar}\n"));
+    }
+    if let Some(bead) = &binding.bead_id {
+        message.push_str(&format!("Coven-Bead: {bead}\n"));
+    }
+    message.push_str(&format!("Coven-Afs-Session: {}\n", binding.id));
+    for author in &request.co_authors {
+        let author = author.trim();
+        if !author.is_empty() {
+            message.push_str(&format!("Co-authored-by: {author}\n"));
+        }
+    }
+    message
+}
+
+/// Best-effort teardown. Any failure here is already secondary to the error
+/// being reported, so it must not mask it.
+fn cleanup_failed_materialization(project_root: &Path, worktree_path: &Path, branch: &str) {
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["worktree", "remove", "--force"])
+        .arg(worktree_path)
+        .output();
+    if worktree_path.exists() {
+        let _ = std::fs::remove_dir_all(worktree_path);
+    }
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["worktree", "prune"])
+        .output();
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["branch", "-D", branch])
+        .output();
 }
 
 // ---- base ingest --------------------------------------------------------
@@ -665,6 +1258,307 @@ mod tests {
                 ..Default::default()
             })
             .unwrap()
+    }
+
+    // ---- commit fixtures ------------------------------------------------
+
+    /// Numeric-id no-reply form, as `AGENTS.md` requires of attribution.
+    const CO_AUTHOR: &str = "Ada <1+ada@users.noreply.github.com>";
+
+    fn git_ok(root: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap_or_else(|error| panic!("git {args:?} could not run: {error}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn signing_key(dir: &Path) -> PathBuf {
+        let key = dir.join("signing_key");
+        let output = std::process::Command::new("ssh-keygen")
+            .args(["-t", "ed25519", "-N", "", "-q", "-f"])
+            .arg(&key)
+            .output()
+            .expect("ssh-keygen is required to test commit signing");
+        assert!(
+            output.status.success(),
+            "ssh-keygen failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        key
+    }
+
+    /// A git project root whose signing configuration is set **locally**, so
+    /// the test never inherits (or depends on) the developer's global key.
+    fn git_project(dir: &Path, key: &Path) -> PathBuf {
+        let root = dir.join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), b"fn main() {}").unwrap();
+        std::fs::write(root.join("README.md"), b"# project").unwrap();
+        git_ok(&root, &["init", "-q", "-b", "main"]);
+        git_ok(&root, &["config", "user.email", "afs@example.test"]);
+        git_ok(&root, &["config", "user.name", "AFS Test"]);
+        git_ok(&root, &["config", "gpg.format", "ssh"]);
+        git_ok(
+            &root,
+            &["config", "user.signingkey", &key.to_string_lossy()],
+        );
+        git_ok(&root, &["add", "--all"]);
+        git_ok(&root, &["commit", "--no-gpg-sign", "-q", "-m", "base"]);
+        root
+    }
+
+    fn delta_write(store: &AfsStore, id: &str, path: &str, data: &[u8]) {
+        let mut fs = store.open_delta(id).unwrap();
+        fs.write_file(path, data).unwrap();
+    }
+
+    fn delta_symlink(store: &AfsStore, id: &str, target: &str, link: &str) {
+        let mut fs = store.open_delta(id).unwrap();
+        fs.symlink(target, link).unwrap();
+    }
+
+    fn commit_err(store: &AfsStore, id: &str) -> AfsError {
+        store
+            .commit(id, &CommitRequest::default())
+            .expect_err("commit should have been refused")
+    }
+
+    #[test]
+    fn commit_materializes_a_signed_branch_carrying_provenance_trailers() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = signing_key(dir.path());
+        let root = git_project(dir.path(), &key);
+        let store = store(dir.path());
+        let view = create(&store, &root);
+
+        delta_write(&store, &view.id, "/src/added.rs", b"// new");
+        delta_write(&store, &view.id, "/README.md", b"# changed");
+
+        let committed = store
+            .commit(
+                &view.id,
+                &CommitRequest {
+                    message: Some("afs: land the delta".into()),
+                    co_authors: vec![CO_AUTHOR.to_string()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(committed.state, STATE_COMMITTED);
+        assert_eq!(committed.branch, format!("afs/{}", view.id));
+        assert!(!committed.commit.is_empty());
+
+        // The commit object itself must carry a signature: signing is not
+        // something materialization is allowed to skip.
+        let object = git_ok(&root, &["cat-file", "commit", &committed.commit]);
+        assert!(object.contains("gpgsig"), "commit must be signed: {object}");
+
+        let message = git_ok(&root, &["log", "-1", "--format=%B", &committed.commit]);
+        assert!(message.contains("afs: land the delta"));
+        assert!(message.contains(&format!("Coven-Afs-Session: {}", view.id)));
+        assert!(message.contains("Coven-Bead: coven-5kt"));
+        assert!(message.contains(&format!("Co-authored-by: {CO_AUTHOR}")));
+
+        // The change set is on the branch, not merely staged somewhere.
+        let added = git_ok(
+            &root,
+            &["show", &format!("{}:src/added.rs", committed.commit)],
+        );
+        assert_eq!(added, "// new");
+        let changed = git_ok(&root, &["show", &format!("{}:README.md", committed.commit)]);
+        assert_eq!(changed, "# changed");
+
+        // §5.8 — the delta survives commit; it is the audit record.
+        let after = store.get(&view.id).unwrap();
+        assert_eq!(after.state, STATE_COMMITTED);
+        let delta = store.open_delta(&view.id).unwrap();
+        let commits = delta.commits().unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].state, STATE_COMMITTED);
+        assert_eq!(
+            commits[0].commit_sha.as_deref(),
+            Some(committed.commit.as_str())
+        );
+        assert_eq!(
+            commits[0].provenance_high_water,
+            committed.provenance_high_water
+        );
+    }
+
+    #[test]
+    fn commit_refuses_a_diverged_base_and_preserves_the_delta() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = signing_key(dir.path());
+        let root = git_project(dir.path(), &key);
+        let store = store(dir.path());
+        let view = create(&store, &root);
+        delta_write(&store, &view.id, "/src/added.rs", b"// new");
+
+        // The project root moves off the recorded base.
+        std::fs::write(root.join("drift.txt"), b"drift").unwrap();
+        git_ok(&root, &["add", "--all"]);
+        git_ok(&root, &["commit", "--no-gpg-sign", "-q", "-m", "drift"]);
+
+        let error = commit_err(&store, &view.id);
+        let (status, code, _) = error.parts();
+        assert_eq!(status, 409);
+        assert_eq!(code, "afs.base_diverged");
+
+        // Preserved, not discarded, and still open for a retry after a rebase.
+        assert_eq!(store.get(&view.id).unwrap().state, STATE_OPEN);
+        assert_eq!(store.diff(&view.id).unwrap().counts.added, 1);
+    }
+
+    #[test]
+    fn commit_refuses_writes_under_git_and_leaves_no_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = signing_key(dir.path());
+        let root = git_project(dir.path(), &key);
+        let store = store(dir.path());
+        let view = create(&store, &root);
+        delta_write(&store, &view.id, "/.git/config", b"[core]\n");
+
+        let error = commit_err(&store, &view.id);
+        let (status, code, _) = error.parts();
+        assert_eq!(status, 400);
+        assert_eq!(code, "afs.path_outside_root");
+
+        // Refusal happens before anything is created.
+        assert!(!git_branch_exists(&root, &format!("afs/{}", view.id)));
+        assert!(!root.join(".worktrees").exists());
+        assert_eq!(store.get(&view.id).unwrap().state, STATE_OPEN);
+    }
+
+    #[test]
+    fn commit_refuses_a_symlink_whose_target_escapes_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = signing_key(dir.path());
+        let root = git_project(dir.path(), &key);
+        let store = store(dir.path());
+        let view = create(&store, &root);
+        delta_symlink(&store, &view.id, "../../../../etc/passwd", "/src/escape");
+
+        let error = commit_err(&store, &view.id);
+        let (_, code, message) = error.parts();
+        assert_eq!(code, "afs.path_outside_root");
+        assert!(message.contains("symlink target"), "{message}");
+        assert!(!git_branch_exists(&root, &format!("afs/{}", view.id)));
+    }
+
+    #[test]
+    fn commit_refuses_a_file_over_the_copy_up_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = signing_key(dir.path());
+        let root = git_project(dir.path(), &key);
+        let store = store(dir.path());
+        let view = create(&store, &root);
+        let oversized = vec![b'x'; COPY_UP_MAX_BYTES as usize + 1];
+        delta_write(&store, &view.id, "/src/huge.bin", &oversized);
+
+        let error = commit_err(&store, &view.id);
+        let (status, code, _) = error.parts();
+        assert_eq!(status, 413);
+        assert_eq!(code, "afs.copy_up_too_large");
+        assert!(!git_branch_exists(&root, &format!("afs/{}", view.id)));
+    }
+
+    #[test]
+    fn commit_refuses_a_branch_that_already_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = signing_key(dir.path());
+        let root = git_project(dir.path(), &key);
+        let store = store(dir.path());
+        let view = create(&store, &root);
+        delta_write(&store, &view.id, "/src/added.rs", b"// new");
+        git_ok(&root, &["branch", &format!("afs/{}", view.id)]);
+
+        let error = commit_err(&store, &view.id);
+        let (status, code, _) = error.parts();
+        assert_eq!(status, 409);
+        assert_eq!(code, "afs.commit_conflict");
+        assert_eq!(store.get(&view.id).unwrap().state, STATE_OPEN);
+    }
+
+    #[test]
+    fn commit_reports_unsigned_and_rolls_the_attempt_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = signing_key(dir.path());
+        let root = git_project(dir.path(), &key);
+        // Point signing at a key that does not exist: git will refuse to
+        // produce the object, and Coven must not fall back to unsigned.
+        git_ok(
+            &root,
+            &[
+                "config",
+                "user.signingkey",
+                &dir.path().join("missing_key").to_string_lossy(),
+            ],
+        );
+        let store = store(dir.path());
+        let view = create(&store, &root);
+        delta_write(&store, &view.id, "/src/added.rs", b"// new");
+
+        let error = commit_err(&store, &view.id);
+        let (status, code, _) = error.parts();
+        assert_eq!(status, 500);
+        assert_eq!(code, "afs.commit_unsigned");
+
+        // All-or-nothing: no branch, no worktree, and the session is handed
+        // back exactly as the caller found it.
+        let branch = format!("afs/{}", view.id);
+        assert!(
+            !git_branch_exists(&root, &branch),
+            "branch must be torn down"
+        );
+        assert!(
+            !root
+                .join(".worktrees")
+                .join(worktree_slug(&branch))
+                .exists(),
+            "worktree must be torn down"
+        );
+        assert_eq!(store.get(&view.id).unwrap().state, STATE_OPEN);
+        assert_eq!(store.diff(&view.id).unwrap().counts.added, 1);
+
+        // The failed attempt is still recorded, so the audit shows it.
+        let delta = store.open_delta(&view.id).unwrap();
+        let commits = delta.commits().unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].state, "failed");
+        assert!(commits[0].commit_sha.is_none());
+    }
+
+    #[test]
+    fn symlink_escape_detection_is_lexical_and_unclamped() {
+        // `normalize` clamps `..` at the root, so escape has to be judged
+        // without it — these are the cases that clamping would hide.
+        assert!(symlink_escapes("/a/link", "../../etc/passwd"));
+        assert!(symlink_escapes("/link", "../outside"));
+        assert!(symlink_escapes("/a/link", "/etc/passwd"));
+        assert!(!symlink_escapes("/a/link", "sibling"));
+        assert!(!symlink_escapes("/a/b/link", "../c"));
+        assert!(!symlink_escapes("/a/b/link", "../../a/c"));
+    }
+
+    #[test]
+    fn escape_rejection_covers_git_and_the_root_itself() {
+        assert!(reject_escape("/src/main.rs").is_ok());
+        assert!(
+            reject_escape("/.gitignore").is_ok(),
+            "only .git/ is refused"
+        );
+        assert!(reject_escape("/").is_err());
+        assert!(reject_escape("/.git/config").is_err());
+        assert!(reject_escape("/.git").is_err());
     }
 
     #[test]
