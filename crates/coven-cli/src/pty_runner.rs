@@ -4700,6 +4700,7 @@ while :; do sleep 1; done
     struct NativeStreamSigtermCleanupHandle {
         command_path: PathBuf,
         acknowledgement_path: PathBuf,
+        sentinel_readiness_path: PathBuf,
         token: String,
     }
 
@@ -4722,8 +4723,29 @@ while :; do sleep 1; done
         Ok(NativeStreamSigtermCleanupHandle {
             command_path,
             acknowledgement_path: fixture_dir.join("cleanup.ack"),
+            sentinel_readiness_path: fixture_dir.join("cleanup.ready"),
             token: format!("coven-native-stream-sigterm-{}", uuid::Uuid::new_v4()),
         })
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    fn native_stream_sigterm_fixture_sentinel_is_ready(
+        cleanup: &NativeStreamSigtermCleanupHandle,
+    ) -> Result<bool> {
+        match std::fs::read_to_string(&cleanup.sentinel_readiness_path) {
+            Ok(readiness) if readiness.trim() == cleanup.token => Ok(true),
+            Ok(readiness) if readiness.trim().is_empty() => Ok(false),
+            Ok(_) => anyhow::bail!(
+                "native stream fixture cleanup sentinel readiness did not match its token"
+            ),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error).with_context(|| {
+                format!(
+                    "reading native stream fixture cleanup sentinel readiness {}",
+                    cleanup.sentinel_readiness_path.display()
+                )
+            }),
+        }
     }
 
     #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
@@ -4889,6 +4911,7 @@ while :; do sleep 1; done
                 r#"#!/bin/sh
 (
   exec 3<> cleanup.fifo
+  printf '%s\n' "{cleanup_token}" > cleanup.ready
   while IFS= read -r cleanup_command <&3; do
     if [ "$cleanup_command" = "{cleanup_token}" ]; then
       printf '%s\n' "$cleanup_command" > cleanup.ack
@@ -4928,11 +4951,23 @@ while :; do sleep 1; done
                     );
                 }
 
-                match native_stream_sigterm_fixture_identities(&signal_dir) {
-                    Ok(Some(identities)) => {
-                        *signal_fixture_identities
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(identities);
+                let fixture_identities_ready =
+                    match native_stream_sigterm_fixture_identities(&signal_dir) {
+                        Ok(Some(identities)) => {
+                            *signal_fixture_identities
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                Some(identities);
+                            true
+                        }
+                        Ok(None) => false,
+                        Err(error) => {
+                            last_readiness_error = Some(format!("{error:#}"));
+                            false
+                        }
+                    };
+                match native_stream_sigterm_fixture_sentinel_is_ready(&signal_cleanup) {
+                    Ok(true) if fixture_identities_ready => {
                         match signal_lifecycle.send_sigterm_if_active(runner_thread) {
                             // `send_sigterm_if_active` holds the lifecycle
                             // lock across pthread_kill, excluding restoration.
@@ -4942,7 +4977,7 @@ while :; do sleep 1; done
                             Err(error) => last_delivery_error = Some(format!("{error:#}")),
                         }
                     }
-                    Ok(None) => {}
+                    Ok(_) => {}
                     Err(error) => {
                         last_readiness_error = Some(format!("{error:#}"));
                     }
@@ -4953,15 +4988,27 @@ while :; do sleep 1; done
                     );
                 }
                 if Instant::now() >= startup_deadline {
-                    // This is a failure-only escape hatch. It intentionally
-                    // does not use pthread_kill without both prerequisites;
-                    // the fixture's own FIFO sentinel kills only its group.
-                    let cleanup_result = request_native_stream_sigterm_fixture_cleanup(
-                        &signal_cleanup,
-                        Instant::now() + NATIVE_STREAM_SIGTERM_TEST_WATCHDOG,
-                    );
+                    // Reuse the owner-verified lifecycle path: its mutex keeps
+                    // handler restoration out of the thread-directed delivery.
+                    let fallback_delivery = match signal_lifecycle
+                        .send_sigterm_if_active(runner_thread)
+                    {
+                        Ok(true) => {
+                            "sent lifecycle-verified SIGTERM cancellation to the stream runner"
+                                .to_string()
+                        }
+                        Ok(false) => {
+                            "did not signal because the cancellation lifecycle was already inactive"
+                                .to_string()
+                        }
+                        Err(error) => {
+                            format!(
+                                "failed to send lifecycle-verified SIGTERM cancellation: {error:#}"
+                            )
+                        }
+                    };
                     anyhow::bail!(
-                        "native stream fixture and cancellation handler did not become ready together before the startup watchdog expired; no SIGTERM was sent{}{}; durable fixture cleanup {}",
+                        "native stream fixture-start failure: the fixture, cleanup sentinel, and cancellation handler did not become ready together before the startup watchdog expired{}{}; fallback {}",
                         last_readiness_error
                             .as_deref()
                             .map(|error| format!("; last readiness error: {error}"))
@@ -4970,10 +5017,7 @@ while :; do sleep 1; done
                             .as_deref()
                             .map(|error| format!("; last delivery error: {error}"))
                             .unwrap_or_default(),
-                        match cleanup_result {
-                            Ok(()) => "was acknowledged".to_string(),
-                            Err(error) => format!("failed: {error:#}"),
-                        }
+                        fallback_delivery,
                     );
                 }
                 thread::sleep(Duration::from_millis(10));
