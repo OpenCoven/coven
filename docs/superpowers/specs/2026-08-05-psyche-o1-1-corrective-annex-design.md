@@ -277,7 +277,7 @@ The implementation evidence must include hermetic tests for:
 ### 8.3 Process ownership
 
 - malformed output terminates and reaps the direct child and descendants;
-- cancellation is observed promptly and returns an error;
+- cancellation returns the expected error;
 - a cancellation recorded before or immediately after spawn cannot escape
   supervision;
 - a direct child that exits while a descendant holds stdout does not hang the

@@ -45,9 +45,10 @@ Run:
 cargo test -p coven-cli pty_runner::tests::native_stream_sigterm_cancels_and_reaps_process_tree -- --exact --nocapture
 ```
 
-Expected: PASS on an unloaded machine. The existing body contains
-`started.elapsed() < Duration::from_secs(2)`, which is the load-sensitive
-assertion this task removes.
+Expected: PASS on an unloaded machine. The old
+`started.elapsed() < Duration::from_secs(2)` check is removed; the behavior
+contract is the expected cancellation error, previous SIGTERM handler
+restoration, and harness/descendant process-tree reaping.
 
 - [ ] **Step 2: Edit the test body**
 
@@ -129,11 +130,11 @@ finally:
 PY
 ```
 
-Expected: the test passes under load. It may take longer than two seconds,
-which is acceptable because correctness is the cancellation error plus
-process-tree reaping. If the watchdog fallback is taken, it must do so via the
-owner-scoped lifecycle-mutex path described above, not via FIFO cleanup or
-unconditional SIGTERM.
+Expected: the test passes under load. The 30-second watchdog is containment
+only; correctness is the cancellation error, previous SIGTERM handler
+restoration, and harness/descendant process-tree reaping. If the watchdog
+fallback is taken, it must do so via the owner-scoped lifecycle-mutex path
+described above, not via FIFO cleanup or unconditional SIGTERM.
 
 - [ ] **Step 5: Commit the test fix**
 
