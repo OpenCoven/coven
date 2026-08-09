@@ -430,9 +430,88 @@ static SUPERVISED_STREAM_CANCELLATION_SIGNAL: AtomicI32 = AtomicI32::new(0);
 #[cfg(unix)]
 static SUPERVISED_STREAM_CANCELLATION_LOCK: Mutex<()> = Mutex::new(());
 
+#[cfg(all(test, unix))]
+#[derive(Default)]
+struct SupervisedStreamCancellationTestState {
+    armed_thread: Option<thread::ThreadId>,
+    handler_active: bool,
+}
+
+#[cfg(all(test, unix))]
+static SUPERVISED_STREAM_CANCELLATION_TEST_STATE: Mutex<SupervisedStreamCancellationTestState> =
+    Mutex::new(SupervisedStreamCancellationTestState {
+        armed_thread: None,
+        handler_active: false,
+    });
+
 #[cfg(unix)]
 extern "C" fn cancel_supervised_stream(signal: libc::c_int) {
     SUPERVISED_STREAM_CANCELLATION_SIGNAL.store(signal, Ordering::Relaxed);
+}
+
+#[cfg(all(test, unix))]
+fn arm_supervised_stream_cancellation_test_signal() {
+    let mut state = SUPERVISED_STREAM_CANCELLATION_TEST_STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(
+        state.armed_thread.is_none(),
+        "another supervised-stream cancellation test is already armed"
+    );
+    state.armed_thread = Some(thread::current().id());
+}
+
+#[cfg(all(test, unix))]
+fn disarm_supervised_stream_cancellation_test_signal() {
+    let mut state = SUPERVISED_STREAM_CANCELLATION_TEST_STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(
+        !state.handler_active,
+        "supervised-stream cancellation handler remained active after the runner returned"
+    );
+    state.armed_thread = None;
+}
+
+#[cfg(all(test, unix))]
+fn activate_supervised_stream_cancellation_test_signal() {
+    let mut state = SUPERVISED_STREAM_CANCELLATION_TEST_STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if state.armed_thread == Some(thread::current().id()) {
+        state.handler_active = true;
+    }
+}
+
+#[cfg(all(test, unix))]
+fn deactivate_supervised_stream_cancellation_test_signal() {
+    let mut state = SUPERVISED_STREAM_CANCELLATION_TEST_STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if state.armed_thread == Some(thread::current().id()) {
+        state.handler_active = false;
+    }
+}
+
+#[cfg(all(test, unix))]
+fn signal_active_supervised_stream_cancellation_test() -> Result<()> {
+    let state = SUPERVISED_STREAM_CANCELLATION_TEST_STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !state.handler_active {
+        anyhow::bail!("native stream SIGTERM handler was not active");
+    }
+    let sent = unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+    if sent != 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to signal test process");
+    }
+    // Keep the handler installed until it records the signal; otherwise a
+    // pending process-wide SIGTERM could run after the prior handler returns.
+    while SUPERVISED_STREAM_CANCELLATION_SIGNAL.load(Ordering::Relaxed) != libc::SIGTERM {
+        thread::yield_now();
+    }
+    drop(state);
+    Ok(())
 }
 
 /// Temporarily converts TERM/INT/HUP into a supervised bridge cancellation.
@@ -587,10 +666,14 @@ impl SupervisedStreamCancellationGuard {
         self.signal_mask
             .unblock_supervisor()
             .context("failed to unblock supervised stream cancellation signals")?;
+        #[cfg(test)]
+        activate_supervised_stream_cancellation_test_signal();
         Ok(self.cancelled_signal())
     }
 
     fn finish(mut self) -> Result<Option<libc::c_int>> {
+        #[cfg(test)]
+        deactivate_supervised_stream_cancellation_test_signal();
         self.signal_mask
             .reblock()
             .context("failed to re-block supervised stream cancellation signals")?;
@@ -624,6 +707,8 @@ impl Drop for SupervisedStreamCancellationGuard {
         if !self.active {
             return;
         }
+        #[cfg(test)]
+        deactivate_supervised_stream_cancellation_test_signal();
         let _ = self.signal_mask.reblock();
         // SAFETY: every entry was captured from a successful sigaction call
         // in install. Restoring it here makes the scope transparent once the
@@ -4370,25 +4455,29 @@ while :; do sleep 1; done
         permissions.set_mode(0o755);
         std::fs::set_permissions(&fake_harness, permissions)?;
 
+        arm_supervised_stream_cancellation_test_signal();
         let signal_dir = temp_dir.path().to_path_buf();
-        let signaler = thread::spawn(move || {
+        let signaler = thread::spawn(move || -> Result<()> {
             let deadline = Instant::now() + watchdog;
-            while Instant::now() < deadline {
+            let fixture_started = loop {
                 if signal_dir.join("harness.pid").exists()
                     && signal_dir.join("descendant.pid").exists()
                 {
-                    let sent = unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
-                    assert_eq!(sent, 0, "failed to signal test process");
-                    return;
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
                 }
                 thread::sleep(Duration::from_millis(10));
+            };
+            signal_active_supervised_stream_cancellation_test()?;
+            if !fixture_started {
+                anyhow::bail!("native stream fixture did not start before the 30-second watchdog");
             }
-            let sent = unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
-            assert_eq!(sent, 0, "failed to signal test process");
-            panic!("native stream fixture did not start before signal deadline");
+            Ok(())
         });
 
-        let error = stream_harness_with_program(
+        let stream_result = stream_harness_with_program(
             fake_harness.to_str().unwrap(),
             temp_dir.path(),
             Vec::new(),
@@ -4396,9 +4485,14 @@ while :; do sleep 1; done
             "streamy",
             "ledger-current",
             &mut Vec::new(),
-        )
-        .expect_err("SIGTERM must cancel a native stream");
-        signaler.join().expect("signal thread panicked");
+        );
+        let signal_result = match signaler.join() {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!("native stream signal thread panicked")),
+        };
+        disarm_supervised_stream_cancellation_test_signal();
+        signal_result?;
+        let error = stream_result.expect_err("SIGTERM must cancel a native stream");
         assert!(
             format!("{error:#}").contains("streamy native stream cancelled by SIGTERM"),
             "unexpected cancellation error: {error:#}"
@@ -4417,28 +4511,76 @@ while :; do sleep 1; done
             "native stream runner did not restore the previous SIGTERM handler"
         );
 
+        let mut failures = Vec::new();
+        let mut fixtures = Vec::new();
         for (label, path) in [
             ("harness", harness_pid_file),
             ("descendant", descendant_pid_file),
         ] {
-            let pid: libc::pid_t = std::fs::read_to_string(path)?.trim().parse()?;
-            let deadline = Instant::now() + watchdog;
-            let mut reaped = false;
-            while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+            match std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {label} PID file {}", path.display()))
+                .and_then(|contents| {
+                    contents
+                        .trim()
+                        .parse::<libc::pid_t>()
+                        .context("parsing fixture PID")
+                }) {
+                Ok(pid) if pid > 0 => fixtures.push((label, pid, false)),
+                Ok(pid) => failures.push(format!("{label} fixture recorded invalid PID {pid}")),
+                Err(error) => failures.push(format!("{label} fixture PID unavailable: {error:#}")),
+            }
+        }
+        let is_reaped = |pid: libc::pid_t| {
+            (unsafe { libc::kill(pid, 0) }) == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        };
+        let reaping_deadline = Instant::now() + watchdog;
+        while fixtures.iter().any(|(_, _, reaped)| !reaped) && Instant::now() < reaping_deadline {
+            for (_, pid, reaped) in &mut fixtures {
+                *reaped = is_reaped(*pid);
+            }
+            if fixtures.iter().any(|(_, _, reaped)| !reaped) {
                 thread::sleep(Duration::from_millis(10));
             }
-            if unsafe { libc::kill(pid, 0) } == -1
-                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-            {
-                reaped = true;
-            }
-            if !reaped {
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
-                    libc::waitpid(pid, std::ptr::null_mut(), 0);
+        }
+
+        for (label, pid, reaped) in &mut fixtures {
+            if !*reaped {
+                failures.push(format!(
+                    "cancelled native stream left {label} {pid} unreaped before cleanup"
+                ));
+                let killed = unsafe { libc::kill(*pid, libc::SIGKILL) };
+                if killed == -1 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::ESRCH) {
+                        *reaped = true;
+                    } else {
+                        failures.push(format!(
+                            "failed to clean up unreaped {label} {pid} with SIGKILL: {error}"
+                        ));
+                    }
                 }
             }
-            assert!(reaped, "cancelled native stream {label} {pid} survived");
+        }
+
+        let cleanup_deadline = Instant::now() + watchdog;
+        while fixtures.iter().any(|(_, _, reaped)| !reaped) && Instant::now() < cleanup_deadline {
+            for (_, pid, reaped) in &mut fixtures {
+                *reaped = is_reaped(*pid);
+            }
+            if fixtures.iter().any(|(_, _, reaped)| !reaped) {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        for (label, pid, reaped) in fixtures {
+            if !reaped {
+                failures.push(format!(
+                    "cancelled native stream {label} {pid} survived cleanup"
+                ));
+            }
+        }
+        if !failures.is_empty() {
+            anyhow::bail!("{}", failures.join("; "));
         }
         Ok(())
     }
