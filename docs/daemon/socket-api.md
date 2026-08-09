@@ -116,6 +116,15 @@ copy-up cap (`afs.copy_up_too_large`), the branch or worktree is taken
 (`afs.commit_conflict`), or signing is unavailable (`afs.commit_unsigned`), the
 attempt is rolled back and the delta is preserved unchanged. The delta survives
 a successful commit too — it is the audit record until an explicit discard.
+
+Passing `"dryRun": true` runs every one of those refusal checks and reports
+what would happen, with **no side effects**: no `committing` transition, no
+worktree, no branch, and no `afs_commit` row. A preview that would succeed
+returns `{ branch, worktreePath, counts, files, provenanceHighWater,
+"dryRun": true, "wouldCommit": true }`; a preview that would be refused
+returns the same dotted error a real commit would raise, so clients read one
+contract rather than two. Preview and commit share their validation, so the
+two cannot disagree.
 Design: [`specs/coven-agent-fs/DESIGN.md`](https://github.com/OpenCoven/coven/blob/main/specs/coven-agent-fs/DESIGN.md).
 
 Session handoff is a **same-user local IPC** operation. A companion must use a
