@@ -99,7 +99,7 @@ Run:
 
 ```sh
 cargo fmt --check
-cargo test -p coven-cli native_stream_sigterm_cancels_and_reaps_process_tree -- --exact --nocapture
+cargo test -p coven-cli pty_runner::tests::native_stream_sigterm_cancels_and_reaps_process_tree -- --exact --nocapture
 ```
 
 Expected: formatting passes, and the renamed test passes while still reporting
@@ -117,7 +117,7 @@ for _ in $(seq 1 24); do
   pids+=("$!")
 done
 trap 'for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done; wait' EXIT
-cargo test -p coven-cli native_stream_sigterm_cancels_and_reaps_process_tree -- --exact --nocapture
+cargo test -p coven-cli pty_runner::tests::native_stream_sigterm_cancels_and_reaps_process_tree -- --exact --nocapture
 ```
 
 Expected: the test passes under load. It may take longer than two seconds,
