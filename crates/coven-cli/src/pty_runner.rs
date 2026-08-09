@@ -462,15 +462,18 @@ fn arm_supervised_stream_cancellation_test_signal() {
 }
 
 #[cfg(all(test, unix))]
-fn disarm_supervised_stream_cancellation_test_signal() {
+fn disarm_supervised_stream_cancellation_test_signal() -> Result<()> {
     let mut state = SUPERVISED_STREAM_CANCELLATION_TEST_STATE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    assert!(
-        !state.handler_active,
-        "supervised-stream cancellation handler remained active after the runner returned"
-    );
+    let handler_active = state.handler_active;
     state.armed_thread = None;
+    if handler_active {
+        anyhow::bail!(
+            "supervised-stream cancellation handler remained active after the runner returned"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(all(test, unix))]
@@ -4490,27 +4493,9 @@ while :; do sleep 1; done
             Ok(result) => result,
             Err(_) => Err(anyhow::anyhow!("native stream signal thread panicked")),
         };
-        disarm_supervised_stream_cancellation_test_signal();
-        signal_result?;
-        let error = stream_result.expect_err("SIGTERM must cancel a native stream");
-        assert!(
-            format!("{error:#}").contains("streamy native stream cancelled by SIGTERM"),
-            "unexpected cancellation error: {error:#}"
-        );
 
-        let _signal_lock = SUPERVISED_STREAM_CANCELLATION_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut restored: libc::sigaction = unsafe { std::mem::zeroed() };
-        assert_eq!(
-            unsafe { libc::sigaction(libc::SIGTERM, std::ptr::null(), &mut restored) },
-            0
-        );
-        assert_ne!(
-            restored.sa_sigaction, cancel_supervised_stream as *const () as usize,
-            "native stream runner did not restore the previous SIGTERM handler"
-        );
-
+        // Cleanup must precede every test outcome check so a runner regression
+        // cannot leave either long-lived fixture process behind.
         let mut failures = Vec::new();
         let mut fixtures = Vec::new();
         for (label, path) in [
@@ -4560,6 +4545,19 @@ while :; do sleep 1; done
                         ));
                     }
                 }
+                let waited = unsafe { libc::waitpid(*pid, std::ptr::null_mut(), 0) };
+                if waited == -1 {
+                    let error = std::io::Error::last_os_error();
+                    if !matches!(error.raw_os_error(), Some(libc::ECHILD) | Some(libc::ESRCH)) {
+                        failures.push(format!(
+                            "failed to wait for unreaped {label} {pid} after SIGKILL: {error}"
+                        ));
+                    }
+                } else if waited != *pid {
+                    failures.push(format!(
+                        "waitpid returned unexpected PID {waited} while cleaning up {label} {pid}"
+                    ));
+                }
             }
         }
 
@@ -4578,6 +4576,43 @@ while :; do sleep 1; done
                     "cancelled native stream {label} {pid} survived cleanup"
                 ));
             }
+        }
+
+        if let Err(error) = disarm_supervised_stream_cancellation_test_signal() {
+            failures.push(format!("{error:#}"));
+        }
+        if let Err(error) = signal_result {
+            failures.push(format!("native stream signal thread failed: {error:#}"));
+        }
+        match stream_result {
+            Ok(code) => failures.push(format!(
+                "SIGTERM must cancel a native stream, but it exited successfully with code {code}"
+            )),
+            Err(error)
+                if !format!("{error:#}").contains("streamy native stream cancelled by SIGTERM") =>
+            {
+                failures.push(format!("unexpected cancellation error: {error:#}"));
+            }
+            Err(_) => {}
+        }
+        let handler_restoration = {
+            let _signal_lock = SUPERVISED_STREAM_CANCELLATION_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut restored: libc::sigaction = unsafe { std::mem::zeroed() };
+            if unsafe { libc::sigaction(libc::SIGTERM, std::ptr::null(), &mut restored) } != 0 {
+                Err(std::io::Error::last_os_error())
+                    .context("failed to read restored SIGTERM handler")
+            } else if restored.sa_sigaction == cancel_supervised_stream as *const () as usize {
+                Err(anyhow::anyhow!(
+                    "native stream runner did not restore the previous SIGTERM handler"
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        if let Err(error) = handler_restoration {
+            failures.push(format!("{error:#}"));
         }
         if !failures.is_empty() {
             anyhow::bail!("{}", failures.join("; "));
