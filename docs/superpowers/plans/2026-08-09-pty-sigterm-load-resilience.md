@@ -27,7 +27,7 @@
 Run:
 
 ```sh
-cargo test -p coven-cli native_stream_sigterm_returns_promptly_and_reaps_process_tree -- --exact --nocapture
+cargo test -p coven-cli pty_runner::tests::native_stream_sigterm_cancels_and_reaps_process_tree -- --exact --nocapture
 ```
 
 Expected: PASS on an unloaded machine. The existing body contains

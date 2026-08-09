@@ -4383,6 +4383,8 @@ while :; do sleep 1; done
                 }
                 thread::sleep(Duration::from_millis(10));
             }
+            let sent = unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+            assert_eq!(sent, 0, "failed to signal test process");
             panic!("native stream fixture did not start before signal deadline");
         });
 
