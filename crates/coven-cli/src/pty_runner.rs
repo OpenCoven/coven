@@ -4361,7 +4361,7 @@ while :; do sleep 1; done
             &fake_harness,
             r#"#!/bin/sh
 printf '%s\n' "$$" > harness.pid
-sleep 30 &
+sleep 120 &
 printf '%s\n' "$!" > descendant.pid
 while :; do sleep 1; done
 "#,
@@ -4421,18 +4421,22 @@ while :; do sleep 1; done
         ] {
             let pid: libc::pid_t = std::fs::read_to_string(path)?.trim().parse()?;
             let deadline = Instant::now() + watchdog;
+            let mut reaped = false;
             while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(10));
             }
-            assert_eq!(
-                unsafe { libc::kill(pid, 0) },
-                -1,
-                "cancelled native stream {label} {pid} survived"
-            );
-            assert_eq!(
-                std::io::Error::last_os_error().raw_os_error(),
-                Some(libc::ESRCH)
-            );
+            if unsafe { libc::kill(pid, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                reaped = true;
+            }
+            if !reaped {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                    libc::waitpid(pid, std::ptr::null_mut(), 0);
+                }
+            }
+            assert!(reaped, "cancelled native stream {label} {pid} survived");
         }
         Ok(())
     }
