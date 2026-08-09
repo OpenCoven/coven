@@ -125,6 +125,22 @@ impl AgentFs {
         self.read_only
     }
 
+    /// Switch this database to write-ahead logging with relaxed sync.
+    ///
+    /// Opt-in, because it trades a property the design values: a WAL database
+    /// is three files (`-wal`, `-shm`) while open rather than the single
+    /// portable file AgentFS databases otherwise are. They are checkpointed
+    /// away on clean close. Worth it for a mounted scratch overlay, where
+    /// every file write is its own transaction and the default rollback
+    /// journal costs a full sync each time; not worth it for a database being
+    /// handed to someone else.
+    pub fn enable_wal(&self) -> Result<()> {
+        self.ensure_writable()?;
+        self.conn.pragma_update(None, "journal_mode", "WAL")?;
+        self.conn.pragma_update(None, "synchronous", "NORMAL")?;
+        Ok(())
+    }
+
     fn ensure_writable(&self) -> Result<()> {
         if self.read_only {
             Err(Error::ReadOnly)
