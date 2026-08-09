@@ -240,7 +240,7 @@ The W0 surface-neutral contract set is:
 | `psyche.delegation.v1` | Parent-child scope, non-widening constraints, budget, evidence access, and cancellation policy. |
 | `psyche.budget.v1` | Reserved, consumed, and released accounting by enforceable resource class. |
 | `psyche.approval.v1` | Psyche orchestration approval request, provenance, decision, and expiry. |
-| `psyche.execution_binding.v1` | Graph attempt, stable request digest, Coven adoption state, event cursor, cancellation, and terminal correlation. |
+| `psyche.execution_binding.v1` | Proposed O2 immutable opaque binding and mismatch correlation; O3-O7 separately own adoption, lookup/fencing, cancellation, artifacts, and recovery. |
 | `psyche.evidence.v1` | Immutable check, artifact, trajectory, verifier, or human evidence reference. |
 | `psyche.verdict.v1` | Verification policy, sealed evidence set, independent verifier, confidence class, and decision. |
 | `psyche.recovery.v1` | Lease, ambiguity, fence, reconciliation, and operator disposition. |
@@ -529,25 +529,13 @@ stores digests, provenance, and identifiers, not a second mutable identity.
 Psyche reads validated handles and verifies digests before graph admission and
 again before execution request construction.
 
-If W1 proves a compatible Coven snapshot-validation contract, Psyche records
-its result in `psyche.execution_binding.v1`:
-
-```json
-{
-  "schema_version": "psyche.execution_binding.v1",
-  "attempt_id": "att_01J...",
-  "familiar_snapshot_id": "ids_01J...",
-  "project_id": "project:sha256:...",
-  "request_id": "req_01J...",
-  "request_digest": "sha256:...",
-  "coven_contract_version": "classified-by-w1",
-  "coven_session_id": null,
-  "adoption_state": "not_submitted",
-  "event_cursor": null,
-  "cancellation_state": "not_requested",
-  "terminal_state": null
-}
-```
+The [proposed O2 contract](./O2_CONTRACT_DESIGN.md) defines the immutable
+opaque binding that Coven persists and exact-compares after W1 proves a
+compatible snapshot-validation contract. Psyche retains its own execution
+request record. O2 is not an adoption, cursor, cancellation, artifact, or
+recovery record: O3 owns adoption and uniqueness, O4 lookup and fencing, O5
+cancellation acknowledgement, O6 artifact binding, and O7 cross-phase
+recovery.
 
 This binding does not make Coven the identity source. It records whether Coven
 accepted the exact Psyche snapshot for one execution request. Missing inputs,
@@ -632,8 +620,8 @@ The execution payload contains a typed task and bounded context manifest. It
 does not contain a competing persona, hidden permission grant, surface secret,
 or untrusted text represented as system instruction. `operation` is `launch`
 or `input`; input also names the adopted session. Psyche persists the exact
-request and digest before submission, then records adoption and event progress
-in `psyche.execution_binding.v1`.
+request and digest before submission. The O2 binding records immutable opaque
+correlation only; adoption and event progress are planned O3 and O4 state.
 
 ### Surface policy request and decision
 
@@ -1118,8 +1106,8 @@ resources. Coven does not authorize Telegram or another surface effect.
 2. Resolve required media or evidence references through only the protected-
    resource contracts that W1 and G4 prove. Missing support blocks that node;
    Psyche never writes directly into a Coven-owned store.
-3. Build and persist the exact `psyche.execution_request.v1` and
-   `psyche.execution_binding.v1` with `adoption_state = not_submitted`.
+3. Build and persist the exact `psyche.execution_request.v1` and the proposed
+   O2 `psyche.execution_binding.v1` immutable correlation tuple.
 4. Submit through the W1-classified session-create or input contract using one
    stable request ID and digest. Surface policy does not participate in Coven
    execution admission.
@@ -1607,7 +1595,7 @@ an exclusive startup lock.
 | `attempts` | One node execution attempt and its immutable request binding. |
 | `delegations` | Non-widening parent-child envelope and cancellation policy. |
 | `budgets` | Idempotent reserve/consume/release accounting by resource class. |
-| `execution_bindings` | Request digest, Coven adoption, session, event cursor, cancellation, terminal state, and ambiguity. |
+| `execution_bindings` | Proposed O2 immutable opaque binding; O3-O7 separately add adoption, session lookup/fencing, cancellation, artifact, and recovery state. |
 | `evidence_sets` | Sealed content-addressed evidence inventory per node attempt. |
 | `verdicts` | Policy, deterministic/human/independent-verifier provenance, confidence class, and decision. |
 | `recovery_records` | Lease, fence, unknown state, reconciliation attempts, and operator disposition. |
@@ -1669,7 +1657,7 @@ Stable v1 error codes:
 | `coven_version_unsupported` | No | Daemon API version is not exactly supported. |
 | `coven_capability_missing` | No | A required capability is not advertised. |
 | `coven_policy_denied` | No | Coven rejected the intent. |
-| `coven_execution_binding_invalid` | No | Execution admission or result does not match every request binding. |
+| `coven_execution_binding_invalid` | No | An O2 binding or later-phase execution record does not match required opaque correlation. |
 | `coven_binding_mismatch` | No | Returned project or familiar binding differs. |
 | `coven_artifact_rejected` | Depends on Coven code | Coven rejected media metadata, bytes, binding, or lifetime. |
 | `coven_intent_conflict` | No | A client intent ID was reused with another request digest. |
