@@ -54,7 +54,8 @@ pub struct ChangeSet {
 impl ChangeSet {
     fn from_entries(mut entries: Vec<ChangeEntry>) -> Self {
         entries.sort_by(|left, right| left.path.cmp(&right.path));
-        let mut set = Self {
+        entries.dedup_by(|a, b| a.path == b.path);
+        Self {
             added: entries.iter().filter(|e| e.change == Change::Added).count(),
             modified: entries
                 .iter()
@@ -66,9 +67,7 @@ impl ChangeSet {
                 .count(),
             bytes: entries.iter().map(|e| e.bytes).sum(),
             entries,
-        };
-        set.entries.dedup_by(|a, b| a.path == b.path);
-        set
+        }
     }
 }
 
