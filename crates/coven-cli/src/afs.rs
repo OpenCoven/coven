@@ -1619,6 +1619,36 @@ mod tests {
     }
 
     #[test]
+    fn commit_replaces_a_symlink_leaf_without_following_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = signing_key(dir.path());
+        let root = git_project(dir.path(), &key);
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, b"outside").unwrap();
+        std::fs::remove_file(root.join("src/main.rs")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, root.join("src/main.rs")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&outside, root.join("src/main.rs")).unwrap();
+        git_ok(&root, &["add", "--all"]);
+        git_ok(&root, &["commit", "--no-gpg-sign", "-q", "-m", "leaf symlink"]);
+
+        let store = store(dir.path());
+        let view = create(&store, &root);
+        delta_write(&store, &view.id, "/src/main.rs", b"fn main() { println!(\"safe\"); }");
+
+        let committed = store
+            .commit(&view.id, &CommitRequest::default())
+            .expect("commit should replace the symlink with a file");
+        assert_eq!(committed.state, STATE_COMMITTED);
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+        assert_eq!(
+            git_ok(&root, &["show", &format!("{}:src/main.rs", committed.commit)]),
+            "fn main() { println!(\"safe\"); }"
+        );
+    }
+
+    #[test]
     fn commit_refuses_a_file_over_the_copy_up_cap() {
         let dir = tempfile::tempdir().unwrap();
         let key = signing_key(dir.path());
